@@ -184,7 +184,10 @@ Only commit touched filed, when commiting commit logical changes not just
 the whole workspace. Commit messages should include a title and the body
 should describe the change so that a reviewer can get an understanding. The
 title should be all lower case and no longer than 50 characters, the body must
-use prose, avoid lists and overly explainging things, be concise.
+use prose, avoid lists and overly explainging things, be concise. Commit body
+lines must be wrapped at 110 characters or less. Do not include literal `\n`
+sequences in commit messages; use separate `git commit -m` arguments or an
+editor so the message contains real line breaks.
 
 ### Release tags
 When creating a tag, include a very brief changelog in the tag annotation using
