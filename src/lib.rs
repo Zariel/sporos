@@ -9,6 +9,7 @@ pub mod domain;
 pub mod error;
 pub mod integrations;
 pub mod matching;
+pub mod memory;
 pub mod operations;
 pub mod persistence;
 pub mod scheduler;

@@ -10,6 +10,13 @@ license = "MIT"
 anyhow = "1"
 thiserror = "2"
 
+[dev-dependencies]
+criterion = { version = "0.7", default-features = false }
+
+[[bench]]
+name = "memory_baseline"
+harness = false
+
 [workspace]
 members = ["."]
 resolver = "3"

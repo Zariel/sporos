@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Example Torznab Feed</title>
+    <item>
+      <title>Example.Release.2024.1080p-GRP</title>
+      <guid>https://indexer.example/details/1</guid>
+      <link>https://indexer.example/download/1</link>
+      <pubDate>Wed, 29 Apr 2026 22:00:00 GMT</pubDate>
+      <torznab:attr name="size" value="123456" />
+    </item>
+  </channel>
+</rss>

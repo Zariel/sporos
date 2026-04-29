@@ -1,0 +1,11 @@
+{
+  "results": [
+    {
+      "name": "Example.Release.2024.1080p-GRP",
+      "guid": "https://indexer.example/details/1",
+      "link": "https://indexer.example/download/1",
+      "tracker": "example",
+      "size": 123456
+    }
+  ]
+}
