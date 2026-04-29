@@ -151,17 +151,29 @@ output filenames, matching decisions, and torrent-client side effects.
 Preserve user-visible behavior before improving internals. When behavior is
 unclear, add a compatibility test from `docs/internal` before changing it.
 
-Memory efficiency is a primary design goal. Prefer streaming filesystem walks,
-bounded queues, iterators, borrowed data, and paged database reads over loading
-whole torrent inventories, RSS feeds, or directory trees into memory. Avoid
-clone-heavy APIs, unbounded process-global caches, and retaining parsed torrent
-metafiles longer than needed.
+Memory efficiency is a primary design goal. The baseline scale is 10,000
+torrents in a client, and the design should expect to handle 100,000. Any path
+that lists, indexes, filters, matches, caches, injects, or cleans up torrents
+must be written as large-inventory production code. Prefer streaming filesystem
+walks, bounded queues, iterators, borrowed data, and paged database reads over
+loading whole torrent inventories, RSS feeds, or directory trees into memory.
+Avoid clone-heavy APIs, unbounded process-global caches, and retaining parsed
+torrent metafiles longer than needed.
 
 Keep module boundaries aligned with the documented runtime layers: CLI/config,
 domain models, persistence, torrent parsing, search and matching, external
 integrations, torrent-client adapters, actions, HTTP API, scheduler, and
 operations. Add abstractions only when they reduce real duplication or protect a
 compatibility boundary.
+
+This is intended to be a long-running service. Production code must surface
+errors up the stack so callers can decide whether to retry, degrade, skip one
+item, return an API error, or shut down. Exiting the process is a serious error
+condition and should be limited to startup/configuration failures or unrecoverable
+runtime corruption. Logs must be sufficient to debug production issues and must
+use appropriate levels: trace/debug for high-volume diagnostics, info for
+lifecycle and user-visible progress, warn for recoverable anomalies, and error
+for failed operations requiring attention.
 
 Every feature that touches matching, injection, persistence, or public API
 behavior needs focused tests. Memory-sensitive paths should include fixtures or
