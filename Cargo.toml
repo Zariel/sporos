@@ -6,6 +6,10 @@ rust-version = "1.85"
 description = "Rust compatibility rebuild of cross-seed behavior"
 license = "MIT"
 
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+
 [workspace]
 members = ["."]
 resolver = "3"

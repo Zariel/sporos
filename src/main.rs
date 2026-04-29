@@ -1,3 +1,4 @@
-fn main() {
-    println!("sporos {}", sporos::VERSION);
+fn main() -> anyhow::Result<()> {
+    sporos::cli::run()?;
+    Ok(())
 }
