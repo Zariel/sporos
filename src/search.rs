@@ -11,11 +11,14 @@ use std::{
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
+use rusqlite::params;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     SporosError,
     domain::{File, MediaType, Searchee},
+    persistence::Database,
+    torrent::parse_metafile,
 };
 
 static EPISODE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -72,6 +75,136 @@ const BOOK_EXTENSIONS: &[&str] = &["epub", "mobi", "azw", "azw3", "pdf", "cbr", 
 pub struct DataDirWatchState {
     watcher: RecommendedWatcher,
     roots: Vec<PathBuf>,
+}
+
+/// Result counts from indexing a torrentDir.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TorrentDirIndexResult {
+    /// `.torrent` files seen in the directory.
+    pub files_seen: usize,
+    /// Torrents parsed and upserted.
+    pub torrents_indexed: usize,
+    /// Existing rows pruned because their files disappeared or became invalid.
+    pub torrents_removed: usize,
+    /// Files that could not be read or parsed.
+    pub files_failed: usize,
+}
+
+/// Parse and index every `.torrent` in a torrentDir, then prune removed files.
+pub fn index_torrent_dir(
+    database: &Database,
+    torrent_dir: &Path,
+) -> crate::Result<TorrentDirIndexResult> {
+    let connection = database.connection();
+    connection
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS current_torrent_dir (
+                file_path TEXT PRIMARY KEY
+            );
+            DELETE FROM current_torrent_dir;",
+        )
+        .map_err(persistence_error)?;
+
+    let mut result = TorrentDirIndexResult {
+        files_seen: 0,
+        torrents_indexed: 0,
+        torrents_removed: 0,
+        files_failed: 0,
+    };
+    let entries = match fs::read_dir(torrent_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            result.torrents_removed = connection
+                .execute("DELETE FROM torrent", [])
+                .map_err(persistence_error)?;
+            return Ok(result);
+        }
+        Err(error) => {
+            return Err(search_error(format!(
+                "failed to read torrentDir {}: {error}",
+                torrent_dir.display()
+            )));
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!("skipping torrentDir entry: {error}");
+                result.files_failed += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("torrent") {
+            continue;
+        }
+        result.files_seen += 1;
+        let file_path = path.display().to_string();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO current_torrent_dir (file_path) VALUES (?1)",
+                params![file_path],
+            )
+            .map_err(persistence_error)?;
+
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!("failed to read torrentDir file {}: {error}", path.display());
+                connection
+                    .execute(
+                        "DELETE FROM torrent WHERE file_path = ?1",
+                        params![file_path],
+                    )
+                    .map_err(persistence_error)?;
+                result.files_failed += 1;
+                continue;
+            }
+        };
+        match parse_metafile(&bytes) {
+            Ok(metafile) => {
+                connection
+                    .execute(
+                        "INSERT INTO torrent (info_hash, name, file_path)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(file_path) DO UPDATE SET
+                            info_hash = excluded.info_hash,
+                            name = excluded.name",
+                        params![
+                            metafile.info_hash.as_str(),
+                            metafile.name.as_ref(),
+                            file_path
+                        ],
+                    )
+                    .map_err(persistence_error)?;
+                result.torrents_indexed += 1;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "failed to parse torrentDir file {}: {error}",
+                    path.display()
+                );
+                connection
+                    .execute(
+                        "DELETE FROM torrent WHERE file_path = ?1",
+                        params![file_path],
+                    )
+                    .map_err(persistence_error)?;
+                result.files_failed += 1;
+            }
+        }
+    }
+
+    result.torrents_removed = connection
+        .execute(
+            "DELETE FROM torrent
+             WHERE file_path NOT IN (SELECT file_path FROM current_torrent_dir)",
+            [],
+        )
+        .map_err(persistence_error)?;
+    Ok(result)
 }
 
 impl DataDirWatchState {
@@ -631,6 +764,12 @@ fn search_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     }
 }
 
+fn persistence_error(error: rusqlite::Error) -> SporosError {
+    SporosError::Persistence {
+        message: Cow::Owned(error.to_string()),
+    }
+}
+
 /// Apply parsed title metadata to a domain object represented by title and media fields.
 pub fn parsed_name_and_media<'a>(
     name: &'a str,
@@ -646,9 +785,12 @@ pub fn parsed_name_and_media<'a>(
 mod tests {
     use super::{
         affected_roots_for_changed_path, create_searchee_from_path, find_potential_nested_roots,
-        get_media_type, parse_title,
+        get_media_type, index_torrent_dir, parse_title,
     };
-    use crate::domain::{File, MediaType};
+    use crate::{
+        domain::{File, MediaType},
+        persistence::Database,
+    };
     use std::{
         fs,
         path::PathBuf,
@@ -783,6 +925,77 @@ mod tests {
                 PathBuf::from("/data")
             ]
         );
+    }
+
+    #[test]
+    fn indexes_torrent_dir_and_prunes_removed_files() {
+        let root = temp_path("torrent-dir");
+        let torrent_dir = root.join("torrents");
+        fs::create_dir_all(&torrent_dir).expect("torrent dir");
+        let first = torrent_dir.join("first.torrent");
+        let second = torrent_dir.join("second.torrent");
+        fs::write(&first, torrent_bytes("First.Release", 10)).expect("first");
+        fs::write(&second, torrent_bytes("Second.Release", 20)).expect("second");
+        let database = Database::open_app_dir(&root).expect("database");
+
+        let result = index_torrent_dir(&database, &torrent_dir).expect("index");
+
+        assert_eq!(result.files_seen, 2);
+        assert_eq!(result.torrents_indexed, 2);
+        let count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM torrent", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 2);
+
+        fs::remove_file(second).expect("remove second");
+        fs::write(&first, torrent_bytes("First.Changed", 30)).expect("change first");
+        let result = index_torrent_dir(&database, &torrent_dir).expect("reindex");
+
+        assert_eq!(result.files_seen, 1);
+        assert_eq!(result.torrents_indexed, 1);
+        assert_eq!(result.torrents_removed, 1);
+        let names = database
+            .connection()
+            .query_row(
+                "SELECT name FROM torrent WHERE file_path = ?1",
+                [&first.display().to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("name");
+        assert_eq!(names, "First.Changed");
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_torrent_dir_files_remove_stale_rows() {
+        let root = temp_path("torrent-dir-invalid");
+        let torrent_dir = root.join("torrents");
+        fs::create_dir_all(&torrent_dir).expect("torrent dir");
+        let path = torrent_dir.join("stale.torrent");
+        fs::write(&path, torrent_bytes("Stale.Release", 10)).expect("torrent");
+        let database = Database::open_app_dir(&root).expect("database");
+        index_torrent_dir(&database, &torrent_dir).expect("index");
+
+        fs::write(&path, b"not bencode").expect("invalid");
+        let result = index_torrent_dir(&database, &torrent_dir).expect("reindex");
+
+        assert_eq!(result.files_seen, 1);
+        assert_eq!(result.files_failed, 1);
+        let count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM torrent", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 0);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {
+        format!(
+            "d4:infod6:lengthi{length}e4:name{}:{name}12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee",
+            name.len()
+        )
+        .into_bytes()
     }
 
     fn temp_path(label: &str) -> PathBuf {
