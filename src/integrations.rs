@@ -215,6 +215,30 @@ impl Default for TorznabSearchOptions {
     }
 }
 
+/// RSS paging behavior.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RssPagerOptions {
+    /// Time elapsed since the previous RSS job run.
+    pub time_since_last_run: Duration,
+    /// Per-request timeout.
+    pub timeout: Option<Duration>,
+    /// Delay between page requests.
+    pub delay: Duration,
+    /// Current wall-clock time in milliseconds.
+    pub now_millis: u64,
+}
+
+impl Default for RssPagerOptions {
+    fn default() -> Self {
+        Self {
+            time_since_last_run: Duration::ZERO,
+            timeout: None,
+            delay: Duration::ZERO,
+            now_millis: current_time_millis(),
+        }
+    }
+}
+
 /// Retry behavior for candidate torrent downloads.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SnatchOptions {
@@ -892,6 +916,108 @@ pub fn search_torznab_indexer(
     Ok(candidates)
 }
 
+/// Page one indexer's RSS feed and persist its newest cursor.
+pub fn rss_pager(
+    database: &Database,
+    indexer: &SearchIndexer,
+    options: RssPagerOptions,
+) -> crate::Result<Vec<Candidate<'static>>> {
+    const MAX_PAGES: u32 = 10;
+    const MAX_CANDIDATES: usize = 10_000;
+
+    let previous_guid = read_rss_cursor(database, indexer.id)?;
+    let limit = indexer.caps.limits.max.max(1);
+    let mut output = Vec::new();
+    let mut first_seen_guid = None;
+    let mut page_back_until = None;
+
+    for page in 0..MAX_PAGES {
+        let query = TorznabQuery {
+            params: vec![
+                ("t".to_owned(), "search".to_owned()),
+                ("q".to_owned(), String::new()),
+                ("limit".to_owned(), limit.to_string()),
+                ("offset".to_owned(), page.saturating_mul(limit).to_string()),
+            ],
+        };
+        let raw_page = search_torznab_indexer(
+            database,
+            indexer,
+            &[query],
+            TorznabSearchOptions {
+                timeout: options.timeout,
+                delay: Duration::ZERO,
+                search_limit: None,
+                now_millis: options.now_millis,
+            },
+        )?;
+        if page == 0 {
+            first_seen_guid = raw_page.first().map(|candidate| candidate.guid.to_string());
+            page_back_until = raw_page
+                .iter()
+                .filter_map(|candidate| candidate.pub_date_millis)
+                .max()
+                .map(|newest| newest.saturating_sub(duration_millis(options.time_since_last_run)));
+        }
+        if raw_page.is_empty() {
+            break;
+        }
+
+        let raw_len = raw_page.len();
+        let mut reached_previous = false;
+        let mut filtered = Vec::with_capacity(raw_page.len());
+        for candidate in raw_page {
+            if previous_guid
+                .as_ref()
+                .is_some_and(|guid| guid == candidate.guid.as_ref())
+            {
+                reached_previous = true;
+                break;
+            }
+            filtered.push(candidate);
+        }
+        if !reached_previous && previous_guid.is_some() {
+            if let Some(cutoff) = page_back_until {
+                filtered.retain(|candidate| {
+                    candidate
+                        .pub_date_millis
+                        .is_some_and(|pub_date| pub_date >= cutoff)
+                });
+            }
+        }
+        let filtered_len = filtered.len();
+        output.append(&mut filtered);
+        if output.len() >= MAX_CANDIDATES {
+            output.truncate(MAX_CANDIDATES);
+            break;
+        }
+        if reached_previous || filtered_len == 0 || filtered_len < raw_len {
+            break;
+        }
+        if !options.delay.is_zero() {
+            thread::sleep(options.delay);
+        }
+    }
+
+    if let Some(guid) = first_seen_guid {
+        update_rss_cursor(database, indexer.id, &guid)?;
+    }
+    Ok(output)
+}
+
+/// Page all enabled RSS feeds.
+pub fn query_rss_feeds(
+    database: &Database,
+    indexers: &[SearchIndexer],
+    options: RssPagerOptions,
+) -> crate::Result<Vec<Candidate<'static>>> {
+    let mut output = Vec::new();
+    for indexer in indexers {
+        output.extend(rss_pager(database, indexer, options)?);
+    }
+    Ok(output)
+}
+
 /// Parse a Torznab RSS response into candidates.
 pub fn parse_torznab_rss(xml: &str, indexer_id: i64) -> crate::Result<Vec<Candidate<'static>>> {
     let mut reader = Reader::from_str(xml);
@@ -1174,6 +1300,31 @@ fn update_indexer_name(database: &Database, indexer_id: i64, name: &str) -> crat
     Ok(())
 }
 
+fn read_rss_cursor(database: &Database, indexer_id: i64) -> crate::Result<Option<String>> {
+    database
+        .connection()
+        .query_row(
+            "SELECT last_seen_guid FROM rss WHERE indexer_id = ?1",
+            params![indexer_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(persistence_error)
+}
+
+fn update_rss_cursor(database: &Database, indexer_id: i64, guid: &str) -> crate::Result<()> {
+    database
+        .connection()
+        .execute(
+            "INSERT INTO rss (indexer_id, last_seen_guid)
+             VALUES (?1, ?2)
+             ON CONFLICT(indexer_id) DO UPDATE SET last_seen_guid = excluded.last_seen_guid",
+            params![indexer_id, guid],
+        )
+        .map_err(persistence_error)?;
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct RssItem {
     guid: Option<String>,
@@ -1449,12 +1600,12 @@ fn json_error(error: serde_json::Error) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CategoryCaps, LimitCaps, SearchIndexer, SnatchHistory, SnatchOptions, SnatchResult,
-        TorznabCaps, TorznabQuery, TorznabSearchIds, TorznabSearchOptions, cache_torrent_file,
-        create_torznab_search_queries, enabled_indexers, get_cached_torrent, guid_lookup,
-        parse_torznab_caps, parse_torznab_rss, search_torznab_indexer, set_indexer_status, snatch,
-        snatch_once, sync_torznab_indexers, torznab_request_url, update_indexer_caps,
-        validate_torznab_url,
+        CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, SnatchHistory, SnatchOptions,
+        SnatchResult, TorznabCaps, TorznabQuery, TorznabSearchIds, TorznabSearchOptions,
+        cache_torrent_file, create_torznab_search_queries, enabled_indexers, get_cached_torrent,
+        guid_lookup, parse_torznab_caps, parse_torznab_rss, rss_pager, search_torznab_indexer,
+        set_indexer_status, snatch, snatch_once, sync_torznab_indexers, torznab_request_url,
+        update_indexer_caps, validate_torznab_url,
     };
     use crate::{
         domain::{Candidate, Decision, File, MediaType, Searchee},
@@ -1791,6 +1942,132 @@ mod tests {
     }
 
     #[test]
+    fn rss_pager_stops_at_previous_cursor_and_persists_newest_guid() {
+        let server = http_server(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/rss+xml")],
+            r#"<rss><channel>
+              <item><title>New</title><guid>new-guid</guid><link>https://idx/new</link><pubDate>Thu, 01 Jan 1970 00:00:10 +0000</pubDate></item>
+              <item><title>Old</title><guid>old-guid</guid><link>https://idx/old</link><pubDate>Thu, 01 Jan 1970 00:00:09 +0000</pubDate></item>
+            </channel></rss>"#,
+        )]);
+        let root = temp_path("rss-cursor");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let indexer = insert_search_indexer(&database, &server.url, 2);
+        database
+            .connection()
+            .execute(
+                "INSERT INTO rss (indexer_id, last_seen_guid) VALUES (?1, 'old-guid')",
+                [indexer.id],
+            )
+            .expect("cursor");
+
+        let candidates = rss_pager(
+            &database,
+            &indexer,
+            RssPagerOptions {
+                time_since_last_run: Duration::from_secs(60),
+                now_millis: 20_000,
+                ..RssPagerOptions::default()
+            },
+        )
+        .expect("rss");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].guid, "new-guid");
+        let cursor: String = database
+            .connection()
+            .query_row(
+                "SELECT last_seen_guid FROM rss WHERE indexer_id = ?1",
+                [indexer.id],
+                |row| row.get(0),
+            )
+            .expect("cursor");
+        assert_eq!(cursor, "new-guid");
+        server.join();
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rss_pager_uses_age_cutoff_when_previous_cursor_is_missing() {
+        let server = http_server(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/rss+xml")],
+            r#"<rss><channel>
+              <item><title>Fresh</title><guid>fresh</guid><link>https://idx/fresh</link><pubDate>Thu, 01 Jan 1970 00:00:10 +0000</pubDate></item>
+              <item><title>Stale</title><guid>stale</guid><link>https://idx/stale</link><pubDate>Thu, 01 Jan 1970 00:00:04 +0000</pubDate></item>
+            </channel></rss>"#,
+        )]);
+        let root = temp_path("rss-age");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let indexer = insert_search_indexer(&database, &server.url, 2);
+        database
+            .connection()
+            .execute(
+                "INSERT INTO rss (indexer_id, last_seen_guid) VALUES (?1, 'missing')",
+                [indexer.id],
+            )
+            .expect("cursor");
+
+        let candidates = rss_pager(
+            &database,
+            &indexer,
+            RssPagerOptions {
+                time_since_last_run: Duration::from_secs(5),
+                now_millis: 20_000,
+                ..RssPagerOptions::default()
+            },
+        )
+        .expect("rss");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].guid, "fresh");
+        server.join();
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rss_pager_requests_offsets_until_empty_page() {
+        let server = http_server(vec![
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/rss+xml")],
+                r#"<rss><channel>
+                  <item><title>Only</title><guid>only</guid><link>https://idx/only</link><pubDate>Thu, 01 Jan 1970 00:00:10 +0000</pubDate></item>
+                </channel></rss>"#,
+            ),
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/rss+xml")],
+                "<rss><channel></channel></rss>",
+            ),
+        ]);
+        let root = temp_path("rss-offsets");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let indexer = insert_search_indexer(&database, &server.url, 1);
+
+        let candidates = rss_pager(
+            &database,
+            &indexer,
+            RssPagerOptions {
+                now_millis: 20_000,
+                ..RssPagerOptions::default()
+            },
+        )
+        .expect("rss");
+
+        assert_eq!(candidates.len(), 1);
+        let requests = server.join();
+        assert!(requests[0].contains("limit=1"));
+        assert!(requests[0].contains("offset=0"));
+        assert!(requests[1].contains("offset=1"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn caches_reads_and_deletes_corrupted_torrents() {
         let root = temp_path("cache");
         fs::create_dir_all(&root).expect("temp dir");
@@ -2070,6 +2347,35 @@ mod tests {
             url,
             requests,
             handle,
+        }
+    }
+
+    fn insert_search_indexer(database: &Database, server_url: &str, limit: u32) -> SearchIndexer {
+        let url = format!("{server_url}/api");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO indexer (url, apikey, active, search_cap) VALUES (?1, 'key', 1, 1)",
+                [&url],
+            )
+            .expect("indexer");
+        let id = database
+            .connection()
+            .query_row("SELECT id FROM indexer WHERE url = ?1", [&url], |row| {
+                row.get(0)
+            })
+            .expect("id");
+        SearchIndexer {
+            id,
+            url,
+            apikey: "key".to_owned(),
+            caps: TorznabCaps {
+                limits: LimitCaps {
+                    default: limit,
+                    max: limit,
+                },
+                ..TorznabCaps::default()
+            },
         }
     }
 
