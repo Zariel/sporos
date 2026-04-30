@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+clap = "4"
 sha1 = "0.10"
 thiserror = "2"
 
