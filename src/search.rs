@@ -246,6 +246,93 @@ pub enum ContentFilterRejection {
     NonStandardNaming,
 }
 
+/// Timestamp state for one searchee/indexer pair.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TimestampDecision {
+    /// First searched timestamp.
+    pub first_searched: u64,
+    /// Last searched timestamp.
+    pub last_searched: u64,
+}
+
+/// Parsed media capability flags for one indexer.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct MediaCapabilities {
+    /// TV search capability.
+    pub tv: bool,
+    /// Movie search capability.
+    pub movie: bool,
+    /// Music/audio search capability.
+    pub audio: bool,
+    /// Book search capability.
+    pub book: bool,
+    /// Generic search fallback.
+    pub generic: bool,
+}
+
+/// Remove duplicate searchees from a set already believed to describe the same media.
+pub fn filter_duplicate_searchees(mut searchees: Vec<Searchee<'static>>) -> Vec<Searchee<'static>> {
+    searchees.sort_by(|left, right| {
+        right
+            .info_hash
+            .is_some()
+            .cmp(&left.info_hash.is_some())
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.length.cmp(&right.length))
+    });
+    let mut filtered = Vec::with_capacity(searchees.len());
+    'outer: for searchee in searchees {
+        for existing in &filtered {
+            if duplicate_searchee(existing, &searchee) {
+                continue 'outer;
+            }
+        }
+        filtered.push(searchee);
+    }
+    filtered
+}
+
+/// Build the lowercased search grouping key used for cached search reuse.
+pub fn search_group_key(searchee: &Searchee<'_>) -> String {
+    normalized_query_key(searchee.title.as_ref())
+}
+
+/// Return true when timestamp history should skip this searchee/indexer.
+pub fn timestamp_excludes(
+    timestamp: Option<TimestampDecision>,
+    now_millis: u64,
+    exclude_older: Option<u64>,
+    exclude_recent_search: Option<u64>,
+    virtual_mtime_millis: Option<u64>,
+) -> bool {
+    let Some(timestamp) = timestamp else {
+        return false;
+    };
+    if virtual_mtime_millis.is_some_and(|mtime| mtime > timestamp.last_searched) {
+        return false;
+    }
+    if exclude_older.is_some_and(|age| timestamp.first_searched < now_millis.saturating_sub(age)) {
+        return true;
+    }
+    if exclude_recent_search
+        .is_some_and(|age| timestamp.last_searched > now_millis.saturating_sub(age))
+    {
+        return true;
+    }
+    false
+}
+
+/// Check whether an indexer can search the searchee media type.
+pub fn indexer_supports_media(media_type: MediaType, caps: MediaCapabilities) -> bool {
+    match media_type {
+        MediaType::Episode | MediaType::Pack | MediaType::Anime => caps.tv || caps.generic,
+        MediaType::Movie | MediaType::Video => caps.movie || caps.generic,
+        MediaType::Audio => caps.audio || caps.generic,
+        MediaType::Book => caps.book || caps.generic,
+        MediaType::Unknown => caps.generic,
+    }
+}
+
 /// Apply documented content filters and return a rejection reason when filtered.
 pub fn filter_by_content(
     searchee: &Searchee<'_>,
@@ -863,6 +950,44 @@ fn non_standard_naming(searchee: &Searchee<'_>) -> bool {
         && !SEASON_REGEX.is_match(searchee.title.as_ref())
 }
 
+fn duplicate_searchee(left: &Searchee<'_>, right: &Searchee<'_>) -> bool {
+    left.title == right.title
+        && left.length == right.length
+        && left.files.len() == right.files.len()
+        && client_host(left) == client_host(right)
+        && sorted_lengths(left) == sorted_lengths(right)
+}
+
+fn client_host<'a>(searchee: &'a Searchee<'_>) -> Option<&'a str> {
+    searchee.client.as_ref().map(|client| client.host.as_ref())
+}
+
+fn sorted_lengths(searchee: &Searchee<'_>) -> Vec<u64> {
+    let mut lengths = searchee
+        .files
+        .iter()
+        .map(|file| file.length)
+        .collect::<Vec<_>>();
+    lengths.sort_unstable();
+    lengths
+}
+
+fn normalized_query_key(title: &str) -> String {
+    title
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     haystack.to_ascii_lowercase().contains(needle_lower)
 }
@@ -1076,9 +1201,11 @@ pub fn parsed_name_and_media<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Blocklist, ContentFilterOptions, ContentFilterRejection, affected_roots_for_changed_path,
-        create_searchee_from_path, filter_by_content, find_potential_nested_roots, get_media_type,
-        index_torrent_dir, parse_title,
+        Blocklist, ContentFilterOptions, ContentFilterRejection, MediaCapabilities,
+        TimestampDecision, affected_roots_for_changed_path, create_searchee_from_path,
+        filter_by_content, filter_duplicate_searchees, find_potential_nested_roots, get_media_type,
+        index_torrent_dir, indexer_supports_media, parse_title, search_group_key,
+        timestamp_excludes,
     };
     use crate::{
         domain::{ClientLabel, ClientTorrentMetadata, File, Label, MediaType, Searchee},
@@ -1401,6 +1528,75 @@ mod tests {
             link_category: None,
             label: Some(Label::Search),
         }
+    }
+
+    #[test]
+    fn duplicate_filter_prefers_info_hash_sources() {
+        let mut with_hash =
+            Searchee::from_files("Release A", "Same Title", vec![File::new("a.mkv", 10)]);
+        with_hash.info_hash =
+            crate::domain::InfoHash::new("0123456789abcdef0123456789abcdef01234567");
+        let duplicate =
+            Searchee::from_files("Release B", "Same Title", vec![File::new("b.mkv", 10)]);
+
+        let filtered = filter_duplicate_searchees(vec![duplicate, with_hash]);
+
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].info_hash.is_some());
+    }
+
+    #[test]
+    fn timestamp_filter_honors_recent_old_and_virtual_freshness() {
+        let timestamp = TimestampDecision {
+            first_searched: 1_000,
+            last_searched: 9_000,
+        };
+
+        assert!(timestamp_excludes(
+            Some(timestamp),
+            10_000,
+            None,
+            Some(2_000),
+            None
+        ));
+        assert!(timestamp_excludes(
+            Some(timestamp),
+            10_000,
+            Some(5_000),
+            None,
+            None
+        ));
+        assert!(!timestamp_excludes(
+            Some(timestamp),
+            10_000,
+            Some(5_000),
+            Some(2_000),
+            Some(9_500)
+        ));
+        assert!(!timestamp_excludes(
+            None,
+            10_000,
+            Some(5_000),
+            Some(2_000),
+            None
+        ));
+    }
+
+    #[test]
+    fn media_caps_and_group_key_are_stable() {
+        let caps = MediaCapabilities {
+            tv: true,
+            ..MediaCapabilities::default()
+        };
+        assert!(indexer_supports_media(MediaType::Episode, caps));
+        assert!(!indexer_supports_media(MediaType::Movie, caps));
+
+        let searchee = Searchee::from_files(
+            "Example.Show.S01E02.1080p",
+            "Example Show S01E02",
+            vec![File::new("Example.Show.S01E02.mkv", 10)],
+        );
+        assert_eq!(search_group_key(&searchee), "example.show.s01e02");
     }
 
     fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {
