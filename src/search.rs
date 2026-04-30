@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -16,7 +16,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     SporosError,
-    domain::{ClientLabel, File, Label, MediaType, Searchee},
+    domain::{ClientLabel, ClientTorrentMetadata, File, Label, MediaType, Searchee},
     persistence::Database,
     torrent::parse_metafile,
 };
@@ -70,6 +70,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 const VIDEO_DISC_EXTENSIONS: &[&str] = &["iso", "vob", "m2ts", "mts"];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "alac"];
 const BOOK_EXTENSIONS: &[&str] = &["epub", "mobi", "azw", "azw3", "pdf", "cbr", "cbz"];
+const EIGHT_DAYS_MILLIS: u64 = 8 * 24 * 60 * 60 * 1000;
 
 /// Active recursive data-dir watcher. Dropping it stops watching.
 pub struct DataDirWatchState {
@@ -270,6 +271,17 @@ pub struct MediaCapabilities {
     pub generic: bool,
 }
 
+/// Options for virtual season construction.
+#[derive(Debug, Clone, Copy)]
+pub struct VirtualSeasonOptions {
+    /// Required episode ratio against the highest episode number.
+    pub season_from_episodes: f64,
+    /// Apply production freshness and minimum-count filters.
+    pub use_filters: bool,
+    /// Current time in milliseconds for age filtering.
+    pub now_millis: u64,
+}
+
 /// Remove duplicate searchees from a set already believed to describe the same media.
 pub fn filter_duplicate_searchees(mut searchees: Vec<Searchee<'static>>) -> Vec<Searchee<'static>> {
     searchees.sort_by(|left, right| {
@@ -331,6 +343,101 @@ pub fn indexer_supports_media(media_type: MediaType, caps: MediaCapabilities) ->
         MediaType::Book => caps.book || caps.generic,
         MediaType::Unknown => caps.generic,
     }
+}
+
+/// Build virtual season searchees from episode searchees.
+pub fn create_virtual_season_searchees(
+    searchees: &[Searchee<'_>],
+    options: VirtualSeasonOptions,
+) -> Vec<Searchee<'static>> {
+    let existing_seasons = searchees
+        .iter()
+        .filter(|searchee| searchee.media_type == MediaType::Pack)
+        .filter_map(|searchee| season_key_from_title(searchee.title.as_ref()))
+        .collect::<BTreeSet<_>>();
+    let mut groups: BTreeMap<SeasonKey, BTreeMap<u32, EpisodeChoice>> = BTreeMap::new();
+
+    for searchee in searchees {
+        if searchee.media_type != MediaType::Episode {
+            continue;
+        }
+        let Some((key, episode)) = episode_key_from_title(searchee.title.as_ref()) else {
+            continue;
+        };
+        if options.use_filters && existing_seasons.contains(&key) {
+            continue;
+        }
+        let Some(file) = searchee.files.iter().max_by_key(|file| file.length) else {
+            continue;
+        };
+        let choice = EpisodeChoice {
+            file: file.clone().into_owned(),
+            length: file.length,
+            mtime_millis: searchee.mtime_millis,
+            client_host: searchee
+                .client
+                .as_ref()
+                .map(|client| client.host.as_ref().to_owned()),
+        };
+        groups
+            .entry(key)
+            .or_default()
+            .entry(episode)
+            .and_modify(|existing| {
+                if choice.length > existing.length
+                    || (choice.length == existing.length
+                        && choice.mtime_millis.unwrap_or(u64::MAX)
+                            < existing.mtime_millis.unwrap_or(u64::MAX))
+                {
+                    *existing = choice.clone();
+                }
+            })
+            .or_insert(choice);
+    }
+
+    let mut virtuals = Vec::new();
+    for (key, episodes) in groups {
+        let Some(highest_episode) = episodes.keys().next_back().copied() else {
+            continue;
+        };
+        if highest_episode == 0 {
+            continue;
+        }
+        let ratio = episodes.len() as f64 / f64::from(highest_episode);
+        let newest_mtime = episodes
+            .values()
+            .filter_map(|episode| episode.mtime_millis)
+            .max();
+        if options.use_filters
+            && (episodes.len() < 3
+                || ratio < options.season_from_episodes
+                || newest_mtime.is_some_and(|mtime| {
+                    options.now_millis.saturating_sub(mtime) < EIGHT_DAYS_MILLIS
+                }))
+        {
+            continue;
+        }
+
+        let files = episodes
+            .values()
+            .map(|episode| episode.file.clone())
+            .collect::<Vec<_>>();
+        let title = format!("{} S{:02}", key.title, key.season);
+        let mut searchee = Searchee::from_files(title.clone(), title, files);
+        searchee.media_type = MediaType::Pack;
+        searchee.mtime_millis = newest_mtime;
+        if let Some(host) = choose_virtual_client_host(episodes.values()) {
+            searchee.client = Some(ClientTorrentMetadata::new(
+                host,
+                "",
+                None,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        virtuals.push(searchee.into_owned());
+    }
+    virtuals
 }
 
 /// Apply documented content filters and return a rejection reason when filtered.
@@ -988,6 +1095,51 @@ fn normalized_query_key(title: &str) -> String {
         .join(".")
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct SeasonKey {
+    title: String,
+    season: u32,
+}
+
+#[derive(Debug, Clone)]
+struct EpisodeChoice {
+    file: File<'static>,
+    length: u64,
+    mtime_millis: Option<u64>,
+    client_host: Option<String>,
+}
+
+fn episode_key_from_title(title: &str) -> Option<(SeasonKey, u32)> {
+    let captures = episode_match(title)?;
+    let title = clean_title(captures.name("title")?.as_str());
+    let season = capture_u32(&captures, "season")?;
+    let episode = capture_u32(&captures, "episode")?;
+    Some((SeasonKey { title, season }, episode))
+}
+
+fn season_key_from_title(title: &str) -> Option<SeasonKey> {
+    let captures = SEASON_REGEX.captures(title)?;
+    let matched = captures.get(0)?;
+    let title = clean_title(title.get(..matched.start())?);
+    let season = season_number(matched.as_str())?;
+    Some(SeasonKey { title, season })
+}
+
+fn choose_virtual_client_host<'a>(
+    episodes: impl Iterator<Item = &'a EpisodeChoice>,
+) -> Option<String> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for episode in episodes {
+        if let Some(host) = &episode.client_host {
+            *counts.entry(host.clone()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(host, _)| host)
+}
+
 fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     haystack.to_ascii_lowercase().contains(needle_lower)
 }
@@ -1202,10 +1354,10 @@ pub fn parsed_name_and_media<'a>(
 mod tests {
     use super::{
         Blocklist, ContentFilterOptions, ContentFilterRejection, MediaCapabilities,
-        TimestampDecision, affected_roots_for_changed_path, create_searchee_from_path,
-        filter_by_content, filter_duplicate_searchees, find_potential_nested_roots, get_media_type,
-        index_torrent_dir, indexer_supports_media, parse_title, search_group_key,
-        timestamp_excludes,
+        TimestampDecision, VirtualSeasonOptions, affected_roots_for_changed_path,
+        create_searchee_from_path, create_virtual_season_searchees, filter_by_content,
+        filter_duplicate_searchees, find_potential_nested_roots, get_media_type, index_torrent_dir,
+        indexer_supports_media, parse_title, search_group_key, timestamp_excludes,
     };
     use crate::{
         domain::{ClientLabel, ClientTorrentMetadata, File, Label, MediaType, Searchee},
@@ -1597,6 +1749,80 @@ mod tests {
             vec![File::new("Example.Show.S01E02.mkv", 10)],
         );
         assert_eq!(search_group_key(&searchee), "example.show.s01e02");
+    }
+
+    #[test]
+    fn builds_virtual_season_from_episode_searchees() {
+        let episodes = (1..=3)
+            .map(|episode| {
+                let title = format!("Example Show S01E{episode:02}");
+                let mut searchee = Searchee::from_files(
+                    title.clone(),
+                    title,
+                    vec![File::new(format!("Example.Show.S01E{episode:02}.mkv"), 100)],
+                );
+                searchee.media_type = MediaType::Episode;
+                searchee.mtime_millis = Some(1_000);
+                searchee.client = Some(ClientTorrentMetadata::new(
+                    "client-a",
+                    "/downloads",
+                    None,
+                    Vec::new(),
+                    Vec::<Cow<'static, str>>::new(),
+                ));
+                searchee
+            })
+            .collect::<Vec<_>>();
+
+        let virtuals = create_virtual_season_searchees(
+            &episodes,
+            VirtualSeasonOptions {
+                season_from_episodes: 0.5,
+                use_filters: true,
+                now_millis: 1_000 + 9 * 24 * 60 * 60 * 1000,
+            },
+        );
+
+        assert_eq!(virtuals.len(), 1);
+        assert_eq!(virtuals[0].title, "Example Show S01");
+        assert_eq!(virtuals[0].media_type, MediaType::Pack);
+        assert_eq!(virtuals[0].length, 300);
+        assert_eq!(
+            virtuals[0]
+                .client
+                .as_ref()
+                .map(|client| client.host.as_ref()),
+            Some("client-a")
+        );
+    }
+
+    #[test]
+    fn virtual_seasons_respect_existing_pack_ratio_and_age() {
+        let mut pack = Searchee::from_files(
+            "Example Show S01",
+            "Example Show S01",
+            vec![File::new("pack.mkv", 1)],
+        );
+        pack.media_type = MediaType::Pack;
+        let mut episode = Searchee::from_files(
+            "Example Show S01E01",
+            "Example Show S01E01",
+            vec![File::new("e1.mkv", 1)],
+        );
+        episode.media_type = MediaType::Episode;
+        episode.mtime_millis = Some(1_000);
+
+        assert!(
+            create_virtual_season_searchees(
+                &[pack, episode],
+                VirtualSeasonOptions {
+                    season_from_episodes: 0.5,
+                    use_filters: true,
+                    now_millis: 1_000 + 9 * 24 * 60 * 60 * 1000,
+                },
+            )
+            .is_empty()
+        );
     }
 
     fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {
