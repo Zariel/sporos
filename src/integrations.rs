@@ -165,6 +165,37 @@ pub struct TorznabSearchIds {
     pub tvmazeid: Option<String>,
 }
 
+/// Sonarr/Radarr service family.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ArrKind {
+    /// Sonarr series parser.
+    Sonarr,
+    /// Radarr movie parser.
+    Radarr,
+}
+
+/// Sanitized Arr parser configuration.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ArrConfig {
+    /// Base URL without the API key query.
+    pub url: String,
+    /// API key extracted from the query string.
+    pub apikey: String,
+    /// Service kind.
+    pub kind: ArrKind,
+}
+
+/// Arr lookup result IDs.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct ArrLookup {
+    /// IDs found by Arr parsing.
+    pub ids: TorznabSearchIds,
+    /// Title sent to the Arr parser.
+    pub query_title: String,
+    /// Stable cache key including IDs.
+    pub cache_key: String,
+}
+
 /// One generated Torznab query.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TorznabQuery {
@@ -839,6 +870,111 @@ pub fn torznab_request_url(indexer: &SearchIndexer, query: &TorznabQuery) -> cra
     Ok(url.to_string())
 }
 
+/// Validate and sanitize a Sonarr/Radarr URL with an `apikey` query parameter.
+pub fn validate_arr_url(value: &str, kind: ArrKind) -> crate::Result<ArrConfig> {
+    let url = Url::parse(value)
+        .map_err(|error| integration_error(format!("invalid Arr URL: {error}")))?;
+    let apikey = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "apikey").then(|| value.into_owned()))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| integration_error("Arr URL must include apikey query parameter"))?;
+    let mut sanitized = url;
+    sanitized.set_query(None);
+    sanitized.set_fragment(None);
+    Ok(ArrConfig {
+        url: sanitized.to_string().trim_end_matches('/').to_owned(),
+        apikey,
+        kind,
+    })
+}
+
+/// Validate an Arr instance by checking `/api` for a JSON `current` field.
+pub fn validate_arr_instance(config: &ArrConfig, timeout: Option<Duration>) -> crate::Result<()> {
+    let client = arr_client(timeout)?;
+    let response = client
+        .get(format!("{}/api", config.url))
+        .header("X-Api-Key", &config.apikey)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| integration_error(format!("failed to validate Arr instance: {error}")))?
+        .text()
+        .map_err(|error| {
+            integration_error(format!("failed to read Arr validation response: {error}"))
+        })?;
+    let response: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
+        integration_error(format!("failed to read Arr validation JSON: {error}"))
+    })?;
+    if response.get("current").is_some() {
+        Ok(())
+    } else {
+        Err(integration_error(
+            "Arr validation response missing current field",
+        ))
+    }
+}
+
+/// Look up IDs by calling selected Sonarr/Radarr parse APIs.
+pub fn lookup_arr_ids(
+    configs: &[ArrConfig],
+    searchee: &Searchee<'_>,
+    timeout: Option<Duration>,
+) -> crate::Result<Option<ArrLookup>> {
+    let client = arr_client(timeout.or(Some(Duration::from_secs(30))))?;
+    for config in arr_configs_for_media(configs, searchee.media_type) {
+        let query_title = prepare_arr_title(searchee, config.kind);
+        let response = client
+            .get(format!("{}/api/v3/parse", config.url))
+            .header("X-Api-Key", &config.apikey)
+            .query(&[("title", query_title.as_str())])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| integration_error(format!("failed to parse title with Arr: {error}")))?
+            .text()
+            .map_err(|error| {
+                integration_error(format!("failed to read Arr parse response: {error}"))
+            })?;
+        let response: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
+            integration_error(format!("failed to read Arr parse JSON: {error}"))
+        })?;
+        let ids = extract_arr_ids(&response);
+        if arr_ids_present(&ids) {
+            let cache_key = arr_search_cache_key(searchee.title.as_ref(), &ids);
+            return Ok(Some(ArrLookup {
+                ids,
+                query_title,
+                cache_key,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Filter found Arr IDs to those usable by an indexer's caps.
+pub fn ids_for_torznab_caps(ids: &TorznabSearchIds, caps: &TorznabCaps) -> TorznabSearchIds {
+    let supports = |key: &str| {
+        caps.tv_ids.iter().any(|id| id == key) || caps.movie_ids.iter().any(|id| id == key)
+    };
+    TorznabSearchIds {
+        tvdbid: supports("tvdbid").then(|| ids.tvdbid.clone()).flatten(),
+        tmdbid: supports("tmdbid").then(|| ids.tmdbid.clone()).flatten(),
+        imdbid: supports("imdbid").then(|| ids.imdbid.clone()).flatten(),
+        tvmazeid: supports("tvmazeid").then(|| ids.tvmazeid.clone()).flatten(),
+    }
+}
+
+/// Stable search cache key including Arr IDs to prevent stale ID reuse.
+pub fn arr_search_cache_key(query: &str, ids: &TorznabSearchIds) -> String {
+    format!(
+        "{}|tvdbid={}|tmdbid={}|imdbid={}|tvmazeid={}",
+        query,
+        ids.tvdbid.as_deref().unwrap_or_default(),
+        ids.tmdbid.as_deref().unwrap_or_default(),
+        ids.imdbid.as_deref().unwrap_or_default(),
+        ids.tvmazeid.as_deref().unwrap_or_default()
+    )
+}
+
 /// Search one indexer with generated queries.
 pub fn search_torznab_indexer(
     database: &Database,
@@ -1134,6 +1270,88 @@ pub fn fetch_torznab_caps(indexer: &TorznabConfig) -> crate::Result<TorznabCaps>
     parse_torznab_caps(&body)
 }
 
+fn arr_client(timeout: Option<Duration>) -> crate::Result<reqwest::blocking::Client> {
+    let mut builder =
+        reqwest::blocking::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder
+        .build()
+        .map_err(|error| integration_error(format!("failed to build Arr HTTP client: {error}")))
+}
+
+fn arr_configs_for_media(configs: &[ArrConfig], media_type: MediaType) -> Vec<&ArrConfig> {
+    let wanted: &[ArrKind] = match media_type {
+        MediaType::Episode | MediaType::Pack => &[ArrKind::Sonarr],
+        MediaType::Movie => &[ArrKind::Radarr],
+        MediaType::Anime | MediaType::Video => &[ArrKind::Sonarr, ArrKind::Radarr],
+        MediaType::Audio | MediaType::Book | MediaType::Unknown => &[],
+    };
+    wanted
+        .iter()
+        .flat_map(|kind| configs.iter().filter(move |config| config.kind == *kind))
+        .collect()
+}
+
+fn prepare_arr_title(searchee: &Searchee<'_>, kind: ArrKind) -> String {
+    match (searchee.media_type, kind) {
+        (MediaType::Video | MediaType::Anime, ArrKind::Sonarr) => {
+            format!("{} S00E00", cleaned_generic_query(searchee.title.as_ref()))
+        }
+        (MediaType::Video | MediaType::Anime, ArrKind::Radarr) => {
+            cleaned_generic_query(searchee.title.as_ref())
+        }
+        _ => searchee.title.as_ref().to_owned(),
+    }
+}
+
+fn extract_arr_ids(value: &serde_json::Value) -> TorznabSearchIds {
+    TorznabSearchIds {
+        tvdbid: find_json_id(value, &["tvdbId", "tvdbid"]),
+        tmdbid: find_json_id(value, &["tmdbId", "tmdbid"]),
+        imdbid: find_json_id(value, &["imdbId", "imdbid"]),
+        tvmazeid: find_json_id(value, &["tvMazeId", "tvmazeId", "tvmazeid"]),
+    }
+}
+
+fn find_json_id(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in keys {
+                if let Some(found) = object.get(*key).and_then(json_id_string) {
+                    return Some(found);
+                }
+            }
+            object.values().find_map(|value| find_json_id(value, keys))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| find_json_id(value, keys))
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => None,
+    }
+}
+
+fn json_id_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(|value| value.to_string()),
+        serde_json::Value::String(value) if !value.is_empty() && value != "0" => {
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
+
+fn arr_ids_present(ids: &TorznabSearchIds) -> bool {
+    ids.tvdbid.is_some() || ids.tmdbid.is_some() || ids.imdbid.is_some() || ids.tvmazeid.is_some()
+}
+
 fn episode_query(
     title: &str,
     caps: &TorznabCaps,
@@ -1217,7 +1435,11 @@ fn strip_query_markers(title: &str) -> String {
 
 fn cleaned_generic_query(title: &str) -> String {
     title
-        .replace(['.', '_', '[', ']', '(', ')'], " ")
+        .replace("WEB-DL", "WEBDL")
+        .replace("web-dl", "webdl")
+        .replace("Blu-ray", "Bluray")
+        .replace("blu-ray", "bluray")
+        .replace(['.', '_', '[', ']', '(', ')', '-'], " ")
         .split_whitespace()
         .filter(|token| !metadata_token(token))
         .collect::<Vec<_>>()
@@ -1600,12 +1822,14 @@ fn json_error(error: serde_json::Error) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, SnatchHistory, SnatchOptions,
-        SnatchResult, TorznabCaps, TorznabQuery, TorznabSearchIds, TorznabSearchOptions,
-        cache_torrent_file, create_torznab_search_queries, enabled_indexers, get_cached_torrent,
-        guid_lookup, parse_torznab_caps, parse_torznab_rss, rss_pager, search_torznab_indexer,
-        set_indexer_status, snatch, snatch_once, sync_torznab_indexers, torznab_request_url,
-        update_indexer_caps, validate_torznab_url,
+        ArrKind, CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, SnatchHistory,
+        SnatchOptions, SnatchResult, TorznabCaps, TorznabQuery, TorznabSearchIds,
+        TorznabSearchOptions, arr_search_cache_key, cache_torrent_file,
+        create_torznab_search_queries, enabled_indexers, get_cached_torrent, guid_lookup,
+        ids_for_torznab_caps, lookup_arr_ids, parse_torznab_caps, parse_torznab_rss, rss_pager,
+        search_torznab_indexer, set_indexer_status, snatch, snatch_once, sync_torznab_indexers,
+        torznab_request_url, update_indexer_caps, validate_arr_instance, validate_arr_url,
+        validate_torznab_url,
     };
     use crate::{
         domain::{Candidate, Decision, File, MediaType, Searchee},
@@ -2065,6 +2289,105 @@ mod tests {
         assert!(requests[0].contains("offset=0"));
         assert!(requests[1].contains("offset=1"));
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validates_arr_urls_and_instances() {
+        let server = http_server(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            r#"{"current":"4.0.0"}"#,
+        )]);
+        let config = validate_arr_url(
+            &format!("{}/sonarr?apikey=secret&ignored=1#frag", server.url),
+            ArrKind::Sonarr,
+        )
+        .expect("config");
+
+        assert_eq!(config.url, format!("{}/sonarr", server.url));
+        assert_eq!(config.apikey, "secret");
+        assert_eq!(config.kind, ArrKind::Sonarr);
+        validate_arr_instance(&config, Some(Duration::from_secs(1))).expect("validate");
+        let requests = server.join();
+        assert!(requests[0].contains("GET /sonarr/api "));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("x-api-key: secret")
+        );
+    }
+
+    #[test]
+    fn looks_up_arr_ids_and_prepares_titles() {
+        let server = http_server(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            r#"{"series":{"tvdbId":123,"tvMazeId":456,"imdbId":"tt123"}}"#,
+        )]);
+        let config = validate_arr_url(&format!("{}?apikey=secret", server.url), ArrKind::Sonarr)
+            .expect("config");
+        let mut searchee = Searchee::from_files(
+            "Example.Show.S01E02",
+            "Example.Show.S01E02",
+            vec![File::new("Example.Show.S01E02.mkv", 10)],
+        );
+        searchee.media_type = MediaType::Episode;
+
+        let lookup = lookup_arr_ids(&[config], &searchee, Some(Duration::from_secs(1)))
+            .expect("lookup")
+            .expect("ids");
+
+        assert_eq!(lookup.query_title, "Example.Show.S01E02");
+        assert_eq!(lookup.ids.tvdbid.as_deref(), Some("123"));
+        assert_eq!(lookup.ids.tvmazeid.as_deref(), Some("456"));
+        assert_eq!(lookup.ids.imdbid.as_deref(), Some("tt123"));
+        assert!(lookup.cache_key.contains("tvdbid=123"));
+        let requests = server.join();
+        assert!(requests[0].contains("/api/v3/parse?title=Example.Show.S01E02"));
+    }
+
+    #[test]
+    fn arr_video_lookup_tries_sonarr_then_filters_ids_for_caps() {
+        let server = http_server(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            r#"{"series":{"tvdbId":777},"movie":{"tmdbId":888}}"#,
+        )]);
+        let sonarr = validate_arr_url(&format!("{}?apikey=secret", server.url), ArrKind::Sonarr)
+            .expect("sonarr");
+        let radarr = validate_arr_url("https://radarr.example?apikey=radarr", ArrKind::Radarr)
+            .expect("radarr");
+        let mut searchee = Searchee::from_files(
+            "Loose.Video.1080p.WEB-DL-GRP",
+            "Loose.Video.1080p.WEB-DL-GRP",
+            vec![File::new("Loose.Video.1080p.WEB-DL-GRP.mkv", 10)],
+        );
+        searchee.media_type = MediaType::Video;
+
+        let lookup = lookup_arr_ids(&[sonarr, radarr], &searchee, Some(Duration::from_secs(1)))
+            .expect("lookup")
+            .expect("ids");
+
+        assert_eq!(lookup.query_title, "Loose Video GRP S00E00");
+        assert_eq!(lookup.ids.tvdbid.as_deref(), Some("777"));
+        let caps = TorznabCaps {
+            tv_ids: vec!["tvdbid".to_owned()],
+            movie_ids: Vec::new(),
+            ..TorznabCaps::default()
+        };
+        let filtered = ids_for_torznab_caps(&lookup.ids, &caps);
+        assert_eq!(filtered.tvdbid.as_deref(), Some("777"));
+        assert_eq!(filtered.tmdbid, None);
+
+        let changed = TorznabSearchIds {
+            tvdbid: Some("778".to_owned()),
+            ..TorznabSearchIds::default()
+        };
+        assert_ne!(
+            arr_search_cache_key(searchee.title.as_ref(), &lookup.ids),
+            arr_search_cache_key(searchee.title.as_ref(), &changed)
+        );
+        server.join();
     }
 
     #[test]
