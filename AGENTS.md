@@ -185,6 +185,68 @@ Every feature that touches matching, injection, persistence, or public API
 behavior needs focused tests. Memory-sensitive paths should include fixtures or
 benchmarks that make peak allocation or resident memory regressions visible.
 
+### Rust implementation practices
+Use Rust 2024 for new crates unless a ticket documents a concrete compatibility
+reason not to. Set `rust-version` explicitly in `Cargo.toml`, keep it aligned
+with the pinned toolchain, and use the workspace resolver explicitly for virtual
+workspaces. Prefer stable Rust; nightly features require an issue with the
+reason, risk, and planned removal path.
+
+Let `rustfmt` own formatting. Keep formatting config minimal and avoid local
+style debates. Run Clippy with project warnings treated as errors; opt into
+stricter Clippy groups one lint at a time, and never enable `restriction` as a
+blanket group.
+
+Use strong domain types for config, torrent metadata, decisions, client state,
+and persisted rows. Keep external DTOs separate from internal models when doing
+so prevents invalid states or accidental contract drift.
+
+Public and cross-module types should implement the common traits that make them
+easy to inspect and test, such as `Debug`, `Clone`, `Eq`, `PartialEq`, `Hash`,
+`Display`, and `Default` when those traits are semantically correct. Validate
+inputs at system boundaries and prefer types that make invalid states
+unrepresentable.
+
+Production code should return `Result` with typed errors from library/domain
+layers and add context at application boundaries. Do not use `unwrap`, `expect`,
+or panics for recoverable runtime failures. If an invariant is truly impossible,
+make that invariant explicit in the type or include a precise failure message.
+
+Prefer borrowing in hot paths and clone only when ownership is actually needed.
+Avoid cloning large `Vec`, `String`, file lists, torrent metadata, or response
+bodies inside loops. Use compact structs, preallocated collections, and
+streaming iterators when processing torrent inventories or filesystem trees.
+
+Use bounded concurrency. Any async fan-out over torrents, indexers, files, or
+clients must have an explicit limit, cancellation behavior, timeout behavior,
+and backpressure. Do not block Tokio worker threads with expensive CPU work,
+synchronous database calls, or large filesystem operations; isolate blocking
+work with `spawn_blocking`, a dedicated worker, or a clearly bounded sync path.
+Do not hold mutex guards, database statements, or other scarce resources across
+`.await` unless the type is specifically designed for that and the scope is
+bounded.
+
+Use `Path` and `PathBuf` for filesystem paths and convert to strings only at
+display, config, or API boundaries. Be careful with non-UTF-8 paths and with
+client paths that may use different platform conventions than the host.
+
+Keep dependencies deliberate. Prefer the standard library and already-selected
+project crates before adding a new dependency. When adding a crate, disable
+unneeded default features where practical and document why it belongs in the
+ticket or PR. Keep feature flags additive and avoid exposing optional
+dependencies through public APIs unless the compatibility cost is intentional.
+
+Use `tracing` spans for operations that cross IO, database, scheduler, or client
+adapter boundaries. Include stable identifiers such as info hash, indexer name,
+client host, job name, and request label when safe, but never log secrets.
+
+Tests should cover both success and failure behavior. Add regression tests for
+compatibility bugs, property tests for parsers or filename round trips where
+useful, and integration tests with fake services for network/client contracts.
+Destructors must not perform fallible or blocking production cleanup; provide an
+explicit close, flush, or shutdown method that returns `Result` when teardown can
+fail.
+
 ### Git
 Only commit touched filed, when commiting commit logical changes not just
 the whole workspace. Commit messages should include a title and the body
