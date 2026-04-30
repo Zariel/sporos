@@ -614,6 +614,31 @@ impl Decision {
     pub const fn is_match(self) -> bool {
         matches!(self, Self::Match | Self::MatchSizeOnly | Self::MatchPartial)
     }
+
+    /// Parse a persisted decision value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "MATCH" => Some(Self::Match),
+            "MATCH_SIZE_ONLY" => Some(Self::MatchSizeOnly),
+            "MATCH_PARTIAL" => Some(Self::MatchPartial),
+            "FUZZY_SIZE_MISMATCH" => Some(Self::FuzzySizeMismatch),
+            "SIZE_MISMATCH" => Some(Self::SizeMismatch),
+            "PARTIAL_SIZE_MISMATCH" => Some(Self::PartialSizeMismatch),
+            "NO_DOWNLOAD_LINK" => Some(Self::NoDownloadLink),
+            "DOWNLOAD_FAILED" => Some(Self::DownloadFailed),
+            "MAGNET_LINK" => Some(Self::MagnetLink),
+            "RATE_LIMITED" => Some(Self::RateLimited),
+            "SAME_INFO_HASH" => Some(Self::SameInfoHash),
+            "INFO_HASH_ALREADY_EXISTS" => Some(Self::InfoHashAlreadyExists),
+            "FILE_TREE_MISMATCH" => Some(Self::FileTreeMismatch),
+            "RELEASE_GROUP_MISMATCH" => Some(Self::ReleaseGroupMismatch),
+            "BLOCKED_RELEASE" => Some(Self::BlockedRelease),
+            "PROPER_REPACK_MISMATCH" => Some(Self::ProperRepackMismatch),
+            "RESOLUTION_MISMATCH" => Some(Self::ResolutionMismatch),
+            "SOURCE_MISMATCH" => Some(Self::SourceMismatch),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Decision {
