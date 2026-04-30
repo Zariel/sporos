@@ -175,6 +175,12 @@ use appropriate levels: trace/debug for high-volume diagnostics, info for
 lifecycle and user-visible progress, warn for recoverable anomalies, and error
 for failed operations requiring attention.
 
+External requests and fallible IO must handle transient failures gracefully with
+bounded jittered exponential backoff where retrying is safe. Preserve explicit
+protocol semantics such as `Retry-After`, avoid retrying non-idempotent actions
+unless the operation is designed for it, and log retry exhaustion with enough
+context to diagnose the dependency, operation, and final error.
+
 Every feature that touches matching, injection, persistence, or public API
 behavior needs focused tests. Memory-sensitive paths should include fixtures or
 benchmarks that make peak allocation or resident memory regressions visible.
