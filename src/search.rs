@@ -5,18 +5,28 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{LazyLock, Mutex},
+    time::Duration,
     time::UNIX_EPOCH,
 };
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     SporosError,
-    domain::{ClientLabel, ClientTorrentMetadata, File, Label, MediaType, Searchee},
+    domain::{
+        ActionResult, Candidate, ClientLabel, ClientTorrentMetadata, File, Label, MediaType,
+        Searchee,
+    },
+    integrations::{
+        ArrConfig, SearchIndexer, SnatchHistory, SnatchOptions, TorznabSearchIds,
+        TorznabSearchOptions, create_torznab_search_queries, ids_for_torznab_caps, lookup_arr_ids,
+        search_torznab_indexer, set_indexer_status,
+    },
+    matching::{Assessment, AssessmentOptions, CandidateAssessmentContext, assess_candidate},
     persistence::Database,
     torrent::parse_metafile,
 };
@@ -269,6 +279,415 @@ pub struct MediaCapabilities {
     pub book: bool,
     /// Generic search fallback.
     pub generic: bool,
+}
+
+/// One matched candidate that reached the configured action hook.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PipelineAction<'a> {
+    /// Workflow label for notifications and action side effects.
+    pub label: Label,
+    /// Local item being cross-seeded.
+    pub searchee: &'a Searchee<'a>,
+    /// Remote candidate that matched the searchee.
+    pub candidate: &'a Candidate<'a>,
+    /// Conservative assessment result.
+    pub assessment: &'a Assessment,
+}
+
+/// Persisted result from one candidate assessment and optional action.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PipelineAttempt {
+    /// Local searchee title.
+    pub searchee_title: String,
+    /// Remote candidate GUID.
+    pub candidate_guid: String,
+    /// Candidate decision.
+    pub decision: crate::domain::Decision,
+    /// Action outcome when a match was dispatched.
+    pub action_result: Option<ActionResult>,
+}
+
+/// Summary returned by bulk search and targeted search flows.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct PipelineSummary {
+    /// Searchees considered after source discovery.
+    pub searchees_seen: usize,
+    /// Searchees rejected by content filters.
+    pub searchees_filtered: usize,
+    /// Real indexer searches performed.
+    pub indexer_searches: usize,
+    /// Remote candidates assessed.
+    pub candidates_assessed: usize,
+    /// Match/action attempts.
+    pub attempts: Vec<PipelineAttempt>,
+}
+
+/// Shared candidate cache used by a bulk search batch.
+#[derive(Debug, Default, Clone)]
+pub struct CandidateSearchCache {
+    entries: BTreeMap<(String, i64), CachedCandidates>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCandidates {
+    ids_key: String,
+    candidates: Vec<Candidate<'static>>,
+}
+
+/// Runtime settings for search orchestration.
+pub struct SearchPipelineOptions<'a> {
+    /// Workflow label, normally `search` or `webhook`.
+    pub label: Label,
+    /// Content filters applied before searching.
+    pub filter: ContentFilterOptions<'a>,
+    /// Candidate assessment options.
+    pub assessment: AssessmentOptions<'a>,
+    /// Candidate snatch retry behavior.
+    pub snatch: SnatchOptions,
+    /// Torznab request options.
+    pub torznab: TorznabSearchOptions,
+    /// Optional Arr parser instances.
+    pub arr_configs: &'a [ArrConfig],
+    /// Arr parser timeout.
+    pub arr_timeout: Option<Duration>,
+    /// Optional virtual season creation.
+    pub virtual_season: Option<VirtualSeasonOptions>,
+    /// Skip searchee/indexer pairs searched before this age window.
+    pub exclude_older: Option<u64>,
+    /// Skip searchee/indexer pairs searched inside this recent window.
+    pub exclude_recent_search: Option<u64>,
+}
+
+/// Shared runtime dependencies for bulk and targeted search flows.
+pub struct SearchPipelineRuntime<'a, 'b> {
+    /// SQLite state.
+    pub database: &'a Database,
+    /// Application directory containing cached torrents.
+    pub app_dir: &'a Path,
+    /// Pipeline settings.
+    pub options: &'a SearchPipelineOptions<'a>,
+    /// Per-batch shared candidate cache.
+    pub cache: &'b mut CandidateSearchCache,
+}
+
+/// One-permit guard for RSS and announce reverse lookups.
+#[derive(Debug, Default)]
+pub struct ReverseLookupGate {
+    permit: Mutex<()>,
+}
+
+impl ReverseLookupGate {
+    /// Create a new reverse lookup gate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Runtime dependencies for RSS, announce, and webhook reverse lookup.
+pub struct ReverseLookupRuntime<'a> {
+    /// One-permit concurrency gate.
+    pub gate: &'a ReverseLookupGate,
+    /// SQLite state.
+    pub database: &'a Database,
+    /// Application directory containing cached torrents.
+    pub app_dir: &'a Path,
+    /// Pipeline settings.
+    pub options: &'a SearchPipelineOptions<'a>,
+}
+
+/// Configured searchee inputs for source selection.
+#[derive(Debug, Default)]
+pub struct SearcheeSources<'a> {
+    /// Explicit `.torrent` paths, when a targeted CLI/API request supplied them.
+    pub torrents: Option<&'a [PathBuf]>,
+    /// Whether configured torrent-client inventory should be used.
+    pub use_client_torrents: bool,
+    /// Already-loaded torrent-client searchees from client adapters.
+    pub client_searchees: &'a [Searchee<'static>],
+    /// Configured torrent directory fallback.
+    pub torrent_dir: Option<&'a Path>,
+    /// Configured data directories.
+    pub data_dirs: &'a [PathBuf],
+    /// Maximum data-dir walk depth.
+    pub max_data_depth: u32,
+}
+
+/// Choose and load searchee sources using the documented precedence.
+pub fn find_all_searchees(
+    sources: &SearcheeSources<'_>,
+    label: Label,
+) -> crate::Result<Vec<Searchee<'static>>> {
+    let mut output = Vec::new();
+    if let Some(torrents) = sources.torrents {
+        for path in torrents {
+            if let Some(searchee) = torrent_file_searchee(path, label)? {
+                output.push(searchee);
+            }
+        }
+    } else if sources.use_client_torrents {
+        output.extend(
+            sources
+                .client_searchees
+                .iter()
+                .cloned()
+                .map(|mut searchee| {
+                    searchee.label = Some(label);
+                    searchee
+                }),
+        );
+    } else if let Some(torrent_dir) = sources.torrent_dir {
+        for entry in fs::read_dir(torrent_dir)
+            .map_err(|error| search_error(format!("failed to read torrentDir: {error}")))?
+        {
+            let entry = entry.map_err(|error| {
+                search_error(format!("failed to read torrentDir entry: {error}"))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) == Some("torrent") {
+                if let Some(searchee) = torrent_file_searchee(&path, label)? {
+                    output.push(searchee);
+                }
+            }
+        }
+    }
+
+    for mut searchee in data_dir_searchees(sources.data_dirs, sources.max_data_depth)? {
+        searchee.label = Some(label);
+        output.push(searchee);
+    }
+    Ok(output)
+}
+
+/// Find searchable searchees from already-loaded sources and configured data dirs.
+pub fn find_searchable_searchees(
+    mut real_searchees: Vec<Searchee<'static>>,
+    data_dirs: &[PathBuf],
+    max_depth: u32,
+    options: &SearchPipelineOptions<'_>,
+) -> crate::Result<Vec<Searchee<'static>>> {
+    for searchee in data_dir_searchees(data_dirs, max_depth)? {
+        real_searchees.push(searchee);
+    }
+    let mut ensemble = real_searchees.clone();
+    if let Some(virtual_options) = options.virtual_season {
+        ensemble.extend(create_virtual_season_searchees(
+            &real_searchees,
+            virtual_options,
+        ));
+    }
+    Ok(filter_duplicate_searchees(
+        ensemble
+            .into_iter()
+            .filter(|searchee| filter_by_content(searchee, &options.filter).is_none())
+            .collect(),
+    ))
+}
+
+/// Run bulk search over a set of searchees and dispatch matched candidates.
+pub fn bulk_search<A, N>(
+    runtime: &mut SearchPipelineRuntime<'_, '_>,
+    searchees: &[Searchee<'static>],
+    indexers: &[SearchIndexer],
+    mut action: A,
+    mut notify: N,
+) -> crate::Result<PipelineSummary>
+where
+    A: FnMut(&PipelineAction<'_>) -> crate::Result<Option<ActionResult>>,
+    N: FnMut(&PipelineAttempt) -> crate::Result<()>,
+{
+    let mut summary = PipelineSummary {
+        searchees_seen: searchees.len(),
+        ..PipelineSummary::default()
+    };
+    let mut snatch_history = SnatchHistory::default();
+
+    for searchee in searchees {
+        let database = runtime.database;
+        let options = runtime.options;
+        if filter_by_content(searchee, &options.filter).is_some() {
+            summary.searchees_filtered += 1;
+            continue;
+        }
+        let searchee_id = database
+            .get_or_insert_searchee(searchee.title.as_ref(), options.torznab.now_millis as i64)?;
+        let arr_lookup = lookup_arr_ids(options.arr_configs, searchee, options.arr_timeout)?;
+        let arr_ids = arr_lookup.as_ref().map(|lookup| &lookup.ids);
+        let ids_key = arr_lookup
+            .as_ref()
+            .map(|lookup| lookup.cache_key.clone())
+            .unwrap_or_else(|| search_group_key(searchee));
+        let group_key = search_group_key(searchee);
+
+        for indexer in indexers {
+            if timestamp_excludes(
+                read_timestamp(database, searchee_id, indexer.id)?,
+                options.torznab.now_millis,
+                options.exclude_older,
+                options.exclude_recent_search,
+                searchee.mtime_millis,
+            ) {
+                continue;
+            }
+            let candidates = cached_or_search_candidates(
+                CandidateSearchRequest {
+                    database,
+                    indexer,
+                    searchee,
+                    arr_ids,
+                    group_key: &group_key,
+                    ids_key: &ids_key,
+                    options,
+                },
+                runtime.cache,
+                &mut summary,
+            )?;
+            for candidate in candidates {
+                let attempt = assess_and_dispatch(
+                    database,
+                    runtime.app_dir,
+                    options,
+                    searchee,
+                    &candidate,
+                    &mut snatch_history,
+                    &mut action,
+                )?;
+                summary.candidates_assessed += 1;
+                if attempt.decision == crate::domain::Decision::RateLimited {
+                    set_indexer_status(
+                        database,
+                        indexer.id,
+                        Some("RATE_LIMITED"),
+                        Some(options.torznab.now_millis.saturating_add(60 * 60 * 1000)),
+                    )?;
+                }
+                notify(&attempt)?;
+                summary.attempts.push(attempt);
+            }
+            update_timestamp(
+                database,
+                searchee_id,
+                indexer.id,
+                options.torznab.now_millis,
+            )?;
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Run a targeted find-on-other-sites search for one webhook/API searchee.
+pub fn find_on_other_sites<A, N>(
+    runtime: &mut SearchPipelineRuntime<'_, '_>,
+    searchee: Searchee<'static>,
+    indexers: &[SearchIndexer],
+    action: A,
+    notify: N,
+) -> crate::Result<PipelineSummary>
+where
+    A: FnMut(&PipelineAction<'_>) -> crate::Result<Option<ActionResult>>,
+    N: FnMut(&PipelineAttempt) -> crate::Result<()>,
+{
+    bulk_search(runtime, &[searchee], indexers, action, notify)
+}
+
+/// Reverse-match one RSS, announce, or webhook candidate against local searchees.
+pub fn check_new_candidate_match<A, N>(
+    runtime: &ReverseLookupRuntime<'_>,
+    candidate: &Candidate<'static>,
+    local_searchees: &[Searchee<'static>],
+    mut action: A,
+    mut notify: N,
+) -> crate::Result<Option<PipelineAttempt>>
+where
+    A: FnMut(&PipelineAction<'_>) -> crate::Result<Option<ActionResult>>,
+    N: FnMut(&PipelineAttempt) -> crate::Result<()>,
+{
+    let _permit = runtime
+        .gate
+        .permit
+        .lock()
+        .map_err(|_error| search_error("reverse lookup gate was poisoned"))?;
+    let mut snatch_history = SnatchHistory::default();
+    let mut candidates =
+        reverse_lookup_searchees(candidate, local_searchees, &runtime.options.filter);
+    sort_reverse_lookup_searchees(&mut candidates);
+
+    let mut best: Option<PipelineAttempt> = None;
+    for searchee in candidates {
+        let attempt = assess_and_dispatch(
+            runtime.database,
+            runtime.app_dir,
+            runtime.options,
+            &searchee,
+            candidate,
+            &mut snatch_history,
+            &mut action,
+        )?;
+        notify(&attempt)?;
+        if attempt
+            .action_result
+            .is_some_and(crate::domain::ActionResult::accepted)
+            || matches!(
+                attempt.decision,
+                crate::domain::Decision::InfoHashAlreadyExists
+                    | crate::domain::Decision::SameInfoHash
+            )
+        {
+            return Ok(Some(attempt));
+        }
+        if best_failure(&attempt, best.as_ref()) {
+            best = Some(attempt);
+        }
+    }
+    Ok(best)
+}
+
+/// Reverse-match a batch of RSS or announce candidates with the same one-permit gate.
+pub fn check_new_candidate_matches<A, N>(
+    runtime: &ReverseLookupRuntime<'_>,
+    candidates: &[Candidate<'static>],
+    local_searchees: &[Searchee<'static>],
+    mut action: A,
+    mut notify: N,
+) -> crate::Result<Vec<PipelineAttempt>>
+where
+    A: FnMut(&PipelineAction<'_>) -> crate::Result<Option<ActionResult>>,
+    N: FnMut(&PipelineAttempt) -> crate::Result<()>,
+{
+    let mut attempts = Vec::new();
+    for candidate in candidates {
+        if let Some(attempt) = check_new_candidate_match(
+            runtime,
+            candidate,
+            local_searchees,
+            &mut action,
+            &mut notify,
+        )? {
+            attempts.push(attempt);
+        }
+    }
+    Ok(attempts)
+}
+
+/// Return likely local searchees for a remote candidate name.
+pub fn reverse_lookup_searchees(
+    candidate: &Candidate<'_>,
+    local_searchees: &[Searchee<'static>],
+    filter: &ContentFilterOptions<'_>,
+) -> Vec<Searchee<'static>> {
+    let keys = reverse_lookup_keys(candidate.name.as_ref());
+    let mut output = local_searchees
+        .iter()
+        .filter(|searchee| filter_by_content(searchee, filter).is_none())
+        .filter(|searchee| {
+            keys.iter()
+                .any(|key| fuzzy_title_match(key, &search_group_key(searchee)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    output = filter_duplicate_searchees(output);
+    sort_reverse_lookup_searchees(&mut output);
+    output
 }
 
 /// Options for virtual season construction.
@@ -1327,6 +1746,284 @@ fn agreed_meta(
         .then(|| first.to_owned())
 }
 
+fn torrent_file_searchee(path: &Path, label: Label) -> crate::Result<Option<Searchee<'static>>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::debug!("skipping torrent file {}: {error}", path.display());
+            return Ok(None);
+        }
+    };
+    let metafile = match parse_metafile(&bytes) {
+        Ok(metafile) => metafile,
+        Err(error) => {
+            tracing::debug!("skipping invalid torrent file {}: {error}", path.display());
+            return Ok(None);
+        }
+    };
+    let mut searchee = Searchee::from_files(
+        metafile.name.into_owned(),
+        metafile.title.into_owned(),
+        metafile.files,
+    );
+    searchee.info_hash = Some(metafile.info_hash);
+    searchee.media_type = metafile.media_type;
+    searchee.label = Some(label);
+    Ok(Some(searchee))
+}
+
+struct CandidateSearchRequest<'a> {
+    database: &'a Database,
+    indexer: &'a SearchIndexer,
+    searchee: &'a Searchee<'a>,
+    arr_ids: Option<&'a TorznabSearchIds>,
+    group_key: &'a str,
+    ids_key: &'a str,
+    options: &'a SearchPipelineOptions<'a>,
+}
+
+fn cached_or_search_candidates(
+    request: CandidateSearchRequest<'_>,
+    cache: &mut CandidateSearchCache,
+    summary: &mut PipelineSummary,
+) -> crate::Result<Vec<Candidate<'static>>> {
+    let cache_key = (request.group_key.to_owned(), request.indexer.id);
+    if let Some(cached) = cache.entries.get(&cache_key) {
+        if cached.ids_key == request.ids_key {
+            return Ok(cached.candidates.clone());
+        }
+    }
+
+    let indexer_ids = request
+        .arr_ids
+        .map(|ids| ids_for_torznab_caps(ids, &request.indexer.caps));
+    let queries = create_torznab_search_queries(
+        request.searchee,
+        &request.indexer.caps,
+        indexer_ids.as_ref(),
+    );
+    if queries.is_empty() {
+        cache.entries.insert(
+            cache_key,
+            CachedCandidates {
+                ids_key: request.ids_key.to_owned(),
+                candidates: Vec::new(),
+            },
+        );
+        return Ok(Vec::new());
+    }
+
+    let candidates = search_torznab_indexer(
+        request.database,
+        request.indexer,
+        &queries,
+        request.options.torznab,
+    )?;
+    summary.indexer_searches += 1;
+    cache.entries.insert(
+        cache_key,
+        CachedCandidates {
+            ids_key: request.ids_key.to_owned(),
+            candidates: candidates.clone(),
+        },
+    );
+    Ok(candidates)
+}
+
+fn assess_and_dispatch<A>(
+    database: &Database,
+    app_dir: &Path,
+    options: &SearchPipelineOptions<'_>,
+    searchee: &Searchee<'_>,
+    candidate: &Candidate<'_>,
+    snatch_history: &mut SnatchHistory,
+    action: &mut A,
+) -> crate::Result<PipelineAttempt>
+where
+    A: FnMut(&PipelineAction<'_>) -> crate::Result<Option<ActionResult>>,
+{
+    let context = CandidateAssessmentContext {
+        database,
+        app_dir,
+        options: &options.assessment,
+        snatch_options: options.snatch,
+        now_millis: options.torznab.now_millis as i64,
+    };
+    let assessment = assess_candidate(&context, candidate, searchee, snatch_history)?;
+    let action_result = if assessment.decision.is_match() {
+        action(&PipelineAction {
+            label: options.label,
+            searchee,
+            candidate,
+            assessment: &assessment,
+        })?
+    } else {
+        None
+    };
+    Ok(PipelineAttempt {
+        searchee_title: searchee.title.to_string(),
+        candidate_guid: candidate.guid.to_string(),
+        decision: assessment.decision,
+        action_result,
+    })
+}
+
+fn read_timestamp(
+    database: &Database,
+    searchee_id: i64,
+    indexer_id: i64,
+) -> crate::Result<Option<TimestampDecision>> {
+    database
+        .connection()
+        .query_row(
+            "SELECT first_searched, last_searched
+             FROM timestamp
+             WHERE searchee_id = ?1 AND indexer_id = ?2",
+            params![searchee_id, indexer_id],
+            |row| {
+                Ok(TimestampDecision {
+                    first_searched: row.get(0)?,
+                    last_searched: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(persistence_error)
+}
+
+fn update_timestamp(
+    database: &Database,
+    searchee_id: i64,
+    indexer_id: i64,
+    now_millis: u64,
+) -> crate::Result<()> {
+    database
+        .connection()
+        .execute(
+            "INSERT INTO timestamp (searchee_id, indexer_id, first_searched, last_searched)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(searchee_id, indexer_id) DO UPDATE SET
+                last_searched = excluded.last_searched",
+            params![searchee_id, indexer_id, now_millis],
+        )
+        .map_err(persistence_error)?;
+    Ok(())
+}
+
+fn reverse_lookup_keys(name: &str) -> Vec<String> {
+    let mut keys = vec![normalized_query_key(
+        parse_title(name, &[], None)
+            .map(|parsed| parsed.title)
+            .unwrap_or_else(|| name.to_owned())
+            .as_str(),
+    )];
+    let stripped = strip_bracketed_metadata(name);
+    let stripped_key = normalized_query_key(&stripped);
+    if !stripped_key.is_empty() && !keys.iter().any(|key| key == &stripped_key) {
+        keys.push(stripped_key);
+    }
+    keys
+}
+
+fn strip_bracketed_metadata(name: &str) -> String {
+    let mut output = String::with_capacity(name.len());
+    let mut depth = 0_u32;
+    for character in name.chars() {
+        match character {
+            '(' | '[' => depth = depth.saturating_add(1),
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => output.push(character),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn fuzzy_title_match(candidate_key: &str, local_key: &str) -> bool {
+    if candidate_key == local_key {
+        return true;
+    }
+    let max_distance = candidate_key.len().max(local_key.len()) / 3;
+    levenshtein_at_most(candidate_key, local_key, max_distance)
+        .is_some_and(|distance| distance <= candidate_key.len().min(local_key.len()) / 3)
+}
+
+fn levenshtein_at_most(left: &str, right: &str, max_distance: usize) -> Option<usize> {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len().abs_diff(right.len()) > max_distance {
+        return None;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_char) in left.iter().enumerate() {
+        *current.get_mut(0)? = left_index + 1;
+        let mut row_min = *current.first()?;
+        for (right_index, right_char) in right.iter().enumerate() {
+            let cost = usize::from(left_char != right_char);
+            let insert = previous.get(right_index + 1)?.saturating_add(1);
+            let delete = current.get(right_index)?.saturating_add(1);
+            let replace = previous.get(right_index)?.saturating_add(cost);
+            let cell = insert.min(delete).min(replace);
+            *current.get_mut(right_index + 1)? = cell;
+            row_min = row_min.min(cell);
+        }
+        if row_min > max_distance {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous
+        .last()
+        .copied()
+        .filter(|distance| *distance <= max_distance)
+}
+
+fn sort_reverse_lookup_searchees(searchees: &mut [Searchee<'static>]) {
+    searchees.sort_by(|left, right| {
+        source_priority(left)
+            .cmp(&source_priority(right))
+            .then_with(|| right.files.len().cmp(&left.files.len()))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+}
+
+fn source_priority(searchee: &Searchee<'_>) -> u8 {
+    match searchee.source() {
+        crate::domain::SearcheeSource::TorrentClient => 0,
+        crate::domain::SearcheeSource::TorrentFile => 1,
+        crate::domain::SearcheeSource::DataDir => 2,
+        crate::domain::SearcheeSource::Virtual => 3,
+    }
+}
+
+fn best_failure(attempt: &PipelineAttempt, current: Option<&PipelineAttempt>) -> bool {
+    let rank = failure_rank(attempt.decision);
+    current.is_none_or(|current| rank < failure_rank(current.decision))
+}
+
+fn failure_rank(decision: crate::domain::Decision) -> u8 {
+    match decision {
+        crate::domain::Decision::RateLimited => 0,
+        crate::domain::Decision::DownloadFailed | crate::domain::Decision::MagnetLink => 1,
+        crate::domain::Decision::NoDownloadLink => 2,
+        crate::domain::Decision::FuzzySizeMismatch
+        | crate::domain::Decision::SizeMismatch
+        | crate::domain::Decision::PartialSizeMismatch
+        | crate::domain::Decision::FileTreeMismatch => 3,
+        crate::domain::Decision::ReleaseGroupMismatch
+        | crate::domain::Decision::ProperRepackMismatch
+        | crate::domain::Decision::ResolutionMismatch
+        | crate::domain::Decision::SourceMismatch => 4,
+        crate::domain::Decision::BlockedRelease => 5,
+        crate::domain::Decision::SameInfoHash
+        | crate::domain::Decision::InfoHashAlreadyExists
+        | crate::domain::Decision::Match
+        | crate::domain::Decision::MatchSizeOnly
+        | crate::domain::Decision::MatchPartial => 6,
+    }
+}
+
 fn search_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Search {
         message: message.into(),
@@ -1353,17 +2050,26 @@ pub fn parsed_name_and_media<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Blocklist, ContentFilterOptions, ContentFilterRejection, MediaCapabilities,
-        TimestampDecision, VirtualSeasonOptions, affected_roots_for_changed_path,
+        Blocklist, CachedCandidates, CandidateSearchCache, ContentFilterOptions,
+        ContentFilterRejection, MediaCapabilities, ReverseLookupRuntime, SearchPipelineOptions,
+        SearchPipelineRuntime, SearcheeSources, TimestampDecision, VirtualSeasonOptions,
+        affected_roots_for_changed_path, bulk_search, check_new_candidate_match,
         create_searchee_from_path, create_virtual_season_searchees, filter_by_content,
-        filter_duplicate_searchees, find_potential_nested_roots, get_media_type, index_torrent_dir,
-        indexer_supports_media, parse_title, search_group_key, timestamp_excludes,
+        filter_duplicate_searchees, find_all_searchees, find_potential_nested_roots,
+        find_searchable_searchees, get_media_type, index_torrent_dir, indexer_supports_media,
+        parse_title, reverse_lookup_searchees, search_group_key, timestamp_excludes,
     };
     use crate::{
-        domain::{ClientLabel, ClientTorrentMetadata, File, Label, MediaType, Searchee},
-        persistence::Database,
+        domain::{
+            ActionResult, Candidate, ClientLabel, ClientTorrentMetadata, Decision, File, Label,
+            MediaType, SaveResult, Searchee,
+        },
+        integrations::{SearchIndexer, SnatchOptions, TorznabCaps, TorznabSearchOptions},
+        matching::AssessmentOptions,
+        persistence::{Database, DecisionRecord},
     };
-    use std::borrow::Cow;
+    use rusqlite::params;
+    use std::{borrow::Cow, collections::BTreeSet};
     use std::{
         fs,
         path::PathBuf,
@@ -1564,6 +2270,48 @@ mod tests {
     }
 
     #[test]
+    fn source_selection_prefers_explicit_torrents_and_adds_data_dirs() {
+        let root = temp_path("source-selection");
+        let torrent_dir = root.join("torrents");
+        let data_dir = root.join("data");
+        let release = data_dir.join("Example Show");
+        fs::create_dir_all(&torrent_dir).expect("torrent dir");
+        fs::create_dir_all(&release).expect("release dir");
+        let explicit = root.join("explicit.torrent");
+        let ignored = torrent_dir.join("ignored.torrent");
+        fs::write(&explicit, torrent_bytes("Explicit.Release", 10)).expect("explicit");
+        fs::write(&ignored, torrent_bytes("Ignored.Release", 10)).expect("ignored");
+        fs::write(release.join("Example.Show.S01E01.mkv"), b"video").expect("video");
+
+        let searchees = find_all_searchees(
+            &SearcheeSources {
+                torrents: Some(std::slice::from_ref(&explicit)),
+                use_client_torrents: false,
+                client_searchees: &[],
+                torrent_dir: Some(&torrent_dir),
+                data_dirs: std::slice::from_ref(&data_dir),
+                max_data_depth: 2,
+            },
+            Label::Webhook,
+        )
+        .expect("sources");
+
+        assert!(searchees.iter().any(|item| item.name == "Explicit.Release"));
+        assert!(!searchees.iter().any(|item| item.name == "Ignored.Release"));
+        assert!(
+            searchees
+                .iter()
+                .any(|item| item.source() == crate::domain::SearcheeSource::DataDir)
+        );
+        assert!(
+            searchees
+                .iter()
+                .all(|item| item.label == Some(Label::Webhook))
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn parses_typed_blocklist_entries_and_legacy_warnings() {
         let blocklist = Blocklist::parse(&[
             "name:bad.release".to_owned(),
@@ -1682,6 +2430,51 @@ mod tests {
         }
     }
 
+    fn pipeline_options<'a>(
+        blocklist: &'a Blocklist,
+        exclude: &'a BTreeSet<String>,
+        _root: &PathBuf,
+        label: Label,
+    ) -> SearchPipelineOptions<'a> {
+        SearchPipelineOptions {
+            label,
+            filter: ContentFilterOptions {
+                label: Some(label),
+                ..filter_options(blocklist)
+            },
+            assessment: AssessmentOptions {
+                match_mode: crate::config::MatchMode::Strict,
+                fuzzy_size_threshold: 0.05,
+                season_from_episodes: 1.0,
+                include_single_episodes: true,
+                info_hashes_to_exclude: exclude,
+                blocklist,
+            },
+            snatch: SnatchOptions::default(),
+            torznab: TorznabSearchOptions {
+                now_millis: 1_000,
+                ..TorznabSearchOptions::default()
+            },
+            arr_configs: &[],
+            arr_timeout: None,
+            virtual_season: None,
+            exclude_older: None,
+            exclude_recent_search: None,
+        }
+    }
+
+    fn episode_searchee(episode: u32, mtime_millis: u64) -> Searchee<'static> {
+        let title = format!("Example Show S01E{episode:02}");
+        let mut searchee = Searchee::from_files(
+            title.clone(),
+            title,
+            vec![File::new(format!("Example.Show.S01E{episode:02}.mkv"), 100)],
+        );
+        searchee.media_type = MediaType::Episode;
+        searchee.mtime_millis = Some(mtime_millis);
+        searchee
+    }
+
     #[test]
     fn duplicate_filter_prefers_info_hash_sources() {
         let mut with_hash =
@@ -1749,6 +2542,191 @@ mod tests {
             vec![File::new("Example.Show.S01E02.mkv", 10)],
         );
         assert_eq!(search_group_key(&searchee), "example.show.s01e02");
+    }
+
+    #[test]
+    fn searchable_pipeline_filters_virtuals_and_dispatches_cached_candidates() {
+        let root = temp_path("bulk-pipeline");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclude = BTreeSet::new();
+        let mut options = pipeline_options(&blocklist, &exclude, &root, Label::Search);
+        options.filter.include_single_episodes = true;
+        options.virtual_season = Some(VirtualSeasonOptions {
+            season_from_episodes: 0.5,
+            use_filters: true,
+            now_millis: 1_000 + 9 * 24 * 60 * 60 * 1000,
+        });
+
+        let searchees = (1..=3)
+            .map(|episode| episode_searchee(episode, 1_000))
+            .collect::<Vec<_>>();
+        let searchable =
+            find_searchable_searchees(searchees, &[], 1, &options).expect("searchable");
+
+        assert_eq!(searchable.len(), 4);
+        assert!(
+            searchable
+                .iter()
+                .any(|item| item.media_type == MediaType::Pack)
+        );
+
+        let target = searchable
+            .iter()
+            .find(|item| item.title.as_ref() == "Example Show S01E01")
+            .expect("target");
+        let searchee_id = database
+            .get_or_insert_searchee(target.title.as_ref(), 1_000)
+            .expect("searchee");
+        database
+            .upsert_decision(&DecisionRecord {
+                searchee_id,
+                guid: "guid-1",
+                info_hash: None,
+                decision: Decision::Match,
+                first_seen: 1_000,
+                last_seen: 1_000,
+                fuzzy_size_factor: 0.05,
+            })
+            .expect("decision");
+
+        let mut cache = CandidateSearchCache::default();
+        cache.entries.insert(
+            (search_group_key(target), 7),
+            CachedCandidates {
+                ids_key: search_group_key(target),
+                candidates: vec![Candidate::new(
+                    "Example.Show.S01E01",
+                    "guid-1",
+                    None::<String>,
+                    "tracker",
+                )],
+            },
+        );
+        let indexer = SearchIndexer {
+            id: 7,
+            url: "https://indexer.example/api".to_owned(),
+            apikey: "secret".to_owned(),
+            caps: TorznabCaps {
+                search: true,
+                tv_search: true,
+                ..TorznabCaps::default()
+            },
+        };
+        database
+            .connection()
+            .execute(
+                "INSERT INTO indexer (id, url, apikey, active)
+                 VALUES (?1, ?2, ?3, 1)",
+                params![indexer.id, indexer.url, indexer.apikey],
+            )
+            .expect("indexer");
+        let mut actions = 0;
+        let mut notifications = 0;
+        let mut runtime = SearchPipelineRuntime {
+            database: &database,
+            app_dir: &root,
+            options: &options,
+            cache: &mut cache,
+        };
+        let summary = bulk_search(
+            &mut runtime,
+            std::slice::from_ref(target),
+            &[indexer],
+            |action| {
+                assert_eq!(action.label, Label::Search);
+                assert_eq!(action.assessment.decision, Decision::Match);
+                actions += 1;
+                Ok(Some(ActionResult::Save(SaveResult::Saved)))
+            },
+            |_| {
+                notifications += 1;
+                Ok(())
+            },
+        )
+        .expect("bulk search");
+
+        assert_eq!(summary.indexer_searches, 0);
+        assert_eq!(summary.candidates_assessed, 1);
+        assert_eq!(
+            summary.attempts[0].action_result,
+            Some(ActionResult::Save(SaveResult::Saved))
+        );
+        assert_eq!(actions, 1);
+        assert_eq!(notifications, 1);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reverse_lookup_filters_sorts_and_stops_after_success() {
+        let root = temp_path("reverse-pipeline");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclude = BTreeSet::new();
+        let mut options = pipeline_options(&blocklist, &exclude, &root, Label::Rss);
+        options.filter.include_single_episodes = true;
+        let candidate =
+            Candidate::new("Example.Show.S01E01", "guid-rss", None::<String>, "tracker");
+        let mut client = episode_searchee(1, 1_000);
+        client.client = Some(ClientTorrentMetadata::new(
+            "client-a",
+            "/downloads",
+            None,
+            Vec::new(),
+            Vec::<Cow<'static, str>>::new(),
+        ));
+        let unrelated = Searchee::from_files(
+            "Other.Movie.2020",
+            "Other Movie 2020",
+            vec![File::new("movie.mkv", 1)],
+        );
+        let local = vec![unrelated, client];
+
+        let matches = reverse_lookup_searchees(&candidate, &local, &options.filter);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title, "Example Show S01E01");
+
+        let searchee_id = database
+            .get_or_insert_searchee(matches[0].title.as_ref(), 1_000)
+            .expect("searchee");
+        database
+            .upsert_decision(&DecisionRecord {
+                searchee_id,
+                guid: "guid-rss",
+                info_hash: None,
+                decision: Decision::MatchSizeOnly,
+                first_seen: 1_000,
+                last_seen: 1_000,
+                fuzzy_size_factor: 0.05,
+            })
+            .expect("decision");
+
+        let gate = super::ReverseLookupGate::new();
+        let mut actions = 0;
+        let runtime = ReverseLookupRuntime {
+            gate: &gate,
+            database: &database,
+            app_dir: &root,
+            options: &options,
+        };
+        let attempt = check_new_candidate_match(
+            &runtime,
+            &candidate,
+            &local,
+            |_| {
+                actions += 1;
+                Ok(Some(ActionResult::Save(SaveResult::Saved)))
+            },
+            |_| Ok(()),
+        )
+        .expect("reverse lookup")
+        .expect("attempt");
+
+        assert_eq!(attempt.decision, Decision::MatchSizeOnly);
+        assert_eq!(actions, 1);
+        let _cleanup = fs::remove_dir_all(root);
     }
 
     #[test]
