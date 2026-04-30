@@ -2,6 +2,7 @@
 
 use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, time::Duration};
 
+use quick_xml::{Reader, events::Event};
 use reqwest::blocking::multipart;
 use reqwest::header::CONTENT_TYPE;
 use url::Url;
@@ -1056,6 +1057,270 @@ impl TorrentClient for DelugeClient {
     }
 }
 
+/// rTorrent XML-RPC adapter.
+pub struct RtorrentClient {
+    identity: ClientIdentity,
+    rpc_url: String,
+    username: String,
+    password: Option<String>,
+    client: reqwest::blocking::Client,
+}
+
+impl RtorrentClient {
+    /// Build an rTorrent adapter from normalized identity metadata.
+    pub fn new(identity: ClientIdentity, timeout: Option<Duration>) -> crate::Result<Self> {
+        let mut url = Url::parse(&identity.url)
+            .map_err(|error| client_error(format!("invalid rTorrent URL: {error}")))?;
+        let username = url.username().to_owned();
+        let password = url.password().map(str::to_owned);
+        url.set_username("")
+            .map_err(|()| client_error("failed to sanitize rTorrent username"))?;
+        url.set_password(None)
+            .map_err(|()| client_error("failed to sanitize rTorrent password"))?;
+        let mut builder = reqwest::blocking::Client::builder()
+            .user_agent(format!("CrossSeed/{}", crate::VERSION));
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder
+            .build()
+            .map_err(|error| client_error(format!("failed to build rTorrent client: {error}")))?;
+        Ok(Self {
+            identity,
+            rpc_url: url.to_string(),
+            username,
+            password,
+            client,
+        })
+    }
+
+    fn rpc(&self, method: &str, params: &[RtXmlParam]) -> crate::Result<RtXmlValue> {
+        let body = rt_xml_call(method, params);
+        let mut request = self
+            .client
+            .post(&self.rpc_url)
+            .header(CONTENT_TYPE, "text/xml")
+            .body(body);
+        if let Some(password) = &self.password {
+            request = request.basic_auth(&self.username, Some(password));
+        }
+        let text = request
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("rTorrent XML-RPC request failed: {error}")))?
+            .text()
+            .map_err(|error| client_error(format!("failed to read rTorrent XML-RPC: {error}")))?;
+        rt_parse_response(&text)
+    }
+
+    fn hashes(&self) -> crate::Result<Vec<String>> {
+        let value = self.rpc("download_list", &[])?;
+        Ok(value
+            .into_array()
+            .into_iter()
+            .filter_map(RtXmlValue::into_string)
+            .collect())
+    }
+
+    fn torrent_info(&self, info_hash: &InfoHash<'_>) -> crate::Result<Option<RtTorrent>> {
+        if self
+            .hashes()?
+            .iter()
+            .any(|hash| hash.eq_ignore_ascii_case(info_hash.as_str()))
+        {
+            self.fetch_torrent(info_hash.as_str()).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn fetch_torrent(&self, hash: &str) -> crate::Result<RtTorrent> {
+        let calls = [
+            rt_call("d.name", &[RtXmlParam::String(hash.to_owned())]),
+            rt_call("d.directory", &[RtXmlParam::String(hash.to_owned())]),
+            rt_call("d.left_bytes", &[RtXmlParam::String(hash.to_owned())]),
+            rt_call("d.hashing", &[RtXmlParam::String(hash.to_owned())]),
+            rt_call("d.complete", &[RtXmlParam::String(hash.to_owned())]),
+            rt_call("d.is_multi_file", &[RtXmlParam::String(hash.to_owned())]),
+            rt_call("d.is_active", &[RtXmlParam::String(hash.to_owned())]),
+            rt_call("d.custom1", &[RtXmlParam::String(hash.to_owned())]),
+            rt_call(
+                "f.multicall",
+                &[
+                    RtXmlParam::String(hash.to_owned()),
+                    RtXmlParam::String(String::new()),
+                    RtXmlParam::String("f.path=".to_owned()),
+                    RtXmlParam::String("f.size_bytes=".to_owned()),
+                ],
+            ),
+            rt_call(
+                "t.multicall",
+                &[
+                    RtXmlParam::String(hash.to_owned()),
+                    RtXmlParam::String(String::new()),
+                    RtXmlParam::String("t.url=".to_owned()),
+                    RtXmlParam::String("t.group=".to_owned()),
+                ],
+            ),
+        ];
+        let values = self
+            .rpc(
+                "system.multicall",
+                &[RtXmlParam::Array(calls.into_iter().collect())],
+            )?
+            .into_array();
+        Ok(RtTorrent {
+            name: rt_wrapped_string(values.first()),
+            directory: rt_wrapped_string(values.get(1)),
+            left_bytes: rt_wrapped_i64(values.get(2)),
+            hashing: rt_wrapped_bool(values.get(3)),
+            complete: rt_wrapped_bool(values.get(4)),
+            _multi_file: rt_wrapped_bool(values.get(5)),
+            label: rt_wrapped_string(values.get(7)),
+            files: rt_wrapped_array(values.get(8))
+                .into_iter()
+                .filter_map(rt_file_row)
+                .collect(),
+            trackers: rt_wrapped_array(values.get(9))
+                .into_iter()
+                .filter_map(rt_tracker_row)
+                .collect(),
+        })
+    }
+
+    fn action(&self, method: &str, info_hash: &InfoHash<'_>) -> crate::Result<()> {
+        self.rpc(method, &[RtXmlParam::String(info_hash.as_str().to_owned())])?;
+        Ok(())
+    }
+}
+
+impl TorrentClient for RtorrentClient {
+    fn metadata(&self) -> &TorrentClientMetadata<'_> {
+        &self.identity.metadata
+    }
+
+    fn is_torrent_in_client(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self.hashes()?.iter().any(|hash| hash == info_hash.as_str()))
+    }
+
+    fn is_torrent_complete(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self
+            .torrent_info(info_hash)?
+            .is_some_and(|torrent| torrent.complete()))
+    }
+
+    fn is_torrent_checking(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self
+            .torrent_info(info_hash)?
+            .is_some_and(|torrent| torrent.checking()))
+    }
+
+    fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
+        let mut output = Vec::new();
+        for hash in self.hashes()? {
+            let Some(info_hash) = InfoHash::new(hash.clone()) else {
+                continue;
+            };
+            let torrent = self.fetch_torrent(&hash)?;
+            let complete = torrent.complete();
+            let checking = torrent.checking();
+            let tags = (!torrent.label.is_empty()).then_some(ClientLabel::new(torrent.label));
+            output.push(ClientTorrent {
+                info_hash: info_hash.into_owned(),
+                name: Cow::Owned(torrent.name),
+                files: torrent.files,
+                save_path: Cow::Owned(torrent.directory),
+                category: None,
+                tags: tags.into_iter().collect(),
+                trackers: torrent.trackers,
+                complete,
+                checking,
+            });
+        }
+        Ok(output)
+    }
+
+    fn get_download_dir(
+        &self,
+        metafile: &Metafile<'_>,
+        options: DownloadDirOptions,
+    ) -> crate::Result<Result<PathBuf, ClientErrorCode>> {
+        let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
+            return Ok(Err(ClientErrorCode::NotFound));
+        };
+        if options.only_completed && !torrent.complete() {
+            return Ok(Err(ClientErrorCode::TorrentNotComplete));
+        }
+        Ok(Ok(PathBuf::from(torrent.directory)))
+    }
+
+    fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>> {
+        let mut output = BTreeMap::new();
+        for hash in self.hashes()? {
+            let torrent = self.fetch_torrent(&hash)?;
+            output.insert(hash, PathBuf::from(torrent.directory));
+        }
+        Ok(output)
+    }
+
+    fn inject(
+        &self,
+        new_torrent: &NewTorrent<'_>,
+        _searchee: &Searchee<'_>,
+        _decision: Decision,
+        options: &InjectionOptions,
+    ) -> crate::Result<InjectionResult> {
+        ensure_writable(self)?;
+        let method = if options.paused {
+            "load.raw"
+        } else {
+            "load.raw_start"
+        };
+        self.rpc(
+            method,
+            &[
+                RtXmlParam::String(String::new()),
+                RtXmlParam::Base64(base64_encode(new_torrent.bytes.as_ref())),
+            ],
+        )?;
+        let label = options
+            .tags
+            .first()
+            .or(options.category.as_ref())
+            .map(ClientLabel::as_str)
+            .unwrap_or("cross-seed");
+        self.rpc(
+            "d.custom1.set",
+            &[
+                RtXmlParam::String(new_torrent.metafile.info_hash.as_str().to_owned()),
+                RtXmlParam::String(label.to_owned()),
+            ],
+        )?;
+        if options.paused {
+            self.action("d.pause", &new_torrent.metafile.info_hash)?;
+        }
+        Ok(InjectionResult::Injected)
+    }
+
+    fn recheck_torrent(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
+        self.action("d.check_hash", info_hash)
+    }
+
+    fn resume_injection(
+        &self,
+        metafile: &Metafile<'_>,
+        _decision: Decision,
+        _options: ResumeOptions,
+    ) -> crate::Result<()> {
+        self.action("d.resume", &metafile.info_hash)
+    }
+
+    fn validate_config(&self) -> crate::Result<()> {
+        self.rpc("download_list", &[])?;
+        Ok(())
+    }
+}
+
 /// Build client identities from config order and URL host/path rules.
 pub fn client_identities(configs: &[TorrentClientConfig]) -> crate::Result<Vec<ClientIdentity>> {
     let mut host_counts = BTreeMap::<String, usize>::new();
@@ -1302,6 +1567,397 @@ struct DelugeFile {
     size: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum RtXmlParam {
+    String(String),
+    Base64(String),
+    Array(Vec<RtXmlParam>),
+    Struct(Vec<(String, RtXmlParam)>),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum RtXmlValue {
+    String(String),
+    I64(i64),
+    Bool(bool),
+    Array(Vec<RtXmlValue>),
+    Struct(BTreeMap<String, RtXmlValue>),
+}
+
+impl RtXmlValue {
+    fn into_array(self) -> Vec<RtXmlValue> {
+        match self {
+            Self::Array(values) => values,
+            _ => Vec::new(),
+        }
+    }
+
+    fn into_string(self) -> Option<String> {
+        match self {
+            Self::String(value) => Some(value),
+            Self::I64(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    fn as_i64(&self) -> i64 {
+        match self {
+            Self::I64(value) => *value,
+            Self::String(value) => value.parse::<i64>().unwrap_or_default(),
+            Self::Bool(value) => i64::from(*value),
+            _ => 0,
+        }
+    }
+
+    fn as_bool(&self) -> bool {
+        match self {
+            Self::Bool(value) => *value,
+            Self::I64(value) => *value != 0,
+            Self::String(value) => value == "1" || value.eq_ignore_ascii_case("true"),
+            _ => false,
+        }
+    }
+
+    fn as_string(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            Self::I64(value) => value.to_string(),
+            Self::Bool(value) => i64::from(*value).to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RtTorrent {
+    name: String,
+    directory: String,
+    left_bytes: i64,
+    hashing: bool,
+    complete: bool,
+    _multi_file: bool,
+    label: String,
+    files: Vec<File<'static>>,
+    trackers: Vec<Cow<'static, str>>,
+}
+
+impl RtTorrent {
+    fn complete(&self) -> bool {
+        self.complete || self.left_bytes == 0
+    }
+
+    fn checking(&self) -> bool {
+        self.hashing
+    }
+}
+
+fn rt_call(method: &str, params: &[RtXmlParam]) -> RtXmlParam {
+    RtXmlParam::Struct(vec![
+        (
+            "methodName".to_owned(),
+            RtXmlParam::String(method.to_owned()),
+        ),
+        ("params".to_owned(), RtXmlParam::Array(params.to_vec())),
+    ])
+}
+
+fn rt_wrapped_value(value: Option<&RtXmlValue>) -> Option<&RtXmlValue> {
+    match value {
+        Some(RtXmlValue::Array(values)) => values.first(),
+        other => other,
+    }
+}
+
+fn rt_wrapped_string(value: Option<&RtXmlValue>) -> String {
+    rt_wrapped_value(value)
+        .map(RtXmlValue::as_string)
+        .unwrap_or_default()
+}
+
+fn rt_wrapped_i64(value: Option<&RtXmlValue>) -> i64 {
+    rt_wrapped_value(value)
+        .map(RtXmlValue::as_i64)
+        .unwrap_or_default()
+}
+
+fn rt_wrapped_bool(value: Option<&RtXmlValue>) -> bool {
+    rt_wrapped_value(value).is_some_and(RtXmlValue::as_bool)
+}
+
+fn rt_wrapped_array(value: Option<&RtXmlValue>) -> Vec<RtXmlValue> {
+    match rt_wrapped_value(value) {
+        Some(RtXmlValue::Array(values)) => values.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn rt_file_row(value: RtXmlValue) -> Option<File<'static>> {
+    let values = value.into_array();
+    let path = values.first().map(RtXmlValue::as_string)?;
+    let size = values
+        .get(1)
+        .map(RtXmlValue::as_i64)
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_default();
+    Some(File::new(path, size))
+}
+
+fn rt_tracker_row(value: RtXmlValue) -> Option<Cow<'static, str>> {
+    let values = value.into_array();
+    let url = values
+        .first()
+        .map(RtXmlValue::as_string)
+        .unwrap_or_default();
+    if let Some(host) = tracker_host(&url) {
+        return Some(Cow::Owned(host));
+    }
+    values
+        .get(1)
+        .map(RtXmlValue::as_string)
+        .filter(|group| !group.is_empty())
+        .map(Cow::Owned)
+}
+
+fn rt_xml_call(method: &str, params: &[RtXmlParam]) -> String {
+    let mut output = String::from("<?xml version=\"1.0\"?><methodCall><methodName>");
+    output.push_str(&xml_escape(method));
+    output.push_str("</methodName><params>");
+    for param in params {
+        output.push_str("<param>");
+        rt_push_param(&mut output, param);
+        output.push_str("</param>");
+    }
+    output.push_str("</params></methodCall>");
+    output
+}
+
+fn rt_push_param(output: &mut String, param: &RtXmlParam) {
+    output.push_str("<value>");
+    match param {
+        RtXmlParam::String(value) => {
+            output.push_str("<string>");
+            output.push_str(&xml_escape(value));
+            output.push_str("</string>");
+        }
+        RtXmlParam::Base64(value) => {
+            output.push_str("<base64>");
+            output.push_str(value);
+            output.push_str("</base64>");
+        }
+        RtXmlParam::Array(values) => {
+            output.push_str("<array><data>");
+            for value in values {
+                rt_push_param(output, value);
+            }
+            output.push_str("</data></array>");
+        }
+        RtXmlParam::Struct(entries) => {
+            output.push_str("<struct>");
+            for (name, value) in entries {
+                output.push_str("<member><name>");
+                output.push_str(&xml_escape(name));
+                output.push_str("</name>");
+                rt_push_param(output, value);
+                output.push_str("</member>");
+            }
+            output.push_str("</struct>");
+        }
+    }
+    output.push_str("</value>");
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn rt_parse_response(xml: &str) -> crate::Result<RtXmlValue> {
+    let mut parser = RtXmlParser::new(xml);
+    parser.parse_response()
+}
+
+struct RtXmlParser<'a> {
+    reader: Reader<&'a [u8]>,
+    buf: Vec<u8>,
+}
+
+impl<'a> RtXmlParser<'a> {
+    fn new(xml: &'a str) -> Self {
+        let mut reader = Reader::from_str(xml);
+        reader.config_mut().trim_text(true);
+        Self {
+            reader,
+            buf: Vec::new(),
+        }
+    }
+
+    fn parse_response(&mut self) -> crate::Result<RtXmlValue> {
+        loop {
+            match self.reader.read_event_into(&mut self.buf) {
+                Ok(Event::Start(event)) if event.name().as_ref() == b"value" => {
+                    self.buf.clear();
+                    return self.parse_value();
+                }
+                Ok(Event::Eof) => return Err(client_error("empty rTorrent XML-RPC response")),
+                Err(error) => {
+                    return Err(client_error(format!(
+                        "invalid rTorrent XML-RPC response: {error}"
+                    )));
+                }
+                _ => {}
+            }
+            self.buf.clear();
+        }
+    }
+
+    fn parse_value(&mut self) -> crate::Result<RtXmlValue> {
+        let mut text = String::new();
+        loop {
+            match self.reader.read_event_into(&mut self.buf) {
+                Ok(Event::Start(event)) => {
+                    let name = event.name().as_ref().to_vec();
+                    self.buf.clear();
+                    return match name.as_slice() {
+                        b"array" => self.parse_array(),
+                        b"struct" => self.parse_struct(),
+                        b"string" | b"base64" => self.read_typed_string(&name),
+                        b"int" | b"i4" | b"i8" => self.read_typed_i64(&name),
+                        b"boolean" => self.read_typed_bool(&name),
+                        _ => self.read_typed_string(&name),
+                    };
+                }
+                Ok(Event::Text(event)) => {
+                    text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                }
+                Ok(Event::CData(event)) => {
+                    text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                }
+                Ok(Event::End(event)) if event.name().as_ref() == b"value" => {
+                    self.buf.clear();
+                    return Ok(RtXmlValue::String(text));
+                }
+                Ok(Event::Eof) => return Err(client_error("unterminated XML-RPC value")),
+                Err(error) => return Err(client_error(format!("invalid XML-RPC value: {error}"))),
+                _ => {}
+            }
+            self.buf.clear();
+        }
+    }
+
+    fn parse_array(&mut self) -> crate::Result<RtXmlValue> {
+        let mut values = Vec::new();
+        loop {
+            match self.reader.read_event_into(&mut self.buf) {
+                Ok(Event::Start(event)) if event.name().as_ref() == b"value" => {
+                    self.buf.clear();
+                    values.push(self.parse_value()?);
+                }
+                Ok(Event::End(event)) if event.name().as_ref() == b"array" => {
+                    self.buf.clear();
+                    return Ok(RtXmlValue::Array(values));
+                }
+                Ok(Event::Eof) => return Err(client_error("unterminated XML-RPC array")),
+                Err(error) => return Err(client_error(format!("invalid XML-RPC array: {error}"))),
+                _ => {}
+            }
+            self.buf.clear();
+        }
+    }
+
+    fn parse_struct(&mut self) -> crate::Result<RtXmlValue> {
+        let mut entries = BTreeMap::new();
+        loop {
+            match self.reader.read_event_into(&mut self.buf) {
+                Ok(Event::Start(event)) if event.name().as_ref() == b"member" => {
+                    self.buf.clear();
+                    if let Some((name, value)) = self.parse_member()? {
+                        entries.insert(name, value);
+                    }
+                }
+                Ok(Event::End(event)) if event.name().as_ref() == b"struct" => {
+                    self.buf.clear();
+                    return Ok(RtXmlValue::Struct(entries));
+                }
+                Ok(Event::Eof) => return Err(client_error("unterminated XML-RPC struct")),
+                Err(error) => return Err(client_error(format!("invalid XML-RPC struct: {error}"))),
+                _ => {}
+            }
+            self.buf.clear();
+        }
+    }
+
+    fn parse_member(&mut self) -> crate::Result<Option<(String, RtXmlValue)>> {
+        let mut name = None;
+        let mut value = None;
+        loop {
+            match self.reader.read_event_into(&mut self.buf) {
+                Ok(Event::Start(event)) if event.name().as_ref() == b"name" => {
+                    let end = event.name().as_ref().to_vec();
+                    self.buf.clear();
+                    name = Some(self.read_text_until(&end)?);
+                }
+                Ok(Event::Start(event)) if event.name().as_ref() == b"value" => {
+                    self.buf.clear();
+                    value = Some(self.parse_value()?);
+                }
+                Ok(Event::End(event)) if event.name().as_ref() == b"member" => {
+                    self.buf.clear();
+                    return Ok(name.zip(value));
+                }
+                Ok(Event::Eof) => return Err(client_error("unterminated XML-RPC member")),
+                Err(error) => return Err(client_error(format!("invalid XML-RPC member: {error}"))),
+                _ => {}
+            }
+            self.buf.clear();
+        }
+    }
+
+    fn read_typed_string(&mut self, end: &[u8]) -> crate::Result<RtXmlValue> {
+        self.read_text_until(end).map(RtXmlValue::String)
+    }
+
+    fn read_typed_i64(&mut self, end: &[u8]) -> crate::Result<RtXmlValue> {
+        Ok(RtXmlValue::I64(
+            self.read_text_until(end)?
+                .parse::<i64>()
+                .unwrap_or_default(),
+        ))
+    }
+
+    fn read_typed_bool(&mut self, end: &[u8]) -> crate::Result<RtXmlValue> {
+        Ok(RtXmlValue::Bool(matches!(
+            self.read_text_until(end)?.as_str(),
+            "1" | "true" | "True"
+        )))
+    }
+
+    fn read_text_until(&mut self, end: &[u8]) -> crate::Result<String> {
+        let mut text = String::new();
+        loop {
+            match self.reader.read_event_into(&mut self.buf) {
+                Ok(Event::Text(event)) => {
+                    text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                }
+                Ok(Event::CData(event)) => {
+                    text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                }
+                Ok(Event::End(event)) if event.name().as_ref() == end => {
+                    self.buf.clear();
+                    return Ok(text);
+                }
+                Ok(Event::Eof) => return Err(client_error("unterminated XML-RPC text")),
+                Err(error) => return Err(client_error(format!("invalid XML-RPC text: {error}"))),
+                _ => {}
+            }
+            self.buf.clear();
+        }
+    }
+}
+
 fn parse_qb_torrents(body: &str) -> crate::Result<Vec<QbTorrentInfo>> {
     serde_json::from_str(body)
         .map_err(|error| client_error(format!("failed to parse qBittorrent torrents: {error}")))
@@ -1427,8 +2083,8 @@ fn client_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 mod tests {
     use super::{
         ClientTorrent, DelugeClient, DownloadDirOptions, InjectionOptions, NewTorrent,
-        QbittorrentClient, ResumeOptions, TorrentClient, TransmissionClient, client_identities,
-        client_torrent_to_searchee, select_injection_client,
+        QbittorrentClient, ResumeOptions, RtorrentClient, TorrentClient, TransmissionClient,
+        client_identities, client_torrent_to_searchee, select_injection_client,
     };
     use crate::{
         config::TorrentClientConfig,
@@ -1852,6 +2508,103 @@ mod tests {
         assert!(requests[12].contains(r#""method":"core.resume_torrent""#));
     }
 
+    #[test]
+    fn rtorrent_maps_inventory_files_and_trackers() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            rt_response(&rt_array(&[rt_string(hash)])),
+            rt_response(&rt_array(&[
+                rt_array(&[rt_string("Example.Show.S01E01")]),
+                rt_array(&[rt_string("/downloads")]),
+                rt_array(&[rt_int(0)]),
+                rt_array(&[rt_bool(false)]),
+                rt_array(&[rt_bool(true)]),
+                rt_array(&[rt_bool(false)]),
+                rt_array(&[rt_bool(false)]),
+                rt_array(&[rt_string("cross-seed")]),
+                rt_array(&[rt_array(&[rt_array(&[
+                    rt_string("Example.Show.S01E01.mkv"),
+                    rt_int(123),
+                ])])]),
+                rt_array(&[rt_array(&[rt_array(&[
+                    rt_string("https://tracker.example/announce"),
+                    rt_string("tracker-group"),
+                ])])]),
+            ])),
+        ]);
+        let client = rtorrent_client(&server.url);
+
+        let torrents = client.get_all_torrents().expect("inventory");
+
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].info_hash.as_str(), hash);
+        assert_eq!(torrents[0].save_path, "/downloads");
+        assert_eq!(torrents[0].files[0].path, "Example.Show.S01E01.mkv");
+        assert_eq!(torrents[0].tags[0].as_str(), "cross-seed");
+        assert_eq!(torrents[0].trackers[0], "tracker.example");
+        assert!(torrents[0].complete);
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("<methodName>download_list</methodName>"));
+        assert!(requests[1].contains("<methodName>system.multicall</methodName>"));
+        assert!(requests[1].contains("f.multicall"));
+        assert!(requests[1].contains("t.multicall"));
+    }
+
+    #[test]
+    fn rtorrent_injects_labels_rechecks_and_resumes() {
+        let server = http_server(vec![
+            rt_response(&rt_string("")),
+            rt_response(&rt_bool(true)),
+            rt_response(&rt_bool(true)),
+            rt_response(&rt_bool(true)),
+            rt_response(&rt_bool(true)),
+        ]);
+        let client = rtorrent_client(&server.url);
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let new_torrent = NewTorrent {
+            metafile,
+            bytes: Cow::Owned(bytes),
+        };
+        let searchee = Searchee::from_files("Inject.Release", "Inject.Release", Vec::new());
+
+        let result = client
+            .inject(
+                &new_torrent,
+                &searchee,
+                Decision::Match,
+                &InjectionOptions {
+                    destination_dir: Some(PathBuf::from("/linked")),
+                    category: None,
+                    tags: vec![ClientLabel::new("cross-seed")],
+                    paused: true,
+                    skip_checking: true,
+                },
+            )
+            .expect("inject");
+        client
+            .recheck_torrent(&new_torrent.metafile.info_hash)
+            .expect("recheck");
+        client
+            .resume_injection(
+                &new_torrent.metafile,
+                Decision::Match,
+                ResumeOptions::default(),
+            )
+            .expect("resume");
+
+        assert_eq!(result, InjectionResult::Injected);
+        let requests = server.join();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].contains("<methodName>load.raw</methodName>"));
+        assert!(requests[0].contains("<base64>"));
+        assert!(requests[1].contains("<methodName>d.custom1.set</methodName>"));
+        assert!(requests[2].contains("<methodName>d.pause</methodName>"));
+        assert!(requests[3].contains("<methodName>d.check_hash</methodName>"));
+        assert!(requests[4].contains("<methodName>d.resume</methodName>"));
+    }
+
     struct FakeClient {
         metadata: TorrentClientMetadata<'static>,
     }
@@ -1967,6 +2720,18 @@ mod tests {
         DelugeClient::new(identity, Some(Duration::from_secs(1))).expect("client")
     }
 
+    fn rtorrent_client(base_url: &str) -> RtorrentClient {
+        let identity =
+            client_identities(&[
+                TorrentClientConfig::parse(&format!("rtorrent:{base_url}")).expect("config")
+            ])
+            .expect("identity")
+            .into_iter()
+            .next()
+            .expect("identity");
+        RtorrentClient::new(identity, Some(Duration::from_secs(1))).expect("client")
+    }
+
     struct TestHttpServer {
         url: String,
         handle: thread::JoinHandle<Vec<String>>,
@@ -2015,6 +2780,35 @@ mod tests {
             "200 OK",
             &format!(r#"{{"result":{result},"error":null,"id":1}}"#),
         )
+    }
+
+    fn rt_response(value: &str) -> String {
+        http_response(
+            "200 OK",
+            &format!(
+                "<?xml version=\"1.0\"?><methodResponse><params><param><value>{value}</value></param></params></methodResponse>"
+            ),
+        )
+    }
+
+    fn rt_string(value: &str) -> String {
+        format!("<string>{value}</string>")
+    }
+
+    fn rt_int(value: i64) -> String {
+        format!("<i8>{value}</i8>")
+    }
+
+    fn rt_bool(value: bool) -> String {
+        format!("<boolean>{}</boolean>", i64::from(value))
+    }
+
+    fn rt_array(values: &[String]) -> String {
+        let values = values
+            .iter()
+            .map(|value| format!("<value>{value}</value>"))
+            .collect::<String>();
+        format!("<array><data>{values}</data></array>")
     }
 
     fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {
