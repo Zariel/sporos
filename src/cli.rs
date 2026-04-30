@@ -91,6 +91,40 @@ where
             let database = Database::open_app_dir(&app_dir)?;
             println!("{}", crate::operations::reset_api_key(&database)?);
         }
+        Some(("daemon", matches)) => {
+            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            if matches.get_flag("no-port") {
+                raw_config.port = Some(None);
+            } else if let Some(port) = matches.get_one::<u16>("port") {
+                raw_config.port = Some(Some(*port));
+            }
+            if let Some(host) = matches.get_one::<String>("host") {
+                raw_config.host = Some(host.parse().map_err(|error| {
+                    crate::SporosError::configuration(format!("invalid --host: {error}"))
+                })?);
+            }
+            if let Some(search_cadence) = matches.get_one::<String>("search-cadence") {
+                raw_config.search_cadence =
+                    Some(crate::config::parse_duration_millis(search_cadence)?);
+            }
+            if let Some(rss_cadence) = matches.get_one::<String>("rss-cadence") {
+                raw_config.rss_cadence = Some(crate::config::parse_duration_millis(rss_cadence)?);
+            }
+            if let Some(api_key) = matches.get_one::<String>("api-key") {
+                raw_config.api_key = Some(api_key.clone());
+            }
+            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let database = Database::open_app_dir(&app_dir)?;
+            let shutdown = crate::daemon::install_shutdown_handler()?;
+            let run = crate::daemon::run_daemon(&config, &database, &shutdown)?;
+            println!(
+                "daemon stopped: serving={}, jobs={}",
+                run.listen_addr
+                    .map(|address| address.to_string())
+                    .unwrap_or_else(|| "disabled".to_owned()),
+                run.jobs.len()
+            );
+        }
         Some((command, _)) => {
             let _raw_config = crate::config::load_file_raw_config(&app_dir)?;
             println!("sporos {} {}", crate::VERSION, command);

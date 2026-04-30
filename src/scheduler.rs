@@ -4,7 +4,15 @@ use std::{borrow::Cow, sync::Mutex};
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::{SporosError, api::JobResponse, persistence::Database};
+use crate::{
+    SporosError,
+    api::JobResponse,
+    config::{Action, RuntimeConfig},
+    persistence::Database,
+};
+
+const ONE_DAY_MILLIS: u64 = 86_400_000;
+const ONE_HOUR_MILLIS: u64 = 3_600_000;
 
 /// Scheduler job names in compatibility order.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -107,6 +115,81 @@ pub struct JobCheckResult {
 pub struct Scheduler {
     jobs: Vec<ScheduledJob>,
     check_jobs: Mutex<()>,
+}
+
+/// Daemon lifecycle plan derived from runtime config.
+#[derive(Debug)]
+pub struct DaemonPlan {
+    /// Whether the HTTP listener should be started.
+    pub serve_http: bool,
+    /// Configured scheduler.
+    pub scheduler: Scheduler,
+}
+
+/// Result from a bounded daemon lifecycle startup pass.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DaemonRun {
+    /// Startup indexing hook ran before serving and jobs.
+    pub startup_indexed: bool,
+    /// HTTP serving would be started.
+    pub serving: bool,
+    /// Bound listener address when HTTP serving is active.
+    pub listen_addr: Option<std::net::SocketAddr>,
+    /// First scheduler check results.
+    pub jobs: Vec<JobCheckResult>,
+}
+
+impl DaemonPlan {
+    /// Build daemon serving and job state from runtime config.
+    pub fn from_config(config: &RuntimeConfig) -> Self {
+        let jobs = vec![
+            ScheduledJob::new(
+                JobName::Rss,
+                config.rss_cadence.unwrap_or_default(),
+                config.rss_cadence.is_some(),
+            ),
+            ScheduledJob::new(
+                JobName::Search,
+                config.search_cadence.unwrap_or_default(),
+                config.search_cadence.is_some(),
+            ),
+            ScheduledJob::new(
+                JobName::UpdateIndexerCaps,
+                ONE_DAY_MILLIS,
+                !config.torznab.is_empty(),
+            ),
+            ScheduledJob::new(
+                JobName::Inject,
+                ONE_HOUR_MILLIS,
+                config.action == Action::Inject,
+            ),
+            ScheduledJob::new(JobName::Cleanup, ONE_DAY_MILLIS, true),
+        ];
+        Self {
+            serve_http: config.port.is_some(),
+            scheduler: Scheduler::new(jobs),
+        }
+    }
+
+    /// Run startup indexing hook and first job check in lifecycle order.
+    pub fn run_startup<I>(
+        &mut self,
+        database: &Database,
+        now_millis: i64,
+        mut index_startup: I,
+    ) -> crate::Result<DaemonRun>
+    where
+        I: FnMut() -> crate::Result<()>,
+    {
+        index_startup()?;
+        let jobs = self.scheduler.check_jobs(database, now_millis, true)?;
+        Ok(DaemonRun {
+            startup_indexed: true,
+            serving: self.serve_http,
+            listen_addr: None,
+            jobs,
+        })
+    }
 }
 
 impl Scheduler {
@@ -299,8 +382,12 @@ fn persistence_error(error: rusqlite::Error) -> SporosError {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobName, ScheduledJob, Scheduler};
-    use crate::{api::JobResponse, persistence::Database};
+    use super::{DaemonPlan, JobName, ScheduledJob, Scheduler};
+    use crate::{
+        api::JobResponse,
+        config::{RawConfig, RuntimeConfig},
+        persistence::Database,
+    };
     use std::{
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -431,11 +518,43 @@ mod tests {
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn daemon_plan_honors_no_port_and_runs_startup_before_jobs() {
+        let root = temp_path("daemon-plan");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let raw = RawConfig {
+            port: Some(None),
+            ..RawConfig::default()
+        };
+        let config = RuntimeConfig::normalize(raw, &root).expect("config");
+        let mut plan = DaemonPlan::from_config(&config);
+        let mut indexed = false;
+
+        let run = plan
+            .run_startup(&database, 1_000, || {
+                indexed = true;
+                Ok(())
+            })
+            .expect("run");
+
+        assert!(indexed);
+        assert!(run.startup_indexed);
+        assert!(!run.serving);
+        assert_eq!(run.jobs.len(), 5);
+        assert!(
+            run.jobs
+                .iter()
+                .any(|result| result.name == JobName::Cleanup && result.ran)
+        );
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
     fn temp_path(name: &str) -> PathBuf {
-        let millis = SystemTime::now()
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
+            .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("sporos-{name}-{millis}"))
+        std::env::temp_dir().join(format!("sporos-{name}-{}-{nanos}", std::process::id()))
     }
 }
