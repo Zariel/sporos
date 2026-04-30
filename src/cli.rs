@@ -93,6 +93,7 @@ where
         }
         Some(("daemon", matches)) => {
             let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            apply_notification_options(matches, &mut raw_config);
             if matches.get_flag("no-port") {
                 raw_config.port = Some(None);
             } else if let Some(port) = matches.get_one::<u16>("port") {
@@ -125,6 +126,18 @@ where
                 run.jobs.len()
             );
         }
+        Some(("test-notification", matches)) => {
+            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            apply_notification_options(matches, &mut raw_config);
+            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let redactor = crate::startup::Redactor::from_config(&config);
+            let sender = crate::notifications::NotificationSender::from_config(&config, redactor)?;
+            let report = sender.send_test();
+            println!(
+                "sent {} of {} notification webhooks",
+                report.succeeded, report.attempted
+            );
+        }
         Some((command, _)) => {
             let _raw_config = crate::config::load_file_raw_config(&app_dir)?;
             println!("sporos {} {}", crate::VERSION, command);
@@ -146,6 +159,15 @@ fn required_string<'a>(matches: &'a ArgMatches, name: &str) -> crate::Result<&'a
 
 fn required_path(matches: &ArgMatches, name: &str) -> crate::Result<PathBuf> {
     Ok(Path::new(required_string(matches, name)?).to_owned())
+}
+
+fn apply_notification_options(matches: &ArgMatches, raw_config: &mut crate::config::RawConfig) {
+    if let Some(values) = matches.get_many::<String>("notification-webhook-urls") {
+        raw_config.notification_webhook_urls = values.cloned().collect();
+    }
+    if let Some(value) = matches.get_one::<String>("notification-webhook-url") {
+        raw_config.notification_webhook_urls = vec![value.clone()];
+    }
 }
 
 /// Build the compatibility command tree.

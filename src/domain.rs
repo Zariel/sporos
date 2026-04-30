@@ -337,6 +337,18 @@ pub enum SearcheeSource {
     Virtual,
 }
 
+impl SearcheeSource {
+    /// String representation used in notifications and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TorrentClient => "torrentClient",
+            Self::TorrentFile => "torrentFile",
+            Self::DataDir => "dataDir",
+            Self::Virtual => "virtual",
+        }
+    }
+}
+
 /// Local data that can be searched for cross-seeds.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Searchee<'a> {

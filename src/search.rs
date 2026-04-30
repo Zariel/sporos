@@ -297,14 +297,38 @@ pub struct PipelineAction<'a> {
 /// Persisted result from one candidate assessment and optional action.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PipelineAttempt {
+    /// Workflow label.
+    pub label: Label,
     /// Local searchee title.
     pub searchee_title: String,
+    /// Remote candidate release name.
+    pub candidate_name: String,
     /// Remote candidate GUID.
     pub candidate_guid: String,
+    /// Candidate info hashes from a matched metafile.
+    pub candidate_info_hashes: Vec<String>,
+    /// Candidate or metafile tracker names.
+    pub trackers: Vec<String>,
     /// Candidate decision.
     pub decision: crate::domain::Decision,
     /// Action outcome when a match was dispatched.
     pub action_result: Option<ActionResult>,
+    /// Searchee category when known.
+    pub searchee_category: Option<String>,
+    /// Searchee tags when known.
+    pub searchee_tags: Vec<String>,
+    /// Searchee trackers when known.
+    pub searchee_trackers: Vec<String>,
+    /// Searchee byte length.
+    pub searchee_length: u64,
+    /// Searchee client host when sourced from a torrent client.
+    pub searchee_client_host: Option<String>,
+    /// Searchee local info hash when known.
+    pub searchee_info_hash: Option<String>,
+    /// Searchee filesystem path when known.
+    pub searchee_path: Option<String>,
+    /// Searchee source type.
+    pub searchee_source_type: String,
 }
 
 /// Summary returned by bulk search and targeted search flows.
@@ -1861,11 +1885,62 @@ where
         None
     };
     Ok(PipelineAttempt {
+        label: options.label,
         searchee_title: searchee.title.to_string(),
+        candidate_name: candidate.name.to_string(),
         candidate_guid: candidate.guid.to_string(),
+        candidate_info_hashes: assessment
+            .metafile
+            .as_ref()
+            .map(|metafile| vec![metafile.info_hash.to_string()])
+            .unwrap_or_default(),
+        trackers: notification_trackers(candidate, assessment.metafile.as_ref()),
         decision: assessment.decision,
         action_result,
+        searchee_category: searchee
+            .client
+            .as_ref()
+            .and_then(|client| client.category.as_ref())
+            .map(ToString::to_string),
+        searchee_tags: searchee
+            .client
+            .as_ref()
+            .map(|client| client.tags.iter().map(ToString::to_string).collect())
+            .unwrap_or_default(),
+        searchee_trackers: searchee
+            .client
+            .as_ref()
+            .map(|client| client.trackers.iter().map(ToString::to_string).collect())
+            .unwrap_or_default(),
+        searchee_length: searchee.length,
+        searchee_client_host: searchee
+            .client
+            .as_ref()
+            .map(|client| client.host.to_string()),
+        searchee_info_hash: searchee.info_hash.as_ref().map(ToString::to_string),
+        searchee_path: searchee.path.as_ref().map(ToString::to_string),
+        searchee_source_type: searchee.source().as_str().to_owned(),
     })
+}
+
+fn notification_trackers(
+    candidate: &Candidate<'_>,
+    metafile: Option<&crate::domain::Metafile<'_>>,
+) -> Vec<String> {
+    let trackers = metafile
+        .map(|metafile| {
+            metafile
+                .trackers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if trackers.is_empty() {
+        vec![candidate.tracker.to_string()]
+    } else {
+        trackers
+    }
 }
 
 fn read_timestamp(
