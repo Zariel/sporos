@@ -736,6 +736,326 @@ impl TorrentClient for TransmissionClient {
     }
 }
 
+/// Deluge Web JSON-RPC adapter.
+pub struct DelugeClient {
+    identity: ClientIdentity,
+    rpc_url: String,
+    password: String,
+    client: reqwest::blocking::Client,
+}
+
+impl DelugeClient {
+    /// Build a Deluge adapter from normalized identity metadata.
+    pub fn new(identity: ClientIdentity, timeout: Option<Duration>) -> crate::Result<Self> {
+        let mut url = Url::parse(&identity.url)
+            .map_err(|error| client_error(format!("invalid Deluge URL: {error}")))?;
+        let password = url.password().unwrap_or("deluge").to_owned();
+        url.set_username("")
+            .map_err(|()| client_error("failed to sanitize Deluge username"))?;
+        url.set_password(None)
+            .map_err(|()| client_error("failed to sanitize Deluge password"))?;
+        let mut builder = reqwest::blocking::Client::builder()
+            .cookie_store(true)
+            .user_agent(format!("CrossSeed/{}", crate::VERSION));
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder
+            .build()
+            .map_err(|error| client_error(format!("failed to build Deluge client: {error}")))?;
+        let base_url = url.to_string().trim_end_matches('/').to_owned();
+        let rpc_url = if base_url.ends_with("/json") {
+            base_url
+        } else {
+            format!("{base_url}/json")
+        };
+        Ok(Self {
+            identity,
+            rpc_url,
+            password,
+            client,
+        })
+    }
+
+    fn rpc(&self, method: &str, params: serde_json::Value) -> crate::Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "method": method,
+            "params": params,
+            "id": 1
+        })
+        .to_string();
+        let text = self
+            .client
+            .post(&self.rpc_url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("Deluge RPC request failed: {error}")))?
+            .text()
+            .map_err(|error| client_error(format!("failed to read Deluge RPC: {error}")))?;
+        let response = serde_json::from_str::<DelugeRpcResponse>(&text)
+            .map_err(|error| client_error(format!("failed to parse Deluge RPC: {error}")))?;
+        if let Some(error) = response.error {
+            return Err(client_error(format!("Deluge RPC {method} failed: {error}")));
+        }
+        Ok(response.result.unwrap_or(serde_json::Value::Null))
+    }
+
+    fn login(&self) -> crate::Result<()> {
+        let result = self.rpc("auth.login", serde_json::json!([self.password]))?;
+        if result.as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(client_error("Deluge authentication failed"))
+        }
+    }
+
+    fn ensure_connected(&self) -> crate::Result<()> {
+        self.login()?;
+        if self.rpc("web.connected", serde_json::json!([]))?.as_bool() == Some(true) {
+            return Ok(());
+        }
+
+        let hosts = self.rpc("web.get_hosts", serde_json::json!([]))?;
+        let host_id = hosts
+            .as_array()
+            .and_then(|hosts| hosts.first())
+            .and_then(serde_json::Value::as_array)
+            .and_then(|host| host.first())
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| client_error("Deluge Web returned no hosts"))?;
+        let connected = self.rpc("web.connect", serde_json::json!([host_id]))?;
+        if connected.as_bool() == Some(false) {
+            Err(client_error("Deluge host connection failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn update_ui(&self, ids: Option<&[String]>) -> crate::Result<Vec<DelugeTorrent>> {
+        self.ensure_connected()?;
+        let mut filter = serde_json::Map::new();
+        if let Some(ids) = ids {
+            filter.insert("id".to_owned(), serde_json::json!(ids));
+        }
+        let response = self.rpc(
+            "web.update_ui",
+            serde_json::json!([
+                [
+                    "name",
+                    "hash",
+                    "save_path",
+                    "files",
+                    "tracker_host",
+                    "label",
+                    "progress",
+                    "state"
+                ],
+                filter
+            ]),
+        )?;
+        let Some(torrents) = response
+            .get("torrents")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return Ok(Vec::new());
+        };
+        torrents
+            .iter()
+            .map(|(id, value)| {
+                let mut torrent =
+                    serde_json::from_value::<DelugeTorrent>(value.clone()).map_err(|error| {
+                        client_error(format!("failed to parse Deluge torrent: {error}"))
+                    })?;
+                if torrent.hash.is_empty() {
+                    torrent.hash.clone_from(id);
+                }
+                Ok(torrent)
+            })
+            .collect()
+    }
+
+    fn torrent_info(&self, info_hash: &InfoHash<'_>) -> crate::Result<Option<DelugeTorrent>> {
+        Ok(self
+            .update_ui(Some(&[info_hash.as_str().to_owned()]))?
+            .into_iter()
+            .next())
+    }
+
+    fn torrent_action(&self, method: &str, info_hash: &InfoHash<'_>) -> crate::Result<()> {
+        self.ensure_connected()?;
+        self.rpc(method, serde_json::json!([[info_hash.as_str()]]))?;
+        Ok(())
+    }
+
+    fn label_torrent(
+        &self,
+        info_hash: &InfoHash<'_>,
+        label: &ClientLabel<'_>,
+    ) -> crate::Result<()> {
+        let label = label.as_str();
+        let labels = self.rpc("label.get_labels", serde_json::json!([]))?;
+        let label_exists = labels
+            .as_array()
+            .is_some_and(|labels| labels.iter().any(|value| value.as_str() == Some(label)));
+        if !label_exists {
+            self.rpc("label.add", serde_json::json!([label]))?;
+        }
+        self.rpc(
+            "label.set_torrent",
+            serde_json::json!([info_hash.as_str(), label]),
+        )?;
+        Ok(())
+    }
+}
+
+impl TorrentClient for DelugeClient {
+    fn metadata(&self) -> &TorrentClientMetadata<'_> {
+        &self.identity.metadata
+    }
+
+    fn is_torrent_in_client(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self.torrent_info(info_hash)?.is_some())
+    }
+
+    fn is_torrent_complete(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self
+            .torrent_info(info_hash)?
+            .is_some_and(|torrent| torrent.complete()))
+    }
+
+    fn is_torrent_checking(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self
+            .torrent_info(info_hash)?
+            .is_some_and(|torrent| torrent.checking()))
+    }
+
+    fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
+        let mut output = Vec::new();
+        for torrent in self.update_ui(None)? {
+            let Some(info_hash) = InfoHash::new(torrent.hash.clone()) else {
+                continue;
+            };
+            let complete = torrent.complete();
+            let checking = torrent.checking();
+            let tracker =
+                (!torrent.tracker_host.is_empty()).then_some(Cow::Owned(torrent.tracker_host));
+            output.push(ClientTorrent {
+                info_hash: info_hash.into_owned(),
+                name: Cow::Owned(torrent.name),
+                files: torrent
+                    .files
+                    .into_iter()
+                    .map(|file| File::new(file.path, file.size))
+                    .collect(),
+                save_path: Cow::Owned(torrent.save_path),
+                category: torrent
+                    .label
+                    .filter(|label| !label.is_empty())
+                    .map(ClientLabel::new),
+                tags: Vec::new(),
+                trackers: tracker.into_iter().collect(),
+                complete,
+                checking,
+            });
+        }
+        Ok(output)
+    }
+
+    fn get_download_dir(
+        &self,
+        metafile: &Metafile<'_>,
+        options: DownloadDirOptions,
+    ) -> crate::Result<Result<PathBuf, ClientErrorCode>> {
+        let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
+            return Ok(Err(ClientErrorCode::NotFound));
+        };
+        if options.only_completed && !torrent.complete() {
+            return Ok(Err(ClientErrorCode::TorrentNotComplete));
+        }
+        Ok(Ok(PathBuf::from(torrent.save_path)))
+    }
+
+    fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>> {
+        Ok(self
+            .update_ui(None)?
+            .into_iter()
+            .map(|torrent| (torrent.hash, PathBuf::from(torrent.save_path)))
+            .collect())
+    }
+
+    fn inject(
+        &self,
+        new_torrent: &NewTorrent<'_>,
+        _searchee: &Searchee<'_>,
+        _decision: Decision,
+        options: &InjectionOptions,
+    ) -> crate::Result<InjectionResult> {
+        ensure_writable(self)?;
+        self.ensure_connected()?;
+        let mut add_options = serde_json::Map::new();
+        add_options.insert(
+            "add_paused".to_owned(),
+            serde_json::Value::Bool(options.paused),
+        );
+        if let Some(destination) = &options.destination_dir {
+            add_options.insert(
+                "download_location".to_owned(),
+                serde_json::Value::String(destination.display().to_string()),
+            );
+        }
+        self.rpc(
+            "core.add_torrent_file",
+            serde_json::json!([
+                format!("{}.torrent", new_torrent.metafile.info_hash),
+                base64_encode(new_torrent.bytes.as_ref()),
+                add_options
+            ]),
+        )?;
+
+        let label = options.category.as_ref().or_else(|| options.tags.first());
+        if let Some(label) = label {
+            self.label_torrent(&new_torrent.metafile.info_hash, label)?;
+        }
+        if options.paused {
+            self.rpc(
+                "core.pause_torrent",
+                serde_json::json!([[new_torrent.metafile.info_hash.as_str()]]),
+            )?;
+        }
+        Ok(InjectionResult::Injected)
+    }
+
+    fn recheck_torrent(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
+        self.torrent_action("core.force_recheck", info_hash)
+    }
+
+    fn resume_injection(
+        &self,
+        metafile: &Metafile<'_>,
+        _decision: Decision,
+        _options: ResumeOptions,
+    ) -> crate::Result<()> {
+        self.torrent_action("core.resume_torrent", &metafile.info_hash)
+    }
+
+    fn validate_config(&self) -> crate::Result<()> {
+        self.ensure_connected()?;
+        let plugins = self.rpc("core.get_enabled_plugins", serde_json::json!([]))?;
+        let label_enabled = plugins.as_array().is_some_and(|plugins| {
+            plugins
+                .iter()
+                .any(|plugin| plugin.as_str() == Some("Label"))
+        });
+        if label_enabled {
+            Ok(())
+        } else {
+            Err(client_error("Deluge Label plugin is not enabled"))
+        }
+    }
+}
+
 /// Build client identities from config order and URL host/path rules.
 pub fn client_identities(configs: &[TorrentClientConfig]) -> crate::Result<Vec<ClientIdentity>> {
     let mut host_counts = BTreeMap::<String, usize>::new();
@@ -939,6 +1259,49 @@ struct TransmissionTracker {
     announce: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DelugeRpcResponse {
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DelugeTorrent {
+    #[serde(default)]
+    hash: String,
+    name: String,
+    #[serde(default)]
+    save_path: String,
+    #[serde(default)]
+    files: Vec<DelugeFile>,
+    #[serde(default)]
+    tracker_host: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    progress: f64,
+    #[serde(default)]
+    state: String,
+}
+
+impl DelugeTorrent {
+    fn complete(&self) -> bool {
+        self.progress >= 100.0 || self.state.eq_ignore_ascii_case("seeding")
+    }
+
+    fn checking(&self) -> bool {
+        self.state.to_ascii_lowercase().contains("check")
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DelugeFile {
+    path: String,
+    size: u64,
+}
+
 fn parse_qb_torrents(body: &str) -> crate::Result<Vec<QbTorrentInfo>> {
     serde_json::from_str(body)
         .map_err(|error| client_error(format!("failed to parse qBittorrent torrents: {error}")))
@@ -1063,8 +1426,8 @@ fn client_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent, QbittorrentClient,
-        ResumeOptions, TorrentClient, TransmissionClient, client_identities,
+        ClientTorrent, DelugeClient, DownloadDirOptions, InjectionOptions, NewTorrent,
+        QbittorrentClient, ResumeOptions, TorrentClient, TransmissionClient, client_identities,
         client_torrent_to_searchee, select_injection_client,
     };
     use crate::{
@@ -1394,6 +1757,101 @@ mod tests {
         assert!(requests[3].contains(r#""method":"torrent-start""#));
     }
 
+    #[test]
+    fn deluge_connects_and_maps_inventory() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&format!(
+                r#"{{"torrents":{{"{hash}":{{"name":"Example.Show.S01E01","save_path":"/downloads","files":[{{"path":"Example.Show.S01E01.mkv","size":123}}],"tracker_host":"tracker.example","label":"tv","progress":100.0,"state":"Seeding"}}}}}}"#
+            )),
+        ]);
+        let client = deluge_client(&server.url);
+
+        let torrents = client.get_all_torrents().expect("inventory");
+
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].info_hash.as_str(), hash);
+        assert_eq!(torrents[0].save_path, "/downloads");
+        assert_eq!(torrents[0].files[0].path, "Example.Show.S01E01.mkv");
+        assert_eq!(
+            torrents[0].category.as_ref().map(ClientLabel::as_str),
+            Some("tv")
+        );
+        assert_eq!(torrents[0].trackers[0], "tracker.example");
+        assert!(torrents[0].complete);
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains(r#""method":"auth.login""#));
+        assert!(requests[1].contains(r#""method":"web.connected""#));
+        assert!(requests[2].contains(r#""method":"web.update_ui""#));
+    }
+
+    #[test]
+    fn deluge_injects_labels_rechecks_and_resumes() {
+        let server = http_server(vec![
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("[]"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+        ]);
+        let client = deluge_client(&server.url);
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let new_torrent = NewTorrent {
+            metafile,
+            bytes: Cow::Owned(bytes),
+        };
+        let searchee = Searchee::from_files("Inject.Release", "Inject.Release", Vec::new());
+
+        let result = client
+            .inject(
+                &new_torrent,
+                &searchee,
+                Decision::Match,
+                &InjectionOptions {
+                    destination_dir: Some(PathBuf::from("/linked")),
+                    category: Some(ClientLabel::new("tv")),
+                    tags: vec![ClientLabel::new("cross-seed")],
+                    paused: true,
+                    skip_checking: true,
+                },
+            )
+            .expect("inject");
+        client
+            .recheck_torrent(&new_torrent.metafile.info_hash)
+            .expect("recheck");
+        client
+            .resume_injection(
+                &new_torrent.metafile,
+                Decision::Match,
+                ResumeOptions::default(),
+            )
+            .expect("resume");
+
+        assert_eq!(result, InjectionResult::Injected);
+        let requests = server.join();
+        assert_eq!(requests.len(), 13);
+        assert!(requests[2].contains(r#""method":"core.add_torrent_file""#));
+        assert!(requests[2].contains(r#""download_location":"/linked""#));
+        assert!(requests[3].contains(r#""method":"label.get_labels""#));
+        assert!(requests[4].contains(r#""method":"label.add""#));
+        assert!(requests[5].contains(r#""method":"label.set_torrent""#));
+        assert!(requests[6].contains(r#""method":"core.pause_torrent""#));
+        assert!(requests[9].contains(r#""method":"core.force_recheck""#));
+        assert!(requests[12].contains(r#""method":"core.resume_torrent""#));
+    }
+
     struct FakeClient {
         metadata: TorrentClientMetadata<'static>,
     }
@@ -1497,6 +1955,18 @@ mod tests {
         TransmissionClient::new(identity, Some(Duration::from_secs(1))).expect("client")
     }
 
+    fn deluge_client(base_url: &str) -> DelugeClient {
+        let identity =
+            client_identities(&[
+                TorrentClientConfig::parse(&format!("deluge:{base_url}")).expect("config")
+            ])
+            .expect("identity")
+            .into_iter()
+            .next()
+            .expect("identity");
+        DelugeClient::new(identity, Some(Duration::from_secs(1))).expect("client")
+    }
+
     struct TestHttpServer {
         url: String,
         handle: thread::JoinHandle<Vec<String>>,
@@ -1537,6 +2007,13 @@ mod tests {
         format!(
             "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
+        )
+    }
+
+    fn deluge_response(result: &str) -> String {
+        http_response(
+            "200 OK",
+            &format!(r#"{{"result":{result},"error":null,"id":1}}"#),
         )
     }
 
