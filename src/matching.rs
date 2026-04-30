@@ -407,7 +407,7 @@ fn exact_file_tree_matches(candidate_files: &[File<'_>], searchee: &Searchee<'_>
 }
 
 fn size_only_matches(candidate_files: &[File<'_>], searchee_files: &[File<'_>]) -> bool {
-    match_sizes(candidate_files, searchee_files).len() == candidate_files.len()
+    matched_pairs(candidate_files, searchee_files).len() == candidate_files.len()
 }
 
 fn size_match_ratio(
@@ -418,9 +418,9 @@ fn size_match_ratio(
     if candidate_length == 0 {
         return 0.0;
     }
-    let matched = match_sizes(candidate_files, searchee_files)
+    let matched = matched_pairs(candidate_files, searchee_files)
         .iter()
-        .map(|file| file.length)
+        .map(|(candidate, _)| candidate.length)
         .sum::<u64>();
     matched as f64 / candidate_length as f64
 }
@@ -429,37 +429,33 @@ fn partial_piece_ratio(metafile: &Metafile<'_>, searchee_files: &[File<'_>]) -> 
     if metafile.length == 0 || metafile.piece_length == 0 {
         return 0.0;
     }
-    let matched = match_sizes(&metafile.files, searchee_files)
+    let matched = matched_pairs(&metafile.files, searchee_files)
         .iter()
-        .map(|file| file.length)
+        .map(|(candidate, _)| candidate.length)
         .sum::<u64>();
     let total_pieces = metafile.length.div_ceil(metafile.piece_length);
     let available_pieces = matched / metafile.piece_length;
     available_pieces as f64 / total_pieces as f64
 }
 
-fn match_sizes<'a>(
-    candidate_files: &'a [File<'a>],
-    searchee_files: &[File<'_>],
-) -> Vec<&'a File<'a>> {
-    let mut available = searchee_files
-        .iter()
-        .enumerate()
-        .map(|(index, file)| (index, file.length, file.name.as_ref()))
-        .collect::<Vec<_>>();
+fn matched_pairs<'a, 'b>(
+    candidate_files: &'a [File<'_>],
+    searchee_files: &'b [File<'_>],
+) -> Vec<(&'a File<'a>, &'b File<'b>)> {
+    let mut available = searchee_files.iter().enumerate().collect::<Vec<_>>();
     let mut matched = Vec::new();
 
     for candidate in candidate_files {
         let Some((available_index, _)) = available
             .iter()
             .enumerate()
-            .filter(|(_, (_, length, _))| *length == candidate.length)
-            .max_by_key(|(_, (_, _, name))| name.eq_ignore_ascii_case(candidate.name.as_ref()))
+            .filter(|(_, (_, file))| file.length == candidate.length)
+            .max_by_key(|(_, (_, file))| file.name.eq_ignore_ascii_case(candidate.name.as_ref()))
         else {
             continue;
         };
-        available.swap_remove(available_index);
-        matched.push(candidate);
+        let (_, local) = available.swap_remove(available_index);
+        matched.push((candidate, local));
     }
     matched
 }
@@ -732,6 +728,104 @@ mod tests {
     }
 
     #[test]
+    fn applies_file_tree_non_match_fallbacks() {
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclusions = BTreeSet::new();
+        let strict = options(&blocklist, MatchMode::Strict, false, &exclusions);
+        let partial = options(&blocklist, MatchMode::Partial, false, &exclusions);
+        let mut searchee = searchee(
+            "Example.Show.S01",
+            "Example.Show.S01",
+            vec![
+                File::new("Example.Show.S01/E01.mkv", 950),
+                File::new("Example.Show.S01/E02.mkv", 100),
+            ],
+        );
+        searchee.info_hash = Some(InfoHash::from_validated(
+            "9999999999999999999999999999999999999999",
+        ));
+
+        let strict_size_mismatch = metafile(
+            "5555555555555555555555555555555555555555",
+            "Example.Show.S01",
+            vec![File::new("Example.Show.S01/E01.mkv", 90)],
+        );
+        assert_eq!(
+            assess_metafile(&strict_size_mismatch, &searchee, &strict, false, 0.05).decision,
+            Decision::SizeMismatch
+        );
+
+        let partial_size_mismatch = metafile(
+            "6666666666666666666666666666666666666666",
+            "Example.Show.S01",
+            vec![
+                File::new("Example.Show.S01/E01.mkv", 100),
+                File::new("Example.Show.S01/E03.mkv", 100),
+                File::new("Example.Show.S01/E04.mkv", 100),
+            ],
+        );
+        assert_eq!(
+            assess_metafile(&partial_size_mismatch, &searchee, &partial, false, 0.05).decision,
+            Decision::PartialSizeMismatch
+        );
+
+        let partial_piece_mismatch = metafile_with_piece_length(
+            "7777777777777777777777777777777777777777",
+            "Example.Show.S01",
+            512,
+            vec![
+                File::new("Example.Show.S01/E01.mkv", 950),
+                File::new("Example.Show.S01/E03.mkv", 50),
+            ],
+        );
+        assert_eq!(
+            assess_metafile(&partial_piece_mismatch, &searchee, &partial, false, 0.05).decision,
+            Decision::FileTreeMismatch
+        );
+    }
+
+    #[test]
+    fn virtual_exact_matching_uses_file_names_not_paths() {
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclusions = BTreeSet::new();
+        let options = options(&blocklist, MatchMode::Strict, false, &exclusions);
+        let searchee = Searchee::from_files(
+            "Example.Show.S01",
+            "Example.Show.S01",
+            vec![File::new("/library/Example.Show/Season 01/E01.mkv", 100)],
+        );
+        assert_eq!(searchee.source(), crate::domain::SearcheeSource::Virtual);
+        let candidate = metafile(
+            "8888888888888888888888888888888888888888",
+            "Example.Show.S01",
+            vec![File::new("Example.Show.S01/E01.mkv", 100)],
+        );
+
+        assert_eq!(
+            assess_metafile(&candidate, &searchee, &options, false, 0.05).decision,
+            Decision::Match
+        );
+    }
+
+    #[test]
+    fn size_matching_prefers_same_names_for_duplicate_lengths() {
+        let candidates = vec![
+            File::new("candidate/episode-one.mkv", 100),
+            File::new("candidate/episode-two.mkv", 100),
+        ];
+        let locals = vec![
+            File::with_name("episode-two.mkv", "local/random-a.mkv", 100),
+            File::with_name("episode-one.mkv", "local/random-b.mkv", 100),
+        ];
+
+        let pairs = super::matched_pairs(&candidates, &locals);
+
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0.name, pairs[0].1.name);
+        assert_eq!(pairs[1].0.name, pairs[1].1.name);
+    }
+
+    #[test]
     fn rejects_conservative_candidate_predownload_mismatches() {
         let blocklist = Blocklist::parse(&[]).expect("blocklist");
         let exclusions = BTreeSet::new();
@@ -902,11 +996,20 @@ mod tests {
     }
 
     fn metafile(hash: &str, name: &str, files: Vec<File<'static>>) -> Metafile<'static> {
+        metafile_with_piece_length(hash, name, 50, files)
+    }
+
+    fn metafile_with_piece_length(
+        hash: &str,
+        name: &str,
+        piece_length: u64,
+        files: Vec<File<'static>>,
+    ) -> Metafile<'static> {
         let mut metafile = Metafile::from_files(
             InfoHash::from_validated(hash.to_owned()),
             name.to_owned(),
             name.to_owned(),
-            50,
+            piece_length,
             files,
         );
         metafile.media_type = if name.contains("S01E") {
