@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 clap = "4"
+filetime = "0.2"
 getrandom = "0.3"
 notify = "8"
 quick-xml = "0.38"
