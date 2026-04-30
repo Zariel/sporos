@@ -141,9 +141,17 @@ pub fn parse_metafile(input: &[u8]) -> crate::Result<Metafile<'static>> {
         required_nonnegative_integer(dict_get(info_dict, b"piece length"), "info.piece length")?;
     let files = normalized_files(name.as_ref(), info_dict)?;
     let trackers = tracker_hosts(root);
+    let parsed_title = crate::search::parse_title(name.as_ref(), &files, None);
+    let title = parsed_title
+        .as_ref()
+        .map(|parsed| Cow::Owned(parsed.title.clone()))
+        .unwrap_or_else(|| name.clone());
 
-    let mut metafile = Metafile::from_files(info_hash, name.clone(), name, piece_length, files);
+    let mut metafile = Metafile::from_files(info_hash, name, title, piece_length, files);
     metafile.trackers = trackers;
+    if let Some(parsed_title) = parsed_title {
+        metafile.media_type = parsed_title.media_type;
+    }
 
     Ok(metafile.into_owned())
 }

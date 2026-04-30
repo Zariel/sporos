@@ -649,6 +649,7 @@ dependencies = [
  "criterion",
  "getrandom",
  "proptest",
+ "regex",
  "rusqlite",
  "sha1",
  "thiserror",
