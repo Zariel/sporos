@@ -1,7 +1,8 @@
 //! Torrent-client adapter boundary and client mutation operations.
 
-use std::{borrow::Cow, collections::BTreeMap, path::PathBuf};
+use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, time::Duration};
 
+use reqwest::blocking::multipart;
 use url::Url;
 
 use crate::{
@@ -190,6 +191,298 @@ pub trait TorrentClient {
     fn validate_config(&self) -> crate::Result<()>;
 }
 
+/// qBittorrent Web API adapter.
+pub struct QbittorrentClient {
+    identity: ClientIdentity,
+    base_url: String,
+    username: String,
+    password: String,
+    client: reqwest::blocking::Client,
+}
+
+impl QbittorrentClient {
+    /// Build a qBittorrent adapter from normalized identity metadata.
+    pub fn new(identity: ClientIdentity, timeout: Option<Duration>) -> crate::Result<Self> {
+        let mut url = Url::parse(&identity.url)
+            .map_err(|error| client_error(format!("invalid qBittorrent URL: {error}")))?;
+        let username = url.username().to_owned();
+        let password = url.password().unwrap_or_default().to_owned();
+        url.set_username("")
+            .map_err(|()| client_error("failed to sanitize qBittorrent username"))?;
+        url.set_password(None)
+            .map_err(|()| client_error("failed to sanitize qBittorrent password"))?;
+        let mut builder = reqwest::blocking::Client::builder()
+            .cookie_store(true)
+            .user_agent(format!("CrossSeed/{}", crate::VERSION));
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder.build().map_err(|error| {
+            client_error(format!("failed to build qBittorrent client: {error}"))
+        })?;
+        Ok(Self {
+            identity,
+            base_url: url.to_string().trim_end_matches('/').to_owned(),
+            username,
+            password,
+            client,
+        })
+    }
+
+    fn login(&self) -> crate::Result<()> {
+        let response = self
+            .client
+            .post(self.api_url("/api/v2/auth/login"))
+            .form(&[
+                ("username", self.username.as_str()),
+                ("password", self.password.as_str()),
+            ])
+            .send()
+            .map_err(|error| client_error(format!("qBittorrent login failed: {error}")))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(client_error(format!(
+                "qBittorrent login returned {}",
+                response.status()
+            )))
+        }
+    }
+
+    fn api_url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    fn get_text(&self, path: &str) -> crate::Result<String> {
+        self.login()?;
+        self.client
+            .get(self.api_url(path))
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("qBittorrent request failed: {error}")))?
+            .text()
+            .map_err(|error| client_error(format!("failed to read qBittorrent response: {error}")))
+    }
+
+    fn post_form(&self, path: &str, form: &[(&str, &str)]) -> crate::Result<()> {
+        self.login()?;
+        self.client
+            .post(self.api_url(path))
+            .form(form)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("qBittorrent mutation failed: {error}")))?;
+        Ok(())
+    }
+
+    fn torrent_info(&self, info_hash: &InfoHash<'_>) -> crate::Result<Option<QbTorrentInfo>> {
+        self.login()?;
+        let response = self
+            .client
+            .get(self.api_url("/api/v2/torrents/info"))
+            .query(&[("hashes", info_hash.as_str())])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("qBittorrent info request failed: {error}")))?
+            .text()
+            .map_err(|error| client_error(format!("failed to read qBittorrent info: {error}")))?;
+        let mut torrents = parse_qb_torrents(&response)?;
+        Ok(torrents.pop())
+    }
+
+    fn torrent_files(&self, info_hash: &str) -> crate::Result<Vec<File<'static>>> {
+        self.login()?;
+        let response = self
+            .client
+            .get(self.api_url("/api/v2/torrents/files"))
+            .query(&[("hash", info_hash)])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("qBittorrent files request failed: {error}")))?
+            .text()
+            .map_err(|error| client_error(format!("failed to read qBittorrent files: {error}")))?;
+        parse_qb_files(&response)
+    }
+
+    fn torrent_trackers(&self, info_hash: &str) -> crate::Result<Vec<Cow<'static, str>>> {
+        self.login()?;
+        let response = self
+            .client
+            .get(self.api_url("/api/v2/torrents/trackers"))
+            .query(&[("hash", info_hash)])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("qBittorrent trackers request failed: {error}")))?
+            .text()
+            .map_err(|error| {
+                client_error(format!("failed to read qBittorrent trackers: {error}"))
+            })?;
+        parse_qb_trackers(&response)
+    }
+
+    fn post_hash_action(
+        &self,
+        primary: &str,
+        fallback: &str,
+        info_hash: &InfoHash<'_>,
+    ) -> crate::Result<()> {
+        self.login()?;
+        let form = [("hashes", info_hash.as_str())];
+        let primary = self.client.post(self.api_url(primary)).form(&form).send();
+        match primary {
+            Ok(response) if response.status().is_success() => Ok(()),
+            _ => self.post_form(fallback, &form),
+        }
+    }
+}
+
+impl TorrentClient for QbittorrentClient {
+    fn metadata(&self) -> &TorrentClientMetadata<'_> {
+        &self.identity.metadata
+    }
+
+    fn is_torrent_in_client(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self.torrent_info(info_hash)?.is_some())
+    }
+
+    fn is_torrent_complete(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self
+            .torrent_info(info_hash)?
+            .is_some_and(|torrent| torrent.complete()))
+    }
+
+    fn is_torrent_checking(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self
+            .torrent_info(info_hash)?
+            .is_some_and(|torrent| torrent.checking()))
+    }
+
+    fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
+        let body = self.get_text("/api/v2/torrents/info")?;
+        let mut output = Vec::new();
+        for torrent in parse_qb_torrents(&body)? {
+            let files = self.torrent_files(&torrent.hash)?;
+            let trackers = self.torrent_trackers(&torrent.hash)?;
+            let Some(info_hash) = InfoHash::new(torrent.hash.clone()) else {
+                continue;
+            };
+            let complete = torrent.complete();
+            let checking = torrent.checking();
+            output.push(ClientTorrent {
+                info_hash: info_hash.into_owned(),
+                name: Cow::Owned(torrent.name),
+                files,
+                save_path: Cow::Owned(torrent.save_path),
+                category: torrent.category.map(ClientLabel::new),
+                tags: split_qb_tags(torrent.tags),
+                trackers,
+                complete,
+                checking,
+            });
+        }
+        Ok(output)
+    }
+
+    fn get_download_dir(
+        &self,
+        metafile: &Metafile<'_>,
+        options: DownloadDirOptions,
+    ) -> crate::Result<Result<PathBuf, ClientErrorCode>> {
+        let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
+            return Ok(Err(ClientErrorCode::NotFound));
+        };
+        if options.only_completed && !torrent.complete() {
+            return Ok(Err(ClientErrorCode::TorrentNotComplete));
+        }
+        Ok(Ok(PathBuf::from(torrent.save_path)))
+    }
+
+    fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>> {
+        let body = self.get_text("/api/v2/torrents/info")?;
+        Ok(parse_qb_torrents(&body)?
+            .into_iter()
+            .map(|torrent| (torrent.hash, PathBuf::from(torrent.save_path)))
+            .collect())
+    }
+
+    fn inject(
+        &self,
+        new_torrent: &NewTorrent<'_>,
+        _searchee: &Searchee<'_>,
+        _decision: Decision,
+        options: &InjectionOptions,
+    ) -> crate::Result<InjectionResult> {
+        ensure_writable(self)?;
+        self.login()?;
+        let mut form = multipart::Form::new().part(
+            "torrents",
+            multipart::Part::bytes(new_torrent.bytes.clone().into_owned())
+                .file_name(format!("{}.torrent", new_torrent.metafile.info_hash)),
+        );
+        if let Some(destination) = &options.destination_dir {
+            form = form.text("savepath", destination.display().to_string());
+        }
+        if let Some(category) = &options.category {
+            form = form.text("category", category.as_str().to_owned());
+        }
+        if !options.tags.is_empty() {
+            form = form.text(
+                "tags",
+                options
+                    .tags
+                    .iter()
+                    .map(ClientLabel::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        form = form
+            .text("paused", options.paused.to_string())
+            .text("skip_checking", options.skip_checking.to_string())
+            .text("contentLayout", "Original");
+        self.client
+            .post(self.api_url("/api/v2/torrents/add"))
+            .multipart(form)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("qBittorrent add failed: {error}")))?;
+        Ok(InjectionResult::Injected)
+    }
+
+    fn recheck_torrent(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
+        self.post_hash_action(
+            "/api/v2/torrents/recheck",
+            "/api/v2/torrents/recheck",
+            info_hash,
+        )
+    }
+
+    fn resume_injection(
+        &self,
+        metafile: &Metafile<'_>,
+        _decision: Decision,
+        _options: ResumeOptions,
+    ) -> crate::Result<()> {
+        self.post_hash_action(
+            "/api/v2/torrents/start",
+            "/api/v2/torrents/resume",
+            &metafile.info_hash,
+        )
+    }
+
+    fn validate_config(&self) -> crate::Result<()> {
+        self.login()?;
+        let version = self.get_text("/api/v2/app/version")?;
+        if !qb_version_at_least(&version, 4, 3, 1) {
+            return Err(client_error(format!(
+                "qBittorrent version {version} is below 4.3.1"
+            )));
+        }
+        let _preferences = self.get_text("/api/v2/app/preferences")?;
+        Ok(())
+    }
+}
+
 /// Build client identities from config order and URL host/path rules.
 pub fn client_identities(configs: &[TorrentClientConfig]) -> crate::Result<Vec<ClientIdentity>> {
     let mut host_counts = BTreeMap::<String, usize>::new();
@@ -312,6 +605,107 @@ pub fn ensure_writable(client: &dyn TorrentClient) -> crate::Result<()> {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct QbTorrentInfo {
+    hash: String,
+    name: String,
+    #[serde(rename = "save_path", default)]
+    save_path: String,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    tags: Option<String>,
+    #[serde(default)]
+    progress: f64,
+    #[serde(default)]
+    state: String,
+}
+
+impl QbTorrentInfo {
+    fn complete(&self) -> bool {
+        self.progress >= 1.0
+            || matches!(
+                self.state.as_str(),
+                "uploading" | "stalledUP" | "forcedUP" | "queuedUP"
+            )
+    }
+
+    fn checking(&self) -> bool {
+        self.state.to_ascii_lowercase().contains("check")
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QbFileInfo {
+    name: String,
+    size: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QbTrackerInfo {
+    url: String,
+}
+
+fn parse_qb_torrents(body: &str) -> crate::Result<Vec<QbTorrentInfo>> {
+    serde_json::from_str(body)
+        .map_err(|error| client_error(format!("failed to parse qBittorrent torrents: {error}")))
+}
+
+fn parse_qb_files(body: &str) -> crate::Result<Vec<File<'static>>> {
+    let files = serde_json::from_str::<Vec<QbFileInfo>>(body)
+        .map_err(|error| client_error(format!("failed to parse qBittorrent files: {error}")))?;
+    Ok(files
+        .into_iter()
+        .map(|file| File::new(file.name, file.size))
+        .collect())
+}
+
+fn parse_qb_trackers(body: &str) -> crate::Result<Vec<Cow<'static, str>>> {
+    let trackers = serde_json::from_str::<Vec<QbTrackerInfo>>(body)
+        .map_err(|error| client_error(format!("failed to parse qBittorrent trackers: {error}")))?;
+    Ok(trackers
+        .into_iter()
+        .filter_map(|tracker| tracker_host(&tracker.url))
+        .map(Cow::Owned)
+        .collect())
+}
+
+fn tracker_host(value: &str) -> Option<String> {
+    Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+}
+
+fn split_qb_tags(tags: Option<String>) -> Vec<ClientLabel<'static>> {
+    tags.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(|tag| ClientLabel::new(tag.to_owned()))
+        .collect()
+}
+
+fn qb_version_at_least(version: &str, major: u32, minor: u32, patch: u32) -> bool {
+    let version = version.trim_start_matches('v');
+    let parts = version
+        .split('.')
+        .take(3)
+        .map(|part| {
+            part.chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u32>()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let current = (
+        parts.first().copied().unwrap_or_default(),
+        parts.get(1).copied().unwrap_or_default(),
+        parts.get(2).copied().unwrap_or_default(),
+    );
+    current >= (major, minor, patch)
+}
+
 fn parse_client_kind(value: &str) -> crate::Result<TorrentClientKind> {
     match value {
         "qbittorrent" => Ok(TorrentClientKind::QBittorrent),
@@ -342,8 +736,9 @@ fn client_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent, ResumeOptions,
-        TorrentClient, client_identities, client_torrent_to_searchee, select_injection_client,
+        ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent, QbittorrentClient,
+        ResumeOptions, TorrentClient, client_identities, client_torrent_to_searchee,
+        select_injection_client,
     };
     use crate::{
         config::TorrentClientConfig,
@@ -352,7 +747,15 @@ mod tests {
             TorrentClientKind, TorrentClientMetadata,
         },
     };
-    use std::{borrow::Cow, collections::BTreeMap, path::PathBuf};
+    use std::{
+        borrow::Cow,
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        thread,
+        time::Duration,
+    };
 
     #[test]
     fn derives_client_hosts_from_unique_host_or_path() {
@@ -450,6 +853,131 @@ mod tests {
         assert!(select_injection_client(&[&readonly], &data_source).is_err());
     }
 
+    #[test]
+    fn qbittorrent_validates_version_and_preferences() {
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", "v4.6.2"),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", r#"{"save_path":"/downloads"}"#),
+        ]);
+        let client = qb_client(&server.url);
+
+        client.validate_config().expect("validate");
+
+        let requests = server.join();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("POST /api/v2/auth/login "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("GET /api/v2/app/version "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("GET /api/v2/app/preferences "))
+        );
+    }
+
+    #[test]
+    fn qbittorrent_maps_inventory_files_and_trackers() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads","category":"tv","tags":"tag, cross-seed","progress":1.0,"state":"uploading"}}]"#
+                ),
+            ),
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                r#"[{"name":"Example.Show.S01E01.mkv","size":123}]"#,
+            ),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", r#"[{"url":"https://tracker.example/announce"}]"#),
+        ]);
+        let client = qb_client(&server.url);
+
+        let torrents = client.get_all_torrents().expect("inventory");
+
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].info_hash.as_str(), hash);
+        assert_eq!(torrents[0].files[0].path, "Example.Show.S01E01.mkv");
+        assert_eq!(
+            torrents[0].category.as_ref().map(ClientLabel::as_str),
+            Some("tv")
+        );
+        assert_eq!(torrents[0].tags.len(), 2);
+        assert_eq!(torrents[0].trackers[0], "tracker.example");
+        assert!(torrents[0].complete);
+        let requests = server.join();
+        assert!(requests.iter().any(|request| {
+            request.contains(
+                "GET /api/v2/torrents/files?hash=0123456789abcdef0123456789abcdef01234567 ",
+            )
+        }));
+    }
+
+    #[test]
+    fn qbittorrent_injects_with_multipart_add_and_starts() {
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", ""),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", ""),
+        ]);
+        let client = qb_client(&server.url);
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let new_torrent = NewTorrent {
+            metafile,
+            bytes: Cow::Owned(bytes),
+        };
+        let searchee = Searchee::from_files("Inject.Release", "Inject.Release", Vec::new());
+
+        let result = client
+            .inject(
+                &new_torrent,
+                &searchee,
+                Decision::Match,
+                &InjectionOptions {
+                    destination_dir: Some(PathBuf::from("/linked")),
+                    category: Some(ClientLabel::new("tv")),
+                    tags: vec![ClientLabel::new("cross-seed")],
+                    paused: true,
+                    skip_checking: true,
+                },
+            )
+            .expect("inject");
+        client
+            .resume_injection(
+                &new_torrent.metafile,
+                Decision::Match,
+                ResumeOptions::default(),
+            )
+            .expect("resume");
+
+        assert_eq!(result, InjectionResult::Injected);
+        let requests = server.join();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("POST /api/v2/torrents/add "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("POST /api/v2/torrents/start "))
+        );
+    }
+
     struct FakeClient {
         metadata: TorrentClientMetadata<'static>,
     }
@@ -527,5 +1055,60 @@ mod tests {
         fn validate_config(&self) -> crate::Result<()> {
             Ok(())
         }
+    }
+
+    fn qb_client(base_url: &str) -> QbittorrentClient {
+        let identity =
+            client_identities(&[
+                TorrentClientConfig::parse(&format!("qbittorrent:{base_url}")).expect("config"),
+            ])
+            .expect("identity")
+            .into_iter()
+            .next()
+            .expect("identity");
+        QbittorrentClient::new(identity, Some(Duration::from_secs(1))).expect("client")
+    }
+
+    struct TestHttpServer {
+        url: String,
+        handle: thread::JoinHandle<Vec<String>>,
+    }
+
+    impl TestHttpServer {
+        fn join(self) -> Vec<String> {
+            self.handle.join().expect("server joins")
+        }
+    }
+
+    fn http_server(responses: Vec<String>) -> TestHttpServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0_u8; 8192];
+                let read = stream.read(&mut buf).expect("read");
+                requests.push(String::from_utf8_lossy(&buf[..read]).into_owned());
+                stream.write_all(response.as_bytes()).expect("write");
+            }
+            requests
+        });
+        TestHttpServer { url, handle }
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {
+        format!(
+            "d4:infod6:lengthi{length}e4:name{}:{name}12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee",
+            name.len()
+        )
+        .into_bytes()
     }
 }
