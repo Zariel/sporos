@@ -1,10 +1,22 @@
 //! Searchee discovery, filtering, Torznab queries, RSS, and announce workflows.
 
-use std::{borrow::Cow, path::Path, sync::LazyLock};
+use std::{
+    borrow::Cow,
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+    time::UNIX_EPOCH,
+};
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
+use walkdir::{DirEntry, WalkDir};
 
-use crate::domain::{File, MediaType};
+use crate::{
+    SporosError,
+    domain::{File, MediaType, Searchee},
+};
 
 static EPISODE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?P<title>.*?)[ ._\-\[]+s(?P<season>\d{1,2})[ ._\-\]]*e(?P<episode>\d{1,3})\b")
@@ -55,6 +67,153 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 const VIDEO_DISC_EXTENSIONS: &[&str] = &["iso", "vob", "m2ts", "mts"];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "alac"];
 const BOOK_EXTENSIONS: &[&str] = &["epub", "mobi", "azw", "azw3", "pdf", "cbr", "cbz"];
+
+/// Active recursive data-dir watcher. Dropping it stops watching.
+pub struct DataDirWatchState {
+    watcher: RecommendedWatcher,
+    roots: Vec<PathBuf>,
+}
+
+impl DataDirWatchState {
+    /// Watched data-dir roots.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// Keep the watcher handle observable without exposing notify internals.
+    pub fn is_active(&self) -> bool {
+        let _watcher = &self.watcher;
+        true
+    }
+}
+
+/// Start one recursive watcher over all configured data dirs.
+pub fn watch_data_dirs<F>(data_dirs: &[PathBuf], handler: F) -> crate::Result<DataDirWatchState>
+where
+    F: FnMut(notify::Result<notify::Event>) + Send + 'static,
+{
+    let mut watcher = notify::recommended_watcher(handler)
+        .map_err(|error| search_error(format!("failed to create data-dir watcher: {error}")))?;
+    for data_dir in data_dirs {
+        watcher
+            .watch(data_dir, RecursiveMode::Recursive)
+            .map_err(|error| {
+                search_error(format!("failed to watch {}: {error}", data_dir.display()))
+            })?;
+    }
+    Ok(DataDirWatchState {
+        watcher,
+        roots: data_dirs.to_vec(),
+    })
+}
+
+/// Discover candidate release roots below a data-dir using a bounded walk.
+pub fn find_potential_nested_roots(root: &Path, max_depth: u32) -> crate::Result<Vec<PathBuf>> {
+    let mut roots = BTreeSet::new();
+    for entry in WalkDir::new(root)
+        .max_depth(max_depth as usize + 1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !ignored_directory(entry))
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!("skipping data-dir entry: {error}");
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() || !path_has_extension(entry.path(), VIDEO_EXTENSIONS) {
+            continue;
+        }
+        if let Some(parent) = entry.path().parent() {
+            roots.insert(parent.to_path_buf());
+        }
+    }
+
+    let mut roots = roots.into_iter().collect::<Vec<_>>();
+    roots.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    Ok(roots)
+}
+
+/// Recompute affected parent roots for a changed path up to `maxDataDepth`.
+pub fn affected_roots_for_changed_path(
+    data_dir: &Path,
+    changed_path: &Path,
+    max_depth: u32,
+) -> Vec<PathBuf> {
+    let mut affected = Vec::new();
+    let mut current = if changed_path.is_dir() {
+        changed_path.to_path_buf()
+    } else {
+        changed_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| changed_path.to_path_buf())
+    };
+
+    for _ in 0..=max_depth {
+        if current.starts_with(data_dir) {
+            affected.push(current.clone());
+        }
+        if current == data_dir {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    affected
+}
+
+/// Build a searchee from a data-dir file or release root.
+pub fn create_searchee_from_path(path: &Path) -> crate::Result<Option<Searchee<'static>>> {
+    let mut files = Vec::new();
+    let mut newest_mtime = None;
+    gather_files(path, &mut files, &mut newest_mtime)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.display().to_string());
+    let Some(parsed) = parse_title(&name, &files, path.to_str()) else {
+        return Ok(None);
+    };
+
+    let mut searchee = Searchee::from_files(name, parsed.title, files);
+    searchee.path = Some(Cow::Owned(path.display().to_string()));
+    searchee.mtime_millis = newest_mtime;
+    searchee.media_type = parsed.media_type;
+    Ok(Some(searchee.into_owned()))
+}
+
+/// Discover and build data-dir searchees in bounded batches.
+pub fn data_dir_searchees(
+    data_dirs: &[PathBuf],
+    max_depth: u32,
+) -> crate::Result<Vec<Searchee<'static>>> {
+    let mut searchees = Vec::new();
+    for data_dir in data_dirs {
+        for root in find_potential_nested_roots(data_dir, max_depth)? {
+            if let Some(searchee) = create_searchee_from_path(&root)? {
+                searchees.push(searchee);
+            }
+        }
+    }
+    Ok(searchees)
+}
 
 /// Parsed title and metadata used by search grouping and compatibility checks.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -287,6 +446,84 @@ fn extension_in(file: &File<'_>, extensions: &[&str]) -> bool {
         .is_some_and(|extension| extensions.contains(&extension))
 }
 
+fn path_has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| extensions.contains(&extension.as_str()))
+}
+
+fn ignored_directory(entry: &DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+    [
+        "sample",
+        "proof",
+        "bdmv",
+        "bdrom",
+        "certificate",
+        "video_ts",
+    ]
+    .iter()
+    .any(|ignored| name.contains(ignored))
+}
+
+fn gather_files(
+    path: &Path,
+    output: &mut Vec<File<'static>>,
+    newest_mtime: &mut Option<u64>,
+) -> crate::Result<()> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| search_error(format!("failed to stat {}: {error}", path.display())))?;
+    if metadata.is_file() {
+        push_file(path, &metadata, output, newest_mtime);
+        return Ok(());
+    }
+
+    for entry in WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !ignored_directory(entry))
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!("skipping data-dir file: {error}");
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!("skipping data-dir metadata: {error}");
+                continue;
+            }
+        };
+        push_file(entry.path(), &metadata, output, newest_mtime);
+    }
+    Ok(())
+}
+
+fn push_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    output: &mut Vec<File<'static>>,
+    newest_mtime: &mut Option<u64>,
+) {
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+            let millis = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+            *newest_mtime = Some(newest_mtime.map_or(millis, |current| current.max(millis)));
+        }
+    }
+    output.push(File::new(path.display().to_string(), metadata.len()));
+}
+
 fn extension_is(file: &File<'_>, expected: &str) -> bool {
     extension(file).as_deref() == Some(expected)
 }
@@ -388,6 +625,12 @@ fn agreed_meta(
         .then(|| first.to_owned())
 }
 
+fn search_error(message: impl Into<Cow<'static, str>>) -> SporosError {
+    SporosError::Search {
+        message: message.into(),
+    }
+}
+
 /// Apply parsed title metadata to a domain object represented by title and media fields.
 pub fn parsed_name_and_media<'a>(
     name: &'a str,
@@ -401,8 +644,16 @@ pub fn parsed_name_and_media<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_media_type, parse_title};
+    use super::{
+        affected_roots_for_changed_path, create_searchee_from_path, find_potential_nested_roots,
+        get_media_type, parse_title,
+    };
     use crate::domain::{File, MediaType};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn classifies_media_type_in_documented_order() {
@@ -479,5 +730,66 @@ mod tests {
         assert!(
             parse_title("Season 2", &[File::new("Episode.One.S02E01.mkv", 10)], None).is_none()
         );
+    }
+
+    #[test]
+    fn discovers_nested_roots_deepest_first_and_ignores_samples() {
+        let root = temp_path("nested-roots");
+        fs::create_dir_all(root.join("Show/Season 1")).expect("season dir");
+        fs::create_dir_all(root.join("Show/Sample")).expect("sample dir");
+        fs::write(root.join("Show/Season 1/Show.S01E01.mkv"), b"video").expect("episode");
+        fs::write(root.join("Show/Sample/sample.mkv"), b"sample").expect("sample");
+        fs::write(root.join("readme.txt"), b"text").expect("text");
+
+        let roots = find_potential_nested_roots(&root, 2).expect("roots");
+
+        assert_eq!(roots, vec![root.join("Show/Season 1")]);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn creates_data_dir_searchee_with_title_mtime_and_files() {
+        let root = temp_path("searchee");
+        let release = root.join("Example Show");
+        fs::create_dir_all(&release).expect("root");
+        let episode = release.join("Example.Show.S01E02.mkv");
+        let subtitle = release.join("Example.Show.S01E02.srt");
+        fs::write(&episode, b"video bytes").expect("episode");
+        fs::write(&subtitle, b"sub").expect("subtitle");
+
+        let searchee = create_searchee_from_path(&release)
+            .expect("create")
+            .expect("searchee");
+
+        assert_eq!(searchee.title, "Example Show S01E02");
+        assert_eq!(searchee.media_type, MediaType::Episode);
+        assert_eq!(searchee.files.len(), 2);
+        assert!(searchee.mtime_millis.is_some());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_path_maps_to_parents_within_max_depth() {
+        let data_dir = PathBuf::from("/data");
+        let changed = PathBuf::from("/data/show/season/episode.mkv");
+
+        let affected = affected_roots_for_changed_path(&data_dir, &changed, 2);
+
+        assert_eq!(
+            affected,
+            vec![
+                PathBuf::from("/data/show/season"),
+                PathBuf::from("/data/show"),
+                PathBuf::from("/data")
+            ]
+        );
+    }
+
+    fn temp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("sporos-search-{label}-{nanos}"))
     }
 }
