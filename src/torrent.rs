@@ -6,11 +6,15 @@ use sha1::{Digest, Sha1};
 
 use crate::{
     SporosError,
-    domain::{ClientLabel, File, InfoHash, Metafile},
+    domain::{ClientLabel, File, InfoHash, MediaType, Metafile},
 };
 
 type DictEntry<'a> = (Cow<'a, [u8]>, Bencode<'a>);
 type DictEntries<'a> = [DictEntry<'a>];
+const TORRENT_CACHE_DIR: &str = "torrent_cache";
+const CACHED_TORRENT_SUFFIX: &str = ".cached.torrent";
+const TORRENT_SUFFIX: &str = ".torrent";
+const MAX_PATH_BYTES: usize = 255;
 
 /// Borrowed bencode value with its original byte span.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -168,6 +172,132 @@ pub fn apply_qbittorrent_fastresume_metadata(
     }
 
     Ok(())
+}
+
+/// Metadata encoded into saved torrent filenames.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SavedTorrentMetadata<'a> {
+    /// Media type bracket.
+    pub media_type: MediaType,
+    /// Tracker bracket.
+    pub tracker: Cow<'a, str>,
+    /// Release name.
+    pub name: Cow<'a, str>,
+    /// Torrent info hash.
+    pub info_hash: InfoHash<'a>,
+    /// Whether this represents restored cached output.
+    pub cached: bool,
+}
+
+impl<'a> SavedTorrentMetadata<'a> {
+    /// Build saved torrent metadata.
+    pub fn new(
+        media_type: MediaType,
+        tracker: impl Into<Cow<'a, str>>,
+        name: impl Into<Cow<'a, str>>,
+        info_hash: InfoHash<'a>,
+        cached: bool,
+    ) -> Self {
+        Self {
+            media_type,
+            tracker: tracker.into(),
+            name: name.into(),
+            info_hash,
+            cached,
+        }
+    }
+}
+
+/// Directory used for downloaded candidate torrent cache files.
+pub fn torrent_cache_dir(app_dir: &std::path::Path) -> std::path::PathBuf {
+    app_dir.join(TORRENT_CACHE_DIR)
+}
+
+/// Cache path for `<infoHash>.cached.torrent`.
+pub fn torrent_cache_path(
+    app_dir: &std::path::Path,
+    info_hash: &InfoHash<'_>,
+) -> std::path::PathBuf {
+    torrent_cache_dir(app_dir).join(format!("{}{}", info_hash.as_str(), CACHED_TORRENT_SUFFIX))
+}
+
+/// Build a saved torrent filename without output-dir path truncation.
+pub fn saved_torrent_filename(metadata: &SavedTorrentMetadata<'_>) -> String {
+    format!(
+        "[{}][{}]{}[{}]{}",
+        metadata.media_type,
+        filesystem_safe_component(metadata.tracker.as_ref()),
+        filesystem_safe_component(metadata.name.as_ref()),
+        metadata.info_hash,
+        if metadata.cached {
+            CACHED_TORRENT_SUFFIX
+        } else {
+            TORRENT_SUFFIX
+        }
+    )
+}
+
+/// Build the saved torrent path and truncate the safe release name so the full
+/// path stays within 255 bytes.
+pub fn torrent_save_path(
+    output_dir: &std::path::Path,
+    metadata: &SavedTorrentMetadata<'_>,
+) -> std::path::PathBuf {
+    let safe_tracker = filesystem_safe_component(metadata.tracker.as_ref());
+    let mut safe_name = filesystem_safe_component(metadata.name.as_ref());
+    let suffix = if metadata.cached {
+        CACHED_TORRENT_SUFFIX
+    } else {
+        TORRENT_SUFFIX
+    };
+    let fixed = format!(
+        "[{}][{}][{}]{}",
+        metadata.media_type, safe_tracker, metadata.info_hash, suffix
+    );
+    let separator_bytes = if output_dir.as_os_str().is_empty() {
+        0
+    } else {
+        std::path::MAIN_SEPARATOR_STR.len()
+    };
+    let dir_bytes = output_dir.as_os_str().as_encoded_bytes().len();
+    let max_name_bytes = MAX_PATH_BYTES.saturating_sub(dir_bytes + separator_bytes + fixed.len());
+    truncate_to_bytes(&mut safe_name, max_name_bytes);
+
+    output_dir.join(format!(
+        "[{}][{}]{}[{}]{}",
+        metadata.media_type, safe_tracker, safe_name, metadata.info_hash, suffix
+    ))
+}
+
+/// Parse metadata from a saved or restored cached torrent filename.
+pub fn parse_metadata_from_filename(filename: &str) -> Option<SavedTorrentMetadata<'static>> {
+    let cached = filename.ends_with(CACHED_TORRENT_SUFFIX);
+    let suffix = if cached {
+        CACHED_TORRENT_SUFFIX
+    } else if filename.ends_with(TORRENT_SUFFIX) {
+        TORRENT_SUFFIX
+    } else {
+        return None;
+    };
+    let stem = filename.strip_suffix(suffix)?;
+    let (media_type, rest) = parse_bracket(stem)?;
+    let (tracker, rest) = parse_bracket(rest)?;
+    if !rest.ends_with(']') {
+        return None;
+    }
+    let hash_start = rest.rfind('[')?;
+    let hash = rest.get(hash_start + 1..rest.len().checked_sub(1)?)?;
+    let name = rest.get(..hash_start)?;
+    let media_type = parse_media_type(media_type)?;
+    let info_hash = InfoHash::new(hash.to_owned())?;
+
+    Some(SavedTorrentMetadata::new(
+        media_type,
+        tracker.to_owned(),
+        name.to_owned(),
+        info_hash.into_owned(),
+        cached,
+    ))
 }
 
 struct Parser<'a> {
@@ -545,6 +675,46 @@ fn hex_digit(nibble: u8) -> char {
     }
 }
 
+fn filesystem_safe_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        })
+        .collect()
+}
+
+fn truncate_to_bytes(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    while value.len() > max_bytes {
+        let _removed = value.pop();
+    }
+}
+
+fn parse_bracket(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    Some((rest.get(..end)?, rest.get(end + 1..)?))
+}
+
+fn parse_media_type(value: &str) -> Option<MediaType> {
+    match value {
+        "episode" => Some(MediaType::Episode),
+        "pack" => Some(MediaType::Pack),
+        "movie" => Some(MediaType::Movie),
+        "anime" => Some(MediaType::Anime),
+        "video" => Some(MediaType::Video),
+        "audio" => Some(MediaType::Audio),
+        "book" => Some(MediaType::Book),
+        "unknown" => Some(MediaType::Unknown),
+        _ => None,
+    }
+}
+
 fn torrent_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Torrent {
         message: message.into(),
@@ -554,6 +724,7 @@ fn torrent_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{Bencode, apply_qbittorrent_fastresume_metadata, bdecode, bencode, parse_metafile};
+    use crate::domain::{InfoHash, MediaType};
     use std::borrow::Cow;
 
     #[test]
@@ -636,6 +807,90 @@ mod tests {
         ]);
 
         assert_eq!(bencode(&value), b"d3:cow3:moo1:ni7ee");
+    }
+
+    #[test]
+    fn cache_path_uses_info_hash_cached_torrent_name() {
+        let hash = InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567");
+        let path = super::torrent_cache_path(std::path::Path::new("/config"), &hash);
+
+        assert_eq!(
+            path,
+            std::path::Path::new("/config")
+                .join("torrent_cache")
+                .join("0123456789abcdef0123456789abcdef01234567.cached.torrent")
+        );
+    }
+
+    #[test]
+    fn saved_torrent_filename_round_trips_metadata() {
+        let hash = InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567");
+        let metadata = super::SavedTorrentMetadata::new(
+            MediaType::Movie,
+            "Tracker/One",
+            "Example:Release 2024",
+            hash,
+            false,
+        );
+        let filename = super::saved_torrent_filename(&metadata);
+        let parsed = super::parse_metadata_from_filename(&filename).expect("metadata parses");
+
+        assert_eq!(
+            filename,
+            "[movie][Tracker_One]Example_Release 2024[0123456789abcdef0123456789abcdef01234567].torrent"
+        );
+        assert_eq!(parsed.media_type, MediaType::Movie);
+        assert_eq!(parsed.tracker, "Tracker_One");
+        assert_eq!(parsed.name, "Example_Release 2024");
+        assert_eq!(
+            parsed.info_hash.as_str(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert!(!parsed.cached);
+    }
+
+    #[test]
+    fn restored_cached_filename_round_trips_metadata() {
+        let hash = InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567");
+        let metadata = super::SavedTorrentMetadata::new(
+            MediaType::Unknown,
+            "UnknownTracker",
+            "Example Release",
+            hash,
+            true,
+        );
+        let filename = super::saved_torrent_filename(&metadata);
+        let parsed = super::parse_metadata_from_filename(&filename).expect("metadata parses");
+
+        assert_eq!(
+            filename,
+            "[unknown][UnknownTracker]Example Release[0123456789abcdef0123456789abcdef01234567].cached.torrent"
+        );
+        assert!(parsed.cached);
+    }
+
+    #[test]
+    fn save_path_truncates_full_path_to_255_bytes() {
+        let hash = InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567");
+        let metadata = super::SavedTorrentMetadata::new(
+            MediaType::Video,
+            "Tracker",
+            "a".repeat(300),
+            hash,
+            false,
+        );
+        let output_dir = std::path::Path::new("/tmp/sporos-long-output-dir");
+        let path = super::torrent_save_path(output_dir, &metadata);
+
+        assert!(path.as_os_str().as_encoded_bytes().len() <= 255);
+        assert!(
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| {
+                    name.starts_with("[video][Tracker]")
+                        && name.ends_with("[0123456789abcdef0123456789abcdef01234567].torrent")
+                })
+        );
     }
 }
 
