@@ -638,3 +638,151 @@ mod tests {
         assert_eq!(bencode(&value), b"d3:cow3:moo1:ni7ee");
     }
 }
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::{Bencode, BencodeValue, bdecode, bencode, parse_metafile};
+    use proptest::{collection, prelude::*};
+    use std::borrow::Cow;
+
+    fn arb_bencode(depth: u32) -> BoxedStrategy<Bencode<'static>> {
+        let leaf = prop_oneof![
+            any::<i64>().prop_map(Bencode::integer),
+            collection::vec(any::<u8>(), 0..64).prop_map(|bytes| Bencode::bytes(Cow::Owned(bytes))),
+        ];
+
+        leaf.prop_recursive(depth, 64, 8, |inner| {
+            prop_oneof![
+                collection::vec(inner.clone(), 0..8).prop_map(Bencode::list),
+                collection::vec((collection::vec(any::<u8>(), 0..16), inner), 0..8).prop_map(
+                    |entries| Bencode::dict(
+                        entries
+                            .into_iter()
+                            .map(|(key, value)| (Cow::Owned(key), value))
+                            .collect(),
+                    ),
+                ),
+            ]
+        })
+        .boxed()
+    }
+
+    fn arb_release_name() -> impl Strategy<Value = String> {
+        "[A-Za-z0-9._ -]{1,32}"
+    }
+
+    fn arb_path_segments() -> impl Strategy<Value = Vec<String>> {
+        collection::vec("[A-Za-z0-9._ -]{0,16}", 1..5)
+    }
+
+    fn same_bencode_value(left: &Bencode<'_>, right: &Bencode<'_>) -> bool {
+        match (&left.value, &right.value) {
+            (BencodeValue::Integer(left), BencodeValue::Integer(right)) => left == right,
+            (BencodeValue::Bytes(left), BencodeValue::Bytes(right)) => {
+                left.as_ref() == right.as_ref()
+            }
+            (BencodeValue::List(left), BencodeValue::List(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| same_bencode_value(left, right))
+            }
+            (BencodeValue::Dict(left), BencodeValue::Dict(right)) => {
+                left.len() == right.len()
+                    && left.iter().zip(right).all(
+                        |((left_key, left_value), (right_key, right_value))| {
+                            left_key.as_ref() == right_key.as_ref()
+                                && same_bencode_value(left_value, right_value)
+                        },
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    fn torrent_with_files(name: String, files: Vec<(u64, Vec<String>)>) -> Bencode<'static> {
+        let file_entries = files
+            .into_iter()
+            .map(|(length, segments)| {
+                Bencode::dict(vec![
+                    (
+                        Cow::Borrowed(b"length".as_slice()),
+                        Bencode::integer(length as i64),
+                    ),
+                    (
+                        Cow::Borrowed(b"path".as_slice()),
+                        Bencode::list(
+                            segments
+                                .into_iter()
+                                .map(|segment| Bencode::bytes(Cow::Owned(segment.into_bytes())))
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect();
+
+        Bencode::dict(vec![
+            (
+                Cow::Borrowed(b"announce".as_slice()),
+                Bencode::bytes(Cow::Borrowed(
+                    b"https://tracker.example/announce".as_slice(),
+                )),
+            ),
+            (
+                Cow::Borrowed(b"info".as_slice()),
+                Bencode::dict(vec![
+                    (
+                        Cow::Borrowed(b"files".as_slice()),
+                        Bencode::list(file_entries),
+                    ),
+                    (
+                        Cow::Borrowed(b"name".as_slice()),
+                        Bencode::bytes(Cow::Owned(name.into_bytes())),
+                    ),
+                    (
+                        Cow::Borrowed(b"piece length".as_slice()),
+                        Bencode::integer(16_384),
+                    ),
+                    (
+                        Cow::Borrowed(b"pieces".as_slice()),
+                        Bencode::bytes(Cow::Owned(vec![b'a'; 20])),
+                    ),
+                ]),
+            ),
+        ])
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_remote_bytes_do_not_panic(input in collection::vec(any::<u8>(), 0..4096)) {
+            let _result = bdecode(&input);
+        }
+
+        #[test]
+        fn generated_bencode_round_trips(value in arb_bencode(4)) {
+            let encoded = bencode(&value);
+            let decoded = bdecode(&encoded).expect("generated bencode should decode");
+
+            prop_assert!(same_bencode_value(&value, &decoded));
+            prop_assert_eq!(bencode(&decoded), encoded);
+        }
+
+        #[test]
+        fn generated_torrent_metafiles_normalize_paths(
+            name in arb_release_name(),
+            files in collection::vec((0_u64..1_000_000, arb_path_segments()), 1..16),
+        ) {
+            let torrent = torrent_with_files(name.clone(), files);
+            let encoded = bencode(&torrent);
+            let metafile = parse_metafile(&encoded).expect("generated torrent should parse");
+
+            prop_assert!(!metafile.files.is_empty());
+            prop_assert_eq!(metafile.length, metafile.files.iter().map(|file| file.length).sum::<u64>());
+            prop_assert!(metafile.files.windows(2).all(|window| window[0].path <= window[1].path));
+            prop_assert!(metafile.files.iter().all(|file| file.path.starts_with(&name)));
+            prop_assert!(metafile.files.iter().all(|file| !file.path.contains("//")));
+        }
+    }
+}
