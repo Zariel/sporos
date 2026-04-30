@@ -16,7 +16,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     SporosError,
-    domain::{File, MediaType, Searchee},
+    domain::{ClientLabel, File, Label, MediaType, Searchee},
     persistence::Database,
     torrent::parse_metafile,
 };
@@ -88,6 +88,202 @@ pub struct TorrentDirIndexResult {
     pub torrents_removed: usize,
     /// Files that could not be read or parsed.
     pub files_failed: usize,
+}
+
+/// Parsed blocklist with compatibility warnings for legacy entries.
+#[derive(Debug)]
+pub struct Blocklist {
+    rules: Vec<BlocklistRule>,
+    legacy_warnings: Vec<String>,
+}
+
+impl Blocklist {
+    /// Parse configured blocklist strings.
+    pub fn parse(entries: &[String]) -> crate::Result<Self> {
+        let mut rules = Vec::with_capacity(entries.len());
+        let mut legacy_warnings = Vec::new();
+        for entry in entries {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let rule = if let Some(value) = trimmed.strip_prefix("regex:") {
+                BlocklistRule::NameRegex(Regex::new(value).map_err(|error| {
+                    search_error(format!(
+                        "invalid blockList regex entry {trimmed:?}: {error}"
+                    ))
+                })?)
+            } else if let Some(value) = trimmed.strip_prefix("folderRegex:") {
+                BlocklistRule::FolderRegex(Regex::new(value).map_err(|error| {
+                    search_error(format!(
+                        "invalid blockList folderRegex entry {trimmed:?}: {error}"
+                    ))
+                })?)
+            } else if let Some(value) = trimmed.strip_prefix("name:") {
+                BlocklistRule::NameContains(value.to_ascii_lowercase())
+            } else if let Some(value) = trimmed.strip_prefix("category:") {
+                BlocklistRule::Category(value.to_ascii_lowercase())
+            } else if let Some(value) = trimmed.strip_prefix("tag:") {
+                BlocklistRule::Tag(value.to_ascii_lowercase())
+            } else if let Some(value) = trimmed.strip_prefix("tracker:") {
+                BlocklistRule::Tracker(value.to_ascii_lowercase())
+            } else if let Some(value) = trimmed.strip_prefix("folder:") {
+                BlocklistRule::FolderContains(value.to_ascii_lowercase())
+            } else {
+                legacy_warnings.push(format!(
+                    "legacy blockList entry {trimmed:?} matches release names; prefer name: or regex:"
+                ));
+                BlocklistRule::NameContains(trimmed.to_ascii_lowercase())
+            };
+            rules.push(rule);
+        }
+        Ok(Self {
+            rules,
+            legacy_warnings,
+        })
+    }
+
+    /// Warnings emitted for legacy untyped entries.
+    pub fn legacy_warnings(&self) -> &[String] {
+        &self.legacy_warnings
+    }
+
+    /// Whether any rule matches a searchee.
+    pub fn matches_searchee(&self, searchee: &Searchee<'_>) -> bool {
+        self.rules.iter().any(|rule| rule.matches(searchee))
+    }
+}
+
+#[derive(Debug)]
+enum BlocklistRule {
+    NameContains(String),
+    NameRegex(Regex),
+    Category(String),
+    Tag(String),
+    Tracker(String),
+    FolderContains(String),
+    FolderRegex(Regex),
+}
+
+impl BlocklistRule {
+    fn matches(&self, searchee: &Searchee<'_>) -> bool {
+        match self {
+            Self::NameContains(value) => {
+                contains_ignore_case(searchee.name.as_ref(), value)
+                    || contains_ignore_case(searchee.title.as_ref(), value)
+            }
+            Self::NameRegex(regex) => {
+                regex.is_match(searchee.name.as_ref()) || regex.is_match(searchee.title.as_ref())
+            }
+            Self::Category(value) => searchee
+                .client
+                .as_ref()
+                .and_then(|client| client.category.as_ref())
+                .is_some_and(|category| eq_ignore_case(category.as_str(), value)),
+            Self::Tag(value) => searchee.client.as_ref().is_some_and(|client| {
+                client
+                    .tags
+                    .iter()
+                    .any(|tag| eq_ignore_case(tag.as_str(), value))
+            }),
+            Self::Tracker(value) => searchee.client.as_ref().is_some_and(|client| {
+                client
+                    .trackers
+                    .iter()
+                    .any(|tracker| contains_ignore_case(tracker.as_ref(), value))
+            }),
+            Self::FolderContains(value) => searchee
+                .path
+                .as_ref()
+                .is_some_and(|path| contains_ignore_case(path.as_ref(), value)),
+            Self::FolderRegex(regex) => searchee
+                .path
+                .as_ref()
+                .is_some_and(|path| regex.is_match(path.as_ref())),
+        }
+    }
+}
+
+/// Content filter options for search, webhook, RSS, and announce flows.
+#[derive(Debug, Clone)]
+pub struct ContentFilterOptions<'a> {
+    /// Parsed blocklist.
+    pub blocklist: &'a Blocklist,
+    /// Accept after blocklist checks.
+    pub blocklist_only: bool,
+    /// Include single episode searchees.
+    pub include_single_episodes: bool,
+    /// Include releases with non-video bytes over the fuzzy threshold.
+    pub include_non_videos: bool,
+    /// Fuzzy size threshold used for non-video ratio checks.
+    pub fuzzy_size_threshold: f64,
+    /// Reject known cross-seed client entries.
+    pub ignore_cross_seeds: bool,
+    /// Configured link category used by cross-seed detection.
+    pub link_category: Option<&'a str>,
+    /// Current workflow label.
+    pub label: Option<Label>,
+}
+
+/// Reasons a searchee can be rejected before search or reverse matching.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ContentFilterRejection {
+    /// Name, folder, tracker, category, or tag matched the blocklist.
+    Blocklisted,
+    /// Data-dir single episode inside a season-pack folder is disabled.
+    DataDirSingleEpisodeInSeasonPack,
+    /// Single episodes are disabled for this workflow.
+    SingleEpisode,
+    /// Non-video bytes exceed the configured threshold.
+    NonVideoRatio,
+    /// Client metadata identifies an existing cross-seed.
+    CrossSeed,
+    /// Data-dir root appears to be an Arr library folder rather than a release.
+    ArrRoot,
+    /// Season 0 or Specials folder.
+    Specials,
+    /// Search/webhook searchee has non-standard episode or season naming.
+    NonStandardNaming,
+}
+
+/// Apply documented content filters and return a rejection reason when filtered.
+pub fn filter_by_content(
+    searchee: &Searchee<'_>,
+    options: &ContentFilterOptions<'_>,
+) -> Option<ContentFilterRejection> {
+    if options.blocklist.matches_searchee(searchee) {
+        return Some(ContentFilterRejection::Blocklisted);
+    }
+    if options.blocklist_only {
+        return None;
+    }
+    if data_dir_single_episode_in_season_pack(searchee) && !options.include_single_episodes {
+        return Some(ContentFilterRejection::DataDirSingleEpisodeInSeasonPack);
+    }
+    if searchee.media_type == MediaType::Episode
+        && !options.include_single_episodes
+        && options.label != Some(Label::Announce)
+    {
+        return Some(ContentFilterRejection::SingleEpisode);
+    }
+    if !options.include_non_videos && non_video_ratio(searchee) > options.fuzzy_size_threshold {
+        return Some(ContentFilterRejection::NonVideoRatio);
+    }
+    if options.ignore_cross_seeds && is_cross_seed(searchee, options.link_category) {
+        return Some(ContentFilterRejection::CrossSeed);
+    }
+    if looks_like_arr_root(searchee) {
+        return Some(ContentFilterRejection::ArrRoot);
+    }
+    if is_specials(searchee) {
+        return Some(ContentFilterRejection::Specials);
+    }
+    if matches!(options.label, Some(Label::Search | Label::Webhook))
+        && non_standard_naming(searchee)
+    {
+        return Some(ContentFilterRejection::NonStandardNaming);
+    }
+    None
 }
 
 /// Parse and index every `.torrent` in a torrentDir, then prune removed files.
@@ -579,6 +775,102 @@ fn extension_in(file: &File<'_>, extensions: &[&str]) -> bool {
         .is_some_and(|extension| extensions.contains(&extension))
 }
 
+fn is_video_file(file: &File<'_>) -> bool {
+    extension_in(file, VIDEO_EXTENSIONS) || extension_in(file, VIDEO_DISC_EXTENSIONS)
+}
+
+fn non_video_ratio(searchee: &Searchee<'_>) -> f64 {
+    if searchee.length == 0 {
+        return 0.0;
+    }
+    let non_video = searchee
+        .files
+        .iter()
+        .filter(|file| !is_video_file(file))
+        .map(|file| file.length)
+        .sum::<u64>();
+    non_video as f64 / searchee.length as f64
+}
+
+fn data_dir_single_episode_in_season_pack(searchee: &Searchee<'_>) -> bool {
+    searchee.source() == crate::domain::SearcheeSource::DataDir
+        && searchee.files.len() == 1
+        && searchee.media_type == MediaType::Episode
+        && searchee
+            .path
+            .as_ref()
+            .is_some_and(|path| SEASON_REGEX.is_match(path.as_ref()))
+}
+
+fn is_cross_seed(searchee: &Searchee<'_>, link_category: Option<&str>) -> bool {
+    let Some(client) = &searchee.client else {
+        return false;
+    };
+    client.category.as_ref().is_some_and(|category| {
+        label_is_cross_seed(category)
+            || link_category
+                .is_some_and(|link_category| category.as_str().eq_ignore_ascii_case(link_category))
+    }) || client.tags.iter().any(label_is_cross_seed)
+}
+
+fn label_is_cross_seed(label: &ClientLabel<'_>) -> bool {
+    let value = label.as_str();
+    value.eq_ignore_ascii_case("cross-seed")
+        || value
+            .to_ascii_lowercase()
+            .strip_suffix(".cross-seed")
+            .is_some()
+}
+
+fn looks_like_arr_root(searchee: &Searchee<'_>) -> bool {
+    if searchee.source() != crate::domain::SearcheeSource::DataDir {
+        return false;
+    }
+    let Some(path) = &searchee.path else {
+        return false;
+    };
+    let name = Path::new(path.as_ref())
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(path.as_ref());
+    !name.chars().any(|character| character.is_ascii_digit())
+        && searchee.media_type == MediaType::Video
+        && searchee
+            .files
+            .iter()
+            .filter(|file| is_video_file(file))
+            .count()
+            > 3
+}
+
+fn is_specials(searchee: &Searchee<'_>) -> bool {
+    let haystack = format!(
+        "{} {} {}",
+        searchee.name,
+        searchee.title,
+        searchee.path.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    haystack.contains("specials")
+        || haystack.contains("season 0")
+        || haystack.contains("season.0")
+        || haystack.contains("s00")
+}
+
+fn non_standard_naming(searchee: &Searchee<'_>) -> bool {
+    matches!(searchee.media_type, MediaType::Episode | MediaType::Pack)
+        && !EPISODE_REGEX.is_match(searchee.title.as_ref())
+        && !SEASON_REGEX.is_match(searchee.title.as_ref())
+}
+
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    haystack.to_ascii_lowercase().contains(needle_lower)
+}
+
+fn eq_ignore_case(left: &str, right_lower: &str) -> bool {
+    left.eq_ignore_ascii_case(right_lower)
+}
+
 fn path_has_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(std::ffi::OsStr::to_str)
@@ -784,13 +1076,15 @@ pub fn parsed_name_and_media<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        affected_roots_for_changed_path, create_searchee_from_path, find_potential_nested_roots,
-        get_media_type, index_torrent_dir, parse_title,
+        Blocklist, ContentFilterOptions, ContentFilterRejection, affected_roots_for_changed_path,
+        create_searchee_from_path, filter_by_content, find_potential_nested_roots, get_media_type,
+        index_torrent_dir, parse_title,
     };
     use crate::{
-        domain::{File, MediaType},
+        domain::{ClientLabel, ClientTorrentMetadata, File, Label, MediaType, Searchee},
         persistence::Database,
     };
+    use std::borrow::Cow;
     use std::{
         fs,
         path::PathBuf,
@@ -988,6 +1282,125 @@ mod tests {
             .expect("count");
         assert_eq!(count, 0);
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_typed_blocklist_entries_and_legacy_warnings() {
+        let blocklist = Blocklist::parse(&[
+            "name:bad.release".to_owned(),
+            "regex:(?i)evil".to_owned(),
+            "category:blocked".to_owned(),
+            "legacy".to_owned(),
+        ])
+        .expect("blocklist");
+        let mut searchee = Searchee::from_files("Good", "Good", vec![File::new("Good.mkv", 10)]);
+        searchee.client = Some(ClientTorrentMetadata::new(
+            "client",
+            "/downloads",
+            Some(ClientLabel::new("blocked")),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        assert!(blocklist.matches_searchee(&searchee));
+        assert_eq!(blocklist.legacy_warnings().len(), 1);
+    }
+
+    #[test]
+    fn content_filter_rejects_blocklisted_and_single_episode() {
+        let blocklist = Blocklist::parse(&["name:blocked".to_owned()]).expect("blocklist");
+        let options = filter_options(&blocklist);
+        let mut blocked = Searchee::from_files(
+            "Blocked.Release",
+            "Blocked.Release",
+            vec![File::new("Blocked.mkv", 10)],
+        );
+        blocked.media_type = MediaType::Video;
+
+        assert_eq!(
+            filter_by_content(&blocked, &options),
+            Some(ContentFilterRejection::Blocklisted)
+        );
+
+        let empty = Blocklist::parse(&[]).expect("empty");
+        let options = filter_options(&empty);
+        let mut episode = Searchee::from_files(
+            "Show.S01E02",
+            "Show S01E02",
+            vec![File::new("Show.S01E02.mkv", 10)],
+        );
+        episode.media_type = MediaType::Episode;
+
+        assert_eq!(
+            filter_by_content(&episode, &options),
+            Some(ContentFilterRejection::SingleEpisode)
+        );
+    }
+
+    #[test]
+    fn announce_allows_single_episode_but_non_video_ratio_can_reject() {
+        let empty = Blocklist::parse(&[]).expect("empty");
+        let mut options = filter_options(&empty);
+        options.label = Some(Label::Announce);
+        let mut searchee = Searchee::from_files(
+            "Show.S01E02",
+            "Show S01E02",
+            vec![File::new("Show.S01E02.mkv", 10), File::new("extra.nfo", 10)],
+        );
+        searchee.media_type = MediaType::Episode;
+
+        assert_eq!(
+            filter_by_content(&searchee, &options),
+            Some(ContentFilterRejection::NonVideoRatio)
+        );
+    }
+
+    #[test]
+    fn content_filter_rejects_cross_seed_and_specials() {
+        let empty = Blocklist::parse(&[]).expect("empty");
+        let mut options = filter_options(&empty);
+        options.ignore_cross_seeds = true;
+        let mut searchee =
+            Searchee::from_files("Release", "Release", vec![File::new("Release.mkv", 10)]);
+        searchee.media_type = MediaType::Video;
+        searchee.client = Some(ClientTorrentMetadata::new(
+            "client",
+            "/downloads",
+            Some(ClientLabel::new("tv.cross-seed")),
+            vec![ClientLabel::new("tag")],
+            Vec::<Cow<'static, str>>::new(),
+        ));
+
+        assert_eq!(
+            filter_by_content(&searchee, &options),
+            Some(ContentFilterRejection::CrossSeed)
+        );
+
+        let mut specials = Searchee::from_files(
+            "Show Specials",
+            "Show Specials",
+            vec![File::new("Show.S00E01.mkv", 10)],
+        );
+        specials.media_type = MediaType::Episode;
+        let mut options = filter_options(&empty);
+        options.include_single_episodes = true;
+        assert_eq!(
+            filter_by_content(&specials, &options),
+            Some(ContentFilterRejection::Specials)
+        );
+    }
+
+    fn filter_options<'a>(blocklist: &'a Blocklist) -> ContentFilterOptions<'a> {
+        ContentFilterOptions {
+            blocklist,
+            blocklist_only: false,
+            include_single_episodes: false,
+            include_non_videos: false,
+            fuzzy_size_threshold: 0.05,
+            ignore_cross_seeds: false,
+            link_category: None,
+            label: Some(Label::Search),
+        }
     }
 
     fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {
