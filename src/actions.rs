@@ -5,15 +5,24 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use crate::{
     SporosError,
+    clients::{
+        ClientErrorCode, DownloadDirOptions, InjectionOptions, NewTorrent, ResumeOptions,
+        TorrentClient, select_injection_client,
+    },
     config::LinkType,
-    domain::{Decision, File, Metafile, SaveResult, Searchee},
+    domain::{
+        Candidate, ClientLabel, Decision, File, InjectionResult, Metafile, SaveResult, Searchee,
+    },
     persistence::Database,
     torrent::{SavedTorrentMetadata, parse_metafile, torrent_cache_dir, torrent_save_path},
 };
+
+static CLIENT_INJECTION: Mutex<()> = Mutex::new(());
 
 /// Options for link creation.
 #[derive(Debug, Clone)]
@@ -43,6 +52,57 @@ pub struct FileLinkResult {
     pub created_roots: Vec<PathBuf>,
 }
 
+/// Inputs for one matched candidate injection.
+pub struct InjectionAction<'a> {
+    /// Local item being cross-seeded.
+    pub searchee: &'a Searchee<'a>,
+    /// Remote candidate metadata.
+    pub candidate: &'a Candidate<'a>,
+    /// Matched candidate torrent metadata.
+    pub metafile: &'a Metafile<'a>,
+    /// Raw candidate torrent bytes.
+    pub bytes: &'a [u8],
+    /// Conservative match decision.
+    pub decision: Decision,
+}
+
+/// Runtime settings for injecting a matched candidate.
+pub struct InjectionActionOptions<'a> {
+    /// Configured torrent clients in priority order.
+    pub clients: &'a [&'a dyn TorrentClient],
+    /// Optional output directory for save-for-retry behavior.
+    pub output_dir: Option<&'a Path>,
+    /// Configured link directories.
+    pub link_dirs: &'a [PathBuf],
+    /// Link mode.
+    pub link_type: LinkType,
+    /// Put links directly under the link dir rather than `<linkDir>/<tracker>`.
+    pub flat_linking: bool,
+    /// Resolve file symlink sources before creating links.
+    pub unwrap_symlinks: bool,
+    /// Skip client-side recheck.
+    pub skip_recheck: bool,
+    /// Category or label to apply during injection.
+    pub category: Option<ClientLabel<'static>>,
+    /// Tags or labels to apply during injection.
+    pub tags: Vec<ClientLabel<'static>>,
+}
+
+/// Perform inject-mode action side effects for one matched candidate.
+pub fn perform_injection_action<N>(
+    action: &InjectionAction<'_>,
+    options: &InjectionActionOptions<'_>,
+    notify_saved: N,
+) -> crate::Result<InjectionResult>
+where
+    N: FnMut(&SaveNotification) -> crate::Result<()>,
+{
+    let _guard = CLIENT_INJECTION
+        .lock()
+        .map_err(|_error| action_error("client injection mutex was poisoned"))?;
+    perform_injection_action_without_mutex(action, options, notify_saved)
+}
+
 /// Choose a link directory compatible with the source path.
 pub fn select_link_dir(
     source_path: &Path,
@@ -68,6 +128,232 @@ pub fn link_destination_dir(link_dir: &Path, tracker: &str, flat_linking: bool) 
     } else {
         link_dir.join(filesystem_safe_segment(tracker))
     }
+}
+
+fn perform_injection_action_without_mutex<N>(
+    action: &InjectionAction<'_>,
+    options: &InjectionActionOptions<'_>,
+    mut notify_saved: N,
+) -> crate::Result<InjectionResult>
+where
+    N: FnMut(&SaveNotification) -> crate::Result<()>,
+{
+    let Some(client) = select_injection_client(options.clients, action.searchee)? else {
+        return Err(action_error(
+            "no writable torrent client available for injection",
+        ));
+    };
+
+    if candidate_exists_elsewhere(options.clients, action.metafile)? {
+        return Ok(InjectionResult::AlreadyExists);
+    }
+
+    let mut linked = FileLinkResult::default();
+    let source_dir = match source_save_path(action.searchee, options.clients, true)? {
+        Ok(path) => path,
+        Err(ClientErrorCode::TorrentNotComplete) => {
+            save_for_retry(action, options, &mut notify_saved)?;
+            return Ok(InjectionResult::TorrentNotComplete);
+        }
+        Err(error) => {
+            return Err(action_error(format!(
+                "failed to resolve source path: {error:?}"
+            )));
+        }
+    };
+    let destination_dir = destination_dir(action, options, &source_dir)?;
+
+    if !options.link_dirs.is_empty() {
+        let Some(destination_dir) = destination_dir.as_ref() else {
+            return Err(action_error("linking requires a destination directory"));
+        };
+        linked = link_all_files_in_metafile(
+            action.searchee,
+            action.metafile,
+            action.decision,
+            destination_dir,
+            &FileLinkOptions {
+                link_dirs: options.link_dirs,
+                link_type: options.link_type,
+                flat_linking: options.flat_linking,
+                ignore_missing: false,
+                unwrap_symlinks: options.unwrap_symlinks,
+            },
+        )?;
+    }
+
+    let should_recheck = should_recheck(action.metafile, action.decision, options.skip_recheck);
+    let new_torrent = NewTorrent {
+        metafile: action.metafile.clone(),
+        bytes: Cow::Borrowed(action.bytes),
+    };
+    let result = client.inject(
+        &new_torrent,
+        action.searchee,
+        action.decision,
+        &InjectionOptions {
+            destination_dir: destination_dir.clone(),
+            category: options.category.clone(),
+            tags: options.tags.clone(),
+            paused: should_recheck,
+            skip_checking: !should_recheck,
+        },
+    );
+
+    if let Err(error) = result {
+        if !linked.created_roots.is_empty() {
+            cleanup_created_roots(&linked.created_roots)?;
+        }
+        save_for_retry(action, options, &mut notify_saved)?;
+        tracing::warn!("torrent injection failed: {error}");
+        return Ok(InjectionResult::Failure);
+    }
+
+    if should_recheck {
+        save_for_retry(action, options, &mut notify_saved)?;
+        client.recheck_torrent(&action.metafile.info_hash)?;
+        client.resume_injection(
+            action.metafile,
+            action.decision,
+            ResumeOptions { check_once: true },
+        )?;
+    } else if action.searchee.info_hash.is_none() {
+        save_for_retry(action, options, &mut notify_saved)?;
+    }
+
+    if linked.linked > 0 && linked.skipped_existing > 0 {
+        client.recheck_torrent(&action.metafile.info_hash)?;
+        client.resume_injection(
+            action.metafile,
+            action.decision,
+            ResumeOptions { check_once: true },
+        )?;
+    }
+
+    Ok(InjectionResult::Injected)
+}
+
+fn candidate_exists_elsewhere(
+    clients: &[&dyn TorrentClient],
+    metafile: &Metafile<'_>,
+) -> crate::Result<bool> {
+    for client in clients {
+        if client.is_torrent_in_client(&metafile.info_hash)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn source_save_path(
+    searchee: &Searchee<'_>,
+    clients: &[&dyn TorrentClient],
+    only_completed: bool,
+) -> crate::Result<Result<PathBuf, ClientErrorCode>> {
+    if let Some(client_metadata) = &searchee.client {
+        let Some(info_hash) = &searchee.info_hash else {
+            return Ok(Err(ClientErrorCode::NotFound));
+        };
+        let Some(client) = clients
+            .iter()
+            .copied()
+            .find(|client| client.metadata().host == client_metadata.host)
+        else {
+            return Ok(Err(ClientErrorCode::NotFound));
+        };
+        let metafile = Metafile::from_files(
+            info_hash.clone().into_owned(),
+            searchee.name.as_ref().to_owned(),
+            searchee.title.as_ref().to_owned(),
+            0,
+            searchee
+                .files
+                .iter()
+                .cloned()
+                .map(File::into_owned)
+                .collect(),
+        );
+        return client.get_download_dir(&metafile, DownloadDirOptions { only_completed });
+    }
+
+    let Some(path) = searchee.path.as_ref() else {
+        return Ok(Err(ClientErrorCode::Unsupported));
+    };
+    let path = PathBuf::from(path.as_ref());
+    if !path.exists() {
+        return Ok(Err(ClientErrorCode::NotFound));
+    }
+    if only_completed && !source_files_unchanged(searchee) {
+        return Ok(Err(ClientErrorCode::TorrentNotComplete));
+    }
+    if path.is_dir() {
+        Ok(Ok(path))
+    } else if let Some(parent) = path.parent() {
+        Ok(Ok(parent.to_path_buf()))
+    } else {
+        Ok(Err(ClientErrorCode::NotFound))
+    }
+}
+
+fn destination_dir(
+    action: &InjectionAction<'_>,
+    options: &InjectionActionOptions<'_>,
+    source_dir: &Path,
+) -> crate::Result<Option<PathBuf>> {
+    if options.link_dirs.is_empty() {
+        return Ok(Some(source_dir.to_path_buf()));
+    }
+    let Some(link_dir) = select_link_dir(source_dir, options.link_dirs, options.link_type)? else {
+        return Err(action_error("no compatible linkDir found for injection"));
+    };
+    Ok(Some(link_destination_dir(
+        &link_dir,
+        action.candidate.tracker.as_ref(),
+        options.flat_linking,
+    )))
+}
+
+fn source_files_unchanged(searchee: &Searchee<'_>) -> bool {
+    searchee.files.iter().all(|file| {
+        let path = source_file_path(file, source_root(searchee).as_ref());
+        path.metadata()
+            .ok()
+            .is_some_and(|metadata| metadata.len() == file.length)
+    })
+}
+
+fn save_for_retry<N>(
+    action: &InjectionAction<'_>,
+    options: &InjectionActionOptions<'_>,
+    notify_saved: &mut N,
+) -> crate::Result<()>
+where
+    N: FnMut(&SaveNotification) -> crate::Result<()>,
+{
+    if let Some(output_dir) = options.output_dir {
+        save_candidate_torrent(
+            output_dir,
+            action.candidate.tracker.as_ref(),
+            action.metafile,
+            action.bytes,
+            notify_saved,
+        )?;
+    }
+    Ok(())
+}
+
+fn should_recheck(metafile: &Metafile<'_>, decision: Decision, skip_recheck: bool) -> bool {
+    !skip_recheck
+        && (decision == Decision::MatchPartial || metafile.files.iter().any(is_video_disc_file))
+}
+
+fn is_video_disc_file(file: &File<'_>) -> bool {
+    let path = file.path.as_ref().to_ascii_lowercase();
+    path.ends_with(".vob")
+        || path.ends_with(".ifo")
+        || path.ends_with(".bup")
+        || path.contains("/bdmv/")
+        || path.contains("\\bdmv\\")
 }
 
 /// Link all candidate files from local searchee data into the destination directory.
@@ -552,20 +838,31 @@ fn json_error(error: serde_json::Error) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileLinkOptions, cleanup_created_roots, link_all_files_in_metafile, link_destination_dir,
+        FileLinkOptions, InjectionAction, InjectionActionOptions, cleanup_created_roots,
+        link_all_files_in_metafile, link_destination_dir, perform_injection_action,
         restore_from_torrent_cache, save_candidate_torrent, save_torrent_with_metadata,
         select_link_dir,
     };
     use crate::{
+        clients::{
+            ClientErrorCode, ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent,
+            ResumeOptions, TorrentClient,
+        },
         config::LinkType,
-        domain::{ClientTorrentMetadata, Decision, File, InfoHash, MediaType, Metafile, Searchee},
+        domain::{
+            Candidate, ClientLabel, ClientTorrentMetadata, Decision, File, InfoHash,
+            InjectionResult, MediaType, Metafile, Searchee, TorrentClientKind,
+            TorrentClientMetadata,
+        },
         persistence::Database,
         torrent::{SavedTorrentMetadata, parse_metadata_from_filename, torrent_cache_path},
     };
     use std::{
         borrow::Cow,
+        collections::BTreeMap,
         fs,
         path::PathBuf,
+        sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -787,6 +1084,249 @@ mod tests {
         let target = fs::read_link(linked).expect("read link");
         assert!(target.ends_with("same.mkv"));
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn injection_action_links_saves_rechecks_and_resumes() {
+        let root = temp_path("inject-action");
+        let data = root.join("data");
+        let link_dir = root.join("links");
+        let output_dir = root.join("out");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::write(data.join("source.mkv"), b"video-data").expect("source");
+        let mut searchee = Searchee::from_files(
+            "Source.Release",
+            "Source.Release",
+            vec![File::new("source.mkv", 10)],
+        );
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+        let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let candidate = Candidate::new(
+            "Candidate.Release",
+            "guid",
+            Some("https://indexer.example/download"),
+            "Tracker/One",
+        );
+        let client = FakeClient::new("client");
+        let clients: [&dyn TorrentClient; 1] = [&client];
+        let mut saved = 0;
+
+        let result = perform_injection_action(
+            &InjectionAction {
+                searchee: &searchee,
+                candidate: &candidate,
+                metafile: &metafile,
+                bytes: &bytes,
+                decision: Decision::MatchPartial,
+            },
+            &InjectionActionOptions {
+                clients: &clients,
+                output_dir: Some(&output_dir),
+                link_dirs: std::slice::from_ref(&link_dir),
+                link_type: LinkType::Symlink,
+                flat_linking: false,
+                unwrap_symlinks: false,
+                skip_recheck: false,
+                category: Some(ClientLabel::new("tv")),
+                tags: vec![ClientLabel::new("cross-seed")],
+            },
+            |_| {
+                saved += 1;
+                Ok(())
+            },
+        )
+        .expect("inject action");
+
+        assert_eq!(result, InjectionResult::Injected);
+        assert_eq!(saved, 1);
+        assert!(link_dir.join("Tracker_One/Candidate.Release").exists());
+        let calls = client.calls.lock().expect("calls").clone();
+        assert_eq!(calls, vec!["inject", "recheck", "resume"]);
+        assert_eq!(
+            client
+                .last_options
+                .lock()
+                .expect("options")
+                .as_ref()
+                .map(|options| options.paused),
+            Some(true)
+        );
+        assert_eq!(
+            fs::read_dir(&output_dir)
+                .expect("output")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("entries")
+                .len(),
+            1
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn injection_action_saves_incomplete_sources_for_retry() {
+        let root = temp_path("inject-incomplete");
+        let output_dir = root.join("out");
+        let mut searchee = Searchee::from_files(
+            "Source.Release",
+            "Source.Release",
+            vec![File::new("file.mkv", 10)],
+        );
+        searchee.client = Some(ClientTorrentMetadata::new(
+            "client",
+            "/downloads",
+            None,
+            Vec::new(),
+            Vec::<Cow<'static, str>>::new(),
+        ));
+        searchee.info_hash = Some(InfoHash::from_validated(
+            "0123456789abcdef0123456789abcdef01234567",
+        ));
+        let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let candidate = Candidate::new("Candidate.Release", "guid", None::<String>, "Tracker");
+        let mut client = FakeClient::new("client");
+        client.download_dir = Err(ClientErrorCode::TorrentNotComplete);
+        let clients: [&dyn TorrentClient; 1] = [&client];
+
+        let result = perform_injection_action(
+            &InjectionAction {
+                searchee: &searchee,
+                candidate: &candidate,
+                metafile: &metafile,
+                bytes: &bytes,
+                decision: Decision::Match,
+            },
+            &InjectionActionOptions {
+                clients: &clients,
+                output_dir: Some(&output_dir),
+                link_dirs: &[],
+                link_type: LinkType::Symlink,
+                flat_linking: false,
+                unwrap_symlinks: false,
+                skip_recheck: true,
+                category: None,
+                tags: Vec::new(),
+            },
+            |_| Ok(()),
+        )
+        .expect("inject action");
+
+        assert_eq!(result, InjectionResult::TorrentNotComplete);
+        assert!(client.calls.lock().expect("calls").is_empty());
+        assert_eq!(
+            fs::read_dir(&output_dir)
+                .expect("output")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("entries")
+                .len(),
+            1
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    struct FakeClient {
+        metadata: TorrentClientMetadata<'static>,
+        existing: bool,
+        download_dir: Result<PathBuf, ClientErrorCode>,
+        calls: Mutex<Vec<&'static str>>,
+        last_options: Mutex<Option<InjectionOptions>>,
+    }
+
+    impl FakeClient {
+        fn new(host: &str) -> Self {
+            Self {
+                metadata: TorrentClientMetadata::new(
+                    host.to_owned(),
+                    0,
+                    TorrentClientKind::QBittorrent,
+                    false,
+                    "fake",
+                ),
+                existing: false,
+                download_dir: Ok(PathBuf::from("/downloads")),
+                calls: Mutex::new(Vec::new()),
+                last_options: Mutex::new(None),
+            }
+        }
+    }
+
+    impl TorrentClient for FakeClient {
+        fn metadata(&self) -> &TorrentClientMetadata<'_> {
+            &self.metadata
+        }
+
+        fn is_torrent_in_client(&self, _info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+            Ok(self.existing)
+        }
+
+        fn is_torrent_complete(&self, _info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+            Ok(true)
+        }
+
+        fn is_torrent_checking(&self, _info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
+            Ok(Vec::new())
+        }
+
+        fn get_download_dir(
+            &self,
+            _metafile: &Metafile<'_>,
+            _options: DownloadDirOptions,
+        ) -> crate::Result<Result<PathBuf, ClientErrorCode>> {
+            Ok(self.download_dir.clone())
+        }
+
+        fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>> {
+            Ok(BTreeMap::new())
+        }
+
+        fn inject(
+            &self,
+            _new_torrent: &NewTorrent<'_>,
+            _searchee: &Searchee<'_>,
+            _decision: Decision,
+            options: &InjectionOptions,
+        ) -> crate::Result<InjectionResult> {
+            self.calls
+                .lock()
+                .map_err(|_error| super::action_error("calls lock poisoned"))?
+                .push("inject");
+            *self
+                .last_options
+                .lock()
+                .map_err(|_error| super::action_error("options lock poisoned"))? =
+                Some(options.clone());
+            Ok(InjectionResult::Injected)
+        }
+
+        fn recheck_torrent(&self, _info_hash: &InfoHash<'_>) -> crate::Result<()> {
+            self.calls
+                .lock()
+                .map_err(|_error| super::action_error("calls lock poisoned"))?
+                .push("recheck");
+            Ok(())
+        }
+
+        fn resume_injection(
+            &self,
+            _metafile: &Metafile<'_>,
+            _decision: Decision,
+            _options: ResumeOptions,
+        ) -> crate::Result<()> {
+            self.calls
+                .lock()
+                .map_err(|_error| super::action_error("calls lock poisoned"))?
+                .push("resume");
+            Ok(())
+        }
+
+        fn validate_config(&self) -> crate::Result<()> {
+            Ok(())
+        }
     }
 
     fn torrent_bytes(name: &str, announce: &str, length: u64) -> Vec<u8> {
