@@ -1,6 +1,10 @@
 //! Command-line entry points and top-level command dispatch.
 
-use clap::{Arg, ArgAction, Command, value_parser};
+use std::path::{Path, PathBuf};
+
+use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
+
+use crate::{SporosError, persistence::Database};
 
 /// Run the command-line entry point.
 pub fn run() -> crate::Result<()> {
@@ -23,8 +27,72 @@ where
             let path = crate::config::generate_config(&app_dir)?;
             println!("{}", path.display());
         }
+        Some(("update-torrent-cache-trackers", matches)) => {
+            let result = crate::operations::update_torrent_cache_trackers(
+                &app_dir,
+                required_string(matches, "old-announce-url")?,
+                required_string(matches, "new-announce-url")?,
+            )?;
+            println!(
+                "updated {} of {} cached torrents",
+                result.files_updated, result.files_seen
+            );
+        }
+        Some(("diff", matches)) => {
+            if let Some(diff) = crate::operations::diff_torrents(
+                &required_path(matches, "searchee")?,
+                &required_path(matches, "candidate")?,
+            )? {
+                println!("{diff}");
+            }
+        }
+        Some(("tree", matches)) => {
+            let tree = crate::operations::torrent_tree(&required_path(matches, "torrent")?)?;
+            println!("name: {}", tree.name);
+            println!("infoHash: {}", tree.info_hash);
+            for (path, length) in tree.files {
+                println!("{length}\t{path}");
+            }
+        }
+        Some(("clear-indexer-failures", _)) => {
+            let database = Database::open_app_dir(&app_dir)?;
+            let updated = crate::operations::clear_indexer_failures(&database)?;
+            println!("cleared {updated} indexer failures");
+        }
+        Some(("clear-cache", _)) => {
+            let database = Database::open_app_dir(&app_dir)?;
+            let result = crate::operations::clear_cache(&database)?;
+            println!(
+                "cleared {} decisions and {} timestamps",
+                result.decisions_removed, result.timestamps_removed
+            );
+        }
+        Some(("clear-client-cache", _)) => {
+            let database = Database::open_app_dir(&app_dir)?;
+            let result = crate::operations::clear_client_cache(&database)?;
+            println!(
+                "cleared {} torrents, {} client searchees, {} data rows, and {} ensemble rows",
+                result.torrents_removed,
+                result.client_searchees_removed,
+                result.data_removed,
+                result.ensemble_removed
+            );
+        }
+        Some(("api-key", matches)) => {
+            let database = Database::open_app_dir(&app_dir)?;
+            let raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            let configured = matches
+                .get_one::<String>("api-key")
+                .map(String::as_str)
+                .or(raw_config.api_key.as_deref());
+            println!("{}", crate::operations::api_key(&database, configured)?);
+        }
+        Some(("reset-api-key", _)) => {
+            let database = Database::open_app_dir(&app_dir)?;
+            println!("{}", crate::operations::reset_api_key(&database)?);
+        }
         Some((command, _)) => {
-            let _file_config = crate::config::get_file_config(&app_dir)?;
+            let _raw_config = crate::config::load_file_raw_config(&app_dir)?;
             println!("sporos {} {}", crate::VERSION, command);
         }
         None => {
@@ -33,6 +101,17 @@ where
     }
 
     Ok(())
+}
+
+fn required_string<'a>(matches: &'a ArgMatches, name: &str) -> crate::Result<&'a str> {
+    matches
+        .get_one::<String>(name)
+        .map(String::as_str)
+        .ok_or_else(|| SporosError::configuration(format!("missing required argument: {name}")))
+}
+
+fn required_path(matches: &ArgMatches, name: &str) -> crate::Result<PathBuf> {
+    Ok(Path::new(required_string(matches, name)?).to_owned())
 }
 
 /// Build the compatibility command tree.
