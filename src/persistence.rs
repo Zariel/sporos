@@ -6,8 +6,12 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 
-use crate::{SporosError, domain::Decision};
+use crate::{
+    SporosError,
+    domain::{ClientLabel, Decision, File},
+};
 
 const DATABASE_FILE_NAME: &str = "cross-seed.db";
 
@@ -139,6 +143,161 @@ impl Database {
         Ok(())
     }
 
+    /// Insert or update one data-dir root row.
+    pub fn upsert_data_root(&self, record: &DataRootRecord<'_>) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO data (path, title)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET title = excluded.title",
+                params![record.path, record.title],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    /// Refresh data-dir roots and prune data/ensemble rows no longer present.
+    pub fn refresh_data_roots<'a>(
+        &self,
+        records: impl IntoIterator<Item = DataRootRecord<'a>>,
+    ) -> crate::Result<usize> {
+        self.connection
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS current_data_roots (
+                    path TEXT PRIMARY KEY
+                );
+                DELETE FROM current_data_roots;",
+            )
+            .map_err(sql_error)?;
+        for record in records {
+            self.upsert_data_root(&record)?;
+            self.connection
+                .execute(
+                    "INSERT OR IGNORE INTO current_data_roots (path) VALUES (?1)",
+                    params![record.path],
+                )
+                .map_err(sql_error)?;
+        }
+        self.connection
+            .execute(
+                "DELETE FROM ensemble
+                 WHERE client_host IS NULL
+                 AND NOT EXISTS (
+                    SELECT 1 FROM current_data_roots
+                    WHERE ensemble.path = current_data_roots.path
+                    OR ensemble.path LIKE current_data_roots.path || '/%'
+                 )",
+                [],
+            )
+            .map_err(sql_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM data
+                 WHERE path NOT IN (SELECT path FROM current_data_roots)",
+                [],
+            )
+            .map_err(sql_error)
+    }
+
+    /// Insert or update one client searchee cache row.
+    pub fn upsert_client_searchee(&self, record: &ClientSearcheeRecord<'_>) -> crate::Result<()> {
+        let files = files_json(record.files)?;
+        let tags = labels_json(record.tags)?;
+        let trackers = strings_json(record.trackers)?;
+        self.connection
+            .execute(
+                "INSERT INTO client_searchee
+                    (client_host, info_hash, name, title, files, length, save_path, category, tags, trackers)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(client_host, info_hash) DO UPDATE SET
+                    name = excluded.name,
+                    title = excluded.title,
+                    files = excluded.files,
+                    length = excluded.length,
+                    save_path = excluded.save_path,
+                    category = excluded.category,
+                    tags = excluded.tags,
+                    trackers = excluded.trackers",
+                params![
+                    record.client_host,
+                    record.info_hash,
+                    record.name,
+                    record.title,
+                    files,
+                    record.length,
+                    record.save_path,
+                    record.category,
+                    tags,
+                    trackers,
+                ],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    /// Refresh one client's searchee rows and prune removed info hashes.
+    pub fn refresh_client_searchees<'a>(
+        &self,
+        client_host: &str,
+        records: impl IntoIterator<Item = ClientSearcheeRecord<'a>>,
+    ) -> crate::Result<usize> {
+        self.connection
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS current_client_info_hashes (
+                    info_hash TEXT PRIMARY KEY
+                );
+                DELETE FROM current_client_info_hashes;",
+            )
+            .map_err(sql_error)?;
+        for record in records {
+            self.upsert_client_searchee(&record)?;
+            self.connection
+                .execute(
+                    "INSERT OR IGNORE INTO current_client_info_hashes (info_hash) VALUES (?1)",
+                    params![record.info_hash],
+                )
+                .map_err(sql_error)?;
+        }
+        self.connection
+            .execute(
+                "DELETE FROM ensemble
+                 WHERE client_host = ?1
+                 AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
+                params![client_host],
+            )
+            .map_err(sql_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM client_searchee
+                 WHERE client_host = ?1
+                 AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
+                params![client_host],
+            )
+            .map_err(sql_error)
+    }
+
+    /// Insert or update one ensemble row.
+    pub fn upsert_ensemble(&self, record: &EnsembleRecord<'_>) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(client_host, path) DO UPDATE SET
+                    info_hash = excluded.info_hash,
+                    ensemble = excluded.ensemble,
+                    element = excluded.element",
+                params![
+                    record.client_host,
+                    record.path,
+                    record.info_hash,
+                    record.ensemble,
+                    record.element,
+                ],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
     /// Database path under an app directory.
     pub fn path_for_app_dir(app_dir: &Path) -> PathBuf {
         app_dir.join(DATABASE_FILE_NAME)
@@ -173,6 +332,62 @@ pub struct GuidInfoHash {
     pub guid: String,
     /// Cached info hash.
     pub info_hash: String,
+}
+
+/// Data-dir cache row.
+#[derive(Debug, Clone, Copy)]
+pub struct DataRootRecord<'a> {
+    /// Absolute data-dir root path.
+    pub path: &'a str,
+    /// Parsed title.
+    pub title: &'a str,
+}
+
+/// Client searchee cache row.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientSearcheeRecord<'a> {
+    /// Stable configured client host.
+    pub client_host: &'a str,
+    /// Torrent info hash.
+    pub info_hash: &'a str,
+    /// Original client torrent name.
+    pub name: &'a str,
+    /// Parsed title.
+    pub title: &'a str,
+    /// File tree serialized to JSON.
+    pub files: &'a [File<'a>],
+    /// Total length.
+    pub length: u64,
+    /// Client save path.
+    pub save_path: &'a str,
+    /// Optional category.
+    pub category: Option<&'a str>,
+    /// Client tags serialized to JSON.
+    pub tags: &'a [ClientLabel<'a>],
+    /// Tracker hosts serialized to JSON.
+    pub trackers: &'a [std::borrow::Cow<'a, str>],
+}
+
+/// Ensemble row used for virtual seasons and reverse lookup.
+#[derive(Debug, Clone, Copy)]
+pub struct EnsembleRecord<'a> {
+    /// Client host for client inventory, null for data-dir rows.
+    pub client_host: Option<&'a str>,
+    /// Absolute largest-file path.
+    pub path: &'a str,
+    /// Source info hash when available.
+    pub info_hash: Option<&'a str>,
+    /// Normalized season/anime key.
+    pub ensemble: &'a str,
+    /// Episode number/date/release element.
+    pub element: &'a str,
+}
+
+#[derive(Serialize)]
+struct FileJson<'a> {
+    name: &'a str,
+    path: &'a str,
+    length: u64,
 }
 
 const SCHEMA: &str = r#"
@@ -301,11 +516,46 @@ fn sql_error(error: rusqlite::Error) -> SporosError {
     }
 }
 
+fn persistence_message(message: impl Into<Cow<'static, str>>) -> SporosError {
+    SporosError::Persistence {
+        message: message.into(),
+    }
+}
+
+fn files_json(files: &[File<'_>]) -> crate::Result<String> {
+    let files = files
+        .iter()
+        .map(|file| FileJson {
+            name: file.name.as_ref(),
+            path: file.path.as_ref(),
+            length: file.length,
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&files)
+        .map_err(|error| persistence_message(format!("failed to serialize files JSON: {error}")))
+}
+
+fn labels_json(labels: &[ClientLabel<'_>]) -> crate::Result<String> {
+    let labels = labels.iter().map(ClientLabel::as_str).collect::<Vec<_>>();
+    serde_json::to_string(&labels)
+        .map_err(|error| persistence_message(format!("failed to serialize labels JSON: {error}")))
+}
+
+fn strings_json(values: &[std::borrow::Cow<'_, str>]) -> crate::Result<String> {
+    let values = values
+        .iter()
+        .map(|value| value.as_ref())
+        .collect::<Vec<_>>();
+    serde_json::to_string(&values)
+        .map_err(|error| persistence_message(format!("failed to serialize strings JSON: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Database, DecisionRecord};
-    use crate::domain::Decision;
+    use super::{ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord, EnsembleRecord};
+    use crate::domain::{ClientLabel, Decision, File};
     use std::{
+        borrow::Cow,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -410,6 +660,112 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef0123456789abcdef".to_owned())
         );
 
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refreshes_data_roots_and_prunes_missing_rows() {
+        let root = temp_path("data-roots");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        database
+            .refresh_data_roots([
+                DataRootRecord {
+                    path: "/data/one",
+                    title: "One",
+                },
+                DataRootRecord {
+                    path: "/data/two",
+                    title: "Two",
+                },
+            ])
+            .expect("refresh");
+        database
+            .upsert_ensemble(&EnsembleRecord {
+                client_host: None,
+                path: "/data/two/file.mkv",
+                info_hash: None,
+                ensemble: "show s01",
+                element: "1",
+            })
+            .expect("ensemble");
+
+        let removed = database
+            .refresh_data_roots([DataRootRecord {
+                path: "/data/one",
+                title: "One Updated",
+            }])
+            .expect("refresh");
+
+        assert_eq!(removed, 1);
+        let title: String = database
+            .connection()
+            .query_row(
+                "SELECT title FROM data WHERE path = '/data/one'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("title");
+        assert_eq!(title, "One Updated");
+        let ensemble_count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM ensemble", [], |row| row.get(0))
+            .expect("ensemble count");
+        assert_eq!(ensemble_count, 0);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stores_client_searchee_json_and_prunes_by_host() {
+        let root = temp_path("client-searchees");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let files = [File::new("Release/file.mkv", 42)];
+        let tags = [ClientLabel::new("tag")];
+        let trackers = [Cow::Borrowed("tracker.example")];
+        database
+            .refresh_client_searchees(
+                "client",
+                [ClientSearcheeRecord {
+                    client_host: "client",
+                    info_hash: "0123456789abcdef0123456789abcdef01234567",
+                    name: "Release",
+                    title: "Release",
+                    files: &files,
+                    length: 42,
+                    save_path: "/downloads",
+                    category: Some("tv"),
+                    tags: &tags,
+                    trackers: &trackers,
+                }],
+            )
+            .expect("refresh");
+        database
+            .upsert_ensemble(&EnsembleRecord {
+                client_host: Some("client"),
+                path: "/downloads/file.mkv",
+                info_hash: Some("0123456789abcdef0123456789abcdef01234567"),
+                ensemble: "release",
+                element: "1",
+            })
+            .expect("ensemble");
+
+        let json: String = database
+            .connection()
+            .query_row("SELECT files FROM client_searchee", [], |row| row.get(0))
+            .expect("files json");
+        assert!(json.contains("Release/file.mkv"));
+
+        let removed = database
+            .refresh_client_searchees("client", [])
+            .expect("prune");
+
+        assert_eq!(removed, 1);
+        let ensemble_count: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM ensemble", [], |row| row.get(0))
+            .expect("ensemble count");
+        assert_eq!(ensemble_count, 0);
         let _cleanup = fs::remove_dir_all(root);
     }
 

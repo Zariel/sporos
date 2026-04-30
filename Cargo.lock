@@ -746,6 +746,8 @@ dependencies = [
  "proptest",
  "regex",
  "rusqlite",
+ "serde",
+ "serde_json",
  "sha1",
  "thiserror",
  "tracing",
