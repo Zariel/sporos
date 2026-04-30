@@ -3,6 +3,7 @@
 use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, time::Duration};
 
 use reqwest::blocking::multipart;
+use reqwest::header::CONTENT_TYPE;
 use url::Url;
 
 use crate::{
@@ -483,6 +484,258 @@ impl TorrentClient for QbittorrentClient {
     }
 }
 
+/// Transmission RPC adapter.
+pub struct TransmissionClient {
+    identity: ClientIdentity,
+    rpc_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl TransmissionClient {
+    /// Build a Transmission adapter from normalized identity metadata.
+    pub fn new(identity: ClientIdentity, timeout: Option<Duration>) -> crate::Result<Self> {
+        let mut builder = reqwest::blocking::Client::builder()
+            .user_agent(format!("CrossSeed/{}", crate::VERSION));
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder.build().map_err(|error| {
+            client_error(format!("failed to build Transmission client: {error}"))
+        })?;
+        Ok(Self {
+            rpc_url: identity.url.clone(),
+            identity,
+            client,
+        })
+    }
+
+    fn rpc(&self, body: serde_json::Value) -> crate::Result<serde_json::Value> {
+        let body = body.to_string();
+        let response = self
+            .client
+            .post(&self.rpc_url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.clone())
+            .send()
+            .map_err(|error| client_error(format!("Transmission RPC request failed: {error}")))?;
+        let response = if response.status() == reqwest::StatusCode::CONFLICT {
+            let session_id = response
+                .headers()
+                .get("X-Transmission-Session-Id")
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| client_error("Transmission session id missing"))?
+                .to_owned();
+            self.client
+                .post(&self.rpc_url)
+                .header("X-Transmission-Session-Id", session_id)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .map_err(|error| client_error(format!("Transmission RPC retry failed: {error}")))?
+        } else {
+            response
+        };
+        let text = response
+            .error_for_status()
+            .map_err(|error| client_error(format!("Transmission RPC returned error: {error}")))?
+            .text()
+            .map_err(|error| client_error(format!("failed to read Transmission RPC: {error}")))?;
+        let value = serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|error| client_error(format!("failed to parse Transmission RPC: {error}")))?;
+        if value.get("result").and_then(serde_json::Value::as_str) == Some("success") {
+            Ok(value)
+        } else {
+            Err(client_error(format!(
+                "Transmission RPC result was {}",
+                value
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+            )))
+        }
+    }
+
+    fn torrent_get(&self, ids: Option<&[String]>) -> crate::Result<Vec<TransmissionTorrent>> {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "fields".to_owned(),
+            serde_json::json!([
+                "hashString",
+                "name",
+                "downloadDir",
+                "files",
+                "trackers",
+                "labels",
+                "percentDone",
+                "status"
+            ]),
+        );
+        if let Some(ids) = ids {
+            arguments.insert("ids".to_owned(), serde_json::json!(ids));
+        }
+        let response = self.rpc(serde_json::json!({
+            "method": "torrent-get",
+            "arguments": arguments
+        }))?;
+        let torrents = response
+            .get("arguments")
+            .and_then(|arguments| arguments.get("torrents"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        serde_json::from_value(torrents).map_err(|error| {
+            client_error(format!("failed to parse Transmission torrents: {error}"))
+        })
+    }
+
+    fn torrent_info(&self, info_hash: &InfoHash<'_>) -> crate::Result<Option<TransmissionTorrent>> {
+        Ok(self
+            .torrent_get(Some(&[info_hash.as_str().to_owned()]))?
+            .into_iter()
+            .next())
+    }
+
+    fn torrent_action(&self, method: &str, info_hash: &InfoHash<'_>) -> crate::Result<()> {
+        self.rpc(serde_json::json!({
+            "method": method,
+            "arguments": { "ids": [info_hash.as_str()] }
+        }))?;
+        Ok(())
+    }
+}
+
+impl TorrentClient for TransmissionClient {
+    fn metadata(&self) -> &TorrentClientMetadata<'_> {
+        &self.identity.metadata
+    }
+
+    fn is_torrent_in_client(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self.torrent_info(info_hash)?.is_some())
+    }
+
+    fn is_torrent_complete(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self
+            .torrent_info(info_hash)?
+            .is_some_and(|torrent| torrent.complete()))
+    }
+
+    fn is_torrent_checking(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        Ok(self
+            .torrent_info(info_hash)?
+            .is_some_and(|torrent| torrent.checking()))
+    }
+
+    fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
+        let mut output = Vec::new();
+        for torrent in self.torrent_get(None)? {
+            let Some(info_hash) = InfoHash::new(torrent.hash_string.clone()) else {
+                continue;
+            };
+            let complete = torrent.complete();
+            let checking = torrent.checking();
+            output.push(ClientTorrent {
+                info_hash: info_hash.into_owned(),
+                name: Cow::Owned(torrent.name),
+                files: torrent
+                    .files
+                    .into_iter()
+                    .map(|file| File::new(file.name, file.length))
+                    .collect(),
+                save_path: Cow::Owned(torrent.download_dir),
+                category: None,
+                tags: torrent.labels.into_iter().map(ClientLabel::new).collect(),
+                trackers: torrent
+                    .trackers
+                    .into_iter()
+                    .filter_map(|tracker| tracker_host(&tracker.announce))
+                    .map(Cow::Owned)
+                    .collect(),
+                complete,
+                checking,
+            });
+        }
+        Ok(output)
+    }
+
+    fn get_download_dir(
+        &self,
+        metafile: &Metafile<'_>,
+        options: DownloadDirOptions,
+    ) -> crate::Result<Result<PathBuf, ClientErrorCode>> {
+        let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
+            return Ok(Err(ClientErrorCode::NotFound));
+        };
+        if options.only_completed && !torrent.complete() {
+            return Ok(Err(ClientErrorCode::TorrentNotComplete));
+        }
+        Ok(Ok(PathBuf::from(torrent.download_dir)))
+    }
+
+    fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>> {
+        Ok(self
+            .torrent_get(None)?
+            .into_iter()
+            .map(|torrent| (torrent.hash_string, PathBuf::from(torrent.download_dir)))
+            .collect())
+    }
+
+    fn inject(
+        &self,
+        new_torrent: &NewTorrent<'_>,
+        _searchee: &Searchee<'_>,
+        _decision: Decision,
+        options: &InjectionOptions,
+    ) -> crate::Result<InjectionResult> {
+        ensure_writable(self)?;
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "metainfo".to_owned(),
+            serde_json::Value::String(base64_encode(new_torrent.bytes.as_ref())),
+        );
+        arguments.insert("paused".to_owned(), serde_json::Value::Bool(options.paused));
+        if let Some(destination) = &options.destination_dir {
+            arguments.insert(
+                "download-dir".to_owned(),
+                serde_json::Value::String(destination.display().to_string()),
+            );
+        }
+        let labels = options
+            .category
+            .iter()
+            .chain(options.tags.iter())
+            .map(ClientLabel::as_str)
+            .collect::<Vec<_>>();
+        if !labels.is_empty() {
+            arguments.insert("labels".to_owned(), serde_json::json!(labels));
+        }
+        self.rpc(serde_json::json!({
+            "method": "torrent-add",
+            "arguments": arguments
+        }))?;
+        if options.paused {
+            self.torrent_action("torrent-stop", &new_torrent.metafile.info_hash)?;
+        }
+        Ok(InjectionResult::Injected)
+    }
+
+    fn recheck_torrent(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
+        self.torrent_action("torrent-verify", info_hash)
+    }
+
+    fn resume_injection(
+        &self,
+        metafile: &Metafile<'_>,
+        _decision: Decision,
+        _options: ResumeOptions,
+    ) -> crate::Result<()> {
+        self.torrent_action("torrent-start", &metafile.info_hash)
+    }
+
+    fn validate_config(&self) -> crate::Result<()> {
+        self.rpc(serde_json::json!({ "method": "session-get" }))?;
+        Ok(())
+    }
+}
+
 /// Build client identities from config order and URL host/path rules.
 pub fn client_identities(configs: &[TorrentClientConfig]) -> crate::Result<Vec<ClientIdentity>> {
     let mut host_counts = BTreeMap::<String, usize>::new();
@@ -646,6 +899,46 @@ struct QbTrackerInfo {
     url: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct TransmissionTorrent {
+    #[serde(rename = "hashString")]
+    hash_string: String,
+    name: String,
+    #[serde(rename = "downloadDir", default)]
+    download_dir: String,
+    #[serde(default)]
+    files: Vec<TransmissionFile>,
+    #[serde(default)]
+    trackers: Vec<TransmissionTracker>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(rename = "percentDone", default)]
+    percent_done: f64,
+    #[serde(default)]
+    status: i64,
+}
+
+impl TransmissionTorrent {
+    fn complete(&self) -> bool {
+        self.percent_done >= 1.0 || self.status == 6
+    }
+
+    fn checking(&self) -> bool {
+        self.status == 2
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TransmissionFile {
+    name: String,
+    length: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TransmissionTracker {
+    announce: String,
+}
+
 fn parse_qb_torrents(body: &str) -> crate::Result<Vec<QbTorrentInfo>> {
     serde_json::from_str(body)
         .map_err(|error| client_error(format!("failed to parse qBittorrent torrents: {error}")))
@@ -706,6 +999,40 @@ fn qb_version_at_least(version: &str, major: u32, minor: u32, patch: u32) -> boo
     current >= (major, minor, patch)
 }
 
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    fn encode_char(index: u8) -> char {
+        TABLE
+            .get(usize::from(index))
+            .copied()
+            .map(char::from)
+            .unwrap_or('=')
+    }
+
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let Some(&first) = chunk.first() else {
+            continue;
+        };
+        let second = chunk.get(1).copied().unwrap_or_default();
+        let third = chunk.get(2).copied().unwrap_or_default();
+
+        output.push(encode_char(first >> 2));
+        output.push(encode_char(((first & 0b0000_0011) << 4) | (second >> 4)));
+        if chunk.len() > 1 {
+            output.push(encode_char(((second & 0b0000_1111) << 2) | (third >> 6)));
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(encode_char(third & 0b0011_1111));
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
 fn parse_client_kind(value: &str) -> crate::Result<TorrentClientKind> {
     match value {
         "qbittorrent" => Ok(TorrentClientKind::QBittorrent),
@@ -737,8 +1064,8 @@ fn client_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 mod tests {
     use super::{
         ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent, QbittorrentClient,
-        ResumeOptions, TorrentClient, client_identities, client_torrent_to_searchee,
-        select_injection_client,
+        ResumeOptions, TorrentClient, TransmissionClient, client_identities,
+        client_torrent_to_searchee, select_injection_client,
     };
     use crate::{
         config::TorrentClientConfig,
@@ -978,6 +1305,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transmission_negotiates_session_and_maps_inventory() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response_with_headers("409 Conflict", &[("X-Transmission-Session-Id", "sid")], ""),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example.Show.S01E01","downloadDir":"/downloads","files":[{{"name":"Example.Show.S01E01.mkv","length":123}}],"trackers":[{{"announce":"https://tracker.example/announce"}}],"labels":["tv","cross-seed"],"percentDone":1.0,"status":6}}]}}}}"#
+                ),
+            ),
+        ]);
+        let client = transmission_client(&server.url);
+
+        let torrents = client.get_all_torrents().expect("inventory");
+
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].info_hash.as_str(), hash);
+        assert_eq!(torrents[0].save_path, "/downloads");
+        assert_eq!(torrents[0].files[0].path, "Example.Show.S01E01.mkv");
+        assert_eq!(torrents[0].tags.len(), 2);
+        assert_eq!(torrents[0].trackers[0], "tracker.example");
+        assert!(torrents[0].complete);
+        assert!(!torrents[0].checking);
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].contains("X-Transmission-Session-Id"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("x-transmission-session-id: sid")
+        );
+        assert!(requests[1].contains(r#""method":"torrent-get""#));
+    }
+
+    #[test]
+    fn transmission_injects_and_starts() {
+        let server = http_server(vec![
+            http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
+            http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
+            http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
+            http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
+        ]);
+        let client = transmission_client(&server.url);
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let new_torrent = NewTorrent {
+            metafile,
+            bytes: Cow::Owned(bytes),
+        };
+        let searchee = Searchee::from_files("Inject.Release", "Inject.Release", Vec::new());
+
+        let result = client
+            .inject(
+                &new_torrent,
+                &searchee,
+                Decision::Match,
+                &InjectionOptions {
+                    destination_dir: Some(PathBuf::from("/linked")),
+                    category: Some(ClientLabel::new("tv")),
+                    tags: vec![ClientLabel::new("cross-seed")],
+                    paused: true,
+                    skip_checking: true,
+                },
+            )
+            .expect("inject");
+        client
+            .recheck_torrent(&new_torrent.metafile.info_hash)
+            .expect("recheck");
+        client
+            .resume_injection(
+                &new_torrent.metafile,
+                Decision::Match,
+                ResumeOptions::default(),
+            )
+            .expect("resume");
+
+        assert_eq!(result, InjectionResult::Injected);
+        let requests = server.join();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].contains(r#""method":"torrent-add""#));
+        assert!(requests[0].contains(r#""download-dir":"/linked""#));
+        assert!(requests[0].contains(r#""labels":["tv","cross-seed"]"#));
+        assert!(requests[0].contains(r#""paused":true"#));
+        assert!(requests[1].contains(r#""method":"torrent-stop""#));
+        assert!(requests[2].contains(r#""method":"torrent-verify""#));
+        assert!(requests[3].contains(r#""method":"torrent-start""#));
+    }
+
     struct FakeClient {
         metadata: TorrentClientMetadata<'static>,
     }
@@ -1069,6 +1485,18 @@ mod tests {
         QbittorrentClient::new(identity, Some(Duration::from_secs(1))).expect("client")
     }
 
+    fn transmission_client(base_url: &str) -> TransmissionClient {
+        let identity =
+            client_identities(&[
+                TorrentClientConfig::parse(&format!("transmission:{base_url}")).expect("config"),
+            ])
+            .expect("identity")
+            .into_iter()
+            .next()
+            .expect("identity");
+        TransmissionClient::new(identity, Some(Duration::from_secs(1))).expect("client")
+    }
+
     struct TestHttpServer {
         url: String,
         handle: thread::JoinHandle<Vec<String>>,
@@ -1098,8 +1526,16 @@ mod tests {
     }
 
     fn http_response(status: &str, body: &str) -> String {
+        http_response_with_headers(status, &[], body)
+    }
+
+    fn http_response_with_headers(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let extra_headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
         format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
     }
