@@ -5,21 +5,32 @@ use std::{
     collections::HashMap,
     fs,
     path::Path,
+    sync::LazyLock,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use filetime::FileTime;
 use quick_xml::{Reader, events::Event};
+use regex::Regex;
 use rusqlite::{OptionalExtension, params};
-use url::Url;
+use url::{Url, form_urlencoded};
 
 use crate::{
     SporosError,
-    domain::{Candidate, InfoHash, Metafile},
+    domain::{Candidate, InfoHash, MediaType, Metafile, Searchee},
     persistence::Database,
     torrent::{parse_metafile, torrent_cache_path},
 };
+
+static EPISODE_QUERY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bS(?P<season>\d{1,2})E(?P<episode>\d{1,3})\b")
+        .expect("episode query regex compiles")
+});
+static SEASON_QUERY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:S(?P<s>\d{1,2})|Season[ ._\-]*(?P<season>\d{1,2}))\b")
+        .expect("season query regex compiles")
+});
 
 /// Sanitized Torznab configuration split into persisted URL and secret API key.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -42,7 +53,7 @@ pub struct IndexerSyncResult {
 }
 
 /// Torznab category capability booleans.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, serde::Serialize)]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CategoryCaps {
     /// Movie categories.
     pub movie: bool,
@@ -61,7 +72,7 @@ pub struct CategoryCaps {
 }
 
 /// Torznab limit caps.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct LimitCaps {
     /// Default page size.
     pub default: u32,
@@ -112,6 +123,96 @@ pub struct EnabledIndexer {
     pub url: String,
     /// API key.
     pub apikey: String,
+}
+
+/// Indexer with parsed capabilities for search requests.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchIndexer {
+    /// Database row id.
+    pub id: i64,
+    /// Sanitized URL.
+    pub url: String,
+    /// API key.
+    pub apikey: String,
+    /// Parsed caps.
+    pub caps: TorznabCaps,
+}
+
+#[derive(Debug, Clone)]
+struct RawSearchCaps {
+    search: bool,
+    tv_search: bool,
+    movie_search: bool,
+    music_search: bool,
+    audio_search: bool,
+    book_search: bool,
+    tv_ids: String,
+    movie_ids: String,
+    categories: String,
+    limits: String,
+}
+
+/// Optional Arr IDs available for Torznab ID searches.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct TorznabSearchIds {
+    /// TVDB series id.
+    pub tvdbid: Option<String>,
+    /// TMDB movie/series id.
+    pub tmdbid: Option<String>,
+    /// IMDB title id.
+    pub imdbid: Option<String>,
+    /// TVMaze series id.
+    pub tvmazeid: Option<String>,
+}
+
+/// One generated Torznab query.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TorznabQuery {
+    /// Query parameters excluding `apikey`.
+    pub params: Vec<(String, String)>,
+}
+
+impl TorznabQuery {
+    fn new<K, V>(params: Vec<(K, V)>) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        Self {
+            params: params
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        }
+    }
+
+    fn push(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.params.push((key.into(), value.into()));
+    }
+}
+
+/// Search request behavior.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TorznabSearchOptions {
+    /// Per-request timeout.
+    pub timeout: Option<Duration>,
+    /// Delay between requests.
+    pub delay: Duration,
+    /// Maximum candidates to return.
+    pub search_limit: Option<usize>,
+    /// Current wall-clock time in milliseconds.
+    pub now_millis: u64,
+}
+
+impl Default for TorznabSearchOptions {
+    fn default() -> Self {
+        Self {
+            timeout: None,
+            delay: Duration::ZERO,
+            search_limit: None,
+            now_millis: current_time_millis(),
+        }
+    }
 }
 
 /// Retry behavior for candidate torrent downloads.
@@ -580,6 +681,267 @@ pub fn enabled_indexers(
     Ok(output)
 }
 
+/// Load enabled indexers with parsed caps for search.
+pub fn enabled_search_indexers(
+    database: &Database,
+    now_millis: u64,
+) -> crate::Result<Vec<SearchIndexer>> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT id, url, apikey,
+                    search_cap, tv_search_cap, movie_search_cap, music_search_cap,
+                    audio_search_cap, book_search_cap, tv_id_caps, movie_id_caps,
+                    cat_caps, limits_caps
+             FROM indexer
+             WHERE active = 1
+               AND search_cap = 1
+               AND (status IS NULL OR status = 'OK' OR retry_after < ?1)",
+        )
+        .map_err(persistence_error)?;
+    let rows = statement
+        .query_map(params![now_millis], |row| {
+            let tv_ids: String = row.get(9)?;
+            let movie_ids: String = row.get(10)?;
+            let categories: String = row.get(11)?;
+            let limits: String = row.get(12)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                RawSearchCaps {
+                    search: row.get(3)?,
+                    tv_search: row.get(4)?,
+                    movie_search: row.get(5)?,
+                    music_search: row.get(6)?,
+                    audio_search: row.get(7)?,
+                    book_search: row.get(8)?,
+                    tv_ids,
+                    movie_ids,
+                    categories,
+                    limits,
+                },
+            ))
+        })
+        .map_err(persistence_error)?;
+    let mut output = Vec::new();
+    for row in rows {
+        let (id, url, apikey, raw_caps) = row.map_err(persistence_error)?;
+        output.push(SearchIndexer {
+            id,
+            url,
+            apikey,
+            caps: TorznabCaps {
+                search: raw_caps.search,
+                tv_search: raw_caps.tv_search,
+                movie_search: raw_caps.movie_search,
+                music_search: raw_caps.music_search,
+                audio_search: raw_caps.audio_search,
+                book_search: raw_caps.book_search,
+                tv_ids: serde_json::from_str(&raw_caps.tv_ids).map_err(json_error)?,
+                movie_ids: serde_json::from_str(&raw_caps.movie_ids).map_err(json_error)?,
+                categories: serde_json::from_str(&raw_caps.categories).map_err(json_error)?,
+                limits: serde_json::from_str(&raw_caps.limits).map_err(json_error)?,
+            },
+        });
+    }
+    Ok(output)
+}
+
+/// Whether an indexer can search a media type.
+pub fn indexer_supports_media_type(media_type: MediaType, caps: &TorznabCaps) -> bool {
+    match media_type {
+        MediaType::Episode | MediaType::Pack => caps.tv_search || caps.categories.xxx,
+        MediaType::Movie => caps.movie_search || caps.categories.xxx,
+        MediaType::Anime | MediaType::Video => {
+            caps.movie_search
+                || caps.tv_search
+                || caps.categories.movie
+                || caps.categories.tv
+                || caps.categories.anime
+                || caps.categories.xxx
+        }
+        MediaType::Audio => caps.audio_search || caps.music_search || caps.categories.audio,
+        MediaType::Book => caps.book_search || caps.categories.book,
+        MediaType::Unknown => caps.categories.additional,
+    }
+}
+
+/// Build Torznab query parameter sets for a searchee and indexer caps.
+pub fn create_torznab_search_queries(
+    searchee: &Searchee<'_>,
+    caps: &TorznabCaps,
+    ids: Option<&TorznabSearchIds>,
+) -> Vec<TorznabQuery> {
+    if !indexer_supports_media_type(searchee.media_type, caps) {
+        return Vec::new();
+    }
+    let title = searchee.title.as_ref();
+    match searchee.media_type {
+        MediaType::Episode if caps.tv_search => {
+            episode_query(title, caps, ids).into_iter().collect()
+        }
+        MediaType::Pack if caps.tv_search => season_query(title, caps, ids).into_iter().collect(),
+        MediaType::Movie if caps.movie_search => vec![movie_query(title, caps, ids)],
+        MediaType::Anime | MediaType::Video if caps.search => {
+            let mut query = TorznabQuery::new(vec![("t", "search")]);
+            query.push("q", cleaned_generic_query(title));
+            vec![query]
+        }
+        MediaType::Audio | MediaType::Book | MediaType::Unknown if caps.search => {
+            let mut query = TorznabQuery::new(vec![("t", "search")]);
+            query.push("q", cleaned_generic_query(title));
+            vec![query]
+        }
+        _ if caps.search => {
+            let mut query = TorznabQuery::new(vec![("t", "search")]);
+            query.push("q", cleaned_generic_query(title));
+            vec![query]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Build the concrete request URL for an indexer/query pair.
+pub fn torznab_request_url(indexer: &SearchIndexer, query: &TorznabQuery) -> crate::Result<String> {
+    let mut url = Url::parse(&indexer.url)
+        .map_err(|error| integration_error(format!("invalid Torznab URL: {error}")))?;
+    let mut encoded = form_urlencoded::Serializer::new(String::new());
+    encoded.append_pair("apikey", &indexer.apikey);
+    for (key, value) in &query.params {
+        encoded.append_pair(key, value);
+    }
+    url.set_query(Some(&encoded.finish()));
+    Ok(url.to_string())
+}
+
+/// Search one indexer with generated queries.
+pub fn search_torznab_indexer(
+    database: &Database,
+    indexer: &SearchIndexer,
+    queries: &[TorznabQuery],
+    options: TorznabSearchOptions,
+) -> crate::Result<Vec<Candidate<'static>>> {
+    let mut builder =
+        reqwest::blocking::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
+    if let Some(timeout) = options.timeout {
+        builder = builder.timeout(timeout);
+    }
+    let client = builder
+        .build()
+        .map_err(|error| integration_error(format!("failed to build HTTP client: {error}")))?;
+    let mut candidates = Vec::new();
+    for (position, query) in queries.iter().enumerate() {
+        if position > 0 && !options.delay.is_zero() {
+            thread::sleep(options.delay);
+        }
+        let response = match client.get(torznab_request_url(indexer, query)?).send() {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                snooze_indexer(
+                    database,
+                    indexer.id,
+                    "UNKNOWN_ERROR",
+                    None,
+                    options.now_millis,
+                )?;
+                continue;
+            }
+            Err(error) => {
+                return Err(integration_error(format!(
+                    "failed to search Torznab indexer: {error}"
+                )));
+            }
+        };
+        if !response.status().is_success() {
+            let retry_after =
+                retry_after_millis(response.headers(), response.status(), options.now_millis);
+            let status = if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                "RATE_LIMITED"
+            } else {
+                "UNKNOWN_ERROR"
+            };
+            snooze_indexer(
+                database,
+                indexer.id,
+                status,
+                Some(retry_after),
+                options.now_millis,
+            )?;
+            continue;
+        }
+        let body = response.text().map_err(|error| {
+            integration_error(format!("failed to read Torznab response: {error}"))
+        })?;
+        let mut parsed = parse_torznab_rss(&body, indexer.id)?;
+        if let Some(tracker) = parsed
+            .iter()
+            .map(|candidate| candidate.tracker.as_ref())
+            .find(|tracker| *tracker != "UnknownTracker")
+        {
+            update_indexer_name(database, indexer.id, tracker)?;
+        }
+        candidates.append(&mut parsed);
+        if let Some(limit) = options.search_limit {
+            if candidates.len() >= limit {
+                candidates.truncate(limit);
+                break;
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// Parse a Torznab RSS response into candidates.
+pub fn parse_torznab_rss(xml: &str, indexer_id: i64) -> crate::Result<Vec<Candidate<'static>>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut candidates = Vec::new();
+    let mut item: Option<RssItem> = None;
+    let mut current = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(event)) => {
+                current = event.name().as_ref().to_vec();
+                if current == b"item" {
+                    item = Some(RssItem::default());
+                }
+            }
+            Ok(Event::End(event)) => {
+                if event.name().as_ref() == b"item" {
+                    if let Some(item) = item.take().and_then(|item| item.into_candidate(indexer_id))
+                    {
+                        candidates.push(item);
+                    }
+                }
+                current.clear();
+            }
+            Ok(Event::Text(event)) => {
+                if let Some(item) = &mut item {
+                    let value = String::from_utf8_lossy(event.as_ref()).into_owned();
+                    item.set(&current, value);
+                }
+            }
+            Ok(Event::CData(event)) => {
+                if let Some(item) = &mut item {
+                    let value = String::from_utf8_lossy(event.as_ref()).into_owned();
+                    item.set(&current, value);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => {
+                return Err(integration_error(format!(
+                    "invalid Torznab RSS XML: {error}"
+                )));
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(candidates)
+}
+
 /// Parse a Torznab caps XML response.
 pub fn parse_torznab_caps(xml: &str) -> crate::Result<TorznabCaps> {
     let mut reader = Reader::from_str(xml);
@@ -644,6 +1006,297 @@ pub fn fetch_torznab_caps(indexer: &TorznabConfig) -> crate::Result<TorznabCaps>
         .text()
         .map_err(|error| integration_error(format!("failed to read Torznab caps: {error}")))?;
     parse_torznab_caps(&body)
+}
+
+fn episode_query(
+    title: &str,
+    caps: &TorznabCaps,
+    ids: Option<&TorznabSearchIds>,
+) -> Option<TorznabQuery> {
+    let captures = EPISODE_QUERY_REGEX.captures(title)?;
+    let season = captures.name("season")?.as_str();
+    let episode = captures.name("episode")?.as_str();
+    let mut query = TorznabQuery::new(vec![("t", "tvsearch")]);
+    append_supported_ids(&mut query, &caps.tv_ids, ids);
+    if !query_has_id(&query) {
+        query.push("q", strip_query_markers(title));
+    }
+    query.push("season", season);
+    query.push("ep", episode);
+    Some(query)
+}
+
+fn season_query(
+    title: &str,
+    caps: &TorznabCaps,
+    ids: Option<&TorznabSearchIds>,
+) -> Option<TorznabQuery> {
+    let captures = SEASON_QUERY_REGEX.captures(title)?;
+    let season = captures
+        .name("s")
+        .or_else(|| captures.name("season"))?
+        .as_str();
+    let mut query = TorznabQuery::new(vec![("t", "tvsearch")]);
+    append_supported_ids(&mut query, &caps.tv_ids, ids);
+    if !query_has_id(&query) {
+        query.push("q", strip_query_markers(title));
+    }
+    query.push("season", season);
+    Some(query)
+}
+
+fn movie_query(title: &str, caps: &TorznabCaps, ids: Option<&TorznabSearchIds>) -> TorznabQuery {
+    let mut query = TorznabQuery::new(vec![("t", "movie")]);
+    append_supported_ids(&mut query, &caps.movie_ids, ids);
+    if !query_has_id(&query) {
+        query.push("q", strip_query_markers(title));
+    }
+    query
+}
+
+fn append_supported_ids(
+    query: &mut TorznabQuery,
+    supported: &[String],
+    ids: Option<&TorznabSearchIds>,
+) {
+    let Some(ids) = ids else {
+        return;
+    };
+    for key in supported {
+        let value = match key.as_str() {
+            "tvdbid" => ids.tvdbid.as_deref(),
+            "tmdbid" => ids.tmdbid.as_deref(),
+            "imdbid" => ids.imdbid.as_deref(),
+            "tvmazeid" => ids.tvmazeid.as_deref(),
+            _ => None,
+        };
+        if let Some(value) = value {
+            query.push(key, value);
+        }
+    }
+}
+
+fn query_has_id(query: &TorznabQuery) -> bool {
+    query
+        .params
+        .iter()
+        .any(|(key, _)| matches!(key.as_str(), "tvdbid" | "tmdbid" | "imdbid" | "tvmazeid"))
+}
+
+fn strip_query_markers(title: &str) -> String {
+    let without_episode = EPISODE_QUERY_REGEX.replace_all(title, "");
+    let without_season = SEASON_QUERY_REGEX.replace_all(&without_episode, "");
+    cleaned_generic_query(&without_season)
+}
+
+fn cleaned_generic_query(title: &str) -> String {
+    title
+        .replace(['.', '_', '[', ']', '(', ')'], " ")
+        .split_whitespace()
+        .filter(|token| !metadata_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn metadata_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "2160p"
+            | "1080p"
+            | "720p"
+            | "480p"
+            | "web"
+            | "web-dl"
+            | "webdl"
+            | "webrip"
+            | "hdtv"
+            | "bluray"
+            | "blu-ray"
+            | "bdrip"
+            | "brrip"
+            | "remux"
+            | "proper"
+            | "repack"
+            | "rerip"
+    ) || lower
+        .strip_prefix('v')
+        .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn snooze_indexer(
+    database: &Database,
+    indexer_id: i64,
+    status: &str,
+    retry_after: Option<u64>,
+    now_millis: u64,
+) -> crate::Result<()> {
+    let fallback = if status == "RATE_LIMITED" {
+        Duration::from_secs(60 * 60)
+    } else {
+        Duration::from_secs(10 * 60)
+    };
+    set_indexer_status(
+        database,
+        indexer_id,
+        Some(status),
+        Some(retry_after.unwrap_or_else(|| now_millis.saturating_add(duration_millis(fallback)))),
+    )
+}
+
+fn retry_after_millis(
+    headers: &reqwest::header::HeaderMap,
+    status: reqwest::StatusCode,
+    now_millis: u64,
+) -> u64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after_seconds)
+        .map(|seconds| now_millis.saturating_add(seconds.saturating_mul(1000)))
+        .unwrap_or_else(|| {
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                now_millis.saturating_add(duration_millis(Duration::from_secs(60 * 60)))
+            } else {
+                now_millis.saturating_add(duration_millis(Duration::from_secs(10 * 60)))
+            }
+        })
+}
+
+fn update_indexer_name(database: &Database, indexer_id: i64, name: &str) -> crate::Result<()> {
+    database
+        .connection()
+        .execute(
+            "UPDATE indexer SET name = ?2 WHERE id = ?1",
+            params![indexer_id, name],
+        )
+        .map_err(persistence_error)?;
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct RssItem {
+    guid: Option<String>,
+    title: Option<String>,
+    link: Option<String>,
+    size: Option<u64>,
+    pub_date_millis: Option<u64>,
+    tracker: Option<String>,
+}
+
+impl RssItem {
+    fn set(&mut self, key: &[u8], value: String) {
+        match key {
+            b"guid" => self.guid = Some(value),
+            b"title" => self.title = Some(value),
+            b"link" => self.link = Some(value),
+            b"size" => self.size = value.trim().parse().ok(),
+            b"pubDate" => self.pub_date_millis = parse_rss_pub_date(&value),
+            b"prowlarrindexer" | b"jackettindexer" | b"indexer" => self.tracker = Some(value),
+            _ => {}
+        }
+    }
+
+    fn into_candidate(self, indexer_id: i64) -> Option<Candidate<'static>> {
+        let mut candidate = Candidate::new(
+            self.title?,
+            self.guid?,
+            self.link,
+            self.tracker.unwrap_or_else(|| "UnknownTracker".to_owned()),
+        );
+        candidate.size = self.size;
+        candidate.pub_date_millis = self.pub_date_millis;
+        candidate.indexer_id = Some(indexer_id);
+        Some(candidate.into_owned())
+    }
+}
+
+fn parse_rss_pub_date(value: &str) -> Option<u64> {
+    let parts = value.split_whitespace().collect::<Vec<_>>();
+    let start = if parts.first().is_some_and(|part| part.ends_with(',')) {
+        1
+    } else {
+        0
+    };
+    let day = parts.get(start)?.parse::<i32>().ok()?;
+    let month = month_number(parts.get(start + 1)?)?;
+    let year = parts.get(start + 2)?.parse::<i32>().ok()?;
+    let time = parts.get(start + 3)?;
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<i64>().ok()?;
+    let minute = time_parts.next()?.parse::<i64>().ok()?;
+    let second = time_parts.next()?.parse::<i64>().ok()?;
+    let offset = parts
+        .get(start + 4)
+        .and_then(|zone| parse_zone_offset_seconds(zone))
+        .unwrap_or(0);
+    let days = days_from_civil(year, month, day);
+    let seconds = days
+        .saturating_mul(86_400)
+        .saturating_add(hour.saturating_mul(3600))
+        .saturating_add(minute.saturating_mul(60))
+        .saturating_add(second)
+        .saturating_sub(offset);
+    u64::try_from(seconds)
+        .ok()
+        .map(|seconds| seconds.saturating_mul(1000))
+}
+
+fn month_number(value: &str) -> Option<i32> {
+    match value {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_zone_offset_seconds(value: &str) -> Option<i64> {
+    if matches!(value, "GMT" | "UTC" | "UT") {
+        return Some(0);
+    }
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = value.get(1..)?;
+    if digits.len() != 4 {
+        return None;
+    }
+    let hours = digits.get(..2)?.parse::<i64>().ok()?;
+    let minutes = digits.get(2..)?.parse::<i64>().ok()?;
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+fn days_from_civil(year: i32, month: i32, day: i32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month_adjusted = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_adjusted + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::from(era * 146_097 + doe - 719_468)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(duration_millis)
+        .unwrap_or(0)
 }
 
 fn attributes(event: &quick_xml::events::BytesStart<'_>) -> crate::Result<Vec<(String, String)>> {
@@ -796,12 +1449,15 @@ fn json_error(error: serde_json::Error) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        SnatchHistory, SnatchOptions, SnatchResult, cache_torrent_file, enabled_indexers,
-        get_cached_torrent, guid_lookup, parse_torznab_caps, set_indexer_status, snatch,
-        snatch_once, sync_torznab_indexers, update_indexer_caps, validate_torznab_url,
+        CategoryCaps, LimitCaps, SearchIndexer, SnatchHistory, SnatchOptions, SnatchResult,
+        TorznabCaps, TorznabQuery, TorznabSearchIds, TorznabSearchOptions, cache_torrent_file,
+        create_torznab_search_queries, enabled_indexers, get_cached_torrent, guid_lookup,
+        parse_torznab_caps, parse_torznab_rss, search_torznab_indexer, set_indexer_status, snatch,
+        snatch_once, sync_torznab_indexers, torznab_request_url, update_indexer_caps,
+        validate_torznab_url,
     };
     use crate::{
-        domain::{Candidate, Decision},
+        domain::{Candidate, Decision, File, MediaType, Searchee},
         persistence::{Database, DecisionRecord},
     };
     use std::{
@@ -901,6 +1557,236 @@ mod tests {
             1
         );
 
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_media_aware_torznab_queries_and_urls() {
+        let mut caps = TorznabCaps {
+            search: true,
+            tv_search: true,
+            movie_search: true,
+            tv_ids: vec!["tvdbid".to_owned()],
+            movie_ids: vec!["imdbid".to_owned()],
+            categories: CategoryCaps {
+                tv: true,
+                movie: true,
+                ..CategoryCaps::default()
+            },
+            limits: LimitCaps::default(),
+            ..TorznabCaps::default()
+        };
+        let mut episode = Searchee::from_files(
+            "Example.Show.S01E02.1080p.WEB-DL-GRP",
+            "Example.Show.S01E02",
+            vec![File::new("Example.Show.S01E02.mkv", 10)],
+        );
+        episode.media_type = MediaType::Episode;
+        let ids = TorznabSearchIds {
+            tvdbid: Some("1234".to_owned()),
+            ..TorznabSearchIds::default()
+        };
+
+        let queries = create_torznab_search_queries(&episode, &caps, Some(&ids));
+
+        assert_eq!(queries.len(), 1);
+        assert!(
+            queries[0]
+                .params
+                .contains(&("t".to_owned(), "tvsearch".to_owned()))
+        );
+        assert!(
+            queries[0]
+                .params
+                .contains(&("season".to_owned(), "01".to_owned()))
+        );
+        assert!(
+            queries[0]
+                .params
+                .contains(&("ep".to_owned(), "02".to_owned()))
+        );
+        assert!(
+            queries[0]
+                .params
+                .contains(&("tvdbid".to_owned(), "1234".to_owned()))
+        );
+        assert!(!queries[0].params.iter().any(|(key, _)| key == "q"));
+
+        caps.tv_search = false;
+        let queries = create_torznab_search_queries(&episode, &caps, Some(&ids));
+        assert!(queries.is_empty());
+
+        let indexer = SearchIndexer {
+            id: 7,
+            url: "https://indexer.example/api".to_owned(),
+            apikey: "secret".to_owned(),
+            caps,
+        };
+        let url = torznab_request_url(
+            &indexer,
+            &TorznabQuery {
+                params: vec![
+                    ("t".to_owned(), "search".to_owned()),
+                    ("q".to_owned(), "a b".to_owned()),
+                ],
+            },
+        )
+        .expect("url");
+        assert_eq!(
+            url,
+            "https://indexer.example/api?apikey=secret&t=search&q=a+b"
+        );
+    }
+
+    #[test]
+    fn parses_torznab_rss_candidates() {
+        let candidates = parse_torznab_rss(
+            r#"
+            <rss><channel>
+              <item>
+                <title>Example.Release</title>
+                <guid>guid-1</guid>
+                <link>https://indexer.example/download/1</link>
+                <size>12345</size>
+                <pubDate>Thu, 01 Jan 1970 00:00:02 +0000</pubDate>
+                <prowlarrindexer>TrackerOne</prowlarrindexer>
+              </item>
+              <item>
+                <title>Other.Release</title>
+                <guid>guid-2</guid>
+                <link>https://indexer.example/download/2</link>
+              </item>
+            </channel></rss>
+            "#,
+            42,
+        )
+        .expect("rss");
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].name, "Example.Release");
+        assert_eq!(candidates[0].guid, "guid-1");
+        assert_eq!(
+            candidates[0].link.as_deref(),
+            Some("https://indexer.example/download/1")
+        );
+        assert_eq!(candidates[0].size, Some(12_345));
+        assert_eq!(candidates[0].pub_date_millis, Some(2_000));
+        assert_eq!(candidates[0].tracker, "TrackerOne");
+        assert_eq!(candidates[0].indexer_id, Some(42));
+        assert_eq!(candidates[1].tracker, "UnknownTracker");
+    }
+
+    #[test]
+    fn searches_torznab_and_updates_indexer_name() {
+        let server = http_server(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/rss+xml")],
+            r#"<rss><channel>
+              <item><title>One</title><guid>g1</guid><link>https://idx/1</link><indexer>NamedTracker</indexer></item>
+              <item><title>Two</title><guid>g2</guid><link>https://idx/2</link><indexer>NamedTracker</indexer></item>
+            </channel></rss>"#,
+        )]);
+        let root = temp_path("torznab-search");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO indexer (url, apikey, active, search_cap) VALUES (?1, 'key', 1, 1)",
+                [format!("{}/api", server.url)],
+            )
+            .expect("indexer");
+        let id = database
+            .connection()
+            .query_row("SELECT id FROM indexer", [], |row| row.get(0))
+            .expect("id");
+        let indexer = SearchIndexer {
+            id,
+            url: format!("{}/api", server.url),
+            apikey: "key".to_owned(),
+            caps: TorznabCaps::default(),
+        };
+
+        let candidates = search_torznab_indexer(
+            &database,
+            &indexer,
+            &[TorznabQuery {
+                params: vec![("t".to_owned(), "search".to_owned())],
+            }],
+            TorznabSearchOptions {
+                search_limit: Some(1),
+                ..TorznabSearchOptions::default()
+            },
+        )
+        .expect("search");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].guid, "g1");
+        let name: String = database
+            .connection()
+            .query_row("SELECT name FROM indexer WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .expect("name");
+        assert_eq!(name, "NamedTracker");
+        let requests = server.join();
+        assert!(requests[0].contains("/api?apikey=key&t=search"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_snoozes_rate_limited_indexers() {
+        let server = http_server(vec![http_response(
+            "429 Too Many Requests",
+            &[("Retry-After", "2")],
+            "",
+        )]);
+        let root = temp_path("torznab-rate");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        database
+            .connection()
+            .execute(
+                "INSERT INTO indexer (url, apikey, active, search_cap) VALUES (?1, 'key', 1, 1)",
+                [format!("{}/api", server.url)],
+            )
+            .expect("indexer");
+        let id = database
+            .connection()
+            .query_row("SELECT id FROM indexer", [], |row| row.get(0))
+            .expect("id");
+        let indexer = SearchIndexer {
+            id,
+            url: format!("{}/api", server.url),
+            apikey: "key".to_owned(),
+            caps: TorznabCaps::default(),
+        };
+
+        let candidates = search_torznab_indexer(
+            &database,
+            &indexer,
+            &[TorznabQuery {
+                params: vec![("t".to_owned(), "search".to_owned())],
+            }],
+            TorznabSearchOptions {
+                now_millis: 1_000,
+                ..TorznabSearchOptions::default()
+            },
+        )
+        .expect("search");
+
+        assert!(candidates.is_empty());
+        let (status, retry_after): (String, u64) = database
+            .connection()
+            .query_row(
+                "SELECT status, retry_after FROM indexer WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("status");
+        assert_eq!(status, "RATE_LIMITED");
+        assert_eq!(retry_after, 3_000);
+        server.join();
         let _cleanup = fs::remove_dir_all(root);
     }
 
