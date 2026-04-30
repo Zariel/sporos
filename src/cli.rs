@@ -117,7 +117,7 @@ where
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
             let database = Database::open_app_dir(&app_dir)?;
             let shutdown = crate::daemon::install_shutdown_handler()?;
-            let run = crate::daemon::run_daemon(&config, &database, &shutdown)?;
+            let run = crate::daemon::run_daemon(&app_dir, &config, &database, &shutdown)?;
             println!(
                 "daemon stopped: serving={}, jobs={}",
                 run.listen_addr

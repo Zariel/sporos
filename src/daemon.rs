@@ -5,6 +5,7 @@ use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -44,15 +45,17 @@ pub fn install_shutdown_handler() -> crate::Result<ShutdownFlag> {
 
 /// Run the daemon until the shutdown flag is set.
 pub fn run_daemon(
+    app_dir: &Path,
     config: &RuntimeConfig,
     database: &Database,
     shutdown: &ShutdownFlag,
 ) -> crate::Result<DaemonRun> {
     let mut plan = DaemonPlan::from_config(config);
-    run_plan(config, database, &mut plan, shutdown, None)
+    run_plan(app_dir, config, database, &mut plan, shutdown, None)
 }
 
 fn run_plan(
+    app_dir: &Path,
     config: &RuntimeConfig,
     database: &Database,
     plan: &mut DaemonPlan,
@@ -62,6 +65,7 @@ fn run_plan(
     let mut run = plan.run_startup(database, now_millis(), || {
         index_torrents_and_data_dirs(config, database)
     })?;
+    execute_ran_jobs(app_dir, config, database, &run.jobs)?;
     let listener = if let Some(address) = listen_address(config) {
         let listener = TcpListener::bind(address)
             .map_err(|error| daemon_error(format!("failed to bind {address}: {error}")))?;
@@ -88,7 +92,8 @@ fn run_plan(
 
         let now = now_millis();
         if now >= next_job_check {
-            let _results = plan.scheduler.check_jobs(database, now, false)?;
+            let results = plan.scheduler.check_jobs(database, now, false)?;
+            execute_ran_jobs(app_dir, config, database, &results)?;
             next_job_check = now.saturating_add(duration_millis(JOB_LOOP_INTERVAL));
         }
 
@@ -99,6 +104,31 @@ fn run_plan(
         thread::sleep(IDLE_SLEEP);
     }
     Ok(run)
+}
+
+fn execute_ran_jobs(
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    database: &Database,
+    results: &[crate::scheduler::JobCheckResult],
+) -> crate::Result<()> {
+    for result in results {
+        if result.ran && result.name == JobName::Cleanup {
+            let cleanup = crate::operations::cleanup_db(database, app_dir, config, now_millis())?;
+            tracing::info!(
+                data_rows_removed = cleanup.data_rows_removed,
+                ensemble_rows_removed = cleanup.ensemble_rows_removed,
+                torrent_cache_files_removed = cleanup.torrent_cache_files_removed,
+                null_decisions_removed = cleanup.null_decisions_removed,
+                missing_cache_decisions_removed = cleanup.missing_cache_decisions_removed,
+                catastrophic_decision_cleanup_skipped =
+                    cleanup.catastrophic_decision_cleanup_skipped,
+                guid_info_hash_rows = cleanup.guid_info_hash_rows,
+                "cleanup job completed"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn accept_ready(
@@ -369,7 +399,8 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut plan = DaemonPlan::from_config(&config);
 
-        let run = run_plan(&config, &database, &mut plan, &shutdown, Some(1)).expect("run daemon");
+        let run =
+            run_plan(&root, &config, &database, &mut plan, &shutdown, Some(1)).expect("run daemon");
 
         assert!(!run.serving);
         assert_eq!(run.listen_addr, None);
