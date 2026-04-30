@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 clap = "4"
+rusqlite = { version = "0.37", features = ["bundled"] }
 sha1 = "0.10"
 thiserror = "2"
 tracing = "0.1"
