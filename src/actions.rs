@@ -18,8 +18,12 @@ use crate::{
     domain::{
         Candidate, ClientLabel, Decision, File, InjectionResult, Metafile, SaveResult, Searchee,
     },
+    matching::{AssessmentOptions, assess_metafile},
     persistence::Database,
-    torrent::{SavedTorrentMetadata, parse_metafile, torrent_cache_dir, torrent_save_path},
+    torrent::{
+        SavedTorrentMetadata, parse_metadata_from_filename, parse_metafile, torrent_cache_dir,
+        torrent_save_path,
+    },
 };
 
 static CLIENT_INJECTION: Mutex<()> = Mutex::new(());
@@ -88,6 +92,35 @@ pub struct InjectionActionOptions<'a> {
     pub tags: Vec<ClientLabel<'static>>,
 }
 
+/// Runtime settings for retrying saved torrent injection.
+pub struct SavedInjectionOptions<'a> {
+    /// Directory containing saved `.torrent` files.
+    pub input_dir: &'a Path,
+    /// Shared inject action settings.
+    pub injection: &'a InjectionActionOptions<'a>,
+    /// Matching options for saved torrent assessment.
+    pub assessment: &'a AssessmentOptions<'a>,
+    /// Allow saved torrents to match even when filename title metadata differs.
+    pub ignore_titles: bool,
+}
+
+/// Summary from one saved torrent injection pass.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct SavedInjectionSummary {
+    /// Saved `.torrent` files scanned.
+    pub scanned: usize,
+    /// Saved torrents injected and deleted.
+    pub injected: usize,
+    /// Saved torrents already present in a client and deleted.
+    pub already_exists: usize,
+    /// Saved torrents kept because the source was incomplete.
+    pub incomplete: usize,
+    /// Saved torrents kept because matching or injection failed.
+    pub failed: usize,
+    /// Saved files deleted after terminal success.
+    pub deleted: usize,
+}
+
 /// Perform inject-mode action side effects for one matched candidate.
 pub fn perform_injection_action<N>(
     action: &InjectionAction<'_>,
@@ -101,6 +134,101 @@ where
         .lock()
         .map_err(|_error| action_error("client injection mutex was poisoned"))?;
     perform_injection_action_without_mutex(action, options, notify_saved)
+}
+
+/// Retry injection for saved `.torrent` files in `injectDir` or `outputDir`.
+pub fn inject_saved_torrents<N>(
+    options: &SavedInjectionOptions<'_>,
+    searchees: &[Searchee<'static>],
+    mut notify_saved: N,
+) -> crate::Result<SavedInjectionSummary>
+where
+    N: FnMut(&SaveNotification) -> crate::Result<()>,
+{
+    let mut summary = SavedInjectionSummary::default();
+    let entries = match fs::read_dir(options.input_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(summary),
+        Err(error) => {
+            return Err(action_error(format!(
+                "failed to read saved torrent dir {}: {error}",
+                options.input_dir.display()
+            )));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            action_error(format!("failed to read saved torrent dir entry: {error}"))
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("torrent") {
+            continue;
+        }
+        summary.scanned += 1;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!("failed to read saved torrent {}: {error}", path.display());
+                summary.failed += 1;
+                continue;
+            }
+        };
+        let metafile = match parse_metafile(&bytes) {
+            Ok(metafile) => metafile,
+            Err(error) => {
+                tracing::debug!("failed to parse saved torrent {}: {error}", path.display());
+                summary.failed += 1;
+                continue;
+            }
+        };
+        let filename_metadata = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(parse_metadata_from_filename);
+        let Some((searchee, decision)) =
+            best_saved_match(&metafile, filename_metadata.as_ref(), searchees, options)
+        else {
+            summary.failed += 1;
+            continue;
+        };
+        let tracker = filename_metadata
+            .as_ref()
+            .map(|metadata| metadata.tracker.as_ref())
+            .or_else(|| metafile.trackers.first().map(Cow::as_ref))
+            .unwrap_or("UnknownTracker");
+        let result = perform_injection_action(
+            &InjectionAction {
+                searchee,
+                candidate: &Candidate::new(
+                    metafile.name.as_ref(),
+                    path.display().to_string(),
+                    None::<String>,
+                    tracker,
+                ),
+                metafile: &metafile,
+                bytes: &bytes,
+                decision,
+            },
+            options.injection,
+            &mut notify_saved,
+        )?;
+        match result {
+            InjectionResult::Injected => {
+                delete_saved_torrent(&path)?;
+                summary.injected += 1;
+                summary.deleted += 1;
+            }
+            InjectionResult::AlreadyExists => {
+                delete_saved_torrent(&path)?;
+                summary.already_exists += 1;
+                summary.deleted += 1;
+            }
+            InjectionResult::TorrentNotComplete => summary.incomplete += 1,
+            InjectionResult::Failure => summary.failed += 1,
+        }
+    }
+    Ok(summary)
 }
 
 /// Choose a link directory compatible with the source path.
@@ -243,6 +371,77 @@ fn candidate_exists_elsewhere(
         }
     }
     Ok(false)
+}
+
+fn best_saved_match<'a>(
+    metafile: &Metafile<'_>,
+    metadata: Option<&SavedTorrentMetadata<'_>>,
+    searchees: &'a [Searchee<'static>],
+    options: &SavedInjectionOptions<'_>,
+) -> Option<(&'a Searchee<'static>, Decision)> {
+    let mut matches = searchees
+        .iter()
+        .filter(|searchee| {
+            options.ignore_titles
+                || metadata.is_none_or(|metadata| {
+                    metadata
+                        .name
+                        .as_ref()
+                        .eq_ignore_ascii_case(searchee.title.as_ref())
+                        || metadata
+                            .name
+                            .as_ref()
+                            .eq_ignore_ascii_case(searchee.name.as_ref())
+                })
+        })
+        .filter_map(|searchee| {
+            let assessment = assess_metafile(
+                metafile,
+                searchee,
+                options.assessment,
+                true,
+                options.assessment.fuzzy_size_threshold,
+            );
+            assessment
+                .decision
+                .is_match()
+                .then_some((searchee, assessment.decision))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(searchee, decision)| {
+        (
+            searchee_client_priority(searchee, options.injection.clients),
+            decision_rank(*decision),
+        )
+    });
+    matches.into_iter().next()
+}
+
+fn searchee_client_priority(searchee: &Searchee<'_>, clients: &[&dyn TorrentClient]) -> u16 {
+    searchee
+        .client
+        .as_ref()
+        .and_then(|metadata| {
+            clients
+                .iter()
+                .find(|client| client.metadata().host == metadata.host)
+                .map(|client| client.metadata().priority)
+        })
+        .unwrap_or(u16::MAX)
+}
+
+fn decision_rank(decision: Decision) -> u8 {
+    match decision {
+        Decision::Match => 0,
+        Decision::MatchSizeOnly => 1,
+        Decision::MatchPartial => 2,
+        _ => 3,
+    }
+}
+
+fn delete_saved_torrent(path: &Path) -> crate::Result<()> {
+    fs::remove_file(path)
+        .map_err(|error| action_error(format!("failed to delete saved torrent: {error}")))
 }
 
 fn source_save_path(
@@ -838,28 +1037,30 @@ fn json_error(error: serde_json::Error) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileLinkOptions, InjectionAction, InjectionActionOptions, cleanup_created_roots,
-        link_all_files_in_metafile, link_destination_dir, perform_injection_action,
-        restore_from_torrent_cache, save_candidate_torrent, save_torrent_with_metadata,
-        select_link_dir,
+        FileLinkOptions, InjectionAction, InjectionActionOptions, SavedInjectionOptions,
+        cleanup_created_roots, inject_saved_torrents, link_all_files_in_metafile,
+        link_destination_dir, perform_injection_action, restore_from_torrent_cache,
+        save_candidate_torrent, save_torrent_with_metadata, select_link_dir,
     };
     use crate::{
         clients::{
             ClientErrorCode, ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent,
             ResumeOptions, TorrentClient,
         },
-        config::LinkType,
+        config::{LinkType, MatchMode},
         domain::{
             Candidate, ClientLabel, ClientTorrentMetadata, Decision, File, InfoHash,
             InjectionResult, MediaType, Metafile, Searchee, TorrentClientKind,
             TorrentClientMetadata,
         },
+        matching::AssessmentOptions,
         persistence::Database,
+        search::Blocklist,
         torrent::{SavedTorrentMetadata, parse_metadata_from_filename, torrent_cache_path},
     };
     use std::{
         borrow::Cow,
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         path::PathBuf,
         sync::Mutex,
@@ -1222,6 +1423,67 @@ mod tests {
                 .len(),
             1
         );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saved_torrent_injection_deletes_successful_retry() {
+        let root = temp_path("saved-inject");
+        let input_dir = root.join("saved");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("data");
+        fs::write(data.join("Candidate.Release"), b"video-data").expect("source");
+        let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let saved = save_candidate_torrent(&input_dir, "Tracker", &metafile, &bytes, |_| Ok(()))
+            .expect("save");
+        let mut searchee = Searchee::from_files(
+            "Candidate.Release",
+            "Candidate.Release",
+            vec![File::new("Candidate.Release", 10)],
+        );
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+        let client = FakeClient::new("client");
+        let clients: [&dyn TorrentClient; 1] = [&client];
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let excluded = BTreeSet::new();
+        let assessment = AssessmentOptions {
+            match_mode: MatchMode::Strict,
+            fuzzy_size_threshold: 0.05,
+            season_from_episodes: 0.75,
+            include_single_episodes: true,
+            info_hashes_to_exclude: &excluded,
+            blocklist: &blocklist,
+        };
+        let injection = InjectionActionOptions {
+            clients: &clients,
+            output_dir: Some(&input_dir),
+            link_dirs: &[],
+            link_type: LinkType::Symlink,
+            flat_linking: false,
+            unwrap_symlinks: false,
+            skip_recheck: true,
+            category: None,
+            tags: vec![ClientLabel::new("cross-seed")],
+        };
+
+        let summary = inject_saved_torrents(
+            &SavedInjectionOptions {
+                input_dir: &input_dir,
+                injection: &injection,
+                assessment: &assessment,
+                ignore_titles: false,
+            },
+            &[searchee],
+            |_| Ok(()),
+        )
+        .expect("inject saved");
+
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.injected, 1);
+        assert_eq!(summary.deleted, 1);
+        assert!(!saved.path.exists());
+        assert_eq!(client.calls.lock().expect("calls").clone(), vec!["inject"]);
         let _cleanup = fs::remove_dir_all(root);
     }
 
