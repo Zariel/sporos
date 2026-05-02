@@ -587,6 +587,8 @@ pub fn link_all_files_in_metafile(
             result.skipped_existing += 1;
             continue;
         }
+        let created_root =
+            created_root(destination_dir, &destination).filter(|root| !root.exists());
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 action_error(format!("failed to create link destination: {error}"))
@@ -594,7 +596,7 @@ pub fn link_all_files_in_metafile(
         }
         create_link(&source, &destination, options.link_type)?;
         result.linked += 1;
-        if let Some(root) = created_root(destination_dir, &destination) {
+        if let Some(root) = created_root {
             created_roots.insert(root);
         }
     }
@@ -1228,6 +1230,59 @@ mod tests {
             1
         );
         assert!(!destination.join("Release").exists());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn link_cleanup_ignores_preexisting_destination_roots() {
+        let root = temp_path("link-preexisting-root");
+        let source = root.join("downloads/Release");
+        let link_dir = root.join("links");
+        fs::create_dir_all(&source).expect("source dir");
+        fs::write(source.join("file.mkv"), b"video").expect("source file");
+        let mut searchee =
+            Searchee::from_files("Release", "Release", vec![File::new("Release/file.mkv", 5)]);
+        searchee.client = Some(ClientTorrentMetadata::new(
+            "client",
+            root.join("downloads").display().to_string(),
+            None,
+            Vec::new(),
+            Vec::<Cow<'static, str>>::new(),
+        ));
+        let candidate = Metafile::from_files(
+            InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567"),
+            "Release",
+            "Release",
+            1,
+            vec![File::new("Release/file.mkv", 5)],
+        );
+        let destination = link_destination_dir(&link_dir, "Tracker", false);
+        fs::create_dir_all(destination.join("Release")).expect("preexisting root");
+        fs::write(destination.join("Release/user-file.txt"), b"keep").expect("user file");
+
+        let result = link_all_files_in_metafile(
+            &searchee,
+            &candidate,
+            Decision::Match,
+            &destination,
+            &FileLinkOptions {
+                link_dirs: std::slice::from_ref(&link_dir),
+                link_type: LinkType::Hardlink,
+                flat_linking: false,
+                ignore_missing: false,
+                unwrap_symlinks: false,
+            },
+        )
+        .expect("link");
+
+        assert_eq!(result.linked, 1);
+        assert!(result.created_roots.is_empty());
+        assert_eq!(
+            cleanup_created_roots(&result.created_roots).expect("cleanup"),
+            0
+        );
+        assert!(destination.join("Release/user-file.txt").exists());
+        assert!(destination.join("Release/file.mkv").exists());
         let _cleanup = fs::remove_dir_all(root);
     }
 
