@@ -956,16 +956,7 @@ fn created_root(destination_dir: &Path, destination: &Path) -> Option<PathBuf> {
 fn probe_link_dir(source_path: &Path, link_dir: &Path, link_type: LinkType) -> crate::Result<bool> {
     fs::create_dir_all(link_dir)
         .map_err(|error| action_error(format!("failed to create link_dir: {error}")))?;
-    let probe_source = if source_path.is_file() {
-        source_path.to_path_buf()
-    } else {
-        link_dir.join(".cross-seed-link-probe-source")
-    };
-    let created_probe = !probe_source.exists();
-    if created_probe {
-        fs::write(&probe_source, b"probe")
-            .map_err(|error| action_error(format!("failed to create link probe: {error}")))?;
-    }
+    let (probe_source, created_probe) = probe_source_path(source_path)?;
     let probe_dest = link_dir.join(".cross-seed-link-probe-dest");
     let _cleanup = fs::remove_file(&probe_dest);
     let result = create_link(&probe_source, &probe_dest, link_type).is_ok();
@@ -974,6 +965,36 @@ fn probe_link_dir(source_path: &Path, link_dir: &Path, link_type: LinkType) -> c
         let _cleanup = fs::remove_file(&probe_source);
     }
     Ok(result)
+}
+
+fn probe_source_path(source_path: &Path) -> crate::Result<(PathBuf, bool)> {
+    if source_path.is_file() {
+        return Ok((source_path.to_path_buf(), false));
+    }
+    if !source_path.is_dir() {
+        return Err(action_error(format!(
+            "link probe source is not readable: {}",
+            source_path.display()
+        )));
+    }
+    if let Some(file) = representative_probe_file(source_path)? {
+        return Ok((file, false));
+    }
+    let probe_source = source_path.join(".cross-seed-link-probe-source");
+    fs::write(&probe_source, b"probe")
+        .map_err(|error| action_error(format!("failed to create link probe: {error}")))?;
+    Ok((probe_source, true))
+}
+
+fn representative_probe_file(source_dir: &Path) -> crate::Result<Option<PathBuf>> {
+    for entry in walkdir::WalkDir::new(source_dir).follow_links(false) {
+        let entry = entry
+            .map_err(|error| action_error(format!("failed to inspect link source: {error}")))?;
+        if entry.file_type().is_file() {
+            return Ok(Some(entry.path().to_path_buf()));
+        }
+    }
+    Ok(None)
 }
 
 fn filesystem_safe_segment(value: &str) -> String {
@@ -1355,6 +1376,39 @@ mod tests {
         );
         let target = fs::read_link(linked).expect("read link");
         assert!(target.ends_with("same.mkv"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn link_probe_source_uses_source_directory() {
+        let root = temp_path("link-probe-source");
+        let source = root.join("source");
+        let nested = source.join("nested");
+        fs::create_dir_all(&nested).expect("source dir");
+        fs::write(nested.join("episode.mkv"), b"video").expect("source file");
+
+        let (probe, created) = super::probe_source_path(&source).expect("probe source");
+
+        assert!(!created);
+        assert_eq!(probe, nested.join("episode.mkv"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn link_probe_temp_source_is_created_in_source_directory() {
+        let root = temp_path("link-probe-empty-source");
+        let source = root.join("source");
+        let link_dir = root.join("links");
+        fs::create_dir_all(&source).expect("source dir");
+        fs::create_dir_all(&link_dir).expect("link dir");
+
+        let (probe, created) = super::probe_source_path(&source).expect("probe source");
+
+        assert!(created);
+        assert_eq!(probe, source.join(".cross-seed-link-probe-source"));
+        assert!(probe.exists());
+        assert!(!link_dir.join(".cross-seed-link-probe-source").exists());
+        fs::remove_file(&probe).expect("cleanup probe");
         let _cleanup = fs::remove_dir_all(root);
     }
 
