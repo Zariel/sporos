@@ -89,7 +89,8 @@ impl LinkType {
 }
 
 /// Parsed torrent-client entry.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TorrentClientConfig {
     /// Client adapter type.
     pub kind: String,
@@ -100,35 +101,47 @@ pub struct TorrentClientConfig {
 }
 
 impl TorrentClientConfig {
-    /// Parse `<type>:[readonly:]<url>`.
+    /// Parse CLI shorthand `<type>:[readonly:]<url>`.
     pub fn parse(value: &str) -> crate::Result<Self> {
         let (kind, rest) = value
             .split_once(':')
             .ok_or_else(|| config_error("torrent client entry missing URL"))?;
-        if kind.is_empty() {
-            return Err(config_error("torrent client entry missing type"));
-        }
-
         let (readonly, url) = if let Some(url) = rest.strip_prefix("readonly:") {
             (true, url)
         } else {
             (false, rest)
         };
 
-        match kind {
-            "qbittorrent" | "rtorrent" | "transmission" | "deluge" => {}
-            _ => return Err(config_error(format!("unsupported torrent client: {kind}"))),
-        }
-
-        if !url.contains("://") {
-            return Err(config_error("torrent client URL must include a scheme"));
-        }
-
-        Ok(Self {
+        let config = Self {
             kind: kind.to_owned(),
             readonly,
             url: url.to_owned(),
-        })
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate a structured TOML or CLI torrent-client entry.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.kind.is_empty() {
+            return Err(config_error("torrent client entry missing kind"));
+        }
+        if self.url.is_empty() {
+            return Err(config_error("torrent client entry missing url"));
+        }
+        match self.kind.as_str() {
+            "qbittorrent" | "rtorrent" | "transmission" | "deluge" => {}
+            _ => {
+                return Err(config_error(format!(
+                    "unsupported torrent client: {}",
+                    self.kind
+                )));
+            }
+        }
+        if !self.url.contains("://") {
+            return Err(config_error("torrent client URL must include a scheme"));
+        }
+        Ok(())
     }
 }
 
@@ -206,7 +219,7 @@ pub struct RawConfig {
     /// Action text.
     pub action: Option<String>,
     /// Torrent-client entries.
-    pub torrent_clients: Vec<String>,
+    pub torrent_clients: Vec<TorrentClientConfig>,
     /// Duplicate categories.
     pub duplicate_categories: Option<bool>,
     /// Notification URLs.
@@ -372,10 +385,9 @@ impl RuntimeConfig {
             );
         }
 
-        let parsed_clients = torrent_clients
-            .iter()
-            .map(|client| TorrentClientConfig::parse(client))
-            .collect::<crate::Result<Vec<_>>>()?;
+        for client in &torrent_clients {
+            client.validate()?;
+        }
         let config = Self {
             delay: raw.delay.unwrap_or(DEFAULT_DELAY_SECONDS),
             torznab: raw.torznab,
@@ -407,7 +419,7 @@ impl RuntimeConfig {
             exclude_older: raw.exclude_older,
             exclude_recent_search: raw.exclude_recent_search,
             action: Action::parse(raw.action.as_deref().unwrap_or("save"))?,
-            torrent_clients: parsed_clients,
+            torrent_clients,
             duplicate_categories: raw.duplicate_categories.unwrap_or(false),
             notification_webhook_urls,
             port: raw.port.unwrap_or(Some(DEFAULT_PORT)),
@@ -707,9 +719,13 @@ fn verify_read_write_dir(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-fn push_deprecated_client(clients: &mut Vec<String>, kind: &str, url: Option<String>) {
+fn push_deprecated_client(clients: &mut Vec<TorrentClientConfig>, kind: &str, url: Option<String>) {
     if let Some(url) = url {
-        clients.push(format!("{kind}:{url}"));
+        clients.push(TorrentClientConfig {
+            kind: kind.to_owned(),
+            readonly: false,
+            url,
+        });
     }
 }
 
@@ -823,7 +839,9 @@ mod tests {
         let raw = RawConfig {
             torrent_dir: Some("/torrents".into()),
             use_client_torrents: Some(true),
-            torrent_clients: vec!["qbittorrent:http://localhost:8080".to_owned()],
+            torrent_clients: vec![
+                TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client"),
+            ],
             ..RawConfig::default()
         };
 
@@ -836,7 +854,10 @@ mod tests {
     fn validates_inject_requires_writable_client() {
         let raw = RawConfig {
             action: Some("inject".to_owned()),
-            torrent_clients: vec!["qbittorrent:readonly:http://localhost:8080".to_owned()],
+            torrent_clients: vec![
+                TorrentClientConfig::parse("qbittorrent:readonly:http://localhost:8080")
+                    .expect("client"),
+            ],
             ..RawConfig::default()
         };
 
@@ -874,8 +895,11 @@ mod tests {
             match_mode = "flexible"
             exclude_older = "2 days"
             exclude_recent_search = false
-            torrent_clients = ["qbittorrent:http://localhost:8080"]
             link_dirs = ["/links"]
+
+            [[torrent_clients]]
+            kind = "qbittorrent"
+            url = "http://localhost:8080"
             "#,
         )
         .expect("config parses");
@@ -888,7 +912,11 @@ mod tests {
         assert_eq!(raw.exclude_recent_search, None);
         assert_eq!(
             raw.torrent_clients,
-            vec!["qbittorrent:http://localhost:8080"]
+            vec![TorrentClientConfig {
+                kind: "qbittorrent".to_owned(),
+                readonly: false,
+                url: "http://localhost:8080".to_owned(),
+            }]
         );
         assert_eq!(raw.link_dirs, vec![Path::new("/links")]);
     }
@@ -897,6 +925,15 @@ mod tests {
     fn rejects_javascript_config_keys() {
         let error = raw_config_from_source("useClientTorrents = true")
             .expect_err("camelCase key is rejected");
+
+        assert!(error.to_string().contains("failed to parse config.toml"));
+    }
+
+    #[test]
+    fn rejects_string_torrent_client_config_entries() {
+        let error =
+            raw_config_from_source(r#"torrent_clients = ["qbittorrent:http://localhost:8080"]"#)
+                .expect_err("string client entries are rejected");
 
         assert!(error.to_string().contains("failed to parse config.toml"));
     }

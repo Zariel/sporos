@@ -274,7 +274,10 @@ fn apply_shared_options(
         raw_config.output_dir = Some(PathBuf::from(value));
     }
     if let Some(values) = string_values(matches, "torrent-clients") {
-        raw_config.torrent_clients = values;
+        raw_config.torrent_clients = values
+            .iter()
+            .map(|value| crate::config::TorrentClientConfig::parse(value))
+            .collect::<crate::Result<Vec<_>>>()?;
     }
     if let Some(value) = string_value(matches, "qbittorrent-url") {
         raw_config.deprecated.qbittorrent_url = Some(value.clone());
@@ -678,7 +681,7 @@ fn repeating(name: &'static str, long: &'static str) -> Arg {
 #[cfg(test)]
 mod tests {
     use super::{apply_inject_options, apply_search_options, apply_shared_options, build_cli};
-    use crate::config::RawConfig;
+    use crate::config::{RawConfig, TorrentClientConfig};
     use std::path::Path;
 
     #[test]
@@ -844,7 +847,7 @@ mod tests {
         assert_eq!(raw.output_dir.as_deref(), Some(Path::new("/output")));
         assert_eq!(
             raw.torrent_clients,
-            vec!["qbittorrent:http://localhost:8080"]
+            vec![TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client")]
         );
         assert_eq!(raw.duplicate_categories, Some(true));
         assert_eq!(raw.link_category.as_deref(), Some("cross-seed"));

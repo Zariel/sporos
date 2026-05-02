@@ -1384,7 +1384,10 @@ mod tests {
             RawConfig {
                 use_client_torrents: Some(true),
                 season_from_episodes: Some(1.0),
-                torrent_clients: vec!["qbittorrent:http://localhost:8080".to_owned()],
+                torrent_clients: vec![
+                    crate::config::TorrentClientConfig::parse("qbittorrent:http://localhost:8080")
+                        .expect("client"),
+                ],
                 ..RawConfig::default()
             },
             &root,

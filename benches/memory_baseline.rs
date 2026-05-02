@@ -15,7 +15,7 @@ use sporos::{
         ClientErrorCode, ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent,
         ResumeOptions, TorrentClient, client_torrent_to_searchee,
     },
-    config::{LinkType, RawConfig, RuntimeConfig},
+    config::{LinkType, RawConfig, RuntimeConfig, TorrentClientConfig},
     domain::{
         Decision, File as TorrentFile, InfoHash, InjectionResult, Label, MediaType, Metafile,
         Searchee, TorrentClientKind, TorrentClientMetadata,
@@ -320,7 +320,9 @@ fn cleanup_fixture() -> (PathBuf, Database, RuntimeConfig, StreamingClient) {
         RawConfig {
             use_client_torrents: Some(true),
             season_from_episodes: Some(1.0),
-            torrent_clients: vec!["qbittorrent:http://localhost:8080".to_owned()],
+            torrent_clients: vec![
+                TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client"),
+            ],
             ..RawConfig::default()
         },
         &root,

@@ -30,7 +30,7 @@ mod tests {
 
     use super::{
         SporosError, VERSION,
-        config::{MatchMode, RawConfig, RuntimeConfig},
+        config::{MatchMode, RawConfig, RuntimeConfig, TorrentClientConfig},
         domain::{Decision, File, InfoHash, MediaType, Metafile, Searchee},
         matching::{AssessmentOptions, assess_metafile},
         search::{Blocklist, VirtualSeasonOptions, create_virtual_season_searchees, parse_title},
@@ -61,7 +61,10 @@ mod tests {
         let config = RuntimeConfig::normalize(
             RawConfig {
                 use_client_torrents: Some(true),
-                torrent_clients: vec!["qbittorrent:readonly:http://localhost:8080".to_owned()],
+                torrent_clients: vec![
+                    TorrentClientConfig::parse("qbittorrent:readonly:http://localhost:8080")
+                        .expect("client"),
+                ],
                 season_from_episodes: Some(1.0),
                 include_single_episodes: Some(true),
                 ..RawConfig::default()
