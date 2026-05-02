@@ -17,8 +17,10 @@ use crate::{
     search::parsed_name_and_media,
 };
 
-const CLIENT_INVENTORY_PAGE_SIZE: usize = 1_000;
-const QB_TORRENT_FILES_CONCURRENCY_LIMIT: usize = 1;
+/// qBittorrent inventory page size used by bounded refresh paths.
+pub const CLIENT_INVENTORY_PAGE_SIZE: usize = 1_000;
+/// Maximum active qBittorrent file-list requests during cleanup refresh.
+pub const QB_TORRENT_FILES_CONCURRENCY_LIMIT: usize = 1;
 
 /// Normalized torrent-client adapter identity.
 #[derive(Debug, Clone, Eq, PartialEq)]

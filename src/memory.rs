@@ -19,6 +19,19 @@ pub struct CollectionBudget {
     pub peak_bytes_per_item: usize,
 }
 
+/// Regression gate for one memory-sensitive workflow.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MemoryRegressionGate {
+    /// Workflow covered by the gate.
+    pub name: &'static str,
+    /// Routine local scale exercised by benchmarks or focused tests.
+    pub baseline_items: usize,
+    /// Production scale the implementation is designed around.
+    pub target_items: usize,
+    /// Maximum items intentionally retained in one active batch.
+    pub max_active_items: usize,
+}
+
 /// Initial budgets for memory-sensitive rebuild paths.
 pub const COLLECTION_BUDGETS: &[CollectionBudget] = &[
     CollectionBudget {
@@ -47,10 +60,63 @@ pub const COLLECTION_BUDGETS: &[CollectionBudget] = &[
     },
 ];
 
+/// Workflows that must stay visible in memory regression checks.
+pub const MEMORY_REGRESSION_GATES: &[MemoryRegressionGate] = &[
+    MemoryRegressionGate {
+        name: "torrent-dir listing",
+        baseline_items: 10_000,
+        target_items: 100_000,
+        max_active_items: 1,
+    },
+    MemoryRegressionGate {
+        name: "data-dir traversal",
+        baseline_items: 100_000,
+        target_items: 1_000_000,
+        max_active_items: 1,
+    },
+    MemoryRegressionGate {
+        name: "client inventory refresh",
+        baseline_items: CLIENT_INVENTORY_BASELINE_TORRENTS,
+        target_items: CLIENT_INVENTORY_TARGET_TORRENTS,
+        max_active_items: crate::clients::CLIENT_INVENTORY_PAGE_SIZE,
+    },
+    MemoryRegressionGate {
+        name: "qBittorrent file-list refresh",
+        baseline_items: CLIENT_INVENTORY_BASELINE_TORRENTS,
+        target_items: CLIENT_INVENTORY_TARGET_TORRENTS,
+        max_active_items: crate::clients::QB_TORRENT_FILES_CONCURRENCY_LIMIT,
+    },
+    MemoryRegressionGate {
+        name: "RSS candidate parsing",
+        baseline_items: 1_000,
+        target_items: 10_000,
+        max_active_items: 1_000,
+    },
+    MemoryRegressionGate {
+        name: "candidate assessment",
+        baseline_items: 10_000,
+        target_items: 100_000,
+        max_active_items: 1,
+    },
+    MemoryRegressionGate {
+        name: "injection and linking",
+        baseline_items: 10_000,
+        target_items: 100_000,
+        max_active_items: 1,
+    },
+    MemoryRegressionGate {
+        name: "cleanup maintenance",
+        baseline_items: CLIENT_INVENTORY_BASELINE_TORRENTS,
+        target_items: CLIENT_INVENTORY_TARGET_TORRENTS,
+        max_active_items: crate::clients::CLIENT_INVENTORY_PAGE_SIZE,
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::{
         CLIENT_INVENTORY_BASELINE_TORRENTS, CLIENT_INVENTORY_TARGET_TORRENTS, COLLECTION_BUDGETS,
+        MEMORY_REGRESSION_GATES,
     };
 
     #[test]
@@ -65,5 +131,39 @@ mod tests {
             assert!(budget.target_items >= budget.baseline_items);
             assert!(budget.peak_bytes_per_item > 0);
         }
+    }
+
+    #[test]
+    fn regression_gates_cover_release_memory_paths() {
+        let required = [
+            "torrent-dir listing",
+            "data-dir traversal",
+            "client inventory refresh",
+            "qBittorrent file-list refresh",
+            "RSS candidate parsing",
+            "candidate assessment",
+            "injection and linking",
+            "cleanup maintenance",
+        ];
+        for name in required {
+            assert!(
+                MEMORY_REGRESSION_GATES.iter().any(|gate| gate.name == name),
+                "missing memory regression gate for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_gates_keep_active_batches_bounded() {
+        for gate in MEMORY_REGRESSION_GATES {
+            assert!(gate.target_items >= gate.baseline_items);
+            assert!(gate.max_active_items > 0);
+            assert!(gate.max_active_items <= gate.baseline_items);
+        }
+        let qb_files = MEMORY_REGRESSION_GATES
+            .iter()
+            .find(|gate| gate.name == "qBittorrent file-list refresh")
+            .expect("qBittorrent file-list gate");
+        assert_eq!(qb_files.max_active_items, 1);
     }
 }
