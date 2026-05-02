@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_javascript_config_keys() {
+    fn rejects_camel_case_config_keys() {
         let error = raw_config_from_source("useClientTorrents = true")
             .expect_err("camelCase key is rejected");
 

@@ -5,7 +5,7 @@ use std::{borrow::Cow, fmt};
 /// Byte length used for torrent files and aggregate torrent sizes.
 pub type ByteLength = u64;
 
-/// Millisecond timestamp used for JavaScript compatibility boundaries.
+/// Millisecond timestamp used at API and persistence boundaries.
 pub type TimestampMillis = u64;
 
 /// A v1 BitTorrent info hash.
@@ -110,7 +110,7 @@ pub enum Label {
 }
 
 impl Label {
-    /// String representation used by the TypeScript compatibility contract.
+    /// String representation used by workflow APIs and persisted records.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Search => "search",
