@@ -17,6 +17,9 @@ use crate::{
     search::parsed_name_and_media,
 };
 
+const CLIENT_INVENTORY_PAGE_SIZE: usize = 1_000;
+const QB_TORRENT_FILES_CONCURRENCY_LIMIT: usize = 1;
+
 /// Normalized torrent-client adapter identity.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ClientIdentity {
@@ -146,6 +149,17 @@ pub trait TorrentClient {
 
     /// Return the complete client inventory.
     fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>>;
+
+    /// Visit client inventory without requiring callers to retain it.
+    fn for_each_torrent(
+        &self,
+        visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        for torrent in self.get_all_torrents()? {
+            visitor(torrent)?;
+        }
+        Ok(())
+    }
 
     /// Map client inventory to searchable searchees.
     fn get_client_searchees(&self) -> crate::Result<ClientSearcheeResult> {
@@ -292,6 +306,20 @@ impl QbittorrentClient {
         Ok(torrents.pop())
     }
 
+    fn torrent_page(&self, offset: usize, limit: usize) -> crate::Result<Vec<QbTorrentInfo>> {
+        self.login()?;
+        let response = self
+            .client
+            .get(self.api_url("/api/v2/torrents/info"))
+            .query(&[("offset", offset.to_string()), ("limit", limit.to_string())])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| client_error(format!("qBittorrent info request failed: {error}")))?
+            .text()
+            .map_err(|error| client_error(format!("failed to read qBittorrent info: {error}")))?;
+        parse_qb_torrents(&response)
+    }
+
     fn torrent_files(&self, info_hash: &str) -> crate::Result<Vec<File<'static>>> {
         self.login()?;
         let response = self
@@ -304,6 +332,43 @@ impl QbittorrentClient {
             .text()
             .map_err(|error| client_error(format!("failed to read qBittorrent files: {error}")))?;
         parse_qb_files(&response)
+    }
+
+    fn client_torrent_from_qb(
+        &self,
+        torrent: QbTorrentInfo,
+    ) -> crate::Result<Option<ClientTorrent<'static>>> {
+        let Some(info_hash) = InfoHash::new(torrent.hash.clone()) else {
+            return Ok(None);
+        };
+        let complete = torrent.complete();
+        let checking = torrent.checking();
+        let files = self.torrent_files(&torrent.hash)?;
+        let trackers = self.torrent_trackers(&torrent.hash)?;
+        Ok(Some(ClientTorrent {
+            info_hash: info_hash.into_owned(),
+            name: Cow::Owned(torrent.name),
+            files,
+            save_path: Cow::Owned(torrent.save_path),
+            category: torrent.category.map(ClientLabel::new),
+            tags: split_qb_tags(torrent.tags),
+            trackers,
+            complete,
+            checking,
+        }))
+    }
+
+    fn visit_qb_torrent_batch(
+        &self,
+        batch: &mut Vec<QbTorrentInfo>,
+        visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        for torrent in batch.drain(..) {
+            if let Some(torrent) = self.client_torrent_from_qb(torrent)? {
+                visitor(torrent)?;
+            }
+        }
+        Ok(())
     }
 
     fn torrent_trackers(&self, info_hash: &str) -> crate::Result<Vec<Cow<'static, str>>> {
@@ -363,26 +428,35 @@ impl TorrentClient for QbittorrentClient {
         let body = self.get_text("/api/v2/torrents/info")?;
         let mut output = Vec::new();
         for torrent in parse_qb_torrents(&body)? {
-            let files = self.torrent_files(&torrent.hash)?;
-            let trackers = self.torrent_trackers(&torrent.hash)?;
-            let Some(info_hash) = InfoHash::new(torrent.hash.clone()) else {
-                continue;
-            };
-            let complete = torrent.complete();
-            let checking = torrent.checking();
-            output.push(ClientTorrent {
-                info_hash: info_hash.into_owned(),
-                name: Cow::Owned(torrent.name),
-                files,
-                save_path: Cow::Owned(torrent.save_path),
-                category: torrent.category.map(ClientLabel::new),
-                tags: split_qb_tags(torrent.tags),
-                trackers,
-                complete,
-                checking,
-            });
+            if let Some(torrent) = self.client_torrent_from_qb(torrent)? {
+                output.push(torrent);
+            }
         }
         Ok(output)
+    }
+
+    fn for_each_torrent(
+        &self,
+        visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let mut offset = 0usize;
+        loop {
+            let page = self.torrent_page(offset, CLIENT_INVENTORY_PAGE_SIZE)?;
+            let page_len = page.len();
+            let mut active_batch = Vec::with_capacity(QB_TORRENT_FILES_CONCURRENCY_LIMIT);
+            for torrent in page {
+                active_batch.push(torrent);
+                if active_batch.len() == QB_TORRENT_FILES_CONCURRENCY_LIMIT {
+                    self.visit_qb_torrent_batch(&mut active_batch, visitor)?;
+                }
+            }
+            self.visit_qb_torrent_batch(&mut active_batch, visitor)?;
+            if page_len < CLIENT_INVENTORY_PAGE_SIZE {
+                break;
+            }
+            offset = offset.saturating_add(CLIENT_INVENTORY_PAGE_SIZE);
+        }
+        Ok(())
     }
 
     fn get_download_dir(
@@ -1365,6 +1439,30 @@ pub fn client_identities(configs: &[TorrentClientConfig]) -> crate::Result<Vec<C
         .collect()
 }
 
+/// Build configured torrent-client adapters.
+pub fn build_torrent_clients(
+    configs: &[TorrentClientConfig],
+    timeout: Option<Duration>,
+) -> crate::Result<Vec<Box<dyn TorrentClient>>> {
+    let identities = client_identities(configs)?;
+    identities
+        .into_iter()
+        .map(|identity| {
+            let client: Box<dyn TorrentClient> = match identity.metadata.kind {
+                TorrentClientKind::QBittorrent => {
+                    Box::new(QbittorrentClient::new(identity, timeout)?)
+                }
+                TorrentClientKind::RTorrent => Box::new(RtorrentClient::new(identity, timeout)?),
+                TorrentClientKind::Transmission => {
+                    Box::new(TransmissionClient::new(identity, timeout)?)
+                }
+                TorrentClientKind::Deluge => Box::new(DelugeClient::new(identity, timeout)?),
+            };
+            Ok(client)
+        })
+        .collect()
+}
+
 /// Select the writable client that should receive an injection.
 pub fn select_injection_client<'a>(
     clients: &'a [&'a dyn TorrentClient],
@@ -2269,6 +2367,52 @@ mod tests {
                 "GET /api/v2/torrents/files?hash=0123456789abcdef0123456789abcdef01234567 ",
             )
         }));
+    }
+
+    #[test]
+    fn qbittorrent_visits_inventory_with_paged_file_backpressure() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads","progress":1.0,"state":"uploading"}}]"#
+                ),
+            ),
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                r#"[{"name":"Example.Show.S01E01.mkv","size":123}]"#,
+            ),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", r#"[]"#),
+        ]);
+        let client = qb_client(&server.url);
+        let mut seen = 0usize;
+
+        client
+            .for_each_torrent(&mut |torrent| {
+                assert_eq!(torrent.info_hash.as_str(), hash);
+                seen += 1;
+                Ok(())
+            })
+            .expect("inventory");
+
+        assert_eq!(seen, 1);
+        let requests = server.join();
+        assert!(
+            requests.iter().any(|request| {
+                request.contains("GET /api/v2/torrents/info?offset=0&limit=1000 ")
+            })
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("GET /api/v2/torrents/files?hash="))
+                .count(),
+            1
+        );
     }
 
     #[test]

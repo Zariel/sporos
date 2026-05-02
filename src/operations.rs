@@ -4,9 +4,11 @@ use std::{borrow::Cow, fs, path::Path};
 
 use crate::{
     SporosError,
+    clients::{TorrentClient, client_torrent_to_searchee},
     config::RuntimeConfig,
     domain::InfoHash,
-    persistence::Database,
+    persistence::{ClientSearcheeRecord, Database, EnsembleRecord},
+    search::episode_ensemble,
     torrent::{
         Bencode, BencodeValue, bdecode, bencode, parse_metafile, torrent_cache_dir,
         torrent_cache_path,
@@ -51,6 +53,12 @@ pub struct TrackerUpdateResult {
 /// Result counts from daily cleanup.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct CleanupDbResult {
+    /// Client searchee rows refreshed from configured clients.
+    pub client_searchees_refreshed: usize,
+    /// Stale client searchee rows pruned after refresh.
+    pub client_searchees_pruned: usize,
+    /// Ensemble rows rebuilt from refreshed client searchees.
+    pub client_ensemble_rows_rebuilt: usize,
     /// Data-dir rows removed because paths no longer exist.
     pub data_rows_removed: usize,
     /// Ensemble rows removed because paths no longer exist.
@@ -153,13 +161,26 @@ pub fn cleanup_db(
     config: &RuntimeConfig,
     now_millis: i64,
 ) -> crate::Result<CleanupDbResult> {
+    cleanup_db_with_clients(database, app_dir, config, now_millis, &[])
+}
+
+/// Run daily database and torrent-cache cleanup with live client refresh.
+pub fn cleanup_db_with_clients(
+    database: &Database,
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    now_millis: i64,
+    clients: &[&dyn TorrentClient],
+) -> crate::Result<CleanupDbResult> {
     let mut result = CleanupDbResult::default();
+    if config.use_client_torrents {
+        refresh_cleanup_client_searchees(database, config, clients, &mut result)?;
+    }
     if !config.data_dirs.is_empty() {
         result.data_rows_removed = prune_missing_data_rows(database)?;
-        result.ensemble_rows_removed += prune_missing_ensemble_rows(database, true)?;
     }
-    if config.season_from_episodes.is_some() {
-        result.ensemble_rows_removed += prune_missing_ensemble_rows(database, false)?;
+    if !config.data_dirs.is_empty() || config.season_from_episodes.is_some() {
+        result.ensemble_rows_removed += prune_missing_ensemble_rows(database)?;
     }
     result.torrent_cache_files_removed =
         prune_unused_torrent_cache(database, app_dir, config, now_millis)?;
@@ -270,13 +291,76 @@ fn prune_missing_data_rows(database: &Database) -> crate::Result<usize> {
     Ok(removed)
 }
 
-fn prune_missing_ensemble_rows(database: &Database, data_dir_only: bool) -> crate::Result<usize> {
-    let sql = if data_dir_only {
-        "SELECT rowid, path FROM ensemble WHERE client_host IS NULL"
-    } else {
-        "SELECT rowid, path FROM ensemble"
-    };
-    let rows = rowid_path_rows(database, sql)?;
+fn refresh_cleanup_client_searchees(
+    database: &Database,
+    config: &RuntimeConfig,
+    clients: &[&dyn TorrentClient],
+    result: &mut CleanupDbResult,
+) -> crate::Result<()> {
+    for client in clients {
+        let metadata = client.metadata().clone().into_owned();
+        database.begin_client_searchee_refresh()?;
+        let mut refreshed = 0usize;
+        let mut ensemble_rows = 0usize;
+        client.for_each_torrent(&mut |torrent| {
+            let Some(searchee) = client_torrent_to_searchee(&metadata, torrent) else {
+                return Ok(());
+            };
+            let Some(client_metadata) = &searchee.client else {
+                return Ok(());
+            };
+            let Some(info_hash) = searchee.info_hash.as_ref() else {
+                return Ok(());
+            };
+            database.upsert_client_searchee(&ClientSearcheeRecord {
+                client_host: metadata.host.as_ref(),
+                info_hash: info_hash.as_str(),
+                name: searchee.name.as_ref(),
+                title: searchee.title.as_ref(),
+                files: &searchee.files,
+                length: searchee.length,
+                save_path: client_metadata.save_path.as_ref(),
+                category: client_metadata
+                    .category
+                    .as_ref()
+                    .map(|label| label.as_str()),
+                tags: &client_metadata.tags,
+                trackers: &client_metadata.trackers,
+            })?;
+            database.mark_refreshed_client_info_hash(info_hash.as_str())?;
+            refreshed = refreshed.saturating_add(1);
+            if config.season_from_episodes.is_some() {
+                if let Some(ensemble) = episode_ensemble(&searchee) {
+                    database.upsert_ensemble(&EnsembleRecord {
+                        client_host: Some(metadata.host.as_ref()),
+                        path: &ensemble.path,
+                        info_hash: Some(info_hash.as_str()),
+                        ensemble: &ensemble.ensemble,
+                        element: &ensemble.element,
+                    })?;
+                    database.mark_refreshed_client_ensemble_path(&ensemble.path)?;
+                    ensemble_rows = ensemble_rows.saturating_add(1);
+                }
+            }
+            Ok(())
+        })?;
+        result.client_searchees_refreshed =
+            result.client_searchees_refreshed.saturating_add(refreshed);
+        result.client_ensemble_rows_rebuilt = result
+            .client_ensemble_rows_rebuilt
+            .saturating_add(ensemble_rows);
+        result.client_searchees_pruned = result
+            .client_searchees_pruned
+            .saturating_add(database.finish_client_searchee_refresh(metadata.host.as_ref())?);
+    }
+    Ok(())
+}
+
+fn prune_missing_ensemble_rows(database: &Database) -> crate::Result<usize> {
+    let rows = rowid_path_rows(
+        database,
+        "SELECT rowid, path FROM ensemble WHERE client_host IS NULL",
+    )?;
     let mut removed = 0usize;
     for (rowid, path) in rows {
         if !Path::new(&path).exists() {
@@ -551,15 +635,24 @@ fn replace_bencode_bytes_recursive(value: &mut Bencode<'_>, from: &[u8], to: &[u
 #[cfg(test)]
 mod tests {
     use super::{
-        api_key, cleanup_db, clear_cache, clear_client_cache, clear_indexer_failures,
-        reset_api_key, update_torrent_cache_trackers,
+        api_key, cleanup_db, cleanup_db_with_clients, clear_cache, clear_client_cache,
+        clear_indexer_failures, reset_api_key, update_torrent_cache_trackers,
     };
     use crate::{
+        clients::{
+            ClientErrorCode, ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent,
+            ResumeOptions, TorrentClient,
+        },
         config::{RawConfig, RuntimeConfig},
-        domain::Decision,
-        persistence::{Database, DecisionRecord},
+        domain::{
+            Decision, File, InfoHash, InjectionResult, Metafile, Searchee, TorrentClientKind,
+            TorrentClientMetadata,
+        },
+        persistence::{ClientSearcheeRecord, Database, DecisionRecord, EnsembleRecord},
     };
     use std::{
+        borrow::Cow,
+        collections::BTreeMap,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -785,6 +878,95 @@ mod tests {
         let _cleanup = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn cleanup_refreshes_client_searchees_and_rebuilds_ensemble() {
+        let root = temp_path("cleanup-client-refresh");
+        fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let stale_files = [File::new("Old.Show.S01E01.mkv", 1)];
+        database
+            .refresh_client_searchees(
+                "localhost",
+                [ClientSearcheeRecord {
+                    client_host: "localhost",
+                    info_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    name: "Old.Show.S01E01",
+                    title: "Old Show S01E01",
+                    files: &stale_files,
+                    length: 1,
+                    save_path: "/downloads",
+                    category: None,
+                    tags: &[],
+                    trackers: &[],
+                }],
+            )
+            .expect("seed client");
+        database
+            .upsert_ensemble(&EnsembleRecord {
+                client_host: Some("localhost"),
+                path: "/downloads/Old.Show.S01E01.mkv",
+                info_hash: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                ensemble: "old.show S01",
+                element: "01",
+            })
+            .expect("stale ensemble");
+        database
+            .upsert_ensemble(&EnsembleRecord {
+                client_host: Some("localhost"),
+                path: "/downloads/Example.Show.S01E01.old.mkv",
+                info_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ensemble: "example.show S01",
+                element: "01",
+            })
+            .expect("stale same-hash ensemble");
+        let client = FakeClient::new(vec![ClientTorrent {
+            info_hash: InfoHash::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .expect("hash")
+                .into_owned(),
+            name: Cow::Borrowed("Example.Show.S01E01"),
+            files: vec![File::new("Example.Show.S01E01.mkv", 42)],
+            save_path: Cow::Borrowed("/downloads"),
+            category: None,
+            tags: Vec::new(),
+            trackers: Vec::new(),
+            complete: true,
+            checking: false,
+        }]);
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                use_client_torrents: Some(true),
+                season_from_episodes: Some(1.0),
+                torrent_clients: vec!["qbittorrent:http://localhost:8080".to_owned()],
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+
+        let result = cleanup_db_with_clients(&database, &root, &config, 2_000_000, &[&client])
+            .expect("cleanup");
+
+        assert_eq!(result.client_searchees_refreshed, 1);
+        assert_eq!(result.client_searchees_pruned, 1);
+        assert_eq!(result.client_ensemble_rows_rebuilt, 1);
+        let client_rows: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM client_searchee", [], |row| row.get(0))
+            .expect("client count");
+        let ensemble_path: String = database
+            .connection()
+            .query_row("SELECT path FROM ensemble", [], |row| row.get(0))
+            .expect("ensemble path");
+        let ensemble_rows: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM ensemble", [], |row| row.get(0))
+            .expect("ensemble count");
+        assert_eq!(client_rows, 1);
+        assert_eq!(ensemble_rows, 1);
+        assert_eq!(ensemble_path, "/downloads/Example.Show.S01E01.mkv");
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
     fn insert_decision(
         database: &Database,
         searchee_id: i64,
@@ -811,5 +993,86 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-ops-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    struct FakeClient {
+        metadata: TorrentClientMetadata<'static>,
+        torrents: Vec<ClientTorrent<'static>>,
+    }
+
+    impl FakeClient {
+        fn new(torrents: Vec<ClientTorrent<'static>>) -> Self {
+            Self {
+                metadata: TorrentClientMetadata::new(
+                    "localhost",
+                    0,
+                    TorrentClientKind::QBittorrent,
+                    false,
+                    "fake",
+                ),
+                torrents,
+            }
+        }
+    }
+
+    impl TorrentClient for FakeClient {
+        fn metadata(&self) -> &TorrentClientMetadata<'_> {
+            &self.metadata
+        }
+
+        fn is_torrent_in_client(&self, _info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        fn is_torrent_complete(&self, _info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        fn is_torrent_checking(&self, _info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
+            Ok(self.torrents.clone())
+        }
+
+        fn get_download_dir(
+            &self,
+            _metafile: &Metafile<'_>,
+            _options: DownloadDirOptions,
+        ) -> crate::Result<Result<PathBuf, ClientErrorCode>> {
+            Ok(Err(ClientErrorCode::NotFound))
+        }
+
+        fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>> {
+            Ok(BTreeMap::new())
+        }
+
+        fn inject(
+            &self,
+            _new_torrent: &NewTorrent<'_>,
+            _searchee: &Searchee<'_>,
+            _decision: Decision,
+            _options: &InjectionOptions,
+        ) -> crate::Result<InjectionResult> {
+            Ok(InjectionResult::Injected)
+        }
+
+        fn recheck_torrent(&self, _info_hash: &InfoHash<'_>) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn resume_injection(
+            &self,
+            _metafile: &Metafile<'_>,
+            _decision: Decision,
+            _options: ResumeOptions,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn validate_config(&self) -> crate::Result<()> {
+            Ok(())
+        }
     }
 }

@@ -20,6 +20,7 @@ use crate::{
         AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, JobRequest, JobResponse,
         WebhookRequest, handle_api_request,
     },
+    clients::build_torrent_clients,
     config::RuntimeConfig,
     persistence::{DataRootRecord, Database},
     scheduler::{DaemonPlan, DaemonRun, JobName, Scheduler},
@@ -114,8 +115,27 @@ fn execute_ran_jobs(
 ) -> crate::Result<()> {
     for result in results {
         if result.ran && result.name == JobName::Cleanup {
-            let cleanup = crate::operations::cleanup_db(database, app_dir, config, now_millis())?;
+            let client_timeout = config.search_timeout.map(Duration::from_millis);
+            let client_adapters = if config.use_client_torrents {
+                build_torrent_clients(&config.torrent_clients, client_timeout)?
+            } else {
+                Vec::new()
+            };
+            let client_refs = client_adapters
+                .iter()
+                .map(|client| client.as_ref())
+                .collect::<Vec<_>>();
+            let cleanup = crate::operations::cleanup_db_with_clients(
+                database,
+                app_dir,
+                config,
+                now_millis(),
+                &client_refs,
+            )?;
             tracing::info!(
+                client_searchees_refreshed = cleanup.client_searchees_refreshed,
+                client_searchees_pruned = cleanup.client_searchees_pruned,
+                client_ensemble_rows_rebuilt = cleanup.client_ensemble_rows_rebuilt,
                 data_rows_removed = cleanup.data_rows_removed,
                 ensemble_rows_removed = cleanup.ensemble_rows_removed,
                 torrent_cache_files_removed = cleanup.torrent_cache_files_removed,

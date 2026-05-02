@@ -725,6 +725,17 @@ pub struct VirtualSeasonOptions {
     pub now_millis: u64,
 }
 
+/// Episode row materialized into the ensemble cache.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EpisodeEnsemble {
+    /// Representative file path for the episode.
+    pub path: String,
+    /// Normalized season key.
+    pub ensemble: String,
+    /// Episode number within the season.
+    pub element: String,
+}
+
 /// Remove duplicate searchees from a set already believed to describe the same media.
 pub fn filter_duplicate_searchees(mut searchees: Vec<Searchee<'static>>) -> Vec<Searchee<'static>> {
     searchees.sort_by(|left, right| {
@@ -881,6 +892,20 @@ pub fn create_virtual_season_searchees(
         virtuals.push(searchee.into_owned());
     }
     virtuals
+}
+
+/// Build an ensemble-cache row from an episode searchee.
+pub fn episode_ensemble(searchee: &Searchee<'_>) -> Option<EpisodeEnsemble> {
+    if searchee.media_type != MediaType::Episode {
+        return None;
+    }
+    let (key, episode) = episode_key_from_title(searchee.title.as_ref())?;
+    let file = searchee.files.iter().max_by_key(|file| file.length)?;
+    Some(EpisodeEnsemble {
+        path: searchee_file_path(searchee, file),
+        ensemble: format!("{} S{:02}", key.title, key.season),
+        element: format!("{episode:02}"),
+    })
 }
 
 /// Apply documented content filters and return a rejection reason when filtered.
@@ -1404,6 +1429,29 @@ fn episode_match(name: &str) -> Option<regex::Captures<'_>> {
     EPISODE_REGEX
         .captures(name)
         .or_else(|| ALT_EPISODE_REGEX.captures(name))
+}
+
+fn searchee_file_path(searchee: &Searchee<'_>, file: &File<'_>) -> String {
+    let path = Path::new(file.path.as_ref());
+    if path.is_absolute() {
+        return path.to_string_lossy().into_owned();
+    }
+    if let Some(client) = &searchee.client {
+        return Path::new(client.save_path.as_ref())
+            .join(path)
+            .to_string_lossy()
+            .into_owned();
+    }
+    if let Some(source) = &searchee.path {
+        let source = Path::new(source.as_ref());
+        let root = if source.is_dir() {
+            source
+        } else {
+            source.parent().unwrap_or(source)
+        };
+        return root.join(path).to_string_lossy().into_owned();
+    }
+    file.path.to_string()
 }
 
 fn extension_in(file: &File<'_>, extensions: &[&str]) -> bool {

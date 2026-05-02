@@ -241,23 +241,62 @@ impl Database {
         client_host: &str,
         records: impl IntoIterator<Item = ClientSearcheeRecord<'a>>,
     ) -> crate::Result<usize> {
+        self.begin_client_searchee_refresh()?;
+        for record in records {
+            self.upsert_client_searchee(&record)?;
+            self.mark_refreshed_client_info_hash(record.info_hash)?;
+        }
+        self.finish_client_searchee_refresh(client_host)
+    }
+
+    /// Start a bounded refresh for one client's searchee rows.
+    pub fn begin_client_searchee_refresh(&self) -> crate::Result<()> {
         self.connection
             .execute_batch(
                 "CREATE TEMP TABLE IF NOT EXISTS current_client_info_hashes (
                     info_hash TEXT PRIMARY KEY
                 );
-                DELETE FROM current_client_info_hashes;",
+                CREATE TEMP TABLE IF NOT EXISTS current_client_ensemble_paths (
+                    path TEXT PRIMARY KEY
+                );
+                DELETE FROM current_client_info_hashes;
+                DELETE FROM current_client_ensemble_paths;",
+            )
+            .map_err(sql_error)
+    }
+
+    /// Mark one info hash as present during a bounded client searchee refresh.
+    pub fn mark_refreshed_client_info_hash(&self, info_hash: &str) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO current_client_info_hashes (info_hash) VALUES (?1)",
+                params![info_hash],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Mark one ensemble path as present during a bounded client searchee refresh.
+    pub fn mark_refreshed_client_ensemble_path(&self, path: &str) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO current_client_ensemble_paths (path) VALUES (?1)",
+                params![path],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Prune rows absent from the current bounded client searchee refresh.
+    pub fn finish_client_searchee_refresh(&self, client_host: &str) -> crate::Result<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM ensemble
+                 WHERE client_host = ?1
+                 AND path NOT IN (SELECT path FROM current_client_ensemble_paths)",
+                params![client_host],
             )
             .map_err(sql_error)?;
-        for record in records {
-            self.upsert_client_searchee(&record)?;
-            self.connection
-                .execute(
-                    "INSERT OR IGNORE INTO current_client_info_hashes (info_hash) VALUES (?1)",
-                    params![record.info_hash],
-                )
-                .map_err(sql_error)?;
-        }
         self.connection
             .execute(
                 "DELETE FROM ensemble
