@@ -580,13 +580,13 @@ fn persist_decision(
     now_millis: i64,
     fuzzy_size_factor: f64,
 ) -> crate::Result<()> {
+    let Some(metafile) = assessment.metafile.as_ref() else {
+        return Ok(());
+    };
     database.upsert_decision(&DecisionRecord {
         searchee_id,
         guid: candidate.guid.as_ref(),
-        info_hash: assessment
-            .metafile
-            .as_ref()
-            .map(|metafile| metafile.info_hash.as_str()),
+        info_hash: Some(metafile.info_hash.as_str()),
         decision: assessment.decision,
         first_seen: now_millis,
         last_seen: now_millis,
@@ -907,6 +907,11 @@ mod tests {
         let assessment = assess_candidate(&context, &second_candidate, &searchee, &mut history)
             .expect("assessment");
         assert_eq!(assessment.decision, Decision::FuzzySizeMismatch);
+        let decisions: i64 = database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM decision", [], |row| row.get(0))
+            .expect("decision count");
+        assert_eq!(decisions, 0);
         let _cleanup = fs::remove_dir_all(database_root);
     }
 
