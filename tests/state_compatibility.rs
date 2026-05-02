@@ -18,7 +18,9 @@ use sporos::{
         ClientErrorCode, ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent,
         ResumeOptions, TorrentClient,
     },
-    config::{DeprecatedConfig, LinkType, MatchMode, RawConfig, RuntimeConfig},
+    config::{
+        ApiIntegrationConfig, DeprecatedConfig, LinkType, MatchMode, RawConfig, RuntimeConfig,
+    },
     domain::{
         ClientLabel, Decision, File, InfoHash, InjectionResult, MediaType, Metafile, Searchee,
         TorrentClientKind, TorrentClientMetadata,
@@ -44,7 +46,10 @@ fn current_bootstrap_reopen_preserves_compatibility_state() {
 
     let runtime = RuntimeConfig::normalize(
         RawConfig {
-            torznab: vec!["https://indexer.example/api?apikey=config-key".to_owned()],
+            torznab: vec![ApiIntegrationConfig {
+                url: "https://indexer.example/api".to_owned(),
+                api_key: "config-key".to_owned(),
+            }],
             data_dirs: vec![data_dir.clone()],
             output_dir: Some(output_dir.clone()),
             inject_dir: Some(retry_dir.clone()),

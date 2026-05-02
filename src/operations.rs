@@ -19,9 +19,9 @@ use crate::{
     config::{Action as ConfigAction, RuntimeConfig},
     domain::{ActionResult, ClientLabel, InfoHash, Label},
     integrations::{
-        RssPagerOptions, SnatchOptions, TorznabSearchOptions, enabled_search_indexers,
-        fetch_torznab_caps, query_rss_feeds, sync_torznab_indexers, update_indexer_caps,
-        validate_torznab_url,
+        ArrConfig, ArrKind, RssPagerOptions, SnatchOptions, TorznabSearchOptions,
+        enabled_search_indexers, fetch_torznab_caps, query_rss_feeds, sync_torznab_indexers,
+        update_indexer_caps, validate_arr_config, validate_torznab_config,
     },
     matching::AssessmentOptions,
     notifications::NotificationSender,
@@ -261,6 +261,7 @@ pub fn run_search_workflow(
     let client_searchees = collect_client_searchees(config, &client_refs)?;
     let blocklist = Blocklist::parse(&config.block_list)?;
     let indexers = enabled_search_indexers(database, current_time_millis())?;
+    let arr_configs = build_arr_configs(config)?;
     let base = find_all_searchees(
         &SearcheeSources {
             torrents: config.torrents.as_deref(),
@@ -273,7 +274,8 @@ pub fn run_search_workflow(
         Label::Search,
     )?;
     let excluded = local_info_hashes(&base);
-    let options = search_pipeline_options(config, &blocklist, &excluded, Label::Search);
+    let options =
+        search_pipeline_options(config, &blocklist, &excluded, &arr_configs, Label::Search);
     let searchees = find_searchable_searchees(base, &[], config.max_data_depth, &options)?;
     let injection = injection_options(config, &client_refs);
     let mut cache = CandidateSearchCache::default();
@@ -314,6 +316,7 @@ pub fn run_rss_workflow(
     let client_searchees = collect_client_searchees(config, &client_refs)?;
     let blocklist = Blocklist::parse(&config.block_list)?;
     let indexers = enabled_search_indexers(database, current_time_millis())?;
+    let arr_configs = build_arr_configs(config)?;
     let candidates = query_rss_feeds(
         database,
         &indexers,
@@ -339,7 +342,7 @@ pub fn run_rss_workflow(
         Label::Rss,
     )?;
     let excluded = local_info_hashes(&local);
-    let options = search_pipeline_options(config, &blocklist, &excluded, Label::Rss);
+    let options = search_pipeline_options(config, &blocklist, &excluded, &arr_configs, Label::Rss);
     let injection = injection_options(config, &client_refs);
     let gate = ReverseLookupGate::new();
     let runtime = ReverseLookupRuntime {
@@ -419,7 +422,7 @@ pub fn run_update_indexer_caps(
     let configured = config
         .torznab
         .iter()
-        .map(|url| validate_torznab_url(url))
+        .map(validate_torznab_config)
         .collect::<crate::Result<Vec<_>>>()?;
     sync_torznab_indexers(database, &configured)?;
     let mut result = IndexerCapsRefreshResult {
@@ -515,10 +518,24 @@ fn sync_configured_indexers(database: &Database, config: &RuntimeConfig) -> crat
     let configured = config
         .torznab
         .iter()
-        .map(|url| validate_torznab_url(url))
+        .map(validate_torznab_config)
         .collect::<crate::Result<Vec<_>>>()?;
     sync_torznab_indexers(database, &configured)?;
     Ok(())
+}
+
+fn build_arr_configs(config: &RuntimeConfig) -> crate::Result<Vec<ArrConfig>> {
+    config
+        .sonarr
+        .iter()
+        .map(|entry| validate_arr_config(entry, ArrKind::Sonarr))
+        .chain(
+            config
+                .radarr
+                .iter()
+                .map(|entry| validate_arr_config(entry, ArrKind::Radarr)),
+        )
+        .collect()
 }
 
 fn indexer_id(database: &Database, url: &str) -> crate::Result<i64> {
@@ -594,6 +611,7 @@ fn search_pipeline_options<'a>(
     config: &'a RuntimeConfig,
     blocklist: &'a Blocklist,
     excluded: &'a BTreeSet<String>,
+    arr_configs: &'a [ArrConfig],
     label: Label,
 ) -> SearchPipelineOptions<'a> {
     let now_millis = current_time_millis();
@@ -623,7 +641,7 @@ fn search_pipeline_options<'a>(
                 .map(|value| usize::try_from(value).unwrap_or(usize::MAX)),
             now_millis,
         },
-        arr_configs: &[],
+        arr_configs,
         arr_timeout: config.search_timeout.map(Duration::from_millis),
         virtual_season: config.season_from_episodes.map(|season_from_episodes| {
             VirtualSeasonOptions {

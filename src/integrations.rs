@@ -18,6 +18,7 @@ use url::{Url, form_urlencoded};
 
 use crate::{
     SporosError,
+    config::ApiIntegrationConfig,
     domain::{Candidate, InfoHash, MediaType, Metafile, Searchee},
     persistence::Database,
     torrent::{parse_metafile, torrent_cache_path},
@@ -590,6 +591,33 @@ pub fn validate_torznab_url(value: &str) -> crate::Result<TorznabConfig> {
     })
 }
 
+/// Validate and sanitize a structured Torznab config entry.
+pub fn validate_torznab_config(value: &ApiIntegrationConfig) -> crate::Result<TorznabConfig> {
+    let mut url = Url::parse(&value.url).map_err(|error| {
+        integration_error(format!("invalid Torznab URL {:?}: {error}", value.url))
+    })?;
+    if !url.path().ends_with("/api") {
+        return Err(integration_error("Torznab URL pathname must end in /api"));
+    }
+    if value.api_key.is_empty() {
+        return Err(integration_error("Torznab config must include api_key"));
+    }
+    if url
+        .query_pairs()
+        .any(|(key, _)| key == "apikey" || key == "api_key")
+    {
+        return Err(integration_error(
+            "Torznab URL must not include api_key query parameters",
+        ));
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(TorznabConfig {
+        url: url.to_string(),
+        apikey: value.api_key.clone(),
+    })
+}
+
 /// Synchronize configured Torznab indexers with the database.
 pub fn sync_torznab_indexers(
     database: &Database,
@@ -885,6 +913,33 @@ pub fn validate_arr_url(value: &str, kind: ArrKind) -> crate::Result<ArrConfig> 
     Ok(ArrConfig {
         url: sanitized.to_string().trim_end_matches('/').to_owned(),
         apikey,
+        kind,
+    })
+}
+
+/// Validate and sanitize a structured Sonarr/Radarr config entry.
+pub fn validate_arr_config(
+    value: &ApiIntegrationConfig,
+    kind: ArrKind,
+) -> crate::Result<ArrConfig> {
+    let mut url = Url::parse(&value.url)
+        .map_err(|error| integration_error(format!("invalid Arr URL: {error}")))?;
+    if value.api_key.is_empty() {
+        return Err(integration_error("Arr config must include api_key"));
+    }
+    if url
+        .query_pairs()
+        .any(|(key, _)| key == "apikey" || key == "api_key")
+    {
+        return Err(integration_error(
+            "Arr URL must not include api_key query parameters",
+        ));
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(ArrConfig {
+        url: url.to_string().trim_end_matches('/').to_owned(),
+        apikey: value.api_key.clone(),
         kind,
     })
 }

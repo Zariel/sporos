@@ -34,14 +34,17 @@ impl Redactor {
         if let Some(api_key) = &config.api_key {
             push_secret(&mut secrets, api_key);
         }
-        for url in config
-            .notification_webhook_urls
+        for url in &config.notification_webhook_urls {
+            push_url_secrets(&mut secrets, url);
+        }
+        for integration in config
+            .torznab
             .iter()
-            .chain(config.torznab.iter())
             .chain(config.sonarr.iter())
             .chain(config.radarr.iter())
         {
-            push_url_secrets(&mut secrets, url);
+            push_url_secrets(&mut secrets, &integration.url);
+            push_secret(&mut secrets, &integration.api_key);
         }
         for client in &config.torrent_clients {
             push_url_secrets(&mut secrets, &client.url);
@@ -294,7 +297,7 @@ mod tests {
         Redactor, StartupHooks, StartupMode, check_config_paths, full_runtime, initialize_logger,
         minimal_runtime,
     };
-    use crate::config::{Action, RuntimeConfig};
+    use crate::config::{Action, ApiIntegrationConfig, RuntimeConfig};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -311,15 +314,20 @@ mod tests {
         config.api_key = Some("123456789012345678901234".to_owned());
         config.notification_webhook_urls =
             vec!["https://user:secret@example.test/hook?token=notificationtoken".to_owned()];
+        config.torznab = vec![ApiIntegrationConfig {
+            url: "https://indexer.example/api".to_owned(),
+            api_key: "indexersecret".to_owned(),
+        }];
 
         let redactor = Redactor::from_config(&config);
         let redacted = redactor.redact(
-            "api=123456789012345678901234 url=https://user:secret@example.test/hook?token=notificationtoken",
+            "api=123456789012345678901234 url=https://user:secret@example.test/hook?token=notificationtoken indexer=indexersecret",
         );
 
         assert!(!redacted.contains("123456789012345678901234"));
         assert!(!redacted.contains("secret@"));
         assert!(!redacted.contains("notificationtoken"));
+        assert!(!redacted.contains("indexersecret"));
     }
 
     #[test]

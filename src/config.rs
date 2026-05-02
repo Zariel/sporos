@@ -145,6 +145,34 @@ impl TorrentClientConfig {
     }
 }
 
+/// Structured API-backed integration config entry.
+#[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiIntegrationConfig {
+    /// Base service URL without API-key query parameters.
+    pub url: String,
+    /// API key kept separately from the URL for redaction and persistence.
+    pub api_key: String,
+}
+
+impl ApiIntegrationConfig {
+    /// Validate fields common to structured integrations.
+    pub fn validate(&self, label: &str) -> crate::Result<()> {
+        if self.url.is_empty() {
+            return Err(config_error(format!("{label} entry missing url")));
+        }
+        if self.api_key.is_empty() {
+            return Err(config_error(format!("{label} entry missing api_key")));
+        }
+        if self.url.contains("apikey=") || self.url.contains("api_key=") {
+            return Err(config_error(format!(
+                "{label} url must not include api_key query parameters"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Deprecated config fields that map into current options.
 #[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -169,8 +197,8 @@ pub struct DeprecatedConfig {
 pub struct RawConfig {
     /// Delay in seconds.
     pub delay: Option<u64>,
-    /// Torznab URLs.
-    pub torznab: Vec<String>,
+    /// Torznab indexers.
+    pub torznab: Vec<ApiIntegrationConfig>,
     /// Use client torrents as searchees.
     pub use_client_torrents: Option<bool>,
     /// Data directories.
@@ -250,10 +278,10 @@ pub struct RawConfig {
     pub block_list: Vec<String>,
     /// API key.
     pub api_key: Option<String>,
-    /// Sonarr URLs.
-    pub sonarr: Vec<String>,
-    /// Radarr URLs.
-    pub radarr: Vec<String>,
+    /// Sonarr instances.
+    pub sonarr: Vec<ApiIntegrationConfig>,
+    /// Radarr instances.
+    pub radarr: Vec<ApiIntegrationConfig>,
     /// Deprecated fields.
     #[serde(skip)]
     pub deprecated: DeprecatedConfig,
@@ -264,8 +292,8 @@ pub struct RawConfig {
 pub struct RuntimeConfig {
     /// Delay in seconds.
     pub delay: u64,
-    /// Torznab URLs.
-    pub torznab: Vec<String>,
+    /// Torznab indexers.
+    pub torznab: Vec<ApiIntegrationConfig>,
     /// Use client torrents as searchees.
     pub use_client_torrents: bool,
     /// Data directories.
@@ -338,10 +366,10 @@ pub struct RuntimeConfig {
     pub block_list: Vec<String>,
     /// API key.
     pub api_key: Option<String>,
-    /// Sonarr URLs.
-    pub sonarr: Vec<String>,
-    /// Radarr URLs.
-    pub radarr: Vec<String>,
+    /// Sonarr instances.
+    pub sonarr: Vec<ApiIntegrationConfig>,
+    /// Radarr instances.
+    pub radarr: Vec<ApiIntegrationConfig>,
 }
 
 impl RuntimeConfig {
@@ -387,6 +415,15 @@ impl RuntimeConfig {
 
         for client in &torrent_clients {
             client.validate()?;
+        }
+        for indexer in &raw.torznab {
+            indexer.validate("torznab")?;
+        }
+        for arr in &raw.sonarr {
+            arr.validate("sonarr")?;
+        }
+        for arr in &raw.radarr {
+            arr.validate("radarr")?;
         }
         let config = Self {
             delay: raw.delay.unwrap_or(DEFAULT_DELAY_SECONDS),
@@ -791,8 +828,8 @@ fn config_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, DeprecatedConfig, LinkType, MatchMode, RawConfig, RuntimeConfig,
-        TorrentClientConfig, parse_duration_millis, raw_config_from_source,
+        Action, ApiIntegrationConfig, DeprecatedConfig, LinkType, MatchMode, RawConfig,
+        RuntimeConfig, TorrentClientConfig, parse_duration_millis, raw_config_from_source,
     };
     use std::path::Path;
 
@@ -889,13 +926,16 @@ mod tests {
     fn loads_config_toml() {
         let raw = raw_config_from_source(
             r#"
-            torznab = ["https://indexer.example/api"]
             use_client_torrents = true
             data_dirs = ["/data"]
             match_mode = "flexible"
             exclude_older = "2 days"
             exclude_recent_search = false
             link_dirs = ["/links"]
+
+            [[torznab]]
+            url = "https://indexer.example/api"
+            api_key = "secret"
 
             [[torrent_clients]]
             kind = "qbittorrent"
@@ -904,7 +944,13 @@ mod tests {
         )
         .expect("config parses");
 
-        assert_eq!(raw.torznab, vec!["https://indexer.example/api"]);
+        assert_eq!(
+            raw.torznab,
+            vec![ApiIntegrationConfig {
+                url: "https://indexer.example/api".to_owned(),
+                api_key: "secret".to_owned(),
+            }]
+        );
         assert_eq!(raw.use_client_torrents, Some(true));
         assert_eq!(raw.data_dirs, vec![Path::new("/data")]);
         assert_eq!(raw.match_mode.as_deref(), Some("flexible"));
@@ -934,6 +980,15 @@ mod tests {
         let error =
             raw_config_from_source(r#"torrent_clients = ["qbittorrent:http://localhost:8080"]"#)
                 .expect_err("string client entries are rejected");
+
+        assert!(error.to_string().contains("failed to parse config.toml"));
+    }
+
+    #[test]
+    fn rejects_string_integration_config_entries() {
+        let error =
+            raw_config_from_source(r#"torznab = ["https://indexer.example/api?apikey=secret"]"#)
+                .expect_err("string integration entries are rejected");
 
         assert!(error.to_string().contains("failed to parse config.toml"));
     }

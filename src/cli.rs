@@ -235,7 +235,10 @@ fn apply_shared_options(
     raw_config: &mut crate::config::RawConfig,
 ) -> crate::Result<()> {
     if let Some(values) = string_values(matches, "torznab") {
-        raw_config.torznab = values;
+        raw_config.torznab = values
+            .iter()
+            .map(|value| integration_from_query_url(value, "torznab"))
+            .collect::<crate::Result<Vec<_>>>()?;
     }
     if matches.get_flag("use-client-torrents") {
         raw_config.use_client_torrents = Some(true);
@@ -343,10 +346,16 @@ fn apply_shared_options(
         raw_config.block_list = values;
     }
     if let Some(values) = string_values(matches, "sonarr") {
-        raw_config.sonarr = values;
+        raw_config.sonarr = values
+            .iter()
+            .map(|value| integration_from_query_url(value, "sonarr"))
+            .collect::<crate::Result<Vec<_>>>()?;
     }
     if let Some(values) = string_values(matches, "radarr") {
-        raw_config.radarr = values;
+        raw_config.radarr = values
+            .iter()
+            .map(|value| integration_from_query_url(value, "radarr"))
+            .collect::<crate::Result<Vec<_>>>()?;
     }
     if matches.get_flag("verbose") {
         raw_config.verbose = Some(true);
@@ -420,6 +429,29 @@ fn string_values(matches: &ArgMatches, name: &str) -> Option<Vec<String>> {
 
 fn path_values(matches: &ArgMatches, name: &str) -> Option<Vec<PathBuf>> {
     string_values(matches, name).map(|values| values.into_iter().map(PathBuf::from).collect())
+}
+
+fn integration_from_query_url(
+    value: &str,
+    label: &str,
+) -> crate::Result<crate::config::ApiIntegrationConfig> {
+    let mut url = url::Url::parse(value)
+        .map_err(|error| SporosError::configuration(format!("invalid {label} URL: {error}")))?;
+    let api_key = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "apikey" || key == "api_key").then(|| value.into_owned()))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            SporosError::configuration(format!(
+                "{label} CLI URL must include apikey query parameter"
+            ))
+        })?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(crate::config::ApiIntegrationConfig {
+        url: url.to_string().trim_end_matches('/').to_owned(),
+        api_key,
+    })
 }
 
 fn parse_ratio(value: &str, name: &str) -> crate::Result<f64> {
@@ -681,7 +713,7 @@ fn repeating(name: &'static str, long: &'static str) -> Arg {
 #[cfg(test)]
 mod tests {
     use super::{apply_inject_options, apply_search_options, apply_shared_options, build_cli};
-    use crate::config::{RawConfig, TorrentClientConfig};
+    use crate::config::{ApiIntegrationConfig, RawConfig, TorrentClientConfig};
     use std::path::Path;
 
     #[test]
@@ -720,7 +752,7 @@ mod tests {
                 "cross-seed",
                 "search",
                 "--torznab",
-                "https://indexer.example/api",
+                "https://indexer.example/api?apikey=secret",
                 "--use-client-torrents",
                 "--match-mode",
                 "partial",
@@ -766,7 +798,7 @@ mod tests {
                 "cross-seed",
                 "search",
                 "--torznab",
-                "https://indexer.example/api",
+                "https://indexer.example/api?apikey=secret",
                 "--use-client-torrents",
                 "--data-dirs",
                 "/data",
@@ -832,7 +864,13 @@ mod tests {
         apply_shared_options(matches, &mut raw).expect("shared");
         apply_search_options(matches, &mut raw).expect("search");
 
-        assert_eq!(raw.torznab, vec!["https://indexer.example/api"]);
+        assert_eq!(
+            raw.torznab,
+            vec![ApiIntegrationConfig {
+                url: "https://indexer.example/api".to_owned(),
+                api_key: "secret".to_owned(),
+            }]
+        );
         assert_eq!(raw.use_client_torrents, Some(true));
         assert_eq!(raw.data_dirs, vec![Path::new("/data")]);
         assert_eq!(raw.torrent_dir.as_deref(), Some(Path::new("/torrents")));
@@ -867,8 +905,20 @@ mod tests {
             vec!["https://notify.example/hook"]
         );
         assert_eq!(raw.block_list, vec!["name:cam"]);
-        assert_eq!(raw.sonarr, vec!["http://sonarr.example/api?apikey=abc"]);
-        assert_eq!(raw.radarr, vec!["http://radarr.example/api?apikey=def"]);
+        assert_eq!(
+            raw.sonarr,
+            vec![ApiIntegrationConfig {
+                url: "http://sonarr.example/api".to_owned(),
+                api_key: "abc".to_owned(),
+            }]
+        );
+        assert_eq!(
+            raw.radarr,
+            vec![ApiIntegrationConfig {
+                url: "http://radarr.example/api".to_owned(),
+                api_key: "def".to_owned(),
+            }]
+        );
         assert_eq!(raw.verbose, Some(true));
         assert_eq!(
             raw.torrents.as_deref(),
