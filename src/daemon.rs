@@ -88,7 +88,7 @@ fn run_plan(
     let mut iterations = 0usize;
     while !shutdown.load(Ordering::SeqCst) {
         if let Some(listener) = &listener {
-            accept_ready(listener, database, &mut plan.scheduler, config)?;
+            accept_ready(listener, app_dir, database, &mut plan.scheduler, config)?;
         }
 
         let now = now_millis();
@@ -206,6 +206,7 @@ fn execute_ran_jobs(
 
 fn accept_ready(
     listener: &TcpListener,
+    app_dir: &Path,
     database: &Database,
     scheduler: &mut Scheduler,
     config: &RuntimeConfig,
@@ -213,7 +214,7 @@ fn accept_ready(
     loop {
         match listener.accept() {
             Ok((stream, remote_addr)) => {
-                handle_stream(stream, remote_addr, database, scheduler, config)?;
+                handle_stream(stream, remote_addr, app_dir, database, scheduler, config)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(daemon_error(format!("failed to accept request: {error}"))),
@@ -224,6 +225,7 @@ fn accept_ready(
 fn handle_stream(
     mut stream: TcpStream,
     remote_addr: SocketAddr,
+    app_dir: &Path,
     database: &Database,
     scheduler: &mut Scheduler,
     config: &RuntimeConfig,
@@ -235,6 +237,8 @@ fn handle_stream(
     request.remote_addr = Some(remote_addr.to_string());
     let api_key = crate::operations::api_key(database, config.api_key.as_deref())?;
     let mut handlers = RuntimeHandlers {
+        app_dir,
+        config,
         database,
         scheduler,
         now_millis: now_millis(),
@@ -388,6 +392,8 @@ fn daemon_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 }
 
 struct RuntimeHandlers<'a> {
+    app_dir: &'a Path,
+    config: &'a RuntimeConfig,
     database: &'a Database,
     scheduler: &'a mut Scheduler,
     now_millis: i64,
@@ -400,7 +406,17 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             name = request.name.as_str(),
             "received announce request"
         );
-        Ok(None)
+        let notifier = crate::notifications::NotificationSender::from_config(
+            self.config,
+            crate::startup::Redactor::from_config(self.config),
+        )?;
+        crate::operations::run_announce_match(
+            self.database,
+            self.app_dir,
+            self.config,
+            request.into_candidate(),
+            &notifier,
+        )
     }
 
     fn webhook(&mut self, _request: WebhookRequest) -> crate::Result<()> {

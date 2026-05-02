@@ -15,9 +15,10 @@ use crate::{
         SavedInjectionSummary, inject_saved_torrents, perform_injection_action,
         restore_from_torrent_cache, save_candidate_torrent,
     },
+    api::ApiOutcome,
     clients::{TorrentClient, build_torrent_clients, client_torrent_to_searchee},
     config::{Action as ConfigAction, RuntimeConfig},
-    domain::{ActionResult, ClientLabel, InfoHash, Label},
+    domain::{ActionResult, Candidate, ClientLabel, InfoHash, Label},
     integrations::{
         ArrConfig, ArrKind, RssPagerOptions, SnatchOptions, TorznabSearchOptions,
         enabled_search_indexers, fetch_torznab_caps, query_rss_feeds, sync_torznab_indexers,
@@ -29,9 +30,9 @@ use crate::{
     search::{
         Blocklist, CandidateSearchCache, ContentFilterOptions, PipelineAction, PipelineSummary,
         ReverseLookupGate, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
-        SearcheeSources, VirtualSeasonOptions, bulk_search, check_new_candidate_matches,
-        episode_ensemble, find_all_searchees, find_searchable_searchees,
-        for_each_data_dir_searchee,
+        SearcheeSources, VirtualSeasonOptions, bulk_search, check_new_candidate_match,
+        check_new_candidate_matches, episode_ensemble, find_all_searchees,
+        find_searchable_searchees, for_each_data_dir_searchee,
     },
     torrent::{
         Bencode, BencodeValue, bdecode, bencode, parse_metafile, torrent_cache_dir,
@@ -367,6 +368,63 @@ pub fn run_rss_workflow(
         candidates: candidates.len(),
         attempts: attempts.len(),
     })
+}
+
+/// Reverse-match one announce API candidate.
+pub fn run_announce_match(
+    database: &Database,
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    candidate: Candidate<'static>,
+    notifier: &NotificationSender,
+) -> crate::Result<Option<ApiOutcome>> {
+    if !config.use_client_torrents && config.torrent_dir.is_none() && config.data_dirs.is_empty() {
+        return Err(operation_error(
+            "announce requires torrent_dir, use_client_torrents, or data_dirs",
+        ));
+    }
+    index_torrents_and_data_dirs(database, config)?;
+    let client_adapters = build_workflow_clients(config)?;
+    let client_refs = client_refs(&client_adapters);
+    let client_searchees = collect_client_searchees(config, &client_refs)?;
+    let blocklist = Blocklist::parse(&config.block_list)?;
+    let arr_configs = build_arr_configs(config)?;
+    let local = find_all_searchees(
+        &SearcheeSources {
+            torrents: None,
+            use_client_torrents: config.use_client_torrents,
+            client_searchees: &client_searchees,
+            torrent_dir: config.torrent_dir.as_deref(),
+            data_dirs: &config.data_dirs,
+            max_data_depth: config.max_data_depth,
+        },
+        Label::Announce,
+    )?;
+    let excluded = local_info_hashes(&local);
+    let options =
+        search_pipeline_options(config, &blocklist, &excluded, &arr_configs, Label::Announce);
+    let injection = injection_options(config, &client_refs);
+    let gate = ReverseLookupGate::new();
+    let runtime = ReverseLookupRuntime {
+        gate: &gate,
+        database,
+        app_dir,
+        options: &options,
+    };
+    let attempt = check_new_candidate_match(
+        &runtime,
+        &candidate,
+        &local,
+        |action| dispatch_pipeline_action(app_dir, config, &injection, action),
+        |attempt| {
+            let _report = notifier.send_result(attempt);
+            Ok(())
+        },
+    )?;
+    Ok(attempt.map(|attempt| ApiOutcome {
+        decision: attempt.decision,
+        action_result: attempt.action_result,
+    }))
 }
 
 /// Run one saved torrent injection workflow.
@@ -1166,7 +1224,7 @@ fn replace_bencode_bytes_recursive(value: &mut Bencode<'_>, from: &[u8], to: &[u
 mod tests {
     use super::{
         api_key, cleanup_db, cleanup_db_with_clients, clear_cache, clear_client_cache,
-        clear_indexer_failures, reset_api_key, update_torrent_cache_trackers,
+        clear_indexer_failures, reset_api_key, run_announce_match, update_torrent_cache_trackers,
     };
     use crate::{
         clients::{
@@ -1175,10 +1233,12 @@ mod tests {
         },
         config::{RawConfig, RuntimeConfig},
         domain::{
-            Decision, File, InfoHash, InjectionResult, Metafile, Searchee, TorrentClientKind,
-            TorrentClientMetadata,
+            Candidate, Decision, File, InfoHash, InjectionResult, Metafile, Searchee,
+            TorrentClientKind, TorrentClientMetadata,
         },
+        notifications::NotificationSender,
         persistence::{ClientSearcheeRecord, Database, DecisionRecord, EnsembleRecord},
+        startup::Redactor,
     };
     use std::{
         borrow::Cow,
@@ -1405,6 +1465,66 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM decision", [], |row| row.get(0))
             .expect("count");
         assert_eq!(remaining, 1);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn announce_match_uses_reverse_lookup_pipeline() {
+        let root = temp_path("announce");
+        let torrent_dir = root.join("torrents");
+        fs::create_dir_all(&torrent_dir).expect("torrent dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        database
+            .upsert_client_searchee(&ClientSearcheeRecord {
+                client_host: "client-a",
+                info_hash: "0123456789abcdef0123456789abcdef01234567",
+                name: "Example.Show.S01E01",
+                title: "Example Show S01E01",
+                files: &[File::new("Example.Show.S01E01.mkv", 10)],
+                length: 10,
+                save_path: "/downloads",
+                category: None,
+                tags: &[],
+                trackers: &[Cow::Borrowed("tracker.example")],
+            })
+            .expect("client searchee");
+        let searchee_id = database
+            .get_or_insert_searchee("Example Show S01E01", 1_000)
+            .expect("searchee");
+        database
+            .upsert_decision(&DecisionRecord {
+                searchee_id,
+                guid: "https://tracker.example/download",
+                info_hash: None,
+                decision: Decision::MatchSizeOnly,
+                first_seen: 1_000,
+                last_seen: 1_000,
+                fuzzy_size_factor: 0.05,
+            })
+            .expect("decision");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                torrent_dir: Some(torrent_dir),
+                include_single_episodes: Some(true),
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let notifier = NotificationSender::new(Vec::new(), Redactor::default()).expect("notifier");
+        let candidate = Candidate::new(
+            "Example.Show.S01E01",
+            "https://tracker.example/download",
+            Some("https://tracker.example/download"),
+            "tracker",
+        );
+
+        let outcome = run_announce_match(&database, &root, &config, candidate, &notifier)
+            .expect("announce")
+            .expect("outcome");
+
+        assert_eq!(outcome.decision, Decision::MatchSizeOnly);
+        assert_eq!(outcome.action_result, None);
         let _cleanup = fs::remove_dir_all(root);
     }
 
