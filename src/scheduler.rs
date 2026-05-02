@@ -93,9 +93,12 @@ impl ScheduledJob {
         }
         self.is_active = true;
         self.runs = self.runs.saturating_add(1);
-        self.is_active = false;
         self.run_ahead_of_schedule = false;
         true
+    }
+
+    fn finish(&mut self) {
+        self.is_active = false;
     }
 }
 
@@ -341,6 +344,13 @@ impl Scheduler {
         }
         Ok(results)
     }
+
+    /// Mark a dispatched job body as finished.
+    pub fn finish_job(&mut self, name: JobName) {
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.name == name) {
+            job.finish();
+        }
+    }
 }
 
 fn read_last_run(database: &Database, name: JobName) -> crate::Result<Option<i64>> {
@@ -515,6 +525,57 @@ mod tests {
 
         assert_eq!(results[1].skipped.as_deref(), Some("rss active"));
         assert_eq!(results[2].skipped.as_deref(), Some("rss active"));
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_flag_spans_dispatched_job_body() {
+        let root = temp_path("scheduler-active-window");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let mut scheduler = Scheduler::new(vec![
+            ScheduledJob::new(JobName::Search, 60_000, true),
+            ScheduledJob::new(JobName::Cleanup, 60_000, true),
+        ]);
+
+        let results = scheduler
+            .check_jobs(&database, 1_000, false)
+            .expect("check jobs");
+
+        assert!(results[0].ran);
+        assert!(scheduler.jobs()[0].is_active);
+        assert!(scheduler.jobs()[1].is_active);
+        assert!(matches!(
+            scheduler
+                .request_early_run(&database, JobName::Search, 1_000)
+                .expect("active"),
+            JobResponse::AlreadyRunning(_)
+        ));
+
+        scheduler.finish_job(JobName::Search);
+        scheduler.finish_job(JobName::Cleanup);
+        assert!(!scheduler.jobs()[0].is_active);
+        assert!(!scheduler.jobs()[1].is_active);
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_waits_for_active_job_from_previous_check() {
+        let root = temp_path("scheduler-cleanup-active");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let mut search = ScheduledJob::new(JobName::Search, 60_000, true);
+        search.is_active = true;
+        let mut scheduler = Scheduler::new(vec![
+            search,
+            ScheduledJob::new(JobName::Cleanup, 60_000, true),
+        ]);
+
+        let results = scheduler
+            .check_jobs(&database, 1_000, false)
+            .expect("check jobs");
+
+        assert_eq!(results[1].skipped.as_deref(), Some("another job active"));
         let _cleanup = std::fs::remove_dir_all(root);
     }
 

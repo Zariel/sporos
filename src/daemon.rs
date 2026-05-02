@@ -66,7 +66,7 @@ fn run_plan(
     let mut run = plan.run_startup(database, now_millis(), || {
         index_torrents_and_data_dirs(config, database)
     })?;
-    execute_ran_jobs(app_dir, config, database, &run.jobs)?;
+    execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &run.jobs)?;
     let listener = if let Some(address) = listen_address(config) {
         let listener = TcpListener::bind(address)
             .map_err(|error| daemon_error(format!("failed to bind {address}: {error}")))?;
@@ -94,7 +94,7 @@ fn run_plan(
         let now = now_millis();
         if now >= next_job_check {
             let results = plan.scheduler.check_jobs(database, now, false)?;
-            execute_ran_jobs(app_dir, config, database, &results)?;
+            execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &results)?;
             next_job_check = now.saturating_add(duration_millis(JOB_LOOP_INTERVAL));
         }
 
@@ -111,95 +111,102 @@ fn execute_ran_jobs(
     app_dir: &Path,
     config: &RuntimeConfig,
     database: &Database,
+    scheduler: &mut Scheduler,
     results: &[crate::scheduler::JobCheckResult],
 ) -> crate::Result<()> {
     for result in results {
         if !result.ran {
             continue;
         }
-        match result.name {
-            JobName::Rss => {
-                let notifier = crate::notifications::NotificationSender::from_config(
-                    config,
-                    crate::startup::Redactor::from_config(config),
-                )?;
-                let rss =
-                    crate::operations::run_rss_workflow(database, app_dir, config, &notifier)?;
-                tracing::info!(
-                    candidates = rss.candidates,
-                    attempts = rss.attempts,
-                    "rss job completed"
-                );
+        let job_result = (|| -> crate::Result<()> {
+            match result.name {
+                JobName::Rss => {
+                    let notifier = crate::notifications::NotificationSender::from_config(
+                        config,
+                        crate::startup::Redactor::from_config(config),
+                    )?;
+                    let rss =
+                        crate::operations::run_rss_workflow(database, app_dir, config, &notifier)?;
+                    tracing::info!(
+                        candidates = rss.candidates,
+                        attempts = rss.attempts,
+                        "rss job completed"
+                    );
+                }
+                JobName::Search => {
+                    let notifier = crate::notifications::NotificationSender::from_config(
+                        config,
+                        crate::startup::Redactor::from_config(config),
+                    )?;
+                    let search = crate::operations::run_search_workflow(
+                        database, app_dir, config, &notifier,
+                    )?;
+                    tracing::info!(
+                        searchees = search.searchees,
+                        indexers = search.indexers,
+                        candidates = search.pipeline.candidates_assessed,
+                        attempts = search.pipeline.attempts.len(),
+                        "search job completed"
+                    );
+                }
+                JobName::UpdateIndexerCaps => {
+                    let caps = crate::operations::run_update_indexer_caps(database, config)?;
+                    tracing::info!(
+                        indexers = caps.indexers,
+                        updated = caps.updated,
+                        "indexer caps job completed"
+                    );
+                }
+                JobName::Inject => {
+                    let inject = crate::operations::run_inject_workflow(database, app_dir, config)?;
+                    tracing::info!(
+                        scanned = inject.scanned,
+                        injected = inject.injected,
+                        already_exists = inject.already_exists,
+                        incomplete = inject.incomplete,
+                        failed = inject.failed,
+                        deleted = inject.deleted,
+                        "inject job completed"
+                    );
+                }
+                JobName::Cleanup => {
+                    let client_timeout = config.search_timeout.map(Duration::from_millis);
+                    let client_adapters = if config.use_client_torrents {
+                        build_torrent_clients(&config.torrent_clients, client_timeout)?
+                    } else {
+                        Vec::new()
+                    };
+                    let client_refs = client_adapters
+                        .iter()
+                        .map(|client| client.as_ref())
+                        .collect::<Vec<_>>();
+                    let cleanup = crate::operations::cleanup_db_with_clients(
+                        database,
+                        app_dir,
+                        config,
+                        now_millis(),
+                        &client_refs,
+                    )?;
+                    tracing::info!(
+                        client_searchees_refreshed = cleanup.client_searchees_refreshed,
+                        client_searchees_pruned = cleanup.client_searchees_pruned,
+                        client_ensemble_rows_rebuilt = cleanup.client_ensemble_rows_rebuilt,
+                        data_rows_removed = cleanup.data_rows_removed,
+                        ensemble_rows_removed = cleanup.ensemble_rows_removed,
+                        torrent_cache_files_removed = cleanup.torrent_cache_files_removed,
+                        null_decisions_removed = cleanup.null_decisions_removed,
+                        missing_cache_decisions_removed = cleanup.missing_cache_decisions_removed,
+                        catastrophic_decision_cleanup_skipped =
+                            cleanup.catastrophic_decision_cleanup_skipped,
+                        guid_info_hash_rows = cleanup.guid_info_hash_rows,
+                        "cleanup job completed"
+                    );
+                }
             }
-            JobName::Search => {
-                let notifier = crate::notifications::NotificationSender::from_config(
-                    config,
-                    crate::startup::Redactor::from_config(config),
-                )?;
-                let search =
-                    crate::operations::run_search_workflow(database, app_dir, config, &notifier)?;
-                tracing::info!(
-                    searchees = search.searchees,
-                    indexers = search.indexers,
-                    candidates = search.pipeline.candidates_assessed,
-                    attempts = search.pipeline.attempts.len(),
-                    "search job completed"
-                );
-            }
-            JobName::UpdateIndexerCaps => {
-                let caps = crate::operations::run_update_indexer_caps(database, config)?;
-                tracing::info!(
-                    indexers = caps.indexers,
-                    updated = caps.updated,
-                    "indexer caps job completed"
-                );
-            }
-            JobName::Inject => {
-                let inject = crate::operations::run_inject_workflow(database, app_dir, config)?;
-                tracing::info!(
-                    scanned = inject.scanned,
-                    injected = inject.injected,
-                    already_exists = inject.already_exists,
-                    incomplete = inject.incomplete,
-                    failed = inject.failed,
-                    deleted = inject.deleted,
-                    "inject job completed"
-                );
-            }
-            JobName::Cleanup => {
-                let client_timeout = config.search_timeout.map(Duration::from_millis);
-                let client_adapters = if config.use_client_torrents {
-                    build_torrent_clients(&config.torrent_clients, client_timeout)?
-                } else {
-                    Vec::new()
-                };
-                let client_refs = client_adapters
-                    .iter()
-                    .map(|client| client.as_ref())
-                    .collect::<Vec<_>>();
-                let cleanup = crate::operations::cleanup_db_with_clients(
-                    database,
-                    app_dir,
-                    config,
-                    now_millis(),
-                    &client_refs,
-                )?;
-                tracing::info!(
-                    client_searchees_refreshed = cleanup.client_searchees_refreshed,
-                    client_searchees_pruned = cleanup.client_searchees_pruned,
-                    client_ensemble_rows_rebuilt = cleanup.client_ensemble_rows_rebuilt,
-                    data_rows_removed = cleanup.data_rows_removed,
-                    ensemble_rows_removed = cleanup.ensemble_rows_removed,
-                    torrent_cache_files_removed = cleanup.torrent_cache_files_removed,
-                    null_decisions_removed = cleanup.null_decisions_removed,
-                    missing_cache_decisions_removed = cleanup.missing_cache_decisions_removed,
-                    catastrophic_decision_cleanup_skipped =
-                        cleanup.catastrophic_decision_cleanup_skipped,
-                    guid_info_hash_rows = cleanup.guid_info_hash_rows,
-                    "cleanup job completed"
-                );
-            }
-        }
+            Ok(())
+        })();
+        scheduler.finish_job(result.name);
+        job_result?;
     }
     Ok(())
 }
@@ -436,9 +443,16 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 JobName::Inject,
                 self.now_millis,
             )?;
-            let _results = self
+            let results = self
                 .scheduler
                 .check_jobs(self.database, self.now_millis, false)?;
+            execute_ran_jobs(
+                self.app_dir,
+                self.config,
+                self.database,
+                self.scheduler,
+                &results,
+            )?;
         }
         let app_dir = PathBuf::from(self.app_dir);
         let config = self.config.clone();
@@ -461,9 +475,16 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             .scheduler
             .request_early_run(self.database, name, self.now_millis)?;
         if matches!(response, JobResponse::Accepted(_)) {
-            let _results = self
+            let results = self
                 .scheduler
                 .check_jobs(self.database, self.now_millis, false)?;
+            execute_ran_jobs(
+                self.app_dir,
+                self.config,
+                self.database,
+                self.scheduler,
+                &results,
+            )?;
         }
         Ok(response)
     }
