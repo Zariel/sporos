@@ -154,11 +154,14 @@ fn fake_arr_and_notification_services_cover_external_http_contracts() {
 fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
     let root = temp_path("daemon-api");
     fs::create_dir_all(&root).expect("root");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&data_dir).expect("data dir");
     let database = Database::open_app_dir(&root).expect("database");
     let config = RuntimeConfig::normalize(
         RawConfig {
             port: Some(None),
             rss_cadence: Some(60_000),
+            data_dirs: vec![data_dir],
             ..RawConfig::default()
         },
         &root,

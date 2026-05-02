@@ -601,13 +601,13 @@ impl RuntimeConfig {
                 "scheduled search/rss requires fuzzy_size_threshold <= 0.1",
             ));
         }
-        if self.search_cadence.is_some()
+        if (self.search_cadence.is_some() || self.rss_cadence.is_some())
             && self.torrent_dir.is_none()
             && !self.use_client_torrents
             && self.data_dirs.is_empty()
         {
             return Err(config_error(
-                "scheduled search requires torrent_dir, use_client_torrents, or data_dirs",
+                "scheduled search/rss requires torrent_dir, use_client_torrents, or data_dirs",
             ));
         }
         if has_nested_paths(
@@ -960,6 +960,19 @@ mod tests {
         let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
 
         assert!(error.to_string().contains("torrent_dir cannot be used"));
+    }
+
+    #[test]
+    fn validates_scheduled_rss_requires_a_local_source() {
+        let raw = RawConfig {
+            rss_cadence: Some(900_000),
+            fuzzy_size_threshold: Some(0.1),
+            ..RawConfig::default()
+        };
+
+        let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
+
+        assert!(error.to_string().contains("scheduled search/rss"));
     }
 
     #[test]
