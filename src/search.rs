@@ -352,10 +352,24 @@ pub struct PipelineSummary {
 #[derive(Debug, Default, Clone)]
 pub struct CandidateSearchCache {
     entries: BTreeMap<(String, i64), CachedCandidates>,
+    indexer_search_counts: BTreeMap<i64, usize>,
     last_indexer_search: Option<Instant>,
 }
 
 impl CandidateSearchCache {
+    fn remaining_search_limit(&self, indexer_id: i64, limit: usize) -> usize {
+        limit.saturating_sub(
+            self.indexer_search_counts
+                .get(&indexer_id)
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn record_indexer_candidates(&mut self, indexer_id: i64, count: usize) {
+        *self.indexer_search_counts.entry(indexer_id).or_default() += count;
+    }
+
     fn wait_for_indexer_delay(&mut self, delay: Duration) {
         if delay.is_zero() {
             return;
@@ -575,7 +589,7 @@ where
             ) {
                 continue;
             }
-            let candidates = cached_or_search_candidates(
+            let search_result = cached_or_search_candidates(
                 CandidateSearchRequest {
                     database,
                     indexer,
@@ -588,7 +602,7 @@ where
                 runtime.cache,
                 &mut summary,
             )?;
-            for candidate in candidates {
+            for candidate in search_result.candidates {
                 let attempt = assess_and_dispatch(
                     database,
                     runtime.app_dir,
@@ -610,12 +624,14 @@ where
                 notify(&attempt)?;
                 summary.attempts.push(attempt);
             }
-            update_timestamp(
-                database,
-                searchee_id,
-                indexer.id,
-                options.torznab.now_millis,
-            )?;
+            if search_result.update_timestamp {
+                update_timestamp(
+                    database,
+                    searchee_id,
+                    indexer.id,
+                    options.torznab.now_millis,
+                )?;
+            }
         }
     }
 
@@ -1985,16 +2001,36 @@ struct CandidateSearchRequest<'a> {
     options: &'a SearchPipelineOptions<'a>,
 }
 
+struct CandidateSearchResult {
+    candidates: Vec<Candidate<'static>>,
+    update_timestamp: bool,
+}
+
 fn cached_or_search_candidates(
     request: CandidateSearchRequest<'_>,
     cache: &mut CandidateSearchCache,
     summary: &mut PipelineSummary,
-) -> crate::Result<Vec<Candidate<'static>>> {
+) -> crate::Result<CandidateSearchResult> {
     let cache_key = (request.group_key.to_owned(), request.indexer.id);
     if let Some(cached) = cache.entries.get(&cache_key) {
         if cached.ids_key == request.ids_key {
-            return Ok(cached.candidates.clone());
+            return Ok(CandidateSearchResult {
+                candidates: cached.candidates.clone(),
+                update_timestamp: true,
+            });
         }
+    }
+
+    let mut torznab_options = request.options.torznab;
+    if let Some(limit) = request.options.torznab.search_limit {
+        let remaining = cache.remaining_search_limit(request.indexer.id, limit);
+        if remaining == 0 {
+            return Ok(CandidateSearchResult {
+                candidates: Vec::new(),
+                update_timestamp: false,
+            });
+        }
+        torznab_options.search_limit = Some(remaining);
     }
 
     let indexer_ids = request
@@ -2013,18 +2049,18 @@ fn cached_or_search_candidates(
                 candidates: Vec::new(),
             },
         );
-        return Ok(Vec::new());
+        return Ok(CandidateSearchResult {
+            candidates: Vec::new(),
+            update_timestamp: true,
+        });
     }
 
     cache.wait_for_indexer_delay(request.options.torznab.delay);
-    let candidates = search_torznab_indexer(
-        request.database,
-        request.indexer,
-        &queries,
-        request.options.torznab,
-    );
+    let candidates =
+        search_torznab_indexer(request.database, request.indexer, &queries, torznab_options);
     cache.mark_indexer_search();
     let candidates = candidates?;
+    cache.record_indexer_candidates(request.indexer.id, candidates.len());
     summary.indexer_searches += 1;
     cache.entries.insert(
         cache_key,
@@ -2033,7 +2069,10 @@ fn cached_or_search_candidates(
             candidates: candidates.clone(),
         },
     );
-    Ok(candidates)
+    Ok(CandidateSearchResult {
+        candidates,
+        update_timestamp: true,
+    })
 }
 
 fn assess_and_dispatch<A>(
@@ -3278,6 +3317,65 @@ mod tests {
                 .duration_since(requests[0].accepted_at)
                 >= options.torznab.delay
         );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bulk_search_counts_search_limit_per_indexer_batch() {
+        let server = http_server(vec![rss_response(
+            r#"<rss><channel>
+              <item><title>Example.Show.S01E01</title><guid>guid-1</guid><indexer>tracker</indexer></item>
+            </channel></rss>"#,
+        )]);
+        let root = temp_path("bulk-search-limit");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclude = BTreeSet::new();
+        let mut options = pipeline_options(&blocklist, &exclude, &root, Label::Search);
+        options.filter.include_single_episodes = true;
+        options.filter.include_non_videos = true;
+        options.torznab.search_limit = Some(1);
+        let indexer = SearchIndexer {
+            id: 7,
+            url: format!("{}/api", server.url),
+            apikey: "secret".to_owned(),
+            caps: TorznabCaps {
+                tv_search: true,
+                ..TorznabCaps::default()
+            },
+        };
+        database
+            .connection()
+            .execute(
+                "INSERT INTO indexer (id, url, apikey, active)
+                 VALUES (?1, ?2, ?3, 1)",
+                params![indexer.id, indexer.url, indexer.apikey],
+            )
+            .expect("indexer");
+        let searchees = vec![episode_searchee(1, 1_000), episode_searchee(2, 1_000)];
+        let mut cache = CandidateSearchCache::default();
+        let mut runtime = SearchPipelineRuntime {
+            database: &database,
+            app_dir: &root,
+            options: &options,
+            cache: &mut cache,
+        };
+
+        let summary = bulk_search(
+            &mut runtime,
+            &searchees,
+            &[indexer],
+            |_| Ok(None),
+            |_| Ok(()),
+        )
+        .expect("bulk search");
+
+        assert_eq!(summary.indexer_searches, 1);
+        assert_eq!(summary.candidates_assessed, 1);
+        let requests = server.join();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].raw.contains("/api?apikey=secret&t=tvsearch"));
         let _cleanup = fs::remove_dir_all(root);
     }
 
