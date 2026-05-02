@@ -396,14 +396,36 @@ fn file_tree_decision(
 fn exact_file_tree_matches(candidate_files: &[File<'_>], searchee: &Searchee<'_>) -> bool {
     candidate_files.iter().all(|candidate| {
         searchee.files.iter().any(|local| {
-            local.length == candidate.length
-                && if searchee.source() == SearcheeSource::Virtual {
-                    local.name.eq_ignore_ascii_case(candidate.name.as_ref())
-                } else {
-                    local.path == candidate.path
-                }
+            local.length == candidate.length && exact_file_path_matches(candidate, local, searchee)
         })
     })
+}
+
+fn exact_file_path_matches(
+    candidate: &File<'_>,
+    local: &File<'_>,
+    searchee: &Searchee<'_>,
+) -> bool {
+    match searchee.source() {
+        SearcheeSource::Virtual => local.name.eq_ignore_ascii_case(candidate.name.as_ref()),
+        SearcheeSource::DataDir => {
+            local.path == candidate.path
+                || data_dir_relative_path(searchee, local)
+                    .as_deref()
+                    .is_some_and(|path| path == candidate.path)
+        }
+        SearcheeSource::TorrentClient | SearcheeSource::TorrentFile => local.path == candidate.path,
+    }
+}
+
+fn data_dir_relative_path(searchee: &Searchee<'_>, local: &File<'_>) -> Option<String> {
+    if local.path == searchee.name {
+        return Some(local.path.as_ref().to_owned());
+    }
+    let root = Path::new(searchee.path.as_ref()?.as_ref());
+    let local_path = Path::new(local.path.as_ref());
+    let relative = local_path.strip_prefix(root).ok()?;
+    (!relative.as_os_str().is_empty()).then(|| relative.display().to_string())
 }
 
 fn size_only_matches(candidate_files: &[File<'_>], searchee_files: &[File<'_>]) -> bool {
@@ -657,6 +679,7 @@ mod tests {
         torrent::torrent_cache_path,
     };
     use std::{
+        borrow::Cow,
         collections::BTreeSet,
         fs,
         path::PathBuf,
@@ -724,6 +747,33 @@ mod tests {
         assert_eq!(
             assess_metafile(&partial_meta, &searchee, &partial, false, 0.05).decision,
             Decision::MatchPartial
+        );
+    }
+
+    #[test]
+    fn data_dir_absolute_paths_can_exact_match_relative_torrents() {
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclusions = BTreeSet::new();
+        let strict = options(&blocklist, MatchMode::Strict, false, &exclusions);
+        let root = PathBuf::from("/data/Example.Show.S01");
+        let mut searchee = searchee(
+            "Example.Show.S01",
+            "Example.Show.S01",
+            vec![
+                File::new(root.join("E01.mkv").display().to_string(), 100),
+                File::new(root.join("E02.mkv").display().to_string(), 100),
+            ],
+        );
+        searchee.path = Some(Cow::Owned(root.display().to_string()));
+        let exact = metafile(
+            "4444444444444444444444444444444444444444",
+            "Example.Show.S01",
+            vec![File::new("E01.mkv", 100), File::new("E02.mkv", 100)],
+        );
+
+        assert_eq!(
+            assess_metafile(&exact, &searchee, &strict, false, 0.05).decision,
+            Decision::Match
         );
     }
 
