@@ -42,6 +42,7 @@ use crate::{
 const ONE_DAY_MILLIS: u64 = 86_400_000;
 const THIRTY_DAYS_MILLIS: u64 = 30 * ONE_DAY_MILLIS;
 const ONE_YEAR_MILLIS: u64 = 365 * ONE_DAY_MILLIS;
+const CLEANUP_DB_PAGE_SIZE: i64 = 1_000;
 
 /// Result counts from cache cleanup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -748,14 +749,28 @@ struct MissingCacheDecisionCleanup {
 }
 
 fn prune_missing_data_rows(database: &Database) -> crate::Result<usize> {
-    let paths = string_column(database, "SELECT path FROM data")?;
     let mut removed = 0usize;
-    for path in paths {
-        if !Path::new(&path).exists() {
-            removed += database
-                .connection()
-                .execute("DELETE FROM data WHERE path = ?1", [&path])
-                .map_err(persistence_error)?;
+    let mut after_rowid = 0_i64;
+    loop {
+        let rows = rowid_path_page(
+            database,
+            "SELECT rowid, path FROM data
+             WHERE rowid > ?1
+             ORDER BY rowid
+             LIMIT ?2",
+            after_rowid,
+        )?;
+        let Some(last) = rows.last() else {
+            break;
+        };
+        after_rowid = last.0;
+        for (rowid, path) in rows {
+            if !Path::new(&path).exists() {
+                removed += database
+                    .connection()
+                    .execute("DELETE FROM data WHERE rowid = ?1", [rowid])
+                    .map_err(persistence_error)?;
+            }
         }
     }
     Ok(removed)
@@ -827,17 +842,29 @@ fn refresh_cleanup_client_searchees(
 }
 
 fn prune_missing_ensemble_rows(database: &Database) -> crate::Result<usize> {
-    let rows = rowid_path_rows(
-        database,
-        "SELECT rowid, path FROM ensemble WHERE client_host IS NULL",
-    )?;
     let mut removed = 0usize;
-    for (rowid, path) in rows {
-        if !Path::new(&path).exists() {
-            removed += database
-                .connection()
-                .execute("DELETE FROM ensemble WHERE rowid = ?1", [rowid])
-                .map_err(persistence_error)?;
+    let mut after_rowid = 0_i64;
+    loop {
+        let rows = rowid_path_page(
+            database,
+            "SELECT rowid, path FROM ensemble
+             WHERE client_host IS NULL
+             AND rowid > ?1
+             ORDER BY rowid
+             LIMIT ?2",
+            after_rowid,
+        )?;
+        let Some(last) = rows.last() else {
+            break;
+        };
+        after_rowid = last.0;
+        for (rowid, path) in rows {
+            if !Path::new(&path).exists() {
+                removed += database
+                    .connection()
+                    .execute("DELETE FROM ensemble WHERE rowid = ?1", [rowid])
+                    .map_err(persistence_error)?;
+            }
         }
     }
     Ok(removed)
@@ -891,23 +918,19 @@ fn prune_missing_cache_decisions(
     database: &Database,
     app_dir: &Path,
 ) -> crate::Result<MissingCacheDecisionCleanup> {
-    let info_hashes = string_column(
-        database,
-        "SELECT DISTINCT info_hash FROM decision WHERE info_hash IS NOT NULL",
-    )?;
-    let missing = info_hashes
-        .iter()
-        .filter_map(|info_hash| {
-            InfoHash::new(info_hash.as_str()).and_then(|hash| {
-                (!torrent_cache_path(app_dir, &hash).exists()).then(|| info_hash.clone())
-            })
-        })
-        .collect::<Vec<_>>();
-    let valid_count = info_hashes
-        .iter()
-        .filter(|info_hash| InfoHash::new(info_hash.as_str()).is_some())
-        .count();
-    if valid_count > 0 && missing.len() == valid_count {
+    let mut valid_count = 0usize;
+    let mut missing_count = 0usize;
+    for_each_decision_info_hash(database, |info_hash| {
+        if let Some(hash) = InfoHash::new(info_hash) {
+            valid_count = valid_count.saturating_add(1);
+            if !torrent_cache_path(app_dir, &hash).exists() {
+                missing_count = missing_count.saturating_add(1);
+            }
+        }
+        Ok(())
+    })?;
+
+    if valid_count > 0 && missing_count == valid_count {
         return Ok(MissingCacheDecisionCleanup {
             removed: 0,
             catastrophic_skipped: true,
@@ -915,12 +938,17 @@ fn prune_missing_cache_decisions(
     }
 
     let mut removed = 0usize;
-    for info_hash in missing {
-        removed += database
-            .connection()
-            .execute("DELETE FROM decision WHERE info_hash = ?1", [&info_hash])
-            .map_err(persistence_error)?;
-    }
+    for_each_decision_info_hash(database, |info_hash| {
+        if let Some(hash) = InfoHash::new(info_hash) {
+            if !torrent_cache_path(app_dir, &hash).exists() {
+                removed += database
+                    .connection()
+                    .execute("DELETE FROM decision WHERE info_hash = ?1", [info_hash])
+                    .map_err(persistence_error)?;
+            }
+        }
+        Ok(())
+    })?;
     Ok(MissingCacheDecisionCleanup {
         removed,
         catastrophic_skipped: false,
@@ -959,13 +987,19 @@ fn recent_decision_exists(
         .map_err(persistence_error)
 }
 
-fn string_column(database: &Database, sql: &str) -> crate::Result<Vec<String>> {
+fn rowid_path_page(
+    database: &Database,
+    sql: &str,
+    after_rowid: i64,
+) -> crate::Result<Vec<(i64, String)>> {
     let mut statement = database
         .connection()
         .prepare(sql)
         .map_err(persistence_error)?;
     let rows = statement
-        .query_map([], |row| row.get(0))
+        .query_map([after_rowid, CLEANUP_DB_PAGE_SIZE], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .map_err(persistence_error)?;
     let mut output = Vec::new();
     for row in rows {
@@ -974,19 +1008,42 @@ fn string_column(database: &Database, sql: &str) -> crate::Result<Vec<String>> {
     Ok(output)
 }
 
-fn rowid_path_rows(database: &Database, sql: &str) -> crate::Result<Vec<(i64, String)>> {
-    let mut statement = database
-        .connection()
-        .prepare(sql)
-        .map_err(persistence_error)?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(persistence_error)?;
-    let mut output = Vec::new();
-    for row in rows {
-        output.push(row.map_err(persistence_error)?);
+fn for_each_decision_info_hash<F>(database: &Database, mut handle: F) -> crate::Result<()>
+where
+    F: FnMut(&str) -> crate::Result<()>,
+{
+    let mut after_info_hash: Option<String> = None;
+    loop {
+        let mut statement = database
+            .connection()
+            .prepare(
+                "SELECT DISTINCT info_hash
+                 FROM decision
+                 WHERE info_hash IS NOT NULL
+                 AND (?1 IS NULL OR info_hash > ?1)
+                 ORDER BY info_hash
+                 LIMIT ?2",
+            )
+            .map_err(persistence_error)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![after_info_hash.as_deref(), CLEANUP_DB_PAGE_SIZE],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(persistence_error)?;
+        let mut page = Vec::new();
+        for row in rows {
+            page.push(row.map_err(persistence_error)?);
+        }
+        let Some(last) = page.last() else {
+            break;
+        };
+        after_info_hash = Some(last.clone());
+        for info_hash in page {
+            handle(&info_hash)?;
+        }
     }
-    Ok(output)
+    Ok(())
 }
 
 fn cache_info_hash(path: &Path) -> Option<String> {
