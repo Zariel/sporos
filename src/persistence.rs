@@ -14,7 +14,7 @@ use crate::{
 };
 
 const DATABASE_FILE_NAME: &str = "cross-seed.db";
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;";
 
 #[derive(Debug, Clone, Copy)]
@@ -23,10 +23,16 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: CURRENT_SCHEMA_VERSION,
-    sql: SCHEMA,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: SCHEMA,
+    },
+    Migration {
+        version: CURRENT_SCHEMA_VERSION,
+        sql: ENSEMBLE_UNIQUE_KEY_MIGRATION,
+    },
+];
 
 /// SQLite database handle with compatibility schema helpers.
 pub struct Database {
@@ -356,14 +362,33 @@ impl Database {
 
     /// Insert or update one ensemble row.
     pub fn upsert_ensemble(&self, record: &EnsembleRecord<'_>) -> crate::Result<()> {
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE ensemble
+                 SET info_hash = ?3, ensemble = ?4, element = ?5
+                 WHERE path = ?2
+                 AND (
+                    client_host = ?1
+                    OR (client_host IS NULL AND ?1 IS NULL)
+                 )",
+                params![
+                    record.client_host,
+                    record.path,
+                    record.info_hash,
+                    record.ensemble,
+                    record.element,
+                ],
+            )
+            .map_err(sql_error)?;
+        if updated > 0 {
+            return Ok(());
+        }
+
         self.connection
             .execute(
                 "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(client_host, path) DO UPDATE SET
-                    info_hash = excluded.info_hash,
-                    ensemble = excluded.ensemble,
-                    element = excluded.element",
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     record.client_host,
                     record.path,
@@ -576,6 +601,25 @@ CREATE TABLE IF NOT EXISTS ensemble (
 );
 CREATE INDEX IF NOT EXISTS idx_ensemble_path ON ensemble(path);
 CREATE INDEX IF NOT EXISTS idx_ensemble_info_hash ON ensemble(info_hash);
+"#;
+
+const ENSEMBLE_UNIQUE_KEY_MIGRATION: &str = r#"
+DELETE FROM ensemble
+WHERE client_host IS NULL
+AND rowid NOT IN (
+    SELECT MAX(rowid)
+    FROM ensemble
+    WHERE client_host IS NULL
+    GROUP BY path
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ensemble_data_path_key
+ON ensemble(path)
+WHERE client_host IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ensemble_client_path_key
+ON ensemble(client_host, path)
+WHERE client_host IS NOT NULL;
 "#;
 
 fn collect_rows<T>(
@@ -795,6 +839,106 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ensemble", [], |row| row.get(0))
             .expect("ensemble count");
         assert_eq!(ensemble_count, 0);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upserts_data_dir_ensemble_rows_with_null_client_host() {
+        let root = temp_path("ensemble-null-client");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+
+        database
+            .upsert_ensemble(&EnsembleRecord {
+                client_host: None,
+                path: "/data/show/file.mkv",
+                info_hash: None,
+                ensemble: "old show s01",
+                element: "1",
+            })
+            .expect("ensemble");
+        database
+            .upsert_ensemble(&EnsembleRecord {
+                client_host: None,
+                path: "/data/show/file.mkv",
+                info_hash: Some("0123456789abcdef0123456789abcdef01234567"),
+                ensemble: "new show s01",
+                element: "2",
+            })
+            .expect("ensemble update");
+
+        let row: (i64, Option<String>, String, String) = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*), info_hash, ensemble, element FROM ensemble",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("ensemble row");
+        assert_eq!(
+            row,
+            (
+                1,
+                Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+                "new show s01".to_owned(),
+                "2".to_owned()
+            )
+        );
+
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_deduplicates_null_client_ensemble_keys() {
+        let root = temp_path("ensemble-null-client-migration");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database_path = Database::path_for_app_dir(&root);
+        let connection = rusqlite::Connection::open(&database_path).expect("raw database");
+        connection.execute_batch(super::SCHEMA).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
+                 VALUES (NULL, '/data/show/file.mkv', NULL, 'old show s01', '1');
+                 INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
+                 VALUES (
+                    NULL,
+                    '/data/show/file.mkv',
+                    '0123456789abcdef0123456789abcdef01234567',
+                    'new show s01',
+                    '2'
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .expect("legacy duplicate rows");
+        drop(connection);
+
+        let database = Database::open(&database_path).expect("migrated database");
+
+        let row: (i64, Option<String>, String, String) = database
+            .connection()
+            .query_row(
+                "SELECT COUNT(*), info_hash, ensemble, element FROM ensemble",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("ensemble row");
+        assert_eq!(
+            row,
+            (
+                1,
+                Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+                "new show s01".to_owned(),
+                "2".to_owned()
+            )
+        );
+
+        let duplicate = database.connection().execute(
+            "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
+             VALUES (NULL, '/data/show/file.mkv', NULL, 'duplicate show s01', '3')",
+            [],
+        );
+        duplicate.expect_err("duplicate null-client ensemble key");
+
         let _cleanup = fs::remove_dir_all(root);
     }
 
