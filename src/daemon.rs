@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -419,7 +419,12 @@ impl ApiHandlers for RuntimeHandlers<'_> {
         )
     }
 
-    fn webhook(&mut self, _request: WebhookRequest) -> crate::Result<()> {
+    fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {
+        tracing::info!(
+            info_hash = request.info_hash.as_deref().unwrap_or_default(),
+            path = request.path.as_deref().unwrap_or_default(),
+            "received webhook request"
+        );
         if self
             .scheduler
             .jobs()
@@ -435,6 +440,13 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 .scheduler
                 .check_jobs(self.database, self.now_millis, false)?;
         }
+        let app_dir = PathBuf::from(self.app_dir);
+        let config = self.config.clone();
+        thread::spawn(move || {
+            if let Err(error) = run_webhook_worker(&app_dir, &config, request) {
+                tracing::error!("webhook targeted search failed: {error}");
+            }
+        });
         Ok(())
     }
 
@@ -455,6 +467,28 @@ impl ApiHandlers for RuntimeHandlers<'_> {
         }
         Ok(response)
     }
+}
+
+fn run_webhook_worker(
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    request: WebhookRequest,
+) -> crate::Result<()> {
+    let database = Database::open_app_dir(app_dir)?;
+    let notifier = crate::notifications::NotificationSender::from_config(
+        config,
+        crate::startup::Redactor::from_config(config),
+    )?;
+    let summary =
+        crate::operations::run_webhook_search(&database, app_dir, config, request, &notifier)?;
+    tracing::info!(
+        searchees = summary.searchees_seen,
+        indexer_searches = summary.indexer_searches,
+        candidates = summary.candidates_assessed,
+        attempts = summary.attempts.len(),
+        "webhook targeted search completed"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

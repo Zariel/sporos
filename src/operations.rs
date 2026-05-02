@@ -15,7 +15,7 @@ use crate::{
         SavedInjectionSummary, inject_saved_torrents, perform_injection_action,
         restore_from_torrent_cache, save_candidate_torrent,
     },
-    api::ApiOutcome,
+    api::{ApiOutcome, WebhookRequest},
     clients::{TorrentClient, build_torrent_clients, client_torrent_to_searchee},
     config::{Action as ConfigAction, RuntimeConfig},
     domain::{ActionResult, Candidate, ClientLabel, InfoHash, Label},
@@ -31,7 +31,7 @@ use crate::{
         Blocklist, CandidateSearchCache, ContentFilterOptions, PipelineAction, PipelineSummary,
         ReverseLookupGate, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
         SearcheeSources, VirtualSeasonOptions, bulk_search, check_new_candidate_match,
-        check_new_candidate_matches, episode_ensemble, find_all_searchees,
+        check_new_candidate_matches, episode_ensemble, find_all_searchees, find_on_other_sites,
         find_searchable_searchees, for_each_data_dir_searchee,
     },
     torrent::{
@@ -427,6 +427,95 @@ pub fn run_announce_match(
     }))
 }
 
+/// Run one targeted webhook search from an info hash or filesystem path.
+pub fn run_webhook_search(
+    database: &Database,
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    request: WebhookRequest,
+    notifier: &NotificationSender,
+) -> crate::Result<PipelineSummary> {
+    let mut config = config.clone();
+    if request.include_single_episodes {
+        config.include_single_episodes = true;
+    }
+    if request.include_non_videos {
+        config.include_non_videos = true;
+    }
+    if request.ignore_exclude_recent_search {
+        config.exclude_recent_search = Some(1);
+    }
+    if request.ignore_exclude_older {
+        config.exclude_older = Some(u64::MAX);
+    }
+    if request.ignore_block_list {
+        config.block_list.clear();
+    }
+
+    sync_configured_indexers(database, &config)?;
+    index_torrents_and_data_dirs(database, &config)?;
+    let client_adapters = build_workflow_clients(&config)?;
+    let client_refs = client_refs(&client_adapters);
+    let client_searchees = collect_client_searchees(&config, &client_refs)?;
+    let blocklist = Blocklist::parse(&config.block_list)?;
+    let indexers = enabled_search_indexers(database, current_time_millis())?;
+    let arr_configs = build_arr_configs(&config)?;
+    let local = find_all_searchees(
+        &SearcheeSources {
+            torrents: config.torrents.as_deref(),
+            use_client_torrents: config.use_client_torrents,
+            client_searchees: &client_searchees,
+            torrent_dir: config.torrent_dir.as_deref(),
+            data_dirs: &config.data_dirs,
+            max_data_depth: config.max_data_depth,
+        },
+        Label::Webhook,
+    )?;
+    let targets = local
+        .into_iter()
+        .filter(|searchee| webhook_matches_request(searchee, &request))
+        .collect::<Vec<_>>();
+    let excluded = local_info_hashes(&targets);
+    let mut options =
+        search_pipeline_options(&config, &blocklist, &excluded, &arr_configs, Label::Webhook);
+    if request.ignore_cross_seeds {
+        options.filter.ignore_cross_seeds = false;
+    }
+    let injection = injection_options(&config, &client_refs);
+    let mut cache = CandidateSearchCache::default();
+    let mut summary = PipelineSummary::default();
+    for searchee in targets {
+        let mut runtime = SearchPipelineRuntime {
+            database,
+            app_dir,
+            options: &options,
+            cache: &mut cache,
+        };
+        let result = find_on_other_sites(
+            &mut runtime,
+            searchee,
+            &indexers,
+            |action| dispatch_pipeline_action(app_dir, &config, &injection, action),
+            |attempt| {
+                let _report = notifier.send_result(attempt);
+                Ok(())
+            },
+        )?;
+        summary.searchees_seen = summary.searchees_seen.saturating_add(result.searchees_seen);
+        summary.searchees_filtered = summary
+            .searchees_filtered
+            .saturating_add(result.searchees_filtered);
+        summary.indexer_searches = summary
+            .indexer_searches
+            .saturating_add(result.indexer_searches);
+        summary.candidates_assessed = summary
+            .candidates_assessed
+            .saturating_add(result.candidates_assessed);
+        summary.attempts.extend(result.attempts);
+    }
+    Ok(summary)
+}
+
 /// Run one saved torrent injection workflow.
 pub fn run_inject_workflow(
     database: &Database,
@@ -668,6 +757,23 @@ fn local_info_hashes(searchees: &[crate::domain::Searchee<'_>]) -> BTreeSet<Stri
         .filter_map(|searchee| searchee.info_hash.as_ref())
         .map(ToString::to_string)
         .collect()
+}
+
+fn webhook_matches_request(
+    searchee: &crate::domain::Searchee<'_>,
+    request: &WebhookRequest,
+) -> bool {
+    if let Some(info_hash) = request.info_hash.as_deref() {
+        return searchee
+            .info_hash
+            .as_ref()
+            .is_some_and(|local| local.as_str().eq_ignore_ascii_case(info_hash));
+    }
+    let Some(path) = request.path.as_deref() else {
+        return false;
+    };
+    searchee.path.as_deref() == Some(path)
+        || searchee.files.iter().any(|file| file.path.as_ref() == path)
 }
 
 fn search_pipeline_options<'a>(
@@ -1224,9 +1330,11 @@ fn replace_bencode_bytes_recursive(value: &mut Bencode<'_>, from: &[u8], to: &[u
 mod tests {
     use super::{
         api_key, cleanup_db, cleanup_db_with_clients, clear_cache, clear_client_cache,
-        clear_indexer_failures, reset_api_key, run_announce_match, update_torrent_cache_trackers,
+        clear_indexer_failures, reset_api_key, run_announce_match, run_webhook_search,
+        update_torrent_cache_trackers,
     };
     use crate::{
+        api::WebhookRequest,
         clients::{
             ClientErrorCode, ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent,
             ResumeOptions, TorrentClient,
@@ -1525,6 +1633,47 @@ mod tests {
 
         assert_eq!(outcome.decision, Decision::MatchSizeOnly);
         assert_eq!(outcome.action_result, None);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn webhook_search_targets_requested_path() {
+        let root = temp_path("webhook");
+        let release = root.join("Example.Show.S01E01");
+        fs::create_dir_all(&release).expect("release dir");
+        fs::write(release.join("Example.Show.S01E01.mkv"), b"video").expect("video");
+        let database = Database::open_app_dir(&root).expect("database");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                data_dirs: vec![release.clone()],
+                include_single_episodes: Some(false),
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let notifier = NotificationSender::new(Vec::new(), Redactor::default()).expect("notifier");
+
+        let summary = run_webhook_search(
+            &database,
+            &root,
+            &config,
+            WebhookRequest {
+                info_hash: None,
+                path: Some(release.display().to_string()),
+                ignore_cross_seeds: false,
+                ignore_exclude_recent_search: true,
+                ignore_exclude_older: true,
+                ignore_block_list: false,
+                include_single_episodes: true,
+                include_non_videos: false,
+            },
+            &notifier,
+        )
+        .expect("webhook search");
+
+        assert_eq!(summary.searchees_seen, 1);
+        assert_eq!(summary.indexer_searches, 0);
         let _cleanup = fs::remove_dir_all(root);
     }
 
