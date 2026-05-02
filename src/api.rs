@@ -318,6 +318,7 @@ fn normalize_body_value(key: &str, value: serde_json::Value) -> serde_json::Valu
 }
 
 fn parse_announce(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<AnnounceRequest> {
+    reject_unknown_fields(body, &["name", "guid", "link", "tracker", "cookie"])?;
     let name = required_string(body, "name")?;
     let guid = required_url(body, "guid")?;
     let link = required_url(body, "link")?;
@@ -336,6 +337,19 @@ fn parse_announce(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<A
 }
 
 fn parse_webhook(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<WebhookRequest> {
+    reject_unknown_fields(
+        body,
+        &[
+            "infoHash",
+            "path",
+            "ignoreCrossSeeds",
+            "ignoreExcludeRecentSearch",
+            "ignoreExcludeOlder",
+            "ignoreBlockList",
+            "includeSingleEpisodes",
+            "includeNonVideos",
+        ],
+    )?;
     let info_hash = optional_string(body, "infoHash");
     let path = optional_string(body, "path");
     if info_hash.is_some() == path.is_some() {
@@ -365,6 +379,10 @@ fn parse_webhook(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<We
 }
 
 fn parse_job(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<JobRequest> {
+    reject_unknown_fields(
+        body,
+        &["name", "ignoreExcludeRecentSearch", "ignoreExcludeOlder"],
+    )?;
     let name = optional_string(body, "name").unwrap_or_else(|| "search".to_owned());
     if !matches!(
         name.as_str(),
@@ -377,6 +395,18 @@ fn parse_job(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<JobReq
         ignore_exclude_recent_search: bool_field(body, "ignoreExcludeRecentSearch"),
         ignore_exclude_older: bool_field(body, "ignoreExcludeOlder"),
     })
+}
+
+fn reject_unknown_fields(
+    body: &BTreeMap<String, serde_json::Value>,
+    allowed: &[&str],
+) -> crate::Result<()> {
+    for key in body.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(api_error(format!("unknown request field: {key}")));
+        }
+    }
+    Ok(())
 }
 
 fn announce_response(outcome: Option<ApiOutcome>) -> ApiResponse {
@@ -576,6 +606,58 @@ mod tests {
         assert_eq!(response.status, 409);
         assert_eq!(response.body, "rss: already running");
         assert_eq!(handlers.jobs[0].name, "rss");
+    }
+
+    #[test]
+    fn api_rejects_unknown_request_fields() {
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Api-Key".to_owned(), "secret".to_owned());
+        let path = std::env::temp_dir().join("sporos-api-strict-path");
+        fs::write(&path, b"data").expect("path");
+        let mut handlers = TestHandlers::default();
+
+        let announce = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/announce",
+                headers.clone(),
+                r#"{"name":"Release","guid":"https://idx/t","link":"https://idx/t","tracker":"Tracker","unexpected":true}"#,
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .expect("announce");
+        let webhook = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/webhook",
+                headers.clone(),
+                format!(r#"{{"path":"{}","unexpected":true}}"#, path.display()),
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .expect("webhook");
+        let job = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/job",
+                headers,
+                r#"{"name":"rss","unexpected":true}"#,
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .expect("job");
+
+        assert_eq!(announce.status, 400);
+        assert_eq!(webhook.status, 400);
+        assert_eq!(job.status, 400);
+        assert!(announce.body.contains("unknown request field"));
+        assert!(handlers.announces.is_empty());
+        assert!(handlers.webhooks.is_empty());
+        assert!(handlers.jobs.is_empty());
+        let _cleanup = fs::remove_file(path);
     }
 
     #[derive(Debug)]
