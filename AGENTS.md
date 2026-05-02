@@ -138,7 +138,7 @@ All tests and clippy must pass with no warnings before the task is complete.
 
 ## Architecture Overview
 
-sporos is a Rust rebuild of the cross-seed behavior documented in
+sporos implements the torrent cross-seeding behavior documented in
 `docs/internal`. Treat those documents as the compatibility contract for CLI
 flags, config semantics, HTTP API behavior, SQLite state, torrent cache and
 output filenames, matching decisions, and torrent-client side effects.

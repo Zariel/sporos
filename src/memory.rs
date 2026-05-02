@@ -32,7 +32,7 @@ pub struct MemoryRegressionGate {
     pub max_active_items: usize,
 }
 
-/// Initial budgets for memory-sensitive rebuild paths.
+/// Initial budgets for memory-sensitive runtime paths.
 pub const COLLECTION_BUDGETS: &[CollectionBudget] = &[
     CollectionBudget {
         name: "client torrent inventory",

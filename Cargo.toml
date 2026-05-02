@@ -3,7 +3,7 @@ name = "sporos"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Rust compatibility rebuild of cross-seed behavior"
+description = "Torrent cross-seeding automation"
 license = "MIT"
 
 [dependencies]

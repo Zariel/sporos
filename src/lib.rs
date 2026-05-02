@@ -1,4 +1,4 @@
-//! Core library for the sporos Rust compatibility rebuild.
+//! Core library for sporos torrent cross-seeding automation.
 
 pub mod actions;
 pub mod api;

@@ -174,7 +174,7 @@ fn apply_notification_options(matches: &ArgMatches, raw_config: &mut crate::conf
 pub fn build_cli() -> Command {
     Command::new("cross-seed")
         .version(crate::VERSION)
-        .about("Rust compatibility rebuild of cross-seed behavior")
+        .about("Torrent cross-seeding automation")
         .subcommand_required(false)
         .arg_required_else_help(false)
         .subcommand(Command::new("gen-config"))

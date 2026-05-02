@@ -1,9 +1,8 @@
 # Rust Binary Release Checklist
 
 Use this checklist for the first Rust binary release and for every later tagged
-release. The binary is a compatibility rebuild, so release readiness means users
-can keep their existing config, state, cache, output directory, automation, and
-torrent-client side effects.
+release. Release readiness means users can keep their existing config, state,
+cache, output directory, automation, and torrent-client side effects.
 
 ## Build Environment
 
