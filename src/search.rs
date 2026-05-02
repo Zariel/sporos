@@ -6,8 +6,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
-    time::Duration,
-    time::UNIX_EPOCH,
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -350,6 +350,26 @@ pub struct PipelineSummary {
 #[derive(Debug, Default, Clone)]
 pub struct CandidateSearchCache {
     entries: BTreeMap<(String, i64), CachedCandidates>,
+    last_indexer_search: Option<Instant>,
+}
+
+impl CandidateSearchCache {
+    fn wait_for_indexer_delay(&mut self, delay: Duration) {
+        if delay.is_zero() {
+            return;
+        }
+        let Some(last_search) = self.last_indexer_search else {
+            return;
+        };
+        let remaining = delay.saturating_sub(last_search.elapsed());
+        if !remaining.is_zero() {
+            thread::sleep(remaining);
+        }
+    }
+
+    fn mark_indexer_search(&mut self) {
+        self.last_indexer_search = Some(Instant::now());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1907,12 +1927,15 @@ fn cached_or_search_candidates(
         return Ok(Vec::new());
     }
 
+    cache.wait_for_indexer_delay(request.options.torznab.delay);
     let candidates = search_torznab_indexer(
         request.database,
         request.indexer,
         &queries,
         request.options.torznab,
-    )?;
+    );
+    cache.mark_indexer_search();
+    let candidates = candidates?;
     summary.indexer_searches += 1;
     cache.entries.insert(
         cache_key,
@@ -2214,11 +2237,16 @@ mod tests {
         persistence::{Database, DecisionRecord},
     };
     use rusqlite::params;
-    use std::{borrow::Cow, collections::BTreeSet};
     use std::{
+        borrow::Cow,
+        collections::BTreeSet,
         fs,
+        io::{Read, Write},
+        net::TcpListener,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     #[test]
@@ -2804,6 +2832,69 @@ mod tests {
     }
 
     #[test]
+    fn bulk_search_waits_between_real_indexer_requests() {
+        let server = http_server(vec![
+            rss_response("<rss><channel></channel></rss>"),
+            rss_response("<rss><channel></channel></rss>"),
+        ]);
+        let root = temp_path("bulk-search-delay");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclude = BTreeSet::new();
+        let mut options = pipeline_options(&blocklist, &exclude, &root, Label::Search);
+        options.filter.include_single_episodes = true;
+        options.filter.include_non_videos = true;
+        options.torznab.delay = Duration::from_millis(20);
+        let indexer = SearchIndexer {
+            id: 7,
+            url: format!("{}/api", server.url),
+            apikey: "secret".to_owned(),
+            caps: TorznabCaps {
+                tv_search: true,
+                ..TorznabCaps::default()
+            },
+        };
+        database
+            .connection()
+            .execute(
+                "INSERT INTO indexer (id, url, apikey, active)
+                 VALUES (?1, ?2, ?3, 1)",
+                params![indexer.id, indexer.url, indexer.apikey],
+            )
+            .expect("indexer");
+        let searchees = vec![episode_searchee(1, 1_000), episode_searchee(2, 1_000)];
+        let mut cache = CandidateSearchCache::default();
+        let mut runtime = SearchPipelineRuntime {
+            database: &database,
+            app_dir: &root,
+            options: &options,
+            cache: &mut cache,
+        };
+
+        let summary = bulk_search(
+            &mut runtime,
+            &searchees,
+            &[indexer],
+            |_| Ok(None),
+            |_| Ok(()),
+        )
+        .expect("bulk search");
+
+        assert_eq!(summary.indexer_searches, 2);
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].raw.contains("/api?apikey=secret&t=tvsearch"));
+        assert!(
+            requests[1]
+                .accepted_at
+                .duration_since(requests[0].accepted_at)
+                >= options.torznab.delay
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn reverse_lookup_filters_sorts_and_stops_after_success() {
         let root = temp_path("reverse-pipeline");
         fs::create_dir_all(&root).expect("temp dir");
@@ -2962,5 +3053,63 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-search-{label}-{nanos}"))
+    }
+
+    fn rss_response(body: &str) -> String {
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n", body.len());
+        response.push_str("Content-Type: application/rss+xml\r\n\r\n");
+        response.push_str(body);
+        response
+    }
+
+    #[derive(Debug)]
+    struct TestRequest {
+        raw: String,
+        accepted_at: Instant,
+    }
+
+    struct TestServer {
+        url: String,
+        requests: Arc<Mutex<Vec<TestRequest>>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl TestServer {
+        fn join(self) -> Vec<TestRequest> {
+            self.handle.join().expect("server thread");
+            Arc::try_unwrap(self.requests)
+                .expect("requests still shared")
+                .into_inner()
+                .expect("requests lock")
+        }
+    }
+
+    fn http_server(responses: Vec<String>) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0; 4096];
+                let read = stream.read(&mut buffer).expect("read request");
+                server_requests
+                    .lock()
+                    .expect("requests lock")
+                    .push(TestRequest {
+                        raw: String::from_utf8_lossy(&buffer[..read]).into_owned(),
+                        accepted_at: Instant::now(),
+                    });
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        TestServer {
+            url,
+            requests,
+            handle,
+        }
     }
 }
