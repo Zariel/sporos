@@ -20,7 +20,8 @@ use crate::{
     domain::{ActionResult, ClientLabel, InfoHash, Label},
     integrations::{
         RssPagerOptions, SnatchOptions, TorznabSearchOptions, enabled_search_indexers,
-        query_rss_feeds, sync_torznab_indexers, validate_torznab_url,
+        fetch_torznab_caps, query_rss_feeds, sync_torznab_indexers, update_indexer_caps,
+        validate_torznab_url,
     },
     matching::AssessmentOptions,
     notifications::NotificationSender,
@@ -115,6 +116,15 @@ pub struct RssWorkflowResult {
     pub candidates: usize,
     /// Reverse-match attempts returned.
     pub attempts: usize,
+}
+
+/// Summary from refreshing configured indexer capabilities.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct IndexerCapsRefreshResult {
+    /// Configured indexers considered.
+    pub indexers: usize,
+    /// Capability rows successfully updated.
+    pub updated: usize,
 }
 
 /// Compact tree output for a parsed torrent.
@@ -401,6 +411,30 @@ pub fn run_restore_workflow(
     restore_from_torrent_cache(database, app_dir, &config.output_dir, |_| Ok(()))
 }
 
+/// Refresh capabilities for configured Torznab indexers.
+pub fn run_update_indexer_caps(
+    database: &Database,
+    config: &RuntimeConfig,
+) -> crate::Result<IndexerCapsRefreshResult> {
+    let configured = config
+        .torznab
+        .iter()
+        .map(|url| validate_torznab_url(url))
+        .collect::<crate::Result<Vec<_>>>()?;
+    sync_torznab_indexers(database, &configured)?;
+    let mut result = IndexerCapsRefreshResult {
+        indexers: configured.len(),
+        updated: 0,
+    };
+    for indexer in configured {
+        let caps = fetch_torznab_caps(&indexer)?;
+        let id = indexer_id(database, &indexer.url)?;
+        update_indexer_caps(database, id, &caps)?;
+        result.updated += 1;
+    }
+    Ok(result)
+}
+
 /// Replace tracker URLs inside cached torrent files.
 pub fn update_torrent_cache_trackers(
     app_dir: &Path,
@@ -485,6 +519,15 @@ fn sync_configured_indexers(database: &Database, config: &RuntimeConfig) -> crat
         .collect::<crate::Result<Vec<_>>>()?;
     sync_torznab_indexers(database, &configured)?;
     Ok(())
+}
+
+fn indexer_id(database: &Database, url: &str) -> crate::Result<i64> {
+    database
+        .connection()
+        .query_row("SELECT id FROM indexer WHERE url = ?1", [url], |row| {
+            row.get(0)
+        })
+        .map_err(persistence_error)
 }
 
 fn index_torrents_and_data_dirs(database: &Database, config: &RuntimeConfig) -> crate::Result<()> {
