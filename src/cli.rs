@@ -93,27 +93,8 @@ where
         }
         Some(("daemon", matches)) => {
             let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
-            apply_notification_options(matches, &mut raw_config);
-            if matches.get_flag("no-port") {
-                raw_config.port = Some(None);
-            } else if let Some(port) = matches.get_one::<u16>("port") {
-                raw_config.port = Some(Some(*port));
-            }
-            if let Some(host) = matches.get_one::<String>("host") {
-                raw_config.host = Some(host.parse().map_err(|error| {
-                    crate::SporosError::configuration(format!("invalid --host: {error}"))
-                })?);
-            }
-            if let Some(search_cadence) = matches.get_one::<String>("search-cadence") {
-                raw_config.search_cadence =
-                    Some(crate::config::parse_duration_millis(search_cadence)?);
-            }
-            if let Some(rss_cadence) = matches.get_one::<String>("rss-cadence") {
-                raw_config.rss_cadence = Some(crate::config::parse_duration_millis(rss_cadence)?);
-            }
-            if let Some(api_key) = matches.get_one::<String>("api-key") {
-                raw_config.api_key = Some(api_key.clone());
-            }
+            apply_shared_options(matches, &mut raw_config)?;
+            apply_daemon_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
             let database = Database::open_app_dir(&app_dir)?;
             let shutdown = crate::daemon::install_shutdown_handler()?;
@@ -128,7 +109,7 @@ where
         }
         Some(("test-notification", matches)) => {
             let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
-            apply_notification_options(matches, &mut raw_config);
+            apply_shared_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
             let redactor = crate::startup::Redactor::from_config(&config);
             let sender = crate::notifications::NotificationSender::from_config(&config, redactor)?;
@@ -138,8 +119,14 @@ where
                 report.succeeded, report.attempted
             );
         }
-        Some((command, _)) => {
-            let _raw_config = crate::config::load_file_raw_config(&app_dir)?;
+        Some((command, matches)) => {
+            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            apply_shared_options(matches, &mut raw_config)?;
+            match command {
+                "search" => apply_search_options(matches, &mut raw_config)?,
+                "inject" => apply_inject_options(matches, &mut raw_config),
+                _ => {}
+            }
             println!("sporos {} {}", crate::VERSION, command);
         }
         None => {
@@ -161,13 +148,199 @@ fn required_path(matches: &ArgMatches, name: &str) -> crate::Result<PathBuf> {
     Ok(Path::new(required_string(matches, name)?).to_owned())
 }
 
-fn apply_notification_options(matches: &ArgMatches, raw_config: &mut crate::config::RawConfig) {
-    if let Some(values) = matches.get_many::<String>("notification-webhook-urls") {
-        raw_config.notification_webhook_urls = values.cloned().collect();
+fn apply_shared_options(
+    matches: &ArgMatches,
+    raw_config: &mut crate::config::RawConfig,
+) -> crate::Result<()> {
+    if let Some(values) = string_values(matches, "torznab") {
+        raw_config.torznab = values;
     }
-    if let Some(value) = matches.get_one::<String>("notification-webhook-url") {
+    if matches.get_flag("use-client-torrents") {
+        raw_config.use_client_torrents = Some(true);
+    }
+    if let Some(values) = path_values(matches, "data-dirs") {
+        raw_config.data_dirs = values;
+    }
+    if let Some(value) = string_value(matches, "torrent-dir") {
+        raw_config.torrent_dir = Some(PathBuf::from(value));
+    }
+    if let Some(value) = string_value(matches, "match-mode") {
+        raw_config.match_mode = Some(value.clone());
+    }
+    if matches.get_flag("include-non-videos") {
+        raw_config.include_non_videos = Some(true);
+    }
+    if matches.get_flag("include-single-episodes") {
+        raw_config.include_single_episodes = Some(true);
+    }
+    if let Some(value) = string_value(matches, "season-from-episodes") {
+        raw_config.season_from_episodes = Some(parse_ratio(value, "season-from-episodes")?);
+    }
+    if let Some(value) = matches.get_one::<f64>("fuzzy-size-threshold") {
+        raw_config.fuzzy_size_threshold = Some(*value);
+    }
+    if let Some(value) = string_value(matches, "exclude-older") {
+        raw_config.exclude_older = Some(crate::config::parse_duration_millis(value)?);
+    }
+    if let Some(value) = string_value(matches, "exclude-recent-search") {
+        raw_config.exclude_recent_search = Some(crate::config::parse_duration_millis(value)?);
+    }
+    if let Some(value) = string_value(matches, "action") {
+        raw_config.action = Some(value.clone());
+    }
+    if let Some(value) = string_value(matches, "output-dir") {
+        raw_config.output_dir = Some(PathBuf::from(value));
+    }
+    if let Some(values) = string_values(matches, "torrent-clients") {
+        raw_config.torrent_clients = values;
+    }
+    if let Some(value) = string_value(matches, "qbittorrent-url") {
+        raw_config.deprecated.qbittorrent_url = Some(value.clone());
+    }
+    if let Some(value) = string_value(matches, "rtorrent-rpc-url") {
+        raw_config.deprecated.rtorrent_rpc_url = Some(value.clone());
+    }
+    if let Some(value) = string_value(matches, "transmission-rpc-url") {
+        raw_config.deprecated.transmission_rpc_url = Some(value.clone());
+    }
+    if let Some(value) = string_value(matches, "deluge-rpc-url") {
+        raw_config.deprecated.deluge_rpc_url = Some(value.clone());
+    }
+    if matches.get_flag("duplicate-categories") {
+        raw_config.duplicate_categories = Some(true);
+    }
+    if let Some(value) = string_value(matches, "link-category") {
+        raw_config.link_category = Some(value.clone());
+    }
+    if let Some(values) = path_values(matches, "link-dirs") {
+        raw_config.link_dirs = values;
+    }
+    if let Some(value) = string_value(matches, "link-dir") {
+        raw_config.deprecated.link_dir = Some(PathBuf::from(value));
+    }
+    if let Some(value) = string_value(matches, "link-type") {
+        raw_config.link_type = Some(value.clone());
+    }
+    if matches.get_flag("flat-linking") {
+        raw_config.flat_linking = Some(true);
+    }
+    if let Some(value) = matches.get_one::<u32>("max-data-depth") {
+        raw_config.max_data_depth = Some(*value);
+    }
+    if matches.get_flag("skip-recheck") {
+        raw_config.skip_recheck = Some(true);
+    }
+    if let Some(value) = matches.get_one::<u64>("auto-resume-max-download") {
+        raw_config.auto_resume_max_download = Some(*value);
+    }
+    if matches.get_flag("ignore-non-relevant-files-to-resume") {
+        raw_config.ignore_non_relevant_files_to_resume = Some(true);
+    }
+    if let Some(value) = matches.get_one::<u64>("delay") {
+        raw_config.delay = Some(*value);
+    }
+    if let Some(value) = string_value(matches, "snatch-timeout") {
+        raw_config.snatch_timeout = Some(crate::config::parse_duration_millis(value)?);
+    }
+    if let Some(value) = string_value(matches, "search-timeout") {
+        raw_config.search_timeout = Some(crate::config::parse_duration_millis(value)?);
+    }
+    if let Some(value) = matches.get_one::<u32>("search-limit") {
+        raw_config.search_limit = Some(*value);
+    }
+    if let Some(values) = string_values(matches, "notification-webhook-urls") {
+        raw_config.notification_webhook_urls = values;
+    }
+    if let Some(value) = string_value(matches, "notification-webhook-url") {
         raw_config.notification_webhook_urls = vec![value.clone()];
     }
+    if let Some(values) = string_values(matches, "block-list") {
+        raw_config.block_list = values;
+    }
+    if let Some(values) = string_values(matches, "sonarr") {
+        raw_config.sonarr = values;
+    }
+    if let Some(values) = string_values(matches, "radarr") {
+        raw_config.radarr = values;
+    }
+    if matches.get_flag("verbose") {
+        raw_config.verbose = Some(true);
+    }
+    Ok(())
+}
+
+fn apply_search_options(
+    matches: &ArgMatches,
+    raw_config: &mut crate::config::RawConfig,
+) -> crate::Result<()> {
+    if let Some(values) = path_values(matches, "torrents") {
+        raw_config.torrents = Some(values);
+    }
+    if matches.get_flag("no-exclude-older") {
+        raw_config.exclude_older = None;
+    }
+    if matches.get_flag("no-exclude-recent-search") {
+        raw_config.exclude_recent_search = None;
+    }
+    Ok(())
+}
+
+fn apply_inject_options(matches: &ArgMatches, raw_config: &mut crate::config::RawConfig) {
+    if let Some(value) = string_value(matches, "inject-dir") {
+        raw_config.inject_dir = Some(PathBuf::from(value));
+    }
+    if matches.get_flag("ignore-titles") {
+        raw_config.ignore_titles = Some(true);
+    }
+    if matches.get_flag("no-ignore-titles") {
+        raw_config.ignore_titles = Some(false);
+    }
+}
+
+fn apply_daemon_options(
+    matches: &ArgMatches,
+    raw_config: &mut crate::config::RawConfig,
+) -> crate::Result<()> {
+    if matches.get_flag("no-port") {
+        raw_config.port = Some(None);
+    } else if let Some(port) = matches.get_one::<u16>("port") {
+        raw_config.port = Some(Some(*port));
+    }
+    if let Some(host) = string_value(matches, "host") {
+        raw_config.host = Some(host.parse().map_err(|error| {
+            crate::SporosError::configuration(format!("invalid --host: {error}"))
+        })?);
+    }
+    if let Some(search_cadence) = string_value(matches, "search-cadence") {
+        raw_config.search_cadence = Some(crate::config::parse_duration_millis(search_cadence)?);
+    }
+    if let Some(rss_cadence) = string_value(matches, "rss-cadence") {
+        raw_config.rss_cadence = Some(crate::config::parse_duration_millis(rss_cadence)?);
+    }
+    if let Some(api_key) = string_value(matches, "api-key") {
+        raw_config.api_key = Some(api_key.clone());
+    }
+    Ok(())
+}
+
+fn string_value<'a>(matches: &'a ArgMatches, name: &str) -> Option<&'a String> {
+    matches.get_one::<String>(name)
+}
+
+fn string_values(matches: &ArgMatches, name: &str) -> Option<Vec<String>> {
+    matches
+        .get_many::<String>(name)
+        .map(|values| values.cloned().collect())
+}
+
+fn path_values(matches: &ArgMatches, name: &str) -> Option<Vec<PathBuf>> {
+    string_values(matches, name).map(|values| values.into_iter().map(PathBuf::from).collect())
+}
+
+fn parse_ratio(value: &str, name: &str) -> crate::Result<f64> {
+    value
+        .parse::<f64>()
+        .map_err(|error| SporosError::configuration(format!("invalid --{name}: {error}")))
 }
 
 /// Build the compatibility command tree.
@@ -422,7 +595,9 @@ fn repeating(name: &'static str, long: &'static str) -> Arg {
 
 #[cfg(test)]
 mod tests {
-    use super::build_cli;
+    use super::{apply_inject_options, apply_search_options, apply_shared_options, build_cli};
+    use crate::config::RawConfig;
+    use std::path::Path;
 
     #[test]
     fn exposes_documented_command_names() {
@@ -497,5 +672,143 @@ mod tests {
                 "--ignore-titles",
             ])
             .expect("inject command parses");
+    }
+
+    #[test]
+    fn applies_shared_cli_options_to_raw_config() {
+        let matches = build_cli()
+            .try_get_matches_from([
+                "cross-seed",
+                "search",
+                "--torznab",
+                "https://indexer.example/api",
+                "--use-client-torrents",
+                "--data-dirs",
+                "/data",
+                "--torrent-dir",
+                "/torrents",
+                "--match-mode",
+                "partial",
+                "--include-non-videos",
+                "--include-single-episodes",
+                "--season-from-episodes",
+                "0.5",
+                "--fuzzy-size-threshold",
+                "0.07",
+                "--exclude-older",
+                "2 days",
+                "--exclude-recent-search",
+                "12 hours",
+                "--action",
+                "inject",
+                "--output-dir",
+                "/output",
+                "--torrent-clients",
+                "qbittorrent:http://localhost:8080",
+                "--duplicate-categories",
+                "--link-category",
+                "cross-seed",
+                "--link-dirs",
+                "/links",
+                "--link-type",
+                "symlink",
+                "--flat-linking",
+                "--max-data-depth",
+                "3",
+                "--skip-recheck",
+                "--auto-resume-max-download",
+                "1024",
+                "--ignore-non-relevant-files-to-resume",
+                "--delay",
+                "60",
+                "--snatch-timeout",
+                "30s",
+                "--search-timeout",
+                "2 minutes",
+                "--search-limit",
+                "25",
+                "--notification-webhook-urls",
+                "https://notify.example/hook",
+                "--block-list",
+                "name:cam",
+                "--sonarr",
+                "http://sonarr.example/api?apikey=abc",
+                "--radarr",
+                "http://radarr.example/api?apikey=def",
+                "--verbose",
+                "--torrents",
+                "/tmp/example.torrent",
+                "--no-exclude-older",
+            ])
+            .expect("matches");
+        let (_, matches) = matches.subcommand().expect("subcommand");
+        let mut raw = RawConfig::default();
+
+        apply_shared_options(matches, &mut raw).expect("shared");
+        apply_search_options(matches, &mut raw).expect("search");
+
+        assert_eq!(raw.torznab, vec!["https://indexer.example/api"]);
+        assert_eq!(raw.use_client_torrents, Some(true));
+        assert_eq!(raw.data_dirs, vec![Path::new("/data")]);
+        assert_eq!(raw.torrent_dir.as_deref(), Some(Path::new("/torrents")));
+        assert_eq!(raw.match_mode.as_deref(), Some("partial"));
+        assert_eq!(raw.include_non_videos, Some(true));
+        assert_eq!(raw.include_single_episodes, Some(true));
+        assert_eq!(raw.season_from_episodes, Some(0.5));
+        assert_eq!(raw.fuzzy_size_threshold, Some(0.07));
+        assert_eq!(raw.exclude_older, None);
+        assert_eq!(raw.exclude_recent_search, Some(43_200_000));
+        assert_eq!(raw.action.as_deref(), Some("inject"));
+        assert_eq!(raw.output_dir.as_deref(), Some(Path::new("/output")));
+        assert_eq!(
+            raw.torrent_clients,
+            vec!["qbittorrent:http://localhost:8080"]
+        );
+        assert_eq!(raw.duplicate_categories, Some(true));
+        assert_eq!(raw.link_category.as_deref(), Some("cross-seed"));
+        assert_eq!(raw.link_dirs, vec![Path::new("/links")]);
+        assert_eq!(raw.link_type.as_deref(), Some("symlink"));
+        assert_eq!(raw.flat_linking, Some(true));
+        assert_eq!(raw.max_data_depth, Some(3));
+        assert_eq!(raw.skip_recheck, Some(true));
+        assert_eq!(raw.auto_resume_max_download, Some(1024));
+        assert_eq!(raw.ignore_non_relevant_files_to_resume, Some(true));
+        assert_eq!(raw.delay, Some(60));
+        assert_eq!(raw.snatch_timeout, Some(30_000));
+        assert_eq!(raw.search_timeout, Some(120_000));
+        assert_eq!(raw.search_limit, Some(25));
+        assert_eq!(
+            raw.notification_webhook_urls,
+            vec!["https://notify.example/hook"]
+        );
+        assert_eq!(raw.block_list, vec!["name:cam"]);
+        assert_eq!(raw.sonarr, vec!["http://sonarr.example/api?apikey=abc"]);
+        assert_eq!(raw.radarr, vec!["http://radarr.example/api?apikey=def"]);
+        assert_eq!(raw.verbose, Some(true));
+        assert_eq!(
+            raw.torrents.as_deref(),
+            Some([Path::new("/tmp/example.torrent").to_path_buf()].as_slice())
+        );
+    }
+
+    #[test]
+    fn applies_inject_cli_options_to_raw_config() {
+        let matches = build_cli()
+            .try_get_matches_from([
+                "cross-seed",
+                "inject",
+                "--inject-dir",
+                "/saved",
+                "--ignore-titles",
+            ])
+            .expect("matches");
+        let (_, matches) = matches.subcommand().expect("subcommand");
+        let mut raw = RawConfig::default();
+
+        apply_shared_options(matches, &mut raw).expect("shared");
+        apply_inject_options(matches, &mut raw);
+
+        assert_eq!(raw.inject_dir.as_deref(), Some(Path::new("/saved")));
+        assert_eq!(raw.ignore_titles, Some(true));
     }
 }
