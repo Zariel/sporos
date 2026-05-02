@@ -166,6 +166,18 @@ where
             continue;
         }
         summary.scanned += 1;
+        let filename_metadata = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(parse_metadata_from_filename);
+        let Some(filename_metadata) = filename_metadata else {
+            tracing::debug!(
+                "skipping saved torrent with unsupported filename: {}",
+                path.display()
+            );
+            summary.failed += 1;
+            continue;
+        };
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -182,21 +194,12 @@ where
                 continue;
             }
         };
-        let filename_metadata = path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .and_then(parse_metadata_from_filename);
         let Some((searchee, decision)) =
-            best_saved_match(&metafile, filename_metadata.as_ref(), searchees, options)
+            best_saved_match(&metafile, &filename_metadata, searchees, options)
         else {
             summary.failed += 1;
             continue;
         };
-        let tracker = filename_metadata
-            .as_ref()
-            .map(|metadata| metadata.tracker.as_ref())
-            .or_else(|| metafile.trackers.first().map(Cow::as_ref))
-            .unwrap_or("UnknownTracker");
         let result = perform_injection_action(
             &InjectionAction {
                 searchee,
@@ -204,7 +207,7 @@ where
                     metafile.name.as_ref(),
                     path.display().to_string(),
                     None::<String>,
-                    tracker,
+                    filename_metadata.tracker.as_ref(),
                 ),
                 metafile: &metafile,
                 bytes: &bytes,
@@ -375,7 +378,7 @@ fn candidate_exists_elsewhere(
 
 fn best_saved_match<'a>(
     metafile: &Metafile<'_>,
-    metadata: Option<&SavedTorrentMetadata<'_>>,
+    metadata: &SavedTorrentMetadata<'_>,
     searchees: &'a [Searchee<'static>],
     options: &SavedInjectionOptions<'_>,
 ) -> Option<(&'a Searchee<'static>, Decision)> {
@@ -383,16 +386,14 @@ fn best_saved_match<'a>(
         .iter()
         .filter(|searchee| {
             options.ignore_titles
-                || metadata.is_none_or(|metadata| {
-                    metadata
-                        .name
-                        .as_ref()
-                        .eq_ignore_ascii_case(searchee.title.as_ref())
-                        || metadata
-                            .name
-                            .as_ref()
-                            .eq_ignore_ascii_case(searchee.name.as_ref())
-                })
+                || metadata
+                    .name
+                    .as_ref()
+                    .eq_ignore_ascii_case(searchee.title.as_ref())
+                || metadata
+                    .name
+                    .as_ref()
+                    .eq_ignore_ascii_case(searchee.name.as_ref())
         })
         .filter_map(|searchee| {
             let assessment = assess_metafile(
@@ -1539,6 +1540,68 @@ mod tests {
         assert_eq!(summary.deleted, 1);
         assert!(!saved.path.exists());
         assert_eq!(client.calls.lock().expect("calls").clone(), vec!["inject"]);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saved_torrent_injection_keeps_unrecognized_torrent_files() {
+        let root = temp_path("saved-inject-arbitrary");
+        let input_dir = root.join("saved");
+        let data = root.join("data");
+        fs::create_dir_all(&input_dir).expect("input");
+        fs::create_dir_all(&data).expect("data");
+        fs::write(data.join("Candidate.Release"), b"video-data").expect("source");
+        let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
+        let arbitrary = input_dir.join("manual-upload.torrent");
+        fs::write(&arbitrary, &bytes).expect("arbitrary torrent");
+        let mut searchee = Searchee::from_files(
+            "Candidate.Release",
+            "Candidate.Release",
+            vec![File::new("Candidate.Release", 10)],
+        );
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+        let client = FakeClient::new("client");
+        let clients: [&dyn TorrentClient; 1] = [&client];
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let excluded = BTreeSet::new();
+        let assessment = AssessmentOptions {
+            match_mode: MatchMode::Strict,
+            fuzzy_size_threshold: 0.05,
+            season_from_episodes: 0.75,
+            include_single_episodes: true,
+            info_hashes_to_exclude: &excluded,
+            blocklist: &blocklist,
+        };
+        let injection = InjectionActionOptions {
+            clients: &clients,
+            output_dir: Some(&input_dir),
+            link_dirs: &[],
+            link_type: LinkType::Symlink,
+            flat_linking: false,
+            unwrap_symlinks: false,
+            skip_recheck: true,
+            category: None,
+            tags: vec![ClientLabel::new("cross-seed")],
+        };
+
+        let summary = inject_saved_torrents(
+            &SavedInjectionOptions {
+                input_dir: &input_dir,
+                injection: &injection,
+                assessment: &assessment,
+                ignore_titles: true,
+            },
+            &[searchee],
+            |_| Ok(()),
+        )
+        .expect("inject saved");
+
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.injected, 0);
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.failed, 1);
+        assert!(arbitrary.exists());
+        assert!(client.calls.lock().expect("calls").is_empty());
         let _cleanup = fs::remove_dir_all(root);
     }
 
