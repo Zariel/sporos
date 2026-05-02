@@ -22,8 +22,9 @@ use crate::{
         Searchee,
     },
     integrations::{
-        ArrConfig, SearchIndexer, SnatchHistory, SnatchOptions, TorznabSearchIds,
-        TorznabSearchOptions, create_torznab_search_queries, ids_for_torznab_caps, lookup_arr_ids,
+        ArrConfig, CategoryCaps, SearchIndexer, SnatchHistory, SnatchOptions, TorznabCaps,
+        TorznabQuery, TorznabSearchIds, TorznabSearchOptions, arr_search_cache_key,
+        create_torznab_search_queries, ids_for_torznab_caps, lookup_arr_ids,
         search_torznab_indexer, set_indexer_status,
     },
     matching::{Assessment, AssessmentOptions, CandidateAssessmentContext, assess_candidate},
@@ -555,13 +556,13 @@ where
         }
         let searchee_id = database
             .get_or_insert_searchee(searchee.title.as_ref(), options.torznab.now_millis as i64)?;
+        let group_key = search_group_key(searchee);
         let arr_lookup = lookup_arr_ids(options.arr_configs, searchee, options.arr_timeout)?;
         let arr_ids = arr_lookup.as_ref().map(|lookup| &lookup.ids);
         let ids_key = arr_lookup
             .as_ref()
-            .map(|lookup| lookup.cache_key.clone())
-            .unwrap_or_else(|| search_group_key(searchee));
-        let group_key = search_group_key(searchee);
+            .map(|lookup| arr_search_cache_key(&group_key, &lookup.ids))
+            .unwrap_or_else(|| group_key.clone());
 
         for indexer in indexers {
             if timestamp_excludes(
@@ -781,7 +782,67 @@ pub fn filter_duplicate_searchees(mut searchees: Vec<Searchee<'static>>) -> Vec<
 
 /// Build the lowercased search grouping key used for cached search reuse.
 pub fn search_group_key(searchee: &Searchee<'_>) -> String {
+    let caps = search_group_caps();
+    if let Some(query) = create_torznab_search_queries(searchee, &caps, None).first() {
+        let key = torznab_query_group_key(query);
+        if !key.is_empty() {
+            return key;
+        }
+    }
     normalized_query_key(searchee.title.as_ref())
+}
+
+fn search_group_caps() -> TorznabCaps {
+    TorznabCaps {
+        search: true,
+        tv_search: true,
+        movie_search: true,
+        music_search: true,
+        audio_search: true,
+        book_search: true,
+        tv_ids: Vec::new(),
+        movie_ids: Vec::new(),
+        categories: CategoryCaps {
+            movie: true,
+            tv: true,
+            anime: true,
+            xxx: true,
+            audio: true,
+            book: true,
+            additional: true,
+        },
+        limits: Default::default(),
+    }
+}
+
+fn torznab_query_group_key(query: &TorznabQuery) -> String {
+    let mut parts = Vec::new();
+    if let Some(query) = torznab_param(query, "q") {
+        let query = normalized_query_key(query);
+        if !query.is_empty() {
+            parts.push(query);
+        }
+    }
+    if let Some(season) = torznab_param(query, "season") {
+        let season = normalized_query_key(season);
+        if !season.is_empty() {
+            parts.push(format!("s{season}"));
+        }
+    }
+    if let Some(episode) = torznab_param(query, "ep") {
+        let episode = normalized_query_key(episode);
+        if !episode.is_empty() {
+            parts.push(format!("e{episode}"));
+        }
+    }
+    parts.join(".")
+}
+
+fn torznab_param<'a>(query: &'a TorznabQuery, name: &str) -> Option<&'a str> {
+    query
+        .params
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
 }
 
 /// Return true when timestamp history should skip this searchee/indexer.
@@ -2709,12 +2770,20 @@ mod tests {
         assert!(indexer_supports_media(MediaType::Episode, caps));
         assert!(!indexer_supports_media(MediaType::Movie, caps));
 
-        let searchee = Searchee::from_files(
+        let mut searchee = Searchee::from_files(
             "Example.Show.S01E02.1080p",
             "Example Show S01E02",
             vec![File::new("Example.Show.S01E02.mkv", 10)],
         );
-        assert_eq!(search_group_key(&searchee), "example.show.s01e02");
+        searchee.media_type = MediaType::Episode;
+        assert_eq!(search_group_key(&searchee), "example.show.s01.e02");
+        let mut decorated = Searchee::from_files(
+            "Example.Show.S01E02.1080p.WEB-DL",
+            "Example Show S01E02 1080p WEB-DL",
+            vec![File::new("Example.Show.S01E02.1080p.WEB-DL.mkv", 10)],
+        );
+        decorated.media_type = MediaType::Episode;
+        assert_eq!(search_group_key(&decorated), search_group_key(&searchee));
     }
 
     #[test]
