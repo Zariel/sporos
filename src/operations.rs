@@ -687,6 +687,9 @@ fn injection_options<'a>(
         flat_linking: config.flat_linking,
         unwrap_symlinks: false,
         skip_recheck: config.skip_recheck,
+        match_mode: config.match_mode,
+        auto_resume_max_download: config.auto_resume_max_download,
+        ignore_non_relevant_files_to_resume: config.ignore_non_relevant_files_to_resume,
         category: config.link_category.clone().map(ClientLabel::new),
         tags: Vec::new(),
     }

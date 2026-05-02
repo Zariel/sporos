@@ -14,7 +14,7 @@ use crate::{
         ClientErrorCode, DownloadDirOptions, InjectionOptions, NewTorrent, ResumeOptions,
         TorrentClient, ensure_writable,
     },
-    config::LinkType,
+    config::{LinkType, MatchMode},
     domain::{
         Candidate, ClientLabel, Decision, File, InjectionResult, Metafile, SaveResult, Searchee,
     },
@@ -86,6 +86,12 @@ pub struct InjectionActionOptions<'a> {
     pub unwrap_symlinks: bool,
     /// Skip client-side recheck.
     pub skip_recheck: bool,
+    /// Configured match mode for partial resume policy.
+    pub match_mode: MatchMode,
+    /// Maximum missing bytes allowed for automatic partial resume.
+    pub auto_resume_max_download: u64,
+    /// Allow resume policy to account for non-relevant missing files.
+    pub ignore_non_relevant_files_to_resume: bool,
     /// Category or label to apply during injection.
     pub category: Option<ClientLabel<'static>>,
     /// Tags or labels to apply during injection.
@@ -321,7 +327,7 @@ where
             client.resume_injection(
                 action.metafile,
                 action.decision,
-                ResumeOptions { check_once: true },
+                resume_options(action, options, true),
             )?;
         }
         return Ok(InjectionResult::AlreadyExists);
@@ -360,7 +366,7 @@ where
         client.resume_injection(
             action.metafile,
             action.decision,
-            ResumeOptions { check_once: true },
+            resume_options(action, options, true),
         )?;
     } else if action.searchee.info_hash.is_none() {
         save_for_retry(action, options, &mut notify_saved)?;
@@ -371,7 +377,7 @@ where
         client.resume_injection(
             action.metafile,
             action.decision,
-            ResumeOptions { check_once: true },
+            resume_options(action, options, true),
         )?;
     }
 
@@ -661,6 +667,39 @@ fn should_recheck(metafile: &Metafile<'_>, decision: Decision, skip_recheck: boo
     !skip_recheck
         || decision == Decision::MatchPartial
         || metafile.files.iter().any(is_video_disc_file)
+}
+
+fn resume_options(
+    action: &InjectionAction<'_>,
+    options: &InjectionActionOptions<'_>,
+    check_once: bool,
+) -> ResumeOptions {
+    ResumeOptions {
+        check_once,
+        max_remaining_bytes: max_remaining_bytes(
+            action.metafile,
+            action.decision,
+            options.match_mode,
+            options.auto_resume_max_download,
+        ),
+        ignore_non_relevant_files: options.ignore_non_relevant_files_to_resume,
+    }
+}
+
+fn max_remaining_bytes(
+    metafile: &Metafile<'_>,
+    decision: Decision,
+    match_mode: MatchMode,
+    auto_resume_max_download: u64,
+) -> u64 {
+    if decision == Decision::MatchPartial
+        && match_mode == MatchMode::Partial
+        && !metafile.files.iter().any(is_video_disc_file)
+    {
+        auto_resume_max_download
+    } else {
+        0
+    }
 }
 
 fn is_video_disc_file(file: &File<'_>) -> bool {
@@ -1556,6 +1595,9 @@ mod tests {
                 flat_linking: false,
                 unwrap_symlinks: false,
                 skip_recheck: false,
+                match_mode: MatchMode::Partial,
+                auto_resume_max_download: 0,
+                ignore_non_relevant_files_to_resume: false,
                 category: Some(ClientLabel::new("tv")),
                 tags: vec![ClientLabel::new("cross-seed")],
             },
@@ -1641,6 +1683,9 @@ mod tests {
                 flat_linking: false,
                 unwrap_symlinks: false,
                 skip_recheck: true,
+                match_mode: MatchMode::Strict,
+                auto_resume_max_download: 0,
+                ignore_non_relevant_files_to_resume: false,
                 category: None,
                 tags: Vec::new(),
             },
@@ -1678,6 +1723,80 @@ mod tests {
         assert!(!super::should_recheck(&exact, Decision::Match, true));
         assert!(super::should_recheck(&exact, Decision::MatchPartial, true));
         assert!(super::should_recheck(&disc, Decision::Match, true));
+    }
+
+    #[test]
+    fn partial_resume_waits_when_remaining_exceeds_policy() {
+        let root = temp_path("partial-resume-policy");
+        let data = root.join("data");
+        let link_dir = root.join("links");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::create_dir_all(&link_dir).expect("link dir");
+        fs::write(data.join("source.mkv"), b"video-data").expect("source");
+        let mut searchee = Searchee::from_files(
+            "Source.Release",
+            "Source.Release",
+            vec![File::new("source.mkv", 10)],
+        );
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+        let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let candidate = Candidate::new(
+            "Candidate.Release",
+            "guid",
+            Some("https://indexer.example/download"),
+            "Tracker",
+        );
+        let client = FakeClient::new("client").with_torrent(ClientTorrent {
+            info_hash: metafile.info_hash.clone().into_owned(),
+            name: Cow::Borrowed("Candidate.Release"),
+            files: metafile
+                .files
+                .iter()
+                .cloned()
+                .map(File::into_owned)
+                .collect(),
+            save_path: Cow::Borrowed("/downloads"),
+            category: None,
+            tags: Vec::new(),
+            trackers: Vec::new(),
+            complete: false,
+            checking: false,
+        });
+        let clients: [&dyn TorrentClient; 1] = [&client];
+
+        let result = perform_injection_action(
+            &InjectionAction {
+                searchee: &searchee,
+                candidate: &candidate,
+                metafile: &metafile,
+                bytes: &bytes,
+                decision: Decision::MatchPartial,
+            },
+            &InjectionActionOptions {
+                clients: &clients,
+                output_dir: None,
+                link_dirs: std::slice::from_ref(&link_dir),
+                link_type: LinkType::Symlink,
+                flat_linking: false,
+                unwrap_symlinks: false,
+                skip_recheck: true,
+                match_mode: MatchMode::Partial,
+                auto_resume_max_download: 0,
+                ignore_non_relevant_files_to_resume: false,
+                category: None,
+                tags: Vec::new(),
+            },
+            |_| Ok(()),
+        )
+        .expect("inject action");
+
+        assert_eq!(result, InjectionResult::Injected);
+        assert_eq!(
+            client.calls.lock().expect("calls").clone(),
+            vec!["inject", "recheck"]
+        );
+        let _cleanup = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1722,6 +1841,9 @@ mod tests {
                 flat_linking: false,
                 unwrap_symlinks: false,
                 skip_recheck: true,
+                match_mode: MatchMode::Strict,
+                auto_resume_max_download: 0,
+                ignore_non_relevant_files_to_resume: false,
                 category: None,
                 tags: Vec::new(),
             },
@@ -1784,6 +1906,9 @@ mod tests {
                 flat_linking: false,
                 unwrap_symlinks: false,
                 skip_recheck: true,
+                match_mode: MatchMode::Partial,
+                auto_resume_max_download: 0,
+                ignore_non_relevant_files_to_resume: false,
                 category: Some(ClientLabel::new("tv")),
                 tags: vec![ClientLabel::new("cross-seed")],
             },
@@ -1839,6 +1964,9 @@ mod tests {
             flat_linking: false,
             unwrap_symlinks: false,
             skip_recheck: true,
+            match_mode: MatchMode::Strict,
+            auto_resume_max_download: 0,
+            ignore_non_relevant_files_to_resume: false,
             category: None,
             tags: vec![ClientLabel::new("cross-seed")],
         };
@@ -1900,6 +2028,9 @@ mod tests {
             flat_linking: false,
             unwrap_symlinks: false,
             skip_recheck: true,
+            match_mode: MatchMode::Strict,
+            auto_resume_max_download: 0,
+            ignore_non_relevant_files_to_resume: false,
             category: None,
             tags: vec![ClientLabel::new("cross-seed")],
         };
@@ -1930,6 +2061,7 @@ mod tests {
         existing: bool,
         download_dir: Result<PathBuf, ClientErrorCode>,
         all_download_dirs: BTreeMap<String, PathBuf>,
+        all_torrents: Vec<ClientTorrent<'static>>,
         calls: Mutex<Vec<&'static str>>,
         last_options: Mutex<Option<InjectionOptions>>,
     }
@@ -1947,6 +2079,7 @@ mod tests {
                 existing: false,
                 download_dir: Ok(PathBuf::from("/downloads")),
                 all_download_dirs: BTreeMap::new(),
+                all_torrents: Vec::new(),
                 calls: Mutex::new(Vec::new()),
                 last_options: Mutex::new(None),
             }
@@ -1959,6 +2092,11 @@ mod tests {
 
         fn with_download_dir(mut self, info_hash: &str, path: PathBuf) -> Self {
             self.all_download_dirs.insert(info_hash.to_owned(), path);
+            self
+        }
+
+        fn with_torrent(mut self, torrent: ClientTorrent<'static>) -> Self {
+            self.all_torrents.push(torrent);
             self
         }
     }
@@ -1981,7 +2119,7 @@ mod tests {
         }
 
         fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
-            Ok(Vec::new())
+            Ok(self.all_torrents.clone())
         }
 
         fn get_download_dir(
@@ -2025,10 +2163,19 @@ mod tests {
 
         fn resume_injection(
             &self,
-            _metafile: &Metafile<'_>,
+            metafile: &Metafile<'_>,
             _decision: Decision,
-            _options: ResumeOptions,
+            options: ResumeOptions,
         ) -> crate::Result<()> {
+            let remaining = self
+                .all_torrents
+                .iter()
+                .find(|torrent| torrent.info_hash == metafile.info_hash)
+                .map(|torrent| if torrent.complete { 0 } else { metafile.length })
+                .unwrap_or(0);
+            if remaining > options.max_remaining_bytes {
+                return Ok(());
+            }
             self.calls
                 .lock()
                 .map_err(|_error| super::action_error("calls lock poisoned"))?

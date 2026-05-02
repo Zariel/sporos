@@ -1,6 +1,6 @@
 //! Torrent-client adapter boundary and client mutation operations.
 
-use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, thread, time::Duration};
 
 use quick_xml::{Reader, events::Event};
 use reqwest::blocking::multipart;
@@ -107,10 +107,24 @@ pub struct InjectionOptions {
 }
 
 /// Resume loop behavior shared by adapters.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ResumeOptions {
     /// Perform one check/resume pass instead of the full background loop.
     pub check_once: bool,
+    /// Maximum bytes still missing before the torrent may be resumed.
+    pub max_remaining_bytes: u64,
+    /// Allow resume policy to account for non-relevant missing files.
+    pub ignore_non_relevant_files: bool,
+}
+
+impl Default for ResumeOptions {
+    fn default() -> Self {
+        Self {
+            check_once: false,
+            max_remaining_bytes: u64::MAX,
+            ignore_non_relevant_files: false,
+        }
+    }
 }
 
 /// Torrent bytes ready to inject.
@@ -185,6 +199,16 @@ pub trait TorrentClient {
     /// Return known download directories keyed by info hash.
     fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>>;
 
+    /// Return bytes still missing for one torrent when the adapter can tell.
+    fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
+        for torrent in self.get_all_torrents()? {
+            if torrent.info_hash == metafile.info_hash {
+                return Ok(Some(if torrent.complete { 0 } else { metafile.length }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Add a candidate torrent to the client.
     fn inject(
         &self,
@@ -207,6 +231,46 @@ pub trait TorrentClient {
 
     /// Validate adapter-specific configuration.
     fn validate_config(&self) -> crate::Result<()>;
+}
+
+fn resume_with_policy<F>(
+    client: &dyn TorrentClient,
+    metafile: &Metafile<'_>,
+    options: ResumeOptions,
+    mut resume: F,
+) -> crate::Result<()>
+where
+    F: FnMut() -> crate::Result<()>,
+{
+    if options.max_remaining_bytes == u64::MAX && !options.check_once {
+        return resume();
+    }
+    let mut attempts = if options.check_once { 1 } else { 360 };
+    while attempts > 0 {
+        attempts -= 1;
+        if client.is_torrent_checking(&metafile.info_hash)? {
+            if attempts > 0 {
+                thread::sleep(Duration::from_secs(10));
+            }
+            continue;
+        }
+        if options.max_remaining_bytes == u64::MAX {
+            return resume();
+        }
+        let remaining = client.remaining_bytes(metafile)?.unwrap_or(0);
+        if remaining <= options.max_remaining_bytes {
+            return resume();
+        }
+        tracing::warn!(
+            info_hash = %metafile.info_hash,
+            remaining_bytes = remaining,
+            max_remaining_bytes = options.max_remaining_bytes,
+            ignore_non_relevant_files = options.ignore_non_relevant_files,
+            "torrent remains above auto-resume threshold"
+        );
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// qBittorrent Web API adapter.
@@ -552,13 +616,15 @@ impl TorrentClient for QbittorrentClient {
         &self,
         metafile: &Metafile<'_>,
         _decision: Decision,
-        _options: ResumeOptions,
+        options: ResumeOptions,
     ) -> crate::Result<()> {
-        self.post_hash_action(
-            "/api/v2/torrents/start",
-            "/api/v2/torrents/resume",
-            &metafile.info_hash,
-        )
+        resume_with_policy(self, metafile, options, || {
+            self.post_hash_action(
+                "/api/v2/torrents/start",
+                "/api/v2/torrents/resume",
+                &metafile.info_hash,
+            )
+        })
     }
 
     fn validate_config(&self) -> crate::Result<()> {
@@ -815,9 +881,11 @@ impl TorrentClient for TransmissionClient {
         &self,
         metafile: &Metafile<'_>,
         _decision: Decision,
-        _options: ResumeOptions,
+        options: ResumeOptions,
     ) -> crate::Result<()> {
-        self.torrent_action("torrent-start", &metafile.info_hash)
+        resume_with_policy(self, metafile, options, || {
+            self.torrent_action("torrent-start", &metafile.info_hash)
+        })
     }
 
     fn validate_config(&self) -> crate::Result<()> {
@@ -1125,9 +1193,11 @@ impl TorrentClient for DelugeClient {
         &self,
         metafile: &Metafile<'_>,
         _decision: Decision,
-        _options: ResumeOptions,
+        options: ResumeOptions,
     ) -> crate::Result<()> {
-        self.torrent_action("core.resume_torrent", &metafile.info_hash)
+        resume_with_policy(self, metafile, options, || {
+            self.torrent_action("core.resume_torrent", &metafile.info_hash)
+        })
     }
 
     fn validate_config(&self) -> crate::Result<()> {
@@ -1403,9 +1473,11 @@ impl TorrentClient for RtorrentClient {
         &self,
         metafile: &Metafile<'_>,
         _decision: Decision,
-        _options: ResumeOptions,
+        options: ResumeOptions,
     ) -> crate::Result<()> {
-        self.action("d.resume", &metafile.info_hash)
+        resume_with_policy(self, metafile, options, || {
+            self.action("d.resume", &metafile.info_hash)
+        })
     }
 
     fn validate_config(&self) -> crate::Result<()> {

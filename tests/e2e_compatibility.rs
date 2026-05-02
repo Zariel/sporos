@@ -116,6 +116,9 @@ fn save_link_inject_retry_and_restore_e2e_paths() {
         flat_linking: false,
         unwrap_symlinks: false,
         skip_recheck: false,
+        match_mode: MatchMode::Partial,
+        auto_resume_max_download: 0,
+        ignore_non_relevant_files_to_resume: false,
         category: Some(ClientLabel::new("tv")),
         tags: vec![ClientLabel::new("cross-seed")],
     };
