@@ -3,7 +3,8 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     thread,
     time::Duration,
 };
@@ -15,7 +16,7 @@ use url::Url;
 
 use crate::{
     SporosError,
-    config::TorrentClientConfig,
+    config::{RuntimeConfig, TorrentClientConfig},
     domain::{
         ClientLabel, ClientTorrentMetadata, Decision, File, InfoHash, InjectionResult, Metafile,
         Searchee, TorrentClientKind, TorrentClientMetadata,
@@ -285,6 +286,7 @@ pub struct QbittorrentClient {
     base_url: String,
     username: String,
     password: String,
+    torrent_dir: Option<PathBuf>,
     client: reqwest::blocking::Client,
 }
 
@@ -313,8 +315,15 @@ impl QbittorrentClient {
             base_url: url.to_string().trim_end_matches('/').to_owned(),
             username,
             password,
+            torrent_dir: None,
             client,
         })
+    }
+
+    /// Attach a configured qBittorrent torrent directory for startup validation.
+    pub fn with_torrent_dir(mut self, torrent_dir: Option<PathBuf>) -> Self {
+        self.torrent_dir = torrent_dir;
+        self
     }
 
     fn login(&self) -> crate::Result<()> {
@@ -641,7 +650,17 @@ impl TorrentClient for QbittorrentClient {
                 "qBittorrent version {version} is below 4.3.1"
             )));
         }
-        let _preferences = self.get_text("/api/v2/app/preferences")?;
+        let preferences = self.get_text("/api/v2/app/preferences")?;
+        let preferences = parse_qb_preferences(&preferences)?;
+        if let Some(torrent_dir) = &self.torrent_dir {
+            if qb_uses_sqlite_resume_data(&preferences) {
+                return Err(client_error(
+                    "qBittorrent torrent_dir cannot use SQLite resume-data mode",
+                ));
+            }
+            validate_qb_fastresume_dir(torrent_dir)?;
+        }
+        self.post_form("/api/v2/torrents/createTags", &[("tags", "cross-seed")])?;
         Ok(())
     }
 }
@@ -1551,14 +1570,24 @@ pub fn build_torrent_clients(
     configs: &[TorrentClientConfig],
     timeout: Option<Duration>,
 ) -> crate::Result<Vec<Box<dyn TorrentClient>>> {
+    build_torrent_clients_with_torrent_dir(configs, timeout, None)
+}
+
+/// Build configured torrent-client adapters with qBittorrent torrent_dir context.
+pub fn build_torrent_clients_with_torrent_dir(
+    configs: &[TorrentClientConfig],
+    timeout: Option<Duration>,
+    torrent_dir: Option<&Path>,
+) -> crate::Result<Vec<Box<dyn TorrentClient>>> {
     let identities = client_identities(configs)?;
     identities
         .into_iter()
         .map(|identity| {
             let client: Box<dyn TorrentClient> = match identity.metadata.kind {
-                TorrentClientKind::QBittorrent => {
-                    Box::new(QbittorrentClient::new(identity, timeout)?)
-                }
+                TorrentClientKind::QBittorrent => Box::new(
+                    QbittorrentClient::new(identity, timeout)?
+                        .with_torrent_dir(torrent_dir.map(Path::to_path_buf)),
+                ),
                 TorrentClientKind::RTorrent => Box::new(RtorrentClient::new(identity, timeout)?),
                 TorrentClientKind::Transmission => {
                     Box::new(TransmissionClient::new(identity, timeout)?)
@@ -1568,6 +1597,19 @@ pub fn build_torrent_clients(
             Ok(client)
         })
         .collect()
+}
+
+/// Validate configured torrent clients during full-runtime startup.
+pub fn validate_configured_torrent_clients(config: &RuntimeConfig) -> crate::Result<()> {
+    let clients = build_torrent_clients_with_torrent_dir(
+        &config.torrent_clients,
+        config.search_timeout.map(Duration::from_millis),
+        config.torrent_dir.as_deref(),
+    )?;
+    for client in clients {
+        client.validate_config()?;
+    }
+    Ok(())
 }
 
 /// Select the writable client that should receive an injection.
@@ -1687,6 +1729,58 @@ struct QbFileInfo {
 #[derive(Debug, serde::Deserialize)]
 struct QbTrackerInfo {
     url: String,
+}
+
+fn parse_qb_preferences(body: &str) -> crate::Result<serde_json::Value> {
+    serde_json::from_str(body).map_err(|error| {
+        client_error(format!(
+            "failed to parse qBittorrent preferences response: {error}"
+        ))
+    })
+}
+
+fn qb_uses_sqlite_resume_data(preferences: &serde_json::Value) -> bool {
+    let Some(value) = preferences.get("resume_data_storage_type") else {
+        return false;
+    };
+    value
+        .as_str()
+        .is_some_and(|value| value.to_ascii_lowercase().contains("sqlite"))
+        || value.as_i64() == Some(1)
+}
+
+fn validate_qb_fastresume_dir(torrent_dir: &Path) -> crate::Result<()> {
+    let mut saw_fastresume = false;
+    for entry in fs::read_dir(torrent_dir)
+        .map_err(|error| client_error(format!("failed to read torrent_dir: {error}")))?
+    {
+        let entry = entry
+            .map_err(|error| client_error(format!("failed to read torrent_dir entry: {error}")))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) == Some("fastresume") {
+            saw_fastresume = true;
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) == Some("torrent") {
+            let fastresume = path.with_extension("fastresume");
+            if !fastresume.is_file() {
+                return Err(client_error(format!(
+                    "qBittorrent torrent_dir entry {} is missing a .fastresume sidecar",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if saw_fastresume {
+        Ok(())
+    } else {
+        Err(client_error(
+            "qBittorrent torrent_dir requires .fastresume files",
+        ))
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2301,6 +2395,7 @@ mod tests {
     use std::{
         borrow::Cow,
         collections::BTreeMap,
+        fs,
         io::{Read, Write},
         net::TcpListener,
         path::PathBuf,
@@ -2423,6 +2518,8 @@ mod tests {
             http_response("200 OK", "v4.6.2"),
             http_response("200 OK", "Ok."),
             http_response("200 OK", r#"{"save_path":"/downloads"}"#),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", ""),
         ]);
         let client = qb_client(&server.url);
 
@@ -2444,6 +2541,64 @@ mod tests {
                 .iter()
                 .any(|request| request.contains("GET /api/v2/app/preferences "))
         );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("POST /api/v2/torrents/createTags "))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("tags=cross-seed"))
+        );
+    }
+
+    #[test]
+    fn qbittorrent_rejects_sqlite_resume_data_with_torrent_dir() {
+        let root = temp_path("qb-sqlite-resume");
+        fs::create_dir_all(&root).expect("torrent dir");
+        fs::write(
+            root.join("0123456789abcdef0123456789abcdef01234567.fastresume"),
+            b"",
+        )
+        .expect("fastresume");
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", "v5.0.0"),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", r#"{"resume_data_storage_type":"SQLite"}"#),
+        ]);
+        let client = qb_client(&server.url).with_torrent_dir(Some(root));
+
+        let error = client.validate_config().expect_err("sqlite rejected");
+
+        assert!(error.to_string().contains("SQLite resume-data mode"));
+        let _requests = server.join();
+    }
+
+    #[test]
+    fn qbittorrent_requires_fastresume_sidecars_with_torrent_dir() {
+        let root = temp_path("qb-fastresume-sidecar");
+        fs::create_dir_all(&root).expect("torrent dir");
+        fs::write(
+            root.join("0123456789abcdef0123456789abcdef01234567.torrent"),
+            b"",
+        )
+        .expect("torrent");
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", "v4.6.2"),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", r#"{"resume_data_storage_type":"Legacy"}"#),
+        ]);
+        let client = qb_client(&server.url).with_torrent_dir(Some(root));
+
+        let error = client.validate_config().expect_err("missing fastresume");
+
+        assert!(error.to_string().contains("missing a .fastresume sidecar"));
+        let _requests = server.join();
     }
 
     #[test]
@@ -3075,6 +3230,17 @@ mod tests {
             .next()
             .expect("identity");
         QbittorrentClient::new(identity, Some(Duration::from_secs(1))).expect("client")
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sporos-clients-{name}-{}-{nanos}",
+            std::process::id(),
+        ))
     }
 
     fn transmission_client(base_url: &str) -> TransmissionClient {

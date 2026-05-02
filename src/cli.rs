@@ -99,7 +99,7 @@ where
             let _runtime = crate::startup::full_runtime(
                 app_dir.clone(),
                 config.clone(),
-                &crate::startup::NoopStartupHooks,
+                &crate::startup::RuntimeStartupHooks,
             )?;
             let database = Database::open_app_dir(&app_dir)?;
             let shutdown = crate::daemon::install_shutdown_handler()?;
@@ -120,7 +120,7 @@ where
             let _runtime = crate::startup::full_runtime(
                 app_dir.clone(),
                 config.clone(),
-                &crate::startup::NoopStartupHooks,
+                &crate::startup::RuntimeStartupHooks,
             )?;
             let database = Database::open_app_dir(&app_dir)?;
             let notifier = crate::notifications::NotificationSender::from_config(
@@ -144,7 +144,7 @@ where
             let _runtime = crate::startup::full_runtime(
                 app_dir.clone(),
                 config.clone(),
-                &crate::startup::NoopStartupHooks,
+                &crate::startup::RuntimeStartupHooks,
             )?;
             let database = Database::open_app_dir(&app_dir)?;
             let notifier = crate::notifications::NotificationSender::from_config(
@@ -166,7 +166,7 @@ where
             let _runtime = crate::startup::full_runtime(
                 app_dir.clone(),
                 config.clone(),
-                &crate::startup::NoopStartupHooks,
+                &crate::startup::RuntimeStartupHooks,
             )?;
             let database = Database::open_app_dir(&app_dir)?;
             let result = crate::operations::run_inject_workflow(&database, &app_dir, &config)?;
@@ -182,7 +182,7 @@ where
             let _runtime = crate::startup::full_runtime(
                 app_dir.clone(),
                 config.clone(),
-                &crate::startup::NoopStartupHooks,
+                &crate::startup::RuntimeStartupHooks,
             )?;
             let database = Database::open_app_dir(&app_dir)?;
             let result = crate::operations::run_restore_workflow(&database, &app_dir, &config)?;
@@ -198,7 +198,7 @@ where
             let _runtime = crate::startup::full_runtime(
                 app_dir.clone(),
                 config.clone(),
-                &crate::startup::NoopStartupHooks,
+                &crate::startup::RuntimeStartupHooks,
             )?;
             let redactor = crate::startup::Redactor::from_config(&config);
             let sender = crate::notifications::NotificationSender::from_config(&config, redactor)?;

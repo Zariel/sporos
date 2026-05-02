@@ -118,6 +118,16 @@ pub struct NoopStartupHooks;
 
 impl StartupHooks for NoopStartupHooks {}
 
+/// Default hooks for full-runtime startup validation.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RuntimeStartupHooks;
+
+impl StartupHooks for RuntimeStartupHooks {
+    fn validate_clients(&self, config: &RuntimeConfig) -> crate::Result<()> {
+        crate::clients::validate_configured_torrent_clients(config)
+    }
+}
+
 /// Start minimal runtime resources.
 pub fn minimal_runtime(app_dir: PathBuf) -> RuntimeContext {
     RuntimeContext {
