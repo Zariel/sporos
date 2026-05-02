@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use regex::Regex;
 use serde::{Deserialize, Deserializer, de};
 
 use crate::SporosError;
@@ -619,6 +620,7 @@ impl RuntimeConfig {
                 "link_dirs, data_dirs, torrent_dir, and output_dir cannot be nested",
             ));
         }
+        validate_block_list(&self.block_list)?;
 
         Ok(())
     }
@@ -828,6 +830,72 @@ fn has_nested_paths(paths: impl Iterator<Item = PathBuf>) -> bool {
     false
 }
 
+fn validate_block_list(entries: &[String]) -> crate::Result<()> {
+    let mut size_below = None;
+    let mut size_above = None;
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (kind, value) = trimmed.split_once(':').ok_or_else(|| {
+            config_error(format!(
+                "invalid block_list entry {trimmed:?}: expected <type>:<value>"
+            ))
+        })?;
+        match kind {
+            "name" | "folder" | "category" | "tag" | "tracker" => {}
+            "name_regex" | "folder_regex" => {
+                Regex::new(value).map_err(|error| {
+                    config_error(format!(
+                        "invalid block_list {kind} entry {trimmed:?}: {error}"
+                    ))
+                })?;
+            }
+            "info_hash" => {
+                if crate::domain::InfoHash::new(value.to_ascii_lowercase()).is_none() {
+                    return Err(config_error(format!(
+                        "invalid block_list info_hash entry {trimmed:?}"
+                    )));
+                }
+            }
+            "size_below" => {
+                if size_below
+                    .replace(parse_blocklist_size(trimmed, value)?)
+                    .is_some()
+                {
+                    return Err(config_error("block_list allows only one size_below entry"));
+                }
+            }
+            "size_above" => {
+                if size_above
+                    .replace(parse_blocklist_size(trimmed, value)?)
+                    .is_some()
+                {
+                    return Err(config_error("block_list allows only one size_above entry"));
+                }
+            }
+            _ => {
+                return Err(config_error(format!(
+                    "invalid block_list entry type {kind:?}; use explicit snake_case blocklist types"
+                )));
+            }
+        }
+    }
+    if let (Some(below), Some(above)) = (size_below, size_above) {
+        if below > above {
+            return Err(config_error("block_list requires size_below <= size_above"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_blocklist_size(entry: &str, value: &str) -> crate::Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|error| config_error(format!("invalid block_list size entry {entry:?}: {error}")))
+}
+
 fn config_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::configuration(message)
 }
@@ -1013,5 +1081,52 @@ mod tests {
                 .expect_err("string integration entries are rejected");
 
         assert!(error.to_string().contains("failed to parse config.toml"));
+    }
+
+    #[test]
+    fn validates_blocklist_entries() {
+        let raw = RawConfig {
+            block_list: vec![
+                "name:blocked".to_owned(),
+                "name_regex:(?i)blocked".to_owned(),
+                "folder:/downloads".to_owned(),
+                "folder_regex:/downloads/.+".to_owned(),
+                "category:tv".to_owned(),
+                "tag:".to_owned(),
+                "tracker:tracker.example".to_owned(),
+                "info_hash:0123456789abcdef0123456789abcdef01234567".to_owned(),
+                "size_below:10".to_owned(),
+                "size_above:100".to_owned(),
+            ],
+            ..RawConfig::default()
+        };
+
+        let config = RuntimeConfig::normalize(raw, Path::new("/config")).expect("valid");
+
+        assert_eq!(config.block_list.len(), 10);
+    }
+
+    #[test]
+    fn rejects_legacy_blocklist_entries() {
+        let raw = RawConfig {
+            block_list: vec!["folderRegex:/downloads".to_owned()],
+            ..RawConfig::default()
+        };
+
+        let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
+
+        assert!(error.to_string().contains("invalid block_list entry type"));
+    }
+
+    #[test]
+    fn rejects_invalid_blocklist_size_bounds() {
+        let raw = RawConfig {
+            block_list: vec!["size_below:100".to_owned(), "size_above:10".to_owned()],
+            ..RawConfig::default()
+        };
+
+        let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
+
+        assert!(error.to_string().contains("size_below <= size_above"));
     }
 }

@@ -103,62 +103,85 @@ pub struct TorrentDirIndexResult {
     pub files_failed: usize,
 }
 
-/// Parsed blocklist with compatibility warnings for legacy entries.
+/// Parsed blocklist.
 #[derive(Debug)]
 pub struct Blocklist {
     rules: Vec<BlocklistRule>,
-    legacy_warnings: Vec<String>,
 }
 
 impl Blocklist {
     /// Parse configured blocklist strings.
     pub fn parse(entries: &[String]) -> crate::Result<Self> {
         let mut rules = Vec::with_capacity(entries.len());
-        let mut legacy_warnings = Vec::new();
+        let mut size_below = None;
+        let mut size_above = None;
         for entry in entries {
             let trimmed = entry.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let rule = if let Some(value) = trimmed.strip_prefix("regex:") {
+            let (kind, value) = trimmed.split_once(':').ok_or_else(|| {
+                search_error(format!(
+                    "invalid block_list entry {trimmed:?}: expected <type>:<value>"
+                ))
+            })?;
+            let rule = if kind == "name_regex" {
                 BlocklistRule::NameRegex(Regex::new(value).map_err(|error| {
                     search_error(format!(
-                        "invalid blockList regex entry {trimmed:?}: {error}"
+                        "invalid block_list name_regex entry {trimmed:?}: {error}"
                     ))
                 })?)
-            } else if let Some(value) = trimmed.strip_prefix("folderRegex:") {
+            } else if kind == "folder_regex" {
                 BlocklistRule::FolderRegex(Regex::new(value).map_err(|error| {
                     search_error(format!(
-                        "invalid blockList folderRegex entry {trimmed:?}: {error}"
+                        "invalid block_list folder_regex entry {trimmed:?}: {error}"
                     ))
                 })?)
-            } else if let Some(value) = trimmed.strip_prefix("name:") {
+            } else if kind == "name" {
                 BlocklistRule::NameContains(value.to_ascii_lowercase())
-            } else if let Some(value) = trimmed.strip_prefix("category:") {
+            } else if kind == "category" {
                 BlocklistRule::Category(value.to_ascii_lowercase())
-            } else if let Some(value) = trimmed.strip_prefix("tag:") {
+            } else if kind == "tag" {
                 BlocklistRule::Tag(value.to_ascii_lowercase())
-            } else if let Some(value) = trimmed.strip_prefix("tracker:") {
+            } else if kind == "tracker" {
                 BlocklistRule::Tracker(value.to_ascii_lowercase())
-            } else if let Some(value) = trimmed.strip_prefix("folder:") {
+            } else if kind == "folder" {
                 BlocklistRule::FolderContains(value.to_ascii_lowercase())
+            } else if kind == "info_hash" {
+                let info_hash = crate::domain::InfoHash::new(value.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        search_error(format!("invalid block_list info_hash entry {trimmed:?}"))
+                    })?;
+                BlocklistRule::InfoHash(info_hash.to_string())
+            } else if kind == "size_below" {
+                if size_below
+                    .replace(parse_blocklist_size(trimmed, value)?)
+                    .is_some()
+                {
+                    return Err(search_error("block_list allows only one size_below entry"));
+                }
+                BlocklistRule::SizeBelow(size_below.unwrap_or_default())
+            } else if kind == "size_above" {
+                if size_above
+                    .replace(parse_blocklist_size(trimmed, value)?)
+                    .is_some()
+                {
+                    return Err(search_error("block_list allows only one size_above entry"));
+                }
+                BlocklistRule::SizeAbove(size_above.unwrap_or_default())
             } else {
-                legacy_warnings.push(format!(
-                    "legacy blockList entry {trimmed:?} matches release names; prefer name: or regex:"
-                ));
-                BlocklistRule::NameContains(trimmed.to_ascii_lowercase())
+                return Err(search_error(format!(
+                    "invalid block_list entry type {kind:?}; use explicit snake_case blocklist types"
+                )));
             };
             rules.push(rule);
         }
-        Ok(Self {
-            rules,
-            legacy_warnings,
-        })
-    }
-
-    /// Warnings emitted for legacy untyped entries.
-    pub fn legacy_warnings(&self) -> &[String] {
-        &self.legacy_warnings
+        if let (Some(below), Some(above)) = (size_below, size_above) {
+            if below > above {
+                return Err(search_error("block_list requires size_below <= size_above"));
+            }
+        }
+        Ok(Self { rules })
     }
 
     /// Whether any rule matches a searchee.
@@ -176,6 +199,9 @@ enum BlocklistRule {
     Tracker(String),
     FolderContains(String),
     FolderRegex(Regex),
+    InfoHash(String),
+    SizeBelow(u64),
+    SizeAbove(u64),
 }
 
 impl BlocklistRule {
@@ -194,16 +220,20 @@ impl BlocklistRule {
                 .and_then(|client| client.category.as_ref())
                 .is_some_and(|category| eq_ignore_case(category.as_str(), value)),
             Self::Tag(value) => searchee.client.as_ref().is_some_and(|client| {
-                client
-                    .tags
-                    .iter()
-                    .any(|tag| eq_ignore_case(tag.as_str(), value))
+                if value.is_empty() {
+                    client.tags.is_empty()
+                } else {
+                    client
+                        .tags
+                        .iter()
+                        .any(|tag| eq_ignore_case(tag.as_str(), value))
+                }
             }),
             Self::Tracker(value) => searchee.client.as_ref().is_some_and(|client| {
                 client
                     .trackers
                     .iter()
-                    .any(|tracker| contains_ignore_case(tracker.as_ref(), value))
+                    .any(|tracker| eq_ignore_case(tracker.as_ref(), value))
             }),
             Self::FolderContains(value) => searchee
                 .path
@@ -213,8 +243,20 @@ impl BlocklistRule {
                 .path
                 .as_ref()
                 .is_some_and(|path| regex.is_match(path.as_ref())),
+            Self::InfoHash(value) => searchee
+                .info_hash
+                .as_ref()
+                .is_some_and(|info_hash| info_hash.as_str().eq_ignore_ascii_case(value)),
+            Self::SizeBelow(value) => searchee.length < *value,
+            Self::SizeAbove(value) => searchee.length > *value,
         }
     }
+}
+
+fn parse_blocklist_size(entry: &str, value: &str) -> crate::Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|error| search_error(format!("invalid block_list size entry {entry:?}: {error}")))
 }
 
 /// Content filter options for search, webhook, RSS, and announce flows.
@@ -2903,12 +2945,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_typed_blocklist_entries_and_legacy_warnings() {
+    fn parses_typed_blocklist_entries() {
         let blocklist = Blocklist::parse(&[
             "name:bad.release".to_owned(),
-            "regex:(?i)evil".to_owned(),
+            "name_regex:(?i)evil".to_owned(),
             "category:blocked".to_owned(),
-            "legacy".to_owned(),
+            "tag:".to_owned(),
+            "tracker:tracker.example".to_owned(),
+            "folder_regex:/downloads".to_owned(),
+            "info_hash:0123456789abcdef0123456789abcdef01234567".to_owned(),
+            "size_below:20".to_owned(),
         ])
         .expect("blocklist");
         let mut searchee = Searchee::from_files("Good", "Good", vec![File::new("Good.mkv", 10)]);
@@ -2917,11 +2963,29 @@ mod tests {
             "/downloads",
             Some(ClientLabel::new("blocked")),
             Vec::new(),
-            Vec::new(),
+            vec!["tracker.example".into()],
         ));
+        searchee.path = Some("/downloads/Good".into());
+        searchee.info_hash =
+            crate::domain::InfoHash::new("0123456789abcdef0123456789abcdef01234567");
 
         assert!(blocklist.matches_searchee(&searchee));
-        assert_eq!(blocklist.legacy_warnings().len(), 1);
+    }
+
+    #[test]
+    fn rejects_legacy_blocklist_entries() {
+        let error = Blocklist::parse(&["folderRegex:/downloads".to_owned()])
+            .expect_err("legacy entry rejected");
+
+        assert!(error.to_string().contains("invalid block_list entry type"));
+    }
+
+    #[test]
+    fn validates_blocklist_size_pair() {
+        let error = Blocklist::parse(&["size_below:20".to_owned(), "size_above:10".to_owned()])
+            .expect_err("inverted size range rejected");
+
+        assert!(error.to_string().contains("size_below <= size_above"));
     }
 
     #[test]

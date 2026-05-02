@@ -81,7 +81,7 @@ mod tests {
         assert_eq!(parsed.media_type, MediaType::Episode);
         assert_eq!(parsed.resolution.as_deref(), Some("1080p"));
 
-        let blocklist = Blocklist::parse(&["regex:WEB-DL".to_owned()]).expect("blocklist");
+        let blocklist = Blocklist::parse(&["name_regex:WEB-DL".to_owned()]).expect("blocklist");
         let searchee = Searchee::from_files(
             "Example.Show.S01E02.1080p.WEB-DL-GRP",
             parsed.title,
