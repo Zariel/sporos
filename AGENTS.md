@@ -199,6 +199,10 @@ Use strong domain types for config, torrent metadata, decisions, client state,
 and persisted rows. Keep external DTOs separate from internal models when doing
 so prevents invalid states or accidental contract drift.
 
+Keep names concise. Function, helper, variable, test, fixture, and module names
+should identify the concept or behavior without restating what is already obvious
+from the type signature, assertions, or surrounding module context.
+
 Public and cross-module types should implement the common traits that make them
 easy to inspect and test, such as `Debug`, `Clone`, `Eq`, `PartialEq`, `Hash`,
 `Display`, and `Default` when those traits are semantically correct. Validate
