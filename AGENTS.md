@@ -130,24 +130,23 @@ CI enforces the same cargo gate order.
 
 All tests and clippy must pass with no warnings before the task is complete.
 
-```bash
-# Example:
-# npm install
-# npm test
-```
-
 ## Architecture Overview
 
 sporos implements the torrent cross-seeding behavior documented in
-`docs/internal`. Treat those documents as the compatibility contract for CLI
-flags, config semantics, HTTP API behavior, SQLite state, torrent cache and
-output filenames, matching decisions, and torrent-client side effects.
+`docs/internal`. Treat those documents as the functional and API contract for
+CLI flags, TOML config semantics, HTTP API behavior, torrent cache and output
+filenames, matching decisions, scheduler behavior, and torrent-client side
+effects. Exact JavaScript configuration and Node SQLite persistence
+compatibility are not design goals. Do not add migration or import support for
+cross-seed JavaScript/ESM config files; this is a green-room TOML
+configuration design.
 
 ## Conventions & Patterns
 
 ### Rust design
 Preserve user-visible behavior before improving internals. When behavior is
-unclear, add a compatibility test from `docs/internal` before changing it.
+unclear, add a functional/API compatibility test from `docs/internal` before
+changing it.
 
 Memory efficiency is a primary design goal. The baseline scale is 10,000
 torrents in a client, and the design should expect to handle 100,000. Any path
