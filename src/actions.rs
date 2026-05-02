@@ -909,7 +909,8 @@ fn create_link(source: &Path, destination: &Path, link_type: LinkType) -> crate:
     match link_type {
         LinkType::Hardlink => fs::hard_link(source, destination),
         LinkType::Symlink => symlink_file(source, destination),
-        LinkType::Reflink | LinkType::ReflinkOrCopy => fs::copy(source, destination).map(|_| ()),
+        LinkType::Reflink => reflink_copy::reflink(source, destination),
+        LinkType::ReflinkOrCopy => reflink_copy::reflink_or_copy(source, destination).map(|_| ()),
     }
     .map_err(|error| action_error(format!("failed to link file: {error}")))
 }
