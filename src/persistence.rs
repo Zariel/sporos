@@ -14,6 +14,19 @@ use crate::{
 };
 
 const DATABASE_FILE_NAME: &str = "cross-seed.db";
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;";
+
+#[derive(Debug, Clone, Copy)]
+struct Migration {
+    version: i64,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: CURRENT_SCHEMA_VERSION,
+    sql: SCHEMA,
+}];
 
 /// SQLite database handle with compatibility schema helpers.
 pub struct Database {
@@ -40,10 +53,36 @@ impl Database {
         &self.connection
     }
 
-    /// Create schema objects and set SQLite pragmas.
+    /// Run pending Rust schema migrations and set SQLite pragmas.
     pub fn initialize(&self) -> crate::Result<()> {
-        self.connection.execute_batch(SCHEMA).map_err(sql_error)?;
+        self.connection.execute_batch(PRAGMAS).map_err(sql_error)?;
+        let current_version = self.schema_version()?;
+        if current_version > CURRENT_SCHEMA_VERSION {
+            return Err(persistence_message(format!(
+                "database schema version {current_version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
+            )));
+        }
+        for migration in MIGRATIONS {
+            if migration.version > current_version {
+                self.connection
+                    .execute_batch(migration.sql)
+                    .map_err(sql_error)?;
+                self.set_schema_version(migration.version)?;
+            }
+        }
         Ok(())
+    }
+
+    fn schema_version(&self) -> crate::Result<i64> {
+        self.connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(sql_error)
+    }
+
+    fn set_schema_version(&self, version: i64) -> crate::Result<()> {
+        self.connection
+            .execute_batch(&format!("PRAGMA user_version = {version}"))
+            .map_err(sql_error)
     }
 
     /// Insert a searchee name if needed and return its stable id.
@@ -611,6 +650,11 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .expect("journal mode");
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        let user_version: i64 = database
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(user_version, super::CURRENT_SCHEMA_VERSION);
 
         for table in [
             "searchee",
