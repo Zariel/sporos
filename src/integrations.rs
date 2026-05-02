@@ -514,28 +514,51 @@ pub fn snatch_once(
     let client = builder
         .build()
         .map_err(|error| integration_error(format!("failed to build HTTP client: {error}")))?;
-    let mut request = client.get(link);
-    if let Some(cookie) = candidate.cookie.as_deref() {
-        request = request.header(reqwest::header::COOKIE, cookie);
-    }
-    let response = match request.send() {
-        Ok(response) => response,
-        Err(error) if error.is_timeout() || error.is_connect() => return Ok(SnatchResult::Aborted),
-        Err(error) => {
-            return Err(integration_error(format!(
-                "failed to snatch torrent: {error}"
-            )));
+    let mut current_link = link.to_owned();
+    let mut response = None;
+    for _ in 0..10 {
+        let mut request = client.get(&current_link);
+        if let Some(cookie) = candidate.cookie.as_deref() {
+            request = request.header(reqwest::header::COOKIE, cookie);
         }
-    };
-    if response.status().is_redirection()
-        && response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|location| location.starts_with("magnet:"))
-    {
-        return Ok(SnatchResult::MagnetLink);
+        let next = match request.send() {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() || error.is_connect() => {
+                return Ok(SnatchResult::Aborted);
+            }
+            Err(error) => {
+                return Err(integration_error(format!(
+                    "failed to snatch torrent: {error}"
+                )));
+            }
+        };
+        if next.status().is_redirection() {
+            let Some(location) = next
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                response = Some(next);
+                break;
+            };
+            if location.starts_with("magnet:") {
+                return Ok(SnatchResult::MagnetLink);
+            }
+            current_link = next
+                .url()
+                .join(location)
+                .map_err(|error| integration_error(format!("invalid redirect URL: {error}")))?
+                .to_string();
+            continue;
+        }
+        response = Some(next);
+        break;
     }
+    let Some(response) = response else {
+        return Ok(SnatchResult::UnknownError {
+            retry_after_millis: None,
+        });
+    };
     let retry_after = response
         .headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -2546,6 +2569,28 @@ mod tests {
             SnatchResult::MagnetLink
         );
         redirect.join();
+
+        let redirected_torrent = torrent_bytes("Redirected.Download", 10);
+        let http_redirect = http_server(vec![
+            http_response("302 Found", &[("Location", "/download")], ""),
+            torrent_response(&redirected_torrent),
+        ]);
+        let http_redirect_candidate = Candidate::new(
+            "Redirected.Download",
+            "http-redirect-guid",
+            Some(http_redirect.url.clone()),
+            "tracker",
+        );
+        let result =
+            snatch_once(&http_redirect_candidate, Some(Duration::from_secs(1))).expect("redirect");
+        assert!(matches!(result, SnatchResult::Metafile { .. }));
+        if let SnatchResult::Metafile { metafile, bytes } = result {
+            assert_eq!(bytes, redirected_torrent);
+            assert_eq!(metafile.name, "Redirected.Download");
+        }
+        let requests = http_redirect.join();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /download "));
 
         let limited = http_server(vec![http_response(
             "429 Too Many Requests",
