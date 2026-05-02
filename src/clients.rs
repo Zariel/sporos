@@ -461,6 +461,19 @@ impl TorrentClient for QbittorrentClient {
         Ok(())
     }
 
+    fn get_client_searchees(&self) -> crate::Result<ClientSearcheeResult> {
+        let mut result = ClientSearcheeResult::default();
+        let metadata = self.metadata().clone().into_owned();
+        self.for_each_torrent(&mut |torrent| {
+            match client_torrent_to_searchee(&metadata, torrent) {
+                Some(searchee) => result.searchees.push(searchee),
+                None => result.skipped += 1,
+            }
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
     fn get_download_dir(
         &self,
         metafile: &Metafile<'_>,
@@ -2418,6 +2431,48 @@ mod tests {
                 .filter(|request| request.contains("GET /api/v2/torrents/files?hash="))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn qbittorrent_client_searchees_use_paged_inventory() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads","progress":1.0,"state":"uploading"}}]"#
+                ),
+            ),
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                r#"[{"name":"Example.Show.S01E01.mkv","size":123}]"#,
+            ),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", r#"[]"#),
+        ]);
+        let client = qb_client(&server.url);
+
+        let result = client.get_client_searchees().expect("searchees");
+
+        assert_eq!(result.searchees.len(), 1);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(
+            result.searchees[0].info_hash.as_ref().map(InfoHash::as_str),
+            Some(hash)
+        );
+        let requests = server.join();
+        assert!(
+            requests.iter().any(|request| {
+                request.contains("GET /api/v2/torrents/info?offset=0&limit=1000 ")
+            })
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("GET /api/v2/torrents/info "))
         );
     }
 
