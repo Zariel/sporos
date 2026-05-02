@@ -275,7 +275,8 @@ where
         ));
     };
 
-    if candidate_exists_elsewhere(options.clients, action.metafile)? {
+    let candidate_exists = candidate_exists_elsewhere(options.clients, action.metafile)?;
+    if candidate_exists && options.link_dirs.is_empty() {
         return Ok(InjectionResult::AlreadyExists);
     }
 
@@ -311,6 +312,18 @@ where
                 unwrap_symlinks: options.unwrap_symlinks,
             },
         )?;
+    }
+
+    if candidate_exists {
+        if linked.linked > 0 {
+            client.recheck_torrent(&action.metafile.info_hash)?;
+            client.resume_injection(
+                action.metafile,
+                action.decision,
+                ResumeOptions { check_once: true },
+            )?;
+        }
+        return Ok(InjectionResult::AlreadyExists);
     }
 
     let should_recheck = should_recheck(action.metafile, action.decision, options.skip_recheck);
@@ -1479,6 +1492,66 @@ mod tests {
                 .len(),
             1
         );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_injection_repairs_missing_links_and_rechecks() {
+        let root = temp_path("inject-existing-links");
+        let data = root.join("data");
+        let link_dir = root.join("links");
+        let output_dir = root.join("out");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::write(data.join("source.mkv"), b"video-data").expect("source");
+        let mut searchee = Searchee::from_files(
+            "Source.Release",
+            "Source.Release",
+            vec![File::new("source.mkv", 10)],
+        );
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+        let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let candidate = Candidate::new(
+            "Candidate.Release",
+            "guid",
+            Some("https://indexer.example/download"),
+            "Tracker/One",
+        );
+        let mut client = FakeClient::new("client");
+        client.existing = true;
+        let clients: [&dyn TorrentClient; 1] = [&client];
+
+        let result = perform_injection_action(
+            &InjectionAction {
+                searchee: &searchee,
+                candidate: &candidate,
+                metafile: &metafile,
+                bytes: &bytes,
+                decision: Decision::MatchPartial,
+            },
+            &InjectionActionOptions {
+                clients: &clients,
+                output_dir: Some(&output_dir),
+                link_dirs: std::slice::from_ref(&link_dir),
+                link_type: LinkType::Symlink,
+                flat_linking: false,
+                unwrap_symlinks: false,
+                skip_recheck: true,
+                category: Some(ClientLabel::new("tv")),
+                tags: vec![ClientLabel::new("cross-seed")],
+            },
+            |_| Ok(()),
+        )
+        .expect("inject action");
+
+        assert_eq!(result, InjectionResult::AlreadyExists);
+        assert!(link_dir.join("Tracker_One/Candidate.Release").exists());
+        assert_eq!(
+            client.calls.lock().expect("calls").clone(),
+            vec!["recheck", "resume"]
+        );
+        assert!(client.last_options.lock().expect("options").is_none());
+        assert!(!output_dir.exists());
         let _cleanup = fs::remove_dir_all(root);
     }
 
