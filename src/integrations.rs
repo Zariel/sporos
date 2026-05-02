@@ -563,8 +563,7 @@ pub fn snatch_once(
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(parse_retry_after_seconds)
-        .map(|seconds| seconds.saturating_mul(1000));
+        .and_then(|value| parse_retry_after_delay_millis(value, current_time_millis()));
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Ok(SnatchResult::RateLimited {
             retry_after_millis: retry_after,
@@ -1578,8 +1577,8 @@ fn retry_after_millis(
     headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(parse_retry_after_seconds)
-        .map(|seconds| now_millis.saturating_add(seconds.saturating_mul(1000)))
+        .and_then(|value| parse_retry_after_delay_millis(value, now_millis))
+        .map(|delay| now_millis.saturating_add(delay))
         .unwrap_or_else(|| {
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 now_millis.saturating_add(duration_millis(Duration::from_secs(60 * 60)))
@@ -1846,8 +1845,11 @@ fn tracker_torrent_id(link: &str) -> Option<String> {
     (!id.is_empty()).then(|| (*id).to_owned())
 }
 
-fn parse_retry_after_seconds(value: &str) -> Option<u64> {
-    value.trim().parse().ok()
+fn parse_retry_after_delay_millis(value: &str, now_millis: u64) -> Option<u64> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+    parse_rss_pub_date(value).map(|retry_at| retry_at.saturating_sub(now_millis))
 }
 
 fn retry_after_duration(result: &SnatchResult) -> Option<Duration> {
@@ -1904,10 +1906,10 @@ mod tests {
         SnatchOptions, SnatchResult, TorznabCaps, TorznabQuery, TorznabSearchIds,
         TorznabSearchOptions, arr_search_cache_key, cache_torrent_file,
         create_torznab_search_queries, enabled_indexers, get_cached_torrent, guid_lookup,
-        ids_for_torznab_caps, lookup_arr_ids, parse_torznab_caps, parse_torznab_rss, rss_pager,
-        search_torznab_indexer, set_indexer_status, snatch, snatch_once, sync_torznab_indexers,
-        torznab_request_url, update_indexer_caps, validate_arr_instance, validate_arr_url,
-        validate_torznab_url,
+        ids_for_torznab_caps, lookup_arr_ids, parse_retry_after_delay_millis, parse_torznab_caps,
+        parse_torznab_rss, rss_pager, search_torznab_indexer, set_indexer_status, snatch,
+        snatch_once, sync_torznab_indexers, torznab_request_url, update_indexer_caps,
+        validate_arr_instance, validate_arr_url, validate_torznab_url,
     };
     use crate::{
         domain::{Candidate, Decision, File, MediaType, Searchee},
@@ -2127,6 +2129,19 @@ mod tests {
         assert_eq!(candidates[0].tracker, "TrackerOne");
         assert_eq!(candidates[0].indexer_id, Some(42));
         assert_eq!(candidates[1].tracker, "UnknownTracker");
+    }
+
+    #[test]
+    fn parses_retry_after_seconds_and_http_dates() {
+        assert_eq!(parse_retry_after_delay_millis("2", 1_000), Some(2_000));
+        assert_eq!(
+            parse_retry_after_delay_millis("Thu, 01 Jan 1970 00:00:04 GMT", 1_000),
+            Some(3_000)
+        );
+        assert_eq!(
+            parse_retry_after_delay_millis("Thu, 01 Jan 1970 00:00:00 GMT", 1_000),
+            Some(0)
+        );
     }
 
     #[test]
