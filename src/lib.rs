@@ -47,9 +47,12 @@ mod tests {
 
     #[test]
     fn errors_keep_user_facing_context() {
-        let error = SporosError::configuration("missing config.js");
+        let error = SporosError::configuration("missing config.toml");
 
-        assert_eq!(error.to_string(), "configuration error: missing config.js");
+        assert_eq!(
+            error.to_string(),
+            "configuration error: missing config.toml"
+        );
     }
 
     #[test]

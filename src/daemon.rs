@@ -291,7 +291,7 @@ fn index_torrents_and_data_dirs(config: &RuntimeConfig, database: &Database) -> 
             torrents_indexed = result.torrents_indexed,
             torrents_removed = result.torrents_removed,
             files_failed = result.files_failed,
-            "indexed torrentDir"
+            "indexed torrent_dir"
         );
     }
 
@@ -308,7 +308,7 @@ fn index_torrents_and_data_dirs(config: &RuntimeConfig, database: &Database) -> 
         tracing::info!(
             roots_indexed = searchees.len(),
             roots_removed = removed,
-            "indexed dataDirs"
+            "indexed data_dirs"
         );
     }
     Ok(())

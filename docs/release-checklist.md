@@ -36,11 +36,11 @@ expected version and command surface before publishing.
 
 Before replacing a Node deployment, back up:
 
-- `config.js`;
+- `config.toml`;
 - `cross-seed.db`, `cross-seed.db-wal`, and `cross-seed.db-shm`;
 - `torrent_cache/`;
-- configured `outputDir`;
-- configured `injectDir` or any saved retry `.torrent` files.
+- configured `output_dir`;
+- configured `inject_dir` or any saved retry `.torrent` files.
 
 The first tagged Rust release is the SQLite migration cutoff. Before that tag,
 the Rust schema is still unreleased and direct bootstrap compatibility tests are
@@ -50,12 +50,12 @@ release is tagged.
 
 The upgrade must preserve:
 
-- config option names, defaults, deprecated aliases, and validation behavior;
+- config option names, defaults, and validation behavior;
 - persisted API keys, indexer caps/health, RSS cursors, search timestamps,
   decisions, client searchee cache, data-dir roots, and ensemble rows;
 - cached torrents named `<infoHash>.cached.torrent`;
 - saved and restored output filenames;
-- retryable saved torrents in `injectDir` or `outputDir`.
+- retryable saved torrents in `inject_dir` or `output_dir`.
 
 ## Operational Smoke Tests
 
@@ -104,7 +104,7 @@ If the Rust binary fails during an upgrade:
 2. Preserve the failed run's logs, generated output, and saved retry torrents.
 3. Restore the previous binary or Node deployment.
 4. Restore the backed-up SQLite files if the Rust binary opened the database.
-5. Restore `torrent_cache/`, `outputDir`, and `injectDir` only when the failed
+5. Restore `torrent_cache/`, `output_dir`, and `inject_dir` only when the failed
    run modified or deleted files unexpectedly.
 6. Re-run `api-key`, `restore`, and a read-only `daemon --no-port` smoke test
    before returning to normal scheduled jobs.

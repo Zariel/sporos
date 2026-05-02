@@ -113,9 +113,9 @@ pub struct WebhookRequest {
     pub path: Option<String>,
     /// Ignore cross-seed filtering.
     pub ignore_cross_seeds: bool,
-    /// Override excludeRecentSearch.
+    /// Override exclude_recent_search.
     pub ignore_exclude_recent_search: bool,
-    /// Override excludeOlder.
+    /// Override exclude_older.
     pub ignore_exclude_older: bool,
     /// Disable blocklist.
     pub ignore_block_list: bool,
@@ -130,9 +130,9 @@ pub struct WebhookRequest {
 pub struct JobRequest {
     /// Job name.
     pub name: String,
-    /// Override excludeRecentSearch.
+    /// Override exclude_recent_search.
     pub ignore_exclude_recent_search: bool,
-    /// Override excludeOlder.
+    /// Override exclude_older.
     pub ignore_exclude_older: bool,
 }
 

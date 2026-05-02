@@ -2,16 +2,17 @@
 
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
     env, fs,
     net::IpAddr,
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Deserializer, de};
+
 use crate::SporosError;
 
 const APP_DIR_NAME: &str = "cross-seed";
-const CONFIG_FILE_NAME: &str = "config.js";
+const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_DELAY_SECONDS: u64 = 30;
 const DEFAULT_PORT: u16 = 2468;
 const DEFAULT_MAX_DATA_DEPTH: u32 = 2;
@@ -36,7 +37,7 @@ impl MatchMode {
             "strict" | "safe" => Ok(Self::Strict),
             "flexible" | "risky" => Ok(Self::Flexible),
             "partial" => Ok(Self::Partial),
-            _ => Err(config_error(format!("invalid matchMode: {value}"))),
+            _ => Err(config_error(format!("invalid match_mode: {value}"))),
         }
     }
 }
@@ -44,7 +45,7 @@ impl MatchMode {
 /// Action mode for matched candidates.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Action {
-    /// Save matched torrents to `outputDir`.
+    /// Save matched torrents to `output_dir`.
     Save,
     /// Inject matched torrents into a client.
     Inject,
@@ -81,8 +82,8 @@ impl LinkType {
             "symlink" => Ok(Self::Symlink),
             "hardlink" => Ok(Self::Hardlink),
             "reflink" => Ok(Self::Reflink),
-            "reflinkOrCopy" => Ok(Self::ReflinkOrCopy),
-            _ => Err(config_error(format!("invalid linkType: {value}"))),
+            "reflink_or_copy" => Ok(Self::ReflinkOrCopy),
+            _ => Err(config_error(format!("invalid link_type: {value}"))),
         }
     }
 }
@@ -132,7 +133,8 @@ impl TorrentClientConfig {
 }
 
 /// Deprecated config fields that map into current options.
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DeprecatedConfig {
     /// Deprecated singular link dir.
     pub link_dir: Option<PathBuf>,
@@ -149,7 +151,8 @@ pub struct DeprecatedConfig {
 }
 
 /// Raw options before defaults and cross-option validation.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
     /// Delay in seconds.
     pub delay: Option<u64>,
@@ -192,10 +195,13 @@ pub struct RawConfig {
     /// Fuzzy size threshold.
     pub fuzzy_size_threshold: Option<f64>,
     /// Season from episodes ratio.
+    #[serde(deserialize_with = "deserialize_optional_ratio")]
     pub season_from_episodes: Option<f64>,
     /// Exclude older duration in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
     pub exclude_older: Option<u64>,
     /// Exclude recent search duration in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
     pub exclude_recent_search: Option<u64>,
     /// Action text.
     pub action: Option<String>,
@@ -210,12 +216,16 @@ pub struct RawConfig {
     /// Daemon host.
     pub host: Option<IpAddr>,
     /// RSS cadence in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
     pub rss_cadence: Option<u64>,
     /// Search cadence in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
     pub search_cadence: Option<u64>,
     /// Snatch timeout in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
     pub snatch_timeout: Option<u64>,
     /// Search timeout in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
     pub search_timeout: Option<u64>,
     /// Search limit.
     pub search_limit: Option<u32>,
@@ -232,6 +242,7 @@ pub struct RawConfig {
     /// Radarr URLs.
     pub radarr: Vec<String>,
     /// Deprecated fields.
+    #[serde(skip)]
     pub deprecated: DeprecatedConfig,
 }
 
@@ -423,29 +434,31 @@ impl RuntimeConfig {
             return Err(config_error("delay must be at least 30 seconds"));
         }
         if self.max_data_depth == 0 {
-            return Err(config_error("maxDataDepth must be at least 1"));
+            return Err(config_error("max_data_depth must be at least 1"));
         }
         if !(self.fuzzy_size_threshold > 0.0 && self.fuzzy_size_threshold <= 1.0) {
-            return Err(config_error("fuzzySizeThreshold must be > 0 and <= 1"));
+            return Err(config_error("fuzzy_size_threshold must be > 0 and <= 1"));
         }
         if self.auto_resume_max_download > MAX_AUTO_RESUME_DOWNLOAD_BYTES {
-            return Err(config_error("autoResumeMaxDownload exceeds 52428800 bytes"));
+            return Err(config_error(
+                "auto_resume_max_download exceeds 52428800 bytes",
+            ));
         }
         if let Some(api_key) = &self.api_key {
             if api_key.len() < 24 {
-                return Err(config_error("apiKey must be at least 24 characters"));
+                return Err(config_error("api_key must be at least 24 characters"));
             }
         }
         if self.torrent_dir.is_some() && self.use_client_torrents {
             return Err(config_error(
-                "torrentDir cannot be used with useClientTorrents",
+                "torrent_dir cannot be used with use_client_torrents",
             ));
         }
         if self.use_client_torrents && self.torrent_clients.is_empty() {
-            return Err(config_error("useClientTorrents requires torrentClients"));
+            return Err(config_error("use_client_torrents requires torrent_clients"));
         }
         if self.action == Action::Inject && self.torrent_clients.is_empty() {
-            return Err(config_error("action inject requires torrentClients"));
+            return Err(config_error("action inject requires torrent_clients"));
         }
         if self.action == Action::Inject
             && self.torrent_clients.iter().all(|client| client.readonly)
@@ -454,7 +467,7 @@ impl RuntimeConfig {
         }
         if self.torrent_clients.len() > 1 && self.torrent_dir.is_some() {
             return Err(config_error(
-                "multiple clients cannot be combined with torrentDir",
+                "multiple clients cannot be combined with torrent_dir",
             ));
         }
         if self.torrent_clients.len() > 1
@@ -470,32 +483,32 @@ impl RuntimeConfig {
         if self.torrent_clients.len() > 1 && !self.data_dirs.is_empty() && self.link_dirs.is_empty()
         {
             return Err(config_error(
-                "multiple clients plus dataDirs require linkDirs",
+                "multiple clients plus data_dirs require link_dirs",
             ));
         }
         if self.inject_dir.is_some() && self.action != Action::Inject {
-            return Err(config_error("injectDir is only valid with action inject"));
+            return Err(config_error("inject_dir is only valid with action inject"));
         }
         if self.action == Action::Inject
             && matches!(self.match_mode, MatchMode::Flexible | MatchMode::Partial)
             && self.link_dirs.is_empty()
         {
             return Err(config_error(
-                "injecting with flexible or partial matchMode requires linkDirs",
+                "injecting with flexible or partial match_mode requires link_dirs",
             ));
         }
         if let Some(season_from_episodes) = self.season_from_episodes {
             if !(season_from_episodes > 0.0 && season_from_episodes <= 1.0) {
-                return Err(config_error("seasonFromEpisodes must be > 0 and <= 1"));
+                return Err(config_error("season_from_episodes must be > 0 and <= 1"));
             }
             if season_from_episodes < 1.0 && self.match_mode != MatchMode::Partial {
                 return Err(config_error(
-                    "seasonFromEpisodes below 1 requires matchMode partial",
+                    "season_from_episodes below 1 requires match_mode partial",
                 ));
             }
             if self.action == Action::Inject && self.link_dirs.is_empty() {
                 return Err(config_error(
-                    "seasonFromEpisodes with action inject requires linkDirs",
+                    "season_from_episodes with action inject requires link_dirs",
                 ));
             }
         }
@@ -504,7 +517,7 @@ impl RuntimeConfig {
         {
             if exclude_recent_search < search_cadence.saturating_mul(3) {
                 return Err(config_error(
-                    "excludeRecentSearch must be at least 3x searchCadence",
+                    "exclude_recent_search must be at least 3x search_cadence",
                 ));
             }
         }
@@ -513,14 +526,14 @@ impl RuntimeConfig {
                 (self.exclude_older, self.exclude_recent_search)
             else {
                 return Err(config_error(
-                    "scheduled search requires excludeOlder and excludeRecentSearch",
+                    "scheduled search requires exclude_older and exclude_recent_search",
                 ));
             };
             if exclude_older < exclude_recent_search.saturating_mul(2)
                 || exclude_older > exclude_recent_search.saturating_mul(5)
             {
                 return Err(config_error(
-                    "excludeOlder must be between 2x and 5x excludeRecentSearch",
+                    "exclude_older must be between 2x and 5x exclude_recent_search",
                 ));
             }
         }
@@ -528,7 +541,7 @@ impl RuntimeConfig {
             && self.fuzzy_size_threshold > 0.1
         {
             return Err(config_error(
-                "scheduled search/rss requires fuzzySizeThreshold <= 0.1",
+                "scheduled search/rss requires fuzzy_size_threshold <= 0.1",
             ));
         }
         if self.search_cadence.is_some()
@@ -537,7 +550,7 @@ impl RuntimeConfig {
             && self.data_dirs.is_empty()
         {
             return Err(config_error(
-                "scheduled search requires torrentDir, useClientTorrents, or dataDirs",
+                "scheduled search requires torrent_dir, use_client_torrents, or data_dirs",
             ));
         }
         if has_nested_paths(
@@ -547,7 +560,7 @@ impl RuntimeConfig {
                 .chain(self.torrent_dir.iter().cloned()),
         ) {
             return Err(config_error(
-                "linkDirs, dataDirs, torrentDir, and outputDir cannot be nested",
+                "link_dirs, data_dirs, torrent_dir, and output_dir cannot be nested",
             ));
         }
 
@@ -555,26 +568,18 @@ impl RuntimeConfig {
     }
 }
 
-/// Parse raw `config.js` source into typed raw options.
+/// Parse raw `config.toml` source into typed raw options.
 pub fn raw_config_from_source(source: &str) -> crate::Result<RawConfig> {
-    let object_source = exported_object_source(source)?;
-    let mut parser = JsConfigParser::new(&object_source);
-    let value = parser.parse_value()?;
-    parser.finish()?;
-
-    let JsConfigValue::Object(object) = value else {
-        return Err(config_error("config.js default export must be an object"));
-    };
-
-    raw_config_from_object(&object)
+    toml::from_str(source)
+        .map_err(|error| config_error(format!("failed to parse config.toml: {error}")))
 }
 
-/// Minimal representation of discovered `config.js`.
+/// Minimal representation of discovered `config.toml`.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct FileConfig {
     /// Full path to the config file.
     pub path: PathBuf,
-    /// Raw JavaScript source when the file exists.
+    /// Raw TOML source when the file exists.
     pub source: Option<String>,
 }
 
@@ -600,12 +605,12 @@ pub fn app_dir() -> crate::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Path to `config.js` under the app directory.
+/// Path to `config.toml` under the app directory.
 pub fn config_path(app_dir: &Path) -> PathBuf {
     app_dir.join(CONFIG_FILE_NAME)
 }
 
-/// Load raw `config.js` source if present.
+/// Load raw `config.toml` source if present.
 pub fn get_file_config(app_dir: &Path) -> crate::Result<FileConfig> {
     let path = config_path(app_dir);
     let source = match fs::read_to_string(&path) {
@@ -614,19 +619,19 @@ pub fn get_file_config(app_dir: &Path) -> crate::Result<FileConfig> {
             if env::var_os("DOCKER_ENV").is_some() {
                 generate_config(app_dir)?;
                 Some(fs::read_to_string(&path).map_err(|error| {
-                    config_error(format!("failed to read generated config.js: {error}"))
+                    config_error(format!("failed to read generated config.toml: {error}"))
                 })?)
             } else {
                 None
             }
         }
-        Err(error) => return Err(config_error(format!("failed to read config.js: {error}"))),
+        Err(error) => return Err(config_error(format!("failed to read config.toml: {error}"))),
     };
 
     Ok(FileConfig { path, source })
 }
 
-/// Load and parse `config.js` when present.
+/// Load and parse `config.toml` when present.
 pub fn load_file_raw_config(app_dir: &Path) -> crate::Result<RawConfig> {
     let file_config = get_file_config(app_dir)?;
     match file_config.source {
@@ -644,13 +649,13 @@ pub fn generate_config(app_dir: &Path) -> crate::Result<PathBuf> {
         return Ok(path);
     }
     fs::write(&path, config_template())
-        .map_err(|error| config_error(format!("failed to write config.js: {error}")))?;
+        .map_err(|error| config_error(format!("failed to write config.toml: {error}")))?;
     Ok(path)
 }
 
 /// Starter config template.
 pub const fn config_template() -> &'static str {
-    "export default {\n  torznab: [],\n  useClientTorrents: true,\n  dataDirs: [],\n  torrentClients: [],\n};\n"
+    "torznab = []\nuse_client_torrents = true\ndata_dirs = []\ntorrent_clients = []\n"
 }
 
 /// Parse simple duration strings used by CLI/config options.
@@ -708,494 +713,46 @@ fn push_deprecated_client(clients: &mut Vec<String>, kind: &str, url: Option<Str
     }
 }
 
-fn raw_config_from_object(object: &BTreeMap<String, JsConfigValue>) -> crate::Result<RawConfig> {
-    Ok(RawConfig {
-        delay: optional_u64(object, "delay")?,
-        torznab: string_array(object, "torznab")?,
-        use_client_torrents: optional_bool(object, "useClientTorrents")?,
-        data_dirs: path_array(object, "dataDirs")?,
-        match_mode: optional_string(object, "matchMode")?,
-        skip_recheck: optional_bool(object, "skipRecheck")?,
-        auto_resume_max_download: optional_u64(object, "autoResumeMaxDownload")?,
-        ignore_non_relevant_files_to_resume: optional_bool(
-            object,
-            "ignoreNonRelevantFilesToResume",
-        )?,
-        link_category: optional_string(object, "linkCategory")?,
-        link_dirs: path_array(object, "linkDirs")?,
-        link_type: optional_string(object, "linkType")?,
-        flat_linking: optional_bool(object, "flatLinking")?,
-        max_data_depth: optional_u32(object, "maxDataDepth")?,
-        torrent_dir: optional_path(object, "torrentDir")?,
-        output_dir: optional_path(object, "outputDir")?,
-        inject_dir: optional_path(object, "injectDir")?,
-        ignore_titles: optional_bool(object, "ignoreTitles")?,
-        include_single_episodes: optional_bool(object, "includeSingleEpisodes")?,
-        include_non_videos: optional_bool(object, "includeNonVideos")?,
-        fuzzy_size_threshold: optional_f64(object, "fuzzySizeThreshold")?,
-        season_from_episodes: optional_ratio_or_false(object, "seasonFromEpisodes")?,
-        exclude_older: optional_duration_or_false(object, "excludeOlder")?,
-        exclude_recent_search: optional_duration_or_false(object, "excludeRecentSearch")?,
-        action: optional_string(object, "action")?,
-        torrent_clients: string_array(object, "torrentClients")?,
-        duplicate_categories: optional_bool(object, "duplicateCategories")?,
-        notification_webhook_urls: string_array(object, "notificationWebhookUrls")?,
-        rss_cadence: optional_duration_or_false(object, "rssCadence")?,
-        search_cadence: optional_duration_or_false(object, "searchCadence")?,
-        snatch_timeout: optional_duration_or_false(object, "snatchTimeout")?,
-        search_timeout: optional_duration_or_false(object, "searchTimeout")?,
-        search_limit: optional_u32(object, "searchLimit")?,
-        verbose: optional_bool(object, "verbose")?,
-        block_list: string_array(object, "blockList")?,
-        api_key: optional_string(object, "apiKey")?,
-        sonarr: string_array(object, "sonarr")?,
-        radarr: string_array(object, "radarr")?,
-        deprecated: DeprecatedConfig {
-            link_dir: optional_path(object, "linkDir")?,
-            notification_webhook_url: optional_string(object, "notificationWebhookUrl")?,
-            qbittorrent_url: optional_string(object, "qbittorrentUrl")?,
-            rtorrent_rpc_url: optional_string(object, "rtorrentRpcUrl")?,
-            transmission_rpc_url: optional_string(object, "transmissionRpcUrl")?,
-            deluge_rpc_url: optional_string(object, "delugeRpcUrl")?,
-        },
-        ..RawConfig::default()
-    })
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DurationConfigValue {
+    Bool(bool),
+    Integer(u64),
+    String(String),
 }
 
-fn exported_object_source(source: &str) -> crate::Result<String> {
-    let source = strip_comments(source);
-    let trimmed = source.trim();
-    let body = trimmed
-        .strip_prefix("export default")
-        .or_else(|| trimmed.strip_prefix("module.exports ="))
-        .unwrap_or(trimmed)
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-
-    if body.starts_with('{') {
-        Ok(body.to_owned())
-    } else {
-        Err(config_error(
-            "config.js must export an object literal with export default",
-        ))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum JsConfigValue {
-    Null,
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RatioConfigValue {
     Bool(bool),
     Number(f64),
-    String(String),
-    Array(Vec<JsConfigValue>),
-    Object(BTreeMap<String, JsConfigValue>),
 }
 
-struct JsConfigParser<'a> {
-    input: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> JsConfigParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
-            input: input.as_bytes(),
-            offset: 0,
-        }
-    }
-
-    fn parse_value(&mut self) -> crate::Result<JsConfigValue> {
-        self.skip_ws();
-        match self.peek() {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
-            Some(b'"' | b'\'') => self.parse_string().map(JsConfigValue::String),
-            Some(b't') => {
-                self.expect_keyword("true")?;
-                Ok(JsConfigValue::Bool(true))
-            }
-            Some(b'f') => {
-                self.expect_keyword("false")?;
-                Ok(JsConfigValue::Bool(false))
-            }
-            Some(b'n') => {
-                self.expect_keyword("null")?;
-                Ok(JsConfigValue::Null)
-            }
-            Some(b'-' | b'0'..=b'9') => self.parse_number().map(JsConfigValue::Number),
-            Some(byte) => Err(config_error(format!(
-                "unexpected config token '{}' at byte {}",
-                char::from(byte),
-                self.offset
-            ))),
-            None => Err(config_error("unexpected end of config")),
-        }
-    }
-
-    fn parse_object(&mut self) -> crate::Result<JsConfigValue> {
-        self.expect_byte(b'{')?;
-        let mut object = BTreeMap::new();
-        loop {
-            self.skip_ws();
-            if self.consume_if(b'}') {
-                break;
-            }
-            let key = self.parse_key()?;
-            self.skip_ws();
-            self.expect_byte(b':')?;
-            let value = self.parse_value()?;
-            object.insert(key, value);
-            self.skip_ws();
-            if self.consume_if(b',') {
-                continue;
-            }
-            self.expect_byte(b'}')?;
-            break;
-        }
-        Ok(JsConfigValue::Object(object))
-    }
-
-    fn parse_array(&mut self) -> crate::Result<JsConfigValue> {
-        self.expect_byte(b'[')?;
-        let mut values = Vec::new();
-        loop {
-            self.skip_ws();
-            if self.consume_if(b']') {
-                break;
-            }
-            values.push(self.parse_value()?);
-            self.skip_ws();
-            if self.consume_if(b',') {
-                continue;
-            }
-            self.expect_byte(b']')?;
-            break;
-        }
-        Ok(JsConfigValue::Array(values))
-    }
-
-    fn parse_key(&mut self) -> crate::Result<String> {
-        self.skip_ws();
-        match self.peek() {
-            Some(b'"' | b'\'') => self.parse_string(),
-            Some(byte) if is_identifier_start(byte) => self.parse_identifier(),
-            _ => Err(config_error(format!(
-                "expected object key at byte {}",
-                self.offset
-            ))),
-        }
-    }
-
-    fn parse_string(&mut self) -> crate::Result<String> {
-        let quote = self
-            .next()
-            .ok_or_else(|| config_error("unexpected end of string"))?;
-        let mut output = String::new();
-        while let Some(byte) = self.next() {
-            if byte == quote {
-                return Ok(output);
-            }
-            if byte == b'\\' {
-                let escaped = self
-                    .next()
-                    .ok_or_else(|| config_error("unterminated escape sequence"))?;
-                match escaped {
-                    b'"' => output.push('"'),
-                    b'\'' => output.push('\''),
-                    b'\\' => output.push('\\'),
-                    b'/' => output.push('/'),
-                    b'b' => output.push('\u{0008}'),
-                    b'f' => output.push('\u{000c}'),
-                    b'n' => output.push('\n'),
-                    b'r' => output.push('\r'),
-                    b't' => output.push('\t'),
-                    _ => {
-                        return Err(config_error(format!(
-                            "unsupported escape sequence: \\{}",
-                            char::from(escaped)
-                        )));
-                    }
-                }
-            } else {
-                output.push(char::from(byte));
-            }
-        }
-        Err(config_error("unterminated string"))
-    }
-
-    fn parse_identifier(&mut self) -> crate::Result<String> {
-        let start = self.offset;
-        while self.peek().is_some_and(is_identifier_continue) {
-            self.offset += 1;
-        }
-        let bytes = self
-            .input
-            .get(start..self.offset)
-            .ok_or_else(|| config_error("invalid identifier range"))?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|error| config_error(format!("invalid identifier: {error}")))
-    }
-
-    fn parse_number(&mut self) -> crate::Result<f64> {
-        let start = self.offset;
-        let _negative = self.consume_if(b'-');
-        self.skip_digits();
-        if self.consume_if(b'.') {
-            self.skip_digits();
-        }
-        if self.consume_if(b'e') || self.consume_if(b'E') {
-            if !self.consume_if(b'+') {
-                let _minus = self.consume_if(b'-');
-            }
-            self.skip_digits();
-        }
-        let bytes = self
-            .input
-            .get(start..self.offset)
-            .ok_or_else(|| config_error("invalid number range"))?;
-        let text = std::str::from_utf8(bytes)
-            .map_err(|error| config_error(format!("invalid number text: {error}")))?;
-        text.parse::<f64>()
-            .map_err(|error| config_error(format!("invalid number: {error}")))
-    }
-
-    fn finish(&mut self) -> crate::Result<()> {
-        self.skip_ws();
-        if self.offset == self.input.len() {
-            Ok(())
-        } else {
-            Err(config_error(format!(
-                "trailing config input at byte {}",
-                self.offset
-            )))
-        }
-    }
-
-    fn skip_digits(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
-            self.offset += 1;
-        }
-    }
-
-    fn skip_ws(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            self.offset += 1;
-        }
-    }
-
-    fn expect_keyword(&mut self, keyword: &str) -> crate::Result<()> {
-        let end = self
-            .offset
-            .checked_add(keyword.len())
-            .ok_or_else(|| config_error("keyword offset overflow"))?;
-        if self.input.get(self.offset..end) == Some(keyword.as_bytes()) {
-            self.offset = end;
-            Ok(())
-        } else {
-            Err(config_error(format!(
-                "expected keyword {keyword} at byte {}",
-                self.offset
-            )))
-        }
-    }
-
-    fn expect_byte(&mut self, expected: u8) -> crate::Result<()> {
-        match self.next() {
-            Some(actual) if actual == expected => Ok(()),
-            Some(actual) => Err(config_error(format!(
-                "expected '{}' at byte {}, found '{}'",
-                char::from(expected),
-                self.offset.saturating_sub(1),
-                char::from(actual)
-            ))),
-            None => Err(config_error(format!(
-                "expected '{}' at end of config",
-                char::from(expected)
-            ))),
-        }
-    }
-
-    fn consume_if(&mut self, expected: u8) -> bool {
-        if self.peek() == Some(expected) {
-            self.offset += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.input.get(self.offset).copied()
-    }
-
-    fn next(&mut self) -> Option<u8> {
-        let byte = self.peek()?;
-        self.offset += 1;
-        Some(byte)
+fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<DurationConfigValue>::deserialize(deserializer)? {
+        None | Some(DurationConfigValue::Bool(false)) => Ok(None),
+        Some(DurationConfigValue::Bool(true)) => Err(de::Error::custom(
+            "duration fields must be a duration string, integer milliseconds, or false",
+        )),
+        Some(DurationConfigValue::Integer(value)) => Ok(Some(value)),
+        Some(DurationConfigValue::String(value)) => parse_duration_millis(&value)
+            .map(Some)
+            .map_err(de::Error::custom),
     }
 }
 
-fn strip_comments(source: &str) -> String {
-    let mut output = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    let mut quote = None;
-    while let Some(character) = chars.next() {
-        if let Some(active_quote) = quote {
-            output.push(character);
-            if character == '\\' {
-                if let Some(escaped) = chars.next() {
-                    output.push(escaped);
-                }
-            } else if character == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-
-        if character == '"' || character == '\'' {
-            quote = Some(character);
-            output.push(character);
-            continue;
-        }
-
-        if character == '/' && chars.peek() == Some(&'/') {
-            let _slash = chars.next();
-            for next in chars.by_ref() {
-                if next == '\n' {
-                    output.push('\n');
-                    break;
-                }
-            }
-        } else if character == '/' && chars.peek() == Some(&'*') {
-            let _star = chars.next();
-            let mut previous = '\0';
-            for next in chars.by_ref() {
-                if previous == '*' && next == '/' {
-                    break;
-                }
-                previous = next;
-            }
-        } else {
-            output.push(character);
-        }
+fn deserialize_optional_ratio<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<RatioConfigValue>::deserialize(deserializer)? {
+        None | Some(RatioConfigValue::Bool(false)) => Ok(None),
+        Some(RatioConfigValue::Bool(true)) => Ok(Some(1.0)),
+        Some(RatioConfigValue::Number(value)) => Ok(Some(value)),
     }
-    output
-}
-
-fn optional_string(
-    object: &BTreeMap<String, JsConfigValue>,
-    key: &str,
-) -> crate::Result<Option<String>> {
-    match object.get(key) {
-        Some(JsConfigValue::String(value)) => Ok(Some(value.clone())),
-        Some(JsConfigValue::Null) | None => Ok(None),
-        Some(_) => Err(config_error(format!("{key} must be a string"))),
-    }
-}
-
-fn optional_path(
-    object: &BTreeMap<String, JsConfigValue>,
-    key: &str,
-) -> crate::Result<Option<PathBuf>> {
-    Ok(optional_string(object, key)?.map(PathBuf::from))
-}
-
-fn optional_bool(
-    object: &BTreeMap<String, JsConfigValue>,
-    key: &str,
-) -> crate::Result<Option<bool>> {
-    match object.get(key) {
-        Some(JsConfigValue::Bool(value)) => Ok(Some(*value)),
-        Some(JsConfigValue::Null) | None => Ok(None),
-        Some(_) => Err(config_error(format!("{key} must be a boolean"))),
-    }
-}
-
-fn optional_f64(object: &BTreeMap<String, JsConfigValue>, key: &str) -> crate::Result<Option<f64>> {
-    match object.get(key) {
-        Some(JsConfigValue::Number(value)) => Ok(Some(*value)),
-        Some(JsConfigValue::Null) | None => Ok(None),
-        Some(_) => Err(config_error(format!("{key} must be a number"))),
-    }
-}
-
-fn optional_u64(object: &BTreeMap<String, JsConfigValue>, key: &str) -> crate::Result<Option<u64>> {
-    optional_f64(object, key)?.map(checked_u64).transpose()
-}
-
-fn optional_u32(object: &BTreeMap<String, JsConfigValue>, key: &str) -> crate::Result<Option<u32>> {
-    optional_u64(object, key)?
-        .map(|value| u32::try_from(value).map_err(|error| config_error(format!("{key}: {error}"))))
-        .transpose()
-}
-
-fn optional_duration_or_false(
-    object: &BTreeMap<String, JsConfigValue>,
-    key: &str,
-) -> crate::Result<Option<u64>> {
-    match object.get(key) {
-        Some(JsConfigValue::Bool(false)) | Some(JsConfigValue::Null) | None => Ok(None),
-        Some(JsConfigValue::Number(value)) => checked_u64(*value).map(Some),
-        Some(JsConfigValue::String(value)) => parse_duration_millis(value).map(Some),
-        Some(_) => Err(config_error(format!(
-            "{key} must be a duration string, number, false, or null",
-        ))),
-    }
-}
-
-fn optional_ratio_or_false(
-    object: &BTreeMap<String, JsConfigValue>,
-    key: &str,
-) -> crate::Result<Option<f64>> {
-    match object.get(key) {
-        Some(JsConfigValue::Bool(false)) | Some(JsConfigValue::Null) | None => Ok(None),
-        Some(JsConfigValue::Bool(true)) => Ok(Some(1.0)),
-        Some(JsConfigValue::Number(value)) => Ok(Some(*value)),
-        Some(_) => Err(config_error(format!(
-            "{key} must be a number, false, or null"
-        ))),
-    }
-}
-
-fn string_array(object: &BTreeMap<String, JsConfigValue>, key: &str) -> crate::Result<Vec<String>> {
-    match object.get(key) {
-        Some(JsConfigValue::Array(items)) => items
-            .iter()
-            .map(|item| match item {
-                JsConfigValue::String(value) => Ok(value.clone()),
-                _ => Err(config_error(format!("{key} entries must be strings"))),
-            })
-            .collect(),
-        Some(JsConfigValue::Null) | None => Ok(Vec::new()),
-        Some(_) => Err(config_error(format!("{key} must be an array"))),
-    }
-}
-
-fn path_array(object: &BTreeMap<String, JsConfigValue>, key: &str) -> crate::Result<Vec<PathBuf>> {
-    Ok(string_array(object, key)?
-        .into_iter()
-        .map(PathBuf::from)
-        .collect())
-}
-
-fn checked_u64(value: f64) -> crate::Result<u64> {
-    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 {
-        value
-            .to_string()
-            .parse::<u64>()
-            .map_err(|error| config_error(format!("number must fit in u64: {error}")))
-    } else {
-        Err(config_error("number must be a nonnegative integer"))
-    }
-}
-
-fn is_identifier_start(byte: u8) -> bool {
-    byte == b'_' || byte == b'$' || byte.is_ascii_alphabetic()
-}
-
-fn is_identifier_continue(byte: u8) -> bool {
-    is_identifier_start(byte) || byte.is_ascii_digit()
 }
 
 fn has_nested_paths(paths: impl Iterator<Item = PathBuf>) -> bool {
@@ -1227,7 +784,7 @@ mod tests {
     fn normalizes_defaults_and_deprecated_names() {
         let raw = RawConfig {
             match_mode: Some("safe".to_owned()),
-            link_type: Some("reflinkOrCopy".to_owned()),
+            link_type: Some("reflink_or_copy".to_owned()),
             deprecated: DeprecatedConfig {
                 link_dir: Some("/links".into()),
                 notification_webhook_url: Some("https://notify.example".to_owned()),
@@ -1272,7 +829,7 @@ mod tests {
 
         let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
 
-        assert!(error.to_string().contains("torrentDir cannot be used"));
+        assert!(error.to_string().contains("torrent_dir cannot be used"));
     }
 
     #[test]
@@ -1308,22 +865,17 @@ mod tests {
     }
 
     #[test]
-    fn loads_export_default_config_object() {
+    fn loads_config_toml() {
         let raw = raw_config_from_source(
             r#"
-            // existing configs are ESM object literals
-            export default {
-              torznab: ["https://indexer.example/api"],
-              useClientTorrents: true,
-              dataDirs: ["/data"],
-              matchMode: "risky",
-              excludeOlder: "2 days",
-              excludeRecentSearch: false,
-              torrentClients: [
-                "qbittorrent:http://localhost:8080",
-              ],
-              linkDir: "/links",
-            };
+            torznab = ["https://indexer.example/api"]
+            use_client_torrents = true
+            data_dirs = ["/data"]
+            match_mode = "flexible"
+            exclude_older = "2 days"
+            exclude_recent_search = false
+            torrent_clients = ["qbittorrent:http://localhost:8080"]
+            link_dirs = ["/links"]
             "#,
         )
         .expect("config parses");
@@ -1331,16 +883,21 @@ mod tests {
         assert_eq!(raw.torznab, vec!["https://indexer.example/api"]);
         assert_eq!(raw.use_client_torrents, Some(true));
         assert_eq!(raw.data_dirs, vec![Path::new("/data")]);
-        assert_eq!(raw.match_mode.as_deref(), Some("risky"));
+        assert_eq!(raw.match_mode.as_deref(), Some("flexible"));
         assert_eq!(raw.exclude_older, Some(172_800_000));
         assert_eq!(raw.exclude_recent_search, None);
         assert_eq!(
             raw.torrent_clients,
             vec!["qbittorrent:http://localhost:8080"]
         );
-        assert_eq!(
-            raw.deprecated.link_dir.as_deref(),
-            Some(Path::new("/links"))
-        );
+        assert_eq!(raw.link_dirs, vec![Path::new("/links")]);
+    }
+
+    #[test]
+    fn rejects_javascript_config_keys() {
+        let error = raw_config_from_source("useClientTorrents = true")
+            .expect_err("camelCase key is rejected");
+
+        assert!(error.to_string().contains("failed to parse config.toml"));
     }
 }

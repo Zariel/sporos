@@ -88,7 +88,7 @@ pub struct DataDirWatchState {
     roots: Vec<PathBuf>,
 }
 
-/// Result counts from indexing a torrentDir.
+/// Result counts from indexing a torrent_dir.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TorrentDirIndexResult {
     /// `.torrent` files seen in the directory.
@@ -461,10 +461,10 @@ pub fn find_all_searchees(
         );
     } else if let Some(torrent_dir) = sources.torrent_dir {
         for entry in fs::read_dir(torrent_dir)
-            .map_err(|error| search_error(format!("failed to read torrentDir: {error}")))?
+            .map_err(|error| search_error(format!("failed to read torrent_dir: {error}")))?
         {
             let entry = entry.map_err(|error| {
-                search_error(format!("failed to read torrentDir entry: {error}"))
+                search_error(format!("failed to read torrent_dir entry: {error}"))
             })?;
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) == Some("torrent") {
@@ -948,7 +948,7 @@ pub fn filter_by_content(
     None
 }
 
-/// Parse and index every `.torrent` in a torrentDir, then prune removed files.
+/// Parse and index every `.torrent` in a torrent_dir, then prune removed files.
 pub fn index_torrent_dir(
     database: &Database,
     torrent_dir: &Path,
@@ -979,7 +979,7 @@ pub fn index_torrent_dir(
         }
         Err(error) => {
             return Err(search_error(format!(
-                "failed to read torrentDir {}: {error}",
+                "failed to read torrent_dir {}: {error}",
                 torrent_dir.display()
             )));
         }
@@ -989,7 +989,7 @@ pub fn index_torrent_dir(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                tracing::debug!("skipping torrentDir entry: {error}");
+                tracing::debug!("skipping torrent_dir entry: {error}");
                 result.files_failed += 1;
                 continue;
             }
@@ -1010,7 +1010,10 @@ pub fn index_torrent_dir(
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                tracing::debug!("failed to read torrentDir file {}: {error}", path.display());
+                tracing::debug!(
+                    "failed to read torrent_dir file {}: {error}",
+                    path.display()
+                );
                 connection
                     .execute(
                         "DELETE FROM torrent WHERE file_path = ?1",
@@ -1041,7 +1044,7 @@ pub fn index_torrent_dir(
             }
             Err(error) => {
                 tracing::debug!(
-                    "failed to parse torrentDir file {}: {error}",
+                    "failed to parse torrent_dir file {}: {error}",
                     path.display()
                 );
                 connection
@@ -1133,7 +1136,7 @@ pub fn find_potential_nested_roots(root: &Path, max_depth: u32) -> crate::Result
     Ok(roots)
 }
 
-/// Recompute affected parent roots for a changed path up to `maxDataDepth`.
+/// Recompute affected parent roots for a changed path up to `max_data_depth`.
 pub fn affected_roots_for_changed_path(
     data_dir: &Path,
     changed_path: &Path,

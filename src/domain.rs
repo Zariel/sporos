@@ -329,9 +329,9 @@ impl<'a> ClientTorrentMetadata<'a> {
 pub enum SearcheeSource {
     /// Torrent loaded in a configured client.
     TorrentClient,
-    /// `.torrent` file from `torrentDir`.
+    /// `.torrent` file from `torrent_dir`.
     TorrentFile,
-    /// Real file or folder from `dataDirs`.
+    /// Real file or folder from `data_dirs`.
     DataDir,
     /// Synthetic season pack assembled from episode files.
     Virtual,
@@ -659,10 +659,10 @@ impl fmt::Display for Decision {
     }
 }
 
-/// Result of saving a matched torrent file to `outputDir`.
+/// Result of saving a matched torrent file to `output_dir`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum SaveResult {
-    /// Torrent was written to `outputDir`.
+    /// Torrent was written to `output_dir`.
     Saved,
 }
 

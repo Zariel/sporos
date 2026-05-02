@@ -175,17 +175,17 @@ pub fn initialize_logger(app_dir: &Path, verbose: bool) -> crate::Result<()> {
 /// Check configured filesystem paths and create writable output/link paths.
 pub fn check_config_paths(config: &RuntimeConfig) -> crate::Result<()> {
     if let Some(torrent_dir) = &config.torrent_dir {
-        verify_readable_dir(torrent_dir, "torrentDir")?;
+        verify_readable_dir(torrent_dir, "torrent_dir")?;
     }
-    ensure_read_write_dir(&config.output_dir, "outputDir")?;
+    ensure_read_write_dir(&config.output_dir, "output_dir")?;
     for link_dir in &config.link_dirs {
-        ensure_read_write_dir(link_dir, "linkDir")?;
+        ensure_read_write_dir(link_dir, "link_dir")?;
     }
     for data_dir in &config.data_dirs {
-        verify_readable_dir(data_dir, "dataDir")?;
+        verify_readable_dir(data_dir, "data_dir")?;
     }
     if let Some(inject_dir) = &config.inject_dir {
-        ensure_read_write_dir(inject_dir, "injectDir")?;
+        ensure_read_write_dir(inject_dir, "inject_dir")?;
     }
     for data_dir in &config.data_dirs {
         for link_dir in &config.link_dirs {
@@ -221,8 +221,8 @@ fn ensure_read_write_dir(path: &Path, label: &str) -> crate::Result<()> {
 }
 
 fn verify_link_probe(data_dir: &Path, link_dir: &Path) -> crate::Result<()> {
-    verify_readable_dir(data_dir, "dataDir")?;
-    ensure_read_write_dir(link_dir, "linkDir")
+    verify_readable_dir(data_dir, "data_dir")?;
+    ensure_read_write_dir(link_dir, "link_dir")
 }
 
 fn push_secret(secrets: &mut Vec<String>, secret: &str) {

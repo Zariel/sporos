@@ -35,7 +35,7 @@ pub struct FileLinkOptions<'a> {
     pub link_dirs: &'a [PathBuf],
     /// Link mode.
     pub link_type: LinkType,
-    /// Put links directly under the link dir rather than `<linkDir>/<tracker>`.
+    /// Put links directly under the link dir rather than `<link_dir>/<tracker>`.
     pub flat_linking: bool,
     /// Ignore missing source files.
     pub ignore_missing: bool,
@@ -80,7 +80,7 @@ pub struct InjectionActionOptions<'a> {
     pub link_dirs: &'a [PathBuf],
     /// Link mode.
     pub link_type: LinkType,
-    /// Put links directly under the link dir rather than `<linkDir>/<tracker>`.
+    /// Put links directly under the link dir rather than `<link_dir>/<tracker>`.
     pub flat_linking: bool,
     /// Resolve file symlink sources before creating links.
     pub unwrap_symlinks: bool,
@@ -136,7 +136,7 @@ where
     perform_injection_action_without_mutex(action, options, notify_saved)
 }
 
-/// Retry injection for saved `.torrent` files in `injectDir` or `outputDir`.
+/// Retry injection for saved `.torrent` files in `inject_dir` or `output_dir`.
 pub fn inject_saved_torrents<N>(
     options: &SavedInjectionOptions<'_>,
     searchees: &[Searchee<'static>],
@@ -503,7 +503,7 @@ fn destination_dir(
         return Ok(Some(source_dir.to_path_buf()));
     }
     let Some(link_dir) = select_link_dir(source_dir, options.link_dirs, options.link_type)? else {
-        return Err(action_error("no compatible linkDir found for injection"));
+        return Err(action_error("no compatible link_dir found for injection"));
     };
     Ok(Some(link_destination_dir(
         &link_dir,
@@ -618,7 +618,7 @@ pub fn cleanup_created_roots(roots: &[PathBuf]) -> crate::Result<usize> {
 }
 use filetime::FileTime;
 
-/// Result from saving one torrent to `outputDir`.
+/// Result from saving one torrent to `output_dir`.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SavedTorrent {
     /// Compatibility action result.
@@ -642,7 +642,7 @@ pub struct SaveNotification {
     pub existed: bool,
 }
 
-/// Summary from restoring cached torrents to `outputDir`.
+/// Summary from restoring cached torrents to `output_dir`.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct RestoreSummary {
     /// Cached torrent files scanned.
@@ -653,7 +653,7 @@ pub struct RestoreSummary {
     pub failed: usize,
 }
 
-/// Save a matched candidate torrent to `outputDir`.
+/// Save a matched candidate torrent to `output_dir`.
 pub fn save_candidate_torrent<N>(
     output_dir: &Path,
     tracker: &str,
@@ -686,7 +686,7 @@ where
     N: FnMut(&SaveNotification) -> crate::Result<()>,
 {
     fs::create_dir_all(output_dir)
-        .map_err(|error| action_error(format!("failed to create outputDir: {error}")))?;
+        .map_err(|error| action_error(format!("failed to create output_dir: {error}")))?;
     let path = torrent_save_path(output_dir, metadata);
     let existed = path.exists();
     if existed {
@@ -708,7 +708,7 @@ where
     })
 }
 
-/// Restore cached candidate torrents into `outputDir` without deleting cache files.
+/// Restore cached candidate torrents into `output_dir` without deleting cache files.
 pub fn restore_from_torrent_cache<N>(
     database: &Database,
     app_dir: &Path,
@@ -937,7 +937,7 @@ fn created_root(destination_dir: &Path, destination: &Path) -> Option<PathBuf> {
 
 fn probe_link_dir(source_path: &Path, link_dir: &Path, link_type: LinkType) -> crate::Result<bool> {
     fs::create_dir_all(link_dir)
-        .map_err(|error| action_error(format!("failed to create linkDir: {error}")))?;
+        .map_err(|error| action_error(format!("failed to create link_dir: {error}")))?;
     let probe_source = if source_path.is_file() {
         source_path.to_path_buf()
     } else {
