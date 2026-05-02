@@ -12,7 +12,7 @@ use crate::{
     SporosError,
     clients::{
         ClientErrorCode, DownloadDirOptions, InjectionOptions, NewTorrent, ResumeOptions,
-        TorrentClient, select_injection_client,
+        TorrentClient, ensure_writable,
     },
     config::LinkType,
     domain::{
@@ -119,6 +119,11 @@ pub struct SavedInjectionSummary {
     pub failed: usize,
     /// Saved files deleted after terminal success.
     pub deleted: usize,
+}
+
+struct InjectionTarget<'a> {
+    client: &'a dyn TorrentClient,
+    destination_dir: Option<PathBuf>,
 }
 
 /// Perform inject-mode action side effects for one matched candidate.
@@ -269,14 +274,8 @@ fn perform_injection_action_without_mutex<N>(
 where
     N: FnMut(&SaveNotification) -> crate::Result<()>,
 {
-    let Some(client) = select_injection_client(options.clients, action.searchee)? else {
-        return Err(action_error(
-            "no writable torrent client available for injection",
-        ));
-    };
-
-    let candidate_exists = candidate_exists_elsewhere(options.clients, action.metafile)?;
-    if candidate_exists && options.link_dirs.is_empty() {
+    let existing_client = candidate_existing_client(options.clients, action.metafile)?;
+    if existing_client.is_some() && options.link_dirs.is_empty() {
         return Ok(InjectionResult::AlreadyExists);
     }
 
@@ -293,7 +292,9 @@ where
             )));
         }
     };
-    let destination_dir = destination_dir(action, options, &source_dir)?;
+    let target = select_injection_target(action, options, &source_dir, existing_client)?;
+    let client = target.client;
+    let destination_dir = target.destination_dir;
 
     if !options.link_dirs.is_empty() {
         let Some(destination_dir) = destination_dir.as_ref() else {
@@ -314,7 +315,7 @@ where
         )?;
     }
 
-    if candidate_exists {
+    if existing_client.is_some() {
         if linked.linked > 0 {
             client.recheck_torrent(&action.metafile.info_hash)?;
             client.resume_injection(
@@ -377,16 +378,16 @@ where
     Ok(InjectionResult::Injected)
 }
 
-fn candidate_exists_elsewhere(
-    clients: &[&dyn TorrentClient],
+fn candidate_existing_client<'a>(
+    clients: &'a [&'a dyn TorrentClient],
     metafile: &Metafile<'_>,
-) -> crate::Result<bool> {
+) -> crate::Result<Option<&'a dyn TorrentClient>> {
     for client in clients {
         if client.is_torrent_in_client(&metafile.info_hash)? {
-            return Ok(true);
+            return Ok(Some(*client));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn best_saved_match<'a>(
@@ -524,6 +525,107 @@ fn destination_dir(
         action.candidate.tracker.as_ref(),
         options.flat_linking,
     )))
+}
+
+fn select_injection_target<'a>(
+    action: &InjectionAction<'_>,
+    options: &'a InjectionActionOptions<'a>,
+    source_dir: &Path,
+    existing_client: Option<&'a dyn TorrentClient>,
+) -> crate::Result<InjectionTarget<'a>> {
+    let destination_dir = destination_dir(action, options, source_dir)?;
+    if options.clients.len() == 1 {
+        let client = options.clients.first().copied().ok_or_else(|| {
+            action_error("no compatible writable torrent client available for injection")
+        })?;
+        ensure_writable(client)?;
+        return Ok(InjectionTarget {
+            client,
+            destination_dir,
+        });
+    }
+
+    if let Some(client) = existing_client.filter(|client| !client.metadata().readonly) {
+        return Ok(InjectionTarget {
+            client,
+            destination_dir,
+        });
+    }
+
+    if let Some(client) = writable_source_client(options.clients, action.searchee)? {
+        return Ok(InjectionTarget {
+            client,
+            destination_dir,
+        });
+    }
+
+    let client = if options.link_dirs.is_empty() {
+        first_writable_client(options.clients)
+    } else {
+        compatible_link_client(options.clients, source_dir, options.link_type)?
+    };
+    let Some(client) = client else {
+        return Err(action_error(
+            "no compatible writable torrent client available for injection",
+        ));
+    };
+    Ok(InjectionTarget {
+        client,
+        destination_dir,
+    })
+}
+
+fn writable_source_client<'a>(
+    clients: &'a [&'a dyn TorrentClient],
+    searchee: &Searchee<'_>,
+) -> crate::Result<Option<&'a dyn TorrentClient>> {
+    let Some(host) = searchee.client.as_ref().map(|client| client.host.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(client) = clients
+        .iter()
+        .copied()
+        .find(|client| client.metadata().host.as_ref() == host)
+    else {
+        return Ok(None);
+    };
+    if client.metadata().readonly {
+        Ok(None)
+    } else {
+        ensure_writable(client).map(|()| Some(client))
+    }
+}
+
+fn first_writable_client<'a>(
+    clients: &'a [&'a dyn TorrentClient],
+) -> Option<&'a dyn TorrentClient> {
+    clients
+        .iter()
+        .copied()
+        .filter(|client| !client.metadata().readonly)
+        .min_by_key(|client| client.metadata().priority)
+}
+
+fn compatible_link_client<'a>(
+    clients: &'a [&'a dyn TorrentClient],
+    source_dir: &Path,
+    link_type: LinkType,
+) -> crate::Result<Option<&'a dyn TorrentClient>> {
+    let mut writable = clients
+        .iter()
+        .copied()
+        .filter(|client| !client.metadata().readonly)
+        .collect::<Vec<_>>();
+    writable.sort_by_key(|client| client.metadata().priority);
+    for client in writable {
+        let download_dirs = client.get_all_download_dirs()?;
+        if download_dirs.values().any(|download_dir| {
+            probe_link_dir(source_dir, download_dir, link_type).unwrap_or(false)
+        }) {
+            return Ok(Some(client));
+        }
+    }
+    Ok(None)
 }
 
 fn source_files_unchanged(searchee: &Searchee<'_>) -> bool {
@@ -1490,6 +1592,72 @@ mod tests {
     }
 
     #[test]
+    fn linked_data_injection_selects_compatible_client() {
+        let root = temp_path("inject-compatible-client");
+        let data = root.join("data");
+        let link_dir = root.join("links");
+        let incompatible_downloads = root.join("incompatible-downloads");
+        let compatible_downloads = root.join("compatible-downloads");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::create_dir_all(&link_dir).expect("link dir");
+        fs::create_dir_all(&compatible_downloads).expect("downloads");
+        fs::write(&incompatible_downloads, b"not a directory").expect("blocked downloads");
+        fs::write(data.join("source.mkv"), b"video-data").expect("source");
+        let mut searchee = Searchee::from_files(
+            "Source.Release",
+            "Source.Release",
+            vec![File::new("source.mkv", 10)],
+        );
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+        let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let candidate = Candidate::new(
+            "Candidate.Release",
+            "guid",
+            Some("https://indexer.example/download"),
+            "Tracker",
+        );
+        let incompatible = FakeClient::new("incompatible")
+            .with_priority(0)
+            .with_download_dir("old", incompatible_downloads);
+        let compatible = FakeClient::new("compatible")
+            .with_priority(1)
+            .with_download_dir("old", compatible_downloads);
+        let clients: [&dyn TorrentClient; 2] = [&incompatible, &compatible];
+
+        let result = perform_injection_action(
+            &InjectionAction {
+                searchee: &searchee,
+                candidate: &candidate,
+                metafile: &metafile,
+                bytes: &bytes,
+                decision: Decision::Match,
+            },
+            &InjectionActionOptions {
+                clients: &clients,
+                output_dir: None,
+                link_dirs: std::slice::from_ref(&link_dir),
+                link_type: LinkType::Hardlink,
+                flat_linking: false,
+                unwrap_symlinks: false,
+                skip_recheck: true,
+                category: None,
+                tags: Vec::new(),
+            },
+            |_| Ok(()),
+        )
+        .expect("inject action");
+
+        assert_eq!(result, InjectionResult::Injected);
+        assert!(incompatible.calls.lock().expect("calls").is_empty());
+        assert_eq!(
+            compatible.calls.lock().expect("calls").clone(),
+            vec!["inject"]
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recheck_policy_matches_documented_cases() {
         let exact = Metafile::from_files(
             InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567"),
@@ -1761,6 +1929,7 @@ mod tests {
         metadata: TorrentClientMetadata<'static>,
         existing: bool,
         download_dir: Result<PathBuf, ClientErrorCode>,
+        all_download_dirs: BTreeMap<String, PathBuf>,
         calls: Mutex<Vec<&'static str>>,
         last_options: Mutex<Option<InjectionOptions>>,
     }
@@ -1777,9 +1946,20 @@ mod tests {
                 ),
                 existing: false,
                 download_dir: Ok(PathBuf::from("/downloads")),
+                all_download_dirs: BTreeMap::new(),
                 calls: Mutex::new(Vec::new()),
                 last_options: Mutex::new(None),
             }
+        }
+
+        fn with_priority(mut self, priority: u16) -> Self {
+            self.metadata.priority = priority;
+            self
+        }
+
+        fn with_download_dir(mut self, info_hash: &str, path: PathBuf) -> Self {
+            self.all_download_dirs.insert(info_hash.to_owned(), path);
+            self
         }
     }
 
@@ -1813,7 +1993,7 @@ mod tests {
         }
 
         fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>> {
-            Ok(BTreeMap::new())
+            Ok(self.all_download_dirs.clone())
         }
 
         fn inject(
