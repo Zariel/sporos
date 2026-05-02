@@ -206,6 +206,16 @@ impl Database {
         &self,
         records: impl IntoIterator<Item = DataRootRecord<'a>>,
     ) -> crate::Result<usize> {
+        self.begin_data_root_refresh()?;
+        for record in records {
+            self.upsert_data_root(&record)?;
+            self.mark_refreshed_data_root(record.path)?;
+        }
+        self.finish_data_root_refresh()
+    }
+
+    /// Start a bounded refresh for data-dir roots.
+    pub fn begin_data_root_refresh(&self) -> crate::Result<()> {
         self.connection
             .execute_batch(
                 "CREATE TEMP TABLE IF NOT EXISTS current_data_roots (
@@ -213,16 +223,22 @@ impl Database {
                 );
                 DELETE FROM current_data_roots;",
             )
-            .map_err(sql_error)?;
-        for record in records {
-            self.upsert_data_root(&record)?;
-            self.connection
-                .execute(
-                    "INSERT OR IGNORE INTO current_data_roots (path) VALUES (?1)",
-                    params![record.path],
-                )
-                .map_err(sql_error)?;
-        }
+            .map_err(sql_error)
+    }
+
+    /// Mark one data-dir root as present during a bounded refresh.
+    pub fn mark_refreshed_data_root(&self, path: &str) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO current_data_roots (path) VALUES (?1)",
+                params![path],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Prune data-dir rows absent from the current bounded refresh.
+    pub fn finish_data_root_refresh(&self) -> crate::Result<usize> {
         self.connection
             .execute(
                 "DELETE FROM ensemble

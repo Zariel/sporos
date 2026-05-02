@@ -31,6 +31,7 @@ use crate::{
         ReverseLookupGate, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
         SearcheeSources, VirtualSeasonOptions, bulk_search, check_new_candidate_matches,
         episode_ensemble, find_all_searchees, find_searchable_searchees,
+        for_each_data_dir_searchee,
     },
     torrent::{
         Bencode, BencodeValue, bdecode, bencode, parse_metafile, torrent_cache_dir,
@@ -552,15 +553,18 @@ fn index_torrents_and_data_dirs(database: &Database, config: &RuntimeConfig) -> 
         let _result = crate::search::index_torrent_dir(database, torrent_dir)?;
     }
     if !config.data_dirs.is_empty() {
-        let searchees =
-            crate::search::data_dir_searchees(&config.data_dirs, config.max_data_depth)?;
-        let records = searchees.iter().filter_map(|searchee| {
-            Some(DataRootRecord {
-                path: searchee.path.as_deref()?,
+        database.begin_data_root_refresh()?;
+        for_each_data_dir_searchee(&config.data_dirs, config.max_data_depth, |searchee| {
+            let Some(path) = searchee.path.as_deref() else {
+                return Ok(());
+            };
+            database.upsert_data_root(&DataRootRecord {
+                path,
                 title: searchee.title.as_ref(),
-            })
-        });
-        database.refresh_data_roots(records)?;
+            })?;
+            database.mark_refreshed_data_root(path)
+        })?;
+        database.finish_data_root_refresh()?;
     }
     Ok(())
 }

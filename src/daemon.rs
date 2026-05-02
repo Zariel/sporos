@@ -349,20 +349,23 @@ fn index_torrents_and_data_dirs(config: &RuntimeConfig, database: &Database) -> 
     }
 
     if !config.data_dirs.is_empty() {
-        let searchees =
-            crate::search::data_dir_searchees(&config.data_dirs, config.max_data_depth)?;
-        let records = searchees.iter().filter_map(|searchee| {
-            Some(DataRootRecord {
-                path: searchee.path.as_deref()?,
-                title: searchee.title.as_ref(),
-            })
-        });
-        let removed = database.refresh_data_roots(records)?;
-        tracing::info!(
-            roots_indexed = searchees.len(),
-            roots_removed = removed,
-            "indexed data_dirs"
-        );
+        database.begin_data_root_refresh()?;
+        let roots_indexed = crate::search::for_each_data_dir_searchee(
+            &config.data_dirs,
+            config.max_data_depth,
+            |searchee| {
+                let Some(path) = searchee.path.as_deref() else {
+                    return Ok(());
+                };
+                database.upsert_data_root(&DataRootRecord {
+                    path,
+                    title: searchee.title.as_ref(),
+                })?;
+                database.mark_refreshed_data_root(path)
+            },
+        )?;
+        let removed = database.finish_data_root_refresh()?;
+        tracing::info!(roots_indexed, roots_removed = removed, "indexed data_dirs");
     }
     Ok(())
 }

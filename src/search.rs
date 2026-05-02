@@ -475,10 +475,11 @@ pub fn find_all_searchees(
         }
     }
 
-    for mut searchee in data_dir_searchees(sources.data_dirs, sources.max_data_depth)? {
+    for_each_data_dir_searchee(sources.data_dirs, sources.max_data_depth, |mut searchee| {
         searchee.label = Some(label);
         output.push(searchee);
-    }
+        Ok(())
+    })?;
     Ok(output)
 }
 
@@ -489,16 +490,16 @@ pub fn find_searchable_searchees(
     max_depth: u32,
     options: &SearchPipelineOptions<'_>,
 ) -> crate::Result<Vec<Searchee<'static>>> {
-    for searchee in data_dir_searchees(data_dirs, max_depth)? {
+    for_each_data_dir_searchee(data_dirs, max_depth, |searchee| {
         real_searchees.push(searchee);
-    }
-    let mut ensemble = real_searchees.clone();
-    if let Some(virtual_options) = options.virtual_season {
-        ensemble.extend(create_virtual_season_searchees(
-            &real_searchees,
-            virtual_options,
-        ));
-    }
+        Ok(())
+    })?;
+    let virtuals = options
+        .virtual_season
+        .map(|virtual_options| create_virtual_season_searchees(&real_searchees, virtual_options))
+        .unwrap_or_default();
+    let mut ensemble = real_searchees;
+    ensemble.extend(virtuals);
     Ok(filter_duplicate_searchees(
         ensemble
             .into_iter()
@@ -1199,14 +1200,32 @@ pub fn data_dir_searchees(
     max_depth: u32,
 ) -> crate::Result<Vec<Searchee<'static>>> {
     let mut searchees = Vec::new();
+    for_each_data_dir_searchee(data_dirs, max_depth, |searchee| {
+        searchees.push(searchee);
+        Ok(())
+    })?;
+    Ok(searchees)
+}
+
+/// Discover and handle data-dir searchees one at a time.
+pub fn for_each_data_dir_searchee<F>(
+    data_dirs: &[PathBuf],
+    max_depth: u32,
+    mut handle: F,
+) -> crate::Result<usize>
+where
+    F: FnMut(Searchee<'static>) -> crate::Result<()>,
+{
+    let mut seen = 0usize;
     for data_dir in data_dirs {
         for root in find_potential_nested_roots(data_dir, max_depth)? {
             if let Some(searchee) = create_searchee_from_path(&root)? {
-                searchees.push(searchee);
+                handle(searchee)?;
+                seen = seen.saturating_add(1);
             }
         }
     }
-    Ok(searchees)
+    Ok(seen)
 }
 
 /// Parsed title and metadata used by search grouping and compatibility checks.
