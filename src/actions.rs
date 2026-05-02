@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Cow,
+    cmp::Reverse,
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
@@ -17,6 +18,7 @@ use crate::{
     config::{LinkType, MatchMode},
     domain::{
         Candidate, ClientLabel, Decision, File, InjectionResult, Metafile, SaveResult, Searchee,
+        SearcheeSource,
     },
     matching::{AssessmentOptions, assess_metafile},
     persistence::Database,
@@ -405,16 +407,9 @@ fn best_saved_match<'a>(
     let mut matches = searchees
         .iter()
         .filter(|searchee| {
-            options.ignore_titles
-                || metadata
-                    .name
-                    .as_ref()
-                    .eq_ignore_ascii_case(searchee.title.as_ref())
-                || metadata
-                    .name
-                    .as_ref()
-                    .eq_ignore_ascii_case(searchee.name.as_ref())
+            options.ignore_titles || saved_title_matches(metadata.name.as_ref(), metafile, searchee)
         })
+        .filter(|searchee| !options.assessment.blocklist.matches_searchee(searchee))
         .filter_map(|searchee| {
             let assessment = assess_metafile(
                 metafile,
@@ -433,9 +428,109 @@ fn best_saved_match<'a>(
         (
             searchee_client_priority(searchee, options.injection.clients),
             decision_rank(*decision),
+            searchee_source_rank(searchee.source()),
+            Reverse(searchee.files.len()),
         )
     });
     matches.into_iter().next()
+}
+
+fn saved_title_matches(saved_name: &str, metafile: &Metafile<'_>, searchee: &Searchee<'_>) -> bool {
+    let saved_keys =
+        title_match_keys([saved_name, metafile.title.as_ref(), metafile.name.as_ref()]);
+    let searchee_keys = title_match_keys([searchee.title.as_ref(), searchee.name.as_ref()]);
+    saved_keys.iter().any(|saved| {
+        searchee_keys
+            .iter()
+            .any(|searchee| title_key_matches(saved, searchee))
+    })
+}
+
+fn title_match_keys<'a>(titles: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for title in titles {
+        insert_title_key(&mut keys, title);
+        if let Some((primary, alternate)) = alternate_title_parts(title) {
+            insert_title_key(&mut keys, primary);
+            insert_title_key(&mut keys, alternate);
+        }
+    }
+    keys
+}
+
+fn insert_title_key(keys: &mut BTreeSet<String>, title: &str) {
+    let key = normalized_title_key(title);
+    if !key.is_empty() {
+        keys.insert(key);
+    }
+}
+
+fn alternate_title_parts(title: &str) -> Option<(&str, &str)> {
+    let without_close = title.strip_suffix(')')?;
+    let (primary, alternate) = without_close.rsplit_once('(')?;
+    let primary = primary.trim();
+    let alternate = alternate.trim();
+    (!primary.is_empty() && !alternate.is_empty()).then_some((primary, alternate))
+}
+
+fn normalized_title_key(title: &str) -> String {
+    title
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn title_key_matches(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if left.len().min(right.len()) >= 6 && (left.contains(right) || right.contains(left)) {
+        return true;
+    }
+    fuzzy_title_match(left, right)
+}
+
+fn fuzzy_title_match(left: &str, right: &str) -> bool {
+    let max_distance = left.len().max(right.len()) / 3;
+    levenshtein_at_most(left, right, max_distance)
+        .is_some_and(|distance| distance <= left.len().min(right.len()) / 3)
+}
+
+fn levenshtein_at_most(left: &str, right: &str, max_distance: usize) -> Option<usize> {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len().abs_diff(right.len()) > max_distance {
+        return None;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_char) in left.iter().enumerate() {
+        *current.get_mut(0)? = left_index + 1;
+        let mut row_min = *current.first()?;
+        for (right_index, right_char) in right.iter().enumerate() {
+            let cost = usize::from(left_char != right_char);
+            let insert = previous.get(right_index + 1)?.saturating_add(1);
+            let delete = current.get(right_index)?.saturating_add(1);
+            let replace = previous.get(right_index)?.saturating_add(cost);
+            let cell = insert.min(delete).min(replace);
+            *current.get_mut(right_index + 1)? = cell;
+            row_min = row_min.min(cell);
+        }
+        if row_min > max_distance {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous.get(right.len()).copied()
 }
 
 fn searchee_client_priority(searchee: &Searchee<'_>, clients: &[&dyn TorrentClient]) -> u16 {
@@ -449,6 +544,14 @@ fn searchee_client_priority(searchee: &Searchee<'_>, clients: &[&dyn TorrentClie
                 .map(|client| client.metadata().priority)
         })
         .unwrap_or(u16::MAX)
+}
+
+fn searchee_source_rank(source: SearcheeSource) -> u8 {
+    match source {
+        SearcheeSource::TorrentClient | SearcheeSource::TorrentFile => 0,
+        SearcheeSource::DataDir => 1,
+        SearcheeSource::Virtual => 2,
+    }
 }
 
 fn decision_rank(decision: Decision) -> u8 {
@@ -1218,7 +1321,7 @@ fn json_error(error: serde_json::Error) -> SporosError {
 mod tests {
     use super::{
         FileLinkOptions, InjectionAction, InjectionActionOptions, SavedInjectionOptions,
-        cleanup_created_roots, inject_saved_torrents, link_all_files_in_metafile,
+        best_saved_match, cleanup_created_roots, inject_saved_torrents, link_all_files_in_metafile,
         link_destination_dir, perform_injection_action, restore_from_torrent_cache,
         save_candidate_torrent, save_torrent_with_metadata, select_link_dir,
     };
@@ -2054,6 +2157,208 @@ mod tests {
         assert!(arbitrary.exists());
         assert!(client.calls.lock().expect("calls").is_empty());
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saved_match_accepts_alternate_title_similarity() {
+        let metadata = saved_metadata("Foreign Title");
+        let metafile = saved_metafile("Foreign Title", vec![File::new("episode.mkv", 10)]);
+        let searchee = Searchee::from_files(
+            "Example Show (Foreign Title)",
+            "Example Show (Foreign Title)",
+            vec![File::new("episode.mkv", 10)],
+        );
+        let clients: [&dyn TorrentClient; 0] = [];
+        let injection = test_injection_options(&clients);
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let excluded = BTreeSet::new();
+        let assessment = test_assessment_options(&blocklist, &excluded, MatchMode::Strict);
+        let input_dir = PathBuf::from(".");
+        let searchees = [searchee];
+
+        let matched = best_saved_match(
+            &metafile,
+            &metadata,
+            &searchees,
+            &SavedInjectionOptions {
+                input_dir: &input_dir,
+                injection: &injection,
+                assessment: &assessment,
+                ignore_titles: false,
+            },
+        );
+
+        assert!(matched.is_some());
+    }
+
+    #[test]
+    fn saved_match_filters_blocklisted_searchees() {
+        let metadata = saved_metadata("Candidate Release");
+        let metafile = saved_metafile("Candidate Release", vec![File::new("candidate.mkv", 10)]);
+        let blocked = Searchee::from_files(
+            "Blocked Candidate Release",
+            "Candidate Release",
+            vec![File::new("candidate.mkv", 10)],
+        );
+        let allowed = Searchee::from_files(
+            "Candidate Release",
+            "Candidate Release",
+            vec![File::new("candidate.mkv", 10)],
+        );
+        let clients: [&dyn TorrentClient; 0] = [];
+        let injection = test_injection_options(&clients);
+        let blocklist = Blocklist::parse(&["name:blocked".to_owned()]).expect("blocklist");
+        let excluded = BTreeSet::new();
+        let assessment = test_assessment_options(&blocklist, &excluded, MatchMode::Strict);
+        let input_dir = PathBuf::from(".");
+        let searchees = [blocked, allowed];
+
+        let (matched, decision) = best_saved_match(
+            &metafile,
+            &metadata,
+            &searchees,
+            &SavedInjectionOptions {
+                input_dir: &input_dir,
+                injection: &injection,
+                assessment: &assessment,
+                ignore_titles: false,
+            },
+        )
+        .expect("saved match");
+
+        assert_eq!(matched.name, "Candidate Release");
+        assert_eq!(decision, Decision::Match);
+    }
+
+    #[test]
+    fn saved_match_sorts_by_source_and_file_count() {
+        let metadata = saved_metadata("Candidate Release");
+        let metafile = saved_metafile("Candidate Release", vec![File::new("candidate.mkv", 10)]);
+        let mut data = Searchee::from_files(
+            "Candidate Release",
+            "Candidate Release",
+            vec![
+                File::new("candidate.mkv", 10),
+                File::new("extra-feature.mkv", 5),
+            ],
+        );
+        data.path = Some(Cow::Borrowed("/data/Candidate Release"));
+        let mut torrent = Searchee::from_files(
+            "Candidate Release",
+            "Candidate Release",
+            vec![File::new("candidate.mkv", 10)],
+        );
+        torrent.info_hash = Some(InfoHash::from_validated(
+            "2222222222222222222222222222222222222222",
+        ));
+        let clients: [&dyn TorrentClient; 0] = [];
+        let injection = test_injection_options(&clients);
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let excluded = BTreeSet::new();
+        let assessment = test_assessment_options(&blocklist, &excluded, MatchMode::Strict);
+        let input_dir = PathBuf::from(".");
+        let searchees = [data, torrent];
+
+        let (matched, _) = best_saved_match(
+            &metafile,
+            &metadata,
+            &searchees,
+            &SavedInjectionOptions {
+                input_dir: &input_dir,
+                injection: &injection,
+                assessment: &assessment,
+                ignore_titles: false,
+            },
+        )
+        .expect("saved match");
+
+        assert!(matched.info_hash.is_some());
+
+        let mut first = Searchee::from_files(
+            "Candidate Release",
+            "Candidate Release",
+            vec![File::new("candidate.mkv", 10)],
+        );
+        first.path = Some(Cow::Borrowed("/data/one"));
+        let mut more_files = Searchee::from_files(
+            "Candidate Release",
+            "Candidate Release",
+            vec![
+                File::new("candidate.mkv", 10),
+                File::new("extra-feature.mkv", 5),
+            ],
+        );
+        more_files.path = Some(Cow::Borrowed("/data/two"));
+        let searchees = [first, more_files];
+
+        let (matched, _) = best_saved_match(
+            &metafile,
+            &metadata,
+            &searchees,
+            &SavedInjectionOptions {
+                input_dir: &input_dir,
+                injection: &injection,
+                assessment: &assessment,
+                ignore_titles: false,
+            },
+        )
+        .expect("saved match");
+
+        assert_eq!(matched.files.len(), 2);
+    }
+
+    fn saved_metadata(name: &str) -> SavedTorrentMetadata<'static> {
+        SavedTorrentMetadata::new(
+            MediaType::Video,
+            "Tracker",
+            name.to_owned(),
+            InfoHash::from_validated("1111111111111111111111111111111111111111"),
+            false,
+        )
+    }
+
+    fn saved_metafile(name: &str, files: Vec<File<'static>>) -> Metafile<'static> {
+        Metafile::from_files(
+            InfoHash::from_validated("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            name.to_owned(),
+            name.to_owned(),
+            1,
+            files,
+        )
+    }
+
+    fn test_assessment_options<'a>(
+        blocklist: &'a Blocklist,
+        excluded: &'a BTreeSet<String>,
+        match_mode: MatchMode,
+    ) -> AssessmentOptions<'a> {
+        AssessmentOptions {
+            match_mode,
+            fuzzy_size_threshold: 0.05,
+            season_from_episodes: 0.75,
+            include_single_episodes: true,
+            info_hashes_to_exclude: excluded,
+            blocklist,
+        }
+    }
+
+    fn test_injection_options<'a>(
+        clients: &'a [&'a dyn TorrentClient],
+    ) -> InjectionActionOptions<'a> {
+        InjectionActionOptions {
+            clients,
+            output_dir: None,
+            link_dirs: &[],
+            link_type: LinkType::Symlink,
+            flat_linking: false,
+            unwrap_symlinks: false,
+            skip_recheck: true,
+            match_mode: MatchMode::Strict,
+            auto_resume_max_download: 0,
+            ignore_non_relevant_files_to_resume: false,
+            category: None,
+            tags: Vec::new(),
+        }
     }
 
     struct FakeClient {
