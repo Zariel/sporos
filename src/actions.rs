@@ -557,7 +557,8 @@ where
 
 fn should_recheck(metafile: &Metafile<'_>, decision: Decision, skip_recheck: bool) -> bool {
     !skip_recheck
-        && (decision == Decision::MatchPartial || metafile.files.iter().any(is_video_disc_file))
+        || decision == Decision::MatchPartial
+        || metafile.files.iter().any(is_video_disc_file)
 }
 
 fn is_video_disc_file(file: &File<'_>) -> bool {
@@ -1431,6 +1432,29 @@ mod tests {
             1
         );
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recheck_policy_matches_documented_cases() {
+        let exact = Metafile::from_files(
+            InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567"),
+            "Exact.Release",
+            "Exact.Release",
+            16_384,
+            vec![File::new("movie.mkv", 10)],
+        );
+        let disc = Metafile::from_files(
+            InfoHash::from_validated("1111111111111111111111111111111111111111"),
+            "Disc.Release",
+            "Disc.Release",
+            16_384,
+            vec![File::new("VIDEO_TS/VTS_01_1.VOB", 10)],
+        );
+
+        assert!(super::should_recheck(&exact, Decision::Match, false));
+        assert!(!super::should_recheck(&exact, Decision::Match, true));
+        assert!(super::should_recheck(&exact, Decision::MatchPartial, true));
+        assert!(super::should_recheck(&disc, Decision::Match, true));
     }
 
     #[test]
