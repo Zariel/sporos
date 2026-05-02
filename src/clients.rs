@@ -1352,13 +1352,17 @@ impl TorrentClient for RtorrentClient {
         } else {
             "load.raw_start"
         };
-        self.rpc(
-            method,
-            &[
-                RtXmlParam::String(String::new()),
-                RtXmlParam::Base64(base64_encode(new_torrent.bytes.as_ref())),
-            ],
-        )?;
+        let mut params = vec![
+            RtXmlParam::String(String::new()),
+            RtXmlParam::Base64(base64_encode(new_torrent.bytes.as_ref())),
+        ];
+        if let Some(destination) = &options.destination_dir {
+            params.push(RtXmlParam::String(format!(
+                "d.directory.set={}",
+                destination.display()
+            )));
+        }
+        self.rpc(method, &params)?;
         let label = options
             .tags
             .first()
@@ -2821,6 +2825,7 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert!(requests[0].contains("<methodName>load.raw</methodName>"));
         assert!(requests[0].contains("<base64>"));
+        assert!(requests[0].contains("d.directory.set=/linked"));
         assert!(requests[1].contains("<methodName>d.custom1.set</methodName>"));
         assert!(requests[2].contains("<methodName>d.pause</methodName>"));
         assert!(requests[3].contains("<methodName>d.check_hash</methodName>"));
