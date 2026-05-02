@@ -1,14 +1,36 @@
 //! Maintenance operations for cache, indexer, API-key, diff, and tree commands.
 
-use std::{borrow::Cow, fs, path::Path};
+use std::{
+    borrow::Cow,
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     SporosError,
-    clients::{TorrentClient, client_torrent_to_searchee},
-    config::RuntimeConfig,
-    domain::InfoHash,
-    persistence::{ClientSearcheeRecord, Database, EnsembleRecord},
-    search::episode_ensemble,
+    actions::{
+        InjectionAction, InjectionActionOptions, RestoreSummary, SavedInjectionOptions,
+        SavedInjectionSummary, inject_saved_torrents, perform_injection_action,
+        restore_from_torrent_cache, save_candidate_torrent,
+    },
+    clients::{TorrentClient, build_torrent_clients, client_torrent_to_searchee},
+    config::{Action as ConfigAction, RuntimeConfig},
+    domain::{ActionResult, ClientLabel, InfoHash, Label},
+    integrations::{
+        RssPagerOptions, SnatchOptions, TorznabSearchOptions, enabled_search_indexers,
+        query_rss_feeds, sync_torznab_indexers, validate_torznab_url,
+    },
+    matching::AssessmentOptions,
+    notifications::NotificationSender,
+    persistence::{ClientSearcheeRecord, DataRootRecord, Database, EnsembleRecord},
+    search::{
+        Blocklist, CandidateSearchCache, ContentFilterOptions, PipelineAction, PipelineSummary,
+        ReverseLookupGate, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
+        SearcheeSources, VirtualSeasonOptions, bulk_search, check_new_candidate_matches,
+        episode_ensemble, find_all_searchees, find_searchable_searchees,
+    },
     torrent::{
         Bencode, BencodeValue, bdecode, bencode, parse_metafile, torrent_cache_dir,
         torrent_cache_path,
@@ -73,6 +95,26 @@ pub struct CleanupDbResult {
     pub catastrophic_decision_cleanup_skipped: bool,
     /// GUID to info-hash rows read while rebuilding the map.
     pub guid_info_hash_rows: usize,
+}
+
+/// Summary from one CLI search workflow run.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct SearchWorkflowResult {
+    /// Local searchees considered.
+    pub searchees: usize,
+    /// Enabled indexers considered.
+    pub indexers: usize,
+    /// Pipeline summary.
+    pub pipeline: PipelineSummary,
+}
+
+/// Summary from one CLI RSS workflow run.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct RssWorkflowResult {
+    /// RSS candidates loaded from indexers.
+    pub candidates: usize,
+    /// Reverse-match attempts returned.
+    pub attempts: usize,
 }
 
 /// Compact tree output for a parsed torrent.
@@ -195,6 +237,170 @@ pub fn cleanup_db_with_clients(
     Ok(result)
 }
 
+/// Run one bulk search workflow.
+pub fn run_search_workflow(
+    database: &Database,
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    notifier: &NotificationSender,
+) -> crate::Result<SearchWorkflowResult> {
+    sync_configured_indexers(database, config)?;
+    index_torrents_and_data_dirs(database, config)?;
+    let client_adapters = build_workflow_clients(config)?;
+    let client_refs = client_refs(&client_adapters);
+    let client_searchees = collect_client_searchees(config, &client_refs)?;
+    let blocklist = Blocklist::parse(&config.block_list)?;
+    let indexers = enabled_search_indexers(database, current_time_millis())?;
+    let base = find_all_searchees(
+        &SearcheeSources {
+            torrents: config.torrents.as_deref(),
+            use_client_torrents: config.use_client_torrents,
+            client_searchees: &client_searchees,
+            torrent_dir: config.torrent_dir.as_deref(),
+            data_dirs: &config.data_dirs,
+            max_data_depth: config.max_data_depth,
+        },
+        Label::Search,
+    )?;
+    let excluded = local_info_hashes(&base);
+    let options = search_pipeline_options(config, &blocklist, &excluded, Label::Search);
+    let searchees = find_searchable_searchees(base, &[], config.max_data_depth, &options)?;
+    let injection = injection_options(config, &client_refs);
+    let mut cache = CandidateSearchCache::default();
+    let mut runtime = SearchPipelineRuntime {
+        database,
+        app_dir,
+        options: &options,
+        cache: &mut cache,
+    };
+    let pipeline = bulk_search(
+        &mut runtime,
+        &searchees,
+        &indexers,
+        |action| dispatch_pipeline_action(app_dir, config, &injection, action),
+        |attempt| {
+            let _report = notifier.send_result(attempt);
+            Ok(())
+        },
+    )?;
+    Ok(SearchWorkflowResult {
+        searchees: searchees.len(),
+        indexers: indexers.len(),
+        pipeline,
+    })
+}
+
+/// Run one RSS reverse-match workflow.
+pub fn run_rss_workflow(
+    database: &Database,
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    notifier: &NotificationSender,
+) -> crate::Result<RssWorkflowResult> {
+    sync_configured_indexers(database, config)?;
+    index_torrents_and_data_dirs(database, config)?;
+    let client_adapters = build_workflow_clients(config)?;
+    let client_refs = client_refs(&client_adapters);
+    let client_searchees = collect_client_searchees(config, &client_refs)?;
+    let blocklist = Blocklist::parse(&config.block_list)?;
+    let indexers = enabled_search_indexers(database, current_time_millis())?;
+    let candidates = query_rss_feeds(
+        database,
+        &indexers,
+        RssPagerOptions {
+            time_since_last_run: config
+                .rss_cadence
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::ZERO),
+            timeout: config.search_timeout.map(Duration::from_millis),
+            delay: Duration::from_secs(config.delay),
+            now_millis: current_time_millis(),
+        },
+    )?;
+    let local = find_all_searchees(
+        &SearcheeSources {
+            torrents: None,
+            use_client_torrents: config.use_client_torrents,
+            client_searchees: &client_searchees,
+            torrent_dir: config.torrent_dir.as_deref(),
+            data_dirs: &config.data_dirs,
+            max_data_depth: config.max_data_depth,
+        },
+        Label::Rss,
+    )?;
+    let excluded = local_info_hashes(&local);
+    let options = search_pipeline_options(config, &blocklist, &excluded, Label::Rss);
+    let injection = injection_options(config, &client_refs);
+    let gate = ReverseLookupGate::new();
+    let runtime = ReverseLookupRuntime {
+        gate: &gate,
+        database,
+        app_dir,
+        options: &options,
+    };
+    let attempts = check_new_candidate_matches(
+        &runtime,
+        &candidates,
+        &local,
+        |action| dispatch_pipeline_action(app_dir, config, &injection, action),
+        |attempt| {
+            let _report = notifier.send_result(attempt);
+            Ok(())
+        },
+    )?;
+    Ok(RssWorkflowResult {
+        candidates: candidates.len(),
+        attempts: attempts.len(),
+    })
+}
+
+/// Run one saved torrent injection workflow.
+pub fn run_inject_workflow(
+    database: &Database,
+    _app_dir: &Path,
+    config: &RuntimeConfig,
+) -> crate::Result<SavedInjectionSummary> {
+    index_torrents_and_data_dirs(database, config)?;
+    let client_adapters = build_workflow_clients(config)?;
+    let client_refs = client_refs(&client_adapters);
+    let client_searchees = collect_client_searchees(config, &client_refs)?;
+    let blocklist = Blocklist::parse(&config.block_list)?;
+    let searchees = find_all_searchees(
+        &SearcheeSources {
+            torrents: None,
+            use_client_torrents: config.use_client_torrents,
+            client_searchees: &client_searchees,
+            torrent_dir: config.torrent_dir.as_deref(),
+            data_dirs: &config.data_dirs,
+            max_data_depth: config.max_data_depth,
+        },
+        Label::Inject,
+    )?;
+    let excluded = local_info_hashes(&searchees);
+    let assessment = assessment_options(config, &blocklist, &excluded);
+    let injection = injection_options(config, &client_refs);
+    let input_dir = config.inject_dir.as_deref().unwrap_or(&config.output_dir);
+    inject_saved_torrents(
+        &SavedInjectionOptions {
+            input_dir,
+            injection: &injection,
+            assessment: &assessment,
+            ignore_titles: config.ignore_titles.unwrap_or(false),
+        },
+        &searchees,
+        |_| Ok(()),
+    )
+}
+
+/// Run one restore workflow.
+pub fn run_restore_workflow(
+    database: &Database,
+    app_dir: &Path,
+    config: &RuntimeConfig,
+) -> crate::Result<RestoreSummary> {
+    restore_from_torrent_cache(database, app_dir, &config.output_dir, |_| Ok(()))
+}
+
 /// Replace tracker URLs inside cached torrent files.
 pub fn update_torrent_cache_trackers(
     app_dir: &Path,
@@ -269,6 +475,205 @@ pub fn torrent_tree(path: &Path) -> crate::Result<TorrentTree> {
             .map(|file| (file.path.into_owned(), file.length))
             .collect(),
     })
+}
+
+fn sync_configured_indexers(database: &Database, config: &RuntimeConfig) -> crate::Result<()> {
+    let configured = config
+        .torznab
+        .iter()
+        .map(|url| validate_torznab_url(url))
+        .collect::<crate::Result<Vec<_>>>()?;
+    sync_torznab_indexers(database, &configured)?;
+    Ok(())
+}
+
+fn index_torrents_and_data_dirs(database: &Database, config: &RuntimeConfig) -> crate::Result<()> {
+    if let Some(torrent_dir) = &config.torrent_dir {
+        let _result = crate::search::index_torrent_dir(database, torrent_dir)?;
+    }
+    if !config.data_dirs.is_empty() {
+        let searchees =
+            crate::search::data_dir_searchees(&config.data_dirs, config.max_data_depth)?;
+        let records = searchees.iter().filter_map(|searchee| {
+            Some(DataRootRecord {
+                path: searchee.path.as_deref()?,
+                title: searchee.title.as_ref(),
+            })
+        });
+        database.refresh_data_roots(records)?;
+    }
+    Ok(())
+}
+
+fn build_workflow_clients(config: &RuntimeConfig) -> crate::Result<Vec<Box<dyn TorrentClient>>> {
+    if config.torrent_clients.is_empty() {
+        return Ok(Vec::new());
+    }
+    build_torrent_clients(
+        &config.torrent_clients,
+        config.search_timeout.map(Duration::from_millis),
+    )
+}
+
+fn client_refs(clients: &[Box<dyn TorrentClient>]) -> Vec<&dyn TorrentClient> {
+    clients.iter().map(|client| client.as_ref()).collect()
+}
+
+fn collect_client_searchees(
+    config: &RuntimeConfig,
+    clients: &[&dyn TorrentClient],
+) -> crate::Result<Vec<crate::domain::Searchee<'static>>> {
+    if !config.use_client_torrents {
+        return Ok(Vec::new());
+    }
+    let mut output = Vec::new();
+    for client in clients {
+        let metadata = client.metadata().clone().into_owned();
+        client.for_each_torrent(&mut |torrent| {
+            if let Some(searchee) = client_torrent_to_searchee(&metadata, torrent) {
+                output.push(searchee);
+            }
+            Ok(())
+        })?;
+    }
+    Ok(output)
+}
+
+fn local_info_hashes(searchees: &[crate::domain::Searchee<'_>]) -> BTreeSet<String> {
+    searchees
+        .iter()
+        .filter_map(|searchee| searchee.info_hash.as_ref())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn search_pipeline_options<'a>(
+    config: &'a RuntimeConfig,
+    blocklist: &'a Blocklist,
+    excluded: &'a BTreeSet<String>,
+    label: Label,
+) -> SearchPipelineOptions<'a> {
+    let now_millis = current_time_millis();
+    SearchPipelineOptions {
+        label,
+        filter: ContentFilterOptions {
+            blocklist,
+            blocklist_only: false,
+            include_single_episodes: config.include_single_episodes,
+            include_non_videos: config.include_non_videos,
+            fuzzy_size_threshold: config.fuzzy_size_threshold,
+            ignore_cross_seeds: false,
+            link_category: config.link_category.as_deref(),
+            label: Some(label),
+        },
+        assessment: assessment_options(config, blocklist, excluded),
+        snatch: SnatchOptions {
+            retries: 0,
+            delay: Duration::from_secs(config.delay),
+            timeout: config.snatch_timeout.map(Duration::from_millis),
+        },
+        torznab: TorznabSearchOptions {
+            timeout: config.search_timeout.map(Duration::from_millis),
+            delay: Duration::from_secs(config.delay),
+            search_limit: config
+                .search_limit
+                .map(|value| usize::try_from(value).unwrap_or(usize::MAX)),
+            now_millis,
+        },
+        arr_configs: &[],
+        arr_timeout: config.search_timeout.map(Duration::from_millis),
+        virtual_season: config.season_from_episodes.map(|season_from_episodes| {
+            VirtualSeasonOptions {
+                season_from_episodes,
+                use_filters: true,
+                now_millis,
+            }
+        }),
+        exclude_older: config.exclude_older,
+        exclude_recent_search: config.exclude_recent_search,
+    }
+}
+
+fn assessment_options<'a>(
+    config: &'a RuntimeConfig,
+    blocklist: &'a Blocklist,
+    excluded: &'a BTreeSet<String>,
+) -> AssessmentOptions<'a> {
+    AssessmentOptions {
+        match_mode: config.match_mode,
+        fuzzy_size_threshold: config.fuzzy_size_threshold,
+        season_from_episodes: config.season_from_episodes.unwrap_or(1.0),
+        include_single_episodes: config.include_single_episodes,
+        info_hashes_to_exclude: excluded,
+        blocklist,
+    }
+}
+
+fn injection_options<'a>(
+    config: &'a RuntimeConfig,
+    clients: &'a [&'a dyn TorrentClient],
+) -> InjectionActionOptions<'a> {
+    InjectionActionOptions {
+        clients,
+        output_dir: Some(&config.output_dir),
+        link_dirs: &config.link_dirs,
+        link_type: config.link_type,
+        flat_linking: config.flat_linking,
+        unwrap_symlinks: false,
+        skip_recheck: config.skip_recheck,
+        category: config.link_category.clone().map(ClientLabel::new),
+        tags: Vec::new(),
+    }
+}
+
+fn dispatch_pipeline_action(
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    injection: &InjectionActionOptions<'_>,
+    action: &PipelineAction<'_>,
+) -> crate::Result<Option<ActionResult>> {
+    let Some(metafile) = action.assessment.metafile.as_ref() else {
+        return Ok(None);
+    };
+    let bytes = fs::read(torrent_cache_path(app_dir, &metafile.info_hash)).map_err(|error| {
+        operation_error(format!(
+            "failed to read cached candidate torrent {}: {error}",
+            metafile.info_hash
+        ))
+    })?;
+    match config.action {
+        ConfigAction::Save => {
+            let saved = save_candidate_torrent(
+                &config.output_dir,
+                action.candidate.tracker.as_ref(),
+                metafile,
+                &bytes,
+                |_| Ok(()),
+            )?;
+            Ok(Some(ActionResult::Save(saved.result)))
+        }
+        ConfigAction::Inject => {
+            let result = perform_injection_action(
+                &InjectionAction {
+                    searchee: action.searchee,
+                    candidate: action.candidate,
+                    metafile,
+                    bytes: &bytes,
+                    decision: action.assessment.decision,
+                },
+                injection,
+                |_| Ok(()),
+            )?;
+            Ok(Some(ActionResult::Injection(result)))
+        }
+    }
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]

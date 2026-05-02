@@ -96,6 +96,11 @@ where
             apply_shared_options(matches, &mut raw_config)?;
             apply_daemon_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let _runtime = crate::startup::full_runtime(
+                app_dir.clone(),
+                config.clone(),
+                &crate::startup::NoopStartupHooks,
+            )?;
             let database = Database::open_app_dir(&app_dir)?;
             let shutdown = crate::daemon::install_shutdown_handler()?;
             let run = crate::daemon::run_daemon(&app_dir, &config, &database, &shutdown)?;
@@ -107,10 +112,94 @@ where
                 run.jobs.len()
             );
         }
+        Some(("search", matches)) => {
+            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            apply_shared_options(matches, &mut raw_config)?;
+            apply_search_options(matches, &mut raw_config)?;
+            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let _runtime = crate::startup::full_runtime(
+                app_dir.clone(),
+                config.clone(),
+                &crate::startup::NoopStartupHooks,
+            )?;
+            let database = Database::open_app_dir(&app_dir)?;
+            let notifier = crate::notifications::NotificationSender::from_config(
+                &config,
+                crate::startup::Redactor::from_config(&config),
+            )?;
+            let result =
+                crate::operations::run_search_workflow(&database, &app_dir, &config, &notifier)?;
+            println!(
+                "searched {} searchees across {} indexers: {} candidates, {} attempts",
+                result.searchees,
+                result.indexers,
+                result.pipeline.candidates_assessed,
+                result.pipeline.attempts.len()
+            );
+        }
+        Some(("rss", matches)) => {
+            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            apply_shared_options(matches, &mut raw_config)?;
+            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let _runtime = crate::startup::full_runtime(
+                app_dir.clone(),
+                config.clone(),
+                &crate::startup::NoopStartupHooks,
+            )?;
+            let database = Database::open_app_dir(&app_dir)?;
+            let notifier = crate::notifications::NotificationSender::from_config(
+                &config,
+                crate::startup::Redactor::from_config(&config),
+            )?;
+            let result =
+                crate::operations::run_rss_workflow(&database, &app_dir, &config, &notifier)?;
+            println!(
+                "rss matched {} of {} candidates",
+                result.attempts, result.candidates
+            );
+        }
+        Some(("inject", matches)) => {
+            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            apply_shared_options(matches, &mut raw_config)?;
+            apply_inject_options(matches, &mut raw_config);
+            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let _runtime = crate::startup::full_runtime(
+                app_dir.clone(),
+                config.clone(),
+                &crate::startup::NoopStartupHooks,
+            )?;
+            let database = Database::open_app_dir(&app_dir)?;
+            let result = crate::operations::run_inject_workflow(&database, &app_dir, &config)?;
+            println!(
+                "injected {} saved torrents, {} already existed, {} incomplete, {} failed",
+                result.injected, result.already_exists, result.incomplete, result.failed
+            );
+        }
+        Some(("restore", matches)) => {
+            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            apply_shared_options(matches, &mut raw_config)?;
+            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let _runtime = crate::startup::full_runtime(
+                app_dir.clone(),
+                config.clone(),
+                &crate::startup::NoopStartupHooks,
+            )?;
+            let database = Database::open_app_dir(&app_dir)?;
+            let result = crate::operations::run_restore_workflow(&database, &app_dir, &config)?;
+            println!(
+                "restored {} of {} cached torrents, failed {}",
+                result.restored, result.scanned, result.failed
+            );
+        }
         Some(("test-notification", matches)) => {
             let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
             apply_shared_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let _runtime = crate::startup::full_runtime(
+                app_dir.clone(),
+                config.clone(),
+                &crate::startup::NoopStartupHooks,
+            )?;
             let redactor = crate::startup::Redactor::from_config(&config);
             let sender = crate::notifications::NotificationSender::from_config(&config, redactor)?;
             let report = sender.send_test();
@@ -119,14 +208,7 @@ where
                 report.succeeded, report.attempted
             );
         }
-        Some((command, matches)) => {
-            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
-            apply_shared_options(matches, &mut raw_config)?;
-            match command {
-                "search" => apply_search_options(matches, &mut raw_config)?,
-                "inject" => apply_inject_options(matches, &mut raw_config),
-                _ => {}
-            }
+        Some((command, _)) => {
             println!("sporos {} {}", crate::VERSION, command);
         }
         None => {
