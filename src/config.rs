@@ -20,6 +20,9 @@ const DEFAULT_PORT: u16 = 2468;
 const DEFAULT_MAX_DATA_DEPTH: u32 = 2;
 const DEFAULT_FUZZY_SIZE_THRESHOLD: f64 = 0.05;
 const MAX_AUTO_RESUME_DOWNLOAD_BYTES: u64 = 52_428_800;
+const MIN_RSS_CADENCE_MILLIS: u64 = 10 * 60 * 1_000;
+const MAX_RSS_CADENCE_MILLIS: u64 = 2 * 60 * 60 * 1_000;
+const MIN_SEARCH_CADENCE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 
 /// Match mode after deprecated names have been normalized.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -569,6 +572,21 @@ impl RuntimeConfig {
                 ));
             }
         }
+        if !dev_mode_enabled() {
+            if let Some(rss_cadence) = self.rss_cadence {
+                if !(MIN_RSS_CADENCE_MILLIS..=MAX_RSS_CADENCE_MILLIS).contains(&rss_cadence) {
+                    return Err(config_error(
+                        "rss_cadence must be between 10 minutes and 2 hours",
+                    ));
+                }
+            }
+            if self
+                .search_cadence
+                .is_some_and(|search_cadence| search_cadence < MIN_SEARCH_CADENCE_MILLIS)
+            {
+                return Err(config_error("search_cadence must be at least 1 day"));
+            }
+        }
         if let (Some(search_cadence), Some(exclude_recent_search)) =
             (self.search_cadence, self.exclude_recent_search)
         {
@@ -900,6 +918,16 @@ fn config_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::configuration(message)
 }
 
+fn dev_mode_enabled() -> bool {
+    env::var_os("DEV").is_some()
+        || env::var("NODE_ENV")
+            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "dev" | "development"))
+            .unwrap_or(false)
+        || env::var("SPOROS_ENV")
+            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "dev" | "development"))
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -973,6 +1001,41 @@ mod tests {
         let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
 
         assert!(error.to_string().contains("scheduled search/rss"));
+    }
+
+    #[test]
+    fn validates_scheduled_rss_cadence_bounds() {
+        let too_low = RawConfig {
+            rss_cadence: Some(60_000),
+            fuzzy_size_threshold: Some(0.1),
+            data_dirs: vec!["/data".into()],
+            ..RawConfig::default()
+        };
+        let error = RuntimeConfig::normalize(too_low, Path::new("/config")).expect_err("low");
+        assert!(error.to_string().contains("rss_cadence"));
+
+        let too_high = RawConfig {
+            rss_cadence: Some(3 * 60 * 60 * 1_000),
+            fuzzy_size_threshold: Some(0.1),
+            data_dirs: vec!["/data".into()],
+            ..RawConfig::default()
+        };
+        let error = RuntimeConfig::normalize(too_high, Path::new("/config")).expect_err("high");
+        assert!(error.to_string().contains("rss_cadence"));
+    }
+
+    #[test]
+    fn validates_scheduled_search_cadence_minimum() {
+        let raw = RawConfig {
+            search_cadence: Some(60_000),
+            fuzzy_size_threshold: Some(0.1),
+            data_dirs: vec!["/data".into()],
+            ..RawConfig::default()
+        };
+
+        let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
+
+        assert!(error.to_string().contains("search_cadence"));
     }
 
     #[test]

@@ -160,7 +160,7 @@ fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
     let config = RuntimeConfig::normalize(
         RawConfig {
             port: Some(None),
-            rss_cadence: Some(60_000),
+            rss_cadence: Some(600_000),
             data_dirs: vec![data_dir],
             ..RawConfig::default()
         },
