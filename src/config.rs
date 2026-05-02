@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     env, fs,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -506,6 +507,12 @@ impl RuntimeConfig {
         if self.use_client_torrents && self.torrent_clients.is_empty() {
             return Err(config_error("use_client_torrents requires torrent_clients"));
         }
+        let mut torrent_client_urls = BTreeSet::new();
+        for client in &self.torrent_clients {
+            if !torrent_client_urls.insert(client.url.as_str()) {
+                return Err(config_error("duplicate torrent client URL"));
+            }
+        }
         if self.action == Action::Inject && self.torrent_clients.is_empty() {
             return Err(config_error("action inject requires torrent_clients"));
         }
@@ -901,6 +908,21 @@ mod tests {
         let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
 
         assert!(error.to_string().contains("non-readonly client"));
+    }
+
+    #[test]
+    fn rejects_duplicate_torrent_client_urls() {
+        let raw = RawConfig {
+            torrent_clients: vec![
+                TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client"),
+                TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client"),
+            ],
+            ..RawConfig::default()
+        };
+
+        let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
+
+        assert!(error.to_string().contains("duplicate torrent client URL"));
     }
 
     #[test]

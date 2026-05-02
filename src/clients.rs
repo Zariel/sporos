@@ -1,6 +1,12 @@
 //! Torrent-client adapter boundary and client mutation operations.
 
-use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, thread, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
 
 use quick_xml::{Reader, events::Event};
 use reqwest::blocking::multipart;
@@ -1507,7 +1513,7 @@ pub fn client_identities(configs: &[TorrentClientConfig]) -> crate::Result<Vec<C
         })
         .collect::<crate::Result<Vec<_>>>()?;
 
-    parsed
+    let identities = parsed
         .into_iter()
         .enumerate()
         .map(|(priority, (config, url, host))| {
@@ -1527,7 +1533,17 @@ pub fn client_identities(configs: &[TorrentClientConfig]) -> crate::Result<Vec<C
                 ),
             })
         })
-        .collect()
+        .collect::<crate::Result<Vec<_>>>()?;
+    let mut seen = BTreeSet::new();
+    for identity in &identities {
+        if !seen.insert(identity.metadata.host.as_ref().to_owned()) {
+            return Err(client_error(format!(
+                "duplicate torrent client identity: {}",
+                identity.metadata.host
+            )));
+        }
+    }
+    Ok(identities)
 }
 
 /// Build configured torrent-client adapters.
@@ -2314,6 +2330,17 @@ mod tests {
 
         assert_eq!(duplicate[0].metadata.host, "shared.example/qb");
         assert_eq!(duplicate[1].metadata.host, "shared.example/transmission");
+
+        let error = client_identities(&[
+            TorrentClientConfig::parse("qbittorrent:http://shared.example/qb").expect("client"),
+            TorrentClientConfig::parse("transmission:http://shared.example/qb").expect("client"),
+        ])
+        .expect_err("duplicate identity");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate torrent client identity")
+        );
     }
 
     #[test]
