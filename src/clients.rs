@@ -2182,9 +2182,9 @@ fn client_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientTorrent, DelugeClient, DownloadDirOptions, InjectionOptions, NewTorrent,
-        QbittorrentClient, ResumeOptions, RtorrentClient, TorrentClient, TransmissionClient,
-        client_identities, client_torrent_to_searchee, select_injection_client,
+        ClientErrorCode, ClientTorrent, DelugeClient, DownloadDirOptions, InjectionOptions,
+        NewTorrent, QbittorrentClient, ResumeOptions, RtorrentClient, TorrentClient,
+        TransmissionClient, client_identities, client_torrent_to_searchee, select_injection_client,
     };
     use crate::{
         config::TorrentClientConfig,
@@ -2414,6 +2414,82 @@ mod tests {
                 .filter(|request| request.contains("GET /api/v2/torrents/files?hash="))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn qbittorrent_contracts_presence_state_and_download_dir() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let info = format!(
+            r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads/show","progress":0.5,"state":"checkingUP"}}]"#
+        );
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", &info),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", &info),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", &info),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", &info),
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", &info),
+        ]);
+        let client = qb_client(&server.url);
+        let metafile = Metafile::from_files(
+            InfoHash::from_validated(hash),
+            "Example.Show.S01E01",
+            "Example.Show.S01E01",
+            16_384,
+            vec![File::new("Example.Show.S01E01.mkv", 123)],
+        );
+
+        assert!(
+            client
+                .is_torrent_in_client(&metafile.info_hash)
+                .expect("present")
+        );
+        assert!(
+            !client
+                .is_torrent_complete(&metafile.info_hash)
+                .expect("complete")
+        );
+        assert!(
+            client
+                .is_torrent_checking(&metafile.info_hash)
+                .expect("checking")
+        );
+        assert_eq!(
+            client
+                .get_download_dir(
+                    &metafile,
+                    DownloadDirOptions {
+                        only_completed: true,
+                    },
+                )
+                .expect("download dir"),
+            Err(ClientErrorCode::TorrentNotComplete)
+        );
+        assert_eq!(
+            client
+                .get_download_dir(
+                    &metafile,
+                    DownloadDirOptions {
+                        only_completed: false,
+                    },
+                )
+                .expect("download dir")
+                .expect("path"),
+            PathBuf::from("/downloads/show")
+        );
+
+        let requests = server.join();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("GET /api/v2/torrents/info?hashes="))
+                .count(),
+            5
         );
     }
 
