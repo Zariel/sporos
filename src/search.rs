@@ -13,13 +13,14 @@ use std::{
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rusqlite::{OptionalExtension, params};
+use serde::Deserialize;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     SporosError,
     domain::{
-        ActionResult, Candidate, ClientLabel, ClientTorrentMetadata, File, Label, MediaType,
-        Searchee,
+        ActionResult, Candidate, ClientLabel, ClientTorrentMetadata, File, InfoHash, Label,
+        MediaType, Searchee,
     },
     integrations::{
         ArrConfig, CategoryCaps, SearchIndexer, SnatchHistory, SnatchOptions, TorznabCaps,
@@ -654,8 +655,7 @@ where
         .lock()
         .map_err(|_error| search_error("reverse lookup gate was poisoned"))?;
     let mut snatch_history = SnatchHistory::default();
-    let mut candidates =
-        reverse_lookup_searchees(candidate, local_searchees, &runtime.options.filter);
+    let mut candidates = reverse_lookup_candidates(runtime, candidate, local_searchees)?;
     sort_reverse_lookup_searchees(&mut candidates);
 
     let mut best: Option<PipelineAttempt> = None;
@@ -734,6 +734,34 @@ pub fn reverse_lookup_searchees(
     output = filter_duplicate_searchees(output);
     sort_reverse_lookup_searchees(&mut output);
     output
+}
+
+fn reverse_lookup_candidates(
+    runtime: &ReverseLookupRuntime<'_>,
+    candidate: &Candidate<'_>,
+    local_searchees: &[Searchee<'static>],
+) -> crate::Result<Vec<Searchee<'static>>> {
+    let keys = reverse_lookup_keys(candidate.name.as_ref());
+    let mut output = reverse_lookup_searchees(candidate, local_searchees, &runtime.options.filter);
+    output.extend(reverse_lookup_client_rows(
+        runtime.database,
+        &keys,
+        &runtime.options.filter,
+    )?);
+    output.extend(reverse_lookup_data_rows(
+        runtime.database,
+        &keys,
+        &runtime.options.filter,
+    )?);
+    output.extend(reverse_lookup_ensemble_rows(
+        runtime.database,
+        candidate,
+        &runtime.options.filter,
+        runtime.options.virtual_season,
+    )?);
+    output = filter_duplicate_searchees(output);
+    sort_reverse_lookup_searchees(&mut output);
+    Ok(output)
 }
 
 /// Options for virtual season construction.
@@ -2154,6 +2182,296 @@ fn reverse_lookup_keys(name: &str) -> Vec<String> {
     keys
 }
 
+fn reverse_lookup_client_rows(
+    database: &Database,
+    keys: &[String],
+    filter: &ContentFilterOptions<'_>,
+) -> crate::Result<Vec<Searchee<'static>>> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT client_host, info_hash, name, title, files, save_path, category, tags, trackers
+             FROM client_searchee",
+        )
+        .map_err(persistence_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ClientSearcheeCacheRow {
+                client_host: row.get(0)?,
+                info_hash: row.get(1)?,
+                name: row.get(2)?,
+                title: row.get(3)?,
+                files: row.get(4)?,
+                save_path: row.get(5)?,
+                category: row.get(6)?,
+                tags: row.get(7)?,
+                trackers: row.get(8)?,
+            })
+        })
+        .map_err(persistence_error)?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        let row = row.map_err(persistence_error)?;
+        if !reverse_keys_match(keys, &row.title) {
+            continue;
+        }
+        if let Some(searchee) = row.into_searchee()? {
+            if filter_by_content(&searchee, filter).is_none() {
+                output.push(searchee);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn reverse_lookup_data_rows(
+    database: &Database,
+    keys: &[String],
+    filter: &ContentFilterOptions<'_>,
+) -> crate::Result<Vec<Searchee<'static>>> {
+    let mut statement = database
+        .connection()
+        .prepare("SELECT path, title FROM data")
+        .map_err(persistence_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(persistence_error)?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        let (path, title) = row.map_err(persistence_error)?;
+        if !reverse_keys_match(keys, &title) {
+            continue;
+        }
+        match create_searchee_from_path(Path::new(&path)) {
+            Ok(Some(searchee)) if filter_by_content(&searchee, filter).is_none() => {
+                output.push(searchee);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("skipping stale reverse lookup data path {path}: {error}")
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn reverse_lookup_ensemble_rows(
+    database: &Database,
+    candidate: &Candidate<'_>,
+    filter: &ContentFilterOptions<'_>,
+    virtual_options: Option<VirtualSeasonOptions>,
+) -> crate::Result<Vec<Searchee<'static>>> {
+    let mut output = Vec::new();
+    if let Some((ensemble, element)) = candidate_episode_key(candidate.name.as_ref()) {
+        output.extend(ensemble_rows(database, &ensemble, Some(&element), filter)?);
+    }
+    if let (Some(ensemble), Some(options)) = (
+        candidate_season_key(candidate.name.as_ref()),
+        virtual_options.map(|mut options| {
+            options.use_filters = false;
+            options
+        }),
+    ) {
+        let episodes = ensemble_rows(database, &ensemble, None, filter)?;
+        output.extend(create_virtual_season_searchees(&episodes, options));
+    }
+    Ok(output)
+}
+
+fn ensemble_rows(
+    database: &Database,
+    ensemble: &str,
+    element: Option<&str>,
+    filter: &ContentFilterOptions<'_>,
+) -> crate::Result<Vec<Searchee<'static>>> {
+    let mut statement = database
+        .connection()
+        .prepare(
+            "SELECT client_host, path, info_hash
+             FROM ensemble
+             WHERE ensemble = ?1
+             AND (?2 IS NULL OR element = ?2)",
+        )
+        .map_err(persistence_error)?;
+    let rows = statement
+        .query_map(params![ensemble, element], |row| {
+            Ok(EnsembleCacheRow {
+                client_host: row.get(0)?,
+                path: row.get(1)?,
+                info_hash: row.get(2)?,
+            })
+        })
+        .map_err(persistence_error)?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        let row = row.map_err(persistence_error)?;
+        if let Some(searchee) = row.into_searchee(database)? {
+            if filter_by_content(&searchee, filter).is_none() {
+                output.push(searchee);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn reverse_keys_match(keys: &[String], title: &str) -> bool {
+    let mut searchee = Searchee::from_files(title.to_owned(), title.to_owned(), Vec::new());
+    searchee.media_type = get_media_type(title, &[]);
+    let local_key = search_group_key(&searchee);
+    keys.iter().any(|key| fuzzy_title_match(key, &local_key))
+}
+
+fn candidate_episode_key(name: &str) -> Option<(String, String)> {
+    let title = parse_title(name, &[], None)
+        .map(|parsed| parsed.title)
+        .unwrap_or_else(|| name.to_owned());
+    let (key, episode) = episode_key_from_title(&title)?;
+    Some((
+        format!("{} S{:02}", key.title, key.season),
+        format!("{episode:02}"),
+    ))
+}
+
+fn candidate_season_key(name: &str) -> Option<String> {
+    let title = parse_title(name, &[], None)
+        .map(|parsed| parsed.title)
+        .unwrap_or_else(|| name.to_owned());
+    let key = season_key_from_title(&title)?;
+    Some(format!("{} S{:02}", key.title, key.season))
+}
+
+#[derive(Debug)]
+struct ClientSearcheeCacheRow {
+    client_host: String,
+    info_hash: String,
+    name: String,
+    title: String,
+    files: String,
+    save_path: String,
+    category: Option<String>,
+    tags: Option<String>,
+    trackers: String,
+}
+
+impl ClientSearcheeCacheRow {
+    fn into_searchee(self) -> crate::Result<Option<Searchee<'static>>> {
+        let Some(info_hash) = InfoHash::new(self.info_hash) else {
+            return Ok(None);
+        };
+        let files = files_from_json(&self.files)?;
+        let tags = labels_from_json(self.tags.as_deref())?;
+        let trackers = strings_from_json(&self.trackers)?;
+        let category = self.category.map(ClientLabel::new);
+        let mut searchee = Searchee::from_files(self.name, self.title, files);
+        searchee.media_type = get_media_type(searchee.title.as_ref(), &searchee.files);
+        searchee.info_hash = Some(info_hash);
+        searchee.client = Some(ClientTorrentMetadata::new(
+            self.client_host,
+            self.save_path,
+            category,
+            tags,
+            trackers,
+        ));
+        Ok(Some(searchee))
+    }
+}
+
+#[derive(Debug)]
+struct EnsembleCacheRow {
+    client_host: Option<String>,
+    path: String,
+    info_hash: Option<String>,
+}
+
+impl EnsembleCacheRow {
+    fn into_searchee(self, database: &Database) -> crate::Result<Option<Searchee<'static>>> {
+        if let (Some(client_host), Some(info_hash)) = (self.client_host, self.info_hash) {
+            return client_searchee_by_hash(database, &client_host, &info_hash);
+        }
+        match create_searchee_from_path(Path::new(&self.path)) {
+            Ok(searchee) => Ok(searchee),
+            Err(error) => {
+                tracing::debug!(
+                    "skipping stale reverse lookup ensemble path {}: {error}",
+                    self.path
+                );
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn client_searchee_by_hash(
+    database: &Database,
+    client_host: &str,
+    info_hash: &str,
+) -> crate::Result<Option<Searchee<'static>>> {
+    database
+        .connection()
+        .query_row(
+            "SELECT client_host, info_hash, name, title, files, save_path, category, tags, trackers
+             FROM client_searchee
+             WHERE client_host = ?1 AND info_hash = ?2",
+            params![client_host, info_hash],
+            |row| {
+                Ok(ClientSearcheeCacheRow {
+                    client_host: row.get(0)?,
+                    info_hash: row.get(1)?,
+                    name: row.get(2)?,
+                    title: row.get(3)?,
+                    files: row.get(4)?,
+                    save_path: row.get(5)?,
+                    category: row.get(6)?,
+                    tags: row.get(7)?,
+                    trackers: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(persistence_error)?
+        .map(ClientSearcheeCacheRow::into_searchee)
+        .transpose()
+        .map(Option::flatten)
+}
+
+#[derive(Deserialize)]
+struct StoredFile {
+    name: String,
+    path: String,
+    length: u64,
+}
+
+fn files_from_json(value: &str) -> crate::Result<Vec<File<'static>>> {
+    serde_json::from_str::<Vec<StoredFile>>(value)
+        .map_err(|error| search_error(format!("failed to parse cached files JSON: {error}")))
+        .map(|files| {
+            files
+                .into_iter()
+                .map(|file| File::with_name(file.name, file.path, file.length))
+                .collect()
+        })
+}
+
+fn labels_from_json(value: Option<&str>) -> crate::Result<Vec<ClientLabel<'static>>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<String>>(value)
+        .map_err(|error| search_error(format!("failed to parse cached labels JSON: {error}")))
+        .map(|labels| labels.into_iter().map(ClientLabel::new).collect())
+}
+
+fn strings_from_json(value: &str) -> crate::Result<Vec<Cow<'static, str>>> {
+    serde_json::from_str::<Vec<String>>(value)
+        .map_err(|error| search_error(format!("failed to parse cached strings JSON: {error}")))
+        .map(|values| values.into_iter().map(Cow::Owned).collect())
+}
+
 fn strip_bracketed_metadata(name: &str) -> String {
     let mut output = String::with_capacity(name.len());
     let mut depth = 0_u32;
@@ -2295,7 +2613,7 @@ mod tests {
         },
         integrations::{SearchIndexer, SnatchOptions, TorznabCaps, TorznabSearchOptions},
         matching::AssessmentOptions,
-        persistence::{Database, DecisionRecord},
+        persistence::{ClientSearcheeRecord, Database, DecisionRecord},
     };
     use rusqlite::params;
     use std::{
@@ -3030,6 +3348,72 @@ mod tests {
         .expect("attempt");
 
         assert_eq!(attempt.decision, Decision::MatchSizeOnly);
+        assert_eq!(actions, 1);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reverse_lookup_uses_cached_client_rows() {
+        let root = temp_path("reverse-client-cache");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclude = BTreeSet::new();
+        let mut options = pipeline_options(&blocklist, &exclude, &root, Label::Rss);
+        options.filter.include_single_episodes = true;
+        database
+            .upsert_client_searchee(&ClientSearcheeRecord {
+                client_host: "client-a",
+                info_hash: "0123456789abcdef0123456789abcdef01234567",
+                name: "Example.Show.S01E01",
+                title: "Example Show S01E01",
+                files: &[File::new("Example.Show.S01E01.mkv", 10)],
+                length: 10,
+                save_path: "/downloads",
+                category: None,
+                tags: &[],
+                trackers: &[Cow::Borrowed("tracker.example")],
+            })
+            .expect("client searchee");
+        let searchee_id = database
+            .get_or_insert_searchee("Example Show S01E01", 1_000)
+            .expect("searchee");
+        database
+            .upsert_decision(&DecisionRecord {
+                searchee_id,
+                guid: "guid-db",
+                info_hash: None,
+                decision: Decision::MatchSizeOnly,
+                first_seen: 1_000,
+                last_seen: 1_000,
+                fuzzy_size_factor: 0.05,
+            })
+            .expect("decision");
+        let gate = super::ReverseLookupGate::new();
+        let runtime = ReverseLookupRuntime {
+            gate: &gate,
+            database: &database,
+            app_dir: &root,
+            options: &options,
+        };
+        let candidate = Candidate::new("Example.Show.S01E01", "guid-db", None::<String>, "tracker");
+        let mut actions = 0;
+
+        let attempt = check_new_candidate_match(
+            &runtime,
+            &candidate,
+            &[],
+            |_| {
+                actions += 1;
+                Ok(Some(ActionResult::Save(SaveResult::Saved)))
+            },
+            |_| Ok(()),
+        )
+        .expect("reverse lookup")
+        .expect("attempt");
+
+        assert_eq!(attempt.decision, Decision::MatchSizeOnly);
+        assert_eq!(attempt.searchee_client_host.as_deref(), Some("client-a"));
         assert_eq!(actions, 1);
         let _cleanup = fs::remove_dir_all(root);
     }
