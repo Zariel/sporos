@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     fs,
     future::Future,
+    io::Write,
     path::Path,
     sync::LazyLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -356,9 +357,104 @@ pub fn cache_torrent_file(app_dir: &Path, bytes: &[u8]) -> crate::Result<Metafil
             integration_error(format!("failed to create torrent cache: {error}"))
         })?;
     }
-    fs::write(&path, bytes)
-        .map_err(|error| integration_error(format!("failed to write cached torrent: {error}")))?;
+    write_cached_torrent_atomically(&path, bytes)?;
     Ok(metafile)
+}
+
+fn write_cached_torrent_atomically(path: &Path, bytes: &[u8]) -> crate::Result<()> {
+    refuse_cache_symlink(path)?;
+    let Some(parent) = path.parent() else {
+        return Err(integration_error(format!(
+            "cached torrent path has no parent: {}",
+            path.display()
+        )));
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            integration_error(format!("invalid cached torrent path: {}", path.display()))
+        })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut temp_path = None;
+    let mut temp_file = None;
+    for attempt in 0..16 {
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            nonce + attempt
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temp_path = Some(candidate);
+                temp_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(integration_error(format!(
+                    "failed to create cached torrent temp file: {error}"
+                )));
+            }
+        }
+    }
+    let Some(mut file) = temp_file else {
+        return Err(integration_error(
+            "failed to create unique cached torrent temp file",
+        ));
+    };
+    let temp_path = temp_path.expect("temp path set with temp file");
+    let write_result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| integration_error(format!("failed to write cached torrent: {error}")));
+    drop(file);
+    if let Err(error) = write_result {
+        remove_temp_cached_torrent(&temp_path);
+        return Err(error);
+    }
+    if let Err(error) = refuse_cache_symlink(path) {
+        remove_temp_cached_torrent(&temp_path);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temp_path, path) {
+        remove_temp_cached_torrent(&temp_path);
+        return Err(integration_error(format!(
+            "failed to publish cached torrent: {error}"
+        )));
+    }
+    Ok(())
+}
+
+fn remove_temp_cached_torrent(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        tracing::debug!(
+            "failed to remove cached torrent temp file {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn refuse_cache_symlink(path: &Path) -> crate::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(integration_error(format!(
+            "refusing to write cached torrent through symlink: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(integration_error(format!(
+            "failed to inspect cached torrent path {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 /// Read a cached torrent, update access time, and delete corrupted cache files.
@@ -2389,6 +2485,30 @@ mod tests {
         fs::write(&path, b"not a torrent").expect("corrupt");
         let _error = get_cached_torrent(&root, &metafile.info_hash).expect_err("corrupted");
         assert!(!path.exists());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_refuses_symlink_target() {
+        let root = temp_path("cache-symlink");
+        fs::create_dir_all(&root).expect("temp dir");
+        let bytes = torrent_bytes("Cached.Symlink.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let path = crate::torrent::torrent_cache_path(&root, &metafile.info_hash);
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("cache parent");
+        let target = root.join("outside.torrent");
+        fs::write(&target, b"outside").expect("outside");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        let error = cache_torrent_file(&root, &bytes).expect_err("symlink rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to write cached torrent through symlink")
+        );
+        assert_eq!(fs::read(&target).expect("target"), b"outside");
         let _cleanup = fs::remove_dir_all(root);
     }
 
