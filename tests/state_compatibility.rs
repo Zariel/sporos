@@ -364,7 +364,12 @@ fn assert_database_state_survived(database: &Database, info_hash: &str) {
     );
 
     let ensemble_count: i64 = database
-        .query_scalar("SELECT COUNT(*) FROM ensemble", &[])
+        .query_scalar(
+            "SELECT
+                (SELECT COUNT(*) FROM data_ensemble)
+                + (SELECT COUNT(*) FROM client_ensemble)",
+            &[],
+        )
         .expect("ensemble count");
     assert_eq!(ensemble_count, 2);
 }

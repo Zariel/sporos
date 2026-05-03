@@ -256,12 +256,11 @@ impl Database {
     pub fn finish_data_root_refresh(&self) -> crate::Result<usize> {
         self.block_on(async {
             sqlx::query(
-                "DELETE FROM ensemble
-                 WHERE client_host IS NULL
-                 AND NOT EXISTS (
+                "DELETE FROM data_ensemble
+                 WHERE NOT EXISTS (
                     SELECT 1 FROM current_data_roots
-                    WHERE ensemble.path = current_data_roots.path
-                    OR ensemble.path LIKE current_data_roots.path || '/%'
+                    WHERE data_ensemble.path = current_data_roots.path
+                    OR data_ensemble.path LIKE current_data_roots.path || '/%'
                  )",
             )
             .execute(self.pool())
@@ -388,7 +387,7 @@ impl Database {
     pub fn finish_client_searchee_refresh(&self, client_host: &str) -> crate::Result<usize> {
         self.block_on(async {
             sqlx::query(
-                "DELETE FROM ensemble
+                "DELETE FROM client_ensemble
                  WHERE client_host = ?1
                  AND path NOT IN (SELECT path FROM current_client_ensemble_paths)",
             )
@@ -397,7 +396,7 @@ impl Database {
             .await
             .map_err(sqlx_error)?;
             sqlx::query(
-                "DELETE FROM ensemble
+                "DELETE FROM client_ensemble
                  WHERE client_host = ?1
                  AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
             )
@@ -421,40 +420,46 @@ impl Database {
     /// Insert or update one ensemble row.
     pub fn upsert_ensemble(&self, record: &EnsembleRecord<'_>) -> crate::Result<()> {
         self.block_on(async {
-            let updated = sqlx::query(
-                "UPDATE ensemble
-                 SET info_hash = ?3, ensemble = ?4, element = ?5
-                 WHERE path = ?2
-                 AND (
-                    client_host = ?1
-                    OR (client_host IS NULL AND ?1 IS NULL)
-                 )",
-            )
-            .bind(record.client_host)
-            .bind(record.path)
-            .bind(record.info_hash)
-            .bind(record.ensemble)
-            .bind(record.element)
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
-            if updated.rows_affected() > 0 {
-                return Ok(());
+            if let Some(client_host) = record.client_host {
+                let info_hash = record.info_hash.ok_or_else(|| {
+                    persistence_message("client ensemble rows require an info hash")
+                })?;
+                sqlx::query(
+                    "INSERT INTO client_ensemble
+                        (client_host, path, info_hash, ensemble, element)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(client_host, path) DO UPDATE SET
+                        info_hash = excluded.info_hash,
+                        ensemble = excluded.ensemble,
+                        element = excluded.element",
+                )
+                .bind(client_host)
+                .bind(record.path)
+                .bind(info_hash)
+                .bind(record.ensemble)
+                .bind(record.element)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
+            } else {
+                sqlx::query(
+                    "INSERT INTO data_ensemble (path, info_hash, ensemble, element)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(path) DO UPDATE SET
+                        info_hash = excluded.info_hash,
+                        ensemble = excluded.ensemble,
+                        element = excluded.element",
+                )
+                .bind(record.path)
+                .bind(record.info_hash)
+                .bind(record.ensemble)
+                .bind(record.element)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
             }
-
-            sqlx::query(
-                "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .bind(record.client_host)
-            .bind(record.path)
-            .bind(record.info_hash)
-            .bind(record.ensemble)
-            .bind(record.element)
-            .execute(self.pool())
-            .await
-            .map(|_| ())
-            .map_err(sqlx_error)
         })
     }
 
@@ -1006,8 +1011,8 @@ impl Database {
     ) -> crate::Result<Vec<EnsembleCacheRecord>> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT client_host, path, info_hash
-                 FROM ensemble
+                "SELECT NULL AS client_host, path, info_hash
+                 FROM data_ensemble
                  WHERE ensemble = ?1
                  AND (?2 IS NULL OR element = ?2)",
             )
@@ -1016,14 +1021,31 @@ impl Database {
             .fetch_all(self.pool())
             .await
             .map_err(sqlx_error)?;
-            Ok(rows
+            let mut records = rows
                 .into_iter()
                 .map(|row| EnsembleCacheRecord {
                     client_host: row.get(0),
                     path: row.get(1),
                     info_hash: row.get(2),
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            let rows = sqlx::query(
+                "SELECT client_host, path, info_hash
+                 FROM client_ensemble
+                 WHERE ensemble = ?1
+                 AND (?2 IS NULL OR element = ?2)",
+            )
+            .bind(ensemble)
+            .bind(element)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            records.extend(rows.into_iter().map(|row| EnsembleCacheRecord {
+                client_host: row.get(0),
+                path: row.get(1),
+                info_hash: row.get(2),
+            }));
+            Ok(records)
         })
     }
 
@@ -1071,9 +1093,8 @@ impl Database {
         limit: i64,
     ) -> crate::Result<Vec<RowidPath>> {
         self.rowid_path_page(
-            "SELECT rowid, path FROM ensemble
-             WHERE client_host IS NULL
-             AND rowid > ?1
+            "SELECT rowid, path FROM data_ensemble
+             WHERE rowid > ?1
              ORDER BY rowid
              LIMIT ?2",
             after_rowid,
@@ -1119,7 +1140,7 @@ impl Database {
     /// Delete one data-dir ensemble row by rowid.
     pub fn delete_ensemble_rowid(&self, rowid: i64) -> crate::Result<usize> {
         self.block_on(async {
-            let result = sqlx::query("DELETE FROM ensemble WHERE rowid = ?1")
+            let result = sqlx::query("DELETE FROM data_ensemble WHERE rowid = ?1")
                 .bind(rowid)
                 .execute(self.pool())
                 .await
@@ -1381,7 +1402,17 @@ impl AsyncDatabase {
             CacheTable::Torrent => "DELETE FROM torrent",
             CacheTable::ClientSearchee => "DELETE FROM client_searchee",
             CacheTable::Data => "DELETE FROM data",
-            CacheTable::Ensemble => "DELETE FROM ensemble",
+            CacheTable::Ensemble => {
+                let data = sqlx::query("DELETE FROM data_ensemble")
+                    .execute(self.pool())
+                    .await
+                    .map_err(sqlx_error)?;
+                let client = sqlx::query("DELETE FROM client_ensemble")
+                    .execute(self.pool())
+                    .await
+                    .map_err(sqlx_error)?;
+                return rows_affected(data.rows_affected().saturating_add(client.rows_affected()));
+            }
         };
         let result = sqlx::query(sql)
             .execute(self.pool())
@@ -1523,7 +1554,7 @@ pub struct ClientSearcheeRecord<'a> {
 /// Ensemble row used for virtual seasons and reverse lookup.
 #[derive(Debug, Clone, Copy)]
 pub struct EnsembleRecord<'a> {
-    /// Client host for client inventory, null for data-dir rows.
+    /// Client host for client inventory, absent for data-dir rows.
     pub client_host: Option<&'a str>,
     /// Absolute largest-file path.
     pub path: &'a str,
@@ -1893,24 +1924,30 @@ CREATE TABLE IF NOT EXISTS data (
 CREATE INDEX IF NOT EXISTS idx_data_lookup
 ON data(search_key, media_type, season, episode, length);
 
-CREATE TABLE IF NOT EXISTS ensemble (
-    client_host TEXT NULL,
+CREATE TABLE IF NOT EXISTS data_ensemble (
     path TEXT NOT NULL,
     info_hash TEXT NULL,
     ensemble TEXT NOT NULL,
     element TEXT NOT NULL,
-    PRIMARY KEY(client_host, path)
+    PRIMARY KEY(path)
 );
-CREATE INDEX IF NOT EXISTS idx_ensemble_path ON ensemble(path);
-CREATE INDEX IF NOT EXISTS idx_ensemble_info_hash ON ensemble(info_hash);
-CREATE INDEX IF NOT EXISTS idx_ensemble_lookup ON ensemble(ensemble, element);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ensemble_data_path_key
-ON ensemble(path)
-WHERE client_host IS NULL;
+CREATE INDEX IF NOT EXISTS idx_data_ensemble_info_hash ON data_ensemble(info_hash);
+CREATE INDEX IF NOT EXISTS idx_data_ensemble_lookup ON data_ensemble(ensemble, element);
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ensemble_client_path_key
-ON ensemble(client_host, path)
-WHERE client_host IS NOT NULL;
+CREATE TABLE IF NOT EXISTS client_ensemble (
+    client_host TEXT NOT NULL,
+    path TEXT NOT NULL,
+    info_hash TEXT NOT NULL,
+    ensemble TEXT NOT NULL,
+    element TEXT NOT NULL,
+    PRIMARY KEY(client_host, path),
+    FOREIGN KEY(client_host, info_hash)
+        REFERENCES client_searchee(client_host, info_hash)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_client_ensemble_path ON client_ensemble(path);
+CREATE INDEX IF NOT EXISTS idx_client_ensemble_info_hash ON client_ensemble(info_hash);
+CREATE INDEX IF NOT EXISTS idx_client_ensemble_lookup ON client_ensemble(ensemble, element);
 "#;
 
 fn block_on_runtime<F>(runtime: &Runtime, future: F) -> F::Output
@@ -2167,7 +2204,8 @@ mod tests {
             "current_torrent_dir",
             "client_searchee",
             "data",
-            "ensemble",
+            "data_ensemble",
+            "client_ensemble",
         ] {
             let count: i64 = database
                 .query_scalar(
@@ -2207,7 +2245,8 @@ mod tests {
         for index in [
             "idx_client_searchee_lookup",
             "idx_data_lookup",
-            "idx_ensemble_lookup",
+            "idx_data_ensemble_lookup",
+            "idx_client_ensemble_lookup",
         ] {
             assert_index(&database, index);
         }
@@ -2346,10 +2385,22 @@ mod tests {
             assert!(data_plan.contains("idx_data_lookup"), "{data_plan}");
             assert!(data_plan.contains("search_key=?"), "{data_plan}");
         }
-        let ensemble_plan = explain_detail(
+        let data_ensemble_plan = explain_detail(
             &database,
             "EXPLAIN QUERY PLAN
-             SELECT rowid FROM ensemble
+             SELECT rowid FROM data_ensemble
+             WHERE ensemble = ?1 AND element = ?2
+             ORDER BY rowid
+             LIMIT 100",
+            &[
+                SqlValue::Text(Cow::Borrowed("example show s01")),
+                SqlValue::Text(Cow::Borrowed("01")),
+            ],
+        );
+        let client_ensemble_plan = explain_detail(
+            &database,
+            "EXPLAIN QUERY PLAN
+             SELECT rowid FROM client_ensemble
              WHERE ensemble = ?1 AND element = ?2
              ORDER BY rowid
              LIMIT 100",
@@ -2360,8 +2411,12 @@ mod tests {
         );
 
         assert!(
-            ensemble_plan.contains("idx_ensemble_lookup"),
-            "{ensemble_plan}"
+            data_ensemble_plan.contains("idx_data_ensemble_lookup"),
+            "{data_ensemble_plan}"
+        );
+        assert!(
+            client_ensemble_plan.contains("idx_client_ensemble_lookup"),
+            "{client_ensemble_plan}"
         );
 
         let _cleanup = fs::remove_dir_all(root);
@@ -2492,15 +2547,15 @@ mod tests {
             .expect("title");
         assert_eq!(title, "One Updated");
         let ensemble_count: i64 = database
-            .query_scalar("SELECT COUNT(*) FROM ensemble", &[])
+            .query_scalar("SELECT COUNT(*) FROM data_ensemble", &[])
             .expect("ensemble count");
         assert_eq!(ensemble_count, 0);
         let _cleanup = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn upserts_data_dir_ensemble_rows_with_null_client_host() {
-        let root = temp_path("ensemble-null-client");
+    fn upserts_data_dir_ensemble_rows_with_data_source() {
+        let root = temp_path("ensemble-data-source");
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
 
@@ -2525,7 +2580,7 @@ mod tests {
 
         let row: (i64, Option<String>, String, String) = database
             .query_row(
-                "SELECT COUNT(*), info_hash, ensemble, element FROM ensemble",
+                "SELECT COUNT(*), info_hash, ensemble, element FROM data_ensemble",
                 &[],
                 |row| (row.get(0), row.get(1), row.get(2), row.get(3)),
             )
@@ -2735,7 +2790,7 @@ mod tests {
 
         assert_eq!(removed, 1);
         let ensemble_count: i64 = database
-            .query_scalar("SELECT COUNT(*) FROM ensemble", &[])
+            .query_scalar("SELECT COUNT(*) FROM client_ensemble", &[])
             .expect("ensemble count");
         assert_eq!(ensemble_count, 0);
         let _cleanup = fs::remove_dir_all(root);

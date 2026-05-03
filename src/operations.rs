@@ -218,9 +218,9 @@ pub async fn clear_cache_async(database: &AsyncDatabase) -> crate::Result<ClearC
 /// Clear cached client, torrent-dir, data-dir, and ensemble state.
 pub fn clear_client_cache(database: &Database) -> crate::Result<ClearClientCacheResult> {
     let torrents_removed = database.clear_table(CacheTable::Torrent)?;
+    let ensemble_removed = database.clear_table(CacheTable::Ensemble)?;
     let client_searchees_removed = database.clear_table(CacheTable::ClientSearchee)?;
     let data_removed = database.clear_table(CacheTable::Data)?;
-    let ensemble_removed = database.clear_table(CacheTable::Ensemble)?;
     Ok(ClearClientCacheResult {
         torrents_removed,
         client_searchees_removed,
@@ -234,9 +234,9 @@ pub async fn clear_client_cache_async(
     database: &AsyncDatabase,
 ) -> crate::Result<ClearClientCacheResult> {
     let torrents_removed = database.clear_table(CacheTable::Torrent).await?;
+    let ensemble_removed = database.clear_table(CacheTable::Ensemble).await?;
     let client_searchees_removed = database.clear_table(CacheTable::ClientSearchee).await?;
     let data_removed = database.clear_table(CacheTable::Data).await?;
-    let ensemble_removed = database.clear_table(CacheTable::Ensemble).await?;
     Ok(ClearClientCacheResult {
         torrents_removed,
         client_searchees_removed,
@@ -1805,8 +1805,8 @@ mod tests {
         let missing_ensemble = missing_ensemble.to_string_lossy();
         database
             .execute_sql(
-                "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
-                 VALUES (NULL, ?1, NULL, 'show s01', 'e01')",
+                "INSERT INTO data_ensemble (path, info_hash, ensemble, element)
+                 VALUES (?1, NULL, 'show s01', 'e01')",
                 &[SqlValue::Text(Cow::Borrowed(missing_ensemble.as_ref()))],
             )
             .expect("ensemble");
@@ -2132,19 +2132,34 @@ mod tests {
         database
             .refresh_client_searchees(
                 "localhost",
-                [ClientSearcheeRecord {
-                    client_host: "localhost",
-                    info_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    name: "Old.Show.S01E01",
-                    title: "Old Show S01E01",
-                    files: &stale_files,
-                    length: 1,
-                    save_path: "/downloads",
-                    category: None,
-                    tags: &[],
-                    trackers: &[],
-                    lookup: None,
-                }],
+                [
+                    ClientSearcheeRecord {
+                        client_host: "localhost",
+                        info_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        name: "Old.Show.S01E01",
+                        title: "Old Show S01E01",
+                        files: &stale_files,
+                        length: 1,
+                        save_path: "/downloads",
+                        category: None,
+                        tags: &[],
+                        trackers: &[],
+                        lookup: None,
+                    },
+                    ClientSearcheeRecord {
+                        client_host: "localhost",
+                        info_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        name: "Example.Show.S01E01",
+                        title: "Example Show S01E01",
+                        files: &stale_files,
+                        length: 1,
+                        save_path: "/downloads",
+                        category: None,
+                        tags: &[],
+                        trackers: &[],
+                        lookup: None,
+                    },
+                ],
             )
             .expect("seed client");
         database
@@ -2202,10 +2217,10 @@ mod tests {
             .query_scalar("SELECT COUNT(*) FROM client_searchee", &[])
             .expect("client count");
         let ensemble_path: String = database
-            .query_scalar("SELECT path FROM ensemble", &[])
+            .query_scalar("SELECT path FROM client_ensemble", &[])
             .expect("ensemble path");
         let ensemble_rows: i64 = database
-            .query_scalar("SELECT COUNT(*) FROM ensemble", &[])
+            .query_scalar("SELECT COUNT(*) FROM client_ensemble", &[])
             .expect("ensemble count");
         assert_eq!(client_rows, 1);
         assert_eq!(ensemble_rows, 1);
