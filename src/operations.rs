@@ -394,7 +394,7 @@ pub fn run_rss_workflow(
     refresh_torrent_and_data_indexes(database, config)?;
     let client_adapters = build_workflow_clients(config)?;
     let client_refs = client_refs(&client_adapters);
-    let client_searchees = collect_client_searchees(config, &client_refs)?;
+    refresh_workflow_client_searchees(database, config, &client_refs)?;
     let blocklist = Blocklist::parse(&config.block_list)?;
     let indexers = enabled_search_indexers(database, current_time_millis())?;
     let arr_configs = build_arr_configs(config)?;
@@ -403,9 +403,13 @@ pub fn run_rss_workflow(
     let local = find_all_searchees(
         &SearcheeSources {
             torrents: None,
-            use_client_torrents: config.use_client_torrents,
-            client_searchees: &client_searchees,
-            torrent_dir: config.torrent_dir.as_deref(),
+            use_client_torrents: false,
+            client_searchees: &[],
+            torrent_dir: if config.use_client_torrents {
+                None
+            } else {
+                config.torrent_dir.as_deref()
+            },
             data_dirs: &config.data_dirs,
             max_data_depth: config.max_data_depth,
         },
@@ -481,15 +485,19 @@ pub fn run_announce_match(
     refresh_torrent_and_data_indexes(database, config)?;
     let client_adapters = build_workflow_clients(config)?;
     let client_refs = client_refs(&client_adapters);
-    let client_searchees = collect_client_searchees(config, &client_refs)?;
+    refresh_workflow_client_searchees(database, config, &client_refs)?;
     let blocklist = Blocklist::parse(&config.block_list)?;
     let arr_configs = build_arr_configs(config)?;
     let local = find_all_searchees(
         &SearcheeSources {
             torrents: None,
-            use_client_torrents: config.use_client_torrents,
-            client_searchees: &client_searchees,
-            torrent_dir: config.torrent_dir.as_deref(),
+            use_client_torrents: false,
+            client_searchees: &[],
+            torrent_dir: if config.use_client_torrents {
+                None
+            } else {
+                config.torrent_dir.as_deref()
+            },
             data_dirs: &config.data_dirs,
             max_data_depth: config.max_data_depth,
         },
@@ -927,6 +935,83 @@ fn collect_client_searchees(
     Ok(output)
 }
 
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+struct ClientSearcheeRefreshCounts {
+    refreshed: usize,
+    ensemble_rows: usize,
+    pruned: usize,
+}
+
+fn refresh_workflow_client_searchees(
+    database: &Database,
+    config: &RuntimeConfig,
+    clients: &[&dyn TorrentClient],
+) -> crate::Result<()> {
+    if !config.use_client_torrents {
+        return Ok(());
+    }
+    for client in clients {
+        refresh_client_searchee_cache(database, config, *client)?;
+    }
+    Ok(())
+}
+
+fn refresh_client_searchee_cache(
+    database: &Database,
+    config: &RuntimeConfig,
+    client: &dyn TorrentClient,
+) -> crate::Result<ClientSearcheeRefreshCounts> {
+    let metadata = client.metadata().clone().into_owned();
+    database.begin_client_searchee_refresh()?;
+    let mut counts = ClientSearcheeRefreshCounts::default();
+    client.for_each_torrent(&mut |torrent| {
+        let Some(searchee) = client_torrent_to_searchee(&metadata, torrent) else {
+            return Ok(());
+        };
+        let Some(client_metadata) = &searchee.client else {
+            return Ok(());
+        };
+        let Some(info_hash) = searchee.info_hash.as_ref() else {
+            return Ok(());
+        };
+        let lookup = lookup_fields(&searchee);
+        database.upsert_client_searchee(&ClientSearcheeRecord {
+            client_host: metadata.host.as_ref(),
+            info_hash: info_hash.as_str(),
+            name: searchee.name.as_ref(),
+            title: searchee.title.as_ref(),
+            files: &searchee.files,
+            length: searchee.length,
+            save_path: client_metadata.save_path.as_ref(),
+            category: client_metadata
+                .category
+                .as_ref()
+                .map(|label| label.as_str()),
+            tags: &client_metadata.tags,
+            trackers: &client_metadata.trackers,
+            lookup: Some(&lookup),
+        })?;
+        database.mark_refreshed_client_info_hash(info_hash.as_str())?;
+        counts.refreshed = counts.refreshed.saturating_add(1);
+        if config.season_from_episodes.is_some() {
+            if let Some(ensemble) = episode_ensemble(&searchee) {
+                database.upsert_ensemble(&EnsembleRecord {
+                    client_host: Some(metadata.host.as_ref()),
+                    path: &ensemble.path,
+                    info_hash: Some(info_hash.as_str()),
+                    ensemble: &ensemble.ensemble,
+                    element: &ensemble.element,
+                })?;
+                database.mark_refreshed_client_ensemble_path(&ensemble.path)?;
+                counts.ensemble_rows = counts.ensemble_rows.saturating_add(1);
+            }
+        }
+        Ok(())
+    })?;
+    counts.pruned = database.finish_client_searchee_refresh(metadata.host.as_ref())?;
+    Ok(counts)
+}
+
 fn local_info_hashes(searchees: &[crate::domain::Searchee<'_>]) -> BTreeSet<String> {
     searchees
         .iter()
@@ -1169,62 +1254,15 @@ fn refresh_cleanup_client_searchees(
     result: &mut CleanupDbResult,
 ) -> crate::Result<()> {
     for client in clients {
-        let metadata = client.metadata().clone().into_owned();
-        database.begin_client_searchee_refresh()?;
-        let mut refreshed = 0usize;
-        let mut ensemble_rows = 0usize;
-        client.for_each_torrent(&mut |torrent| {
-            let Some(searchee) = client_torrent_to_searchee(&metadata, torrent) else {
-                return Ok(());
-            };
-            let Some(client_metadata) = &searchee.client else {
-                return Ok(());
-            };
-            let Some(info_hash) = searchee.info_hash.as_ref() else {
-                return Ok(());
-            };
-            let lookup = lookup_fields(&searchee);
-            database.upsert_client_searchee(&ClientSearcheeRecord {
-                client_host: metadata.host.as_ref(),
-                info_hash: info_hash.as_str(),
-                name: searchee.name.as_ref(),
-                title: searchee.title.as_ref(),
-                files: &searchee.files,
-                length: searchee.length,
-                save_path: client_metadata.save_path.as_ref(),
-                category: client_metadata
-                    .category
-                    .as_ref()
-                    .map(|label| label.as_str()),
-                tags: &client_metadata.tags,
-                trackers: &client_metadata.trackers,
-                lookup: Some(&lookup),
-            })?;
-            database.mark_refreshed_client_info_hash(info_hash.as_str())?;
-            refreshed = refreshed.saturating_add(1);
-            if config.season_from_episodes.is_some() {
-                if let Some(ensemble) = episode_ensemble(&searchee) {
-                    database.upsert_ensemble(&EnsembleRecord {
-                        client_host: Some(metadata.host.as_ref()),
-                        path: &ensemble.path,
-                        info_hash: Some(info_hash.as_str()),
-                        ensemble: &ensemble.ensemble,
-                        element: &ensemble.element,
-                    })?;
-                    database.mark_refreshed_client_ensemble_path(&ensemble.path)?;
-                    ensemble_rows = ensemble_rows.saturating_add(1);
-                }
-            }
-            Ok(())
-        })?;
-        result.client_searchees_refreshed =
-            result.client_searchees_refreshed.saturating_add(refreshed);
+        let counts = refresh_client_searchee_cache(database, config, *client)?;
+        result.client_searchees_refreshed = result
+            .client_searchees_refreshed
+            .saturating_add(counts.refreshed);
         result.client_ensemble_rows_rebuilt = result
             .client_ensemble_rows_rebuilt
-            .saturating_add(ensemble_rows);
-        result.client_searchees_pruned = result
-            .client_searchees_pruned
-            .saturating_add(database.finish_client_searchee_refresh(metadata.host.as_ref())?);
+            .saturating_add(counts.ensemble_rows);
+        result.client_searchees_pruned =
+            result.client_searchees_pruned.saturating_add(counts.pruned);
     }
     Ok(())
 }
@@ -1511,9 +1549,9 @@ mod tests {
     use super::{
         api_key, api_key_async, cleanup_db, cleanup_db_with_clients, clear_cache,
         clear_cache_async, clear_client_cache, clear_client_cache_async, clear_indexer_failures,
-        clear_indexer_failures_async, reset_api_key, reset_api_key_async, rss_time_since_last_run,
-        run_announce_match, run_webhook_search, update_torrent_cache_trackers,
-        webhook_matches_request, webhook_targets_and_excluded,
+        clear_indexer_failures_async, refresh_workflow_client_searchees, reset_api_key,
+        reset_api_key_async, rss_time_since_last_run, run_announce_match, run_webhook_search,
+        update_torrent_cache_trackers, webhook_matches_request, webhook_targets_and_excluded,
     };
     use crate::{
         api::WebhookRequest,
@@ -2162,6 +2200,49 @@ mod tests {
         let _cleanup = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn workflow_client_refresh_uses_streaming_inventory() {
+        let root = temp_path("workflow-client-cache");
+        fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let client = FakeClient::new(vec![ClientTorrent {
+            info_hash: InfoHash::new("cccccccccccccccccccccccccccccccccccccccc")
+                .expect("hash")
+                .into_owned(),
+            name: Cow::Borrowed("Streaming.Show.S01E01"),
+            files: vec![File::new("Streaming.Show.S01E01.mkv", 42)],
+            save_path: Cow::Borrowed("/downloads"),
+            category: None,
+            tags: Vec::new(),
+            trackers: Vec::new(),
+            complete: true,
+            checking: false,
+        }]);
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                use_client_torrents: Some(true),
+                torrent_clients: vec![
+                    crate::config::TorrentClientConfig::parse("qbittorrent:http://localhost:8080")
+                        .expect("client"),
+                ],
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let clients: [&dyn TorrentClient; 1] = [&client];
+
+        refresh_workflow_client_searchees(&database, &config, &clients).expect("refresh");
+
+        let rows = database.client_searchee_rows().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].info_hash,
+            "cccccccccccccccccccccccccccccccccccccccc"
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
     fn insert_decision(
         database: &Database,
         searchee_id: i64,
@@ -2228,7 +2309,19 @@ mod tests {
         }
 
         fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
-            Ok(self.torrents.clone())
+            Err(super::operation_error(
+                "operation workflows must use the streaming torrent visitor",
+            ))
+        }
+
+        fn for_each_torrent(
+            &self,
+            visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+        ) -> crate::Result<()> {
+            for torrent in self.torrents.iter().cloned() {
+                visitor(torrent)?;
+            }
+            Ok(())
         }
 
         fn get_download_dir(

@@ -238,12 +238,14 @@ pub trait TorrentClient {
     /// Map client inventory to searchable searchees.
     fn get_client_searchees(&self) -> crate::Result<ClientSearcheeResult> {
         let mut result = ClientSearcheeResult::default();
-        for torrent in self.get_all_torrents()? {
-            match client_torrent_to_searchee(self.metadata(), torrent) {
+        let metadata = self.metadata().clone().into_owned();
+        self.for_each_torrent(&mut |torrent| {
+            match client_torrent_to_searchee(&metadata, torrent) {
                 Some(searchee) => result.searchees.push(searchee),
                 None => result.skipped += 1,
             }
-        }
+            Ok(())
+        })?;
         Ok(result)
     }
 
