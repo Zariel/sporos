@@ -883,9 +883,6 @@ fn config_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 
 fn dev_mode_enabled() -> bool {
     env::var_os("DEV").is_some()
-        || env::var("NODE_ENV")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "dev" | "development"))
-            .unwrap_or(false)
         || env::var("SPOROS_ENV")
             .map(|value| matches!(value.to_ascii_lowercase().as_str(), "dev" | "development"))
             .unwrap_or(false)
