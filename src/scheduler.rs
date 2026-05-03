@@ -124,6 +124,8 @@ pub struct JobCheckResult {
     pub name: JobName,
     /// Runtime config overrides for this run.
     pub config_override: JobConfigOverride,
+    /// `job_log.last_run` value to persist if the dispatched body succeeds.
+    pub completion_last_run: Option<i64>,
     /// Whether the job was dispatched.
     pub ran: bool,
     /// Why the job did not run.
@@ -377,6 +379,7 @@ impl Scheduler {
                 results.push(JobCheckResult {
                     name: job.name,
                     config_override: JobConfigOverride::default(),
+                    completion_last_run: None,
                     ran: false,
                     skipped: Some(Cow::Borrowed("disabled")),
                 });
@@ -386,6 +389,7 @@ impl Scheduler {
                 results.push(JobCheckResult {
                     name: job.name,
                     config_override: JobConfigOverride::default(),
+                    completion_last_run: None,
                     ran: false,
                     skipped: Some(Cow::Borrowed("already active")),
                 });
@@ -396,6 +400,7 @@ impl Scheduler {
                     results.push(JobCheckResult {
                         name: job.name,
                         config_override: JobConfigOverride::default(),
+                        completion_last_run: None,
                         ran: false,
                         skipped: Some(Cow::Borrowed("rss active")),
                     });
@@ -405,6 +410,7 @@ impl Scheduler {
                     results.push(JobCheckResult {
                         name: job.name,
                         config_override: JobConfigOverride::default(),
+                        completion_last_run: None,
                         ran: false,
                         skipped: Some(Cow::Borrowed("another job active")),
                     });
@@ -414,6 +420,7 @@ impl Scheduler {
                     results.push(JobCheckResult {
                         name: job.name,
                         config_override: JobConfigOverride::default(),
+                        completion_last_run: None,
                         ran: false,
                         skipped: Some(Cow::Borrowed("not due")),
                     });
@@ -421,18 +428,27 @@ impl Scheduler {
                 }
             }
             let config_override = job.run();
-            if config_override.is_some() {
-                let persisted = if job.delay_next_run {
+            let completion_last_run = if config_override.is_some() {
+                Some(if job.delay_next_run {
                     job.delay_next_run = false;
                     now_millis.saturating_add(job.cadence_millis as i64)
                 } else {
                     now_millis
-                };
-                write_last_run(database, job.name, persisted)?;
+                })
+            } else {
+                None
+            };
+            if let Some(completion_last_run) = completion_last_run {
+                tracing::debug!(
+                    job = job.name.as_str(),
+                    completion_last_run,
+                    "scheduler job dispatch awaiting completion"
+                );
             }
             results.push(JobCheckResult {
                 name: job.name,
                 config_override: config_override.unwrap_or_default(),
+                completion_last_run,
                 ran: config_override.is_some(),
                 skipped: config_override
                     .is_none()
@@ -471,6 +487,7 @@ impl Scheduler {
                 results.push(JobCheckResult {
                     name: job.name,
                     config_override: JobConfigOverride::default(),
+                    completion_last_run: None,
                     ran: false,
                     skipped: Some(Cow::Borrowed("disabled")),
                 });
@@ -480,6 +497,7 @@ impl Scheduler {
                 results.push(JobCheckResult {
                     name: job.name,
                     config_override: JobConfigOverride::default(),
+                    completion_last_run: None,
                     ran: false,
                     skipped: Some(Cow::Borrowed("already active")),
                 });
@@ -490,6 +508,7 @@ impl Scheduler {
                     results.push(JobCheckResult {
                         name: job.name,
                         config_override: JobConfigOverride::default(),
+                        completion_last_run: None,
                         ran: false,
                         skipped: Some(Cow::Borrowed("rss active")),
                     });
@@ -499,6 +518,7 @@ impl Scheduler {
                     results.push(JobCheckResult {
                         name: job.name,
                         config_override: JobConfigOverride::default(),
+                        completion_last_run: None,
                         ran: false,
                         skipped: Some(Cow::Borrowed("another job active")),
                     });
@@ -508,6 +528,7 @@ impl Scheduler {
                     results.push(JobCheckResult {
                         name: job.name,
                         config_override: JobConfigOverride::default(),
+                        completion_last_run: None,
                         ran: false,
                         skipped: Some(Cow::Borrowed("not due")),
                     });
@@ -515,20 +536,27 @@ impl Scheduler {
                 }
             }
             let config_override = job.run();
-            if config_override.is_some() {
-                let persisted = if job.delay_next_run {
+            let completion_last_run = if config_override.is_some() {
+                Some(if job.delay_next_run {
                     job.delay_next_run = false;
                     now_millis.saturating_add(job.cadence_millis as i64)
                 } else {
                     now_millis
-                };
-                database
-                    .write_last_run(job.name.as_str(), persisted)
-                    .await?;
+                })
+            } else {
+                None
+            };
+            if let Some(completion_last_run) = completion_last_run {
+                tracing::debug!(
+                    job = job.name.as_str(),
+                    completion_last_run,
+                    "scheduler job dispatch awaiting completion"
+                );
             }
             results.push(JobCheckResult {
                 name: job.name,
                 config_override: config_override.unwrap_or_default(),
+                completion_last_run,
                 ran: config_override.is_some(),
                 skipped: config_override
                     .is_none()
@@ -548,10 +576,6 @@ impl Scheduler {
 
 fn read_last_run(database: &Database, name: JobName) -> crate::Result<Option<i64>> {
     database.read_last_run(name.as_str())
-}
-
-fn write_last_run(database: &Database, name: JobName, last_run: i64) -> crate::Result<()> {
-    database.write_last_run(name.as_str(), last_run)
 }
 
 fn scheduler_error(message: impl Into<Cow<'static, str>>) -> SporosError {
@@ -574,7 +598,7 @@ mod tests {
     };
 
     #[test]
-    fn check_jobs_runs_due_jobs_and_persists_last_run() {
+    fn check_jobs_runs_due_jobs_and_defers_last_run() {
         let root = temp_path("scheduler-due");
         std::fs::create_dir_all(&root).expect("root");
         let database = Database::open_app_dir(&root).expect("database");
@@ -589,17 +613,17 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|result| result.ran));
+        assert_eq!(results[0].completion_last_run, Some(1_000));
         assert_eq!(scheduler.jobs()[0].runs, 1);
-        let last_run: i64 = database
+        let last_run = database
             .read_last_run(JobName::Search.as_str())
-            .expect("last run")
             .expect("last run");
-        assert_eq!(last_run, 1_000);
+        assert_eq!(last_run, None);
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn async_check_jobs_runs_due_jobs_and_persists_last_run() {
+    async fn async_check_jobs_runs_due_jobs_and_defers_last_run() {
         let root = temp_path("scheduler-async-due");
         std::fs::create_dir_all(&root).expect("root");
         let database = AsyncDatabase::open_app_dir(&root).await.expect("database");
@@ -615,13 +639,13 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|result| result.ran));
+        assert_eq!(results[0].completion_last_run, Some(1_000));
         assert_eq!(scheduler.jobs()[0].runs, 1);
-        let last_run: i64 = database
+        let last_run = database
             .read_last_run(JobName::Search.as_str())
             .await
-            .expect("last run")
-            .expect("search last run");
-        assert_eq!(last_run, 1_000);
+            .expect("last run");
+        assert_eq!(last_run, None);
         database.close().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -648,14 +672,14 @@ mod tests {
         assert!(scheduler.jobs()[0].run_ahead_of_schedule);
         assert!(scheduler.jobs()[0].delay_next_run);
 
-        scheduler
+        let results = scheduler
             .check_jobs(&database, 1_000, false)
             .expect("check");
-        let last_run: i64 = database
+        assert_eq!(results[0].completion_last_run, Some(61_000));
+        let last_run = database
             .read_last_run(JobName::Search.as_str())
-            .expect("last run")
             .expect("last run");
-        assert_eq!(last_run, 61_000);
+        assert_eq!(last_run, None);
         assert!(!scheduler.jobs()[0].delay_next_run);
         let _cleanup = std::fs::remove_dir_all(root);
     }

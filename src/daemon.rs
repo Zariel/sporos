@@ -83,7 +83,7 @@ async fn run_plan(
         shutdown.child_token(),
     )
     .await;
-    finish_executed_jobs(&mut plan.scheduler, startup_jobs)?;
+    finish_executed_jobs(&mut plan.scheduler, &async_database, startup_jobs).await?;
 
     let mut server_state = None;
     let server = if let Some(address) = listen_address(config) {
@@ -137,9 +137,9 @@ async fn run_plan(
                 .await;
                 if let Some(state) = &server_state {
                     let mut scheduler = state.scheduler.lock().await;
-                    finish_executed_jobs(&mut scheduler, executed_jobs)?;
+                    finish_executed_jobs(&mut scheduler, &async_database, executed_jobs).await?;
                 } else {
-                    finish_executed_jobs(&mut plan.scheduler, executed_jobs)?;
+                    finish_executed_jobs(&mut plan.scheduler, &async_database, executed_jobs).await?;
                 }
                 iterations = iterations.saturating_add(1);
             }
@@ -260,7 +260,7 @@ async fn handle_runtime_request(
     .await;
     if !executed_jobs.is_empty() {
         let mut scheduler = state.scheduler.lock().await;
-        finish_executed_jobs(&mut scheduler, executed_jobs)?;
+        finish_executed_jobs(&mut scheduler, &async_database, executed_jobs).await?;
     }
     async_database.close().await;
     Ok(response)
@@ -282,6 +282,7 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
 
 struct ExecutedJob {
     name: JobName,
+    completion_last_run: Option<i64>,
     result: Option<crate::Result<()>>,
 }
 
@@ -301,6 +302,7 @@ async fn execute_ran_jobs(
             tracing::info!(job = result.name.as_str(), "job cancelled during shutdown");
             executed.push(ExecutedJob {
                 name: result.name,
+                completion_last_run: result.completion_last_run,
                 result: None,
             });
             continue;
@@ -316,24 +318,38 @@ async fn execute_ran_jobs(
         };
         executed.push(ExecutedJob {
             name: result.name,
+            completion_last_run: result.completion_last_run,
             result: job_result,
         });
     }
     executed
 }
 
-fn finish_executed_jobs(
+async fn finish_executed_jobs(
     scheduler: &mut Scheduler,
+    database: &AsyncDatabase,
     executed_jobs: Vec<ExecutedJob>,
 ) -> crate::Result<()> {
     let mut first_error = None;
     for executed in executed_jobs {
         scheduler.finish_job(executed.name);
-        if first_error.is_none()
-            && let Some(result) = executed.result
-        {
-            if let Err(error) = result {
-                first_error = Some(error);
+        if let Some(result) = executed.result {
+            match result {
+                Ok(()) => {
+                    if let Some(last_run) = executed.completion_last_run
+                        && let Err(error) = database
+                            .write_last_run(executed.name.as_str(), last_run)
+                            .await
+                        && first_error.is_none()
+                    {
+                        first_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
     }
@@ -621,7 +637,7 @@ async fn run_webhook_worker(
             shutdown.child_token(),
         )
         .await;
-        finish_executed_jobs(&mut plan.scheduler, executed_jobs)?;
+        finish_executed_jobs(&mut plan.scheduler, &async_database, executed_jobs).await?;
     }
     let notifier = crate::notifications::NotificationSender::from_config(
         &config,
@@ -656,11 +672,14 @@ async fn run_webhook_worker(
 mod tests {
     use super::{MAX_REQUEST_BODY_BYTES, handle_runtime_request, run_plan};
     use crate::{
+        SporosError,
         api::{ApiMethod, ApiRequest, handle_api_request},
         config::{RawConfig, RuntimeConfig, TorrentClientConfig},
         persistence::{AsyncDatabase, Database},
         runtime::{RuntimeServices, RuntimeTaskQueue},
-        scheduler::{DaemonPlan, JobCheckResult, JobConfigOverride, JobName},
+        scheduler::{
+            DaemonPlan, JobCheckResult, JobConfigOverride, JobName, ScheduledJob, Scheduler,
+        },
     };
     use std::{
         collections::BTreeMap,
@@ -1005,6 +1024,7 @@ mod tests {
         let results = vec![JobCheckResult {
             name: JobName::Search,
             config_override: JobConfigOverride::default(),
+            completion_last_run: Some(1_000),
             ran: true,
             skipped: None,
         }];
@@ -1029,6 +1049,56 @@ mod tests {
         let _held = held_matching.await.expect("held matching joins");
         let _cleanup = std::fs::remove_dir_all(root);
         let _cleanup = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn finish_jobs_persists_last_run_only_after_success() {
+        let root = temp_path("daemon-finish-last-run");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+        let mut search = ScheduledJob::new(JobName::Search, 60_000, true);
+        search.is_active = true;
+        let mut rss = ScheduledJob::new(JobName::Rss, 60_000, true);
+        rss.is_active = true;
+        let mut scheduler = Scheduler::new(vec![search, rss]);
+
+        let result = super::finish_executed_jobs(
+            &mut scheduler,
+            &database,
+            vec![
+                super::ExecutedJob {
+                    name: JobName::Search,
+                    completion_last_run: Some(1_000),
+                    result: Some(Ok(())),
+                },
+                super::ExecutedJob {
+                    name: JobName::Rss,
+                    completion_last_run: Some(2_000),
+                    result: Some(Err(SporosError::configuration("rss failed"))),
+                },
+            ],
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            database
+                .read_last_run(JobName::Search.as_str())
+                .await
+                .expect("search last run"),
+            Some(1_000)
+        );
+        assert_eq!(
+            database
+                .read_last_run(JobName::Rss.as_str())
+                .await
+                .expect("rss last run"),
+            None
+        );
+        assert!(!scheduler.jobs()[0].is_active);
+        assert!(!scheduler.jobs()[1].is_active);
+        database.close().await;
+        let _cleanup = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
