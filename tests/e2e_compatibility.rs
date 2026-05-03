@@ -29,25 +29,6 @@ use sporos::{
     torrent::{SavedTorrentMetadata, parse_metafile},
 };
 
-const REQUIRED_E2E_SCENARIOS: &[&str] = &[
-    "save search",
-    "inject search",
-    "partial linking with auto-resume guard",
-    "data-dir source with linking",
-    "RSS reverse lookup",
-    "announce reverse lookup",
-    "webhook targeted search",
-    "saved torrent retry",
-    "restore from cache",
-];
-
-#[test]
-fn documented_e2e_scenario_registry_is_complete() {
-    assert_eq!(REQUIRED_E2E_SCENARIOS.len(), 9);
-    assert!(REQUIRED_E2E_SCENARIOS.contains(&"save search"));
-    assert!(REQUIRED_E2E_SCENARIOS.contains(&"restore from cache"));
-}
-
 #[test]
 fn save_link_inject_retry_and_restore_e2e_paths() {
     let root = temp_path("save-link-inject");
