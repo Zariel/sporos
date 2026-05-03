@@ -136,10 +136,9 @@ sporos implements the torrent cross-seeding behavior documented in
 `docs/internal`. Treat those documents as the functional and API contract for
 CLI flags, TOML config semantics, HTTP API behavior, torrent cache and output
 filenames, matching decisions, scheduler behavior, and torrent-client side
-effects. Exact JavaScript configuration and Node SQLite persistence
-compatibility are not design goals. Do not add migration or import support for
-cross-seed JavaScript/ESM config files; this is a green-room TOML
-configuration design.
+effects. The Rust-native TOML configuration and initial Rust schema are the
+supported contract; do not add alternate configuration loaders or schema
+compatibility layers unless a ticket explicitly changes that contract.
 
 ## Conventions & Patterns
 
