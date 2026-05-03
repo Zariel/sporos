@@ -472,11 +472,7 @@ pub fn run_webhook_search(
         },
         Label::Webhook,
     )?;
-    let targets = local
-        .into_iter()
-        .filter(|searchee| webhook_matches_request(searchee, &request))
-        .collect::<Vec<_>>();
-    let excluded = local_info_hashes(&targets);
+    let (targets, excluded) = webhook_targets_and_excluded(local, &request);
     let mut options =
         search_pipeline_options(&config, &blocklist, &excluded, &arr_configs, Label::Webhook);
     if request.ignore_cross_seeds {
@@ -758,6 +754,18 @@ fn local_info_hashes(searchees: &[crate::domain::Searchee<'_>]) -> BTreeSet<Stri
         .filter_map(|searchee| searchee.info_hash.as_ref())
         .map(ToString::to_string)
         .collect()
+}
+
+fn webhook_targets_and_excluded(
+    local: Vec<crate::domain::Searchee<'static>>,
+    request: &WebhookRequest,
+) -> (Vec<crate::domain::Searchee<'static>>, BTreeSet<String>) {
+    let excluded = local_info_hashes(&local);
+    let targets = local
+        .into_iter()
+        .filter(|searchee| webhook_matches_request(searchee, request))
+        .collect();
+    (targets, excluded)
 }
 
 fn webhook_matches_request(
@@ -1380,6 +1388,7 @@ mod tests {
         api_key, cleanup_db, cleanup_db_with_clients, clear_cache, clear_client_cache,
         clear_indexer_failures, reset_api_key, rss_time_since_last_run, run_announce_match,
         run_webhook_search, update_torrent_cache_trackers, webhook_matches_request,
+        webhook_targets_and_excluded,
     };
     use crate::{
         api::WebhookRequest,
@@ -1806,6 +1815,40 @@ mod tests {
 
         assert!(webhook_matches_request(&searchee, &request));
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn webhook_search_excludes_all_local_hashes_not_only_targets() {
+        let mut target = Searchee::from_files(
+            "Target",
+            "Target",
+            vec![File::new("/downloads/target.mkv", 5)],
+        );
+        target.path = Some(Cow::Borrowed("/downloads/target.mkv"));
+        let mut other = Searchee::from_files(
+            "Existing",
+            "Existing",
+            vec![File::new("/downloads/existing.mkv", 5)],
+        );
+        other.info_hash = Some(InfoHash::from_validated(
+            "0123456789abcdef0123456789abcdef01234567",
+        ));
+        let request = WebhookRequest {
+            info_hash: None,
+            path: Some("/downloads/target.mkv".to_owned()),
+            ignore_cross_seeds: false,
+            ignore_exclude_recent_search: false,
+            ignore_exclude_older: false,
+            ignore_block_list: false,
+            include_single_episodes: false,
+            include_non_videos: false,
+        };
+
+        let (targets, excluded) =
+            webhook_targets_and_excluded(vec![target.into_owned(), other.into_owned()], &request);
+
+        assert_eq!(targets.len(), 1);
+        assert!(excluded.contains("0123456789abcdef0123456789abcdef01234567"));
     }
 
     #[test]
