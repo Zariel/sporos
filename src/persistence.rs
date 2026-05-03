@@ -963,6 +963,99 @@ impl Database {
         })
     }
 
+    /// Select one bounded page of likely client reverse lookup rows.
+    pub fn reverse_lookup_client_page(
+        &self,
+        criteria: &ReverseLookupCriteria<'_>,
+        after_rowid: i64,
+        limit: i64,
+    ) -> crate::Result<Vec<ReverseLookupClientRecord>> {
+        if criteria.search_keys.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        self.block_on(async {
+            let key_placeholders = placeholders(criteria.search_keys.len());
+            let sql = format!(
+                "SELECT rowid, client_host, info_hash, title
+                 FROM client_searchee
+                 WHERE rowid > ?
+                 AND (
+                    search_key IS NULL
+                    OR (
+                        search_key IN ({key_placeholders})
+                        AND (? IS NULL OR media_type IS NULL OR media_type = ?)
+                        AND (? IS NULL OR season IS NULL OR season = ?)
+                        AND (? IS NULL OR episode IS NULL OR episode = ?)
+                        AND (? IS NULL OR length >= ?)
+                        AND (? IS NULL OR length <= ?)
+                    )
+                 )
+                 ORDER BY rowid
+                 LIMIT ?"
+            );
+            let params = reverse_lookup_params(criteria, after_rowid, limit);
+            let rows = bind_values(sqlx::query(&sql), &params)
+                .fetch_all(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| ReverseLookupClientRecord {
+                    rowid: row.get(0),
+                    client_host: row.get(1),
+                    info_hash: row.get(2),
+                    title: row.get(3),
+                })
+                .collect())
+        })
+    }
+
+    /// Select one bounded page of likely data-dir reverse lookup rows.
+    pub fn reverse_lookup_data_page(
+        &self,
+        criteria: &ReverseLookupCriteria<'_>,
+        after_rowid: i64,
+        limit: i64,
+    ) -> crate::Result<Vec<ReverseLookupDataRecord>> {
+        if criteria.search_keys.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        self.block_on(async {
+            let key_placeholders = placeholders(criteria.search_keys.len());
+            let sql = format!(
+                "SELECT rowid, path, title
+                 FROM data
+                 WHERE rowid > ?
+                 AND (
+                    search_key IS NULL
+                    OR (
+                        search_key IN ({key_placeholders})
+                        AND (? IS NULL OR media_type IS NULL OR media_type = ?)
+                        AND (? IS NULL OR season IS NULL OR season = ?)
+                        AND (? IS NULL OR episode IS NULL OR episode = ?)
+                        AND (? IS NULL OR length IS NULL OR length >= ?)
+                        AND (? IS NULL OR length IS NULL OR length <= ?)
+                    )
+                 )
+                 ORDER BY rowid
+                 LIMIT ?"
+            );
+            let params = reverse_lookup_params(criteria, after_rowid, limit);
+            let rows = bind_values(sqlx::query(&sql), &params)
+                .fetch_all(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| ReverseLookupDataRecord {
+                    rowid: row.get(0),
+                    path: row.get(1),
+                    title: row.get(2),
+                })
+                .collect())
+        })
+    }
+
     /// Load virtual season and episode rows.
     pub fn ensemble_rows(
         &self,
@@ -1630,6 +1723,47 @@ pub struct DataCacheRecord {
     pub title: String,
 }
 
+/// Candidate-derived filters for paged reverse lookup selectors.
+#[derive(Debug, Clone, Copy)]
+pub struct ReverseLookupCriteria<'a> {
+    /// Normalized candidate title keys.
+    pub search_keys: &'a [String],
+    /// Candidate media type string.
+    pub media_type: Option<&'a str>,
+    /// Candidate season when present.
+    pub season: Option<u32>,
+    /// Candidate episode when present.
+    pub episode: Option<u32>,
+    /// Inclusive lower byte bound.
+    pub min_length: Option<u64>,
+    /// Inclusive upper byte bound.
+    pub max_length: Option<u64>,
+}
+
+/// Compact client reverse lookup selector row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReverseLookupClientRecord {
+    /// SQLite rowid used for stable paging.
+    pub rowid: i64,
+    /// Client host needed for hydration.
+    pub client_host: String,
+    /// Info hash needed for hydration.
+    pub info_hash: String,
+    /// Parsed title used by the fuzzy Rust matcher.
+    pub title: String,
+}
+
+/// Compact data-dir reverse lookup selector row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReverseLookupDataRecord {
+    /// SQLite rowid used for stable paging.
+    pub rowid: i64,
+    /// Data path needed for hydration.
+    pub path: String,
+    /// Parsed title used by the fuzzy Rust matcher.
+    pub title: String,
+}
+
 /// Ensemble cache row.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct EnsembleCacheRecord {
@@ -1852,6 +1986,70 @@ fn bind_values<'q>(
     query
 }
 
+fn placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn reverse_lookup_params<'a>(
+    criteria: &'a ReverseLookupCriteria<'a>,
+    after_rowid: i64,
+    limit: i64,
+) -> Vec<SqlValue<'a>> {
+    let mut params = Vec::with_capacity(criteria.search_keys.len().saturating_add(12));
+    params.push(SqlValue::I64(after_rowid));
+    params.extend(
+        criteria
+            .search_keys
+            .iter()
+            .map(|key| SqlValue::Text(Cow::Borrowed(key.as_str()))),
+    );
+    push_text_pair(&mut params, criteria.media_type);
+    push_i64_pair(&mut params, criteria.season.map(i64::from));
+    push_i64_pair(&mut params, criteria.episode.map(i64::from));
+    push_i64_pair(
+        &mut params,
+        criteria
+            .min_length
+            .map(|length| i64::try_from(length).unwrap_or(i64::MAX)),
+    );
+    push_i64_pair(
+        &mut params,
+        criteria
+            .max_length
+            .map(|length| i64::try_from(length).unwrap_or(i64::MAX)),
+    );
+    params.push(SqlValue::I64(limit));
+    params
+}
+
+fn push_text_pair<'a>(params: &mut Vec<SqlValue<'a>>, value: Option<&'a str>) {
+    match value {
+        Some(value) => {
+            params.push(SqlValue::Text(Cow::Borrowed(value)));
+            params.push(SqlValue::Text(Cow::Borrowed(value)));
+        }
+        None => {
+            params.push(SqlValue::Null);
+            params.push(SqlValue::Null);
+        }
+    }
+}
+
+fn push_i64_pair<'a>(params: &mut Vec<SqlValue<'a>>, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            params.push(SqlValue::I64(value));
+            params.push(SqlValue::I64(value));
+        }
+        None => {
+            params.push(SqlValue::Null);
+            params.push(SqlValue::Null);
+        }
+    }
+}
+
 fn client_searchee_record(row: SqliteRow) -> ClientSearcheeCacheRecord {
     ClientSearcheeCacheRecord {
         client_host: row.get(0),
@@ -1915,9 +2113,9 @@ fn strings_json(values: &[std::borrow::Cow<'_, str>]) -> crate::Result<String> {
 mod tests {
     use super::{
         AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord,
-        EnsembleRecord, SqlValue,
+        EnsembleRecord, ReverseLookupCriteria, SqlValue,
     };
-    use crate::domain::{ClientLabel, Decision, File};
+    use crate::domain::{ClientLabel, Decision, File, LookupFields, MediaType};
     use sqlx::Row;
     use std::{
         borrow::Cow,
@@ -2246,6 +2444,151 @@ mod tests {
     }
 
     #[test]
+    fn reverse_lookup_selectors_page_compact_rows() {
+        let root = temp_path("reverse-selectors");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let files = [File::new("Example.Show.S01E01.mkv", 10)];
+        let lookup = lookup_fields("example.show.s01e01", Some(1), Some(1), 10);
+        let other_lookup = lookup_fields("other.show.s01e01", Some(1), Some(1), 10);
+        for (info_hash, title, lookup) in [
+            (
+                "0123456789abcdef0123456789abcdef01234567",
+                "Example Show S01E01",
+                &lookup,
+            ),
+            (
+                "fedcba9876543210fedcba9876543210fedcba98",
+                "Example Show S01E01",
+                &lookup,
+            ),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "Other Show S01E01",
+                &other_lookup,
+            ),
+        ] {
+            database
+                .upsert_client_searchee(&ClientSearcheeRecord {
+                    client_host: "client",
+                    info_hash,
+                    name: title,
+                    title,
+                    files: &files,
+                    length: 10,
+                    save_path: "/downloads",
+                    category: None,
+                    tags: &[],
+                    trackers: &[],
+                    lookup: Some(lookup),
+                })
+                .expect("client row");
+        }
+        for (path, title, lookup) in [
+            ("/data/example-a", "Example Show S01E01", &lookup),
+            ("/data/example-b", "Example Show S01E01", &lookup),
+            ("/data/other", "Other Show S01E01", &other_lookup),
+        ] {
+            database
+                .upsert_data_root(&DataRootRecord {
+                    path,
+                    title,
+                    lookup: Some(lookup),
+                })
+                .expect("data row");
+        }
+        let keys = vec!["example.show.s01e01".to_owned()];
+        let criteria = ReverseLookupCriteria {
+            search_keys: &keys,
+            media_type: Some("episode"),
+            season: Some(1),
+            episode: Some(1),
+            min_length: Some(1),
+            max_length: Some(100),
+        };
+
+        let first_client = database
+            .reverse_lookup_client_page(&criteria, 0, 1)
+            .expect("client page");
+        assert_eq!(first_client.len(), 1);
+        assert_eq!(first_client[0].title, "Example Show S01E01");
+        let second_client = database
+            .reverse_lookup_client_page(&criteria, first_client[0].rowid, 10)
+            .expect("client page");
+        assert_eq!(second_client.len(), 1);
+        assert_eq!(
+            second_client[0].info_hash,
+            "fedcba9876543210fedcba9876543210fedcba98"
+        );
+
+        let first_data = database
+            .reverse_lookup_data_page(&criteria, 0, 1)
+            .expect("data page");
+        assert_eq!(first_data.len(), 1);
+        assert_eq!(first_data[0].path, "/data/example-a");
+        let second_data = database
+            .reverse_lookup_data_page(&criteria, first_data[0].rowid, 10)
+            .expect("data page");
+        assert_eq!(second_data.len(), 1);
+        assert_eq!(second_data[0].path, "/data/example-b");
+
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reverse_lookup_selectors_include_unindexed_rows() {
+        let root = temp_path("reverse-selector-stale");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let files = [File::new("Stale.Show.S01E01.mkv", 10)];
+        database
+            .upsert_client_searchee(&ClientSearcheeRecord {
+                client_host: "client",
+                info_hash: "0123456789abcdef0123456789abcdef01234567",
+                name: "Stale Show S01E01",
+                title: "Stale Show S01E01",
+                files: &files,
+                length: 10,
+                save_path: "/downloads",
+                category: None,
+                tags: &[],
+                trackers: &[],
+                lookup: None,
+            })
+            .expect("client row");
+        database
+            .upsert_data_root(&DataRootRecord {
+                path: "/data/stale",
+                title: "Stale Show S01E01",
+                lookup: None,
+            })
+            .expect("data row");
+        let keys = vec!["example.show.s01e01".to_owned()];
+        let criteria = ReverseLookupCriteria {
+            search_keys: &keys,
+            media_type: Some("episode"),
+            season: Some(1),
+            episode: Some(1),
+            min_length: Some(1),
+            max_length: Some(100),
+        };
+
+        let client_rows = database
+            .reverse_lookup_client_page(&criteria, 0, 10)
+            .expect("client page");
+        let data_rows = database
+            .reverse_lookup_data_page(&criteria, 0, 10)
+            .expect("data page");
+
+        assert_eq!(client_rows.len(), 1);
+        assert_eq!(client_rows[0].title, "Stale Show S01E01");
+        assert_eq!(data_rows.len(), 1);
+        assert_eq!(data_rows[0].path, "/data/stale");
+
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn stores_client_searchee_json_and_prunes_by_host() {
         let root = temp_path("client-searchees");
         fs::create_dir_all(&root).expect("temp dir");
@@ -2328,5 +2671,23 @@ mod tests {
         database
             .query_row(sql, params, |row| row.get(3))
             .expect("query plan")
+    }
+
+    fn lookup_fields(
+        search_key: &str,
+        season: Option<u32>,
+        episode: Option<u32>,
+        length: u64,
+    ) -> LookupFields {
+        LookupFields {
+            search_key: search_key.to_owned(),
+            media_type: MediaType::Episode,
+            season,
+            episode,
+            length,
+            file_count: 1,
+            video_bytes: length,
+            non_video_bytes: 0,
+        }
     }
 }
