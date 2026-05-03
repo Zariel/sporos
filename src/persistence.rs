@@ -1781,6 +1781,8 @@ CREATE TABLE IF NOT EXISTS client_searchee (
     PRIMARY KEY(client_host, info_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_client_searchee_info_hash ON client_searchee(info_hash);
+CREATE INDEX IF NOT EXISTS idx_client_searchee_lookup
+ON client_searchee(media_type, season, episode, search_key, length);
 
 CREATE TABLE IF NOT EXISTS data (
     path TEXT PRIMARY KEY,
@@ -1794,6 +1796,8 @@ CREATE TABLE IF NOT EXISTS data (
     video_bytes INTEGER NULL,
     non_video_bytes INTEGER NULL
 );
+CREATE INDEX IF NOT EXISTS idx_data_lookup
+ON data(media_type, season, episode, search_key, length);
 
 CREATE TABLE IF NOT EXISTS ensemble (
     client_host TEXT NULL,
@@ -1805,6 +1809,7 @@ CREATE TABLE IF NOT EXISTS ensemble (
 );
 CREATE INDEX IF NOT EXISTS idx_ensemble_path ON ensemble(path);
 CREATE INDEX IF NOT EXISTS idx_ensemble_info_hash ON ensemble(info_hash);
+CREATE INDEX IF NOT EXISTS idx_ensemble_lookup ON ensemble(ensemble, element);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ensemble_data_path_key
 ON ensemble(path)
 WHERE client_host IS NULL;
@@ -1981,6 +1986,85 @@ mod tests {
         ] {
             assert_column(&database, "data", column);
         }
+        for index in [
+            "idx_client_searchee_lookup",
+            "idx_data_lookup",
+            "idx_ensemble_lookup",
+        ] {
+            assert_index(&database, index);
+        }
+
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lookup_query_plans_use_indexes() {
+        let root = temp_path("lookup-indexes");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+
+        let client_plan = explain_detail(
+            &database,
+            "EXPLAIN QUERY PLAN
+             SELECT rowid FROM client_searchee
+             WHERE media_type = ?1
+             AND season = ?2
+             AND episode = ?3
+             AND search_key = ?4
+             AND length BETWEEN ?5 AND ?6
+             ORDER BY rowid
+             LIMIT 100",
+            &[
+                SqlValue::Text(Cow::Borrowed("episode")),
+                SqlValue::I64(1),
+                SqlValue::I64(1),
+                SqlValue::Text(Cow::Borrowed("example.show.s01e01")),
+                SqlValue::I64(1),
+                SqlValue::I64(100),
+            ],
+        );
+        let data_plan = explain_detail(
+            &database,
+            "EXPLAIN QUERY PLAN
+             SELECT rowid FROM data
+             WHERE media_type = ?1
+             AND season = ?2
+             AND episode = ?3
+             AND search_key = ?4
+             AND length BETWEEN ?5 AND ?6
+             ORDER BY rowid
+             LIMIT 100",
+            &[
+                SqlValue::Text(Cow::Borrowed("episode")),
+                SqlValue::I64(1),
+                SqlValue::I64(1),
+                SqlValue::Text(Cow::Borrowed("example.show.s01e01")),
+                SqlValue::I64(1),
+                SqlValue::I64(100),
+            ],
+        );
+        let ensemble_plan = explain_detail(
+            &database,
+            "EXPLAIN QUERY PLAN
+             SELECT rowid FROM ensemble
+             WHERE ensemble = ?1 AND element = ?2
+             ORDER BY rowid
+             LIMIT 100",
+            &[
+                SqlValue::Text(Cow::Borrowed("example show s01")),
+                SqlValue::Text(Cow::Borrowed("01")),
+            ],
+        );
+
+        assert!(
+            client_plan.contains("idx_client_searchee_lookup"),
+            "{client_plan}"
+        );
+        assert!(data_plan.contains("idx_data_lookup"), "{data_plan}");
+        assert!(
+            ensemble_plan.contains("idx_ensemble_lookup"),
+            "{ensemble_plan}"
+        );
 
         let _cleanup = fs::remove_dir_all(root);
     }
@@ -2228,5 +2312,21 @@ mod tests {
             .query_scalar(&sql, &[SqlValue::Text(Cow::Borrowed(column))])
             .expect("column query");
         assert_eq!(count, 1, "{table}.{column}");
+    }
+
+    fn assert_index(database: &Database, index: &str) {
+        let count: i64 = database
+            .query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                &[SqlValue::Text(Cow::Borrowed(index))],
+            )
+            .expect("index query");
+        assert_eq!(count, 1, "{index}");
+    }
+
+    fn explain_detail(database: &Database, sql: &str, params: &[SqlValue<'_>]) -> String {
+        database
+            .query_row(sql, params, |row| row.get(3))
+            .expect("query plan")
     }
 }
