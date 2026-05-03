@@ -824,6 +824,7 @@ fn reverse_lookup_candidates(
     )?);
     output.extend(reverse_lookup_data_rows(
         runtime.database,
+        candidate,
         &keys,
         &runtime.options.filter,
     )?);
@@ -2356,24 +2357,35 @@ fn saturated_f64_length(value: f64) -> u64 {
 
 fn reverse_lookup_data_rows(
     database: &Database,
+    candidate: &Candidate<'_>,
     keys: &[String],
     filter: &ContentFilterOptions<'_>,
 ) -> crate::Result<Vec<Searchee<'static>>> {
     let mut output = Vec::new();
-    for row in database.data_rows()? {
-        if !reverse_keys_match(keys, &row.title) {
-            continue;
-        }
-        match create_searchee_from_path(Path::new(&row.path)) {
-            Ok(Some(searchee)) if filter_by_content(&searchee, filter).is_none() => {
-                output.push(searchee);
+    let criteria = reverse_lookup_criteria(candidate, keys, filter);
+    let mut after_rowid = 0_i64;
+    loop {
+        let rows =
+            database.reverse_lookup_data_page(&criteria, after_rowid, REVERSE_LOOKUP_PAGE_SIZE)?;
+        let Some(last) = rows.last() else {
+            break;
+        };
+        after_rowid = last.rowid;
+        for row in rows {
+            if !reverse_keys_match(keys, &row.title) {
+                continue;
             }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::debug!(
-                    "skipping stale reverse lookup data path {}: {error}",
-                    row.path
-                )
+            match create_searchee_from_path(Path::new(&row.path)) {
+                Ok(Some(searchee)) if filter_by_content(&searchee, filter).is_none() => {
+                    output.push(searchee);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        "skipping stale reverse lookup data path {}: {error}",
+                        row.path
+                    )
+                }
             }
         }
     }
@@ -2746,7 +2758,8 @@ mod tests {
         create_searchee_from_path, create_virtual_season_searchees, filter_by_content,
         filter_duplicate_searchees, find_all_searchees, find_potential_nested_roots,
         find_searchable_searchees, get_media_type, index_torrent_dir, indexer_supports_media,
-        lookup_fields, parse_title, reverse_lookup_searchees, search_group_key, timestamp_excludes,
+        lookup_fields, parse_title, reverse_lookup_data_rows, reverse_lookup_keys,
+        reverse_lookup_searchees, search_group_key, timestamp_excludes,
     };
     use crate::{
         domain::{
@@ -2755,7 +2768,7 @@ mod tests {
         },
         integrations::{SearchIndexer, SnatchOptions, TorznabCaps, TorznabSearchOptions},
         matching::AssessmentOptions,
-        persistence::{ClientSearcheeRecord, Database, DecisionRecord, SqlValue},
+        persistence::{ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord, SqlValue},
     };
     use std::{
         borrow::Cow,
@@ -3682,6 +3695,46 @@ mod tests {
         assert_eq!(attempt.decision, Decision::MatchSizeOnly);
         assert_eq!(attempt.searchee_client_host.as_deref(), Some("client-a"));
         assert_eq!(actions, 1);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reverse_lookup_data_selector_skips_nonmatching_lookup_rows() {
+        let root = temp_path("reverse-data-selector");
+        let release = root.join("Example.Show.S01E01");
+        fs::create_dir_all(&release).expect("release dir");
+        fs::write(release.join("Example.Show.S01E01.mkv"), b"video").expect("video");
+        let database = Database::open_app_dir(&root).expect("database");
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclude = BTreeSet::new();
+        let mut options = pipeline_options(&blocklist, &exclude, &root, Label::Rss);
+        options.filter.include_single_episodes = true;
+        let mut other = Searchee::from_files(
+            "Other.Show.S01E01",
+            "Other Show S01E01",
+            vec![File::new("Other.Show.S01E01.mkv", 5)],
+        );
+        other.media_type = MediaType::Episode;
+        let lookup = lookup_fields(&other);
+        database
+            .upsert_data_root(&DataRootRecord {
+                path: release.to_str().expect("utf-8 path"),
+                title: "Example Show S01E01",
+                lookup: Some(&lookup),
+            })
+            .expect("data root");
+        let candidate = Candidate::new(
+            "Example.Show.S01E01",
+            "guid-data",
+            None::<String>,
+            "tracker",
+        );
+        let keys = reverse_lookup_keys(candidate.name.as_ref());
+
+        let rows = reverse_lookup_data_rows(&database, &candidate, &keys, &options.filter)
+            .expect("data reverse lookup");
+
+        assert!(rows.is_empty());
         let _cleanup = fs::remove_dir_all(root);
     }
 
