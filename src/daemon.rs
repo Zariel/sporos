@@ -28,7 +28,7 @@ use crate::{
         WebhookRequest, handle_api_request,
     },
     config::RuntimeConfig,
-    persistence::{AsyncDatabase, DataRootRecord, Database},
+    persistence::{AsyncDatabase, Database},
     runtime::RuntimeServices,
     scheduler::{DaemonPlan, DaemonRun, JobName, Scheduler},
 };
@@ -72,7 +72,7 @@ async fn run_plan(
     let runtime_services = RuntimeServices::start(shutdown.child_token());
     let mut run = plan
         .run_startup_async(&async_database, now_millis(), || {
-            index_torrents_and_data_dirs(config, database)
+            crate::operations::refresh_torrent_and_data_indexes(database, config).map(|_| ())
         })
         .await?;
     let startup_jobs =
@@ -418,40 +418,6 @@ fn listen_address(config: &RuntimeConfig) -> Option<SocketAddr> {
         let host = config.host.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         SocketAddr::new(host, port)
     })
-}
-
-fn index_torrents_and_data_dirs(config: &RuntimeConfig, database: &Database) -> crate::Result<()> {
-    if let Some(torrent_dir) = &config.torrent_dir {
-        let result = crate::search::index_torrent_dir(database, torrent_dir)?;
-        tracing::info!(
-            files_seen = result.files_seen,
-            torrents_indexed = result.torrents_indexed,
-            torrents_removed = result.torrents_removed,
-            files_failed = result.files_failed,
-            "indexed torrent_dir"
-        );
-    }
-
-    if !config.data_dirs.is_empty() {
-        database.begin_data_root_refresh()?;
-        let roots_indexed = crate::search::for_each_data_dir_searchee(
-            &config.data_dirs,
-            config.max_data_depth,
-            |searchee| {
-                let Some(path) = searchee.path.as_deref() else {
-                    return Ok(());
-                };
-                database.upsert_data_root(&DataRootRecord {
-                    path,
-                    title: searchee.title.as_ref(),
-                })?;
-                database.mark_refreshed_data_root(path)
-            },
-        )?;
-        let removed = database.finish_data_root_refresh()?;
-        tracing::info!(roots_indexed, roots_removed = removed, "indexed data_dirs");
-    }
-    Ok(())
 }
 
 fn now_millis() -> i64 {

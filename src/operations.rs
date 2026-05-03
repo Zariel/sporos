@@ -33,9 +33,10 @@ use crate::{
     search::{
         Blocklist, CandidateSearchCache, ContentFilterOptions, PipelineAction, PipelineSummary,
         ReverseLookupGate, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
-        SearcheeSources, VirtualSeasonOptions, bulk_search, check_new_candidate_match,
-        check_new_candidate_matches, episode_ensemble, find_all_searchees, find_on_other_sites,
-        find_searchable_searchees, for_each_data_dir_searchee,
+        SearcheeSources, TorrentDirIndexResult, VirtualSeasonOptions, bulk_search,
+        check_new_candidate_match, check_new_candidate_matches, episode_ensemble,
+        find_all_searchees, find_on_other_sites, find_searchable_searchees,
+        for_each_data_dir_searchee,
     },
     torrent::{
         Bencode, BencodeValue, bdecode, bencode, parse_metafile, torrent_cache_dir,
@@ -77,6 +78,17 @@ pub struct TrackerUpdateResult {
     pub files_seen: usize,
     /// Cached torrent files rewritten.
     pub files_updated: usize,
+}
+
+/// Result from refreshing configured local search indexes.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct IndexRefreshResult {
+    /// Torrent-dir refresh counts when a torrent_dir is configured.
+    pub torrent_dir: Option<TorrentDirIndexResult>,
+    /// Data-dir roots indexed.
+    pub data_roots_indexed: usize,
+    /// Data-dir rows pruned because roots disappeared.
+    pub data_roots_removed: usize,
 }
 
 /// Result counts from daily cleanup.
@@ -310,7 +322,7 @@ pub fn run_search_workflow(
     notifier: &NotificationSender,
 ) -> crate::Result<SearchWorkflowResult> {
     sync_configured_indexers(database, config)?;
-    index_torrents_and_data_dirs(database, config)?;
+    refresh_torrent_and_data_indexes(database, config)?;
     let client_adapters = build_workflow_clients(config)?;
     let client_refs = client_refs(&client_adapters);
     let client_searchees = collect_client_searchees(config, &client_refs)?;
@@ -379,7 +391,7 @@ pub fn run_rss_workflow(
     notifier: &NotificationSender,
 ) -> crate::Result<RssWorkflowResult> {
     sync_configured_indexers(database, config)?;
-    index_torrents_and_data_dirs(database, config)?;
+    refresh_torrent_and_data_indexes(database, config)?;
     let client_adapters = build_workflow_clients(config)?;
     let client_refs = client_refs(&client_adapters);
     let client_searchees = collect_client_searchees(config, &client_refs)?;
@@ -462,7 +474,7 @@ pub fn run_announce_match(
             "announce requires torrent_dir, use_client_torrents, or data_dirs",
         ));
     }
-    index_torrents_and_data_dirs(database, config)?;
+    refresh_torrent_and_data_indexes(database, config)?;
     let client_adapters = build_workflow_clients(config)?;
     let client_refs = client_refs(&client_adapters);
     let client_searchees = collect_client_searchees(config, &client_refs)?;
@@ -547,7 +559,7 @@ pub fn run_webhook_search(
     }
 
     sync_configured_indexers(database, &config)?;
-    index_torrents_and_data_dirs(database, &config)?;
+    refresh_torrent_and_data_indexes(database, &config)?;
     let client_adapters = build_workflow_clients(&config)?;
     let client_refs = client_refs(&client_adapters);
     let client_searchees = collect_client_searchees(&config, &client_refs)?;
@@ -627,7 +639,7 @@ pub fn run_inject_workflow(
     _app_dir: &Path,
     config: &RuntimeConfig,
 ) -> crate::Result<SavedInjectionSummary> {
-    index_torrents_and_data_dirs(database, config)?;
+    refresh_torrent_and_data_indexes(database, config)?;
     let client_adapters = build_workflow_clients(config)?;
     let client_refs = client_refs(&client_adapters);
     let client_searchees = collect_client_searchees(config, &client_refs)?;
@@ -835,25 +847,44 @@ fn indexer_id(database: &Database, url: &str) -> crate::Result<i64> {
     database.indexer_id(url)
 }
 
-fn index_torrents_and_data_dirs(database: &Database, config: &RuntimeConfig) -> crate::Result<()> {
+/// Refresh configured torrent_dir and data_dir indexes.
+pub fn refresh_torrent_and_data_indexes(
+    database: &Database,
+    config: &RuntimeConfig,
+) -> crate::Result<IndexRefreshResult> {
+    let mut result = IndexRefreshResult::default();
     if let Some(torrent_dir) = &config.torrent_dir {
-        let _result = crate::search::index_torrent_dir(database, torrent_dir)?;
+        let indexed = crate::search::index_torrent_dir(database, torrent_dir)?;
+        tracing::info!(
+            files_seen = indexed.files_seen,
+            torrents_indexed = indexed.torrents_indexed,
+            torrents_removed = indexed.torrents_removed,
+            files_failed = indexed.files_failed,
+            "indexed torrent_dir"
+        );
+        result.torrent_dir = Some(indexed);
     }
     if !config.data_dirs.is_empty() {
         database.begin_data_root_refresh()?;
-        for_each_data_dir_searchee(&config.data_dirs, config.max_data_depth, |searchee| {
-            let Some(path) = searchee.path.as_deref() else {
-                return Ok(());
-            };
-            database.upsert_data_root(&DataRootRecord {
-                path,
-                title: searchee.title.as_ref(),
+        result.data_roots_indexed =
+            for_each_data_dir_searchee(&config.data_dirs, config.max_data_depth, |searchee| {
+                let Some(path) = searchee.path.as_deref() else {
+                    return Ok(());
+                };
+                database.upsert_data_root(&DataRootRecord {
+                    path,
+                    title: searchee.title.as_ref(),
+                })?;
+                database.mark_refreshed_data_root(path)
             })?;
-            database.mark_refreshed_data_root(path)
-        })?;
-        database.finish_data_root_refresh()?;
+        result.data_roots_removed = database.finish_data_root_refresh()?;
+        tracing::info!(
+            roots_indexed = result.data_roots_indexed,
+            roots_removed = result.data_roots_removed,
+            "indexed data_dirs"
+        );
     }
-    Ok(())
+    Ok(result)
 }
 
 fn build_workflow_clients(config: &RuntimeConfig) -> crate::Result<Vec<Box<dyn TorrentClient>>> {
