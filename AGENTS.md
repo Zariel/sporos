@@ -249,14 +249,17 @@ explicit close, flush, or shutdown method that returns `Result` when teardown ca
 fail.
 
 ### Git
-Only commit touched filed, when commiting commit logical changes not just
-the whole workspace. Commit messages should include a title and the body
-should describe the change so that a reviewer can get an understanding. The
-title should be all lower case and no longer than 50 characters, the body must
-use prose, avoid lists and overly explainging things, be concise. Commit body
-lines must be wrapped at 110 characters or less. Do not include literal `\n`
-sequences in commit messages; use separate `git commit -m` arguments or an
-editor so the message contains real line breaks.
+Only commit touched files, and commit logical changes rather than the whole
+workspace. Commit titles must be lower case, no longer than 50 characters, and
+formatted as `area: title`. The title after the area must complete the sentence
+"when this change is merged it will ..."; for example,
+`persistence: fix unique key violation`.
+
+Commit bodies must use concise prose and give reviewers enough context. Avoid
+lists unless the change genuinely needs them. When committing non-interactively,
+pass the title in the first `-m` argument and split the body across separate
+`-m` arguments. Each body `-m` value must be 110 characters or less. Do not
+include literal `\n` sequences in commit messages.
 
 ### Release tags
 When creating a tag, include a very brief changelog in the tag annotation using
