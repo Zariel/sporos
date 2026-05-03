@@ -973,25 +973,7 @@ impl Database {
             return Ok(Vec::new());
         }
         self.block_on(async {
-            let key_placeholders = placeholders(criteria.search_keys.len());
-            let sql = format!(
-                "SELECT rowid, client_host, info_hash, title
-                 FROM client_searchee
-                 WHERE rowid > ?
-                 AND (
-                    search_key IS NULL
-                    OR (
-                        search_key IN ({key_placeholders})
-                        AND (? IS NULL OR media_type IS NULL OR media_type = ?)
-                        AND (? IS NULL OR season IS NULL OR season = ?)
-                        AND (? IS NULL OR episode IS NULL OR episode = ?)
-                        AND (? IS NULL OR length >= ?)
-                        AND (? IS NULL OR length <= ?)
-                    )
-                 )
-                 ORDER BY rowid
-                 LIMIT ?"
-            );
+            let sql = reverse_lookup_client_sql(criteria.search_keys.len());
             let params = reverse_lookup_params(criteria, after_rowid, limit);
             let rows = bind_values(sqlx::query(&sql), &params)
                 .fetch_all(self.pool())
@@ -1020,25 +1002,7 @@ impl Database {
             return Ok(Vec::new());
         }
         self.block_on(async {
-            let key_placeholders = placeholders(criteria.search_keys.len());
-            let sql = format!(
-                "SELECT rowid, path, title
-                 FROM data
-                 WHERE rowid > ?
-                 AND (
-                    search_key IS NULL
-                    OR (
-                        search_key IN ({key_placeholders})
-                        AND (? IS NULL OR media_type IS NULL OR media_type = ?)
-                        AND (? IS NULL OR season IS NULL OR season = ?)
-                        AND (? IS NULL OR episode IS NULL OR episode = ?)
-                        AND (? IS NULL OR length IS NULL OR length >= ?)
-                        AND (? IS NULL OR length IS NULL OR length <= ?)
-                    )
-                 )
-                 ORDER BY rowid
-                 LIMIT ?"
-            );
+            let sql = reverse_lookup_data_sql(criteria.search_keys.len());
             let params = reverse_lookup_params(criteria, after_rowid, limit);
             let rows = bind_values(sqlx::query(&sql), &params)
                 .fetch_all(self.pool())
@@ -1989,12 +1953,62 @@ fn placeholders(count: usize) -> String {
         .join(", ")
 }
 
+fn reverse_lookup_client_sql(search_key_count: usize) -> String {
+    let key_placeholders = placeholders(search_key_count);
+    format!(
+        "SELECT rowid, client_host, info_hash, title
+         FROM (
+            SELECT rowid, client_host, info_hash, title
+            FROM client_searchee INDEXED BY idx_client_searchee_lookup
+            WHERE rowid > ?
+            AND search_key IN ({key_placeholders})
+            AND (? IS NULL OR media_type IS NULL OR media_type = ?)
+            AND (? IS NULL OR season IS NULL OR season = ?)
+            AND (? IS NULL OR episode IS NULL OR episode = ?)
+            AND (? IS NULL OR length >= ?)
+            AND (? IS NULL OR length <= ?)
+            UNION ALL
+            SELECT rowid, client_host, info_hash, title
+            FROM client_searchee
+            WHERE rowid > ?
+            AND search_key IS NULL
+         )
+         ORDER BY rowid
+         LIMIT ?"
+    )
+}
+
+fn reverse_lookup_data_sql(search_key_count: usize) -> String {
+    let key_placeholders = placeholders(search_key_count);
+    format!(
+        "SELECT rowid, path, title
+         FROM (
+            SELECT rowid, path, title
+            FROM data INDEXED BY idx_data_lookup
+            WHERE rowid > ?
+            AND search_key IN ({key_placeholders})
+            AND (? IS NULL OR media_type IS NULL OR media_type = ?)
+            AND (? IS NULL OR season IS NULL OR season = ?)
+            AND (? IS NULL OR episode IS NULL OR episode = ?)
+            AND (? IS NULL OR length IS NULL OR length >= ?)
+            AND (? IS NULL OR length IS NULL OR length <= ?)
+            UNION ALL
+            SELECT rowid, path, title
+            FROM data
+            WHERE rowid > ?
+            AND search_key IS NULL
+         )
+         ORDER BY rowid
+         LIMIT ?"
+    )
+}
+
 fn reverse_lookup_params<'a>(
     criteria: &'a ReverseLookupCriteria<'a>,
     after_rowid: i64,
     limit: i64,
 ) -> Vec<SqlValue<'a>> {
-    let mut params = Vec::with_capacity(criteria.search_keys.len().saturating_add(12));
+    let mut params = Vec::with_capacity(criteria.search_keys.len().saturating_add(13));
     params.push(SqlValue::I64(after_rowid));
     params.extend(
         criteria
@@ -2017,6 +2031,7 @@ fn reverse_lookup_params<'a>(
             .max_length
             .map(|length| i64::try_from(length).unwrap_or(i64::MAX)),
     );
+    params.push(SqlValue::I64(after_rowid));
     params.push(SqlValue::I64(limit));
     params
 }
@@ -2110,7 +2125,8 @@ fn strings_json(values: &[std::borrow::Cow<'_, str>]) -> crate::Result<String> {
 mod tests {
     use super::{
         AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord,
-        EnsembleRecord, ReverseLookupCriteria, SqlValue,
+        EnsembleRecord, ReverseLookupCriteria, SqlValue, bind_values, reverse_lookup_client_sql,
+        reverse_lookup_data_sql, reverse_lookup_params, sqlx_error,
     };
     use crate::domain::{ClientLabel, Decision, File, LookupFields, MediaType};
     use sqlx::Row;
@@ -2200,46 +2216,28 @@ mod tests {
         let root = temp_path("lookup-indexes");
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
-
+        let keys = vec!["example.show.s01e01".to_owned()];
+        let criteria = ReverseLookupCriteria {
+            search_keys: &keys,
+            media_type: Some("episode"),
+            season: Some(1),
+            episode: Some(1),
+            min_length: Some(1),
+            max_length: Some(100),
+        };
+        let params = reverse_lookup_params(&criteria, 0, 100);
         let client_plan = explain_detail(
             &database,
-            "EXPLAIN QUERY PLAN
-             SELECT rowid FROM client_searchee
-             WHERE media_type = ?1
-             AND season = ?2
-             AND episode = ?3
-             AND search_key = ?4
-             AND length BETWEEN ?5 AND ?6
-             ORDER BY rowid
-             LIMIT 100",
-            &[
-                SqlValue::Text(Cow::Borrowed("episode")),
-                SqlValue::I64(1),
-                SqlValue::I64(1),
-                SqlValue::Text(Cow::Borrowed("example.show.s01e01")),
-                SqlValue::I64(1),
-                SqlValue::I64(100),
-            ],
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                reverse_lookup_client_sql(keys.len())
+            ),
+            &params,
         );
         let data_plan = explain_detail(
             &database,
-            "EXPLAIN QUERY PLAN
-             SELECT rowid FROM data
-             WHERE media_type = ?1
-             AND season = ?2
-             AND episode = ?3
-             AND search_key = ?4
-             AND length BETWEEN ?5 AND ?6
-             ORDER BY rowid
-             LIMIT 100",
-            &[
-                SqlValue::Text(Cow::Borrowed("episode")),
-                SqlValue::I64(1),
-                SqlValue::I64(1),
-                SqlValue::Text(Cow::Borrowed("example.show.s01e01")),
-                SqlValue::I64(1),
-                SqlValue::I64(100),
-            ],
+            &format!("EXPLAIN QUERY PLAN {}", reverse_lookup_data_sql(keys.len())),
+            &params,
         );
         let ensemble_plan = explain_detail(
             &database,
@@ -2677,7 +2675,18 @@ mod tests {
 
     fn explain_detail(database: &Database, sql: &str, params: &[SqlValue<'_>]) -> String {
         database
-            .query_row(sql, params, |row| row.get(3))
+            .block_on(async {
+                bind_values(sqlx::query(sql), params)
+                    .fetch_all(database.pool())
+                    .await
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|row| row.get::<String, _>(3))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .map_err(sqlx_error)
+            })
             .expect("query plan")
     }
 
