@@ -6,6 +6,7 @@ use std::{
     fs,
     future::Future,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -23,6 +24,7 @@ use crate::{
         ClientLabel, ClientTorrentMetadata, Decision, File, InfoHash, InjectionResult, Metafile,
         Searchee, TorrentClientKind, TorrentClientMetadata,
     },
+    retry::{RetryClass, RetryPolicy, classify_reqwest_error},
     search::parsed_name_and_media,
 };
 
@@ -476,6 +478,7 @@ pub struct QbittorrentClient {
     password: String,
     torrent_dir: Option<PathBuf>,
     client: reqwest::Client,
+    session_valid: Mutex<bool>,
 }
 
 impl QbittorrentClient {
@@ -505,6 +508,7 @@ impl QbittorrentClient {
             password,
             torrent_dir: None,
             client,
+            session_valid: Mutex::new(false),
         })
     }
 
@@ -515,6 +519,27 @@ impl QbittorrentClient {
     }
 
     fn login(&self) -> crate::Result<()> {
+        if self.session_valid()? {
+            return Ok(());
+        }
+        self.force_login()
+    }
+
+    fn session_valid(&self) -> crate::Result<bool> {
+        self.session_valid
+            .lock()
+            .map(|session_valid| *session_valid)
+            .map_err(|error| client_error(format!("qBittorrent session lock failed: {error}")))
+    }
+
+    fn set_session_valid(&self, valid: bool) -> crate::Result<()> {
+        self.session_valid
+            .lock()
+            .map(|mut session_valid| *session_valid = valid)
+            .map_err(|error| client_error(format!("qBittorrent session lock failed: {error}")))
+    }
+
+    fn force_login(&self) -> crate::Result<()> {
         let response = block_on_client(async {
             self.client
                 .post(self.api_url("/api/v2/auth/login"))
@@ -527,8 +552,10 @@ impl QbittorrentClient {
         })?
         .map_err(|error| client_error(format!("qBittorrent login failed: {error}")))?;
         if response.status().is_success() {
+            self.set_session_valid(true)?;
             Ok(())
         } else {
+            self.set_session_valid(false)?;
             Err(client_error(format!(
                 "qBittorrent login returned {}",
                 response.status()
@@ -541,79 +568,40 @@ impl QbittorrentClient {
     }
 
     fn get_text(&self, path: &str) -> crate::Result<String> {
-        self.login()?;
-        block_on_client(async {
-            self.client
-                .get(self.api_url(path))
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await
-        })?
-        .map_err(|error| client_error(format!("qBittorrent request failed: {error}")))
+        self.request_text("request", || self.client.get(self.api_url(path)))
     }
 
     fn post_form(&self, path: &str, form: &[(&str, &str)]) -> crate::Result<()> {
-        self.login()?;
-        block_on_client(async {
-            self.client
-                .post(self.api_url(path))
-                .form(form)
-                .send()
-                .await?
-                .error_for_status()
-        })?
-        .map_err(|error| client_error(format!("qBittorrent mutation failed: {error}")))?;
-        Ok(())
+        self.request_unit("mutation", || {
+            self.client.post(self.api_url(path)).form(form)
+        })
     }
 
     fn torrent_info(&self, info_hash: &InfoHash<'_>) -> crate::Result<Option<QbTorrentInfo>> {
-        self.login()?;
-        let response = block_on_client(async {
+        let response = self.request_text("info", || {
             self.client
                 .get(self.api_url("/api/v2/torrents/info"))
                 .query(&[("hashes", info_hash.as_str())])
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await
-        })?
-        .map_err(|error| client_error(format!("qBittorrent info request failed: {error}")))?;
+        })?;
         let mut torrents = parse_qb_torrents(&response)?;
         Ok(torrents.pop())
     }
 
     fn torrent_page(&self, offset: usize, limit: usize) -> crate::Result<Vec<QbTorrentInfo>> {
-        self.login()?;
-        let response = block_on_client(async {
+        let response = self.request_text("info", || {
             self.client
                 .get(self.api_url("/api/v2/torrents/info"))
                 .query(&[("offset", offset.to_string()), ("limit", limit.to_string())])
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await
-        })?
-        .map_err(|error| client_error(format!("qBittorrent info request failed: {error}")))?;
+        })?;
         parse_qb_torrents(&response)
     }
 
     fn torrent_files(&self, info_hash: &str) -> crate::Result<Vec<File<'static>>> {
-        self.login()?;
-        let response = block_on_client(async {
+        let response = self.request_text("files", || {
             self.client
                 .get(self.api_url("/api/v2/torrents/files"))
                 .query(&[("hash", info_hash)])
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await
-        })?
-        .map_err(|error| client_error(format!("qBittorrent files request failed: {error}")))?;
+        })?;
         parse_qb_files(&response)
     }
 
@@ -655,18 +643,11 @@ impl QbittorrentClient {
     }
 
     fn torrent_trackers(&self, info_hash: &str) -> crate::Result<Vec<Cow<'static, str>>> {
-        self.login()?;
-        let response = block_on_client(async {
+        let response = self.request_text("trackers", || {
             self.client
                 .get(self.api_url("/api/v2/torrents/trackers"))
                 .query(&[("hash", info_hash)])
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await
-        })?
-        .map_err(|error| client_error(format!("qBittorrent trackers request failed: {error}")))?;
+        })?;
         parse_qb_trackers(&response)
     }
 
@@ -676,19 +657,88 @@ impl QbittorrentClient {
         fallback: &str,
         info_hash: &InfoHash<'_>,
     ) -> crate::Result<()> {
-        self.login()?;
         let form = [("hashes", info_hash.as_str())];
-        let primary = block_on_client(async {
-            self.client
-                .post(self.api_url(primary))
-                .form(&form)
-                .send()
-                .await
-        })?;
+        let primary = self.request_unit("hash_action", || {
+            self.client.post(self.api_url(primary)).form(&form)
+        });
         match primary {
-            Ok(response) if response.status().is_success() => Ok(()),
+            Ok(()) => Ok(()),
             _ => self.post_form(fallback, &form),
         }
+    }
+
+    fn request_text<F>(&self, kind: &'static str, build: F) -> crate::Result<String>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        self.request_with_retry(
+            kind,
+            |response| async move { response.error_for_status()?.text().await },
+            build,
+        )
+    }
+
+    fn request_unit<F>(&self, kind: &'static str, build: F) -> crate::Result<()>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        self.request_with_retry(
+            kind,
+            |response| async move { response.error_for_status().map(|_| ()) },
+            build,
+        )
+    }
+
+    fn request_with_retry<T, F, P, Fut>(
+        &self,
+        kind: &'static str,
+        parse: P,
+        build: F,
+    ) -> crate::Result<T>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+        P: Fn(reqwest::Response) -> Fut,
+        Fut: Future<Output = Result<T, reqwest::Error>>,
+    {
+        let policy = RetryPolicy::idempotent();
+        let mut retried_auth = false;
+        for attempt in 1..=policy.max_attempts {
+            self.login()?;
+            let result = block_on_client(async {
+                let response = build().send().await?;
+                parse(response).await
+            })?;
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) if is_qb_auth_error(&error) && !retried_auth => {
+                    self.set_session_valid(false)?;
+                    self.force_login()?;
+                    retried_auth = true;
+                }
+                Err(error) if qb_error_retryable(&error) && attempt < policy.max_attempts => {
+                    tracing::debug!(
+                        client = %self.base_url,
+                        kind,
+                        attempt,
+                        max_attempts = policy.max_attempts,
+                        error = %error,
+                        "retrying qBittorrent request",
+                    );
+                    let delay = policy.delay_for_retry(attempt);
+                    if !delay.is_zero() {
+                        block_on_client_delay(delay)?;
+                    }
+                }
+                Err(error) => {
+                    return Err(client_error(format!(
+                        "qBittorrent {kind} request failed: {error}"
+                    )));
+                }
+            }
+        }
+        Err(client_error(format!(
+            "qBittorrent {kind} request retry attempts exhausted"
+        )))
     }
 }
 
@@ -2668,6 +2718,16 @@ fn client_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     }
 }
 
+fn is_qb_auth_error(error: &reqwest::Error) -> bool {
+    error.status().is_some_and(|status| {
+        status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
+    })
+}
+
+fn qb_error_retryable(error: &reqwest::Error) -> bool {
+    matches!(classify_reqwest_error(error), RetryClass::Retryable { .. })
+}
+
 fn block_on_client<F, T>(future: F) -> crate::Result<T>
 where
     F: Future<Output = T>,
@@ -2844,11 +2904,8 @@ mod tests {
     fn qbittorrent_validates_version_and_preferences() {
         let server = http_server(vec![
             http_response("200 OK", "Ok."),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", "v4.6.2"),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", r#"{"save_path":"/downloads"}"#),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", ""),
         ]);
         let client = qb_client(&server.url);
@@ -2894,9 +2951,7 @@ mod tests {
         .expect("fastresume");
         let server = http_server(vec![
             http_response("200 OK", "Ok."),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", "v5.0.0"),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", r#"{"resume_data_storage_type":"SQLite"}"#),
         ]);
         let client = qb_client(&server.url).with_torrent_dir(Some(root));
@@ -2918,9 +2973,7 @@ mod tests {
         .expect("torrent");
         let server = http_server(vec![
             http_response("200 OK", "Ok."),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", "v4.6.2"),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", r#"{"resume_data_storage_type":"Legacy"}"#),
         ]);
         let client = qb_client(&server.url).with_torrent_dir(Some(root));
@@ -2942,12 +2995,10 @@ mod tests {
                     r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads","category":"tv","tags":"tag, cross-seed","progress":1.0,"state":"uploading"}}]"#
                 ),
             ),
-            http_response("200 OK", "Ok."),
             http_response(
                 "200 OK",
                 r#"[{"name":"Example.Show.S01E01.mkv","size":123}]"#,
             ),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", r#"[{"url":"https://tracker.example/announce"}]"#),
         ]);
         let client = qb_client(&server.url);
@@ -2970,6 +3021,84 @@ mod tests {
                 "GET /api/v2/torrents/files?hash=0123456789abcdef0123456789abcdef01234567 ",
             )
         }));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("POST /api/v2/auth/login "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn qbittorrent_relogs_after_auth_failure() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("403 Forbidden", "Forbidden"),
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"[{{"hash":"{hash}","name":"Example","save_path":"/downloads","progress":1.0,"state":"uploading"}}]"#
+                ),
+            ),
+        ]);
+        let client = qb_client(&server.url);
+        let metafile = Metafile::from_files(
+            InfoHash::new(hash).expect("hash").into_owned(),
+            "Example".to_owned(),
+            "Example".to_owned(),
+            42,
+            vec![File::new("Example.mkv", 42)],
+        );
+
+        let remaining = client.remaining_bytes(&metafile).expect("remaining");
+
+        assert_eq!(remaining, Some(0));
+        let requests = server.join();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("POST /api/v2/auth/login "))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn qbittorrent_retries_transient_info_status() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("502 Bad Gateway", ""),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"[{{"hash":"{hash}","name":"Example","save_path":"/downloads","progress":0.5,"amount_left":42,"state":"downloading"}}]"#
+                ),
+            ),
+        ]);
+        let client = qb_client(&server.url);
+        let metafile = Metafile::from_files(
+            InfoHash::new(hash).expect("hash").into_owned(),
+            "Example".to_owned(),
+            "Example".to_owned(),
+            42,
+            vec![File::new("Example.mkv", 42)],
+        );
+
+        let remaining = client.remaining_bytes(&metafile).expect("remaining");
+
+        assert_eq!(remaining, Some(42));
+        let requests = server.join();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("GET /api/v2/torrents/info?hashes="))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2983,12 +3112,10 @@ mod tests {
                     r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads","progress":1.0,"state":"uploading"}}]"#
                 ),
             ),
-            http_response("200 OK", "Ok."),
             http_response(
                 "200 OK",
                 r#"[{"name":"Example.Show.S01E01.mkv","size":123}]"#,
             ),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", r#"[]"#),
         ]);
         let client = qb_client(&server.url);
@@ -3029,12 +3156,10 @@ mod tests {
                     r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads","progress":1.0,"state":"uploading"}}]"#
                 ),
             ),
-            http_response("200 OK", "Ok."),
             http_response(
                 "200 OK",
                 r#"[{"name":"Example.Show.S01E01.mkv","size":123}]"#,
             ),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", r#"[]"#),
         ]);
         let client = qb_client(&server.url);
@@ -3140,13 +3265,9 @@ mod tests {
         let server = http_server(vec![
             http_response("200 OK", "Ok."),
             http_response("200 OK", &info),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", &info),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", &info),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", &info),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", &info),
         ]);
         let client = qb_client(&server.url);
@@ -3212,7 +3333,6 @@ mod tests {
         let server = http_server(vec![
             http_response("200 OK", "Ok."),
             http_response("200 OK", ""),
-            http_response("200 OK", "Ok."),
             http_response("200 OK", ""),
         ]);
         let client = qb_client(&server.url);
