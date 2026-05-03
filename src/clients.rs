@@ -3028,12 +3028,11 @@ mod tests {
                 .await
                 .expect("in client")
         );
-        assert_eq!(
-            client
+        assert!(
+            !client
                 .is_torrent_complete_async(&info_hash)
                 .await
-                .expect("complete"),
-            false
+                .expect("complete")
         );
         assert_eq!(TorrentClient::metadata(&client).host.as_ref(), "async");
         client.validate_config_async().await.expect("validate");

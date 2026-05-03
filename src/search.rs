@@ -3599,7 +3599,7 @@ mod tests {
         let second = super::ReverseLookupGate::new();
         let _held = first.permit.lock().expect("first gate");
 
-        assert!(second.permit.try_lock().is_err());
+        second.permit.try_lock().unwrap_err();
     }
 
     #[test]
