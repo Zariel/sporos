@@ -221,18 +221,25 @@ pub trait TorrentClient {
     /// Whether a torrent is hash-checking.
     fn is_torrent_checking(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool>;
 
-    /// Return the complete client inventory.
-    fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>>;
-
     /// Visit client inventory without requiring callers to retain it.
     fn for_each_torrent(
         &self,
         visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        for torrent in self.get_all_torrents()? {
-            visitor(torrent)?;
-        }
-        Ok(())
+        let _visitor = visitor;
+        Err(client_error(
+            "torrent client does not support streaming inventory",
+        ))
+    }
+
+    /// Return the complete client inventory.
+    fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
+        let mut output = Vec::new();
+        self.for_each_torrent(&mut |torrent| {
+            output.push(torrent);
+            Ok(())
+        })?;
+        Ok(output)
     }
 
     /// Map client inventory to searchable searchees.
@@ -1084,21 +1091,13 @@ impl TransmissionClient {
         Err(client_error(format!("{kind} RPC retry attempts exhausted")))
     }
 
-    fn torrent_get(&self, ids: Option<&[String]>) -> crate::Result<Vec<TransmissionTorrent>> {
+    fn torrent_get_fields(
+        &self,
+        ids: Option<&[String]>,
+        fields: &[&str],
+    ) -> crate::Result<Vec<TransmissionTorrent>> {
         let mut arguments = serde_json::Map::new();
-        arguments.insert(
-            "fields".to_owned(),
-            serde_json::json!([
-                "hashString",
-                "name",
-                "downloadDir",
-                "files",
-                "trackers",
-                "labels",
-                "percentDone",
-                "status"
-            ]),
-        );
+        arguments.insert("fields".to_owned(), serde_json::json!(fields));
         if let Some(ids) = ids {
             arguments.insert("ids".to_owned(), serde_json::json!(ids));
         }
@@ -1116,6 +1115,31 @@ impl TransmissionClient {
         })
     }
 
+    fn torrent_get(&self, ids: Option<&[String]>) -> crate::Result<Vec<TransmissionTorrent>> {
+        self.torrent_get_fields(
+            ids,
+            &[
+                "hashString",
+                "name",
+                "downloadDir",
+                "files",
+                "trackers",
+                "labels",
+                "percentDone",
+                "status",
+            ],
+        )
+    }
+
+    fn torrent_hashes(&self) -> crate::Result<Vec<String>> {
+        Ok(self
+            .torrent_get_fields(None, &["hashString"])?
+            .into_iter()
+            .map(|torrent| torrent.hash_string)
+            .filter(|hash| InfoHash::new(hash.clone()).is_some())
+            .collect())
+    }
+
     fn torrent_info(&self, info_hash: &InfoHash<'_>) -> crate::Result<Option<TransmissionTorrent>> {
         Ok(self
             .torrent_get(Some(&[info_hash.as_str().to_owned()]))?
@@ -1129,6 +1153,34 @@ impl TransmissionClient {
             "arguments": { "ids": [info_hash.as_str()] }
         }))?;
         Ok(())
+    }
+
+    fn client_torrent_from_transmission(
+        torrent: TransmissionTorrent,
+    ) -> Option<ClientTorrent<'static>> {
+        let info_hash = InfoHash::new(torrent.hash_string.clone())?;
+        let complete = torrent.complete();
+        let checking = torrent.checking();
+        Some(ClientTorrent {
+            info_hash: info_hash.into_owned(),
+            name: Cow::Owned(torrent.name),
+            files: torrent
+                .files
+                .into_iter()
+                .map(|file| File::new(file.name, file.length))
+                .collect(),
+            save_path: Cow::Owned(torrent.download_dir),
+            category: None,
+            tags: torrent.labels.into_iter().map(ClientLabel::new).collect(),
+            trackers: torrent
+                .trackers
+                .into_iter()
+                .filter_map(|tracker| tracker_host(&tracker.announce))
+                .map(Cow::Owned)
+                .collect(),
+            complete,
+            checking,
+        })
     }
 }
 
@@ -1155,34 +1207,25 @@ impl TorrentClient for TransmissionClient {
 
     fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
         let mut output = Vec::new();
-        for torrent in self.torrent_get(None)? {
-            let Some(info_hash) = InfoHash::new(torrent.hash_string.clone()) else {
-                continue;
-            };
-            let complete = torrent.complete();
-            let checking = torrent.checking();
-            output.push(ClientTorrent {
-                info_hash: info_hash.into_owned(),
-                name: Cow::Owned(torrent.name),
-                files: torrent
-                    .files
-                    .into_iter()
-                    .map(|file| File::new(file.name, file.length))
-                    .collect(),
-                save_path: Cow::Owned(torrent.download_dir),
-                category: None,
-                tags: torrent.labels.into_iter().map(ClientLabel::new).collect(),
-                trackers: torrent
-                    .trackers
-                    .into_iter()
-                    .filter_map(|tracker| tracker_host(&tracker.announce))
-                    .map(Cow::Owned)
-                    .collect(),
-                complete,
-                checking,
-            });
-        }
+        self.for_each_torrent(&mut |torrent| {
+            output.push(torrent);
+            Ok(())
+        })?;
         Ok(output)
+    }
+
+    fn for_each_torrent(
+        &self,
+        visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        for hash in self.torrent_hashes()? {
+            for torrent in self.torrent_get(Some(&[hash]))? {
+                if let Some(torrent) = Self::client_torrent_from_transmission(torrent) {
+                    visitor(torrent)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn get_download_dir(
@@ -1425,28 +1468,17 @@ impl DelugeClient {
         }
     }
 
-    fn update_ui(&self, ids: Option<&[String]>) -> crate::Result<Vec<DelugeTorrent>> {
+    fn update_ui_fields(
+        &self,
+        ids: Option<&[String]>,
+        fields: &[&str],
+    ) -> crate::Result<Vec<DelugeTorrent>> {
         self.ensure_connected()?;
         let mut filter = serde_json::Map::new();
         if let Some(ids) = ids {
             filter.insert("id".to_owned(), serde_json::json!(ids));
         }
-        let response = self.rpc(
-            "web.update_ui",
-            serde_json::json!([
-                [
-                    "name",
-                    "hash",
-                    "save_path",
-                    "files",
-                    "tracker_host",
-                    "label",
-                    "progress",
-                    "state"
-                ],
-                filter
-            ]),
-        )?;
+        let response = self.rpc("web.update_ui", serde_json::json!([fields, filter]))?;
         let Some(torrents) = response
             .get("torrents")
             .and_then(serde_json::Value::as_object)
@@ -1466,6 +1498,31 @@ impl DelugeClient {
                 Ok(torrent)
             })
             .collect()
+    }
+
+    fn update_ui(&self, ids: Option<&[String]>) -> crate::Result<Vec<DelugeTorrent>> {
+        self.update_ui_fields(
+            ids,
+            &[
+                "name",
+                "hash",
+                "save_path",
+                "files",
+                "tracker_host",
+                "label",
+                "progress",
+                "state",
+            ],
+        )
+    }
+
+    fn torrent_hashes(&self) -> crate::Result<Vec<String>> {
+        Ok(self
+            .update_ui_fields(None, &["hash"])?
+            .into_iter()
+            .map(|torrent| torrent.hash)
+            .filter(|hash| InfoHash::new(hash.as_str()).is_some())
+            .collect())
     }
 
     fn torrent_info(&self, info_hash: &InfoHash<'_>) -> crate::Result<Option<DelugeTorrent>> {
@@ -1500,6 +1557,32 @@ impl DelugeClient {
         )?;
         Ok(())
     }
+
+    fn client_torrent_from_deluge(torrent: DelugeTorrent) -> Option<ClientTorrent<'static>> {
+        let info_hash = InfoHash::new(torrent.hash.clone())?;
+        let complete = torrent.complete();
+        let checking = torrent.checking();
+        let tracker =
+            (!torrent.tracker_host.is_empty()).then_some(Cow::Owned(torrent.tracker_host));
+        Some(ClientTorrent {
+            info_hash: info_hash.into_owned(),
+            name: Cow::Owned(torrent.name),
+            files: torrent
+                .files
+                .into_iter()
+                .map(|file| File::new(file.path, file.size))
+                .collect(),
+            save_path: Cow::Owned(torrent.save_path),
+            category: torrent
+                .label
+                .filter(|label| !label.is_empty())
+                .map(ClientLabel::new),
+            tags: Vec::new(),
+            trackers: tracker.into_iter().collect(),
+            complete,
+            checking,
+        })
+    }
 }
 
 impl TorrentClient for DelugeClient {
@@ -1525,34 +1608,25 @@ impl TorrentClient for DelugeClient {
 
     fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
         let mut output = Vec::new();
-        for torrent in self.update_ui(None)? {
-            let Some(info_hash) = InfoHash::new(torrent.hash.clone()) else {
-                continue;
-            };
-            let complete = torrent.complete();
-            let checking = torrent.checking();
-            let tracker =
-                (!torrent.tracker_host.is_empty()).then_some(Cow::Owned(torrent.tracker_host));
-            output.push(ClientTorrent {
-                info_hash: info_hash.into_owned(),
-                name: Cow::Owned(torrent.name),
-                files: torrent
-                    .files
-                    .into_iter()
-                    .map(|file| File::new(file.path, file.size))
-                    .collect(),
-                save_path: Cow::Owned(torrent.save_path),
-                category: torrent
-                    .label
-                    .filter(|label| !label.is_empty())
-                    .map(ClientLabel::new),
-                tags: Vec::new(),
-                trackers: tracker.into_iter().collect(),
-                complete,
-                checking,
-            });
-        }
+        self.for_each_torrent(&mut |torrent| {
+            output.push(torrent);
+            Ok(())
+        })?;
         Ok(output)
+    }
+
+    fn for_each_torrent(
+        &self,
+        visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        for hash in self.torrent_hashes()? {
+            for torrent in self.update_ui(Some(&[hash]))? {
+                if let Some(torrent) = Self::client_torrent_from_deluge(torrent) {
+                    visitor(torrent)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn get_download_dir(
@@ -1836,6 +1910,27 @@ impl RtorrentClient {
         })
     }
 
+    fn client_torrent_from_rtorrent(
+        hash: String,
+        torrent: RtTorrent,
+    ) -> Option<ClientTorrent<'static>> {
+        let info_hash = InfoHash::new(hash)?;
+        let complete = torrent.complete();
+        let checking = torrent.checking();
+        let tags = (!torrent.label.is_empty()).then_some(ClientLabel::new(torrent.label));
+        Some(ClientTorrent {
+            info_hash: info_hash.into_owned(),
+            name: Cow::Owned(torrent.name),
+            files: torrent.files,
+            save_path: Cow::Owned(torrent.directory),
+            category: None,
+            tags: tags.into_iter().collect(),
+            trackers: torrent.trackers,
+            complete,
+            checking,
+        })
+    }
+
     fn action(&self, method: &str, info_hash: &InfoHash<'_>) -> crate::Result<()> {
         self.rpc(method, &[RtXmlParam::String(info_hash.as_str().to_owned())])?;
         Ok(())
@@ -1865,27 +1960,27 @@ impl TorrentClient for RtorrentClient {
 
     fn get_all_torrents(&self) -> crate::Result<Vec<ClientTorrent<'static>>> {
         let mut output = Vec::new();
+        self.for_each_torrent(&mut |torrent| {
+            output.push(torrent);
+            Ok(())
+        })?;
+        Ok(output)
+    }
+
+    fn for_each_torrent(
+        &self,
+        visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
         for hash in self.hashes()? {
-            let Some(info_hash) = InfoHash::new(hash.clone()) else {
+            let Some(_) = InfoHash::new(hash.as_str()) else {
                 continue;
             };
             let torrent = self.fetch_torrent(&hash)?;
-            let complete = torrent.complete();
-            let checking = torrent.checking();
-            let tags = (!torrent.label.is_empty()).then_some(ClientLabel::new(torrent.label));
-            output.push(ClientTorrent {
-                info_hash: info_hash.into_owned(),
-                name: Cow::Owned(torrent.name),
-                files: torrent.files,
-                save_path: Cow::Owned(torrent.directory),
-                category: None,
-                tags: tags.into_iter().collect(),
-                trackers: torrent.trackers,
-                complete,
-                checking,
-            });
+            if let Some(torrent) = Self::client_torrent_from_rtorrent(hash, torrent) {
+                visitor(torrent)?;
+            }
         }
-        Ok(output)
+        Ok(())
     }
 
     fn get_download_dir(
@@ -3570,14 +3665,13 @@ mod tests {
     #[test]
     fn transmission_negotiates_session_and_maps_inventory() {
         let hash = "0123456789abcdef0123456789abcdef01234567";
+        let body = format!(
+            r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example.Show.S01E01","downloadDir":"/downloads","files":[{{"name":"Example.Show.S01E01.mkv","length":123}}],"trackers":[{{"announce":"https://tracker.example/announce"}}],"labels":["tv","cross-seed"],"percentDone":1.0,"status":6}}]}}}}"#
+        );
         let server = http_server(vec![
             http_response_with_headers("409 Conflict", &[("X-Transmission-Session-Id", "sid")], ""),
-            http_response(
-                "200 OK",
-                &format!(
-                    r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example.Show.S01E01","downloadDir":"/downloads","files":[{{"name":"Example.Show.S01E01.mkv","length":123}}],"trackers":[{{"announce":"https://tracker.example/announce"}}],"labels":["tv","cross-seed"],"percentDone":1.0,"status":6}}]}}}}"#
-                ),
-            ),
+            http_response("200 OK", &body),
+            http_response("200 OK", &body),
         ]);
         let client = transmission_client(&server.url);
 
@@ -3592,7 +3686,7 @@ mod tests {
         assert!(torrents[0].complete);
         assert!(!torrents[0].checking);
         let requests = server.join();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(!requests[0].contains("X-Transmission-Session-Id"));
         assert!(
             requests[1]
@@ -3605,15 +3699,14 @@ mod tests {
     #[test]
     fn transmission_retries_transient_reads() {
         let hash = "0123456789abcdef0123456789abcdef01234567";
+        let body = format!(
+            r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example","downloadDir":"/downloads","files":[],"trackers":[],"labels":[],"percentDone":1.0,"status":6}}]}}}}"#
+        );
         let server = http_server(vec![
             http_response("502 Bad Gateway", ""),
             http_response_with_headers("409 Conflict", &[("X-Transmission-Session-Id", "sid")], ""),
-            http_response(
-                "200 OK",
-                &format!(
-                    r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example","downloadDir":"/downloads","files":[],"trackers":[],"labels":[],"percentDone":1.0,"status":6}}]}}}}"#
-                ),
-            ),
+            http_response("200 OK", &body),
+            http_response("200 OK", &body),
         ]);
         let client = transmission_client(&server.url);
 
@@ -3621,7 +3714,7 @@ mod tests {
 
         assert_eq!(torrents.len(), 1);
         let requests = server.join();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
     }
 
     #[test]
@@ -3682,12 +3775,16 @@ mod tests {
     #[test]
     fn deluge_connects_and_maps_inventory() {
         let hash = "0123456789abcdef0123456789abcdef01234567";
+        let body = format!(
+            r#"{{"torrents":{{"{hash}":{{"name":"Example.Show.S01E01","save_path":"/downloads","files":[{{"path":"Example.Show.S01E01.mkv","size":123}}],"tracker_host":"tracker.example","label":"tv","progress":100.0,"state":"Seeding"}}}}}}"#
+        );
         let server = http_server(vec![
             deluge_response("true"),
             deluge_response("true"),
-            deluge_response(&format!(
-                r#"{{"torrents":{{"{hash}":{{"name":"Example.Show.S01E01","save_path":"/downloads","files":[{{"path":"Example.Show.S01E01.mkv","size":123}}],"tracker_host":"tracker.example","label":"tv","progress":100.0,"state":"Seeding"}}}}}}"#
-            )),
+            deluge_response(&body),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&body),
         ]);
         let client = deluge_client(&server.url);
 
@@ -3704,7 +3801,7 @@ mod tests {
         assert_eq!(torrents[0].trackers[0], "tracker.example");
         assert!(torrents[0].complete);
         let requests = server.join();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 6);
         assert!(requests[0].contains(r#""method":"auth.login""#));
         assert!(requests[1].contains(r#""method":"web.connected""#));
         assert!(requests[2].contains(r#""method":"web.update_ui""#));
@@ -3713,13 +3810,17 @@ mod tests {
     #[test]
     fn deluge_retries_transient_reads() {
         let hash = "0123456789abcdef0123456789abcdef01234567";
+        let body = format!(
+            r#"{{"torrents":{{"{hash}":{{"name":"Example","save_path":"/downloads","files":[],"tracker_host":"","label":"","progress":100.0,"state":"Seeding"}}}}}}"#
+        );
         let server = http_server(vec![
             http_response("503 Service Unavailable", ""),
             deluge_response("true"),
             deluge_response("true"),
-            deluge_response(&format!(
-                r#"{{"torrents":{{"{hash}":{{"name":"Example","save_path":"/downloads","files":[],"tracker_host":"","label":"","progress":100.0,"state":"Seeding"}}}}}}"#
-            )),
+            deluge_response(&body),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&body),
         ]);
         let client = deluge_client(&server.url);
 
@@ -3727,7 +3828,7 @@ mod tests {
 
         assert_eq!(torrents.len(), 1);
         let requests = server.join();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 7);
     }
 
     #[test]
