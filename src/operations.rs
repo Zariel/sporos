@@ -1621,9 +1621,7 @@ mod tests {
         let root = temp_path("clear-cache");
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
-        let searchee_id = database
-            .get_or_insert_searchee("name", 1)
-            .expect("searchee");
+        let searchee_id = database.get_or_insert_searchee("name").expect("searchee");
         database
             .upsert_decision(&DecisionRecord {
                 searchee_id,
@@ -1648,7 +1646,7 @@ mod tests {
         fs::create_dir_all(&root).expect("temp dir");
         let sync_database = Database::open_app_dir(&root).expect("database");
         let searchee_id = sync_database
-            .get_or_insert_searchee("name", 1)
+            .get_or_insert_searchee("name")
             .expect("searchee");
         sync_database
             .upsert_decision(&DecisionRecord {
@@ -1812,9 +1810,7 @@ mod tests {
                 &[SqlValue::Text(Cow::Borrowed(missing_ensemble.as_ref()))],
             )
             .expect("ensemble");
-        let searchee_id = database
-            .get_or_insert_searchee("name", 1)
-            .expect("searchee");
+        let searchee_id = database.get_or_insert_searchee("name").expect("searchee");
         let old_hash = "0123456789012345678901234567890123456789";
         let recent_hash = "1111111111111111111111111111111111111111";
         let missing_hash = "2222222222222222222222222222222222222222";
@@ -1885,9 +1881,7 @@ mod tests {
         let root = temp_path("cleanup-guard");
         fs::create_dir_all(&root).expect("root");
         let database = Database::open_app_dir(&root).expect("database");
-        let searchee_id = database
-            .get_or_insert_searchee("name", 1)
-            .expect("searchee");
+        let searchee_id = database.get_or_insert_searchee("name").expect("searchee");
         insert_decision(
             &database,
             searchee_id,
@@ -1930,7 +1924,7 @@ mod tests {
             })
             .expect("client searchee");
         let searchee_id = database
-            .get_or_insert_searchee("Example Show S01E01", 1_000)
+            .get_or_insert_searchee("Example Show S01E01")
             .expect("searchee");
         database
             .upsert_decision(&DecisionRecord {

@@ -92,15 +92,14 @@ impl Database {
     }
 
     /// Insert a searchee name if needed and return its stable id.
-    pub fn get_or_insert_searchee(&self, name: &str, now_millis: i64) -> crate::Result<i64> {
+    pub fn get_or_insert_searchee(&self, name: &str) -> crate::Result<i64> {
         self.block_on(async {
             sqlx::query(
-                "INSERT INTO searchee (name, first_searched, last_searched)
-                 VALUES (?1, ?2, ?2)
+                "INSERT INTO searchee (name)
+                 VALUES (?1)
                  ON CONFLICT(name) DO NOTHING",
             )
             .bind(name)
-            .bind(now_millis)
             .execute(self.pool())
             .await
             .map_err(sqlx_error)?;
@@ -1822,9 +1821,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS searchee (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    first_searched INTEGER NOT NULL,
-    last_searched INTEGER NOT NULL
+    name TEXT NOT NULL UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS decision (
@@ -2184,6 +2181,9 @@ mod tests {
         ] {
             assert_column(&database, "data", column);
         }
+        for column in ["first_searched", "last_searched"] {
+            assert_no_column(&database, "searchee", column);
+        }
         for index in [
             "idx_client_searchee_lookup",
             "idx_data_lookup",
@@ -2292,7 +2292,7 @@ mod tests {
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
         let searchee_id = database
-            .get_or_insert_searchee("Example Show S01", 100)
+            .get_or_insert_searchee("Example Show S01")
             .expect("searchee");
 
         database
@@ -2655,6 +2655,14 @@ mod tests {
             .query_scalar(&sql, &[SqlValue::Text(Cow::Borrowed(column))])
             .expect("column query");
         assert_eq!(count, 1, "{table}.{column}");
+    }
+
+    fn assert_no_column(database: &Database, table: &str, column: &str) {
+        let sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1");
+        let count: i64 = database
+            .query_scalar(&sql, &[SqlValue::Text(Cow::Borrowed(column))])
+            .expect("column query");
+        assert_eq!(count, 0, "{table}.{column}");
     }
 
     fn assert_index(database: &Database, index: &str) {

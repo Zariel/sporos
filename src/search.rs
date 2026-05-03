@@ -691,8 +691,7 @@ where
             summary.searchees_filtered += 1;
             continue;
         }
-        let searchee_id = database
-            .get_or_insert_searchee(searchee.title.as_ref(), options.torznab.now_millis as i64)?;
+        let searchee_id = database.get_or_insert_searchee(searchee.title.as_ref())?;
         let group_key = search_group_key(searchee);
         let arr_lookup = lookup_arr_ids(options.arr_configs, searchee, options.arr_timeout)?;
         let arr_ids = arr_lookup.as_ref().map(|lookup| &lookup.ids);
@@ -3420,7 +3419,7 @@ mod tests {
             .find(|item| item.title.as_ref() == "Example Show S01E01")
             .expect("target");
         let searchee_id = database
-            .get_or_insert_searchee(target.title.as_ref(), 1_000)
+            .get_or_insert_searchee(target.title.as_ref())
             .expect("searchee");
         database
             .upsert_decision(&DecisionRecord {
@@ -3663,7 +3662,7 @@ mod tests {
         assert_eq!(matches[0].title, "Example Show S01E01");
 
         let searchee_id = database
-            .get_or_insert_searchee(matches[0].title.as_ref(), 1_000)
+            .get_or_insert_searchee(matches[0].title.as_ref())
             .expect("searchee");
         database
             .upsert_decision(&DecisionRecord {
@@ -3766,7 +3765,7 @@ mod tests {
             )
             .expect("poison row");
         let searchee_id = database
-            .get_or_insert_searchee("Example Show S01E01", 1_000)
+            .get_or_insert_searchee("Example Show S01E01")
             .expect("searchee");
         database
             .upsert_decision(&DecisionRecord {

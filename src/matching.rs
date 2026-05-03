@@ -89,7 +89,7 @@ pub fn assess_candidate(
     let options = context.options;
     let now_millis = context.now_millis;
     let fuzzy_size_factor = fuzzy_size_factor(searchee, options);
-    let searchee_id = database.get_or_insert_searchee(searchee.title.as_ref(), now_millis)?;
+    let searchee_id = database.get_or_insert_searchee(searchee.title.as_ref())?;
 
     if let Some(cached) = cached_decision(database, searchee_id, candidate.guid.as_ref())? {
         if let Some(info_hash) = InfoHash::new(cached.info_hash.clone().unwrap_or_default()) {
@@ -923,7 +923,7 @@ mod tests {
         let bytes = torrent_bytes("Cached.Release", 10);
         let metafile = crate::integrations::cache_torrent_file(&root, &bytes).expect("cache");
         let searchee_id = database
-            .get_or_insert_searchee(searchee.title.as_ref(), 1)
+            .get_or_insert_searchee(searchee.title.as_ref())
             .expect("searchee");
         database
             .upsert_decision(&crate::persistence::DecisionRecord {

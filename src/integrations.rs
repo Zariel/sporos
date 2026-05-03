@@ -3017,7 +3017,7 @@ mod tests {
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
         let searchee_id = database
-            .get_or_insert_searchee("release", 1)
+            .get_or_insert_searchee("release")
             .expect("searchee");
         database
             .upsert_decision(&DecisionRecord {

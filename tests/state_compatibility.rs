@@ -217,7 +217,7 @@ fn seed_database_state(database: &Database, info_hash: &str) {
         .set_api_key("0123456789abcdef0123456789abcdef0123456789abcdef")
         .expect("api key");
     let searchee_id = database
-        .get_or_insert_searchee("Example.Show.S01E01", 100)
+        .get_or_insert_searchee("Example.Show.S01E01")
         .expect("searchee");
     database
         .upsert_decision(&DecisionRecord {
