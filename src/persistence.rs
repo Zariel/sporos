@@ -232,16 +232,11 @@ impl Database {
     /// Start a bounded refresh for data-dir roots.
     pub fn begin_data_root_refresh(&self) -> crate::Result<()> {
         self.block_on(async {
-            sqlx::raw_sql(
-                "CREATE TEMP TABLE IF NOT EXISTS current_data_roots (
-                    path TEXT PRIMARY KEY
-                );
-                DELETE FROM current_data_roots;",
-            )
-            .execute(self.pool())
-            .await
-            .map(|_| ())
-            .map_err(sqlx_error)
+            sqlx::query("DELETE FROM current_data_roots")
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
         })
     }
 
@@ -355,13 +350,7 @@ impl Database {
     pub fn begin_client_searchee_refresh(&self) -> crate::Result<()> {
         self.block_on(async {
             sqlx::raw_sql(
-                "CREATE TEMP TABLE IF NOT EXISTS current_client_info_hashes (
-                    info_hash TEXT PRIMARY KEY
-                );
-                CREATE TEMP TABLE IF NOT EXISTS current_client_ensemble_paths (
-                    path TEXT PRIMARY KEY
-                );
-                DELETE FROM current_client_info_hashes;
+                "DELETE FROM current_client_info_hashes;
                 DELETE FROM current_client_ensemble_paths;",
             )
             .execute(self.pool())
@@ -517,15 +506,10 @@ impl Database {
     ) -> crate::Result<IndexerSyncStats> {
         let configured = configured.into_iter().collect::<Vec<_>>();
         self.block_on(async {
-            sqlx::raw_sql(
-                "CREATE TEMP TABLE IF NOT EXISTS current_indexer_urls (
-                    url TEXT PRIMARY KEY
-                );
-                DELETE FROM current_indexer_urls;",
-            )
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
+            sqlx::query("DELETE FROM current_indexer_urls")
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
             let mut result = IndexerSyncStats::default();
             for (url, apikey) in configured {
                 sqlx::query("INSERT OR IGNORE INTO current_indexer_urls (url) VALUES (?1)")
@@ -855,16 +839,11 @@ impl Database {
     /// Start a bounded refresh for torrent-dir rows.
     pub fn begin_torrent_dir_refresh(&self) -> crate::Result<()> {
         self.block_on(async {
-            sqlx::raw_sql(
-                "CREATE TEMP TABLE IF NOT EXISTS current_torrent_dir (
-                    file_path TEXT PRIMARY KEY
-                );
-                DELETE FROM current_torrent_dir;",
-            )
-            .execute(self.pool())
-            .await
-            .map(|_| ())
-            .map_err(sqlx_error)
+            sqlx::query("DELETE FROM current_torrent_dir")
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
         })
     }
 
@@ -1855,6 +1834,26 @@ CREATE TABLE IF NOT EXISTS rss (
     last_seen_guid TEXT NULL
 );
 
+CREATE TABLE IF NOT EXISTS current_data_roots (
+    path TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS current_client_info_hashes (
+    info_hash TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS current_client_ensemble_paths (
+    path TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS current_indexer_urls (
+    url TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS current_torrent_dir (
+    file_path TEXT PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS client_searchee (
     client_host TEXT NOT NULL,
     info_hash TEXT NOT NULL,
@@ -2161,6 +2160,11 @@ mod tests {
             "timestamp",
             "settings",
             "rss",
+            "current_data_roots",
+            "current_client_info_hashes",
+            "current_client_ensemble_paths",
+            "current_indexer_urls",
+            "current_torrent_dir",
             "client_searchee",
             "data",
             "ensemble",
@@ -2207,6 +2211,63 @@ mod tests {
         ] {
             assert_index(&database, index);
         }
+
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_staging_tables_are_connection_independent() {
+        let root = temp_path("refresh-staging");
+        fs::create_dir_all(&root).expect("temp dir");
+        let first = Database::open_app_dir(&root).expect("database");
+        let second = Database::open(Database::path_for_app_dir(&root)).expect("second database");
+
+        first.begin_data_root_refresh().expect("begin data");
+        second
+            .mark_refreshed_data_root("/media")
+            .expect("mark data");
+        assert_eq!(first.finish_data_root_refresh().expect("finish data"), 0);
+
+        first.begin_client_searchee_refresh().expect("begin client");
+        second
+            .mark_refreshed_client_info_hash("abcdef")
+            .expect("mark client hash");
+        second
+            .mark_refreshed_client_ensemble_path("/downloads/show")
+            .expect("mark client path");
+        assert_eq!(
+            first
+                .finish_client_searchee_refresh("http://client")
+                .expect("finish client"),
+            0
+        );
+
+        first.begin_torrent_dir_refresh().expect("begin torrent");
+        second
+            .mark_refreshed_torrent_path("/torrents/example.torrent")
+            .expect("mark torrent");
+        assert_eq!(
+            first.finish_torrent_dir_refresh().expect("finish torrent"),
+            0
+        );
+
+        first
+            .sync_indexers([("http://indexer.test/torznab", "secret")])
+            .expect("sync indexers");
+        let temp_tables: i64 = first
+            .query_scalar(
+                "SELECT COUNT(*) FROM sqlite_temp_master
+                 WHERE name IN (
+                    'current_data_roots',
+                    'current_client_info_hashes',
+                    'current_client_ensemble_paths',
+                    'current_indexer_urls',
+                    'current_torrent_dir'
+                 )",
+                &[],
+            )
+            .expect("temp table query");
+        assert_eq!(temp_tables, 0);
 
         let _cleanup = fs::remove_dir_all(root);
     }
