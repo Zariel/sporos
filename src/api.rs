@@ -1,6 +1,6 @@
 //! Daemon HTTP API routing, authentication, and response mapping.
 
-use std::{borrow::Cow, collections::BTreeMap, path::Path};
+use std::{borrow::Cow, collections::BTreeMap, net::IpAddr, path::Path};
 
 use async_trait::async_trait;
 use url::{Url, form_urlencoded};
@@ -183,8 +183,8 @@ pub async fn handle_api_request<H: ApiHandlers>(
         return Ok(ApiResponse::new(200, "OK"));
     }
     if !authorized(&request, api_key) {
-        if let Some(remote_addr) = request.remote_addr.as_deref() {
-            tracing::warn!("unauthorized API request from {remote_addr}");
+        if let Some(client_addr) = logged_client_addr(&request) {
+            tracing::warn!("unauthorized API request from {client_addr}");
         }
         return Ok(ApiResponse::new(401, AUTH_MESSAGE));
     }
@@ -257,6 +257,23 @@ fn authorized(request: &ApiRequest, api_key: &str) -> bool {
         .get("x-api-key")
         .or_else(|| request.query.get("apikey"))
         .is_some_and(|value| value == api_key)
+}
+
+fn logged_client_addr(request: &ApiRequest) -> Option<Cow<'_, str>> {
+    request
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|value| forwarded_client_addr(value))
+        .map(Cow::Owned)
+        .or_else(|| request.remote_addr.as_deref().map(Cow::Borrowed))
+}
+
+fn forwarded_client_addr(value: &str) -> Option<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|addr| addr.parse::<IpAddr>().is_ok())
+        .map(ToOwned::to_owned)
 }
 
 fn parse_body(body: &str) -> crate::Result<BTreeMap<String, serde_json::Value>> {
@@ -535,6 +552,35 @@ mod tests {
         .expect("status");
         assert_eq!(status.status, 200);
         assert_eq!(status.body, "OK");
+    }
+
+    #[test]
+    fn unauthorized_logging_prefers_valid_forwarded_client() {
+        let mut request = ApiRequest::new(ApiMethod::Get, "/api/status", BTreeMap::new(), "");
+        request.remote_addr = Some("10.0.0.4:50000".to_owned());
+        request.headers.insert(
+            "x-forwarded-for".to_owned(),
+            "203.0.113.9, 10.0.0.4".to_owned(),
+        );
+
+        assert_eq!(
+            super::logged_client_addr(&request).as_deref(),
+            Some("203.0.113.9")
+        );
+    }
+
+    #[test]
+    fn unauthorized_logging_falls_back_to_socket_remote() {
+        let mut request = ApiRequest::new(ApiMethod::Get, "/api/status", BTreeMap::new(), "");
+        request.remote_addr = Some("10.0.0.4:50000".to_owned());
+        request
+            .headers
+            .insert("x-forwarded-for".to_owned(), "unknown".to_owned());
+
+        assert_eq!(
+            super::logged_client_addr(&request).as_deref(),
+            Some("10.0.0.4:50000")
+        );
     }
 
     #[tokio::test]
