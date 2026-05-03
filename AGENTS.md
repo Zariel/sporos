@@ -145,6 +145,11 @@ Rust release. Do not add migration files for unreleased schema changes. After
 the first release, schema changes must use append-only numbered migrations and
 compatibility tests from released schema fixtures.
 
+Do not collapse every `info_hash` column into one canonical identity table.
+Decision rows may describe external candidates that were never cached locally,
+while torrent, client, and ensemble rows describe local state. Add foreign keys
+only where the ownership boundary is explicit.
+
 ## Conventions & Patterns
 
 ### Rust design
