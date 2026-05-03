@@ -52,6 +52,15 @@ impl JobName {
     }
 }
 
+/// Runtime config overrides requested for one queued job run.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct JobConfigOverride {
+    /// Override exclude_recent_search for this run.
+    pub ignore_exclude_recent_search: bool,
+    /// Override exclude_older for this run.
+    pub ignore_exclude_older: bool,
+}
+
 /// One scheduler job.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ScheduledJob {
@@ -65,6 +74,8 @@ pub struct ScheduledJob {
     pub is_active: bool,
     /// Force one run ahead of schedule.
     pub run_ahead_of_schedule: bool,
+    /// Runtime config overrides for the next queued run.
+    pub config_override: JobConfigOverride,
     /// Move persisted last_run forward by one cadence after an early run.
     pub delay_next_run: bool,
     /// Testable count of successful run dispatches.
@@ -80,19 +91,25 @@ impl ScheduledJob {
             cadence_millis,
             is_active: false,
             run_ahead_of_schedule: false,
+            config_override: JobConfigOverride {
+                ignore_exclude_recent_search: false,
+                ignore_exclude_older: false,
+            },
             delay_next_run: false,
             runs: 0,
         }
     }
 
-    fn run(&mut self) -> bool {
+    fn run(&mut self) -> Option<JobConfigOverride> {
         if self.is_active {
-            return false;
+            return None;
         }
         self.is_active = true;
         self.runs = self.runs.saturating_add(1);
         self.run_ahead_of_schedule = false;
-        true
+        let config_override = self.config_override;
+        self.config_override = JobConfigOverride::default();
+        Some(config_override)
     }
 
     fn finish(&mut self) {
@@ -105,6 +122,8 @@ impl ScheduledJob {
 pub struct JobCheckResult {
     /// Job name.
     pub name: JobName,
+    /// Runtime config overrides for this run.
+    pub config_override: JobConfigOverride,
     /// Whether the job was dispatched.
     pub ran: bool,
     /// Why the job did not run.
@@ -241,6 +260,7 @@ impl Scheduler {
         database: &Database,
         name: JobName,
         now_millis: i64,
+        config_override: JobConfigOverride,
     ) -> crate::Result<JobResponse> {
         let Some(job) = self.jobs.iter_mut().find(|job| job.name == name) else {
             return Ok(JobResponse::Disabled(format!(
@@ -267,6 +287,7 @@ impl Scheduler {
             )));
         }
         job.run_ahead_of_schedule = true;
+        job.config_override = config_override;
         if matches!(name, JobName::Rss | JobName::Search) {
             job.delay_next_run = true;
         }
@@ -282,6 +303,7 @@ impl Scheduler {
         database: &AsyncDatabase,
         name: JobName,
         now_millis: i64,
+        config_override: JobConfigOverride,
     ) -> crate::Result<JobResponse> {
         let Some(job) = self.jobs.iter_mut().find(|job| job.name == name) else {
             return Ok(JobResponse::Disabled(format!(
@@ -312,6 +334,7 @@ impl Scheduler {
             )));
         }
         job.run_ahead_of_schedule = true;
+        job.config_override = config_override;
         if matches!(name, JobName::Rss | JobName::Search) {
             job.delay_next_run = true;
         }
@@ -353,6 +376,7 @@ impl Scheduler {
             if !job.enabled {
                 results.push(JobCheckResult {
                     name: job.name,
+                    config_override: JobConfigOverride::default(),
                     ran: false,
                     skipped: Some(Cow::Borrowed("disabled")),
                 });
@@ -361,6 +385,7 @@ impl Scheduler {
             if job.is_active {
                 results.push(JobCheckResult {
                     name: job.name,
+                    config_override: JobConfigOverride::default(),
                     ran: false,
                     skipped: Some(Cow::Borrowed("already active")),
                 });
@@ -370,6 +395,7 @@ impl Scheduler {
                 if rss_active && job.name != JobName::Rss {
                     results.push(JobCheckResult {
                         name: job.name,
+                        config_override: JobConfigOverride::default(),
                         ran: false,
                         skipped: Some(Cow::Borrowed("rss active")),
                     });
@@ -378,6 +404,7 @@ impl Scheduler {
                 if job.name == JobName::Cleanup && any_active {
                     results.push(JobCheckResult {
                         name: job.name,
+                        config_override: JobConfigOverride::default(),
                         ran: false,
                         skipped: Some(Cow::Borrowed("another job active")),
                     });
@@ -386,14 +413,15 @@ impl Scheduler {
                 if !eligible {
                     results.push(JobCheckResult {
                         name: job.name,
+                        config_override: JobConfigOverride::default(),
                         ran: false,
                         skipped: Some(Cow::Borrowed("not due")),
                     });
                     continue;
                 }
             }
-            let ran = job.run();
-            if ran {
+            let config_override = job.run();
+            if config_override.is_some() {
                 let persisted = if job.delay_next_run {
                     job.delay_next_run = false;
                     now_millis.saturating_add(job.cadence_millis as i64)
@@ -404,8 +432,11 @@ impl Scheduler {
             }
             results.push(JobCheckResult {
                 name: job.name,
-                ran,
-                skipped: (!ran).then_some(Cow::Borrowed("already active")),
+                config_override: config_override.unwrap_or_default(),
+                ran: config_override.is_some(),
+                skipped: config_override
+                    .is_none()
+                    .then_some(Cow::Borrowed("already active")),
             });
         }
         Ok(results)
@@ -439,6 +470,7 @@ impl Scheduler {
             if !job.enabled {
                 results.push(JobCheckResult {
                     name: job.name,
+                    config_override: JobConfigOverride::default(),
                     ran: false,
                     skipped: Some(Cow::Borrowed("disabled")),
                 });
@@ -447,6 +479,7 @@ impl Scheduler {
             if job.is_active {
                 results.push(JobCheckResult {
                     name: job.name,
+                    config_override: JobConfigOverride::default(),
                     ran: false,
                     skipped: Some(Cow::Borrowed("already active")),
                 });
@@ -456,6 +489,7 @@ impl Scheduler {
                 if rss_active && job.name != JobName::Rss {
                     results.push(JobCheckResult {
                         name: job.name,
+                        config_override: JobConfigOverride::default(),
                         ran: false,
                         skipped: Some(Cow::Borrowed("rss active")),
                     });
@@ -464,6 +498,7 @@ impl Scheduler {
                 if job.name == JobName::Cleanup && any_active {
                     results.push(JobCheckResult {
                         name: job.name,
+                        config_override: JobConfigOverride::default(),
                         ran: false,
                         skipped: Some(Cow::Borrowed("another job active")),
                     });
@@ -472,14 +507,15 @@ impl Scheduler {
                 if !eligible {
                     results.push(JobCheckResult {
                         name: job.name,
+                        config_override: JobConfigOverride::default(),
                         ran: false,
                         skipped: Some(Cow::Borrowed("not due")),
                     });
                     continue;
                 }
             }
-            let ran = job.run();
-            if ran {
+            let config_override = job.run();
+            if config_override.is_some() {
                 let persisted = if job.delay_next_run {
                     job.delay_next_run = false;
                     now_millis.saturating_add(job.cadence_millis as i64)
@@ -492,8 +528,11 @@ impl Scheduler {
             }
             results.push(JobCheckResult {
                 name: job.name,
-                ran,
-                skipped: (!ran).then_some(Cow::Borrowed("already active")),
+                config_override: config_override.unwrap_or_default(),
+                ran: config_override.is_some(),
+                skipped: config_override
+                    .is_none()
+                    .then_some(Cow::Borrowed("already active")),
             });
         }
         Ok(results)
@@ -523,7 +562,7 @@ fn scheduler_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonPlan, JobName, ScheduledJob, Scheduler};
+    use super::{DaemonPlan, JobConfigOverride, JobName, ScheduledJob, Scheduler};
     use crate::{
         api::JobResponse,
         config::{RawConfig, RuntimeConfig},
@@ -595,7 +634,12 @@ mod tests {
         let mut scheduler = Scheduler::new(vec![ScheduledJob::new(JobName::Search, 60_000, true)]);
 
         let response = scheduler
-            .request_early_run(&database, JobName::Search, 1_000)
+            .request_early_run(
+                &database,
+                JobName::Search,
+                1_000,
+                JobConfigOverride::default(),
+            )
             .expect("early");
         assert_eq!(
             response,
@@ -617,6 +661,33 @@ mod tests {
     }
 
     #[test]
+    fn early_run_preserves_config_override_for_dispatch() {
+        let root = temp_path("scheduler-early-override");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let mut scheduler = Scheduler::new(vec![ScheduledJob::new(JobName::Search, 60_000, true)]);
+        let config_override = JobConfigOverride {
+            ignore_exclude_recent_search: true,
+            ignore_exclude_older: true,
+        };
+
+        scheduler
+            .request_early_run(&database, JobName::Search, 1_000, config_override)
+            .expect("early");
+        let results = scheduler
+            .check_jobs(&database, 1_000, false)
+            .expect("check");
+
+        assert!(results[0].ran);
+        assert_eq!(results[0].config_override, config_override);
+        assert_eq!(
+            scheduler.jobs()[0].config_override,
+            JobConfigOverride::default()
+        );
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn request_early_run_rejects_disabled_active_and_queued() {
         let root = temp_path("scheduler-reject");
         std::fs::create_dir_all(&root).expect("root");
@@ -634,19 +705,29 @@ mod tests {
 
         assert!(matches!(
             scheduler
-                .request_early_run(&database, JobName::Cleanup, 1_000)
+                .request_early_run(
+                    &database,
+                    JobName::Cleanup,
+                    1_000,
+                    JobConfigOverride::default(),
+                )
                 .expect("disabled"),
             JobResponse::Disabled(_)
         ));
         assert!(matches!(
             scheduler
-                .request_early_run(&database, JobName::Search, 1_000)
+                .request_early_run(
+                    &database,
+                    JobName::Search,
+                    1_000,
+                    JobConfigOverride::default(),
+                )
                 .expect("active"),
             JobResponse::AlreadyRunning(_)
         ));
         assert!(matches!(
             scheduler
-                .request_early_run(&database, JobName::Rss, 1_000)
+                .request_early_run(&database, JobName::Rss, 1_000, JobConfigOverride::default())
                 .expect("queued"),
             JobResponse::NotEligible(_)
         ));
@@ -694,7 +775,12 @@ mod tests {
         assert!(scheduler.jobs()[1].is_active);
         assert!(matches!(
             scheduler
-                .request_early_run(&database, JobName::Search, 1_000)
+                .request_early_run(
+                    &database,
+                    JobName::Search,
+                    1_000,
+                    JobConfigOverride::default(),
+                )
                 .expect("active"),
             JobResponse::AlreadyRunning(_)
         ));

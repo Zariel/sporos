@@ -30,7 +30,7 @@ use crate::{
     config::RuntimeConfig,
     persistence::{AsyncDatabase, Database},
     runtime::RuntimeServices,
-    scheduler::{DaemonPlan, DaemonRun, JobName, Scheduler},
+    scheduler::{DaemonPlan, DaemonRun, JobConfigOverride, JobName, Scheduler},
 };
 
 const JOB_LOOP_INTERVAL: Duration = Duration::from_secs(60);
@@ -283,7 +283,7 @@ async fn execute_ran_jobs(
         if !result.ran {
             continue;
         }
-        let job_result = execute_ran_job(Arc::clone(&services), app_dir, config, result.name).await;
+        let job_result = execute_ran_job(Arc::clone(&services), app_dir, config, result).await;
         executed.push(ExecutedJob {
             name: result.name,
             result: job_result,
@@ -315,18 +315,19 @@ async fn execute_ran_job(
     services: Arc<RuntimeServices>,
     app_dir: &Path,
     config: &RuntimeConfig,
-    name: JobName,
+    job: &crate::scheduler::JobCheckResult,
 ) -> crate::Result<()> {
-    match name {
+    match job.name {
         JobName::Rss => {
+            let config = config_with_job_override(config, job.config_override);
             let notifier = crate::notifications::NotificationSender::from_config(
-                config,
-                crate::startup::Redactor::from_config(config),
+                &config,
+                crate::startup::Redactor::from_config(&config),
             )?;
             let rss = crate::operations::run_rss_workflow_async(
                 services.blocking().matching.clone(),
                 app_dir.to_path_buf(),
-                config.clone(),
+                config,
                 notifier,
             )
             .await?;
@@ -337,14 +338,15 @@ async fn execute_ran_job(
             );
         }
         JobName::Search => {
+            let config = config_with_job_override(config, job.config_override);
             let notifier = crate::notifications::NotificationSender::from_config(
-                config,
-                crate::startup::Redactor::from_config(config),
+                &config,
+                crate::startup::Redactor::from_config(&config),
             )?;
             let search = crate::operations::run_search_workflow_async(
                 services.blocking().matching.clone(),
                 app_dir.to_path_buf(),
-                config.clone(),
+                config,
                 notifier,
             )
             .await?;
@@ -411,6 +413,20 @@ async fn execute_ran_job(
         }
     }
     Ok(())
+}
+
+fn config_with_job_override(
+    config: &RuntimeConfig,
+    config_override: JobConfigOverride,
+) -> RuntimeConfig {
+    let mut config = config.clone();
+    if config_override.ignore_exclude_recent_search {
+        config.exclude_recent_search = Some(1);
+    }
+    if config_override.ignore_exclude_older {
+        config.exclude_older = Some(u64::MAX);
+    }
+    config
 }
 
 fn listen_address(config: &RuntimeConfig) -> Option<SocketAddr> {
@@ -520,8 +536,12 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 request.name
             )));
         };
+        let config_override = JobConfigOverride {
+            ignore_exclude_recent_search: request.ignore_exclude_recent_search,
+            ignore_exclude_older: request.ignore_exclude_older,
+        };
         let response = scheduler
-            .request_early_run_async(self.async_database, name, self.now_millis)
+            .request_early_run_async(self.async_database, name, self.now_millis, config_override)
             .await?;
         if matches!(response, JobResponse::Accepted(_)) {
             let results = scheduler
@@ -550,7 +570,12 @@ async fn run_webhook_worker(
     {
         let _response = plan
             .scheduler
-            .request_early_run_async(&async_database, JobName::Inject, now)
+            .request_early_run_async(
+                &async_database,
+                JobName::Inject,
+                now,
+                JobConfigOverride::default(),
+            )
             .await?;
         let results = plan
             .scheduler
@@ -591,7 +616,7 @@ mod tests {
         config::{RawConfig, RuntimeConfig, TorrentClientConfig},
         persistence::{AsyncDatabase, Database},
         runtime::RuntimeServices,
-        scheduler::{DaemonPlan, JobName},
+        scheduler::{DaemonPlan, JobConfigOverride, JobName},
     };
     use std::{
         collections::BTreeMap,
@@ -699,6 +724,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_job_preserves_timestamp_overrides_for_dispatch() {
+        let root = temp_path("daemon-job-override");
+        let data_dir = temp_path("daemon-job-override-data");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                port: Some(None),
+                search_cadence: Some(86_400_000),
+                exclude_recent_search: Some(259_200_000),
+                exclude_older: Some(518_400_000),
+                data_dirs: vec![data_dir.clone()],
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let async_database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+        let mut plan = DaemonPlan::from_config(&config);
+        let services = RuntimeServices::start(CancellationToken::new());
+        let mut handlers = super::RuntimeHandlers {
+            app_dir: &root,
+            config: &config,
+            services,
+            async_database: &async_database,
+            scheduler: Some(&mut plan.scheduler),
+            now_millis: 1_000,
+            webhook_requests: Vec::new(),
+            job_dispatches: Vec::new(),
+        };
+
+        let response = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/job?apikey=secret",
+                BTreeMap::new(),
+                r#"{"name":"search","ignoreExcludeRecentSearch":true,"ignoreExcludeOlder":true}"#,
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .await
+        .expect("job");
+
+        assert_eq!(response.status, 200);
+        let search = handlers
+            .job_dispatches
+            .iter()
+            .find(|result| result.name == JobName::Search)
+            .expect("search dispatch");
+        assert!(search.ran);
+        assert_eq!(
+            search.config_override,
+            JobConfigOverride {
+                ignore_exclude_recent_search: true,
+                ignore_exclude_older: true,
+            }
+        );
+        handlers.services.shutdown().await;
+        async_database.close().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+        let _cleanup = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn axum_request_state_routes_ping_and_auth() {
         let root = temp_path("daemon-axum-state");
         std::fs::create_dir_all(&root).expect("root");
@@ -773,6 +863,31 @@ mod tests {
     #[tokio::test]
     async fn max_request_body_limit_matches_compatibility_limit() {
         assert_eq!(MAX_REQUEST_BODY_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    fn job_config_override_maps_timestamp_ignores() {
+        let root = temp_path("daemon-job-config-override");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                exclude_recent_search: Some(180_000),
+                exclude_older: Some(360_000),
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+
+        let overridden = super::config_with_job_override(
+            &config,
+            JobConfigOverride {
+                ignore_exclude_recent_search: true,
+                ignore_exclude_older: true,
+            },
+        );
+
+        assert_eq!(overridden.exclude_recent_search, Some(1));
+        assert_eq!(overridden.exclude_older, Some(u64::MAX));
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
