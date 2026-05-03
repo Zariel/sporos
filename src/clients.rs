@@ -32,6 +32,9 @@ use crate::{
 pub const CLIENT_INVENTORY_PAGE_SIZE: usize = 1_000;
 /// Maximum active qBittorrent file-list requests during cleanup refresh.
 pub const QB_TORRENT_FILES_CONCURRENCY_LIMIT: usize = 1;
+const INJECTION_CONFIRM_ATTEMPTS: usize = 5;
+const INJECTION_CONFIRM_BASE_DELAY: Duration = Duration::from_millis(100);
+const INJECTION_CONFIRM_MAX_DELAY: Duration = Duration::from_millis(500);
 
 /// Normalized torrent-client adapter identity.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -479,6 +482,27 @@ where
     Ok(())
 }
 
+fn confirm_injection(
+    client: &dyn TorrentClient,
+    info_hash: &InfoHash<'_>,
+) -> crate::Result<InjectionResult> {
+    let mut delay = INJECTION_CONFIRM_BASE_DELAY;
+    for attempt in 0..INJECTION_CONFIRM_ATTEMPTS {
+        if client.is_torrent_in_client(info_hash)? {
+            return Ok(InjectionResult::Injected);
+        }
+        if attempt + 1 < INJECTION_CONFIRM_ATTEMPTS {
+            block_on_client_delay(delay)?;
+            delay = delay.saturating_mul(2).min(INJECTION_CONFIRM_MAX_DELAY);
+        }
+    }
+    tracing::warn!(
+        info_hash = %info_hash,
+        "torrent client did not confirm injected torrent before timeout"
+    );
+    Ok(InjectionResult::Failure)
+}
+
 /// qBittorrent Web API adapter.
 pub struct QbittorrentClient {
     identity: ClientIdentity,
@@ -916,7 +940,7 @@ impl TorrentClient for QbittorrentClient {
                 .error_for_status()
         })?
         .map_err(|error| client_error(format!("qBittorrent add failed: {error}")))?;
-        Ok(InjectionResult::Injected)
+        confirm_injection(self, &new_torrent.metafile.info_hash)
     }
 
     fn recheck_torrent(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
@@ -1309,10 +1333,14 @@ impl TorrentClient for TransmissionClient {
             "method": "torrent-add",
             "arguments": arguments
         }))?;
+        let result = confirm_injection(self, &new_torrent.metafile.info_hash)?;
+        if result != InjectionResult::Injected {
+            return Ok(result);
+        }
         if options.paused {
             self.torrent_action("torrent-stop", &new_torrent.metafile.info_hash)?;
         }
-        Ok(InjectionResult::Injected)
+        Ok(result)
     }
 
     fn recheck_torrent(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
@@ -1720,6 +1748,10 @@ impl TorrentClient for DelugeClient {
                 add_options
             ]),
         )?;
+        let result = confirm_injection(self, &new_torrent.metafile.info_hash)?;
+        if result != InjectionResult::Injected {
+            return Ok(result);
+        }
 
         let label = primary_client_label(searchee, options);
         if let Some(label) = label {
@@ -1731,7 +1763,7 @@ impl TorrentClient for DelugeClient {
                 serde_json::json!([[new_torrent.metafile.info_hash.as_str()]]),
             )?;
         }
-        Ok(InjectionResult::Injected)
+        Ok(result)
     }
 
     fn recheck_torrent(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
@@ -2084,6 +2116,10 @@ impl TorrentClient for RtorrentClient {
             )));
         }
         self.rpc(method, &params)?;
+        let result = confirm_injection(self, &new_torrent.metafile.info_hash)?;
+        if result != InjectionResult::Injected {
+            return Ok(result);
+        }
         let label = options
             .tags
             .first()
@@ -2100,7 +2136,7 @@ impl TorrentClient for RtorrentClient {
         if options.paused {
             self.action("d.pause", &new_torrent.metafile.info_hash)?;
         }
-        Ok(InjectionResult::Injected)
+        Ok(result)
     }
 
     fn recheck_torrent(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
@@ -3739,14 +3775,16 @@ mod tests {
 
     #[test]
     fn qbittorrent_injects_with_multipart_add_and_starts() {
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let info = qb_info_body(&metafile.info_hash);
         let server = http_server(vec![
             http_response("200 OK", "Ok."),
             http_response("200 OK", ""),
+            http_response("200 OK", &info),
             http_response("200 OK", ""),
         ]);
         let client = qb_client(&server.url);
-        let bytes = torrent_bytes("Inject.Release", 10);
-        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let new_torrent = NewTorrent {
             metafile,
             bytes: Cow::Owned(bytes),
@@ -3788,17 +3826,24 @@ mod tests {
                 .iter()
                 .any(|request| request.contains("POST /api/v2/torrents/start "))
         );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("GET /api/v2/torrents/info?hashes="))
+        );
     }
 
     #[test]
     fn qbittorrent_injects_duplicate_source_category() {
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let info = qb_info_body(&metafile.info_hash);
         let server = http_server(vec![
             http_response("200 OK", "Ok."),
             http_response("200 OK", ""),
+            http_response("200 OK", &info),
         ]);
         let client = qb_client(&server.url);
-        let bytes = torrent_bytes("Inject.Release", 10);
-        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let new_torrent = NewTorrent {
             metafile,
             bytes: Cow::Owned(bytes),
@@ -3834,6 +3879,53 @@ mod tests {
             .find(|request| request.contains("POST /api/v2/torrents/add "))
             .expect("add request");
         assert!(add.contains("movies.cross-seed"));
+    }
+
+    #[test]
+    fn qbittorrent_requires_injection_confirmation() {
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", ""),
+            http_response("200 OK", "[]"),
+            http_response("200 OK", "[]"),
+            http_response("200 OK", "[]"),
+            http_response("200 OK", "[]"),
+            http_response("200 OK", "[]"),
+        ]);
+        let client = qb_client(&server.url);
+        let new_torrent = NewTorrent {
+            metafile,
+            bytes: Cow::Owned(bytes),
+        };
+        let searchee = Searchee::from_files("Inject.Release", "Inject.Release", Vec::new());
+
+        let result = client
+            .inject(
+                &new_torrent,
+                &searchee,
+                Decision::Match,
+                &InjectionOptions {
+                    destination_dir: None,
+                    category: None,
+                    tags: Vec::new(),
+                    duplicate_categories: false,
+                    paused: false,
+                    skip_checking: true,
+                },
+            )
+            .expect("inject");
+
+        assert_eq!(result, InjectionResult::Failure);
+        let requests = server.join();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("GET /api/v2/torrents/info?hashes="))
+                .count(),
+            super::INJECTION_CONFIRM_ATTEMPTS
+        );
     }
 
     #[test]
@@ -3893,15 +3985,17 @@ mod tests {
 
     #[test]
     fn transmission_injects_and_starts() {
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let info = transmission_info_body(&metafile.info_hash);
         let server = http_server(vec![
             http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
+            http_response("200 OK", &info),
             http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
             http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
             http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
         ]);
         let client = transmission_client(&server.url);
-        let bytes = torrent_bytes("Inject.Release", 10);
-        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let new_torrent = NewTorrent {
             metafile,
             bytes: Cow::Owned(bytes),
@@ -3936,14 +4030,15 @@ mod tests {
 
         assert_eq!(result, InjectionResult::Injected);
         let requests = server.join();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
         assert!(requests[0].contains(r#""method":"torrent-add""#));
         assert!(requests[0].contains(r#""download-dir":"/linked""#));
         assert!(requests[0].contains(r#""labels":["tv","cross-seed"]"#));
         assert!(requests[0].contains(r#""paused":true"#));
-        assert!(requests[1].contains(r#""method":"torrent-stop""#));
-        assert!(requests[2].contains(r#""method":"torrent-verify""#));
-        assert!(requests[3].contains(r#""method":"torrent-start""#));
+        assert!(requests[1].contains(r#""method":"torrent-get""#));
+        assert!(requests[2].contains(r#""method":"torrent-stop""#));
+        assert!(requests[3].contains(r#""method":"torrent-verify""#));
+        assert!(requests[4].contains(r#""method":"torrent-start""#));
     }
 
     #[test]
@@ -4007,10 +4102,16 @@ mod tests {
 
     #[test]
     fn deluge_injects_labels_rechecks_and_resumes() {
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let info = deluge_info_body(&metafile.info_hash);
         let server = http_server(vec![
             deluge_response("true"),
             deluge_response("true"),
             deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&info),
             deluge_response("[]"),
             deluge_response("true"),
             deluge_response("true"),
@@ -4023,8 +4124,6 @@ mod tests {
             deluge_response("true"),
         ]);
         let client = deluge_client(&server.url);
-        let bytes = torrent_bytes("Inject.Release", 10);
-        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let new_torrent = NewTorrent {
             metafile,
             bytes: Cow::Owned(bytes),
@@ -4059,30 +4158,35 @@ mod tests {
 
         assert_eq!(result, InjectionResult::Injected);
         let requests = server.join();
-        assert_eq!(requests.len(), 13);
+        assert_eq!(requests.len(), 16);
         assert!(requests[2].contains(r#""method":"core.add_torrent_file""#));
         assert!(requests[2].contains(r#""download_location":"/linked""#));
-        assert!(requests[3].contains(r#""method":"label.get_labels""#));
-        assert!(requests[4].contains(r#""method":"label.add""#));
-        assert!(requests[5].contains(r#""method":"label.set_torrent""#));
-        assert!(requests[6].contains(r#""method":"core.pause_torrent""#));
-        assert!(requests[9].contains(r#""method":"core.force_recheck""#));
-        assert!(requests[12].contains(r#""method":"core.resume_torrent""#));
+        assert!(requests[5].contains(r#""method":"web.update_ui""#));
+        assert!(requests[6].contains(r#""method":"label.get_labels""#));
+        assert!(requests[7].contains(r#""method":"label.add""#));
+        assert!(requests[8].contains(r#""method":"label.set_torrent""#));
+        assert!(requests[9].contains(r#""method":"core.pause_torrent""#));
+        assert!(requests[12].contains(r#""method":"core.force_recheck""#));
+        assert!(requests[15].contains(r#""method":"core.resume_torrent""#));
     }
 
     #[test]
     fn deluge_injects_duplicate_source_category_label() {
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let info = deluge_info_body(&metafile.info_hash);
         let server = http_server(vec![
             deluge_response("true"),
             deluge_response("true"),
             deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&info),
             deluge_response("[]"),
             deluge_response("true"),
             deluge_response("true"),
         ]);
         let client = deluge_client(&server.url);
-        let bytes = torrent_bytes("Inject.Release", 10);
-        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let new_torrent = NewTorrent {
             metafile,
             bytes: Cow::Owned(bytes),
@@ -4113,8 +4217,8 @@ mod tests {
             .expect("inject");
 
         let requests = server.join();
-        assert!(requests[4].contains("movies.cross-seed"));
-        assert!(requests[5].contains("movies.cross-seed"));
+        assert!(requests[7].contains("movies.cross-seed"));
+        assert!(requests[8].contains("movies.cross-seed"));
     }
 
     #[test]
@@ -4190,16 +4294,17 @@ mod tests {
 
     #[test]
     fn rtorrent_injects_labels_rechecks_and_resumes() {
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let server = http_server(vec![
             rt_response(&rt_string("")),
+            rt_response(&rt_array(&[rt_string(metafile.info_hash.as_str())])),
             rt_response(&rt_bool(true)),
             rt_response(&rt_bool(true)),
             rt_response(&rt_bool(true)),
             rt_response(&rt_bool(true)),
         ]);
         let client = rtorrent_client(&server.url);
-        let bytes = torrent_bytes("Inject.Release", 10);
-        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let new_torrent = NewTorrent {
             metafile,
             bytes: Cow::Owned(bytes),
@@ -4234,14 +4339,15 @@ mod tests {
 
         assert_eq!(result, InjectionResult::Injected);
         let requests = server.join();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert!(requests[0].contains("<methodName>load.raw</methodName>"));
         assert!(requests[0].contains("<base64>"));
         assert!(requests[0].contains("d.directory.set=/linked"));
-        assert!(requests[1].contains("<methodName>d.custom1.set</methodName>"));
-        assert!(requests[2].contains("<methodName>d.pause</methodName>"));
-        assert!(requests[3].contains("<methodName>d.check_hash</methodName>"));
-        assert!(requests[4].contains("<methodName>d.resume</methodName>"));
+        assert!(requests[1].contains("<methodName>download_list</methodName>"));
+        assert!(requests[2].contains("<methodName>d.custom1.set</methodName>"));
+        assert!(requests[3].contains("<methodName>d.pause</methodName>"));
+        assert!(requests[4].contains("<methodName>d.check_hash</methodName>"));
+        assert!(requests[5].contains("<methodName>d.resume</methodName>"));
     }
 
     struct FakeClient {
@@ -4459,6 +4565,27 @@ mod tests {
             .map(|value| format!("<value>{value}</value>"))
             .collect::<String>();
         format!("<array><data>{values}</data></array>")
+    }
+
+    fn qb_info_body(info_hash: &InfoHash<'_>) -> String {
+        format!(
+            r#"[{{"hash":"{}","name":"Inject.Release","save_path":"/downloads","progress":1.0,"state":"uploading"}}]"#,
+            info_hash.as_str()
+        )
+    }
+
+    fn transmission_info_body(info_hash: &InfoHash<'_>) -> String {
+        format!(
+            r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{}","name":"Inject.Release","downloadDir":"/downloads","files":[],"trackers":[],"labels":[],"percentDone":1.0,"status":6}}]}}}}"#,
+            info_hash.as_str()
+        )
+    }
+
+    fn deluge_info_body(info_hash: &InfoHash<'_>) -> String {
+        format!(
+            r#"{{"torrents":{{"{}":{{"name":"Inject.Release","save_path":"/downloads","files":[],"tracker_host":"","label":"","progress":100.0,"state":"Seeding"}}}}}}"#,
+            info_hash.as_str()
+        )
     }
 
     fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {
