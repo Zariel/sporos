@@ -99,13 +99,30 @@ pub fn assess_candidate(
                 let assessment =
                     assess_metafile(&metafile, searchee, options, true, fuzzy_size_factor);
                 if options.info_hashes_to_exclude.contains(info_hash.as_str()) {
-                    return Ok(Assessment::new(
+                    let assessment = Assessment::new(
                         Decision::InfoHashAlreadyExists,
                         Some(metafile),
                         true,
                         "cached candidate info hash is already present locally",
-                    ));
+                    );
+                    persist_decision(
+                        database,
+                        searchee_id,
+                        candidate,
+                        &assessment,
+                        now_millis,
+                        fuzzy_size_factor,
+                    )?;
+                    return Ok(assessment);
                 }
+                persist_decision(
+                    database,
+                    searchee_id,
+                    candidate,
+                    &assessment,
+                    now_millis,
+                    fuzzy_size_factor,
+                )?;
                 return Ok(assessment);
             }
         } else {
@@ -941,7 +958,7 @@ mod tests {
                 decision: Decision::Match,
                 first_seen: 1,
                 last_seen: 1,
-                fuzzy_size_factor: 0.05,
+                fuzzy_size_factor: 0.01,
             })
             .expect("decision");
         let mut history = SnatchHistory::default();
@@ -965,6 +982,18 @@ mod tests {
         assert_eq!(assessment.decision, Decision::Match);
         assert!(assessment.meta_cached);
         assert!(torrent_cache_path(&root, &metafile.info_hash).exists());
+        let (first_seen, last_seen, fuzzy_size_factor): (i64, i64, f64) = database
+            .connection()
+            .query_row(
+                "SELECT first_seen, last_seen, fuzzy_size_factor FROM decision
+                 WHERE searchee_id = ?1 AND guid = 'guid-1'",
+                [searchee_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("refreshed decision");
+        assert_eq!(first_seen, 1);
+        assert_eq!(last_seen, 2);
+        assert!((fuzzy_size_factor - 0.5).abs() < f64::EPSILON);
         let _cleanup = fs::remove_dir_all(root);
     }
 
