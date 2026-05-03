@@ -1877,7 +1877,7 @@ CREATE TABLE IF NOT EXISTS client_searchee (
 );
 CREATE INDEX IF NOT EXISTS idx_client_searchee_info_hash ON client_searchee(info_hash);
 CREATE INDEX IF NOT EXISTS idx_client_searchee_lookup
-ON client_searchee(media_type, season, episode, search_key, length);
+ON client_searchee(search_key, media_type, season, episode, length);
 
 CREATE TABLE IF NOT EXISTS data (
     path TEXT PRIMARY KEY,
@@ -1892,7 +1892,7 @@ CREATE TABLE IF NOT EXISTS data (
     non_video_bytes INTEGER NULL
 );
 CREATE INDEX IF NOT EXISTS idx_data_lookup
-ON data(media_type, season, episode, search_key, length);
+ON data(search_key, media_type, season, episode, length);
 
 CREATE TABLE IF NOT EXISTS ensemble (
     client_host TEXT NULL,
@@ -2216,29 +2216,75 @@ mod tests {
         let root = temp_path("lookup-indexes");
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
-        let keys = vec!["example.show.s01e01".to_owned()];
-        let criteria = ReverseLookupCriteria {
-            search_keys: &keys,
-            media_type: Some("episode"),
-            season: Some(1),
-            episode: Some(1),
-            min_length: Some(1),
-            max_length: Some(100),
-        };
-        let params = reverse_lookup_params(&criteria, 0, 100);
-        let client_plan = explain_detail(
+        assert_index_columns(
             &database,
-            &format!(
-                "EXPLAIN QUERY PLAN {}",
-                reverse_lookup_client_sql(keys.len())
-            ),
-            &params,
+            "idx_client_searchee_lookup",
+            &["search_key", "media_type", "season", "episode", "length"],
         );
-        let data_plan = explain_detail(
+        assert_index_columns(
             &database,
-            &format!("EXPLAIN QUERY PLAN {}", reverse_lookup_data_sql(keys.len())),
-            &params,
+            "idx_data_lookup",
+            &["search_key", "media_type", "season", "episode", "length"],
         );
+
+        let keys = vec!["example.show.s01e01".to_owned(), "example.show".to_owned()];
+        for criteria in [
+            ReverseLookupCriteria {
+                search_keys: &keys,
+                media_type: Some("episode"),
+                season: Some(1),
+                episode: Some(1),
+                min_length: Some(1),
+                max_length: Some(100),
+            },
+            ReverseLookupCriteria {
+                search_keys: &keys,
+                media_type: Some("episode"),
+                season: Some(1),
+                episode: None,
+                min_length: None,
+                max_length: None,
+            },
+            ReverseLookupCriteria {
+                search_keys: &keys,
+                media_type: None,
+                season: None,
+                episode: None,
+                min_length: None,
+                max_length: None,
+            },
+            ReverseLookupCriteria {
+                search_keys: &keys,
+                media_type: None,
+                season: None,
+                episode: None,
+                min_length: Some(1),
+                max_length: Some(100),
+            },
+        ] {
+            let params = reverse_lookup_params(&criteria, 0, 100);
+            let client_plan = explain_detail(
+                &database,
+                &format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    reverse_lookup_client_sql(keys.len())
+                ),
+                &params,
+            );
+            let data_plan = explain_detail(
+                &database,
+                &format!("EXPLAIN QUERY PLAN {}", reverse_lookup_data_sql(keys.len())),
+                &params,
+            );
+
+            assert!(
+                client_plan.contains("idx_client_searchee_lookup"),
+                "{client_plan}"
+            );
+            assert!(client_plan.contains("search_key=?"), "{client_plan}");
+            assert!(data_plan.contains("idx_data_lookup"), "{data_plan}");
+            assert!(data_plan.contains("search_key=?"), "{data_plan}");
+        }
         let ensemble_plan = explain_detail(
             &database,
             "EXPLAIN QUERY PLAN
@@ -2252,11 +2298,6 @@ mod tests {
             ],
         );
 
-        assert!(
-            client_plan.contains("idx_client_searchee_lookup"),
-            "{client_plan}"
-        );
-        assert!(data_plan.contains("idx_data_lookup"), "{data_plan}");
         assert!(
             ensemble_plan.contains("idx_ensemble_lookup"),
             "{ensemble_plan}"
@@ -2671,6 +2712,24 @@ mod tests {
             )
             .expect("index query");
         assert_eq!(count, 1, "{index}");
+    }
+
+    fn assert_index_columns(database: &Database, index: &str, expected: &[&str]) {
+        let columns = database
+            .block_on(async {
+                sqlx::query("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                    .bind(index)
+                    .fetch_all(database.pool())
+                    .await
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|row| row.get::<String, _>(0))
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(sqlx_error)
+            })
+            .expect("index column query");
+        assert_eq!(columns, expected, "{index}");
     }
 
     fn explain_detail(database: &Database, sql: &str, params: &[SqlValue<'_>]) -> String {
