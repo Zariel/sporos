@@ -91,7 +91,6 @@ Do not treat a release as an opportunity to broaden compatibility:
 
 - no less-conservative matching or title-only matching expansion;
 - no removal of saved-torrent retry behavior;
-- no daemon API contract drift from the Axum/Hyper serving boundary;
 - no database engine change without an explicit migration or import path;
 - no network requirement for local commands such as `diff` and `tree`;
 - no user-visible default change without a release note and compatibility test.
