@@ -999,7 +999,7 @@ fn search_pipeline_options<'a>(
         },
         assessment: assessment_options(config, blocklist, excluded),
         snatch: SnatchOptions {
-            retries: 0,
+            retries: config.snatch_retries,
             delay: Duration::from_secs(config.delay),
             timeout: config.snatch_timeout.map(Duration::from_millis),
         },

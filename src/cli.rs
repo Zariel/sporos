@@ -324,6 +324,9 @@ fn apply_shared_options(
     if let Some(value) = string_value(matches, "snatch-timeout") {
         raw_config.snatch_timeout = Some(crate::config::parse_duration_millis(value)?);
     }
+    if let Some(value) = matches.get_one::<u32>("snatch-retries") {
+        raw_config.snatch_retries = Some(*value);
+    }
     if let Some(value) = string_value(matches, "search-timeout") {
         raw_config.search_timeout = Some(crate::config::parse_duration_millis(value)?);
     }
@@ -638,6 +641,12 @@ fn add_shared_options(command: Command) -> Command {
                 .num_args(1),
         )
         .arg(
+            Arg::new("snatch-retries")
+                .long("snatch-retries")
+                .num_args(1)
+                .value_parser(value_parser!(u32)),
+        )
+        .arg(
             Arg::new("search-timeout")
                 .long("search-timeout")
                 .num_args(1),
@@ -816,6 +825,8 @@ mod tests {
                 "60",
                 "--snatch-timeout",
                 "30s",
+                "--snatch-retries",
+                "4",
                 "--search-timeout",
                 "2 minutes",
                 "--search-limit",
@@ -874,6 +885,7 @@ mod tests {
         assert_eq!(raw.ignore_non_relevant_files_to_resume, Some(true));
         assert_eq!(raw.delay, Some(60));
         assert_eq!(raw.snatch_timeout, Some(30_000));
+        assert_eq!(raw.snatch_retries, Some(4));
         assert_eq!(raw.search_timeout, Some(120_000));
         assert_eq!(raw.search_limit, Some(25));
         assert_eq!(

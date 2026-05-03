@@ -443,6 +443,7 @@ mod tests {
             rss_cadence: None,
             search_cadence: None,
             snatch_timeout: None,
+            snatch_retries: 2,
             search_timeout: None,
             search_limit: None,
             verbose: false,

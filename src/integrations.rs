@@ -22,6 +22,7 @@ use crate::{
     config::ApiIntegrationConfig,
     domain::{Candidate, InfoHash, MediaType, Metafile, Searchee},
     persistence::{Database, IndexerCapsRecord},
+    retry::RetryPolicy,
     torrent::{parse_metafile, torrent_cache_path},
 };
 
@@ -521,6 +522,7 @@ pub async fn snatch_async(
     }
 
     let attempts = options.retries.saturating_add(1);
+    let retry_policy = snatch_retry_policy(options);
     for attempt in 0..attempts {
         let result = snatch_once_async(candidate, options.timeout).await?;
         match result {
@@ -543,7 +545,8 @@ pub async fn snatch_async(
                 if retry_after_exceeds_window(retry_after, options.delay, remaining) {
                     return Ok(result);
                 }
-                let sleep_for = retry_after.unwrap_or(Duration::ZERO).max(options.delay);
+                let policy_delay = retry_policy.delay_for_retry(attempt.saturating_add(1));
+                let sleep_for = retry_after.unwrap_or(Duration::ZERO).max(policy_delay);
                 if !sleep_for.is_zero() {
                     tokio::time::sleep(sleep_for).await;
                 }
@@ -553,6 +556,16 @@ pub async fn snatch_async(
     Ok(SnatchResult::UnknownError {
         retry_after_millis: None,
     })
+}
+
+fn snatch_retry_policy(options: SnatchOptions) -> RetryPolicy {
+    if options.retries == 0 {
+        return RetryPolicy::default();
+    }
+    RetryPolicy::idempotent()
+        .with_max_attempts(options.retries.saturating_add(1))
+        .with_max_elapsed(options.delay.saturating_mul(options.retries))
+        .with_backoff(options.delay, options.delay, Duration::ZERO)
 }
 
 /// Look up a cached candidate info hash by GUID, link, or tracker-specific URL id.

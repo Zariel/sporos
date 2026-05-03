@@ -99,6 +99,11 @@ impl RetryPolicy {
             .saturating_add(random_jitter(self.jitter))
             .min(self.max_delay)
     }
+
+    /// Compute the bounded policy delay for a one-based retry number.
+    pub fn delay_for_retry(&self, retry_number: u32) -> Duration {
+        self.delay(retry_number)
+    }
 }
 
 /// Non-secret tracing context for retry attempts.

@@ -19,6 +19,8 @@ const DEFAULT_DELAY_SECONDS: u64 = 30;
 const DEFAULT_PORT: u16 = 2468;
 const DEFAULT_MAX_DATA_DEPTH: u32 = 2;
 const DEFAULT_FUZZY_SIZE_THRESHOLD: f64 = 0.05;
+const DEFAULT_SNATCH_RETRIES: u32 = 2;
+const MAX_SNATCH_RETRIES: u32 = 10;
 const MAX_AUTO_RESUME_DOWNLOAD_BYTES: u64 = 52_428_800;
 const MIN_RSS_CADENCE_MILLIS: u64 = 10 * 60 * 1_000;
 const MAX_RSS_CADENCE_MILLIS: u64 = 2 * 60 * 60 * 1_000;
@@ -252,6 +254,8 @@ pub struct RawConfig {
     /// Snatch timeout in ms.
     #[serde(deserialize_with = "deserialize_optional_duration")]
     pub snatch_timeout: Option<u64>,
+    /// Snatch retries after the first attempt.
+    pub snatch_retries: Option<u32>,
     /// Search timeout in ms.
     #[serde(deserialize_with = "deserialize_optional_duration")]
     pub search_timeout: Option<u64>,
@@ -338,6 +342,8 @@ pub struct RuntimeConfig {
     pub search_cadence: Option<u64>,
     /// Snatch timeout in ms.
     pub snatch_timeout: Option<u64>,
+    /// Snatch retries after the first attempt.
+    pub snatch_retries: u32,
     /// Search timeout in ms.
     pub search_timeout: Option<u64>,
     /// Search limit.
@@ -414,6 +420,7 @@ impl RuntimeConfig {
             rss_cadence: raw.rss_cadence,
             search_cadence: raw.search_cadence,
             snatch_timeout: raw.snatch_timeout,
+            snatch_retries: raw.snatch_retries.unwrap_or(DEFAULT_SNATCH_RETRIES),
             search_timeout: raw.search_timeout,
             search_limit: raw.search_limit,
             verbose: raw.verbose.unwrap_or(false),
@@ -431,6 +438,9 @@ impl RuntimeConfig {
     fn validate(&self) -> crate::Result<()> {
         if self.delay < DEFAULT_DELAY_SECONDS {
             return Err(config_error("delay must be at least 30 seconds"));
+        }
+        if self.snatch_retries > MAX_SNATCH_RETRIES {
+            return Err(config_error("snatch_retries must be <= 10"));
         }
         if self.max_data_depth == 0 {
             return Err(config_error("max_data_depth must be at least 1"));
@@ -893,7 +903,22 @@ mod tests {
             config.notification_webhook_urls,
             vec!["https://notify.example"]
         );
+        assert_eq!(config.snatch_retries, 2);
         assert_eq!(config.torrent_clients[0].kind, "qbittorrent");
+    }
+
+    #[test]
+    fn validates_snatch_retries_bound() {
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                snatch_retries: Some(11),
+                ..RawConfig::default()
+            },
+            Path::new("/config"),
+        )
+        .expect_err("snatch retry bound");
+
+        assert!(config.to_string().contains("snatch_retries"));
     }
 
     #[test]
@@ -1047,6 +1072,7 @@ mod tests {
             match_mode = "flexible"
             exclude_older = "2 days"
             exclude_recent_search = false
+            snatch_retries = 4
             link_dirs = ["/links"]
 
             [[torznab]]
@@ -1072,6 +1098,7 @@ mod tests {
         assert_eq!(raw.match_mode.as_deref(), Some("flexible"));
         assert_eq!(raw.exclude_older, Some(172_800_000));
         assert_eq!(raw.exclude_recent_search, None);
+        assert_eq!(raw.snatch_retries, Some(4));
         assert_eq!(
             raw.torrent_clients,
             vec![TorrentClientConfig {
