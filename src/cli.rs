@@ -7,12 +7,12 @@ use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use crate::{SporosError, persistence::Database};
 
 /// Run the command-line entry point.
-pub fn run() -> crate::Result<()> {
-    run_from(std::env::args_os())
+pub async fn run() -> crate::Result<()> {
+    run_from(std::env::args_os()).await
 }
 
 /// Run the command-line entry point from explicit arguments.
-pub fn run_from<I, T>(args: I) -> crate::Result<()>
+pub async fn run_from<I, T>(args: I) -> crate::Result<()>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
@@ -102,8 +102,8 @@ where
                 &crate::startup::RuntimeStartupHooks,
             )?;
             let database = Database::open_app_dir(&app_dir)?;
-            let shutdown = crate::daemon::install_shutdown_handler()?;
-            let run = crate::daemon::run_daemon(&app_dir, &config, &database, &shutdown)?;
+            let shutdown = crate::daemon::install_shutdown_handler();
+            let run = crate::daemon::run_daemon(&app_dir, &config, &database, shutdown).await?;
             println!(
                 "daemon stopped: serving={}, jobs={}",
                 run.listen_addr

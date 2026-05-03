@@ -1,18 +1,25 @@
-//! Daemon runtime, HTTP serving, scheduler loop, and shutdown handling.
+//! Daemon runtime, Axum HTTP serving, scheduler loop, and shutdown handling.
 
 use std::{
     borrow::Cow,
     collections::BTreeMap,
-    io::{BufRead, BufReader, Read, Write},
-    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use async_trait::async_trait;
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{ConnectInfo, DefaultBodyLimit, State},
+    http::{HeaderMap, Method, StatusCode, Uri},
+    response::{IntoResponse, Response},
+    routing::any,
+};
+use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     SporosError,
@@ -27,85 +34,205 @@ use crate::{
 };
 
 const JOB_LOOP_INTERVAL: Duration = Duration::from_secs(60);
-const IDLE_SLEEP: Duration = Duration::from_millis(50);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
-/// Shared shutdown flag set by signal handlers or tests.
-pub type ShutdownFlag = Arc<AtomicBool>;
-
 /// Install process signal handling for daemon shutdown.
-pub fn install_shutdown_handler() -> crate::Result<ShutdownFlag> {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let signal_shutdown = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || {
-        signal_shutdown.store(true, Ordering::SeqCst);
-    })
-    .map_err(|error| daemon_error(format!("failed to install shutdown handler: {error}")))?;
-    Ok(shutdown)
+pub fn install_shutdown_handler() -> CancellationToken {
+    let shutdown = CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => signal_shutdown.cancel(),
+            Err(error) => tracing::error!("failed to listen for shutdown signal: {error}"),
+        }
+    });
+    shutdown
 }
 
-/// Run the daemon until the shutdown flag is set.
-pub fn run_daemon(
+/// Run the daemon until cancellation is requested.
+pub async fn run_daemon(
     app_dir: &Path,
     config: &RuntimeConfig,
     database: &Database,
-    shutdown: &ShutdownFlag,
+    shutdown: CancellationToken,
 ) -> crate::Result<DaemonRun> {
     let mut plan = DaemonPlan::from_config(config);
-    run_plan(app_dir, config, database, &mut plan, shutdown, None)
+    run_plan(app_dir, config, database, &mut plan, shutdown, None).await
 }
 
-fn run_plan(
+async fn run_plan(
     app_dir: &Path,
     config: &RuntimeConfig,
     database: &Database,
     plan: &mut DaemonPlan,
-    shutdown: &ShutdownFlag,
+    shutdown: CancellationToken,
     max_iterations: Option<usize>,
 ) -> crate::Result<DaemonRun> {
     let mut run = plan.run_startup(database, now_millis(), || {
         index_torrents_and_data_dirs(config, database)
     })?;
     execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &run.jobs)?;
-    let listener = if let Some(address) = listen_address(config) {
+
+    let mut server_state = None;
+    let server = if let Some(address) = listen_address(config) {
         let listener = TcpListener::bind(address)
+            .await
             .map_err(|error| daemon_error(format!("failed to bind {address}: {error}")))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| daemon_error(format!("failed to configure listener: {error}")))?;
         let address = listener
             .local_addr()
             .map_err(|error| daemon_error(format!("failed to read listener address: {error}")))?;
         tracing::info!("daemon listening on {address}");
         run.listen_addr = Some(address);
-        Some(listener)
+        let state = Arc::new(DaemonState {
+            app_dir: app_dir.to_owned(),
+            config: config.clone(),
+            scheduler: Mutex::new(std::mem::replace(
+                &mut plan.scheduler,
+                Scheduler::new(Vec::new()),
+            )),
+        });
+        server_state = Some(Arc::clone(&state));
+        Some(serve_http(listener, state, shutdown.clone()))
     } else {
         tracing::info!("daemon HTTP serving disabled by --no-port or config");
         None
     };
 
-    let mut next_job_check = now_millis().saturating_add(duration_millis(JOB_LOOP_INTERVAL));
+    let mut interval = tokio::time::interval(JOB_LOOP_INTERVAL);
     let mut iterations = 0usize;
-    while !shutdown.load(Ordering::SeqCst) {
-        if let Some(listener) = &listener {
-            accept_ready(listener, app_dir, database, &mut plan.scheduler, config)?;
-        }
-
-        let now = now_millis();
-        if now >= next_job_check {
-            let results = plan.scheduler.check_jobs(database, now, false)?;
-            execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &results)?;
-            next_job_check = now.saturating_add(duration_millis(JOB_LOOP_INTERVAL));
-        }
-
-        iterations = iterations.saturating_add(1);
+    loop {
         if max_iterations.is_some_and(|limit| iterations >= limit) {
             break;
         }
-        thread::sleep(IDLE_SLEEP);
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            _tick = interval.tick() => {
+                let now = now_millis();
+                if let Some(state) = &server_state {
+                    let mut scheduler = state.scheduler.lock().await;
+                    let results = scheduler.check_jobs(database, now, false)?;
+                    execute_ran_jobs(app_dir, config, database, &mut scheduler, &results)?;
+                } else {
+                    let results = plan.scheduler.check_jobs(database, now, false)?;
+                    execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &results)?;
+                }
+                iterations = iterations.saturating_add(1);
+            }
+        }
+    }
+
+    shutdown.cancel();
+    if let Some(server) = server {
+        server
+            .await
+            .map_err(|error| daemon_error(format!("HTTP server task failed: {error}")))??;
     }
     Ok(run)
+}
+
+fn serve_http(
+    listener: TcpListener,
+    state: Arc<DaemonState>,
+    shutdown: CancellationToken,
+) -> JoinHandle<crate::Result<()>> {
+    tokio::spawn(async move {
+        let router = Router::new()
+            .fallback(any(handle_axum_request))
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+            .with_state(state);
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+        .map_err(|error| daemon_error(format!("HTTP server failed: {error}")))
+    })
+}
+
+async fn handle_axum_request(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request = ApiRequest {
+        method: api_method(&method),
+        path: uri.path().to_owned(),
+        query: uri.query().map(parse_query).unwrap_or_default(),
+        headers: headers
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (key.as_str().to_ascii_lowercase(), value.to_owned()))
+            })
+            .collect(),
+        body: String::from_utf8_lossy(&body).into_owned(),
+        remote_addr: Some(remote_addr.to_string()),
+    };
+
+    let runtime = tokio::runtime::Handle::current();
+    let response = match tokio::task::spawn_blocking(move || {
+        runtime.block_on(handle_runtime_request(state, request))
+    })
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::error!("API request failed: {error}");
+            crate::api::ApiResponse {
+                status: 500,
+                body: error.to_string(),
+            }
+        }
+        Err(error) => {
+            tracing::error!("API request task failed: {error}");
+            crate::api::ApiResponse {
+                status: 500,
+                body: error.to_string(),
+            }
+        }
+    };
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
+    (status, response.body).into_response()
+}
+
+async fn handle_runtime_request(
+    state: Arc<DaemonState>,
+    request: ApiRequest,
+) -> crate::Result<crate::api::ApiResponse> {
+    let database = Database::open_app_dir(&state.app_dir)?;
+    let api_key = crate::operations::api_key(&database, state.config.api_key.as_deref())?;
+    let mut scheduler = state.scheduler.lock().await;
+    let mut handlers = RuntimeHandlers {
+        app_dir: &state.app_dir,
+        config: &state.config,
+        database: &database,
+        scheduler: &mut scheduler,
+        now_millis: now_millis(),
+        webhook_requests: Vec::new(),
+    };
+    let response = handle_api_request(request, &api_key, &mut handlers).await?;
+    handlers.spawn_webhook_workers();
+    Ok(response)
+}
+
+fn api_method(method: &Method) -> ApiMethod {
+    match *method {
+        Method::GET => ApiMethod::Get,
+        Method::POST => ApiMethod::Post,
+        _ => ApiMethod::Other,
+    }
+}
+
+fn parse_query(query: &str) -> BTreeMap<String, String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
 }
 
 fn execute_ran_jobs(
@@ -212,186 +339,6 @@ fn execute_ran_jobs(
     Ok(())
 }
 
-fn accept_ready(
-    listener: &TcpListener,
-    app_dir: &Path,
-    database: &Database,
-    scheduler: &mut Scheduler,
-    config: &RuntimeConfig,
-) -> crate::Result<()> {
-    loop {
-        match listener.accept() {
-            Ok((stream, remote_addr)) => {
-                handle_stream(stream, remote_addr, app_dir, database, scheduler, config)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) => return Err(daemon_error(format!("failed to accept request: {error}"))),
-        }
-    }
-}
-
-fn handle_stream(
-    mut stream: TcpStream,
-    remote_addr: SocketAddr,
-    app_dir: &Path,
-    database: &Database,
-    scheduler: &mut Scheduler,
-    config: &RuntimeConfig,
-) -> crate::Result<()> {
-    stream
-        .set_read_timeout(Some(READ_TIMEOUT))
-        .map_err(|error| daemon_error(format!("failed to set read timeout: {error}")))?;
-    let mut request = match read_request(&mut stream) {
-        Ok(request) => request,
-        Err(error) => {
-            write_response(&mut stream, error.status(), error.body())?;
-            let _shutdown = stream.shutdown(Shutdown::Both);
-            return Ok(());
-        }
-    };
-    request.remote_addr = Some(remote_addr.to_string());
-    let api_key = crate::operations::api_key(database, config.api_key.as_deref())?;
-    let mut handlers = RuntimeHandlers {
-        app_dir,
-        config,
-        database,
-        scheduler,
-        now_millis: now_millis(),
-        webhook_requests: Vec::new(),
-    };
-    let response = handle_api_request(request, &api_key, &mut handlers)?;
-    write_response(&mut stream, response.status, &response.body)?;
-    handlers.spawn_webhook_workers();
-    let _shutdown = stream.shutdown(Shutdown::Both);
-    Ok(())
-}
-
-fn read_request(stream: &mut TcpStream) -> Result<ApiRequest, RequestReadError> {
-    let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    let read = reader.read_line(&mut request_line).map_err(|error| {
-        RequestReadError::bad_request(format!("failed to read request line: {error}"))
-    })?;
-    if read == 0 {
-        return Err(RequestReadError::bad_request("empty HTTP request"));
-    }
-
-    let mut parts = request_line.split_whitespace();
-    let method = match parts.next() {
-        Some("GET") => ApiMethod::Get,
-        Some("POST") => ApiMethod::Post,
-        Some(_) => ApiMethod::Other,
-        None => return Err(RequestReadError::bad_request("missing HTTP method")),
-    };
-    let target = parts
-        .next()
-        .ok_or_else(|| RequestReadError::bad_request("missing HTTP request target"))?
-        .to_owned();
-
-    let mut headers = BTreeMap::new();
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line).map_err(|error| {
-            RequestReadError::bad_request(format!("failed to read HTTP header: {error}"))
-        })?;
-        if read == 0 || line == "\r\n" || line == "\n" {
-            break;
-        }
-        let Some((name, value)) = line.trim_end().split_once(':') else {
-            continue;
-        };
-        let value = value.trim().to_owned();
-        if name.eq_ignore_ascii_case("content-length") {
-            let parsed = value.parse().map_err(|error| {
-                RequestReadError::bad_request(format!("invalid content-length: {error}"))
-            })?;
-            content_length = Some(parsed);
-        }
-        headers.insert(name.to_owned(), value);
-    }
-
-    if method == ApiMethod::Post && content_length.is_none() {
-        return Err(RequestReadError::bad_request("missing content-length"));
-    }
-    let content_length = content_length.unwrap_or(0usize);
-    if content_length > MAX_REQUEST_BODY_BYTES {
-        return Err(RequestReadError::payload_too_large(content_length));
-    }
-
-    let mut body = vec![0_u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body).map_err(|error| {
-            RequestReadError::bad_request(format!("failed to read request body: {error}"))
-        })?;
-    }
-    Ok(ApiRequest::new(
-        method,
-        &target,
-        headers,
-        String::from_utf8_lossy(&body),
-    ))
-}
-
-fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> crate::Result<()> {
-    let reason = reason_phrase(status);
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream
-        .write_all(response.as_bytes())
-        .map_err(|error| daemon_error(format!("failed to write response: {error}")))
-}
-
-fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        202 => "Accepted",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        413 => "Payload Too Large",
-        500 => "Internal Server Error",
-        _ => "OK",
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct RequestReadError {
-    status: u16,
-    body: String,
-}
-
-impl RequestReadError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: 400,
-            body: message.into(),
-        }
-    }
-
-    fn payload_too_large(size: usize) -> Self {
-        Self {
-            status: 413,
-            body: format!(
-                "request body too large: {size} bytes exceeds {MAX_REQUEST_BODY_BYTES} byte limit"
-            ),
-        }
-    }
-
-    fn status(&self) -> u16 {
-        self.status
-    }
-
-    fn body(&self) -> &str {
-        &self.body
-    }
-}
-
 fn listen_address(config: &RuntimeConfig) -> Option<SocketAddr> {
     config.port.map(|port| {
         let host = config.host.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
@@ -440,14 +387,16 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn duration_millis(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
 fn daemon_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Operation {
         message: message.into(),
     }
+}
+
+struct DaemonState {
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+    scheduler: Mutex<Scheduler>,
 }
 
 struct RuntimeHandlers<'a> {
@@ -464,7 +413,7 @@ impl RuntimeHandlers<'_> {
         for request in self.webhook_requests {
             let app_dir = PathBuf::from(self.app_dir);
             let config = self.config.clone();
-            thread::spawn(move || {
+            tokio::task::spawn_blocking(move || {
                 if let Err(error) = run_webhook_worker(&app_dir, &config, request) {
                     tracing::error!("webhook background work failed: {error}");
                 }
@@ -473,8 +422,9 @@ impl RuntimeHandlers<'_> {
     }
 }
 
+#[async_trait(?Send)]
 impl ApiHandlers for RuntimeHandlers<'_> {
-    fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>> {
+    async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>> {
         tracing::info!(
             tracker = request.tracker.as_str(),
             name = request.name.as_str(),
@@ -493,7 +443,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
         )
     }
 
-    fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {
+    async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {
         tracing::info!(
             info_hash = request.info_hash.as_deref().unwrap_or_default(),
             path = request.path.as_deref().unwrap_or_default(),
@@ -503,7 +453,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
         Ok(())
     }
 
-    fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse> {
+    async fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse> {
         let Some(name) = JobName::parse(&request.name) else {
             return Ok(JobResponse::Disabled(format!(
                 "{}: unable to run, disabled in config",
@@ -567,7 +517,7 @@ fn run_webhook_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REQUEST_BODY_BYTES, read_request, run_plan, write_response};
+    use super::{MAX_REQUEST_BODY_BYTES, handle_runtime_request, run_plan};
     use crate::{
         api::{ApiMethod, ApiRequest, handle_api_request},
         config::{RawConfig, RuntimeConfig, TorrentClientConfig},
@@ -576,17 +526,14 @@ mod tests {
     };
     use std::{
         collections::BTreeMap,
-        io::{Read, Write},
-        net::{Shutdown, TcpListener, TcpStream},
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
-    #[test]
-    fn no_port_runs_startup_jobs_without_serving() {
+    #[tokio::test]
+    async fn no_port_runs_startup_jobs_without_serving() {
         let root = temp_path("daemon-no-port");
         std::fs::create_dir_all(&root).expect("root");
         let database = Database::open_app_dir(&root).expect("database");
@@ -598,11 +545,12 @@ mod tests {
             &root,
         )
         .expect("config");
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
         let mut plan = DaemonPlan::from_config(&config);
 
-        let run =
-            run_plan(&root, &config, &database, &mut plan, &shutdown, Some(1)).expect("run daemon");
+        let run = run_plan(&root, &config, &database, &mut plan, shutdown, Some(1))
+            .await
+            .expect("run daemon");
 
         assert!(!run.serving);
         assert_eq!(run.listen_addr, None);
@@ -611,30 +559,11 @@ mod tests {
                 .iter()
                 .any(|result| result.name == JobName::Cleanup && result.ran)
         );
-        shutdown.store(true, Ordering::SeqCst);
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn http_response_includes_status_and_body_length() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let address = listener.local_addr().expect("address");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _remote) = listener.accept().expect("accept");
-            write_response(&mut stream, 404, "Not Found").expect("response");
-        });
-        let mut client = TcpStream::connect(address).expect("connect");
-        let mut response = String::new();
-        client.read_to_string(&mut response).expect("read");
-        handle.join().expect("join");
-
-        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(response.contains("Content-Length: 9"));
-        assert!(response.ends_with("Not Found"));
-    }
-
-    #[test]
-    fn runtime_webhook_queues_background_work_without_running_jobs_inline() {
+    #[tokio::test]
+    async fn runtime_webhook_queues_background_work_without_running_jobs_inline() {
         let root = temp_path("daemon-webhook-inline");
         std::fs::create_dir_all(&root).expect("root");
         let webhook_path = root.join("source.mkv");
@@ -673,6 +602,7 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("webhook");
 
         assert_eq!(response.status, 204);
@@ -698,41 +628,41 @@ mod tests {
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn daemon_request_parser_rejects_oversized_body_before_reading_it() {
-        let error = parse_raw_request(&format!(
-            "POST /api/job HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-            MAX_REQUEST_BODY_BYTES + 1
-        ))
-        .expect_err("oversized request rejected");
+    #[tokio::test]
+    async fn axum_request_state_routes_ping_and_auth() {
+        let root = temp_path("daemon-axum-state");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let scheduler = DaemonPlan::from_config(&config).scheduler;
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            scheduler: Mutex::new(scheduler),
+        });
 
-        assert_eq!(error.status(), 413);
-        assert!(error.body().contains("request body too large"));
-    }
-
-    #[test]
-    fn daemon_request_parser_rejects_invalid_or_missing_post_lengths() {
-        let invalid = parse_raw_request(
-            "POST /api/job HTTP/1.1\r\nContent-Length: definitely-not-a-number\r\n\r\n",
+        let ping = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(ApiMethod::Get, "/api/ping", BTreeMap::new(), ""),
         )
-        .expect_err("invalid length rejected");
-        assert_eq!(invalid.status(), 400);
-        assert!(invalid.body().contains("invalid content-length"));
+        .await
+        .expect("ping");
+        let unauthorized = handle_runtime_request(
+            state,
+            ApiRequest::new(ApiMethod::Get, "/api/status", BTreeMap::new(), ""),
+        )
+        .await
+        .expect("status");
 
-        let missing = parse_raw_request("POST /api/job HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .expect_err("missing length rejected");
-        assert_eq!(missing.status(), 400);
-        assert_eq!(missing.body(), "missing content-length");
+        assert_eq!(ping.status, 200);
+        assert_eq!(unauthorized.status, 401);
+        let _cleanup = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn daemon_request_parser_allows_get_without_content_length() {
-        let request = parse_raw_request("GET /api/ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .expect("request parsed");
-
-        assert_eq!(request.method, crate::api::ApiMethod::Get);
-        assert_eq!(request.path, "/api/ping");
-        assert_eq!(request.body, "");
+    #[tokio::test]
+    async fn max_request_body_limit_matches_compatibility_limit() {
+        assert_eq!(MAX_REQUEST_BODY_BYTES, 64 * 1024);
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -741,33 +671,5 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-{name}-{}-{nanos}", std::process::id()))
-    }
-
-    fn parse_raw_request(
-        raw: &str,
-    ) -> std::result::Result<crate::api::ApiRequest, super::RequestReadError> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|error| super::RequestReadError::bad_request(format!("bind: {error}")))?;
-        let address = listener.local_addr().map_err(|error| {
-            super::RequestReadError::bad_request(format!("local address: {error}"))
-        })?;
-        let raw = raw.as_bytes().to_vec();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _remote) = listener.accept().map_err(|error| {
-                super::RequestReadError::bad_request(format!("accept: {error}"))
-            })?;
-            read_request(&mut stream)
-        });
-        let mut client = TcpStream::connect(address)
-            .map_err(|error| super::RequestReadError::bad_request(format!("connect: {error}")))?;
-        client.write_all(&raw).map_err(|error| {
-            super::RequestReadError::bad_request(format!("write request: {error}"))
-        })?;
-        client.shutdown(Shutdown::Write).map_err(|error| {
-            super::RequestReadError::bad_request(format!("shutdown write: {error}"))
-        })?;
-        handle
-            .join()
-            .map_err(|_panic| super::RequestReadError::bad_request("join"))?
     }
 }

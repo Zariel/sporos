@@ -2,6 +2,7 @@
 
 use std::{borrow::Cow, collections::BTreeMap, path::Path};
 
+use async_trait::async_trait;
 use url::{Url, form_urlencoded};
 
 use crate::{
@@ -150,13 +151,14 @@ pub enum JobResponse {
 }
 
 /// Handler callbacks supplied by the daemon runtime.
+#[async_trait(?Send)]
 pub trait ApiHandlers {
     /// Reverse-match an announce candidate.
-    fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>>;
+    async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>>;
     /// Start webhook work after the immediate 204 response is selected.
-    fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()>;
+    async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()>;
     /// Run a scheduled job ahead of schedule.
-    fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse>;
+    async fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse>;
 }
 
 /// API-compatible action outcome for announce response mapping.
@@ -169,7 +171,7 @@ pub struct ApiOutcome {
 }
 
 /// Route one API request.
-pub fn handle_api_request<H: ApiHandlers>(
+pub async fn handle_api_request<H: ApiHandlers>(
     request: ApiRequest,
     api_key: &str,
     handlers: &mut H,
@@ -205,7 +207,7 @@ pub fn handle_api_request<H: ApiHandlers>(
                 Ok(announce) => announce,
                 Err(response) => return Ok(response),
             };
-            let outcome = handlers.announce(announce)?;
+            let outcome = handlers.announce(announce).await?;
             Ok(announce_response(outcome))
         }
         "/api/webhook" => {
@@ -220,7 +222,7 @@ pub fn handle_api_request<H: ApiHandlers>(
                 Ok(webhook) => webhook,
                 Err(response) => return Ok(response),
             };
-            handlers.webhook(webhook)?;
+            handlers.webhook(webhook).await?;
             Ok(ApiResponse::new(204, ""))
         }
         "/api/job" => {
@@ -235,7 +237,7 @@ pub fn handle_api_request<H: ApiHandlers>(
                 Ok(job) => job,
                 Err(response) => return Ok(response),
             };
-            Ok(job_response(handlers.job(job)?))
+            Ok(job_response(handlers.job(job).await?))
         }
         _ => Ok(ApiResponse::new(404, "Not Found")),
     }
@@ -493,14 +495,15 @@ mod tests {
     use crate::domain::{ActionResult, Decision, InjectionResult};
     use std::{collections::BTreeMap, fs};
 
-    #[test]
-    fn ping_skips_auth_and_status_requires_auth() {
+    #[tokio::test]
+    async fn ping_skips_auth_and_status_requires_auth() {
         let mut handlers = TestHandlers::default();
         let ping = handle_api_request(
             ApiRequest::new(ApiMethod::Get, "/api/ping", BTreeMap::new(), ""),
             "secret",
             &mut handlers,
         )
+        .await
         .expect("ping");
         assert_eq!(ping.status, 200);
         assert_eq!(ping.body, "OK");
@@ -510,6 +513,7 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("status");
         assert_eq!(unauthorized.status, 401);
 
@@ -523,13 +527,14 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("status");
         assert_eq!(status.status, 200);
         assert_eq!(status.body, "OK");
     }
 
-    #[test]
-    fn announce_validates_body_and_maps_result() {
+    #[tokio::test]
+    async fn announce_validates_body_and_maps_result() {
         let mut headers = BTreeMap::new();
         headers.insert("X-Api-Key".to_owned(), "secret".to_owned());
         let mut handlers = TestHandlers {
@@ -550,6 +555,7 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("announce");
 
         assert_eq!(response.status, 202);
@@ -557,8 +563,8 @@ mod tests {
         assert_eq!(handlers.announces[0].name, "Release");
     }
 
-    #[test]
-    fn webhook_accepts_form_body_and_returns_immediately() {
+    #[tokio::test]
+    async fn webhook_accepts_form_body_and_returns_immediately() {
         let path = std::env::temp_dir().join("sporos-api-webhook-path");
         fs::write(&path, b"data").expect("path");
         let mut handlers = TestHandlers::default();
@@ -576,6 +582,7 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("webhook");
 
         assert_eq!(response.status, 204);
@@ -585,8 +592,8 @@ mod tests {
         let _cleanup = fs::remove_file(path);
     }
 
-    #[test]
-    fn job_endpoint_maps_scheduler_responses() {
+    #[tokio::test]
+    async fn job_endpoint_maps_scheduler_responses() {
         let mut handlers = TestHandlers {
             job_response: JobResponse::AlreadyRunning("rss: already running".to_owned()),
             ..TestHandlers::default()
@@ -601,6 +608,7 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("job");
 
         assert_eq!(response.status, 409);
@@ -608,8 +616,8 @@ mod tests {
         assert_eq!(handlers.jobs[0].name, "rss");
     }
 
-    #[test]
-    fn api_rejects_unknown_request_fields() {
+    #[tokio::test]
+    async fn api_rejects_unknown_request_fields() {
         let mut headers = BTreeMap::new();
         headers.insert("X-Api-Key".to_owned(), "secret".to_owned());
         let path = std::env::temp_dir().join("sporos-api-strict-path");
@@ -626,6 +634,7 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("announce");
         let webhook = handle_api_request(
             ApiRequest::new(
@@ -637,6 +646,7 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("webhook");
         let job = handle_api_request(
             ApiRequest::new(
@@ -648,6 +658,7 @@ mod tests {
             "secret",
             &mut handlers,
         )
+        .await
         .expect("job");
 
         assert_eq!(announce.status, 400);
@@ -684,18 +695,22 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl ApiHandlers for TestHandlers {
-        fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>> {
+        async fn announce(
+            &mut self,
+            request: AnnounceRequest,
+        ) -> crate::Result<Option<ApiOutcome>> {
             self.announces.push(request);
             Ok(self.announce_result)
         }
 
-        fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {
+        async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {
             self.webhooks.push(request);
             Ok(())
         }
 
-        fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse> {
+        async fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse> {
             self.jobs.push(request);
             Ok(self.job_response.clone())
         }

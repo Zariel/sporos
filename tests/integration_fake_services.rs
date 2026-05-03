@@ -150,8 +150,8 @@ fn fake_arr_and_notification_services_cover_external_http_contracts() {
     );
 }
 
-#[test]
-fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
+#[tokio::test]
+async fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
     let root = temp_path("daemon-api");
     fs::create_dir_all(&root).expect("root");
     let data_dir = root.join("data");
@@ -181,6 +181,7 @@ fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
         "secret",
         &mut handlers,
     )
+    .await
     .expect("ping");
     assert_eq!(ping.status, 200);
 
@@ -189,6 +190,7 @@ fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
         "secret",
         &mut handlers,
     )
+    .await
     .expect("status");
     assert_eq!(unauthorized.status, 401);
 
@@ -204,6 +206,7 @@ fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
         "secret",
         &mut handlers,
     )
+    .await
     .expect("webhook");
     assert_eq!(webhook.status, 204);
     assert_eq!(handlers.webhooks, 1);
@@ -218,6 +221,7 @@ fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
         "secret",
         &mut handlers,
     )
+    .await
     .expect("job");
     assert_eq!(job.status, 409);
     assert_eq!(handlers.jobs, 1);
@@ -353,20 +357,21 @@ struct TestHandlers {
     jobs: usize,
 }
 
+#[async_trait::async_trait(?Send)]
 impl ApiHandlers for TestHandlers {
-    fn announce(&mut self, _request: AnnounceRequest) -> sporos::Result<Option<ApiOutcome>> {
+    async fn announce(&mut self, _request: AnnounceRequest) -> sporos::Result<Option<ApiOutcome>> {
         Ok(Some(ApiOutcome {
             decision: Decision::Match,
             action_result: Some(ActionResult::Save(sporos::domain::SaveResult::Saved)),
         }))
     }
 
-    fn webhook(&mut self, _request: WebhookRequest) -> sporos::Result<()> {
+    async fn webhook(&mut self, _request: WebhookRequest) -> sporos::Result<()> {
         self.webhooks += 1;
         Ok(())
     }
 
-    fn job(&mut self, _request: JobRequest) -> sporos::Result<JobResponse> {
+    async fn job(&mut self, _request: JobRequest) -> sporos::Result<JobResponse> {
         self.jobs += 1;
         Ok(JobResponse::AlreadyRunning(
             "rss: already running".to_owned(),
