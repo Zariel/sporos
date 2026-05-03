@@ -29,6 +29,7 @@ use crate::{
 const JOB_LOOP_INTERVAL: Duration = Duration::from_secs(60);
 const IDLE_SLEEP: Duration = Duration::from_millis(50);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 /// Shared shutdown flag set by signal handlers or tests.
 pub type ShutdownFlag = Arc<AtomicBool>;
@@ -240,7 +241,14 @@ fn handle_stream(
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|error| daemon_error(format!("failed to set read timeout: {error}")))?;
-    let mut request = read_request(&mut stream)?;
+    let mut request = match read_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            write_response(&mut stream, error.status(), error.body())?;
+            let _shutdown = stream.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+    };
     request.remote_addr = Some(remote_addr.to_string());
     let api_key = crate::operations::api_key(database, config.api_key.as_deref())?;
     let mut handlers = RuntimeHandlers {
@@ -256,14 +264,14 @@ fn handle_stream(
     Ok(())
 }
 
-fn read_request(stream: &mut TcpStream) -> crate::Result<ApiRequest> {
+fn read_request(stream: &mut TcpStream) -> Result<ApiRequest, RequestReadError> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    let read = reader
-        .read_line(&mut request_line)
-        .map_err(|error| daemon_error(format!("failed to read request line: {error}")))?;
+    let read = reader.read_line(&mut request_line).map_err(|error| {
+        RequestReadError::bad_request(format!("failed to read request line: {error}"))
+    })?;
     if read == 0 {
-        return Err(daemon_error("empty HTTP request"));
+        return Err(RequestReadError::bad_request("empty HTTP request"));
     }
 
     let mut parts = request_line.split_whitespace();
@@ -271,20 +279,20 @@ fn read_request(stream: &mut TcpStream) -> crate::Result<ApiRequest> {
         Some("GET") => ApiMethod::Get,
         Some("POST") => ApiMethod::Post,
         Some(_) => ApiMethod::Other,
-        None => return Err(daemon_error("missing HTTP method")),
+        None => return Err(RequestReadError::bad_request("missing HTTP method")),
     };
     let target = parts
         .next()
-        .ok_or_else(|| daemon_error("missing HTTP request target"))?
+        .ok_or_else(|| RequestReadError::bad_request("missing HTTP request target"))?
         .to_owned();
 
     let mut headers = BTreeMap::new();
-    let mut content_length = 0usize;
+    let mut content_length = None;
     loop {
         let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|error| daemon_error(format!("failed to read HTTP header: {error}")))?;
+        let read = reader.read_line(&mut line).map_err(|error| {
+            RequestReadError::bad_request(format!("failed to read HTTP header: {error}"))
+        })?;
         if read == 0 || line == "\r\n" || line == "\n" {
             break;
         }
@@ -293,18 +301,27 @@ fn read_request(stream: &mut TcpStream) -> crate::Result<ApiRequest> {
         };
         let value = value.trim().to_owned();
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value
-                .parse()
-                .map_err(|error| daemon_error(format!("invalid content-length: {error}")))?;
+            let parsed = value.parse().map_err(|error| {
+                RequestReadError::bad_request(format!("invalid content-length: {error}"))
+            })?;
+            content_length = Some(parsed);
         }
         headers.insert(name.to_owned(), value);
     }
 
+    if method == ApiMethod::Post && content_length.is_none() {
+        return Err(RequestReadError::bad_request("missing content-length"));
+    }
+    let content_length = content_length.unwrap_or(0usize);
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        return Err(RequestReadError::payload_too_large(content_length));
+    }
+
     let mut body = vec![0_u8; content_length];
     if content_length > 0 {
-        reader
-            .read_exact(&mut body)
-            .map_err(|error| daemon_error(format!("failed to read request body: {error}")))?;
+        reader.read_exact(&mut body).map_err(|error| {
+            RequestReadError::bad_request(format!("failed to read request body: {error}"))
+        })?;
     }
     Ok(ApiRequest::new(
         method,
@@ -335,8 +352,41 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "OK",
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RequestReadError {
+    status: u16,
+    body: String,
+}
+
+impl RequestReadError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: 400,
+            body: message.into(),
+        }
+    }
+
+    fn payload_too_large(size: usize) -> Self {
+        Self {
+            status: 413,
+            body: format!(
+                "request body too large: {size} bytes exceeds {MAX_REQUEST_BODY_BYTES} byte limit"
+            ),
+        }
+    }
+
+    fn status(&self) -> u16 {
+        self.status
+    }
+
+    fn body(&self) -> &str {
+        &self.body
     }
 }
 
@@ -514,15 +564,15 @@ fn run_webhook_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_plan, write_response};
+    use super::{MAX_REQUEST_BODY_BYTES, read_request, run_plan, write_response};
     use crate::{
         config::{RawConfig, RuntimeConfig},
         persistence::Database,
         scheduler::{DaemonPlan, JobName},
     };
     use std::{
-        io::Read,
-        net::{TcpListener, TcpStream},
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -578,11 +628,76 @@ mod tests {
         assert!(response.ends_with("Not Found"));
     }
 
+    #[test]
+    fn daemon_request_parser_rejects_oversized_body_before_reading_it() {
+        let error = parse_raw_request(&format!(
+            "POST /api/job HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BODY_BYTES + 1
+        ))
+        .expect_err("oversized request rejected");
+
+        assert_eq!(error.status(), 413);
+        assert!(error.body().contains("request body too large"));
+    }
+
+    #[test]
+    fn daemon_request_parser_rejects_invalid_or_missing_post_lengths() {
+        let invalid = parse_raw_request(
+            "POST /api/job HTTP/1.1\r\nContent-Length: definitely-not-a-number\r\n\r\n",
+        )
+        .expect_err("invalid length rejected");
+        assert_eq!(invalid.status(), 400);
+        assert!(invalid.body().contains("invalid content-length"));
+
+        let missing = parse_raw_request("POST /api/job HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect_err("missing length rejected");
+        assert_eq!(missing.status(), 400);
+        assert_eq!(missing.body(), "missing content-length");
+    }
+
+    #[test]
+    fn daemon_request_parser_allows_get_without_content_length() {
+        let request = parse_raw_request("GET /api/ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("request parsed");
+
+        assert_eq!(request.method, crate::api::ApiMethod::Get);
+        assert_eq!(request.path, "/api/ping");
+        assert_eq!(request.body, "");
+    }
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn parse_raw_request(
+        raw: &str,
+    ) -> std::result::Result<crate::api::ApiRequest, super::RequestReadError> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| super::RequestReadError::bad_request(format!("bind: {error}")))?;
+        let address = listener.local_addr().map_err(|error| {
+            super::RequestReadError::bad_request(format!("local address: {error}"))
+        })?;
+        let raw = raw.as_bytes().to_vec();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _remote) = listener.accept().map_err(|error| {
+                super::RequestReadError::bad_request(format!("accept: {error}"))
+            })?;
+            read_request(&mut stream)
+        });
+        let mut client = TcpStream::connect(address)
+            .map_err(|error| super::RequestReadError::bad_request(format!("connect: {error}")))?;
+        client.write_all(&raw).map_err(|error| {
+            super::RequestReadError::bad_request(format!("write request: {error}"))
+        })?;
+        client.shutdown(Shutdown::Write).map_err(|error| {
+            super::RequestReadError::bad_request(format!("shutdown write: {error}"))
+        })?;
+        handle
+            .join()
+            .map_err(|_panic| super::RequestReadError::bad_request("join"))?
     }
 }
