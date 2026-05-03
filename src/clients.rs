@@ -715,7 +715,7 @@ impl QbittorrentClient {
                     self.force_login()?;
                     retried_auth = true;
                 }
-                Err(error) if qb_error_retryable(&error) && attempt < policy.max_attempts => {
+                Err(error) if client_error_retryable(&error) && attempt < policy.max_attempts => {
                     tracing::debug!(
                         client = %self.base_url,
                         kind,
@@ -982,45 +982,53 @@ impl TransmissionClient {
     }
 
     fn rpc(&self, body: serde_json::Value) -> crate::Result<serde_json::Value> {
+        let retry_safe =
+            body.get("method").and_then(serde_json::Value::as_str) != Some("torrent-add");
         let body = body.to_string();
-        let text = block_on_client(async {
-            let response = self
-                .client
-                .post(&self.rpc_url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body.clone())
-                .send()
-                .await
-                .map_err(|error| {
-                    client_error(format!("Transmission RPC request failed: {error}"))
-                })?;
-            let response = if response.status() == reqwest::StatusCode::CONFLICT {
-                let session_id = response
-                    .headers()
-                    .get("X-Transmission-Session-Id")
-                    .and_then(|value| value.to_str().ok())
-                    .ok_or_else(|| client_error("Transmission session id missing"))?
-                    .to_owned();
-                self.client
+        let text = self.rpc_text("transmission", retry_safe, || {
+            let body = body.clone();
+            async move {
+                let response = match self
+                    .client
                     .post(&self.rpc_url)
-                    .header("X-Transmission-Session-Id", session_id)
                     .header(CONTENT_TYPE, "application/json")
-                    .body(body)
+                    .body(body.clone())
                     .send()
                     .await
-                    .map_err(|error| {
-                        client_error(format!("Transmission RPC retry failed: {error}"))
-                    })?
-            } else {
-                response
-            };
-            response
-                .error_for_status()
-                .map_err(|error| client_error(format!("Transmission RPC returned error: {error}")))?
-                .text()
-                .await
-                .map_err(|error| client_error(format!("failed to read Transmission RPC: {error}")))
-        })??;
+                {
+                    Ok(response) => response,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let response = if response.status() == reqwest::StatusCode::CONFLICT {
+                    let Some(session_id) = response
+                        .headers()
+                        .get("X-Transmission-Session-Id")
+                        .and_then(|value| value.to_str().ok())
+                    else {
+                        return Err(client_error("Transmission session id missing"));
+                    };
+                    match self
+                        .client
+                        .post(&self.rpc_url)
+                        .header("X-Transmission-Session-Id", session_id.to_owned())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .send()
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => return Ok(Err(error)),
+                    }
+                } else {
+                    response
+                };
+                let response = match response.error_for_status() {
+                    Ok(response) => response,
+                    Err(error) => return Ok(Err(error)),
+                };
+                Ok(response.text().await)
+            }
+        })?;
         let value = serde_json::from_str::<serde_json::Value>(&text)
             .map_err(|error| client_error(format!("failed to parse Transmission RPC: {error}")))?;
         if value.get("result").and_then(serde_json::Value::as_str) == Some("success") {
@@ -1034,6 +1042,44 @@ impl TransmissionClient {
                     .unwrap_or("unknown")
             )))
         }
+    }
+
+    fn rpc_text<F, Fut>(
+        &self,
+        kind: &'static str,
+        retry_safe: bool,
+        request: F,
+    ) -> crate::Result<String>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = crate::Result<Result<String, reqwest::Error>>>,
+    {
+        let policy = RetryPolicy::idempotent();
+        let max_attempts = if retry_safe { policy.max_attempts } else { 1 };
+        for attempt in 1..=max_attempts {
+            let result = block_on_client(request())??;
+            match result {
+                Ok(text) => return Ok(text),
+                Err(error) if client_error_retryable(&error) && attempt < max_attempts => {
+                    tracing::debug!(
+                        client = %self.rpc_url,
+                        kind,
+                        attempt,
+                        max_attempts,
+                        error = %error,
+                        "retrying torrent client request",
+                    );
+                    let delay = policy.delay_for_retry(attempt);
+                    if !delay.is_zero() {
+                        block_on_client_delay(delay)?;
+                    }
+                }
+                Err(error) => {
+                    return Err(client_error(format!("{kind} RPC request failed: {error}")));
+                }
+            }
+        }
+        Err(client_error(format!("{kind} RPC retry attempts exhausted")))
     }
 
     fn torrent_get(&self, ids: Option<&[String]>) -> crate::Result<Vec<TransmissionTorrent>> {
@@ -1272,30 +1318,78 @@ impl DelugeClient {
     }
 
     fn rpc(&self, method: &str, params: serde_json::Value) -> crate::Result<serde_json::Value> {
+        let retry_safe = method != "core.add_torrent_file";
         let body = serde_json::json!({
             "method": method,
             "params": params,
             "id": 1
         })
         .to_string();
-        let text = block_on_client(async {
-            self.client
-                .post(&self.rpc_url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await
-        })?
-        .map_err(|error| client_error(format!("Deluge RPC request failed: {error}")))?;
+        let text = self.rpc_text("deluge", retry_safe, || {
+            let body = body.clone();
+            async move {
+                let response = match self
+                    .client
+                    .post(&self.rpc_url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let response = match response.error_for_status() {
+                    Ok(response) => response,
+                    Err(error) => return Ok(Err(error)),
+                };
+                Ok(response.text().await)
+            }
+        })?;
         let response = serde_json::from_str::<DelugeRpcResponse>(&text)
             .map_err(|error| client_error(format!("failed to parse Deluge RPC: {error}")))?;
         if let Some(error) = response.error {
             return Err(client_error(format!("Deluge RPC {method} failed: {error}")));
         }
         Ok(response.result.unwrap_or(serde_json::Value::Null))
+    }
+
+    fn rpc_text<F, Fut>(
+        &self,
+        kind: &'static str,
+        retry_safe: bool,
+        request: F,
+    ) -> crate::Result<String>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = crate::Result<Result<String, reqwest::Error>>>,
+    {
+        let policy = RetryPolicy::idempotent();
+        let max_attempts = if retry_safe { policy.max_attempts } else { 1 };
+        for attempt in 1..=max_attempts {
+            let result = block_on_client(request())??;
+            match result {
+                Ok(text) => return Ok(text),
+                Err(error) if client_error_retryable(&error) && attempt < max_attempts => {
+                    tracing::debug!(
+                        client = %self.rpc_url,
+                        kind,
+                        attempt,
+                        max_attempts,
+                        error = %error,
+                        "retrying torrent client request",
+                    );
+                    let delay = policy.delay_for_retry(attempt);
+                    if !delay.is_zero() {
+                        block_on_client_delay(delay)?;
+                    }
+                }
+                Err(error) => {
+                    return Err(client_error(format!("{kind} RPC request failed: {error}")));
+                }
+            }
+        }
+        Err(client_error(format!("{kind} RPC retry attempts exhausted")))
     }
 
     fn login(&self) -> crate::Result<()> {
@@ -1603,21 +1697,66 @@ impl RtorrentClient {
     }
 
     fn rpc(&self, method: &str, params: &[RtXmlParam]) -> crate::Result<RtXmlValue> {
+        let retry_safe = !matches!(method, "load.raw" | "load.raw_start");
         let body = rt_xml_call(method, params);
-        let mut request = self
-            .client
-            .post(&self.rpc_url)
-            .header(CONTENT_TYPE, "text/xml")
-            .body(body);
-        if let Some(password) = &self.password {
-            request = request.basic_auth(&self.username, Some(password));
-        }
-        let text =
-            block_on_client(async { request.send().await?.error_for_status()?.text().await })?
-                .map_err(|error| {
-                    client_error(format!("rTorrent XML-RPC request failed: {error}"))
-                })?;
+        let text = self.rpc_text(retry_safe, || {
+            let body = body.clone();
+            async move {
+                let mut request = self
+                    .client
+                    .post(&self.rpc_url)
+                    .header(CONTENT_TYPE, "text/xml")
+                    .body(body);
+                if let Some(password) = &self.password {
+                    request = request.basic_auth(&self.username, Some(password));
+                }
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let response = match response.error_for_status() {
+                    Ok(response) => response,
+                    Err(error) => return Ok(Err(error)),
+                };
+                Ok(response.text().await)
+            }
+        })?;
         rt_parse_response(&text)
+    }
+
+    fn rpc_text<F, Fut>(&self, retry_safe: bool, request: F) -> crate::Result<String>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = crate::Result<Result<String, reqwest::Error>>>,
+    {
+        let policy = RetryPolicy::idempotent();
+        let max_attempts = if retry_safe { policy.max_attempts } else { 1 };
+        for attempt in 1..=max_attempts {
+            let result = block_on_client(request())??;
+            match result {
+                Ok(text) => return Ok(text),
+                Err(error) if client_error_retryable(&error) && attempt < max_attempts => {
+                    tracing::debug!(
+                        client = %self.rpc_url,
+                        kind = "rtorrent",
+                        attempt,
+                        max_attempts,
+                        error = %error,
+                        "retrying torrent client request",
+                    );
+                    let delay = policy.delay_for_retry(attempt);
+                    if !delay.is_zero() {
+                        block_on_client_delay(delay)?;
+                    }
+                }
+                Err(error) => {
+                    return Err(client_error(format!(
+                        "rTorrent XML-RPC request failed: {error}"
+                    )));
+                }
+            }
+        }
+        Err(client_error("rTorrent XML-RPC retry attempts exhausted"))
     }
 
     fn hashes(&self) -> crate::Result<Vec<String>> {
@@ -2724,7 +2863,7 @@ fn is_qb_auth_error(error: &reqwest::Error) -> bool {
     })
 }
 
-fn qb_error_retryable(error: &reqwest::Error) -> bool {
+fn client_error_retryable(error: &reqwest::Error) -> bool {
     matches!(classify_reqwest_error(error), RetryClass::Retryable { .. })
 }
 
@@ -3463,6 +3602,28 @@ mod tests {
     }
 
     #[test]
+    fn transmission_retries_transient_reads() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("502 Bad Gateway", ""),
+            http_response_with_headers("409 Conflict", &[("X-Transmission-Session-Id", "sid")], ""),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example","downloadDir":"/downloads","files":[],"trackers":[],"labels":[],"percentDone":1.0,"status":6}}]}}}}"#
+                ),
+            ),
+        ]);
+        let client = transmission_client(&server.url);
+
+        let torrents = client.get_all_torrents().expect("inventory");
+
+        assert_eq!(torrents.len(), 1);
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[test]
     fn transmission_injects_and_starts() {
         let server = http_server(vec![
             http_response("200 OK", r#"{"result":"success","arguments":{}}"#),
@@ -3546,6 +3707,26 @@ mod tests {
         assert!(requests[0].contains(r#""method":"auth.login""#));
         assert!(requests[1].contains(r#""method":"web.connected""#));
         assert!(requests[2].contains(r#""method":"web.update_ui""#));
+    }
+
+    #[test]
+    fn deluge_retries_transient_reads() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("503 Service Unavailable", ""),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&format!(
+                r#"{{"torrents":{{"{hash}":{{"name":"Example","save_path":"/downloads","files":[],"tracker_host":"","label":"","progress":100.0,"state":"Seeding"}}}}}}"#
+            )),
+        ]);
+        let client = deluge_client(&server.url);
+
+        let torrents = client.get_all_torrents().expect("inventory");
+
+        assert_eq!(torrents.len(), 1);
+        let requests = server.join();
+        assert_eq!(requests.len(), 4);
     }
 
     #[test]
@@ -3701,6 +3882,34 @@ mod tests {
         assert!(requests[1].contains("<methodName>system.multicall</methodName>"));
         assert!(requests[1].contains("f.multicall"));
         assert!(requests[1].contains("t.multicall"));
+    }
+
+    #[test]
+    fn rtorrent_retries_transient_reads() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("502 Bad Gateway", ""),
+            rt_response(&rt_array(&[rt_string(hash)])),
+            rt_response(&rt_array(&[
+                rt_array(&[rt_string("Example")]),
+                rt_array(&[rt_string("/downloads")]),
+                rt_array(&[rt_int(0)]),
+                rt_array(&[rt_bool(false)]),
+                rt_array(&[rt_bool(true)]),
+                rt_array(&[rt_bool(false)]),
+                rt_array(&[rt_bool(false)]),
+                rt_array(&[rt_string("cross-seed")]),
+                rt_array(&[rt_array(&[])]),
+                rt_array(&[rt_array(&[])]),
+            ])),
+        ]);
+        let client = rtorrent_client(&server.url);
+
+        let torrents = client.get_all_torrents().expect("inventory");
+
+        assert_eq!(torrents.len(), 1);
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
     }
 
     #[test]
