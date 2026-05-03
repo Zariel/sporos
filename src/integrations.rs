@@ -22,7 +22,10 @@ use crate::{
     config::ApiIntegrationConfig,
     domain::{Candidate, InfoHash, MediaType, Metafile, Searchee},
     persistence::{Database, IndexerCapsRecord},
-    retry::RetryPolicy,
+    retry::{
+        RetryClass, RetryContext, RetryDecision, RetryError, RetryPolicy, classify_http_status,
+        classify_reqwest_error, retry,
+    },
     torrent::{parse_metafile, torrent_cache_path},
 };
 
@@ -1091,26 +1094,26 @@ pub async fn search_torznab_indexer_async(
         if position > 0 && !options.delay.is_zero() {
             tokio::time::sleep(options.delay).await;
         }
-        let response = match client
-            .get(torznab_request_url(indexer, query)?)
-            .send()
-            .await
+        let request_url = torznab_request_url(indexer, query)?;
+        let response = match retry_torznab_request(
+            client.clone(),
+            request_url,
+            "torznab_search",
+            indexer.url.clone(),
+            options.now_millis,
+            true,
+        )
+        .await
         {
             Ok(response) => response,
-            Err(error) if error.is_timeout() => {
-                snooze_indexer(
-                    database,
-                    indexer.id,
-                    "UNKNOWN_ERROR",
-                    None,
-                    options.now_millis,
-                )?;
-                continue;
-            }
             Err(error) => {
-                return Err(integration_error(format!(
-                    "failed to search Torznab indexer: {error}"
-                )));
+                tracing::warn!(
+                    indexer = %indexer.url,
+                    error = %error,
+                    "Torznab search retries exhausted",
+                );
+                snooze_indexer_for_retry_error(database, indexer.id, &error, options.now_millis)?;
+                continue;
             }
         };
         if !response.status().is_success() {
@@ -1383,17 +1386,137 @@ pub async fn fetch_torznab_caps_async(indexer: &TorznabConfig) -> crate::Result<
         .user_agent(format!("CrossSeed/{}", crate::VERSION))
         .build()
         .map_err(|error| integration_error(format!("failed to build HTTP client: {error}")))?;
-    let body = client
-        .get(&indexer.url)
-        .query(&[("apikey", indexer.apikey.as_str()), ("t", "caps")])
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|error| integration_error(format!("failed to fetch Torznab caps: {error}")))?
-        .text()
-        .await
-        .map_err(|error| integration_error(format!("failed to read Torznab caps: {error}")))?;
+    let request_url = torznab_caps_url(indexer)?;
+    let body = retry_torznab_request(
+        client,
+        request_url,
+        "torznab_caps",
+        indexer.url.clone(),
+        current_time_millis(),
+        false,
+    )
+    .await
+    .map_err(|error| integration_error(format!("failed to fetch Torznab caps: {error}")))?
+    .error_for_status()
+    .map_err(|error| integration_error(format!("failed to fetch Torznab caps: {error}")))?
+    .text()
+    .await
+    .map_err(|error| integration_error(format!("failed to read Torznab caps: {error}")))?;
     parse_torznab_caps(&body)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TorznabRetryFailure {
+    message: String,
+    status: Option<reqwest::StatusCode>,
+    retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for TorznabRetryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TorznabRetryFailure {}
+
+async fn retry_torznab_request(
+    client: reqwest::Client,
+    request_url: String,
+    operation: &'static str,
+    target: String,
+    now_millis: u64,
+    terminal_rate_limit: bool,
+) -> Result<reqwest::Response, RetryError<TorznabRetryFailure>> {
+    retry(
+        RetryPolicy::idempotent(),
+        RetryContext::new(operation, tokio_util::sync::CancellationToken::new())
+            .with_target(target),
+        move |_attempt| {
+            let client = client.clone();
+            let request_url = request_url.clone();
+            async move {
+                match client.get(request_url).send().await {
+                    Ok(response) => {
+                        classify_torznab_response(response, now_millis, terminal_rate_limit)
+                    }
+                    Err(error) => match classify_reqwest_error(&error) {
+                        RetryClass::Retryable { retry_after } => RetryDecision::Retryable {
+                            error: TorznabRetryFailure {
+                                message: error.to_string(),
+                                status: error.status(),
+                                retry_after,
+                            },
+                            retry_after,
+                        },
+                        RetryClass::Fatal => RetryDecision::Fatal(TorznabRetryFailure {
+                            message: error.to_string(),
+                            status: error.status(),
+                            retry_after: None,
+                        }),
+                    },
+                }
+            }
+        },
+    )
+    .await
+}
+
+fn classify_torznab_response(
+    response: reqwest::Response,
+    now_millis: u64,
+    terminal_rate_limit: bool,
+) -> RetryDecision<reqwest::Response, TorznabRetryFailure> {
+    let status = response.status();
+    if status.is_success()
+        || (terminal_rate_limit && status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+    {
+        return RetryDecision::Success(response);
+    }
+    match classify_http_status(status, response.headers(), now_millis) {
+        RetryClass::Retryable { retry_after } => RetryDecision::Retryable {
+            error: TorznabRetryFailure {
+                message: format!("Torznab request returned HTTP {status}"),
+                status: Some(status),
+                retry_after,
+            },
+            retry_after,
+        },
+        RetryClass::Fatal => RetryDecision::Success(response),
+    }
+}
+
+fn torznab_caps_url(indexer: &TorznabConfig) -> crate::Result<String> {
+    let mut url = Url::parse(&indexer.url)
+        .map_err(|error| integration_error(format!("invalid Torznab URL: {error}")))?;
+    url.query_pairs_mut()
+        .append_pair("apikey", &indexer.apikey)
+        .append_pair("t", "caps");
+    Ok(url.into())
+}
+
+fn snooze_indexer_for_retry_error(
+    database: &Database,
+    indexer_id: i64,
+    error: &RetryError<TorznabRetryFailure>,
+    now_millis: u64,
+) -> crate::Result<()> {
+    let failure = match error {
+        RetryError::Fatal { error, .. } | RetryError::Exhausted { error, .. } => Some(error),
+        RetryError::Cancelled { .. } => None,
+    };
+    let status = if failure
+        .and_then(|failure| failure.status)
+        .is_some_and(|status| status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+    {
+        "RATE_LIMITED"
+    } else {
+        "UNKNOWN_ERROR"
+    };
+    let retry_after = failure
+        .and_then(|failure| failure.retry_after)
+        .map(|retry_after| now_millis.saturating_add(duration_millis(retry_after)));
+    snooze_indexer(database, indexer_id, status, retry_after, now_millis)
 }
 
 fn arr_client(timeout: Option<Duration>) -> crate::Result<reqwest::Client> {
@@ -1925,13 +2048,13 @@ fn json_error(error: serde_json::Error) -> SporosError {
 mod tests {
     use super::{
         ArrKind, CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, SnatchHistory,
-        SnatchOptions, SnatchResult, TorznabCaps, TorznabQuery, TorznabSearchIds,
+        SnatchOptions, SnatchResult, TorznabCaps, TorznabConfig, TorznabQuery, TorznabSearchIds,
         TorznabSearchOptions, arr_search_cache_key, cache_torrent_file,
-        create_torznab_search_queries, enabled_indexers, get_cached_torrent, guid_lookup,
-        ids_for_torznab_caps, lookup_arr_ids, parse_retry_after_delay_millis, parse_torznab_caps,
-        parse_torznab_rss, rss_pager, search_torznab_indexer, set_indexer_status, snatch,
-        snatch_once, sync_torznab_indexers, torznab_request_url, update_indexer_caps,
-        validate_arr_instance, validate_arr_url, validate_torznab_url,
+        create_torznab_search_queries, enabled_indexers, fetch_torznab_caps, get_cached_torrent,
+        guid_lookup, ids_for_torznab_caps, lookup_arr_ids, parse_retry_after_delay_millis,
+        parse_torznab_caps, parse_torznab_rss, rss_pager, search_torznab_indexer,
+        set_indexer_status, snatch, snatch_once, sync_torznab_indexers, torznab_request_url,
+        update_indexer_caps, validate_arr_instance, validate_arr_url, validate_torznab_url,
     };
     use crate::{
         domain::{Candidate, Decision, File, MediaType, Searchee},
@@ -2029,6 +2152,30 @@ mod tests {
         );
 
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fetch_torznab_caps_retries_transient_status() {
+        let server = http_server(vec![
+            http_response("502 Bad Gateway", &[], ""),
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/xml")],
+                r#"<caps><searching searchAvailable="yes" /><limits default="25" max="100" /></caps>"#,
+            ),
+        ]);
+        let indexer = TorznabConfig {
+            url: format!("{}/api", server.url),
+            apikey: "key".to_owned(),
+        };
+
+        let caps = fetch_torznab_caps(&indexer).expect("caps");
+
+        assert!(caps.search);
+        assert_eq!(caps.limits.default, 25);
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("apikey=key"));
     }
 
     #[test]
@@ -2266,6 +2413,54 @@ mod tests {
         assert_eq!(status, "RATE_LIMITED");
         assert_eq!(retry_after, 3_000);
         server.join();
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_retries_transient_status_per_indexer() {
+        let server = http_server(vec![
+            http_response("500 Internal Server Error", &[], ""),
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/rss+xml")],
+                r#"<rss><channel>
+                  <item><title>One</title><guid>g1</guid><link>https://idx/1</link><indexer>NamedTracker</indexer></item>
+                </channel></rss>"#,
+            ),
+        ]);
+        let root = temp_path("torznab-search-retry");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        database
+            .execute_sql(
+                "INSERT INTO indexer (url, apikey, active, search_cap) VALUES (?1, 'key', 1, 1)",
+                &[SqlValue::Text(Cow::Owned(format!("{}/api", server.url)))],
+            )
+            .expect("indexer");
+        let id = database
+            .query_scalar("SELECT id FROM indexer", &[])
+            .expect("id");
+        let indexer = SearchIndexer {
+            id,
+            url: format!("{}/api", server.url),
+            apikey: "key".to_owned(),
+            caps: TorznabCaps::default(),
+        };
+
+        let candidates = search_torznab_indexer(
+            &database,
+            &indexer,
+            &[TorznabQuery {
+                params: vec![("t".to_owned(), "search".to_owned())],
+            }],
+            TorznabSearchOptions::default(),
+        )
+        .expect("search");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].guid, "g1");
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
         let _cleanup = fs::remove_dir_all(root);
     }
 
