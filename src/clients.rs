@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use quick_xml::{Reader, events::Event};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::multipart;
@@ -294,6 +295,129 @@ pub trait TorrentClient {
 
     /// Validate adapter-specific configuration.
     fn validate_config(&self) -> crate::Result<()>;
+}
+
+/// Async-shaped torrent-client API for Tokio orchestration boundaries.
+#[async_trait(?Send)]
+pub trait AsyncTorrentClient {
+    /// Check whether one info hash exists in the client.
+    async fn is_torrent_in_client_async(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool>;
+
+    /// Check whether one info hash is complete in the client.
+    async fn is_torrent_complete_async(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool>;
+
+    /// Check whether one info hash is hash-checking.
+    async fn is_torrent_checking_async(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool>;
+
+    /// Visit all torrents with adapter-specific paging where available.
+    async fn for_each_torrent_async(
+        &self,
+        visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+    ) -> crate::Result<()>;
+
+    /// Map client inventory to searchable searchees.
+    async fn get_client_searchees_async(&self) -> crate::Result<ClientSearcheeResult>;
+
+    /// Resolve the download directory for a torrent.
+    async fn get_download_dir_async(
+        &self,
+        metafile: &Metafile<'_>,
+        options: DownloadDirOptions,
+    ) -> crate::Result<Result<PathBuf, ClientErrorCode>>;
+
+    /// Return bytes still missing for one torrent when the adapter can tell.
+    async fn remaining_bytes_async(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>>;
+
+    /// Add a candidate torrent to the client.
+    async fn inject_async(
+        &self,
+        new_torrent: &NewTorrent<'_>,
+        searchee: &Searchee<'_>,
+        decision: Decision,
+        options: &InjectionOptions,
+    ) -> crate::Result<InjectionResult>;
+
+    /// Trigger a hash check.
+    async fn recheck_torrent_async(&self, info_hash: &InfoHash<'_>) -> crate::Result<()>;
+
+    /// Resume or start after injection/recheck policy allows it.
+    async fn resume_injection_async(
+        &self,
+        metafile: &Metafile<'_>,
+        decision: Decision,
+        options: ResumeOptions,
+    ) -> crate::Result<()>;
+
+    /// Validate adapter-specific configuration.
+    async fn validate_config_async(&self) -> crate::Result<()>;
+}
+
+#[async_trait(?Send)]
+impl<T> AsyncTorrentClient for T
+where
+    T: TorrentClient + ?Sized,
+{
+    async fn is_torrent_in_client_async(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        self.is_torrent_in_client(info_hash)
+    }
+
+    async fn is_torrent_complete_async(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        self.is_torrent_complete(info_hash)
+    }
+
+    async fn is_torrent_checking_async(&self, info_hash: &InfoHash<'_>) -> crate::Result<bool> {
+        self.is_torrent_checking(info_hash)
+    }
+
+    async fn for_each_torrent_async(
+        &self,
+        visitor: &mut dyn FnMut(ClientTorrent<'static>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        self.for_each_torrent(visitor)
+    }
+
+    async fn get_client_searchees_async(&self) -> crate::Result<ClientSearcheeResult> {
+        self.get_client_searchees()
+    }
+
+    async fn get_download_dir_async(
+        &self,
+        metafile: &Metafile<'_>,
+        options: DownloadDirOptions,
+    ) -> crate::Result<Result<PathBuf, ClientErrorCode>> {
+        self.get_download_dir(metafile, options)
+    }
+
+    async fn remaining_bytes_async(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
+        self.remaining_bytes(metafile)
+    }
+
+    async fn inject_async(
+        &self,
+        new_torrent: &NewTorrent<'_>,
+        searchee: &Searchee<'_>,
+        decision: Decision,
+        options: &InjectionOptions,
+    ) -> crate::Result<InjectionResult> {
+        self.inject(new_torrent, searchee, decision, options)
+    }
+
+    async fn recheck_torrent_async(&self, info_hash: &InfoHash<'_>) -> crate::Result<()> {
+        self.recheck_torrent(info_hash)
+    }
+
+    async fn resume_injection_async(
+        &self,
+        metafile: &Metafile<'_>,
+        decision: Decision,
+        options: ResumeOptions,
+    ) -> crate::Result<()> {
+        self.resume_injection(metafile, decision, options)
+    }
+
+    async fn validate_config_async(&self) -> crate::Result<()> {
+        self.validate_config()
+    }
 }
 
 fn resume_with_policy<F>(
@@ -2564,9 +2688,10 @@ fn block_on_client_delay(delay: Duration) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientErrorCode, ClientTorrent, DelugeClient, DownloadDirOptions, InjectionOptions,
-        NewTorrent, QbittorrentClient, ResumeOptions, RtorrentClient, TorrentClient,
-        TransmissionClient, client_identities, client_torrent_to_searchee, select_injection_client,
+        AsyncTorrentClient, ClientErrorCode, ClientTorrent, DelugeClient, DownloadDirOptions,
+        InjectionOptions, NewTorrent, QbittorrentClient, ResumeOptions, RtorrentClient,
+        TorrentClient, TransmissionClient, client_identities, client_torrent_to_searchee,
+        select_injection_client,
     };
     use crate::{
         config::TorrentClientConfig,
@@ -2691,6 +2816,28 @@ mod tests {
 
         assert_eq!(selected.metadata().host, "writable");
         assert!(select_injection_client(&[&readonly], &data_source).is_err());
+    }
+
+    #[tokio::test]
+    async fn async_client_facade_preserves_trait_behavior() {
+        let client = FakeClient::new("async", 0, false);
+        let info_hash = InfoHash::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("hash");
+
+        assert!(
+            !client
+                .is_torrent_in_client_async(&info_hash)
+                .await
+                .expect("in client")
+        );
+        assert_eq!(
+            client
+                .is_torrent_complete_async(&info_hash)
+                .await
+                .expect("complete"),
+            false
+        );
+        assert_eq!(TorrentClient::metadata(&client).host.as_ref(), "async");
+        client.validate_config_async().await.expect("validate");
     }
 
     #[test]
