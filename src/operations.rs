@@ -8,6 +8,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use rusqlite::OptionalExtension;
+
 use crate::{
     SporosError,
     actions::{
@@ -320,17 +322,16 @@ pub fn run_rss_workflow(
     let blocklist = Blocklist::parse(&config.block_list)?;
     let indexers = enabled_search_indexers(database, current_time_millis())?;
     let arr_configs = build_arr_configs(config)?;
+    let now_millis = current_time_millis();
+    let time_since_last_run = rss_time_since_last_run(database, config, now_millis)?;
     let candidates = query_rss_feeds(
         database,
         &indexers,
         RssPagerOptions {
-            time_since_last_run: config
-                .rss_cadence
-                .map(Duration::from_millis)
-                .unwrap_or(Duration::ZERO),
+            time_since_last_run,
             timeout: config.search_timeout.map(Duration::from_millis),
             delay: Duration::from_secs(config.delay),
-            now_millis: current_time_millis(),
+            now_millis,
         },
     )?;
     let local = find_all_searchees(
@@ -909,6 +910,34 @@ fn current_time_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn rss_time_since_last_run(
+    database: &Database,
+    config: &RuntimeConfig,
+    now_millis: u64,
+) -> crate::Result<Duration> {
+    let fallback = config
+        .rss_cadence
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO);
+    let last_run = database
+        .connection()
+        .query_row(
+            "SELECT last_run FROM job_log WHERE name = 'rss'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(persistence_error)?;
+    let Some(last_run) = last_run.and_then(|value| u64::try_from(value).ok()) else {
+        return Ok(fallback);
+    };
+    if now_millis > last_run {
+        Ok(Duration::from_millis(now_millis.saturating_sub(last_run)))
+    } else {
+        Ok(fallback)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 struct MissingCacheDecisionCleanup {
     removed: usize,
@@ -1330,8 +1359,8 @@ fn replace_bencode_bytes_recursive(value: &mut Bencode<'_>, from: &[u8], to: &[u
 mod tests {
     use super::{
         api_key, cleanup_db, cleanup_db_with_clients, clear_cache, clear_client_cache,
-        clear_indexer_failures, reset_api_key, run_announce_match, run_webhook_search,
-        update_torrent_cache_trackers,
+        clear_indexer_failures, reset_api_key, rss_time_since_last_run, run_announce_match,
+        run_webhook_search, update_torrent_cache_trackers,
     };
     use crate::{
         api::WebhookRequest,
@@ -1353,7 +1382,7 @@ mod tests {
         collections::BTreeMap,
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     #[test]
@@ -1448,6 +1477,55 @@ mod tests {
         assert_eq!(
             fs::read(&path).expect("read"),
             b"d8:announce35:https://longer-new.example/announce13:announce-listll35:https://longer-new.example/announceeee"
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rss_elapsed_time_uses_persisted_last_run_with_cadence_fallback() {
+        let root = temp_path("rss-last-run");
+        let app_dir = root.join("app");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&app_dir).expect("app dir");
+        fs::create_dir_all(&data_dir).expect("data dir");
+        let database = Database::open_app_dir(&app_dir).expect("database");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                rss_cadence: Some(600_000),
+                data_dirs: vec![data_dir],
+                ..RawConfig::default()
+            },
+            &app_dir,
+        )
+        .expect("config");
+
+        assert_eq!(
+            rss_time_since_last_run(&database, &config, 1_000_000).expect("missing cursor"),
+            Duration::from_millis(600_000)
+        );
+        database
+            .connection()
+            .execute(
+                "INSERT INTO job_log (name, last_run) VALUES ('rss', 100_000)",
+                [],
+            )
+            .expect("job log");
+
+        assert_eq!(
+            rss_time_since_last_run(&database, &config, 250_000).expect("elapsed"),
+            Duration::from_millis(150_000)
+        );
+        database
+            .connection()
+            .execute(
+                "UPDATE job_log SET last_run = 300_000 WHERE name = 'rss'",
+                [],
+            )
+            .expect("future job log");
+
+        assert_eq!(
+            rss_time_since_last_run(&database, &config, 250_000).expect("current cursor"),
+            Duration::from_millis(600_000)
         );
         let _cleanup = fs::remove_dir_all(root);
     }
