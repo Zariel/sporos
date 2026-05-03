@@ -1729,13 +1729,28 @@ CREATE TABLE IF NOT EXISTS client_searchee (
     category TEXT NULL,
     tags TEXT NULL,
     trackers TEXT NOT NULL,
+    search_key TEXT NULL,
+    media_type TEXT NULL,
+    season INTEGER NULL,
+    episode INTEGER NULL,
+    file_count INTEGER NULL,
+    video_bytes INTEGER NULL,
+    non_video_bytes INTEGER NULL,
     PRIMARY KEY(client_host, info_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_client_searchee_info_hash ON client_searchee(info_hash);
 
 CREATE TABLE IF NOT EXISTS data (
     path TEXT PRIMARY KEY,
-    title TEXT NOT NULL
+    title TEXT NOT NULL,
+    search_key TEXT NULL,
+    media_type TEXT NULL,
+    season INTEGER NULL,
+    episode INTEGER NULL,
+    length INTEGER NULL,
+    file_count INTEGER NULL,
+    video_bytes INTEGER NULL,
+    non_video_bytes INTEGER NULL
 );
 
 CREATE TABLE IF NOT EXISTS ensemble (
@@ -1899,6 +1914,30 @@ mod tests {
                 )
                 .expect("table query");
             assert_eq!(count, 1, "{table}");
+        }
+
+        for column in [
+            "search_key",
+            "media_type",
+            "season",
+            "episode",
+            "file_count",
+            "video_bytes",
+            "non_video_bytes",
+        ] {
+            assert_column(&database, "client_searchee", column);
+        }
+        for column in [
+            "search_key",
+            "media_type",
+            "season",
+            "episode",
+            "length",
+            "file_count",
+            "video_bytes",
+            "non_video_bytes",
+        ] {
+            assert_column(&database, "data", column);
         }
 
         let _cleanup = fs::remove_dir_all(root);
@@ -2135,5 +2174,13 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-db-{label}-{nanos}"))
+    }
+
+    fn assert_column(database: &Database, table: &str, column: &str) {
+        let sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1");
+        let count: i64 = database
+            .query_scalar(&sql, &[SqlValue::Text(Cow::Borrowed(column))])
+            .expect("column query");
+        assert_eq!(count, 1, "{table}.{column}");
     }
 }
