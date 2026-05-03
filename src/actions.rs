@@ -4,7 +4,7 @@ use std::{
     borrow::Cow,
     cmp::Reverse,
     collections::BTreeSet,
-    fs,
+    fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
     sync::{LazyLock, Mutex},
@@ -1408,7 +1408,9 @@ fn probe_link_dir(source_path: &Path, link_dir: &Path, link_type: LinkType) -> c
     let (probe_source, created_probe) = probe_source_path(source_path)?;
     let probe_dest = unique_probe_destination(link_dir)?;
     let result = create_link(&probe_source, &probe_dest, link_type).is_ok();
-    let _cleanup = fs::remove_file(&probe_dest);
+    if result {
+        let _cleanup = fs::remove_file(&probe_dest);
+    }
     if created_probe {
         let _cleanup = fs::remove_file(&probe_source);
     }
@@ -1445,10 +1447,31 @@ fn probe_source_path(source_path: &Path) -> crate::Result<(PathBuf, bool)> {
     if let Some(file) = representative_probe_file(source_path)? {
         return Ok((file, false));
     }
-    let probe_source = source_path.join(".cross-seed-link-probe-source");
-    fs::write(&probe_source, b"probe")
+    let probe_source = create_unique_probe_file(source_path, ".cross-seed-link-probe-source")
         .map_err(|error| action_error(format!("failed to create link probe: {error}")))?;
     Ok((probe_source, true))
+}
+
+fn create_unique_probe_file(dir: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..128 {
+        let path = dir.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(b"probe")?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate unique link probe source",
+    ))
 }
 
 fn representative_probe_file(source_dir: &Path) -> crate::Result<Option<PathBuf>> {
@@ -2043,10 +2066,35 @@ mod tests {
         let (probe, created) = super::probe_source_path(&source).expect("probe source");
 
         assert!(created);
-        assert_eq!(probe, source.join(".cross-seed-link-probe-source"));
+        assert_eq!(probe.parent(), Some(source.as_path()));
+        assert!(
+            probe
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".cross-seed-link-probe-source-"))
+        );
         assert!(probe.exists());
         assert!(!link_dir.join(".cross-seed-link-probe-source").exists());
         fs::remove_file(&probe).expect("cleanup probe");
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn link_probe_does_not_clobber_existing_source_probe() {
+        let root = temp_path("link-probe-source-collision");
+        let source = root.join("source");
+        let existing_probe = source.join(".cross-seed-link-probe-source");
+        fs::create_dir_all(&source).expect("source dir");
+        fs::write(&existing_probe, b"user data").expect("existing probe");
+
+        let (probe, created) = super::probe_source_path(&source).expect("probe source");
+
+        assert!(!created);
+        assert_eq!(probe, existing_probe);
+        assert_eq!(
+            fs::read(source.join(".cross-seed-link-probe-source")).expect("existing probe"),
+            b"user data"
+        );
         let _cleanup = fs::remove_dir_all(root);
     }
 

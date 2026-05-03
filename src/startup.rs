@@ -1,9 +1,11 @@
 //! Startup validation, logger setup, runtime wiring, and graceful shutdown.
 
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use tracing::Level;
@@ -225,12 +227,33 @@ fn ensure_read_write_dir(path: &Path, label: &str) -> crate::Result<()> {
     fs::create_dir_all(path)
         .map_err(|error| startup_error(format!("failed to create {label}: {error}")))?;
     verify_readable_dir(path, label)?;
-    let probe = path.join(".sporos-write-test");
-    fs::write(&probe, b"test")
+    let probe = create_unique_probe(path, ".sporos-write-test")
         .map_err(|error| startup_error(format!("{label} is not writable: {error}")))?;
     fs::remove_file(&probe)
         .map_err(|error| startup_error(format!("failed to remove {label} probe: {error}")))?;
     Ok(())
+}
+
+fn create_unique_probe(dir: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..128 {
+        let path = dir.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(b"test")?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate unique probe path",
+    ))
 }
 
 fn verify_link_probe(data_dir: &Path, link_dir: &Path) -> crate::Result<()> {
@@ -350,6 +373,23 @@ mod tests {
 
         assert!(root.join("logs/error.log").exists());
         assert!(root.join("cross-seeds").exists());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_write_probe_does_not_clobber_existing_probe_name() {
+        let root = temp_path("startup-probe-collision");
+        let config = test_config(root.clone());
+        fs::create_dir_all(&config.output_dir).expect("output dir");
+        let existing_probe = config.output_dir.join(".sporos-write-test");
+        fs::write(&existing_probe, b"user data").expect("existing probe");
+
+        check_config_paths(&config).expect("paths");
+
+        assert_eq!(
+            fs::read(existing_probe).expect("existing probe"),
+            b"user data"
+        );
         let _cleanup = fs::remove_dir_all(root);
     }
 

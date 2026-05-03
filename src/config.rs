@@ -3,9 +3,12 @@
 use std::{
     borrow::Cow,
     collections::BTreeSet,
-    env, fs,
+    env,
+    fs::{self, OpenOptions},
+    io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use regex::Regex;
@@ -730,12 +733,33 @@ fn verify_read_write_dir(path: &Path) -> crate::Result<()> {
         )));
     }
 
-    let probe = path.join(".sporos-write-test");
-    fs::write(&probe, b"test")
+    let probe = create_unique_probe(path, ".sporos-write-test")
         .map_err(|error| config_error(format!("app directory is not writable: {error}")))?;
     fs::remove_file(&probe)
         .map_err(|error| config_error(format!("failed to remove app directory probe: {error}")))?;
     Ok(())
+}
+
+fn create_unique_probe(dir: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..128 {
+        let path = dir.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(b"test")?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate unique probe path",
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -879,7 +903,11 @@ mod tests {
         Action, ApiIntegrationConfig, LinkType, MatchMode, RawConfig, RuntimeConfig,
         TorrentClientConfig, parse_duration_millis, raw_config_from_source,
     };
-    use std::path::Path;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn normalizes_defaults_and_supported_names() {
@@ -1064,6 +1092,22 @@ mod tests {
     }
 
     #[test]
+    fn app_dir_write_probe_does_not_clobber_existing_probe_name() {
+        let root = temp_path("config-probe-collision");
+        fs::create_dir_all(&root).expect("root");
+        let existing_probe = root.join(".sporos-write-test");
+        fs::write(&existing_probe, b"user data").expect("existing probe");
+
+        super::verify_read_write_dir(&root).expect("writable app dir");
+
+        assert_eq!(
+            fs::read(existing_probe).expect("existing probe"),
+            b"user data"
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn loads_config_toml() {
         let raw = raw_config_from_source(
             r#"
@@ -1181,5 +1225,13 @@ mod tests {
         let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
 
         assert!(error.to_string().contains("size_below <= size_above"));
+    }
+
+    fn temp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("sporos-{label}-{nanos}"))
     }
 }
