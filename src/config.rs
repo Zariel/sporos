@@ -765,7 +765,6 @@ fn create_unique_probe(dir: &Path, prefix: &str) -> std::io::Result<PathBuf> {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum DurationConfigValue {
-    Bool(bool),
     Integer(u64),
     String(String),
 }
@@ -773,7 +772,6 @@ enum DurationConfigValue {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RatioConfigValue {
-    Bool(bool),
     Number(f64),
 }
 
@@ -782,10 +780,7 @@ where
     D: Deserializer<'de>,
 {
     match Option::<DurationConfigValue>::deserialize(deserializer)? {
-        None | Some(DurationConfigValue::Bool(false)) => Ok(None),
-        Some(DurationConfigValue::Bool(true)) => Err(de::Error::custom(
-            "duration fields must be a duration string, integer milliseconds, or false",
-        )),
+        None => Ok(None),
         Some(DurationConfigValue::Integer(value)) => Ok(Some(value)),
         Some(DurationConfigValue::String(value)) => parse_duration_millis(&value)
             .map(Some)
@@ -798,8 +793,7 @@ where
     D: Deserializer<'de>,
 {
     match Option::<RatioConfigValue>::deserialize(deserializer)? {
-        None | Some(RatioConfigValue::Bool(false)) => Ok(None),
-        Some(RatioConfigValue::Bool(true)) => Ok(Some(1.0)),
+        None => Ok(None),
         Some(RatioConfigValue::Number(value)) => Ok(Some(value)),
     }
 }
@@ -1115,7 +1109,8 @@ mod tests {
             data_dirs = ["/data"]
             match_mode = "flexible"
             exclude_older = "2 days"
-            exclude_recent_search = false
+            exclude_recent_search = 86400000
+            season_from_episodes = 0.75
             snatch_retries = 4
             link_dirs = ["/links"]
 
@@ -1141,7 +1136,8 @@ mod tests {
         assert_eq!(raw.data_dirs, vec![Path::new("/data")]);
         assert_eq!(raw.match_mode.as_deref(), Some("flexible"));
         assert_eq!(raw.exclude_older, Some(172_800_000));
-        assert_eq!(raw.exclude_recent_search, None);
+        assert_eq!(raw.exclude_recent_search, Some(86_400_000));
+        assert_eq!(raw.season_from_episodes, Some(0.75));
         assert_eq!(raw.snatch_retries, Some(4));
         assert_eq!(
             raw.torrent_clients,
@@ -1152,6 +1148,24 @@ mod tests {
             }]
         );
         assert_eq!(raw.link_dirs, vec![Path::new("/links")]);
+    }
+
+    #[test]
+    fn rejects_boolean_duration_and_ratio_values() {
+        for source in [
+            "exclude_older = false",
+            "exclude_recent_search = true",
+            "rss_cadence = false",
+            "search_cadence = true",
+            "snatch_timeout = false",
+            "search_timeout = true",
+            "season_from_episodes = false",
+            "season_from_episodes = true",
+        ] {
+            let error = raw_config_from_source(source).expect_err("boolean value rejected");
+
+            assert!(error.to_string().contains("failed to parse config.toml"));
+        }
     }
 
     #[test]
