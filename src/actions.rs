@@ -99,6 +99,8 @@ pub struct InjectionActionOptions<'a> {
     pub category: Option<ClientLabel<'static>>,
     /// Tags or labels to apply during injection.
     pub tags: Vec<ClientLabel<'static>>,
+    /// Derive duplicate cross-seed categories from source client metadata.
+    pub duplicate_categories: bool,
 }
 
 /// Runtime settings for retrying saved torrent injection.
@@ -366,6 +368,7 @@ where
             destination_dir: destination_dir.clone(),
             category: options.category.clone(),
             tags: options.tags.clone(),
+            duplicate_categories: options.duplicate_categories,
             paused: should_recheck,
             skip_checking: !should_recheck,
         },
@@ -2056,6 +2059,7 @@ mod tests {
                 ignore_non_relevant_files_to_resume: false,
                 category: Some(ClientLabel::new("tv")),
                 tags: vec![ClientLabel::new("cross-seed")],
+                duplicate_categories: false,
             },
             |_| {
                 saved += 1;
@@ -2144,6 +2148,7 @@ mod tests {
                 ignore_non_relevant_files_to_resume: false,
                 category: None,
                 tags: Vec::new(),
+                duplicate_categories: false,
             },
             |_| Ok(()),
         )
@@ -2242,6 +2247,7 @@ mod tests {
                 ignore_non_relevant_files_to_resume: false,
                 category: None,
                 tags: Vec::new(),
+                duplicate_categories: false,
             },
             |_| Ok(()),
         )
@@ -2302,6 +2308,7 @@ mod tests {
                 ignore_non_relevant_files_to_resume: false,
                 category: None,
                 tags: Vec::new(),
+                duplicate_categories: false,
             },
             |_| Ok(()),
         )
@@ -2367,6 +2374,7 @@ mod tests {
                 ignore_non_relevant_files_to_resume: false,
                 category: Some(ClientLabel::new("tv")),
                 tags: vec![ClientLabel::new("cross-seed")],
+                duplicate_categories: false,
             },
             |_| Ok(()),
         )
@@ -2425,6 +2433,7 @@ mod tests {
             ignore_non_relevant_files_to_resume: false,
             category: None,
             tags: vec![ClientLabel::new("cross-seed")],
+            duplicate_categories: false,
         };
 
         let summary = inject_saved_torrents(
@@ -2490,6 +2499,7 @@ mod tests {
             ignore_non_relevant_files_to_resume: false,
             category: None,
             tags: vec![ClientLabel::new("cross-seed")],
+            duplicate_categories: false,
         };
 
         let summary = inject_saved_torrents(
@@ -2555,6 +2565,7 @@ mod tests {
             ignore_non_relevant_files_to_resume: false,
             category: None,
             tags: vec![ClientLabel::new("cross-seed")],
+            duplicate_categories: false,
         };
 
         let summary = inject_saved_torrents(
@@ -2777,6 +2788,7 @@ mod tests {
             ignore_non_relevant_files_to_resume: false,
             category: None,
             tags: Vec::new(),
+            duplicate_categories: false,
         }
     }
 

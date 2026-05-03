@@ -107,6 +107,8 @@ pub struct InjectionOptions {
     pub category: Option<ClientLabel<'static>>,
     /// Tags or labels to assign.
     pub tags: Vec<ClientLabel<'static>>,
+    /// Derive a duplicate cross-seed category from the source torrent category.
+    pub duplicate_categories: bool,
     /// Add paused/stopped before recheck.
     pub paused: bool,
     /// Skip client-side hash checking where the adapter supports it.
@@ -141,6 +143,51 @@ pub struct NewTorrent<'a> {
     pub metafile: Metafile<'a>,
     /// Original `.torrent` bytes.
     pub bytes: Cow<'a, [u8]>,
+}
+
+fn duplicate_category_label(
+    searchee: &Searchee<'_>,
+    options: &InjectionOptions,
+) -> Option<ClientLabel<'static>> {
+    if !options.duplicate_categories {
+        return None;
+    }
+    let category = searchee
+        .client
+        .as_ref()
+        .and_then(|client| client.category.as_ref())?;
+    Some(ClientLabel::new(format!(
+        "{}.cross-seed",
+        category.as_str()
+    )))
+}
+
+fn qbit_category_and_tags(
+    searchee: &Searchee<'_>,
+    options: &InjectionOptions,
+) -> (Option<ClientLabel<'static>>, Vec<ClientLabel<'static>>) {
+    let duplicate = duplicate_category_label(searchee, options);
+    let mut tags = options.tags.clone();
+    if let (Some(_category), Some(duplicate)) = (&options.category, duplicate.as_ref()) {
+        if !tags
+            .iter()
+            .any(|tag| tag.as_str().eq_ignore_ascii_case(duplicate.as_str()))
+        {
+            tags.push(duplicate.clone());
+        }
+    }
+    (options.category.clone().or(duplicate), tags)
+}
+
+fn primary_client_label(
+    searchee: &Searchee<'_>,
+    options: &InjectionOptions,
+) -> Option<ClientLabel<'static>> {
+    options
+        .category
+        .clone()
+        .or_else(|| duplicate_category_label(searchee, options))
+        .or_else(|| options.tags.first().cloned())
 }
 
 /// Error codes used by shared client-selection logic.
@@ -578,7 +625,7 @@ impl TorrentClient for QbittorrentClient {
     fn inject(
         &self,
         new_torrent: &NewTorrent<'_>,
-        _searchee: &Searchee<'_>,
+        searchee: &Searchee<'_>,
         _decision: Decision,
         options: &InjectionOptions,
     ) -> crate::Result<InjectionResult> {
@@ -592,15 +639,14 @@ impl TorrentClient for QbittorrentClient {
         if let Some(destination) = &options.destination_dir {
             form = form.text("savepath", destination.display().to_string());
         }
-        if let Some(category) = &options.category {
+        let (category, tags) = qbit_category_and_tags(searchee, options);
+        if let Some(category) = &category {
             form = form.text("category", category.as_str().to_owned());
         }
-        if !options.tags.is_empty() {
+        if !tags.is_empty() {
             form = form.text(
                 "tags",
-                options
-                    .tags
-                    .iter()
+                tags.iter()
                     .map(ClientLabel::as_str)
                     .collect::<Vec<_>>()
                     .join(","),
@@ -1171,7 +1217,7 @@ impl TorrentClient for DelugeClient {
     fn inject(
         &self,
         new_torrent: &NewTorrent<'_>,
-        _searchee: &Searchee<'_>,
+        searchee: &Searchee<'_>,
         _decision: Decision,
         options: &InjectionOptions,
     ) -> crate::Result<InjectionResult> {
@@ -1197,9 +1243,9 @@ impl TorrentClient for DelugeClient {
             ]),
         )?;
 
-        let label = options.category.as_ref().or_else(|| options.tags.first());
+        let label = primary_client_label(searchee, options);
         if let Some(label) = label {
-            self.label_torrent(&new_torrent.metafile.info_hash, label)?;
+            self.label_torrent(&new_torrent.metafile.info_hash, &label)?;
         }
         if options.paused {
             self.rpc(
@@ -2388,8 +2434,8 @@ mod tests {
     use crate::{
         config::TorrentClientConfig,
         domain::{
-            ClientLabel, Decision, File, InfoHash, InjectionResult, MediaType, Metafile, Searchee,
-            TorrentClientKind, TorrentClientMetadata,
+            ClientLabel, ClientTorrentMetadata, Decision, File, InfoHash, InjectionResult,
+            MediaType, Metafile, Searchee, TorrentClientKind, TorrentClientMetadata,
         },
     };
     use std::{
@@ -2832,6 +2878,7 @@ mod tests {
                     destination_dir: Some(PathBuf::from("/linked")),
                     category: Some(ClientLabel::new("tv")),
                     tags: vec![ClientLabel::new("cross-seed")],
+                    duplicate_categories: false,
                     paused: true,
                     skip_checking: true,
                 },
@@ -2857,6 +2904,52 @@ mod tests {
                 .iter()
                 .any(|request| request.contains("POST /api/v2/torrents/start "))
         );
+    }
+
+    #[test]
+    fn qbittorrent_injects_duplicate_source_category() {
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response("200 OK", ""),
+        ]);
+        let client = qb_client(&server.url);
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let new_torrent = NewTorrent {
+            metafile,
+            bytes: Cow::Owned(bytes),
+        };
+        let mut searchee = Searchee::from_files("Inject.Release", "Inject.Release", Vec::new());
+        searchee.client = Some(ClientTorrentMetadata::new(
+            "client",
+            "/downloads",
+            Some(ClientLabel::new("movies")),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        client
+            .inject(
+                &new_torrent,
+                &searchee,
+                Decision::Match,
+                &InjectionOptions {
+                    destination_dir: None,
+                    category: None,
+                    tags: Vec::new(),
+                    duplicate_categories: true,
+                    paused: false,
+                    skip_checking: true,
+                },
+            )
+            .expect("inject");
+
+        let requests = server.join();
+        let add = requests
+            .iter()
+            .find(|request| request.contains("POST /api/v2/torrents/add "))
+            .expect("add request");
+        assert!(add.contains("movies.cross-seed"));
     }
 
     #[test]
@@ -2920,6 +3013,7 @@ mod tests {
                     destination_dir: Some(PathBuf::from("/linked")),
                     category: Some(ClientLabel::new("tv")),
                     tags: vec![ClientLabel::new("cross-seed")],
+                    duplicate_categories: false,
                     paused: true,
                     skip_checking: true,
                 },
@@ -3014,6 +3108,7 @@ mod tests {
                     destination_dir: Some(PathBuf::from("/linked")),
                     category: Some(ClientLabel::new("tv")),
                     tags: vec![ClientLabel::new("cross-seed")],
+                    duplicate_categories: false,
                     paused: true,
                     skip_checking: true,
                 },
@@ -3041,6 +3136,53 @@ mod tests {
         assert!(requests[6].contains(r#""method":"core.pause_torrent""#));
         assert!(requests[9].contains(r#""method":"core.force_recheck""#));
         assert!(requests[12].contains(r#""method":"core.resume_torrent""#));
+    }
+
+    #[test]
+    fn deluge_injects_duplicate_source_category_label() {
+        let server = http_server(vec![
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response("[]"),
+            deluge_response("true"),
+            deluge_response("true"),
+        ]);
+        let client = deluge_client(&server.url);
+        let bytes = torrent_bytes("Inject.Release", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let new_torrent = NewTorrent {
+            metafile,
+            bytes: Cow::Owned(bytes),
+        };
+        let mut searchee = Searchee::from_files("Inject.Release", "Inject.Release", Vec::new());
+        searchee.client = Some(ClientTorrentMetadata::new(
+            "client",
+            "/downloads",
+            Some(ClientLabel::new("movies")),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        client
+            .inject(
+                &new_torrent,
+                &searchee,
+                Decision::Match,
+                &InjectionOptions {
+                    destination_dir: None,
+                    category: None,
+                    tags: Vec::new(),
+                    duplicate_categories: true,
+                    paused: false,
+                    skip_checking: true,
+                },
+            )
+            .expect("inject");
+
+        let requests = server.join();
+        assert!(requests[4].contains("movies.cross-seed"));
+        assert!(requests[5].contains("movies.cross-seed"));
     }
 
     #[test]
@@ -3113,6 +3255,7 @@ mod tests {
                     destination_dir: Some(PathBuf::from("/linked")),
                     category: None,
                     tags: vec![ClientLabel::new("cross-seed")],
+                    duplicate_categories: false,
                     paused: true,
                     skip_checking: true,
                 },

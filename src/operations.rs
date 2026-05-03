@@ -884,6 +884,7 @@ fn injection_options<'a>(
         ignore_non_relevant_files_to_resume: config.ignore_non_relevant_files_to_resume,
         category: config.link_category.clone().map(ClientLabel::new),
         tags: Vec::new(),
+        duplicate_categories: config.duplicate_categories,
     }
 }
 

@@ -167,6 +167,7 @@ fn current_bootstrap_reopen_preserves_compatibility_state() {
         ignore_non_relevant_files_to_resume: false,
         category: Some(ClientLabel::new("tv")),
         tags: vec![ClientLabel::new("cross-seed")],
+        duplicate_categories: false,
     };
     let saved_options = SavedInjectionOptions {
         input_dir: &retry_dir,

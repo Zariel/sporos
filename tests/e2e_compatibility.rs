@@ -121,6 +121,7 @@ fn save_link_inject_retry_and_restore_e2e_paths() {
         ignore_non_relevant_files_to_resume: false,
         category: Some(ClientLabel::new("tv")),
         tags: vec![ClientLabel::new("cross-seed")],
+        duplicate_categories: false,
     };
     let action = InjectionAction {
         searchee: &searchee,
