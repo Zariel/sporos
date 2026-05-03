@@ -495,6 +495,7 @@ fn encode_into(value: &Bencode<'_>, output: &mut Vec<u8>) {
 }
 
 fn normalized_files(name: &str, info: &DictEntries<'_>) -> crate::Result<Vec<File<'static>>> {
+    validate_torrent_path_component(name, "info.name")?;
     if let Some(files_value) = dict_get(info, b"files") {
         let BencodeValue::List(file_entries) = &files_value.value else {
             return Err(torrent_error("info.files must be a list"));
@@ -543,14 +544,42 @@ fn path_segments(value: &Bencode<'_>) -> crate::Result<Vec<String>> {
             .as_bytes()
             .ok_or_else(|| torrent_error("file path segment must be bytes"))?;
         let segment = String::from_utf8_lossy(bytes);
-        if segment.is_empty() {
-            normalized.push("_".to_owned());
+        let segment = if segment.is_empty() {
+            Cow::Borrowed("_")
         } else {
-            normalized.push(segment.into_owned());
-        }
+            segment
+        };
+        validate_torrent_path_component(segment.as_ref(), "file path segment")?;
+        normalized.push(segment.into_owned());
     }
 
     Ok(normalized)
+}
+
+fn validate_torrent_path_component(component: &str, field: &str) -> crate::Result<()> {
+    if component.is_empty() {
+        return Err(torrent_error(format!("{field} must not be empty")));
+    }
+    if component == "." || component == ".." {
+        return Err(torrent_error(format!(
+            "{field} must not be a relative path component"
+        )));
+    }
+    if component.contains(['/', '\\']) {
+        return Err(torrent_error(format!(
+            "{field} must not contain separators"
+        )));
+    }
+    if has_windows_prefix(component) {
+        return Err(torrent_error(format!(
+            "{field} must not use a Windows prefix"
+        )));
+    }
+    Ok(())
+}
+
+fn has_windows_prefix(component: &str) -> bool {
+    matches!(component.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
 }
 
 fn tracker_hosts(root: &DictEntries<'_>) -> Vec<Cow<'static, str>> {
@@ -788,6 +817,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_metafile_rejects_unsafe_path_components() {
+        let cases = [
+            encoded_torrent("Release/Name", &["file.mkv"]),
+            encoded_torrent("Release", &["..", "file.mkv"]),
+            encoded_torrent("Release", &["Season/01", "file.mkv"]),
+            encoded_torrent("Release", &["Season\\01", "file.mkv"]),
+            encoded_torrent("Release", &["C:", "file.mkv"]),
+        ];
+
+        for input in cases {
+            let error = parse_metafile(&input).expect_err("unsafe path rejected");
+
+            assert!(error.to_string().contains("torrent error:"));
+        }
+    }
+
+    #[test]
     fn fastresume_metadata_updates_category_tags_and_trackers() {
         let input =
             b"d4:infod6:lengthi1e4:name4:Test12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
@@ -900,6 +946,43 @@ mod tests {
                 })
         );
     }
+
+    fn encoded_torrent(name: &str, path_segments: &[&str]) -> Vec<u8> {
+        bencode(&Bencode::dict(vec![(
+            Cow::Borrowed(b"info".as_slice()),
+            Bencode::dict(vec![
+                (
+                    Cow::Borrowed(b"files".as_slice()),
+                    Bencode::list(vec![Bencode::dict(vec![
+                        (Cow::Borrowed(b"length".as_slice()), Bencode::integer(1)),
+                        (
+                            Cow::Borrowed(b"path".as_slice()),
+                            Bencode::list(
+                                path_segments
+                                    .iter()
+                                    .map(|segment| {
+                                        Bencode::bytes(Cow::Owned(segment.as_bytes().to_vec()))
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                    ])]),
+                ),
+                (
+                    Cow::Borrowed(b"name".as_slice()),
+                    Bencode::bytes(Cow::Owned(name.as_bytes().to_vec())),
+                ),
+                (
+                    Cow::Borrowed(b"piece length".as_slice()),
+                    Bencode::integer(16_384),
+                ),
+                (
+                    Cow::Borrowed(b"pieces".as_slice()),
+                    Bencode::bytes(Cow::Owned(vec![b'a'; 20])),
+                ),
+            ]),
+        )]))
+    }
 }
 
 #[cfg(test)]
@@ -932,10 +1015,16 @@ mod fuzz_tests {
 
     fn arb_release_name() -> impl Strategy<Value = String> {
         "[A-Za-z0-9._ -]{1,32}"
+            .prop_filter("safe release component", |name| name != "." && name != "..")
     }
 
     fn arb_path_segments() -> impl Strategy<Value = Vec<String>> {
-        collection::vec("[A-Za-z0-9._ -]{0,16}", 1..5)
+        collection::vec(
+            "[A-Za-z0-9._ -]{0,16}".prop_filter("safe path component", |segment| {
+                segment != "." && segment != ".."
+            }),
+            1..5,
+        )
     }
 
     fn same_bencode_value(left: &Bencode<'_>, right: &Bencode<'_>) -> bool {

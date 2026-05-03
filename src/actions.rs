@@ -5,7 +5,7 @@ use std::{
     cmp::Reverse,
     collections::BTreeSet,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Mutex,
 };
 
@@ -822,6 +822,10 @@ pub fn link_all_files_in_metafile(
     destination_dir: &Path,
     options: &FileLinkOptions<'_>,
 ) -> crate::Result<FileLinkResult> {
+    ensure_not_filesystem_root(destination_dir, "link destination")?;
+    for link_dir in options.link_dirs {
+        ensure_not_filesystem_root(link_dir, "link root")?;
+    }
     let pairs = file_link_pairs(searchee, candidate, decision)?;
     let mut result = FileLinkResult::default();
     let mut created_roots = BTreeSet::new();
@@ -841,7 +845,7 @@ pub fn link_all_files_in_metafile(
                 source.display()
             )));
         }
-        let destination = destination_dir.join(pair.destination);
+        let destination = safe_link_destination(destination_dir, &pair.destination)?;
         if destination.exists() {
             result.skipped_existing += 1;
             continue;
@@ -861,6 +865,78 @@ pub fn link_all_files_in_metafile(
     }
     result.created_roots = created_roots.into_iter().collect();
     Ok(result)
+}
+
+fn safe_link_destination(destination_dir: &Path, relative: &Path) -> crate::Result<PathBuf> {
+    if relative.is_absolute() {
+        return Err(action_error(format!(
+            "link destination must be relative: {}",
+            relative.display()
+        )));
+    }
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => {
+                let text = value.to_string_lossy();
+                if text.contains('\\') || has_windows_prefix(text.as_ref()) {
+                    return Err(action_error(format!(
+                        "unsafe link destination component: {}",
+                        relative.display()
+                    )));
+                }
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(action_error(format!(
+                    "unsafe link destination path: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    Ok(destination_dir.join(relative))
+}
+
+#[cfg(unix)]
+fn ensure_not_filesystem_root(path: &Path, label: &str) -> crate::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = fs::metadata("/")
+        .map_err(|error| action_error(format!("failed to stat filesystem root: {error}")))?;
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(action_error(format!(
+                "failed to stat {label} {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if metadata.dev() == root.dev() && metadata.ino() == root.ino() {
+        return Err(action_error(format!(
+            "{label} must not be filesystem root: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_not_filesystem_root(path: &Path, label: &str) -> crate::Result<()> {
+    if path.parent().is_none() {
+        return Err(action_error(format!(
+            "{label} must not be filesystem root: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn has_windows_prefix(component: &str) -> bool {
+    matches!(component.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
 }
 
 /// Remove destination roots that were created during a failed action.
@@ -1511,6 +1587,120 @@ mod tests {
             1
         );
         assert!(!destination.join("Release").exists());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linking_rejects_candidate_paths_outside_destination() {
+        let root = temp_path("link-traversal");
+        let data = root.join("data");
+        let destination = root.join("links");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::write(data.join("source.mkv"), b"video").expect("source file");
+        let mut searchee =
+            Searchee::from_files("Source", "Source", vec![File::new("source.mkv", 5)]);
+        searchee.path = Some(Cow::Owned(data.join("source.mkv").display().to_string()));
+        let candidate = Metafile::from_files(
+            InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567"),
+            "Release",
+            "Release",
+            1,
+            vec![File::new("../escape.mkv", 5)],
+        );
+
+        let error = link_all_files_in_metafile(
+            &searchee,
+            &candidate,
+            Decision::MatchSizeOnly,
+            &destination,
+            &FileLinkOptions {
+                link_dirs: std::slice::from_ref(&destination),
+                link_type: LinkType::Hardlink,
+                flat_linking: false,
+                ignore_missing: false,
+                unwrap_symlinks: false,
+            },
+        )
+        .expect_err("unsafe destination rejected");
+
+        assert!(error.to_string().contains("unsafe link destination"));
+        assert!(!root.join("escape.mkv").exists());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linking_rejects_filesystem_root_destination() {
+        let root = temp_path("link-root-destination");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::write(data.join("source.mkv"), b"video").expect("source file");
+        let mut searchee =
+            Searchee::from_files("Source", "Source", vec![File::new("source.mkv", 5)]);
+        searchee.path = Some(Cow::Owned(data.join("source.mkv").display().to_string()));
+        let candidate = Metafile::from_files(
+            InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567"),
+            "Release",
+            "Release",
+            1,
+            vec![File::new("safe.mkv", 5)],
+        );
+        let destination = PathBuf::from("/");
+
+        let error = link_all_files_in_metafile(
+            &searchee,
+            &candidate,
+            Decision::MatchSizeOnly,
+            &destination,
+            &FileLinkOptions {
+                link_dirs: std::slice::from_ref(&destination),
+                link_type: LinkType::Hardlink,
+                flat_linking: true,
+                ignore_missing: false,
+                unwrap_symlinks: false,
+            },
+        )
+        .expect_err("root destination rejected");
+
+        assert!(error.to_string().contains("filesystem root"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linking_rejects_link_root_that_stats_as_filesystem_root() {
+        let root = temp_path("link-root-symlink");
+        let data = root.join("data");
+        let link_root = root.join("root-link");
+        fs::create_dir_all(&data).expect("data dir");
+        std::os::unix::fs::symlink("/", &link_root).expect("root symlink");
+        fs::write(data.join("source.mkv"), b"video").expect("source file");
+        let mut searchee =
+            Searchee::from_files("Source", "Source", vec![File::new("source.mkv", 5)]);
+        searchee.path = Some(Cow::Owned(data.join("source.mkv").display().to_string()));
+        let candidate = Metafile::from_files(
+            InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567"),
+            "Release",
+            "Release",
+            1,
+            vec![File::new("safe.mkv", 5)],
+        );
+
+        let error = link_all_files_in_metafile(
+            &searchee,
+            &candidate,
+            Decision::MatchSizeOnly,
+            &link_root,
+            &FileLinkOptions {
+                link_dirs: std::slice::from_ref(&link_root),
+                link_type: LinkType::Hardlink,
+                flat_linking: true,
+                ignore_missing: false,
+                unwrap_symlinks: false,
+            },
+        )
+        .expect_err("root symlink rejected");
+
+        assert!(error.to_string().contains("filesystem root"));
         let _cleanup = fs::remove_dir_all(root);
     }
 
