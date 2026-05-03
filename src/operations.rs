@@ -5,10 +5,12 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::OptionalExtension;
+use tokio::sync::Semaphore;
 
 use crate::{
     SporosError,
@@ -48,6 +50,10 @@ const ONE_DAY_MILLIS: u64 = 86_400_000;
 const THIRTY_DAYS_MILLIS: u64 = 30 * ONE_DAY_MILLIS;
 const ONE_YEAR_MILLIS: u64 = 365 * ONE_DAY_MILLIS;
 const CLEANUP_DB_PAGE_SIZE: i64 = 1_000;
+const LOCAL_WORK_CONCURRENCY_LIMIT: usize = 4;
+
+static LOCAL_WORK_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(LOCAL_WORK_CONCURRENCY_LIMIT)));
 
 /// Result counts from cache cleanup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1521,9 +1527,16 @@ async fn run_blocking_workflow<T>(
 where
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(task)
+    let permit = Arc::clone(&LOCAL_WORK_PERMITS)
+        .acquire_owned()
         .await
-        .map_err(|error| operation_error(format!("{name} task failed: {error}")))?
+        .map_err(|error| operation_error(format!("{name} local-work queue closed: {error}")))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|error| operation_error(format!("{name} task failed: {error}")))?
 }
 
 fn operation_error(message: impl Into<Cow<'static, str>>) -> SporosError {
