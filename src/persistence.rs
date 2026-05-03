@@ -133,8 +133,39 @@ impl Database {
             .bind(record.fuzzy_size_factor)
             .execute(self.pool())
             .await
-            .map(|_| ())
-            .map_err(sqlx_error)
+            .map_err(sqlx_error)?;
+
+            let decision_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM decision
+                 WHERE searchee_id = ?1 AND guid = ?2",
+            )
+            .bind(record.searchee_id)
+            .bind(record.guid)
+            .fetch_one(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            sqlx::query("DELETE FROM decision_guid_alias WHERE decision_id = ?1")
+                .bind(decision_id)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            if let (Some(alias), Some(info_hash)) =
+                (decision_guid_alias(record.guid), record.info_hash)
+            {
+                sqlx::query(
+                    "INSERT INTO decision_guid_alias
+                        (alias, decision_id, info_hash, last_seen)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .bind(alias)
+                .bind(decision_id)
+                .bind(info_hash)
+                .bind(record.last_seen)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            }
+            Ok(())
         })
     }
 
@@ -780,18 +811,14 @@ impl Database {
         })
     }
 
-    /// Look up a cached candidate info hash by GUID LIKE pattern.
-    pub fn decision_info_hash_by_guid_like(&self, like: &str) -> crate::Result<Option<String>> {
+    /// Look up a cached candidate info hash by normalized tracker torrent id.
+    pub fn decision_info_hash_by_tracker_id(&self, id: &str) -> crate::Result<Option<String>> {
         self.block_on(async {
-            sqlx::query_scalar(
-                "SELECT info_hash FROM decision
-                 WHERE info_hash IS NOT NULL AND guid LIKE ?1
-                 ORDER BY id DESC LIMIT 1",
-            )
-            .bind(like)
-            .fetch_optional(self.pool())
-            .await
-            .map_err(sqlx_error)
+            sqlx::query_scalar(decision_guid_alias_lookup_sql())
+                .bind(decision_guid_alias_for_torrent_id(id))
+                .fetch_optional(self.pool())
+                .await
+                .map_err(sqlx_error)
         })
     }
 
@@ -1794,6 +1821,16 @@ CREATE INDEX IF NOT EXISTS idx_decision_info_hash_guid ON decision(info_hash, gu
 CREATE INDEX IF NOT EXISTS idx_decision_info_hash ON decision(info_hash);
 CREATE INDEX IF NOT EXISTS idx_decision_guid ON decision(guid);
 
+CREATE TABLE IF NOT EXISTS decision_guid_alias (
+    alias TEXT NOT NULL,
+    decision_id INTEGER NOT NULL REFERENCES decision(id) ON DELETE CASCADE,
+    info_hash TEXT NOT NULL,
+    last_seen INTEGER NOT NULL,
+    PRIMARY KEY(alias, decision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_decision_guid_alias_lookup
+ON decision_guid_alias(alias, last_seen DESC, decision_id DESC);
+
 CREATE TABLE IF NOT EXISTS torrent (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     info_hash TEXT NOT NULL,
@@ -1996,6 +2033,24 @@ fn ensemble_client_sql(has_element: bool) -> &'static str {
     }
 }
 
+fn decision_guid_alias_lookup_sql() -> &'static str {
+    "SELECT info_hash
+     FROM decision_guid_alias
+     WHERE alias = ?1
+     ORDER BY last_seen DESC, decision_id DESC
+     LIMIT 1"
+}
+
+fn decision_guid_alias(value: &str) -> Option<String> {
+    let (_, suffix) = value.split_once("/torrent/")?;
+    let id = suffix.split('/').next()?;
+    (!id.is_empty()).then(|| decision_guid_alias_for_torrent_id(id))
+}
+
+fn decision_guid_alias_for_torrent_id(id: &str) -> String {
+    format!("torrent:{id}")
+}
+
 fn reverse_lookup_client_sql(search_key_count: usize) -> String {
     let key_placeholders = placeholders(search_key_count);
     format!(
@@ -2168,9 +2223,9 @@ fn strings_json(values: &[std::borrow::Cow<'_, str>]) -> crate::Result<String> {
 mod tests {
     use super::{
         AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord,
-        EnsembleRecord, ReverseLookupCriteria, SqlValue, bind_values, ensemble_client_sql,
-        ensemble_data_sql, reverse_lookup_client_sql, reverse_lookup_data_sql,
-        reverse_lookup_params, sqlx_error,
+        EnsembleRecord, ReverseLookupCriteria, SqlValue, bind_values,
+        decision_guid_alias_lookup_sql, ensemble_client_sql, ensemble_data_sql,
+        reverse_lookup_client_sql, reverse_lookup_data_sql, reverse_lookup_params, sqlx_error,
     };
     use crate::domain::{ClientLabel, Decision, File, LookupFields, MediaType};
     use sqlx::Row;
@@ -2199,6 +2254,7 @@ mod tests {
         for table in [
             "searchee",
             "decision",
+            "decision_guid_alias",
             "torrent",
             "job_log",
             "indexer",
@@ -2252,6 +2308,7 @@ mod tests {
         }
         for index in [
             "idx_client_searchee_lookup",
+            "idx_decision_guid_alias_lookup",
             "idx_data_lookup",
             "idx_data_ensemble_root",
             "idx_data_ensemble_lookup",
@@ -2487,14 +2544,41 @@ mod tests {
                 fuzzy_size_factor: 0.1,
             })
             .expect("decision update");
+        database
+            .upsert_decision(&DecisionRecord {
+                searchee_id,
+                guid: "https://tracker.tv/torrent/123/group",
+                info_hash: Some("abcdef0123456789abcdef0123456789abcdef01"),
+                decision: Decision::Match,
+                first_seen: 100,
+                last_seen: 300,
+                fuzzy_size_factor: 0.05,
+            })
+            .expect("alias decision");
 
         let page = database.guid_info_hash_page(0, 10).expect("page");
 
-        assert_eq!(page.len(), 1);
+        assert_eq!(page.len(), 2);
         assert_eq!(page[0].guid, "guid-1");
         assert_eq!(
             page[0].info_hash,
             "fedcba9876543210fedcba9876543210fedcba98"
+        );
+        assert_eq!(
+            database
+                .decision_info_hash_by_tracker_id("123")
+                .expect("alias")
+                .as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        let alias_plan = explain_detail(
+            &database,
+            &format!("EXPLAIN QUERY PLAN {}", decision_guid_alias_lookup_sql()),
+            &[SqlValue::Text(Cow::Borrowed("torrent:123"))],
+        );
+        assert!(
+            alias_plan.contains("idx_decision_guid_alias_lookup"),
+            "{alias_plan}"
         );
 
         let _cleanup = fs::remove_dir_all(root);

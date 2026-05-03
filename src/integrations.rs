@@ -586,8 +586,7 @@ pub fn guid_lookup(
         }
     }
     if let Some(id) = link.and_then(tracker_torrent_id) {
-        let like = format!("%/torrent/{id}/%");
-        return database.decision_info_hash_by_guid_like(&like);
+        return database.decision_info_hash_by_tracker_id(&id);
     }
     Ok(None)
 }
@@ -3052,7 +3051,7 @@ mod tests {
             guid_lookup(
                 &database,
                 "missing",
-                Some("https://tracker.tv/torrent/123/group")
+                Some("https://mirror.tv/torrent/123/group")
             )
             .expect("fallback")
             .as_deref(),
