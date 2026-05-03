@@ -257,9 +257,11 @@ fn handle_stream(
         database,
         scheduler,
         now_millis: now_millis(),
+        webhook_requests: Vec::new(),
     };
     let response = handle_api_request(request, &api_key, &mut handlers)?;
     write_response(&mut stream, response.status, &response.body)?;
+    handlers.spawn_webhook_workers();
     let _shutdown = stream.shutdown(Shutdown::Both);
     Ok(())
 }
@@ -454,6 +456,21 @@ struct RuntimeHandlers<'a> {
     database: &'a Database,
     scheduler: &'a mut Scheduler,
     now_millis: i64,
+    webhook_requests: Vec<WebhookRequest>,
+}
+
+impl RuntimeHandlers<'_> {
+    fn spawn_webhook_workers(self) {
+        for request in self.webhook_requests {
+            let app_dir = PathBuf::from(self.app_dir);
+            let config = self.config.clone();
+            thread::spawn(move || {
+                if let Err(error) = run_webhook_worker(&app_dir, &config, request) {
+                    tracing::error!("webhook background work failed: {error}");
+                }
+            });
+        }
+    }
 }
 
 impl ApiHandlers for RuntimeHandlers<'_> {
@@ -482,35 +499,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             path = request.path.as_deref().unwrap_or_default(),
             "received webhook request"
         );
-        if self
-            .scheduler
-            .jobs()
-            .iter()
-            .any(|job| job.name == JobName::Inject && job.enabled)
-        {
-            let _response = self.scheduler.request_early_run(
-                self.database,
-                JobName::Inject,
-                self.now_millis,
-            )?;
-            let results = self
-                .scheduler
-                .check_jobs(self.database, self.now_millis, false)?;
-            execute_ran_jobs(
-                self.app_dir,
-                self.config,
-                self.database,
-                self.scheduler,
-                &results,
-            )?;
-        }
-        let app_dir = PathBuf::from(self.app_dir);
-        let config = self.config.clone();
-        thread::spawn(move || {
-            if let Err(error) = run_webhook_worker(&app_dir, &config, request) {
-                tracing::error!("webhook targeted search failed: {error}");
-            }
-        });
+        self.webhook_requests.push(request);
         Ok(())
     }
 
@@ -546,6 +535,20 @@ fn run_webhook_worker(
     request: WebhookRequest,
 ) -> crate::Result<()> {
     let database = Database::open_app_dir(app_dir)?;
+    let mut plan = DaemonPlan::from_config(config);
+    let now = now_millis();
+    if plan
+        .scheduler
+        .jobs()
+        .iter()
+        .any(|job| job.name == JobName::Inject && job.enabled)
+    {
+        let _response = plan
+            .scheduler
+            .request_early_run(&database, JobName::Inject, now)?;
+        let results = plan.scheduler.check_jobs(&database, now, false)?;
+        execute_ran_jobs(app_dir, config, &database, &mut plan.scheduler, &results)?;
+    }
     let notifier = crate::notifications::NotificationSender::from_config(
         config,
         crate::startup::Redactor::from_config(config),
@@ -566,11 +569,13 @@ fn run_webhook_worker(
 mod tests {
     use super::{MAX_REQUEST_BODY_BYTES, read_request, run_plan, write_response};
     use crate::{
-        config::{RawConfig, RuntimeConfig},
+        api::{ApiMethod, ApiRequest, handle_api_request},
+        config::{RawConfig, RuntimeConfig, TorrentClientConfig},
         persistence::Database,
         scheduler::{DaemonPlan, JobName},
     };
     use std::{
+        collections::BTreeMap,
         io::{Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
         sync::{
@@ -626,6 +631,71 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
         assert!(response.contains("Content-Length: 9"));
         assert!(response.ends_with("Not Found"));
+    }
+
+    #[test]
+    fn runtime_webhook_queues_background_work_without_running_jobs_inline() {
+        let root = temp_path("daemon-webhook-inline");
+        std::fs::create_dir_all(&root).expect("root");
+        let webhook_path = root.join("source.mkv");
+        std::fs::write(&webhook_path, b"data").expect("webhook source");
+        let database = Database::open_app_dir(&root).expect("database");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                action: Some("inject".to_owned()),
+                torrent_clients: vec![
+                    TorrentClientConfig::parse("qbittorrent:http://localhost:8080")
+                        .expect("client"),
+                ],
+                port: Some(None),
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let mut plan = DaemonPlan::from_config(&config);
+        let mut handlers = super::RuntimeHandlers {
+            app_dir: &root,
+            config: &config,
+            database: &database,
+            scheduler: &mut plan.scheduler,
+            now_millis: 1_000,
+            webhook_requests: Vec::new(),
+        };
+
+        let response = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/webhook?apikey=secret",
+                BTreeMap::new(),
+                format!("path={}", webhook_path.display()),
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .expect("webhook");
+
+        assert_eq!(response.status, 204);
+        assert_eq!(handlers.webhook_requests.len(), 1);
+        assert_eq!(
+            handlers
+                .scheduler
+                .jobs()
+                .iter()
+                .find(|job| job.name == JobName::Inject)
+                .map(|job| job.runs),
+            Some(0)
+        );
+        let inject_last_run: Option<i64> = database
+            .connection()
+            .query_row(
+                "SELECT last_run FROM job_log WHERE name = 'inject'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        assert_eq!(inject_last_run, None);
+        let _cleanup = std::fs::remove_dir_all(root);
     }
 
     #[test]
