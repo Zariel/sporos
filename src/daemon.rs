@@ -68,9 +68,12 @@ async fn run_plan(
     shutdown: CancellationToken,
     max_iterations: Option<usize>,
 ) -> crate::Result<DaemonRun> {
-    let mut run = plan.run_startup(database, now_millis(), || {
-        index_torrents_and_data_dirs(config, database)
-    })?;
+    let async_database = AsyncDatabase::open_app_dir(app_dir).await?;
+    let mut run = plan
+        .run_startup_async(&async_database, now_millis(), || {
+            index_torrents_and_data_dirs(config, database)
+        })
+        .await?;
     execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &run.jobs)?;
 
     let mut server_state = None;
@@ -110,10 +113,10 @@ async fn run_plan(
                 let now = now_millis();
                 if let Some(state) = &server_state {
                     let mut scheduler = state.scheduler.lock().await;
-                    let results = scheduler.check_jobs(database, now, false)?;
+                    let results = scheduler.check_jobs_async(&async_database, now, false).await?;
                     execute_ran_jobs(app_dir, config, database, &mut scheduler, &results)?;
                 } else {
-                    let results = plan.scheduler.check_jobs(database, now, false)?;
+                    let results = plan.scheduler.check_jobs_async(&async_database, now, false).await?;
                     execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &results)?;
                 }
                 iterations = iterations.saturating_add(1);
@@ -127,6 +130,7 @@ async fn run_plan(
             .await
             .map_err(|error| daemon_error(format!("HTTP server task failed: {error}")))??;
     }
+    async_database.close().await;
     Ok(run)
 }
 
@@ -208,12 +212,12 @@ async fn handle_runtime_request(
     let async_database = AsyncDatabase::open_app_dir(&state.app_dir).await?;
     let api_key =
         crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await?;
-    async_database.close().await;
     let database = Database::open_app_dir(&state.app_dir)?;
     let mut scheduler = state.scheduler.lock().await;
     let mut handlers = RuntimeHandlers {
         app_dir: &state.app_dir,
         config: &state.config,
+        async_database: &async_database,
         database: &database,
         scheduler: &mut scheduler,
         now_millis: now_millis(),
@@ -221,6 +225,7 @@ async fn handle_runtime_request(
     };
     let response = handle_api_request(request, &api_key, &mut handlers).await?;
     handlers.spawn_webhook_workers();
+    async_database.close().await;
     Ok(response)
 }
 
@@ -405,6 +410,7 @@ struct DaemonState {
 struct RuntimeHandlers<'a> {
     app_dir: &'a Path,
     config: &'a RuntimeConfig,
+    async_database: &'a AsyncDatabase,
     database: &'a Database,
     scheduler: &'a mut Scheduler,
     now_millis: i64,
@@ -465,11 +471,13 @@ impl ApiHandlers for RuntimeHandlers<'_> {
         };
         let response = self
             .scheduler
-            .request_early_run(self.database, name, self.now_millis)?;
+            .request_early_run_async(self.async_database, name, self.now_millis)
+            .await?;
         if matches!(response, JobResponse::Accepted(_)) {
             let results = self
                 .scheduler
-                .check_jobs(self.database, self.now_millis, false)?;
+                .check_jobs_async(self.async_database, self.now_millis, false)
+                .await?;
             execute_ran_jobs(
                 self.app_dir,
                 self.config,
@@ -524,7 +532,7 @@ mod tests {
     use crate::{
         api::{ApiMethod, ApiRequest, handle_api_request},
         config::{RawConfig, RuntimeConfig, TorrentClientConfig},
-        persistence::Database,
+        persistence::{AsyncDatabase, Database},
         scheduler::{DaemonPlan, JobName},
     };
     use std::{
@@ -586,9 +594,11 @@ mod tests {
         )
         .expect("config");
         let mut plan = DaemonPlan::from_config(&config);
+        let async_database = AsyncDatabase::open_app_dir(&root).await.expect("database");
         let mut handlers = super::RuntimeHandlers {
             app_dir: &root,
             config: &config,
+            async_database: &async_database,
             database: &database,
             scheduler: &mut plan.scheduler,
             now_millis: 1_000,
@@ -628,6 +638,7 @@ mod tests {
             )
             .ok();
         assert_eq!(inject_last_run, None);
+        async_database.close().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
 

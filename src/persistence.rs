@@ -565,6 +565,30 @@ impl AsyncDatabase {
         rows_affected(result.rows_affected())
     }
 
+    /// Read a scheduler job's last run timestamp.
+    pub async fn read_last_run(&self, name: &str) -> crate::Result<Option<i64>> {
+        sqlx::query_scalar("SELECT last_run FROM job_log WHERE name = ?1")
+            .bind(name)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)
+    }
+
+    /// Insert or update a scheduler job's last run timestamp.
+    pub async fn write_last_run(&self, name: &str, last_run: i64) -> crate::Result<()> {
+        sqlx::query(
+            "INSERT INTO job_log (name, last_run)
+             VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET last_run = excluded.last_run",
+        )
+        .bind(name)
+        .bind(last_run)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(sqlx_error)
+    }
+
     async fn schema_version(&self) -> crate::Result<i64> {
         sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(self.pool())

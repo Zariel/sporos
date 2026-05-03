@@ -8,7 +8,7 @@ use crate::{
     SporosError,
     api::JobResponse,
     config::{Action, RuntimeConfig},
-    persistence::Database,
+    persistence::{AsyncDatabase, Database},
 };
 
 const ONE_DAY_MILLIS: u64 = 86_400_000;
@@ -193,6 +193,29 @@ impl DaemonPlan {
             jobs,
         })
     }
+
+    /// Run startup indexing hook and first async job check in lifecycle order.
+    pub async fn run_startup_async<I>(
+        &mut self,
+        database: &AsyncDatabase,
+        now_millis: i64,
+        mut index_startup: I,
+    ) -> crate::Result<DaemonRun>
+    where
+        I: FnMut() -> crate::Result<()>,
+    {
+        index_startup()?;
+        let jobs = self
+            .scheduler
+            .check_jobs_async(database, now_millis, true)
+            .await?;
+        Ok(DaemonRun {
+            startup_indexed: true,
+            serving: self.serve_http,
+            listen_addr: None,
+            jobs,
+        })
+    }
 }
 
 impl Scheduler {
@@ -240,6 +263,51 @@ impl Scheduler {
             )));
         }
         if read_last_run(database, name)?.is_some_and(|last_run| now_millis < last_run) {
+            return Ok(JobResponse::NotEligible(format!(
+                "{}: already queued ahead of schedule",
+                name.as_str()
+            )));
+        }
+        job.run_ahead_of_schedule = true;
+        if matches!(name, JobName::Rss | JobName::Search) {
+            job.delay_next_run = true;
+        }
+        Ok(JobResponse::Accepted(format!(
+            "{}: running ahead of schedule",
+            name.as_str()
+        )))
+    }
+
+    /// Mark a job to run ahead of schedule using async scheduler state.
+    pub async fn request_early_run_async(
+        &mut self,
+        database: &AsyncDatabase,
+        name: JobName,
+        now_millis: i64,
+    ) -> crate::Result<JobResponse> {
+        let Some(job) = self.jobs.iter_mut().find(|job| job.name == name) else {
+            return Ok(JobResponse::Disabled(format!(
+                "{}: unable to run, disabled in config",
+                name.as_str()
+            )));
+        };
+        if !job.enabled {
+            return Ok(JobResponse::Disabled(format!(
+                "{}: unable to run, disabled in config",
+                name.as_str()
+            )));
+        }
+        if job.is_active {
+            return Ok(JobResponse::AlreadyRunning(format!(
+                "{}: already running",
+                name.as_str()
+            )));
+        }
+        if database
+            .read_last_run(name.as_str())
+            .await?
+            .is_some_and(|last_run| now_millis < last_run)
+        {
             return Ok(JobResponse::NotEligible(format!(
                 "{}: already queued ahead of schedule",
                 name.as_str()
@@ -345,6 +413,94 @@ impl Scheduler {
         Ok(results)
     }
 
+    /// Check all jobs using async scheduler state.
+    pub async fn check_jobs_async(
+        &mut self,
+        database: &AsyncDatabase,
+        now_millis: i64,
+        is_first_run: bool,
+    ) -> crate::Result<Vec<JobCheckResult>> {
+        let rss_active = self
+            .jobs
+            .iter()
+            .any(|job| job.name == JobName::Rss && job.is_active);
+        let any_active = self.jobs.iter().any(|job| job.is_active);
+        let mut results = Vec::with_capacity(self.jobs.len());
+        for job in &mut self.jobs {
+            let last_run = database.read_last_run(job.name.as_str()).await?;
+            if is_first_run {
+                tracing::info!(
+                    job = job.name.as_str(),
+                    last_run = ?last_run,
+                    "scheduler job state loaded"
+                );
+            }
+            let eligible = last_run.is_none_or(|last_run| {
+                now_millis >= last_run.saturating_add(job.cadence_millis as i64)
+            });
+            if !job.enabled {
+                results.push(JobCheckResult {
+                    name: job.name,
+                    ran: false,
+                    skipped: Some(Cow::Borrowed("disabled")),
+                });
+                continue;
+            }
+            if job.is_active {
+                results.push(JobCheckResult {
+                    name: job.name,
+                    ran: false,
+                    skipped: Some(Cow::Borrowed("already active")),
+                });
+                continue;
+            }
+            if !job.run_ahead_of_schedule {
+                if rss_active && job.name != JobName::Rss {
+                    results.push(JobCheckResult {
+                        name: job.name,
+                        ran: false,
+                        skipped: Some(Cow::Borrowed("rss active")),
+                    });
+                    continue;
+                }
+                if job.name == JobName::Cleanup && any_active {
+                    results.push(JobCheckResult {
+                        name: job.name,
+                        ran: false,
+                        skipped: Some(Cow::Borrowed("another job active")),
+                    });
+                    continue;
+                }
+                if !eligible {
+                    results.push(JobCheckResult {
+                        name: job.name,
+                        ran: false,
+                        skipped: Some(Cow::Borrowed("not due")),
+                    });
+                    continue;
+                }
+            }
+            let ran = job.run();
+            if ran {
+                let persisted = if job.delay_next_run {
+                    job.delay_next_run = false;
+                    now_millis.saturating_add(job.cadence_millis as i64)
+                } else {
+                    now_millis
+                };
+                database
+                    .write_last_run(job.name.as_str(), persisted)
+                    .await?;
+            }
+            results.push(JobCheckResult {
+                name: job.name,
+                ran,
+                skipped: (!ran).then_some(Cow::Borrowed("already active")),
+            });
+        }
+        Ok(results)
+    }
+
     /// Mark a dispatched job body as finished.
     pub fn finish_job(&mut self, name: JobName) {
         if let Some(job) = self.jobs.iter_mut().find(|job| job.name == name) {
@@ -396,7 +552,7 @@ mod tests {
     use crate::{
         api::JobResponse,
         config::{RawConfig, RuntimeConfig},
-        persistence::Database,
+        persistence::{AsyncDatabase, Database},
     };
     use std::{
         path::PathBuf,
@@ -429,6 +585,34 @@ mod tests {
             )
             .expect("last run");
         assert_eq!(last_run, 1_000);
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn async_check_jobs_runs_due_jobs_and_persists_last_run() {
+        let root = temp_path("scheduler-async-due");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+        let mut scheduler = Scheduler::new(vec![
+            ScheduledJob::new(JobName::Search, 60_000, true),
+            ScheduledJob::new(JobName::Cleanup, 86_400_000, true),
+        ]);
+
+        let results = scheduler
+            .check_jobs_async(&database, 1_000, true)
+            .await
+            .expect("check jobs");
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.ran));
+        assert_eq!(scheduler.jobs()[0].runs, 1);
+        let last_run: i64 = database
+            .read_last_run(JobName::Search.as_str())
+            .await
+            .expect("last run")
+            .expect("search last run");
+        assert_eq!(last_run, 1_000);
+        database.close().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
