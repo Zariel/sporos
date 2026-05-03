@@ -2594,9 +2594,8 @@ mod tests {
         },
         integrations::{SearchIndexer, SnatchOptions, TorznabCaps, TorznabSearchOptions},
         matching::AssessmentOptions,
-        persistence::{ClientSearcheeRecord, Database, DecisionRecord},
+        persistence::{ClientSearcheeRecord, Database, DecisionRecord, SqlValue},
     };
-    use rusqlite::params;
     use std::{
         borrow::Cow,
         collections::BTreeSet,
@@ -2755,8 +2754,7 @@ mod tests {
         assert_eq!(result.files_seen, 2);
         assert_eq!(result.torrents_indexed, 2);
         let count: i64 = database
-            .connection()
-            .query_row("SELECT COUNT(*) FROM torrent", [], |row| row.get(0))
+            .query_scalar("SELECT COUNT(*) FROM torrent", &[])
             .expect("count");
         assert_eq!(count, 2);
 
@@ -2767,12 +2765,10 @@ mod tests {
         assert_eq!(result.files_seen, 1);
         assert_eq!(result.torrents_indexed, 1);
         assert_eq!(result.torrents_removed, 1);
-        let names = database
-            .connection()
-            .query_row(
+        let names: String = database
+            .query_scalar(
                 "SELECT name FROM torrent WHERE file_path = ?1",
-                [&first.display().to_string()],
-                |row| row.get::<_, String>(0),
+                &[SqlValue::Text(Cow::Owned(first.display().to_string()))],
             )
             .expect("name");
         assert_eq!(names, "First.Changed");
@@ -2795,8 +2791,7 @@ mod tests {
         assert_eq!(result.files_seen, 1);
         assert_eq!(result.files_failed, 1);
         let count: i64 = database
-            .connection()
-            .query_row("SELECT COUNT(*) FROM torrent", [], |row| row.get(0))
+            .query_scalar("SELECT COUNT(*) FROM torrent", &[])
             .expect("count");
         assert_eq!(count, 0);
         let _cleanup = fs::remove_dir_all(root);
@@ -3178,11 +3173,14 @@ mod tests {
             },
         };
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (id, url, apikey, active)
                  VALUES (?1, ?2, ?3, 1)",
-                params![indexer.id, indexer.url, indexer.apikey],
+                &[
+                    SqlValue::I64(indexer.id),
+                    SqlValue::Text(Cow::Borrowed(indexer.url.as_str())),
+                    SqlValue::Text(Cow::Borrowed(indexer.apikey.as_str())),
+                ],
             )
             .expect("indexer");
         let mut actions = 0;
@@ -3246,11 +3244,14 @@ mod tests {
             },
         };
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (id, url, apikey, active)
                  VALUES (?1, ?2, ?3, 1)",
-                params![indexer.id, indexer.url, indexer.apikey],
+                &[
+                    SqlValue::I64(indexer.id),
+                    SqlValue::Text(Cow::Borrowed(indexer.url.as_str())),
+                    SqlValue::Text(Cow::Borrowed(indexer.apikey.as_str())),
+                ],
             )
             .expect("indexer");
         let searchees = vec![episode_searchee(1, 1_000), episode_searchee(2, 1_000)];
@@ -3310,11 +3311,14 @@ mod tests {
             },
         };
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (id, url, apikey, active)
                  VALUES (?1, ?2, ?3, 1)",
-                params![indexer.id, indexer.url, indexer.apikey],
+                &[
+                    SqlValue::I64(indexer.id),
+                    SqlValue::Text(Cow::Borrowed(indexer.url.as_str())),
+                    SqlValue::Text(Cow::Borrowed(indexer.apikey.as_str())),
+                ],
             )
             .expect("indexer");
         let searchees = vec![episode_searchee(1, 1_000), episode_searchee(2, 1_000)];

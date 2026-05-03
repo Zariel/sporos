@@ -21,7 +21,7 @@ use sporos::{
         lookup_arr_ids, rss_pager, validate_arr_url,
     },
     notifications::NotificationSender,
-    persistence::Database,
+    persistence::{Database, SqlValue},
     scheduler::DaemonPlan,
     startup::Redactor,
 };
@@ -41,10 +41,9 @@ fn fake_torznab_rss_service_pages_and_persists_sqlite_state() {
     fs::create_dir_all(&root).expect("root");
     let database = Database::open_app_dir(&root).expect("database");
     database
-        .connection()
-        .execute(
+        .execute_sql(
             "INSERT INTO indexer (id, url, apikey, active) VALUES (7, ?1, 'secret', 1)",
-            [&server.url],
+            &[SqlValue::Text(std::borrow::Cow::Borrowed(&server.url))],
         )
         .expect("indexer");
     let indexer = SearchIndexer {
@@ -77,12 +76,8 @@ fn fake_torznab_rss_service_pages_and_persists_sqlite_state() {
     assert_eq!(candidates.len(), 2);
     assert_eq!(candidates[0].guid, "new-guid");
     let cursor: String = database
-        .connection()
-        .query_row(
-            "SELECT last_seen_guid FROM rss WHERE indexer_id = ?1",
-            [indexer.id],
-            |row| row.get(0),
-        )
+        .read_rss_cursor(indexer.id)
+        .expect("cursor")
         .expect("cursor");
     assert_eq!(cursor, "new-guid");
     let requests = server.join();

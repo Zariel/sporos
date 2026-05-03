@@ -1480,7 +1480,7 @@ mod tests {
             TorrentClientMetadata,
         },
         matching::AssessmentOptions,
-        persistence::Database,
+        persistence::{Database, SqlValue},
         search::Blocklist,
         torrent::{SavedTorrentMetadata, parse_metadata_from_filename, torrent_cache_path},
     };
@@ -1543,11 +1543,12 @@ mod tests {
         let output_dir = root.join("out");
         let database = Database::open_app_dir(&root).expect("database");
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (name, url, apikey, trackers, active)
                  VALUES ('TrackerName', 'https://indexer.example/api', 'secret', ?1, 1)",
-                [r#"["tracker.example"]"#],
+                &[SqlValue::Text(std::borrow::Cow::Borrowed(
+                    r#"["tracker.example"]"#,
+                ))],
             )
             .expect("indexer");
         let bytes = torrent_bytes("Cached.Release", "https://tracker.example/announce", 20);

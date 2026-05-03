@@ -1826,8 +1826,9 @@ mod tests {
     };
     use crate::{
         domain::{Candidate, Decision, File, MediaType, Searchee},
-        persistence::{Database, DecisionRecord},
+        persistence::{Database, DecisionRecord, SqlValue},
     };
+    use sqlx::Row;
     use std::{
         borrow::Cow,
         fs,
@@ -1897,14 +1898,7 @@ mod tests {
         assert_eq!(result.updated, 1);
         assert_eq!(result.deactivated, 1);
 
-        let id: i64 = database
-            .connection()
-            .query_row(
-                "SELECT id FROM indexer WHERE url = ?1",
-                [&first.url],
-                |row| row.get(0),
-            )
-            .expect("id");
+        let id = database.indexer_id(&first.url).expect("id");
         let caps = parse_torznab_caps(
             r#"<caps><searching searchAvailable="yes" /><categories><category id="5000" name="TV" /></categories></caps>"#,
         )
@@ -2071,15 +2065,13 @@ mod tests {
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (url, apikey, active, search_cap) VALUES (?1, 'key', 1, 1)",
-                [format!("{}/api", server.url)],
+                &[SqlValue::Text(Cow::Owned(format!("{}/api", server.url)))],
             )
             .expect("indexer");
         let id = database
-            .connection()
-            .query_row("SELECT id FROM indexer", [], |row| row.get(0))
+            .query_scalar("SELECT id FROM indexer", &[])
             .expect("id");
         let indexer = SearchIndexer {
             id,
@@ -2104,10 +2096,10 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].guid, "g1");
         let name: String = database
-            .connection()
-            .query_row("SELECT name FROM indexer WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
+            .query_scalar(
+                "SELECT name FROM indexer WHERE id = ?1",
+                &[SqlValue::I64(id)],
+            )
             .expect("name");
         assert_eq!(name, "NamedTracker");
         let requests = server.join();
@@ -2126,15 +2118,13 @@ mod tests {
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (url, apikey, active, search_cap) VALUES (?1, 'key', 1, 1)",
-                [format!("{}/api", server.url)],
+                &[SqlValue::Text(Cow::Owned(format!("{}/api", server.url)))],
             )
             .expect("indexer");
         let id = database
-            .connection()
-            .query_row("SELECT id FROM indexer", [], |row| row.get(0))
+            .query_scalar("SELECT id FROM indexer", &[])
             .expect("id");
         let indexer = SearchIndexer {
             id,
@@ -2158,11 +2148,10 @@ mod tests {
 
         assert!(candidates.is_empty());
         let (status, retry_after): (String, u64) = database
-            .connection()
             .query_row(
                 "SELECT status, retry_after FROM indexer WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                &[SqlValue::I64(id)],
+                |row| (row.get(0), row.get(1)),
             )
             .expect("status");
         assert_eq!(status, "RATE_LIMITED");
@@ -2186,11 +2175,7 @@ mod tests {
         let database = Database::open_app_dir(&root).expect("database");
         let indexer = insert_search_indexer(&database, &server.url, 2);
         database
-            .connection()
-            .execute(
-                "INSERT INTO rss (indexer_id, last_seen_guid) VALUES (?1, 'old-guid')",
-                [indexer.id],
-            )
+            .update_rss_cursor(indexer.id, "old-guid")
             .expect("cursor");
 
         let candidates = rss_pager(
@@ -2207,12 +2192,8 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].guid, "new-guid");
         let cursor: String = database
-            .connection()
-            .query_row(
-                "SELECT last_seen_guid FROM rss WHERE indexer_id = ?1",
-                [indexer.id],
-                |row| row.get(0),
-            )
+            .read_rss_cursor(indexer.id)
+            .expect("cursor")
             .expect("cursor");
         assert_eq!(cursor, "new-guid");
         server.join();
@@ -2234,11 +2215,7 @@ mod tests {
         let database = Database::open_app_dir(&root).expect("database");
         let indexer = insert_search_indexer(&database, &server.url, 2);
         database
-            .connection()
-            .execute(
-                "INSERT INTO rss (indexer_id, last_seen_guid) VALUES (?1, 'missing')",
-                [indexer.id],
-            )
+            .update_rss_cursor(indexer.id, "missing")
             .expect("cursor");
 
         let candidates = rss_pager(
@@ -2704,18 +2681,12 @@ mod tests {
     fn insert_search_indexer(database: &Database, server_url: &str, limit: u32) -> SearchIndexer {
         let url = format!("{server_url}/api");
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (url, apikey, active, search_cap) VALUES (?1, 'key', 1, 1)",
-                [&url],
+                &[SqlValue::Text(Cow::Borrowed(url.as_str()))],
             )
             .expect("indexer");
-        let id = database
-            .connection()
-            .query_row("SELECT id FROM indexer WHERE url = ?1", [&url], |row| {
-                row.get(0)
-            })
-            .expect("id");
+        let id = database.indexer_id(&url).expect("id");
         SearchIndexer {
             id,
             url,

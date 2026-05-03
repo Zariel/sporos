@@ -619,14 +619,9 @@ mod tests {
                 .map(|job| job.runs),
             Some(0)
         );
-        let inject_last_run: Option<i64> = database
-            .connection()
-            .query_row(
-                "SELECT last_run FROM job_log WHERE name = 'inject'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
+        let inject_last_run = database
+            .read_last_run(JobName::Inject.as_str())
+            .expect("last run");
         assert_eq!(inject_last_run, None);
         async_database.close().await;
         let _cleanup = std::fs::remove_dir_all(root);

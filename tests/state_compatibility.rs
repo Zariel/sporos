@@ -8,7 +8,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::params;
 use sporos::{
     actions::{
         InjectionActionOptions, SavedInjectionOptions, inject_saved_torrents,
@@ -27,10 +26,13 @@ use sporos::{
     },
     integrations::{cache_torrent_file, get_cached_torrent},
     matching::AssessmentOptions,
-    persistence::{ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord, EnsembleRecord},
+    persistence::{
+        ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord, EnsembleRecord, SqlValue,
+    },
     search::Blocklist,
     torrent::{SavedTorrentMetadata, parse_metadata_from_filename},
 };
+use sqlx::Row;
 
 #[test]
 fn current_bootstrap_reopen_preserves_compatibility_state() {
@@ -229,8 +231,7 @@ fn seed_database_state(database: &Database, info_hash: &str) {
         })
         .expect("decision");
     database
-        .connection()
-        .execute(
+        .execute_sql(
             "INSERT INTO indexer
                 (id, name, url, apikey, trackers, active, status, retry_after,
                  search_cap, tv_search_cap, movie_search_cap, tv_id_caps, cat_caps, limits_caps)
@@ -238,23 +239,21 @@ fn seed_database_state(database: &Database, info_hash: &str) {
                 (1, 'Tracker', 'https://indexer.example/api', 'indexer-key',
                  '[\"tracker.example\"]', 1, 'rate-limited', 12345,
                  1, 1, 0, '[\"imdbid\"]', '[5000,5040]', '{\"default\":100}')",
-            [],
+            &[],
         )
         .expect("indexer");
     database
-        .connection()
-        .execute(
+        .execute_sql(
             "INSERT INTO timestamp
                 (searchee_id, indexer_id, first_searched, last_searched)
              VALUES (?1, 1, 111, 222)",
-            params![searchee_id],
+            &[SqlValue::I64(searchee_id)],
         )
         .expect("timestamp");
     database
-        .connection()
-        .execute(
+        .execute_sql(
             "INSERT INTO rss (indexer_id, last_seen_guid) VALUES (1, 'rss-guid')",
-            [],
+            &[],
         )
         .expect("rss");
     let files = [File::new("Example.Show.S01E01.mkv", 7)];
@@ -315,19 +314,10 @@ fn assert_database_state_survived(database: &Database, info_hash: &str) {
     assert_eq!(guid.info_hash, info_hash);
 
     let indexer_state: (String, String, String, i64, String) = database
-        .connection()
         .query_row(
             "SELECT name, apikey, status, retry_after, trackers FROM indexer WHERE id = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            &[],
+            |row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
         )
         .expect("indexer state");
     assert_eq!(
@@ -342,31 +332,23 @@ fn assert_database_state_survived(database: &Database, info_hash: &str) {
     );
 
     let rss_guid: String = database
-        .connection()
-        .query_row(
-            "SELECT last_seen_guid FROM rss WHERE indexer_id = 1",
-            [],
-            |row| row.get(0),
-        )
+        .query_scalar("SELECT last_seen_guid FROM rss WHERE indexer_id = 1", &[])
         .expect("rss");
     assert_eq!(rss_guid, "rss-guid");
 
     let timestamp_last: i64 = database
-        .connection()
-        .query_row(
+        .query_scalar(
             "SELECT last_searched FROM timestamp WHERE indexer_id = 1",
-            [],
-            |row| row.get(0),
+            &[],
         )
         .expect("timestamp");
     assert_eq!(timestamp_last, 222);
 
     let client_state: (String, String, String, String) = database
-        .connection()
         .query_row(
             "SELECT category, tags, trackers, save_path FROM client_searchee WHERE client_host = 'client'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            &[],
+            |row| (row.get(0), row.get(1), row.get(2), row.get(3)),
         )
         .expect("client state");
     assert_eq!(
@@ -380,8 +362,7 @@ fn assert_database_state_survived(database: &Database, info_hash: &str) {
     );
 
     let ensemble_count: i64 = database
-        .connection()
-        .query_row("SELECT COUNT(*) FROM ensemble", [], |row| row.get(0))
+        .query_scalar("SELECT COUNT(*) FROM ensemble", &[])
         .expect("ensemble count");
     assert_eq!(ensemble_count, 2);
 }

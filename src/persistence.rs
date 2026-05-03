@@ -2,15 +2,19 @@
 
 use std::{
     borrow::Cow,
+    future::Future,
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sqlx::{
-    AssertSqlSafe, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    Decode, Row, Sqlite, SqlitePool, Type,
+    query::Query,
+    sqlite::{
+        SqliteArguments, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow,
+    },
 };
+use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 
 use crate::{
     SporosError,
@@ -18,7 +22,7 @@ use crate::{
 };
 
 const DATABASE_FILE_NAME: &str = "cross-seed.db";
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 1;
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;";
 
 #[derive(Debug, Clone, Copy)]
@@ -27,20 +31,15 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        sql: SCHEMA,
-    },
-    Migration {
-        version: CURRENT_SCHEMA_VERSION,
-        sql: ENSEMBLE_UNIQUE_KEY_MIGRATION,
-    },
-];
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: SCHEMA_VERSION,
+    sql: SCHEMA,
+}];
 
-/// SQLite database handle with compatibility schema helpers.
+/// SQLite database handle with schema helpers.
 pub struct Database {
-    connection: Connection,
+    runtime: Option<Runtime>,
+    inner: AsyncDatabase,
 }
 
 /// Async SQLite database handle for sqlx-backed persistence call sites.
@@ -51,80 +50,72 @@ pub struct AsyncDatabase {
 }
 
 impl Database {
-    /// Open `<appDir>/cross-seed.db`, enable WAL, and create the current
-    /// unreleased schema directly.
+    /// Open `<appDir>/cross-seed.db`, enable WAL, and run migrations.
     pub fn open_app_dir(app_dir: &Path) -> crate::Result<Self> {
         Self::open(app_dir.join(DATABASE_FILE_NAME))
     }
 
-    /// Open a database file, enable WAL, and create the current unreleased schema.
+    /// Open a database file, enable WAL, and run migrations.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
-        let connection = Connection::open(path).map_err(sql_error)?;
-        let database = Self { connection };
-        database.initialize()?;
-        Ok(database)
+        let path = path.as_ref().to_path_buf();
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                persistence_message(format!("failed to build database runtime: {error}"))
+            })?;
+        let inner = block_on_runtime(&runtime, AsyncDatabase::open(path))?;
+        Ok(Self {
+            runtime: Some(runtime),
+            inner,
+        })
     }
 
-    /// Access the raw connection for integration-specific queries.
-    pub fn connection(&self) -> &Connection {
-        &self.connection
-    }
-
-    /// Run pending Rust schema migrations and set SQLite pragmas.
+    /// Run pending schema migrations and set SQLite pragmas.
     pub fn initialize(&self) -> crate::Result<()> {
-        self.connection.execute_batch(PRAGMAS).map_err(sql_error)?;
-        let current_version = self.schema_version()?;
-        if current_version > CURRENT_SCHEMA_VERSION {
-            return Err(persistence_message(format!(
-                "database schema version {current_version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
-            )));
-        }
-        for migration in MIGRATIONS {
-            if migration.version > current_version {
-                self.connection
-                    .execute_batch(migration.sql)
-                    .map_err(sql_error)?;
-                self.set_schema_version(migration.version)?;
-            }
-        }
-        Ok(())
+        self.block_on(self.inner.initialize())
     }
 
-    fn schema_version(&self) -> crate::Result<i64> {
-        self.connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(sql_error)
+    fn pool(&self) -> &SqlitePool {
+        self.inner.pool()
     }
 
-    fn set_schema_version(&self, version: i64) -> crate::Result<()> {
-        self.connection
-            .execute_batch(&format!("PRAGMA user_version = {version}"))
-            .map_err(sql_error)
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        block_on_runtime(
+            self.runtime.as_ref().expect("database runtime is present"),
+            future,
+        )
     }
 
     /// Insert a searchee name if needed and return its stable id.
     pub fn get_or_insert_searchee(&self, name: &str, now_millis: i64) -> crate::Result<i64> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "INSERT INTO searchee (name, first_searched, last_searched)
                  VALUES (?1, ?2, ?2)
                  ON CONFLICT(name) DO NOTHING",
-                params![name, now_millis],
             )
-            .map_err(sql_error)?;
-        self.connection
-            .query_row(
-                "SELECT id FROM searchee WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)
+            .bind(name)
+            .bind(now_millis)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            sqlx::query_scalar("SELECT id FROM searchee WHERE name = ?1")
+                .bind(name)
+                .fetch_one(self.pool())
+                .await
+                .map_err(sqlx_error)
+        })
     }
 
     /// Insert or update a candidate decision row.
     pub fn upsert_decision(&self, record: &DecisionRecord<'_>) -> crate::Result<()> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "INSERT INTO decision
                     (searchee_id, guid, info_hash, decision, first_seen, last_seen, fuzzy_size_factor)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -133,18 +124,19 @@ impl Database {
                     decision = excluded.decision,
                     last_seen = excluded.last_seen,
                     fuzzy_size_factor = excluded.fuzzy_size_factor",
-                params![
-                    record.searchee_id,
-                    record.guid,
-                    record.info_hash,
-                    record.decision.as_str(),
-                    record.first_seen,
-                    record.last_seen,
-                    record.fuzzy_size_factor,
-                ],
             )
-            .map_err(sql_error)?;
-        Ok(())
+            .bind(record.searchee_id)
+            .bind(record.guid)
+            .bind(record.info_hash)
+            .bind(record.decision.as_str())
+            .bind(record.first_seen)
+            .bind(record.last_seen)
+            .bind(record.fuzzy_size_factor)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
+        })
     }
 
     /// Stream non-null GUID to info-hash mappings in bounded pages.
@@ -153,63 +145,55 @@ impl Database {
         after_id: i64,
         limit: u32,
     ) -> crate::Result<Vec<GuidInfoHash>> {
-        let mut statement = self
-            .connection
-            .prepare(
+        self.block_on(async {
+            let rows = sqlx::query(
                 "SELECT id, guid, info_hash
                  FROM decision
                  WHERE id > ?1 AND info_hash IS NOT NULL
                  ORDER BY id
                  LIMIT ?2",
             )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![after_id, limit], |row| {
-                Ok(GuidInfoHash {
-                    id: row.get(0)?,
-                    guid: row.get(1)?,
-                    info_hash: row.get(2)?,
+            .bind(after_id)
+            .bind(i64::from(limit))
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| GuidInfoHash {
+                    id: row.get(0),
+                    guid: row.get(1),
+                    info_hash: row.get(2),
                 })
-            })
-            .map_err(sql_error)?;
-
-        collect_rows(rows)
+                .collect())
+        })
     }
 
     /// Read the generated API key from settings row `id = 0`.
     pub fn get_api_key(&self) -> crate::Result<Option<String>> {
-        self.connection
-            .query_row("SELECT apikey FROM settings WHERE id = 0", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(sql_error)
+        self.block_on(self.inner.get_api_key())
     }
 
     /// Persist the generated API key in settings row `id = 0`.
     pub fn set_api_key(&self, api_key: &str) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO settings (id, apikey)
-                 VALUES (0, ?1)
-                 ON CONFLICT(id) DO UPDATE SET apikey = excluded.apikey",
-                params![api_key],
-            )
-            .map_err(sql_error)?;
-        Ok(())
+        self.block_on(self.inner.set_api_key(api_key))
     }
 
     /// Insert or update one data-dir root row.
     pub fn upsert_data_root(&self, record: &DataRootRecord<'_>) -> crate::Result<()> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "INSERT INTO data (path, title)
                  VALUES (?1, ?2)
                  ON CONFLICT(path) DO UPDATE SET title = excluded.title",
-                params![record.path, record.title],
             )
-            .map_err(sql_error)?;
-        Ok(())
+            .bind(record.path)
+            .bind(record.title)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
+        })
     }
 
     /// Refresh data-dir roots and prune data/ensemble rows no longer present.
@@ -227,31 +211,36 @@ impl Database {
 
     /// Start a bounded refresh for data-dir roots.
     pub fn begin_data_root_refresh(&self) -> crate::Result<()> {
-        self.connection
-            .execute_batch(
+        self.block_on(async {
+            sqlx::raw_sql(
                 "CREATE TEMP TABLE IF NOT EXISTS current_data_roots (
                     path TEXT PRIMARY KEY
                 );
                 DELETE FROM current_data_roots;",
             )
-            .map_err(sql_error)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
+        })
     }
 
     /// Mark one data-dir root as present during a bounded refresh.
     pub fn mark_refreshed_data_root(&self, path: &str) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "INSERT OR IGNORE INTO current_data_roots (path) VALUES (?1)",
-                params![path],
-            )
-            .map(|_| ())
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query("INSERT OR IGNORE INTO current_data_roots (path) VALUES (?1)")
+                .bind(path)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
+        })
     }
 
     /// Prune data-dir rows absent from the current bounded refresh.
     pub fn finish_data_root_refresh(&self) -> crate::Result<usize> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "DELETE FROM ensemble
                  WHERE client_host IS NULL
                  AND NOT EXISTS (
@@ -259,16 +248,19 @@ impl Database {
                     WHERE ensemble.path = current_data_roots.path
                     OR ensemble.path LIKE current_data_roots.path || '/%'
                  )",
-                [],
             )
-            .map_err(sql_error)?;
-        self.connection
-            .execute(
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            let result = sqlx::query(
                 "DELETE FROM data
                  WHERE path NOT IN (SELECT path FROM current_data_roots)",
-                [],
             )
-            .map_err(sql_error)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            rows_affected(result.rows_affected())
+        })
     }
 
     /// Insert or update one client searchee cache row.
@@ -276,8 +268,8 @@ impl Database {
         let files = files_json(record.files)?;
         let tags = labels_json(record.tags)?;
         let trackers = strings_json(record.trackers)?;
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "INSERT INTO client_searchee
                     (client_host, info_hash, name, title, files, length, save_path, category, tags, trackers)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -290,21 +282,22 @@ impl Database {
                     category = excluded.category,
                     tags = excluded.tags,
                     trackers = excluded.trackers",
-                params![
-                    record.client_host,
-                    record.info_hash,
-                    record.name,
-                    record.title,
-                    files,
-                    record.length,
-                    record.save_path,
-                    record.category,
-                    tags,
-                    trackers,
-                ],
             )
-            .map_err(sql_error)?;
-        Ok(())
+            .bind(record.client_host)
+            .bind(record.info_hash)
+            .bind(record.name)
+            .bind(record.title)
+            .bind(files)
+            .bind(i64::try_from(record.length).unwrap_or(i64::MAX))
+            .bind(record.save_path)
+            .bind(record.category)
+            .bind(tags)
+            .bind(trackers)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
+        })
     }
 
     /// Refresh one client's searchee rows and prune removed info hashes.
@@ -323,8 +316,8 @@ impl Database {
 
     /// Start a bounded refresh for one client's searchee rows.
     pub fn begin_client_searchee_refresh(&self) -> crate::Result<()> {
-        self.connection
-            .execute_batch(
+        self.block_on(async {
+            sqlx::raw_sql(
                 "CREATE TEMP TABLE IF NOT EXISTS current_client_info_hashes (
                     info_hash TEXT PRIMARY KEY
                 );
@@ -334,64 +327,75 @@ impl Database {
                 DELETE FROM current_client_info_hashes;
                 DELETE FROM current_client_ensemble_paths;",
             )
-            .map_err(sql_error)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
+        })
     }
 
     /// Mark one info hash as present during a bounded client searchee refresh.
     pub fn mark_refreshed_client_info_hash(&self, info_hash: &str) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "INSERT OR IGNORE INTO current_client_info_hashes (info_hash) VALUES (?1)",
-                params![info_hash],
-            )
-            .map(|_| ())
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query("INSERT OR IGNORE INTO current_client_info_hashes (info_hash) VALUES (?1)")
+                .bind(info_hash)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
+        })
     }
 
     /// Mark one ensemble path as present during a bounded client searchee refresh.
     pub fn mark_refreshed_client_ensemble_path(&self, path: &str) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "INSERT OR IGNORE INTO current_client_ensemble_paths (path) VALUES (?1)",
-                params![path],
-            )
-            .map(|_| ())
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query("INSERT OR IGNORE INTO current_client_ensemble_paths (path) VALUES (?1)")
+                .bind(path)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
+        })
     }
 
     /// Prune rows absent from the current bounded client searchee refresh.
     pub fn finish_client_searchee_refresh(&self, client_host: &str) -> crate::Result<usize> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "DELETE FROM ensemble
                  WHERE client_host = ?1
                  AND path NOT IN (SELECT path FROM current_client_ensemble_paths)",
-                params![client_host],
             )
-            .map_err(sql_error)?;
-        self.connection
-            .execute(
+            .bind(client_host)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            sqlx::query(
                 "DELETE FROM ensemble
                  WHERE client_host = ?1
                  AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
-                params![client_host],
             )
-            .map_err(sql_error)?;
-        self.connection
-            .execute(
+            .bind(client_host)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            let result = sqlx::query(
                 "DELETE FROM client_searchee
                  WHERE client_host = ?1
                  AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
-                params![client_host],
             )
-            .map_err(sql_error)
+            .bind(client_host)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            rows_affected(result.rows_affected())
+        })
     }
 
     /// Insert or update one ensemble row.
     pub fn upsert_ensemble(&self, record: &EnsembleRecord<'_>) -> crate::Result<()> {
-        let updated = self
-            .connection
-            .execute(
+        self.block_on(async {
+            let updated = sqlx::query(
                 "UPDATE ensemble
                  SET info_hash = ?3, ensemble = ?4, element = ?5
                  WHERE path = ?2
@@ -399,101 +403,74 @@ impl Database {
                     client_host = ?1
                     OR (client_host IS NULL AND ?1 IS NULL)
                  )",
-                params![
-                    record.client_host,
-                    record.path,
-                    record.info_hash,
-                    record.ensemble,
-                    record.element,
-                ],
             )
-            .map_err(sql_error)?;
-        if updated > 0 {
-            return Ok(());
-        }
+            .bind(record.client_host)
+            .bind(record.path)
+            .bind(record.info_hash)
+            .bind(record.ensemble)
+            .bind(record.element)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            if updated.rows_affected() > 0 {
+                return Ok(());
+            }
 
-        self.connection
-            .execute(
+            sqlx::query(
                 "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    record.client_host,
-                    record.path,
-                    record.info_hash,
-                    record.ensemble,
-                    record.element,
-                ],
             )
-            .map_err(sql_error)?;
-        Ok(())
+            .bind(record.client_host)
+            .bind(record.path)
+            .bind(record.info_hash)
+            .bind(record.ensemble)
+            .bind(record.element)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
+        })
     }
 
     /// Delete decision rows that have no cached torrent info hash.
     pub fn delete_null_decisions(&self) -> crate::Result<usize> {
-        self.connection
-            .execute("DELETE FROM decision WHERE info_hash IS NULL", [])
-            .map_err(sql_error)
+        self.block_on(self.inner.delete_null_decisions())
     }
 
     /// Clear all search timestamp rows.
     pub fn clear_timestamps(&self) -> crate::Result<usize> {
-        self.connection
-            .execute("DELETE FROM timestamp", [])
-            .map_err(sql_error)
+        self.block_on(self.inner.clear_timestamps())
     }
 
     /// Clear one known cache table.
     pub fn clear_table(&self, table: CacheTable) -> crate::Result<usize> {
-        let sql = match table {
-            CacheTable::Torrent => "DELETE FROM torrent",
-            CacheTable::ClientSearchee => "DELETE FROM client_searchee",
-            CacheTable::Data => "DELETE FROM data",
-            CacheTable::Ensemble => "DELETE FROM ensemble",
-        };
-        self.connection.execute(sql, []).map_err(sql_error)
+        self.block_on(self.inner.clear_table(table))
     }
 
     /// Clear persisted indexer failure status and retry timestamps.
     pub fn clear_indexer_failures(&self) -> crate::Result<usize> {
-        self.connection
-            .execute("UPDATE indexer SET status = NULL, retry_after = NULL", [])
-            .map_err(sql_error)
+        self.block_on(self.inner.clear_indexer_failures())
     }
 
     /// Read a scheduler job's last run timestamp.
     pub fn read_last_run(&self, name: &str) -> crate::Result<Option<i64>> {
-        self.connection
-            .query_row(
-                "SELECT last_run FROM job_log WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)
+        self.block_on(self.inner.read_last_run(name))
     }
 
     /// Insert or update a scheduler job's last run timestamp.
     pub fn write_last_run(&self, name: &str, last_run: i64) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO job_log (name, last_run)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(name) DO UPDATE SET last_run = excluded.last_run",
-                params![name, last_run],
-            )
-            .map(|_| ())
-            .map_err(sql_error)
+        self.block_on(self.inner.write_last_run(name, last_run))
     }
 
     /// Return a persisted indexer id for a configured URL.
     pub fn indexer_id(&self, url: &str) -> crate::Result<i64> {
-        self.connection
-            .query_row(
-                "SELECT id FROM indexer WHERE url = ?1",
-                params![url],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query_scalar("SELECT id FROM indexer WHERE url = ?1")
+                .bind(url)
+                .fetch_one(self.pool())
+                .await
+                .map_err(sqlx_error)
+        })
     }
 
     /// Synchronize configured Torznab indexers with persisted rows.
@@ -501,63 +478,69 @@ impl Database {
         &self,
         configured: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> crate::Result<IndexerSyncStats> {
-        self.connection
-            .execute_batch(
+        let configured = configured.into_iter().collect::<Vec<_>>();
+        self.block_on(async {
+            sqlx::raw_sql(
                 "CREATE TEMP TABLE IF NOT EXISTS current_indexer_urls (
                     url TEXT PRIMARY KEY
                 );
                 DELETE FROM current_indexer_urls;",
             )
-            .map_err(sql_error)?;
-        let mut result = IndexerSyncStats::default();
-        for (url, apikey) in configured {
-            self.connection
-                .execute(
-                    "INSERT OR IGNORE INTO current_indexer_urls (url) VALUES (?1)",
-                    params![url],
-                )
-                .map_err(sql_error)?;
-            let changed = self
-                .connection
-                .execute(
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            let mut result = IndexerSyncStats::default();
+            for (url, apikey) in configured {
+                sqlx::query("INSERT OR IGNORE INTO current_indexer_urls (url) VALUES (?1)")
+                    .bind(url)
+                    .execute(self.pool())
+                    .await
+                    .map_err(sqlx_error)?;
+                let changed = sqlx::query(
                     "UPDATE indexer
                      SET apikey = ?2,
                          active = 1,
                          status = CASE WHEN status = 'UNKNOWN_ERROR' THEN NULL ELSE status END
                      WHERE url = ?1",
-                    params![url, apikey],
                 )
-                .map_err(sql_error)?;
-            if changed == 0 {
-                self.connection
-                    .execute(
+                .bind(url)
+                .bind(apikey)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+                if changed.rows_affected() == 0 {
+                    sqlx::query(
                         "INSERT INTO indexer (url, apikey, active)
                          VALUES (?1, ?2, 1)",
-                        params![url, apikey],
                     )
-                    .map_err(sql_error)?;
-                result.inserted += 1;
-            } else {
-                result.updated += changed;
+                    .bind(url)
+                    .bind(apikey)
+                    .execute(self.pool())
+                    .await
+                    .map_err(sqlx_error)?;
+                    result.inserted += 1;
+                } else {
+                    result.updated += rows_affected(changed.rows_affected())?;
+                }
             }
-        }
-        result.deactivated = self
-            .connection
-            .execute(
+            let deactivated = sqlx::query(
                 "UPDATE indexer
                  SET active = 0
                  WHERE active = 1
                  AND url NOT IN (SELECT url FROM current_indexer_urls)",
-                [],
             )
-            .map_err(sql_error)?;
-        Ok(result)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            result.deactivated = rows_affected(deactivated.rows_affected())?;
+            Ok(result)
+        })
     }
 
     /// Persist parsed caps for an indexer row.
     pub fn update_indexer_caps(&self, record: &IndexerCapsRecord<'_>) -> crate::Result<()> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "UPDATE indexer SET
                     search_cap = ?2,
                     tv_search_cap = ?3,
@@ -572,22 +555,23 @@ impl Database {
                     status = NULL,
                     retry_after = NULL
                  WHERE id = ?1",
-                params![
-                    record.indexer_id,
-                    record.search,
-                    record.tv_search,
-                    record.movie_search,
-                    record.music_search,
-                    record.audio_search,
-                    record.book_search,
-                    record.tv_ids,
-                    record.movie_ids,
-                    record.categories,
-                    record.limits,
-                ],
             )
+            .bind(record.indexer_id)
+            .bind(record.search)
+            .bind(record.tv_search)
+            .bind(record.movie_search)
+            .bind(record.music_search)
+            .bind(record.audio_search)
+            .bind(record.book_search)
+            .bind(record.tv_ids)
+            .bind(record.movie_ids)
+            .bind(record.categories)
+            .bind(record.limits)
+            .execute(self.pool())
+            .await
             .map(|_| ())
-            .map_err(sql_error)
+            .map_err(sqlx_error)
+        })
     }
 
     /// Mark an indexer status and retry timestamp.
@@ -597,44 +581,47 @@ impl Database {
         status: Option<&str>,
         retry_after: Option<u64>,
     ) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "UPDATE indexer SET status = ?2, retry_after = ?3 WHERE id = ?1",
-                params![indexer_id, status, retry_after],
-            )
-            .map(|_| ())
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query("UPDATE indexer SET status = ?2, retry_after = ?3 WHERE id = ?1")
+                .bind(indexer_id)
+                .bind(status)
+                .bind(retry_after.and_then(|value| i64::try_from(value).ok()))
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
+        })
     }
 
     /// Load enabled indexers for the current timestamp.
     pub fn enabled_indexers(&self, now_millis: u64) -> crate::Result<Vec<IndexerRow>> {
-        let mut statement = self
-            .connection
-            .prepare(
+        self.block_on(async {
+            let rows = sqlx::query(
                 "SELECT id, url, apikey
                  FROM indexer
                  WHERE active = 1
                    AND search_cap = 1
                    AND (status IS NULL OR status = 'OK' OR retry_after < ?1)",
             )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![now_millis], |row| {
-                Ok(IndexerRow {
-                    id: row.get(0)?,
-                    url: row.get(1)?,
-                    apikey: row.get(2)?,
+            .bind(i64::try_from(now_millis).unwrap_or(i64::MAX))
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| IndexerRow {
+                    id: row.get(0),
+                    url: row.get(1),
+                    apikey: row.get(2),
                 })
-            })
-            .map_err(sql_error)?;
-        collect_rows(rows)
+                .collect())
+        })
     }
 
     /// Load enabled indexers and serialized caps for search.
     pub fn enabled_search_indexers(&self, now_millis: u64) -> crate::Result<Vec<SearchIndexerRow>> {
-        let mut statement = self
-            .connection
-            .prepare(
+        self.block_on(async {
+            let rows = sqlx::query(
                 "SELECT id, url, apikey,
                         search_cap, tv_search_cap, movie_search_cap, music_search_cap,
                         audio_search_cap, book_search_cap, tv_id_caps, movie_id_caps,
@@ -644,38 +631,42 @@ impl Database {
                    AND search_cap = 1
                    AND (status IS NULL OR status = 'OK' OR retry_after < ?1)",
             )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![now_millis], |row| {
-                Ok(SearchIndexerRow {
-                    id: row.get(0)?,
-                    url: row.get(1)?,
-                    apikey: row.get(2)?,
-                    search: row.get(3)?,
-                    tv_search: row.get(4)?,
-                    movie_search: row.get(5)?,
-                    music_search: row.get(6)?,
-                    audio_search: row.get(7)?,
-                    book_search: row.get(8)?,
-                    tv_ids: row.get(9)?,
-                    movie_ids: row.get(10)?,
-                    categories: row.get(11)?,
-                    limits: row.get(12)?,
+            .bind(i64::try_from(now_millis).unwrap_or(i64::MAX))
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| SearchIndexerRow {
+                    id: row.get(0),
+                    url: row.get(1),
+                    apikey: row.get(2),
+                    search: row.get(3),
+                    tv_search: row.get(4),
+                    movie_search: row.get(5),
+                    music_search: row.get(6),
+                    audio_search: row.get(7),
+                    book_search: row.get(8),
+                    tv_ids: row.get(9),
+                    movie_ids: row.get(10),
+                    categories: row.get(11),
+                    limits: row.get(12),
                 })
-            })
-            .map_err(sql_error)?;
-        collect_rows(rows)
+                .collect())
+        })
     }
 
     /// Update an indexer display name.
     pub fn update_indexer_name(&self, indexer_id: i64, name: &str) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "UPDATE indexer SET name = ?2 WHERE id = ?1",
-                params![indexer_id, name],
-            )
-            .map(|_| ())
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query("UPDATE indexer SET name = ?2 WHERE id = ?1")
+                .bind(indexer_id)
+                .bind(name)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
+        })
     }
 
     /// Update indexer tracker names with caller-encoded JSON.
@@ -684,38 +675,43 @@ impl Database {
         indexer_id: i64,
         trackers: &str,
     ) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "UPDATE indexer SET trackers = ?2 WHERE id = ?1",
-                params![indexer_id, trackers],
-            )
-            .map(|_| ())
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query("UPDATE indexer SET trackers = ?2 WHERE id = ?1")
+                .bind(indexer_id)
+                .bind(trackers)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
+        })
     }
 
     /// Read a stored RSS cursor.
     pub fn read_rss_cursor(&self, indexer_id: i64) -> crate::Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT last_seen_guid FROM rss WHERE indexer_id = ?1",
-                params![indexer_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query_scalar("SELECT last_seen_guid FROM rss WHERE indexer_id = ?1")
+                .bind(indexer_id)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(sqlx_error)
+        })
     }
 
     /// Insert or update a stored RSS cursor.
     pub fn update_rss_cursor(&self, indexer_id: i64, guid: &str) -> crate::Result<()> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "INSERT INTO rss (indexer_id, last_seen_guid)
                  VALUES (?1, ?2)
                  ON CONFLICT(indexer_id) DO UPDATE SET last_seen_guid = excluded.last_seen_guid",
-                params![indexer_id, guid],
             )
+            .bind(indexer_id)
+            .bind(guid)
+            .execute(self.pool())
+            .await
             .map(|_| ())
-            .map_err(sql_error)
+            .map_err(sqlx_error)
+        })
     }
 
     /// Look up a cached decision by searchee and GUID.
@@ -724,48 +720,51 @@ impl Database {
         searchee_id: i64,
         guid: &str,
     ) -> crate::Result<Option<CachedDecisionRecord>> {
-        self.connection
-            .query_row(
+        self.block_on(async {
+            let row = sqlx::query(
                 "SELECT decision, info_hash FROM decision
                  WHERE searchee_id = ?1 AND guid = ?2",
-                params![searchee_id, guid],
-                |row| {
-                    Ok(CachedDecisionRecord {
-                        decision: row.get(0)?,
-                        info_hash: row.get(1)?,
-                    })
-                },
             )
-            .optional()
-            .map_err(sql_error)
+            .bind(searchee_id)
+            .bind(guid)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(row.map(|row| CachedDecisionRecord {
+                decision: row.get(0),
+                info_hash: row.get(1),
+            }))
+        })
     }
 
     /// Look up a cached candidate info hash by exact GUID/link.
     pub fn decision_info_hash_by_guid(&self, key: &str) -> crate::Result<Option<String>> {
-        self.connection
-            .query_row(
+        self.block_on(async {
+            sqlx::query_scalar(
                 "SELECT info_hash FROM decision
                  WHERE guid = ?1 AND info_hash IS NOT NULL
                  ORDER BY id DESC LIMIT 1",
-                params![key],
-                |row| row.get(0),
             )
-            .optional()
-            .map_err(sql_error)
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)
+        })
     }
 
     /// Look up a cached candidate info hash by GUID LIKE pattern.
     pub fn decision_info_hash_by_guid_like(&self, like: &str) -> crate::Result<Option<String>> {
-        self.connection
-            .query_row(
+        self.block_on(async {
+            sqlx::query_scalar(
                 "SELECT info_hash FROM decision
                  WHERE info_hash IS NOT NULL AND guid LIKE ?1
                  ORDER BY id DESC LIMIT 1",
-                params![like],
-                |row| row.get(0),
             )
-            .optional()
-            .map_err(sql_error)
+            .bind(like)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)
+        })
     }
 
     /// Read a search timestamp row.
@@ -774,21 +773,22 @@ impl Database {
         searchee_id: i64,
         indexer_id: i64,
     ) -> crate::Result<Option<TimestampRecord>> {
-        self.connection
-            .query_row(
+        self.block_on(async {
+            let row = sqlx::query(
                 "SELECT first_searched, last_searched
                  FROM timestamp
                  WHERE searchee_id = ?1 AND indexer_id = ?2",
-                params![searchee_id, indexer_id],
-                |row| {
-                    Ok(TimestampRecord {
-                        first_searched: row.get(0)?,
-                        last_searched: row.get(1)?,
-                    })
-                },
             )
-            .optional()
-            .map_err(sql_error)
+            .bind(searchee_id)
+            .bind(indexer_id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(row.map(|row| TimestampRecord {
+                first_searched: row.get::<i64, _>(0).try_into().unwrap_or(0),
+                last_searched: row.get::<i64, _>(1).try_into().unwrap_or(0),
+            }))
+        })
     }
 
     /// Insert or update a search timestamp row.
@@ -798,49 +798,61 @@ impl Database {
         indexer_id: i64,
         now_millis: u64,
     ) -> crate::Result<()> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "INSERT INTO timestamp (searchee_id, indexer_id, first_searched, last_searched)
                  VALUES (?1, ?2, ?3, ?3)
                  ON CONFLICT(searchee_id, indexer_id) DO UPDATE SET
                     last_searched = excluded.last_searched",
-                params![searchee_id, indexer_id, now_millis],
             )
+            .bind(searchee_id)
+            .bind(indexer_id)
+            .bind(i64::try_from(now_millis).unwrap_or(i64::MAX))
+            .execute(self.pool())
+            .await
             .map(|_| ())
-            .map_err(sql_error)
+            .map_err(sqlx_error)
+        })
     }
 
     /// Start a bounded refresh for torrent-dir rows.
     pub fn begin_torrent_dir_refresh(&self) -> crate::Result<()> {
-        self.connection
-            .execute_batch(
+        self.block_on(async {
+            sqlx::raw_sql(
                 "CREATE TEMP TABLE IF NOT EXISTS current_torrent_dir (
                     file_path TEXT PRIMARY KEY
                 );
                 DELETE FROM current_torrent_dir;",
             )
-            .map_err(sql_error)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
+        })
     }
 
     /// Mark one torrent-dir path as present during refresh.
     pub fn mark_refreshed_torrent_path(&self, file_path: &str) -> crate::Result<()> {
-        self.connection
-            .execute(
-                "INSERT OR IGNORE INTO current_torrent_dir (file_path) VALUES (?1)",
-                params![file_path],
-            )
-            .map(|_| ())
-            .map_err(sql_error)
+        self.block_on(async {
+            sqlx::query("INSERT OR IGNORE INTO current_torrent_dir (file_path) VALUES (?1)")
+                .bind(file_path)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(sqlx_error)
+        })
     }
 
     /// Delete one torrent-dir cache row.
     pub fn delete_torrent_path(&self, file_path: &str) -> crate::Result<usize> {
-        self.connection
-            .execute(
-                "DELETE FROM torrent WHERE file_path = ?1",
-                params![file_path],
-            )
-            .map_err(sql_error)
+        self.block_on(async {
+            let result = sqlx::query("DELETE FROM torrent WHERE file_path = ?1")
+                .bind(file_path)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            rows_affected(result.rows_affected())
+        })
     }
 
     /// Insert or update one torrent-dir cache row.
@@ -850,60 +862,67 @@ impl Database {
         name: &str,
         file_path: &str,
     ) -> crate::Result<()> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            sqlx::query(
                 "INSERT INTO torrent (info_hash, name, file_path)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(file_path) DO UPDATE SET
                     info_hash = excluded.info_hash,
                     name = excluded.name",
-                params![info_hash, name, file_path],
             )
+            .bind(info_hash)
+            .bind(name)
+            .bind(file_path)
+            .execute(self.pool())
+            .await
             .map(|_| ())
-            .map_err(sql_error)
+            .map_err(sqlx_error)
+        })
     }
 
     /// Prune torrent-dir rows absent from the current bounded refresh.
     pub fn finish_torrent_dir_refresh(&self) -> crate::Result<usize> {
-        self.connection
-            .execute(
+        self.block_on(async {
+            let result = sqlx::query(
                 "DELETE FROM torrent
                  WHERE file_path NOT IN (SELECT file_path FROM current_torrent_dir)",
-                [],
             )
-            .map_err(sql_error)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            rows_affected(result.rows_affected())
+        })
     }
 
     /// Load all client searchee cache rows.
     pub fn client_searchee_rows(&self) -> crate::Result<Vec<ClientSearcheeCacheRecord>> {
-        let mut statement = self
-            .connection
-            .prepare(
+        self.block_on(async {
+            let rows = sqlx::query(
                 "SELECT client_host, info_hash, name, title, files, save_path, category, tags, trackers
                  FROM client_searchee",
             )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map([], client_searchee_record)
-            .map_err(sql_error)?;
-        collect_rows(rows)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(rows.into_iter().map(client_searchee_record).collect())
+        })
     }
 
     /// Load all data-dir cache rows.
     pub fn data_rows(&self) -> crate::Result<Vec<DataCacheRecord>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT path, title FROM data")
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(DataCacheRecord {
-                    path: row.get(0)?,
-                    title: row.get(1)?,
+        self.block_on(async {
+            let rows = sqlx::query("SELECT path, title FROM data")
+                .fetch_all(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| DataCacheRecord {
+                    path: row.get(0),
+                    title: row.get(1),
                 })
-            })
-            .map_err(sql_error)?;
-        collect_rows(rows)
+                .collect())
+        })
     }
 
     /// Load virtual season and episode rows.
@@ -912,25 +931,27 @@ impl Database {
         ensemble: &str,
         element: Option<&str>,
     ) -> crate::Result<Vec<EnsembleCacheRecord>> {
-        let mut statement = self
-            .connection
-            .prepare(
+        self.block_on(async {
+            let rows = sqlx::query(
                 "SELECT client_host, path, info_hash
                  FROM ensemble
                  WHERE ensemble = ?1
                  AND (?2 IS NULL OR element = ?2)",
             )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![ensemble, element], |row| {
-                Ok(EnsembleCacheRecord {
-                    client_host: row.get(0)?,
-                    path: row.get(1)?,
-                    info_hash: row.get(2)?,
+            .bind(ensemble)
+            .bind(element)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| EnsembleCacheRecord {
+                    client_host: row.get(0),
+                    path: row.get(1),
+                    info_hash: row.get(2),
                 })
-            })
-            .map_err(sql_error)?;
-        collect_rows(rows)
+                .collect())
+        })
     }
 
     /// Load one client searchee row by client host and info hash.
@@ -939,16 +960,19 @@ impl Database {
         client_host: &str,
         info_hash: &str,
     ) -> crate::Result<Option<ClientSearcheeCacheRecord>> {
-        self.connection
-            .query_row(
+        self.block_on(async {
+            let row = sqlx::query(
                 "SELECT client_host, info_hash, name, title, files, save_path, category, tags, trackers
                  FROM client_searchee
                  WHERE client_host = ?1 AND info_hash = ?2",
-                params![client_host, info_hash],
-                client_searchee_record,
             )
-            .optional()
-            .map_err(sql_error)
+            .bind(client_host)
+            .bind(info_hash)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(row.map(client_searchee_record))
+        })
     }
 
     /// Load a bounded rowid/path page from data rows.
@@ -990,30 +1014,45 @@ impl Database {
         after_rowid: i64,
         limit: i64,
     ) -> crate::Result<Vec<RowidPath>> {
-        let mut statement = self.connection.prepare(sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![after_rowid, limit], |row| {
-                Ok(RowidPath {
-                    rowid: row.get(0)?,
-                    path: row.get(1)?,
+        self.block_on(async {
+            let rows = sqlx::query(sql)
+                .bind(after_rowid)
+                .bind(limit)
+                .fetch_all(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| RowidPath {
+                    rowid: row.get(0),
+                    path: row.get(1),
                 })
-            })
-            .map_err(sql_error)?;
-        collect_rows(rows)
+                .collect())
+        })
     }
 
     /// Delete one data row by rowid.
     pub fn delete_data_rowid(&self, rowid: i64) -> crate::Result<usize> {
-        self.connection
-            .execute("DELETE FROM data WHERE rowid = ?1", params![rowid])
-            .map_err(sql_error)
+        self.block_on(async {
+            let result = sqlx::query("DELETE FROM data WHERE rowid = ?1")
+                .bind(rowid)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            rows_affected(result.rows_affected())
+        })
     }
 
     /// Delete one data-dir ensemble row by rowid.
     pub fn delete_ensemble_rowid(&self, rowid: i64) -> crate::Result<usize> {
-        self.connection
-            .execute("DELETE FROM ensemble WHERE rowid = ?1", params![rowid])
-            .map_err(sql_error)
+        self.block_on(async {
+            let result = sqlx::query("DELETE FROM ensemble WHERE rowid = ?1")
+                .bind(rowid)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            rows_affected(result.rows_affected())
+        })
     }
 
     /// Return whether a recent cached decision exists for an info hash.
@@ -1022,16 +1061,19 @@ impl Database {
         info_hash: &str,
         cutoff_millis: i64,
     ) -> crate::Result<bool> {
-        self.connection
-            .query_row(
+        self.block_on(async {
+            sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM decision
                     WHERE info_hash = ?1 AND last_seen >= ?2
                 )",
-                params![info_hash, cutoff_millis],
-                |row| row.get(0),
             )
-            .map_err(sql_error)
+            .bind(info_hash)
+            .bind(cutoff_millis)
+            .fetch_one(self.pool())
+            .await
+            .map_err(sqlx_error)
+        })
     }
 
     /// Stream distinct decision info hashes in stable bounded pages.
@@ -1040,9 +1082,8 @@ impl Database {
         after_info_hash: Option<&str>,
         limit: i64,
     ) -> crate::Result<Vec<String>> {
-        let mut statement = self
-            .connection
-            .prepare(
+        self.block_on(async {
+            let rows = sqlx::query(
                 "SELECT DISTINCT info_hash
                  FROM decision
                  WHERE info_hash IS NOT NULL
@@ -1050,47 +1091,106 @@ impl Database {
                  ORDER BY info_hash
                  LIMIT ?2",
             )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![after_info_hash, limit], |row| row.get(0))
-            .map_err(sql_error)?;
-        collect_rows(rows)
+            .bind(after_info_hash)
+            .bind(limit)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(rows.into_iter().map(|row| row.get(0)).collect())
+        })
     }
 
     /// Delete cached decisions for one info hash.
     pub fn delete_decisions_by_info_hash(&self, info_hash: &str) -> crate::Result<usize> {
-        self.connection
-            .execute(
-                "DELETE FROM decision WHERE info_hash = ?1",
-                params![info_hash],
-            )
-            .map_err(sql_error)
+        self.block_on(async {
+            let result = sqlx::query("DELETE FROM decision WHERE info_hash = ?1")
+                .bind(info_hash)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            rows_affected(result.rows_affected())
+        })
     }
 
     /// Load indexer tracker names with caller-decoded tracker JSON.
     pub fn indexer_tracker_rows(&self) -> crate::Result<Vec<IndexerTrackerRecord>> {
-        let mut statement = self
-            .connection
-            .prepare(
+        self.block_on(async {
+            let rows = sqlx::query(
                 "SELECT COALESCE(name, 'UnknownTracker'), trackers
                  FROM indexer
                  WHERE trackers IS NOT NULL",
             )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(IndexerTrackerRecord {
-                    name: row.get(0)?,
-                    trackers: row.get(1)?,
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| IndexerTrackerRecord {
+                    name: row.get(0),
+                    trackers: row.get(1),
                 })
-            })
-            .map_err(sql_error)?;
-        collect_rows(rows)
+                .collect())
+        })
+    }
+
+    /// Execute raw SQL with positional parameters.
+    #[doc(hidden)]
+    pub fn execute_sql(&self, sql: &str, params: &[SqlValue<'_>]) -> crate::Result<usize> {
+        self.block_on(async {
+            let result = bind_values(sqlx::query(sql), params)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            rows_affected(result.rows_affected())
+        })
+    }
+
+    /// Read one raw SQL row.
+    #[doc(hidden)]
+    pub fn query_row<T>(
+        &self,
+        sql: &str,
+        params: &[SqlValue<'_>],
+        map: impl FnOnce(SqliteRow) -> T + Send,
+    ) -> crate::Result<T>
+    where
+        T: Send,
+    {
+        self.block_on(async {
+            bind_values(sqlx::query(sql), params)
+                .fetch_one(self.pool())
+                .await
+                .map(map)
+                .map_err(sqlx_error)
+        })
+    }
+
+    /// Read one scalar raw SQL value.
+    #[doc(hidden)]
+    pub fn query_scalar<T>(&self, sql: &str, params: &[SqlValue<'_>]) -> crate::Result<T>
+    where
+        T: for<'r> Decode<'r, Sqlite> + Type<Sqlite> + Send + Unpin,
+    {
+        self.block_on(async {
+            bind_values(sqlx::query(sql), params)
+                .fetch_one(self.pool())
+                .await
+                .map(|row| row.get(0))
+                .map_err(sqlx_error)
+        })
     }
 
     /// Database path under an app directory.
     pub fn path_for_app_dir(app_dir: &Path) -> PathBuf {
         app_dir.join(DATABASE_FILE_NAME)
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -1109,6 +1209,7 @@ impl AsyncDatabase {
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
+            .max_connections(1)
             .connect_with(options)
             .await
             .map_err(sqlx_error)?;
@@ -1139,9 +1240,9 @@ impl AsyncDatabase {
             .map_err(sqlx_error)?;
 
         let current_version = self.schema_version().await?;
-        if current_version > CURRENT_SCHEMA_VERSION {
+        if current_version > SCHEMA_VERSION {
             return Err(persistence_message(format!(
-                "database schema version {current_version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
+                "database schema version {current_version} is newer than supported version {SCHEMA_VERSION}"
             )));
         }
         for migration in MIGRATIONS {
@@ -1257,7 +1358,7 @@ impl AsyncDatabase {
     }
 
     async fn set_schema_version(&self, version: i64) -> crate::Result<()> {
-        sqlx::raw_sql(AssertSqlSafe(format!("PRAGMA user_version = {version}")))
+        sqlx::query(&format!("PRAGMA user_version = {version}"))
             .execute(self.pool())
             .await
             .map(|_| ())
@@ -1516,6 +1617,22 @@ pub struct IndexerTrackerRecord {
     pub trackers: String,
 }
 
+/// Raw SQL bind value used by focused test fixtures.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub enum SqlValue<'a> {
+    /// Signed integer value.
+    I64(i64),
+    /// Unsigned integer value stored as signed SQLite integer.
+    U64(u64),
+    /// Floating point value.
+    F64(f64),
+    /// Text value.
+    Text(Cow<'a, str>),
+    /// SQL null.
+    Null,
+}
+
 #[derive(Serialize)]
 struct FileJson<'a> {
     name: &'a str,
@@ -1631,18 +1748,6 @@ CREATE TABLE IF NOT EXISTS ensemble (
 );
 CREATE INDEX IF NOT EXISTS idx_ensemble_path ON ensemble(path);
 CREATE INDEX IF NOT EXISTS idx_ensemble_info_hash ON ensemble(info_hash);
-"#;
-
-const ENSEMBLE_UNIQUE_KEY_MIGRATION: &str = r#"
-DELETE FROM ensemble
-WHERE client_host IS NULL
-AND rowid NOT IN (
-    SELECT MAX(rowid)
-    FROM ensemble
-    WHERE client_host IS NULL
-    GROUP BY path
-);
-
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ensemble_data_path_key
 ON ensemble(path)
 WHERE client_host IS NULL;
@@ -1652,33 +1757,50 @@ ON ensemble(client_host, path)
 WHERE client_host IS NOT NULL;
 "#;
 
-fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> crate::Result<Vec<T>> {
-    let mut output = Vec::new();
-    for row in rows {
-        output.push(row.map_err(sql_error)?);
+fn block_on_runtime<F>(runtime: &Runtime, future: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    match Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| runtime.block_on(future)),
+        Ok(_) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| runtime.block_on(future))
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }),
+        Err(_) => runtime.block_on(future),
     }
-    Ok(output)
 }
 
-fn client_searchee_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientSearcheeCacheRecord> {
-    Ok(ClientSearcheeCacheRecord {
-        client_host: row.get(0)?,
-        info_hash: row.get(1)?,
-        name: row.get(2)?,
-        title: row.get(3)?,
-        files: row.get(4)?,
-        save_path: row.get(5)?,
-        category: row.get(6)?,
-        tags: row.get(7)?,
-        trackers: row.get(8)?,
-    })
+fn bind_values<'q>(
+    mut query: Query<'q, Sqlite, SqliteArguments<'q>>,
+    params: &'q [SqlValue<'q>],
+) -> Query<'q, Sqlite, SqliteArguments<'q>> {
+    for param in params {
+        query = match param {
+            SqlValue::I64(value) => query.bind(*value),
+            SqlValue::U64(value) => query.bind(i64::try_from(*value).unwrap_or(i64::MAX)),
+            SqlValue::F64(value) => query.bind(*value),
+            SqlValue::Text(value) => query.bind(value.as_ref()),
+            SqlValue::Null => query.bind(Option::<i64>::None),
+        };
+    }
+    query
 }
 
-fn sql_error(error: rusqlite::Error) -> SporosError {
-    SporosError::Persistence {
-        message: Cow::Owned(error.to_string()),
+fn client_searchee_record(row: SqliteRow) -> ClientSearcheeCacheRecord {
+    ClientSearcheeCacheRecord {
+        client_host: row.get(0),
+        info_hash: row.get(1),
+        name: row.get(2),
+        title: row.get(3),
+        files: row.get(4),
+        save_path: row.get(5),
+        category: row.get(6),
+        tags: row.get(7),
+        trackers: row.get(8),
     }
 }
 
@@ -1731,9 +1853,10 @@ fn strings_json(values: &[std::borrow::Cow<'_, str>]) -> crate::Result<String> {
 mod tests {
     use super::{
         AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord,
-        EnsembleRecord,
+        EnsembleRecord, SqlValue,
     };
     use crate::domain::{ClientLabel, Decision, File};
+    use sqlx::Row;
     use std::{
         borrow::Cow,
         fs,
@@ -1748,15 +1871,13 @@ mod tests {
         let database = Database::open_app_dir(&root).expect("database");
 
         let journal_mode: String = database
-            .connection()
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .query_scalar("PRAGMA journal_mode", &[])
             .expect("journal mode");
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         let user_version: i64 = database
-            .connection()
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .query_scalar("PRAGMA user_version", &[])
             .expect("schema version");
-        assert_eq!(user_version, super::CURRENT_SCHEMA_VERSION);
+        assert_eq!(user_version, super::SCHEMA_VERSION);
 
         for table in [
             "searchee",
@@ -1772,11 +1893,9 @@ mod tests {
             "ensemble",
         ] {
             let count: i64 = database
-                .connection()
-                .query_row(
+                .query_scalar(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    [table],
-                    |row| row.get(0),
+                    &[SqlValue::Text(Cow::Borrowed(table))],
                 )
                 .expect("table query");
             assert_eq!(count, 1, "{table}");
@@ -1798,54 +1917,7 @@ mod tests {
             .fetch_one(database.pool())
             .await
             .expect("schema version");
-        assert_eq!(user_version, super::CURRENT_SCHEMA_VERSION);
-
-        database.close().await;
-        let _cleanup = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn async_database_migrates_legacy_schema_with_sqlx() {
-        let root = temp_path("async-migration");
-        fs::create_dir_all(&root).expect("temp dir");
-        let database_path = Database::path_for_app_dir(&root);
-        let connection = rusqlite::Connection::open(&database_path).expect("raw database");
-        connection.execute_batch(super::SCHEMA).expect("schema");
-        connection
-            .execute_batch(
-                "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
-                 VALUES (NULL, '/data/show/file.mkv', NULL, 'old show s01', '1');
-                 INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
-                 VALUES (
-                    NULL,
-                    '/data/show/file.mkv',
-                    '0123456789abcdef0123456789abcdef01234567',
-                    'new show s01',
-                    '2'
-                 );
-                 PRAGMA user_version = 1;",
-            )
-            .expect("legacy duplicate rows");
-        drop(connection);
-
-        let database = AsyncDatabase::open(&database_path)
-            .await
-            .expect("migrated database");
-
-        let row: (i64, Option<String>, String, String) =
-            sqlx::query_as("SELECT COUNT(*), info_hash, ensemble, element FROM ensemble")
-                .fetch_one(database.pool())
-                .await
-                .expect("ensemble row");
-        assert_eq!(
-            row,
-            (
-                1,
-                Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
-                "new show s01".to_owned(),
-                "2".to_owned()
-            )
-        );
+        assert_eq!(user_version, super::SCHEMA_VERSION);
 
         database.close().await;
         let _cleanup = fs::remove_dir_all(root);
@@ -1950,17 +2022,11 @@ mod tests {
 
         assert_eq!(removed, 1);
         let title: String = database
-            .connection()
-            .query_row(
-                "SELECT title FROM data WHERE path = '/data/one'",
-                [],
-                |row| row.get(0),
-            )
+            .query_scalar("SELECT title FROM data WHERE path = '/data/one'", &[])
             .expect("title");
         assert_eq!(title, "One Updated");
         let ensemble_count: i64 = database
-            .connection()
-            .query_row("SELECT COUNT(*) FROM ensemble", [], |row| row.get(0))
+            .query_scalar("SELECT COUNT(*) FROM ensemble", &[])
             .expect("ensemble count");
         assert_eq!(ensemble_count, 0);
         let _cleanup = fs::remove_dir_all(root);
@@ -1992,11 +2058,10 @@ mod tests {
             .expect("ensemble update");
 
         let row: (i64, Option<String>, String, String) = database
-            .connection()
             .query_row(
                 "SELECT COUNT(*), info_hash, ensemble, element FROM ensemble",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                &[],
+                |row| (row.get(0), row.get(1), row.get(2), row.get(3)),
             )
             .expect("ensemble row");
         assert_eq!(
@@ -2008,60 +2073,6 @@ mod tests {
                 "2".to_owned()
             )
         );
-
-        let _cleanup = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn migration_deduplicates_null_client_ensemble_keys() {
-        let root = temp_path("ensemble-null-client-migration");
-        fs::create_dir_all(&root).expect("temp dir");
-        let database_path = Database::path_for_app_dir(&root);
-        let connection = rusqlite::Connection::open(&database_path).expect("raw database");
-        connection.execute_batch(super::SCHEMA).expect("schema");
-        connection
-            .execute_batch(
-                "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
-                 VALUES (NULL, '/data/show/file.mkv', NULL, 'old show s01', '1');
-                 INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
-                 VALUES (
-                    NULL,
-                    '/data/show/file.mkv',
-                    '0123456789abcdef0123456789abcdef01234567',
-                    'new show s01',
-                    '2'
-                 );
-                 PRAGMA user_version = 1;",
-            )
-            .expect("legacy duplicate rows");
-        drop(connection);
-
-        let database = Database::open(&database_path).expect("migrated database");
-
-        let row: (i64, Option<String>, String, String) = database
-            .connection()
-            .query_row(
-                "SELECT COUNT(*), info_hash, ensemble, element FROM ensemble",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("ensemble row");
-        assert_eq!(
-            row,
-            (
-                1,
-                Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
-                "new show s01".to_owned(),
-                "2".to_owned()
-            )
-        );
-
-        let duplicate = database.connection().execute(
-            "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
-             VALUES (NULL, '/data/show/file.mkv', NULL, 'duplicate show s01', '3')",
-            [],
-        );
-        duplicate.expect_err("duplicate null-client ensemble key");
 
         let _cleanup = fs::remove_dir_all(root);
     }
@@ -2102,8 +2113,7 @@ mod tests {
             .expect("ensemble");
 
         let json: String = database
-            .connection()
-            .query_row("SELECT files FROM client_searchee", [], |row| row.get(0))
+            .query_scalar("SELECT files FROM client_searchee", &[])
             .expect("files json");
         assert!(json.contains("Release/file.mkv"));
 
@@ -2113,8 +2123,7 @@ mod tests {
 
         assert_eq!(removed, 1);
         let ensemble_count: i64 = database
-            .connection()
-            .query_row("SELECT COUNT(*) FROM ensemble", [], |row| row.get(0))
+            .query_scalar("SELECT COUNT(*) FROM ensemble", &[])
             .expect("ensemble count");
         assert_eq!(ensemble_count, 0);
         let _cleanup = fs::remove_dir_all(root);

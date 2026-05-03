@@ -552,12 +552,8 @@ mod tests {
         assert!(results.iter().all(|result| result.ran));
         assert_eq!(scheduler.jobs()[0].runs, 1);
         let last_run: i64 = database
-            .connection()
-            .query_row(
-                "SELECT last_run FROM job_log WHERE name = 'search'",
-                [],
-                |row| row.get(0),
-            )
+            .read_last_run(JobName::Search.as_str())
+            .expect("last run")
             .expect("last run");
         assert_eq!(last_run, 1_000);
         let _cleanup = std::fs::remove_dir_all(root);
@@ -612,12 +608,8 @@ mod tests {
             .check_jobs(&database, 1_000, false)
             .expect("check");
         let last_run: i64 = database
-            .connection()
-            .query_row(
-                "SELECT last_run FROM job_log WHERE name = 'search'",
-                [],
-                |row| row.get(0),
-            )
+            .read_last_run(JobName::Search.as_str())
+            .expect("last run")
             .expect("last run");
         assert_eq!(last_run, 61_000);
         assert!(!scheduler.jobs()[0].delay_next_run);
@@ -630,11 +622,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         let database = Database::open_app_dir(&root).expect("database");
         database
-            .connection()
-            .execute(
-                "INSERT INTO job_log (name, last_run) VALUES ('rss', 10_000)",
-                [],
-            )
+            .write_last_run(JobName::Rss.as_str(), 10_000)
             .expect("job log");
         let mut active = ScheduledJob::new(JobName::Search, 60_000, true);
         active.is_active = true;

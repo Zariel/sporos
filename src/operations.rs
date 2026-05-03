@@ -1478,7 +1478,7 @@ mod tests {
         },
         notifications::NotificationSender,
         persistence::{
-            AsyncDatabase, ClientSearcheeRecord, Database, DecisionRecord, EnsembleRecord,
+            AsyncDatabase, ClientSearcheeRecord, Database, DecisionRecord, EnsembleRecord, SqlValue,
         },
         startup::Redactor,
     };
@@ -1582,11 +1582,10 @@ mod tests {
             })
             .expect("decision");
         sync_database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (url, apikey, active, status, retry_after)
                  VALUES ('https://indexer.example', 'key', 1, 'RATE_LIMITED', 100)",
-                [],
+                &[],
             )
             .expect("indexer");
         drop(sync_database);
@@ -1615,11 +1614,10 @@ mod tests {
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO indexer (url, apikey, active, status, retry_after)
                  VALUES ('https://indexer.example', 'key', 1, 'RATE_LIMITED', 100)",
-                [],
+                &[],
             )
             .expect("indexer");
 
@@ -1682,10 +1680,9 @@ mod tests {
             Duration::from_millis(600_000)
         );
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO job_log (name, last_run) VALUES ('rss', 100_000)",
-                [],
+                &[],
             )
             .expect("job log");
 
@@ -1694,10 +1691,9 @@ mod tests {
             Duration::from_millis(150_000)
         );
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "UPDATE job_log SET last_run = 300_000 WHERE name = 'rss'",
-                [],
+                &[],
             )
             .expect("future job log");
 
@@ -1713,26 +1709,27 @@ mod tests {
         let root = temp_path("cleanup");
         fs::create_dir_all(root.join("torrent_cache")).expect("cache dir");
         let database = Database::open_app_dir(&root).expect("database");
-        let existing_data = root.join("data");
-        fs::create_dir_all(&existing_data).expect("data dir");
+        let existing_data_path = root.join("data");
+        fs::create_dir_all(&existing_data_path).expect("data dir");
         let missing_data = root.join("missing-data");
         let missing_ensemble = root.join("missing-episode.mkv");
+        let existing_data = existing_data_path.to_string_lossy();
+        let missing_data = missing_data.to_string_lossy();
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO data (path, title) VALUES (?1, 'Existing'), (?2, 'Missing')",
-                rusqlite::params![
-                    existing_data.to_string_lossy(),
-                    missing_data.to_string_lossy()
+                &[
+                    SqlValue::Text(Cow::Borrowed(existing_data.as_ref())),
+                    SqlValue::Text(Cow::Borrowed(missing_data.as_ref())),
                 ],
             )
             .expect("data");
+        let missing_ensemble = missing_ensemble.to_string_lossy();
         database
-            .connection()
-            .execute(
+            .execute_sql(
                 "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
                  VALUES (NULL, ?1, NULL, 'show s01', 'e01')",
-                [missing_ensemble.to_string_lossy()],
+                &[SqlValue::Text(Cow::Borrowed(missing_ensemble.as_ref()))],
             )
             .expect("ensemble");
         let searchee_id = database
@@ -1772,7 +1769,7 @@ mod tests {
         insert_decision(&database, searchee_id, "null-guid", None, now);
         let config = RuntimeConfig::normalize(
             RawConfig {
-                data_dirs: vec![existing_data],
+                data_dirs: vec![existing_data_path],
                 season_from_episodes: Some(1.0),
                 ..RawConfig::default()
             },
@@ -1825,8 +1822,7 @@ mod tests {
         assert!(result.catastrophic_decision_cleanup_skipped);
         assert_eq!(result.missing_cache_decisions_removed, 0);
         let remaining: i64 = database
-            .connection()
-            .query_row("SELECT COUNT(*) FROM decision", [], |row| row.get(0))
+            .query_scalar("SELECT COUNT(*) FROM decision", &[])
             .expect("count");
         assert_eq!(remaining, 1);
         let _cleanup = fs::remove_dir_all(root);
@@ -2076,16 +2072,13 @@ mod tests {
         assert_eq!(result.client_searchees_pruned, 1);
         assert_eq!(result.client_ensemble_rows_rebuilt, 1);
         let client_rows: i64 = database
-            .connection()
-            .query_row("SELECT COUNT(*) FROM client_searchee", [], |row| row.get(0))
+            .query_scalar("SELECT COUNT(*) FROM client_searchee", &[])
             .expect("client count");
         let ensemble_path: String = database
-            .connection()
-            .query_row("SELECT path FROM ensemble", [], |row| row.get(0))
+            .query_scalar("SELECT path FROM ensemble", &[])
             .expect("ensemble path");
         let ensemble_rows: i64 = database
-            .connection()
-            .query_row("SELECT COUNT(*) FROM ensemble", [], |row| row.get(0))
+            .query_scalar("SELECT COUNT(*) FROM ensemble", &[])
             .expect("ensemble count");
         assert_eq!(client_rows, 1);
         assert_eq!(ensemble_rows, 1);

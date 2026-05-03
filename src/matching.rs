@@ -666,10 +666,11 @@ mod tests {
         config::MatchMode,
         domain::{Candidate, Decision, File, InfoHash, MediaType, Metafile, Searchee},
         integrations::{SnatchHistory, SnatchOptions},
-        persistence::Database,
+        persistence::{Database, SqlValue},
         search::Blocklist,
         torrent::torrent_cache_path,
     };
+    use sqlx::Row;
     use std::{
         borrow::Cow,
         collections::BTreeSet,
@@ -900,8 +901,7 @@ mod tests {
             .expect("assessment");
         assert_eq!(assessment.decision, Decision::FuzzySizeMismatch);
         let decisions: i64 = database
-            .connection()
-            .query_row("SELECT COUNT(*) FROM decision", [], |row| row.get(0))
+            .query_scalar("SELECT COUNT(*) FROM decision", &[])
             .expect("decision count");
         assert_eq!(decisions, 0);
         let _cleanup = fs::remove_dir_all(database_root);
@@ -958,12 +958,11 @@ mod tests {
         assert!(assessment.meta_cached);
         assert!(torrent_cache_path(&root, &metafile.info_hash).exists());
         let (first_seen, last_seen, fuzzy_size_factor): (i64, i64, f64) = database
-            .connection()
             .query_row(
                 "SELECT first_seen, last_seen, fuzzy_size_factor FROM decision
                  WHERE searchee_id = ?1 AND guid = 'guid-1'",
-                [searchee_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                &[SqlValue::I64(searchee_id)],
+                |row| (row.get(0), row.get(1), row.get(2)),
             )
             .expect("refreshed decision");
         assert_eq!(first_seen, 1);
