@@ -1805,9 +1805,12 @@ mod tests {
         let missing_ensemble = missing_ensemble.to_string_lossy();
         database
             .execute_sql(
-                "INSERT INTO data_ensemble (path, info_hash, ensemble, element)
-                 VALUES (?1, NULL, 'show s01', 'e01')",
-                &[SqlValue::Text(Cow::Borrowed(missing_ensemble.as_ref()))],
+                "INSERT INTO data_ensemble (data_root, path, info_hash, ensemble, element)
+                 VALUES (?1, ?2, NULL, 'show s01', 'e01')",
+                &[
+                    SqlValue::Text(Cow::Borrowed(existing_data.as_ref())),
+                    SqlValue::Text(Cow::Borrowed(missing_ensemble.as_ref())),
+                ],
             )
             .expect("ensemble");
         let searchee_id = database.get_or_insert_searchee("name").expect("searchee");

@@ -255,17 +255,6 @@ impl Database {
     /// Prune data-dir rows absent from the current bounded refresh.
     pub fn finish_data_root_refresh(&self) -> crate::Result<usize> {
         self.block_on(async {
-            sqlx::query(
-                "DELETE FROM data_ensemble
-                 WHERE NOT EXISTS (
-                    SELECT 1 FROM current_data_roots
-                    WHERE data_ensemble.path = current_data_roots.path
-                    OR data_ensemble.path LIKE current_data_roots.path || '/%'
-                 )",
-            )
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
             let result = sqlx::query(
                 "DELETE FROM data
                  WHERE path NOT IN (SELECT path FROM current_data_roots)",
@@ -443,14 +432,27 @@ impl Database {
                 .map(|_| ())
                 .map_err(sqlx_error)
             } else {
+                let data_root = sqlx::query_scalar::<_, String>(
+                    "SELECT path FROM data
+                     WHERE ?1 = path OR ?1 LIKE path || '/%'
+                     ORDER BY length(path) DESC
+                     LIMIT 1",
+                )
+                .bind(record.path)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(sqlx_error)?
+                .ok_or_else(|| persistence_message("data ensemble rows require a data root"))?;
                 sqlx::query(
-                    "INSERT INTO data_ensemble (path, info_hash, ensemble, element)
-                     VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO data_ensemble (data_root, path, info_hash, ensemble, element)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(path) DO UPDATE SET
+                        data_root = excluded.data_root,
                         info_hash = excluded.info_hash,
                         ensemble = excluded.ensemble,
                         element = excluded.element",
                 )
+                .bind(data_root)
                 .bind(record.path)
                 .bind(record.info_hash)
                 .bind(record.ensemble)
@@ -1904,12 +1906,14 @@ CREATE INDEX IF NOT EXISTS idx_data_lookup
 ON data(search_key, media_type, season, episode, length);
 
 CREATE TABLE IF NOT EXISTS data_ensemble (
+    data_root TEXT NOT NULL REFERENCES data(path) ON DELETE CASCADE,
     path TEXT NOT NULL,
     info_hash TEXT NULL,
     ensemble TEXT NOT NULL,
     element TEXT NOT NULL,
     PRIMARY KEY(path)
 );
+CREATE INDEX IF NOT EXISTS idx_data_ensemble_root ON data_ensemble(data_root);
 CREATE INDEX IF NOT EXISTS idx_data_ensemble_info_hash ON data_ensemble(info_hash);
 CREATE INDEX IF NOT EXISTS idx_data_ensemble_lookup ON data_ensemble(ensemble, element);
 
@@ -2249,6 +2253,7 @@ mod tests {
         for index in [
             "idx_client_searchee_lookup",
             "idx_data_lookup",
+            "idx_data_ensemble_root",
             "idx_data_ensemble_lookup",
             "idx_client_ensemble_lookup",
         ] {
@@ -2568,6 +2573,13 @@ mod tests {
         let root = temp_path("ensemble-data-source");
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
+        database
+            .refresh_data_roots([DataRootRecord {
+                path: "/data/show",
+                title: "Show",
+                lookup: None,
+            }])
+            .expect("data root");
 
         database
             .upsert_ensemble(&EnsembleRecord {
