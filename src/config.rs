@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_match_mode_names() {
+    fn rejects_unsupported_match_mode_names() {
         for match_mode in ["safe", "risky"] {
             let error = RuntimeConfig::normalize(
                 RawConfig {
@@ -950,7 +950,7 @@ mod tests {
                 },
                 Path::new("/config"),
             )
-            .expect_err("legacy match mode rejected");
+            .expect_err("unsupported match mode rejected");
 
             assert!(error.to_string().contains("invalid match_mode"));
         }
@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_blocklist_entries() {
+    fn rejects_unsupported_blocklist_entries() {
         let raw = RawConfig {
             block_list: vec!["folderRegex:/downloads".to_owned()],
             ..RawConfig::default()

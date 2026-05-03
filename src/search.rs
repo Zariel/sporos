@@ -3153,9 +3153,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_blocklist_entries() {
+    fn rejects_unsupported_blocklist_entries() {
         let error = Blocklist::parse(&["folderRegex:/downloads".to_owned()])
-            .expect_err("legacy entry rejected");
+            .expect_err("unsupported entry rejected");
 
         assert!(error.to_string().contains("invalid block_list entry type"));
     }

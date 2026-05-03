@@ -225,7 +225,7 @@ impl fmt::Display for TorrentClientKind {
     }
 }
 
-/// A category, tag, or legacy client label value.
+/// A category, tag, or client label value.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ClientLabel<'a>(Cow<'a, str>);
 
