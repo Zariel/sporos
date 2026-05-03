@@ -6,7 +6,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
-    thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -14,6 +13,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
+use tokio::runtime::Builder;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
@@ -412,17 +412,18 @@ impl CandidateSearchCache {
         *self.indexer_search_counts.entry(indexer_id).or_default() += count;
     }
 
-    fn wait_for_indexer_delay(&mut self, delay: Duration) {
+    fn wait_for_indexer_delay(&mut self, delay: Duration) -> crate::Result<()> {
         if delay.is_zero() {
-            return;
+            return Ok(());
         }
         let Some(last_search) = self.last_indexer_search else {
-            return;
+            return Ok(());
         };
         let remaining = delay.saturating_sub(last_search.elapsed());
         if !remaining.is_zero() {
-            thread::sleep(remaining);
+            block_on_delay(remaining)?;
         }
+        Ok(())
     }
 
     fn mark_indexer_search(&mut self) {
@@ -2097,7 +2098,7 @@ fn cached_or_search_candidates(
         });
     }
 
-    cache.wait_for_indexer_delay(request.options.torznab.delay);
+    cache.wait_for_indexer_delay(request.options.torznab.delay)?;
     let candidates =
         search_torznab_indexer(request.database, request.indexer, &queries, torznab_options);
     cache.mark_indexer_search();
@@ -2662,6 +2663,17 @@ fn persistence_error(error: rusqlite::Error) -> SporosError {
     SporosError::Persistence {
         message: Cow::Owned(error.to_string()),
     }
+}
+
+fn block_on_delay(delay: Duration) -> crate::Result<()> {
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| search_error(format!("failed to build delay runtime: {error}")))?;
+    runtime.block_on(async {
+        tokio::time::sleep(delay).await;
+    });
+    Ok(())
 }
 
 /// Apply parsed title metadata to a domain object represented by title and media fields.

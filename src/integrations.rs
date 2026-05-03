@@ -4,9 +4,9 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fs,
+    future::Future,
     path::Path,
     sync::LazyLock,
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +14,7 @@ use filetime::FileTime;
 use quick_xml::{Reader, events::Event};
 use regex::Regex;
 use rusqlite::{OptionalExtension, params};
+use tokio::runtime::Builder;
 use url::{Url, form_urlencoded};
 
 use crate::{
@@ -415,6 +416,15 @@ pub fn snatch(
     options: SnatchOptions,
     history: &mut SnatchHistory,
 ) -> crate::Result<SnatchResult> {
+    block_on_integration(snatch_async(candidate, options, history))
+}
+
+/// Download a candidate torrent with async retry and failure-memory behavior.
+pub async fn snatch_async(
+    candidate: &Candidate<'_>,
+    options: SnatchOptions,
+    history: &mut SnatchHistory,
+) -> crate::Result<SnatchResult> {
     let Some(link) = candidate.link.as_deref() else {
         return Ok(SnatchResult::UnknownError {
             retry_after_millis: None,
@@ -431,7 +441,7 @@ pub fn snatch(
 
     let attempts = options.retries.saturating_add(1);
     for attempt in 0..attempts {
-        let result = snatch_once(candidate, options.timeout)?;
+        let result = snatch_once_async(candidate, options.timeout).await?;
         match result {
             SnatchResult::Metafile { .. } => {
                 history.clear(link);
@@ -454,7 +464,7 @@ pub fn snatch(
                 }
                 let sleep_for = retry_after.unwrap_or(Duration::ZERO).max(options.delay);
                 if !sleep_for.is_zero() {
-                    thread::sleep(sleep_for);
+                    tokio::time::sleep(sleep_for).await;
                 }
             }
         }
@@ -497,6 +507,14 @@ pub fn snatch_once(
     candidate: &Candidate<'_>,
     timeout: Option<Duration>,
 ) -> crate::Result<SnatchResult> {
+    block_on_integration(snatch_once_async(candidate, timeout))
+}
+
+/// Download a candidate torrent once asynchronously and parse it if valid.
+pub async fn snatch_once_async(
+    candidate: &Candidate<'_>,
+    timeout: Option<Duration>,
+) -> crate::Result<SnatchResult> {
     let Some(link) = candidate.link.as_deref() else {
         return Ok(SnatchResult::UnknownError {
             retry_after_millis: None,
@@ -505,7 +523,7 @@ pub fn snatch_once(
     if link.starts_with("magnet:") {
         return Ok(SnatchResult::MagnetLink);
     }
-    let mut builder = reqwest::blocking::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(format!("CrossSeed/{}", crate::VERSION))
         .redirect(reqwest::redirect::Policy::none());
     if let Some(timeout) = timeout {
@@ -521,7 +539,7 @@ pub fn snatch_once(
         if let Some(cookie) = candidate.cookie.as_deref() {
             request = request.header(reqwest::header::COOKIE, cookie);
         }
-        let next = match request.send() {
+        let next = match request.send().await {
             Ok(response) => response,
             Err(error) if error.is_timeout() || error.is_connect() => {
                 return Ok(SnatchResult::Aborted);
@@ -584,6 +602,7 @@ pub fn snatch_once(
     }
     let bytes = response
         .bytes()
+        .await
         .map_err(|error| integration_error(format!("failed to read torrent response: {error}")))?
         .to_vec();
     match parse_metafile(&bytes) {
@@ -968,14 +987,24 @@ pub fn validate_arr_config(
 
 /// Validate an Arr instance by checking `/api` for a JSON `current` field.
 pub fn validate_arr_instance(config: &ArrConfig, timeout: Option<Duration>) -> crate::Result<()> {
+    block_on_integration(validate_arr_instance_async(config, timeout))
+}
+
+/// Validate an Arr instance by checking `/api` asynchronously.
+pub async fn validate_arr_instance_async(
+    config: &ArrConfig,
+    timeout: Option<Duration>,
+) -> crate::Result<()> {
     let client = arr_client(timeout)?;
     let response = client
         .get(format!("{}/api", config.url))
         .header("X-Api-Key", &config.apikey)
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .map_err(|error| integration_error(format!("failed to validate Arr instance: {error}")))?
         .text()
+        .await
         .map_err(|error| {
             integration_error(format!("failed to read Arr validation response: {error}"))
         })?;
@@ -997,6 +1026,15 @@ pub fn lookup_arr_ids(
     searchee: &Searchee<'_>,
     timeout: Option<Duration>,
 ) -> crate::Result<Option<ArrLookup>> {
+    block_on_integration(lookup_arr_ids_async(configs, searchee, timeout))
+}
+
+/// Look up IDs by calling selected Sonarr/Radarr parse APIs asynchronously.
+pub async fn lookup_arr_ids_async(
+    configs: &[ArrConfig],
+    searchee: &Searchee<'_>,
+    timeout: Option<Duration>,
+) -> crate::Result<Option<ArrLookup>> {
     let client = arr_client(timeout.or(Some(Duration::from_secs(30))))?;
     for config in arr_configs_for_media(configs, searchee.media_type) {
         let query_title = prepare_arr_title(searchee, config.kind);
@@ -1005,9 +1043,11 @@ pub fn lookup_arr_ids(
             .header("X-Api-Key", &config.apikey)
             .query(&[("title", query_title.as_str())])
             .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
+            .await
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|error| integration_error(format!("failed to parse title with Arr: {error}")))?
             .text()
+            .await
             .map_err(|error| {
                 integration_error(format!("failed to read Arr parse response: {error}"))
             })?;
@@ -1059,8 +1099,20 @@ pub fn search_torznab_indexer(
     queries: &[TorznabQuery],
     options: TorznabSearchOptions,
 ) -> crate::Result<Vec<Candidate<'static>>> {
+    block_on_integration(search_torznab_indexer_async(
+        database, indexer, queries, options,
+    ))
+}
+
+/// Search one indexer asynchronously with generated queries.
+pub async fn search_torznab_indexer_async(
+    database: &Database,
+    indexer: &SearchIndexer,
+    queries: &[TorznabQuery],
+    options: TorznabSearchOptions,
+) -> crate::Result<Vec<Candidate<'static>>> {
     let mut builder =
-        reqwest::blocking::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
+        reqwest::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
     if let Some(timeout) = options.timeout {
         builder = builder.timeout(timeout);
     }
@@ -1070,9 +1122,13 @@ pub fn search_torznab_indexer(
     let mut candidates = Vec::new();
     for (position, query) in queries.iter().enumerate() {
         if position > 0 && !options.delay.is_zero() {
-            thread::sleep(options.delay);
+            tokio::time::sleep(options.delay).await;
         }
-        let response = match client.get(torznab_request_url(indexer, query)?).send() {
+        let response = match client
+            .get(torznab_request_url(indexer, query)?)
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(error) if error.is_timeout() => {
                 snooze_indexer(
@@ -1107,7 +1163,7 @@ pub fn search_torznab_indexer(
             )?;
             continue;
         }
-        let body = response.text().map_err(|error| {
+        let body = response.text().await.map_err(|error| {
             integration_error(format!("failed to read Torznab response: {error}"))
         })?;
         let mut parsed = parse_torznab_rss(&body, indexer.id)?;
@@ -1135,6 +1191,15 @@ pub fn rss_pager(
     indexer: &SearchIndexer,
     options: RssPagerOptions,
 ) -> crate::Result<Vec<Candidate<'static>>> {
+    block_on_integration(rss_pager_async(database, indexer, options))
+}
+
+/// Page one indexer's RSS feed asynchronously and persist its newest cursor.
+pub async fn rss_pager_async(
+    database: &Database,
+    indexer: &SearchIndexer,
+    options: RssPagerOptions,
+) -> crate::Result<Vec<Candidate<'static>>> {
     const MAX_PAGES: u32 = 10;
     const MAX_CANDIDATES: usize = 10_000;
 
@@ -1153,7 +1218,7 @@ pub fn rss_pager(
                 ("offset".to_owned(), page.saturating_mul(limit).to_string()),
             ],
         };
-        let raw_page = search_torznab_indexer(
+        let raw_page = search_torznab_indexer_async(
             database,
             indexer,
             &[query],
@@ -1163,7 +1228,8 @@ pub fn rss_pager(
                 search_limit: None,
                 now_millis: options.now_millis,
             },
-        )?;
+        )
+        .await?;
         if page == 0 {
             first_seen_guid = raw_page.first().map(|candidate| candidate.guid.to_string());
             page_back_until = raw_page
@@ -1208,7 +1274,7 @@ pub fn rss_pager(
             break;
         }
         if !options.delay.is_zero() {
-            thread::sleep(options.delay);
+            tokio::time::sleep(options.delay).await;
         }
     }
 
@@ -1224,9 +1290,18 @@ pub fn query_rss_feeds(
     indexers: &[SearchIndexer],
     options: RssPagerOptions,
 ) -> crate::Result<Vec<Candidate<'static>>> {
+    block_on_integration(query_rss_feeds_async(database, indexers, options))
+}
+
+/// Page all enabled RSS feeds asynchronously.
+pub async fn query_rss_feeds_async(
+    database: &Database,
+    indexers: &[SearchIndexer],
+    options: RssPagerOptions,
+) -> crate::Result<Vec<Candidate<'static>>> {
     let mut output = Vec::new();
     for indexer in indexers {
-        output.extend(rss_pager(database, indexer, options)?);
+        output.extend(rss_pager_async(database, indexer, options).await?);
     }
     Ok(output)
 }
@@ -1331,7 +1406,12 @@ pub fn parse_torznab_caps(xml: &str) -> crate::Result<TorznabCaps> {
 
 /// Fetch and parse Torznab caps for one indexer.
 pub fn fetch_torznab_caps(indexer: &TorznabConfig) -> crate::Result<TorznabCaps> {
-    let client = reqwest::blocking::Client::builder()
+    block_on_integration(fetch_torznab_caps_async(indexer))
+}
+
+/// Fetch and parse Torznab caps for one indexer asynchronously.
+pub async fn fetch_torznab_caps_async(indexer: &TorznabConfig) -> crate::Result<TorznabCaps> {
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent(format!("CrossSeed/{}", crate::VERSION))
         .build()
@@ -1340,22 +1420,37 @@ pub fn fetch_torznab_caps(indexer: &TorznabConfig) -> crate::Result<TorznabCaps>
         .get(&indexer.url)
         .query(&[("apikey", indexer.apikey.as_str()), ("t", "caps")])
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .map_err(|error| integration_error(format!("failed to fetch Torznab caps: {error}")))?
         .text()
+        .await
         .map_err(|error| integration_error(format!("failed to read Torznab caps: {error}")))?;
     parse_torznab_caps(&body)
 }
 
-fn arr_client(timeout: Option<Duration>) -> crate::Result<reqwest::blocking::Client> {
+fn arr_client(timeout: Option<Duration>) -> crate::Result<reqwest::Client> {
     let mut builder =
-        reqwest::blocking::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
+        reqwest::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
     }
     builder
         .build()
         .map_err(|error| integration_error(format!("failed to build Arr HTTP client: {error}")))
+}
+
+fn block_on_integration<F, T>(future: F) -> crate::Result<T>
+where
+    F: Future<Output = crate::Result<T>>,
+{
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            integration_error(format!("failed to build integration runtime: {error}"))
+        })?;
+    runtime.block_on(future)
 }
 
 fn arr_configs_for_media(configs: &[ArrConfig], media_type: MediaType) -> Vec<&ArrConfig> {
