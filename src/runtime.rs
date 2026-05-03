@@ -11,7 +11,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,10 @@ pub const WEBHOOK_QUEUE_CAPACITY: usize = 64;
 pub const REVERSE_LOOKUP_QUEUE_CAPACITY: usize = 256;
 pub const INJECTION_QUEUE_CAPACITY: usize = 128;
 pub const BLOCKING_LOCAL_QUEUE_CAPACITY: usize = 64;
+pub const BLOCKING_FILESYSTEM_QUEUE_CAPACITY: usize = 64;
+pub const BLOCKING_TORRENT_IO_QUEUE_CAPACITY: usize = 64;
+pub const BLOCKING_LINKING_QUEUE_CAPACITY: usize = 32;
+pub const BLOCKING_MATCHING_QUEUE_CAPACITY: usize = 32;
 
 type RuntimeTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type RuntimeTaskFn = Box<dyn FnOnce(CancellationToken) -> RuntimeTaskFuture + Send + 'static>;
@@ -58,6 +62,43 @@ impl std::fmt::Display for QueueSubmitError {
 }
 
 impl std::error::Error for QueueSubmitError {}
+
+/// Error returned by a runtime blocking executor submission.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum BlockingTaskError {
+    /// The bounded executor queue did not accept the task.
+    Queue(QueueSubmitError),
+    /// The task was cancelled before its result was returned.
+    Cancelled {
+        /// Executor name.
+        executor: &'static str,
+        /// Task kind.
+        kind: &'static str,
+    },
+    /// The blocking task panicked.
+    Panicked {
+        /// Executor name.
+        executor: &'static str,
+        /// Task kind.
+        kind: &'static str,
+    },
+}
+
+impl std::fmt::Display for BlockingTaskError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Queue(error) => write!(formatter, "{error}"),
+            Self::Cancelled { executor, kind } => {
+                write!(formatter, "{executor} blocking task cancelled for {kind}")
+            }
+            Self::Panicked { executor, kind } => {
+                write!(formatter, "{executor} blocking task panicked for {kind}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlockingTaskError {}
 
 struct RuntimeTask {
     kind: &'static str,
@@ -167,6 +208,64 @@ impl RuntimeTaskQueue {
     }
 }
 
+/// Cloneable handle for one named bounded blocking executor.
+#[derive(Clone)]
+pub struct RuntimeBlockingExecutor {
+    queue: RuntimeTaskQueue,
+}
+
+impl RuntimeBlockingExecutor {
+    /// Executor name used in tracing and errors.
+    pub const fn name(&self) -> &'static str {
+        self.queue.name()
+    }
+
+    /// Maximum number of queued blocking tasks.
+    pub const fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
+    /// Return current executor queue counters.
+    pub fn stats(&self) -> RuntimeQueueStats {
+        self.queue.stats()
+    }
+
+    /// Submit one blocking task and await its returned value.
+    pub async fn submit<T, F>(&self, kind: &'static str, task: F) -> Result<T, BlockingTaskError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let executor = self.name();
+        let (result_sender, result_receiver) = oneshot::channel();
+        self.queue
+            .try_submit(kind, move |_shutdown| async move {
+                let result = tokio::task::spawn_blocking(task).await;
+                if result_sender.send(result).is_err() {
+                    tracing::debug!(executor, kind, "blocking task result receiver dropped");
+                }
+            })
+            .map_err(BlockingTaskError::Queue)?;
+        match result_receiver.await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_error)) => Err(BlockingTaskError::Panicked { executor, kind }),
+            Err(_error) => Err(BlockingTaskError::Cancelled { executor, kind }),
+        }
+    }
+}
+
+/// Named blocking executors for local filesystem and CPU-heavy work.
+pub struct RuntimeBlockingExecutors {
+    /// Filesystem traversal, metadata reads, and directory indexing.
+    pub filesystem: RuntimeBlockingExecutor,
+    /// Torrent metafile parsing and cache IO.
+    pub torrent_io: RuntimeBlockingExecutor,
+    /// Link creation, repair, cleanup, and related path checks.
+    pub linking: RuntimeBlockingExecutor,
+    /// CPU-heavy matching and fuzzy filtering.
+    pub matching: RuntimeBlockingExecutor,
+}
+
 /// Queue handles exposed to daemon, API, and scheduler orchestration.
 pub struct RuntimeQueues {
     /// Accepted scheduled job bodies.
@@ -185,6 +284,7 @@ pub struct RuntimeQueues {
 pub struct RuntimeServices {
     shutdown: CancellationToken,
     queues: RuntimeQueues,
+    blocking: RuntimeBlockingExecutors,
     handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -210,6 +310,26 @@ impl RuntimeServices {
             BLOCKING_LOCAL_QUEUE_CAPACITY,
             shutdown.child_token(),
         );
+        let (blocking_filesystem, blocking_filesystem_worker) = RuntimeTaskQueue::new(
+            "blocking_filesystem",
+            BLOCKING_FILESYSTEM_QUEUE_CAPACITY,
+            shutdown.child_token(),
+        );
+        let (blocking_torrent_io, blocking_torrent_io_worker) = RuntimeTaskQueue::new(
+            "blocking_torrent_io",
+            BLOCKING_TORRENT_IO_QUEUE_CAPACITY,
+            shutdown.child_token(),
+        );
+        let (blocking_linking, blocking_linking_worker) = RuntimeTaskQueue::new(
+            "blocking_linking",
+            BLOCKING_LINKING_QUEUE_CAPACITY,
+            shutdown.child_token(),
+        );
+        let (blocking_matching, blocking_matching_worker) = RuntimeTaskQueue::new(
+            "blocking_matching",
+            BLOCKING_MATCHING_QUEUE_CAPACITY,
+            shutdown.child_token(),
+        );
 
         Arc::new(Self {
             shutdown,
@@ -220,12 +340,30 @@ impl RuntimeServices {
                 injection,
                 blocking_local,
             },
+            blocking: RuntimeBlockingExecutors {
+                filesystem: RuntimeBlockingExecutor {
+                    queue: blocking_filesystem,
+                },
+                torrent_io: RuntimeBlockingExecutor {
+                    queue: blocking_torrent_io,
+                },
+                linking: RuntimeBlockingExecutor {
+                    queue: blocking_linking,
+                },
+                matching: RuntimeBlockingExecutor {
+                    queue: blocking_matching,
+                },
+            },
             handles: Mutex::new(vec![
                 jobs_worker,
                 webhooks_worker,
                 reverse_lookup_worker,
                 injection_worker,
                 blocking_local_worker,
+                blocking_filesystem_worker,
+                blocking_torrent_io_worker,
+                blocking_linking_worker,
+                blocking_matching_worker,
             ]),
         })
     }
@@ -233,6 +371,11 @@ impl RuntimeServices {
     /// Borrow runtime queue handles.
     pub const fn queues(&self) -> &RuntimeQueues {
         &self.queues
+    }
+
+    /// Borrow named blocking executor handles.
+    pub const fn blocking(&self) -> &RuntimeBlockingExecutors {
+        &self.blocking
     }
 
     /// Cancel workers and wait for their tasks to finish.
@@ -315,7 +458,10 @@ async fn run_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{QueueSubmitError, RuntimeQueueMetrics, RuntimeServices, RuntimeTaskQueue};
+    use super::{
+        BlockingTaskError, QueueSubmitError, RuntimeBlockingExecutor, RuntimeQueueMetrics,
+        RuntimeServices, RuntimeTaskQueue,
+    };
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -398,5 +544,90 @@ mod tests {
         assert_eq!(stats.finished, 1);
         assert_eq!(stats.cancelled, 0);
         services.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn blocking_executor_returns_values_and_task_errors() {
+        let services = RuntimeServices::start(CancellationToken::new());
+
+        let value = services
+            .blocking()
+            .matching
+            .submit("score", || 7usize)
+            .await
+            .expect("blocking result");
+        assert_eq!(value, 7);
+
+        let task_error = services
+            .blocking()
+            .matching
+            .submit("fallible", || -> Result<(), &'static str> { Err("failed") })
+            .await
+            .expect("join succeeds");
+        assert_eq!(task_error, Err("failed"));
+        services.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn blocking_executor_reports_panics() {
+        let services = RuntimeServices::start(CancellationToken::new());
+
+        let error = services
+            .blocking()
+            .linking
+            .submit("panic", || panic!("blocking panic"))
+            .await
+            .expect_err("panic is reported");
+
+        assert_eq!(
+            error,
+            BlockingTaskError::Panicked {
+                executor: "blocking_linking",
+                kind: "panic",
+            }
+        );
+        services.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn blocking_executor_reports_cancelled_queued_work() {
+        let shutdown = CancellationToken::new();
+        let (queue, worker) = RuntimeTaskQueue::new("blocking_test", 1, shutdown.child_token());
+        let executor = RuntimeBlockingExecutor {
+            queue: queue.clone(),
+        };
+        queue
+            .try_submit("hold", |_shutdown| std::future::pending())
+            .expect("hold worker");
+
+        for _attempt in 0..10 {
+            if queue.stats().started == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let queued = tokio::spawn(async move { executor.submit("queued", || 1usize).await });
+        for _attempt in 0..10 {
+            if queue.stats().enqueued == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queue.stats().enqueued, 2);
+
+        shutdown.cancel();
+        let error = queued
+            .await
+            .expect("queued task joins")
+            .expect_err("queued task cancelled");
+        assert_eq!(
+            error,
+            BlockingTaskError::Cancelled {
+                executor: "blocking_test",
+                kind: "queued",
+            }
+        );
+        worker.await.expect("worker joins");
     }
 }
