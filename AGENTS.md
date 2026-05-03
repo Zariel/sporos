@@ -259,7 +259,7 @@ Commit bodies must use concise prose and give reviewers enough context. Avoid
 lists unless the change genuinely needs them. When committing non-interactively,
 write the full commit message to a temporary message file and commit with
 `git commit -F <message-file>`. The file must contain the title on the first
-line, a blank second line, and body lines wrapped at 110 characters or less. Do
+line, a blank second line, and body lines wrapped at 72 characters or less. Do
 not include literal `\n` sequences in commit messages.
 
 ### Release tags
