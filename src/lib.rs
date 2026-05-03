@@ -14,6 +14,7 @@ pub mod memory;
 pub mod notifications;
 pub mod operations;
 pub mod persistence;
+pub mod retry;
 pub mod runtime;
 pub mod scheduler;
 pub mod search;

@@ -378,6 +378,11 @@ impl RuntimeServices {
         &self.blocking
     }
 
+    /// Return a child cancellation token for runtime-aware helper code.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.shutdown.child_token()
+    }
+
     /// Cancel workers and wait for their tasks to finish.
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
