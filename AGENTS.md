@@ -257,10 +257,10 @@ formatted as `area: title`. The title after the area must complete the sentence
 
 Commit bodies must use concise prose and give reviewers enough context. Avoid
 lists unless the change genuinely needs them. When committing non-interactively,
-write the full commit message to a temporary message file and commit with
-`git commit -F <message-file>`. The file must contain the title on the first
-line, a blank second line, and body lines wrapped at 72 characters or less. Do
-not include literal `\n` sequences in commit messages.
+pass the full commit message directly on stdin with `git commit -F-`. The
+message must contain the title on the first line, a blank second line, and body
+lines wrapped at 72 characters or less. Do not include literal `\n` sequences in
+commit messages.
 
 ### Release tags
 When creating a tag, include a very brief changelog in the tag annotation using
