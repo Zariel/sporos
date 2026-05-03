@@ -208,6 +208,12 @@ where
                 continue;
             }
         };
+        if safe_saved_torrent_already_in_client(&filename_metadata, &metafile, options)? {
+            delete_saved_torrent(&path)?;
+            summary.already_exists += 1;
+            summary.deleted += 1;
+            continue;
+        }
         let Some((searchee, decision)) =
             best_saved_match(&metafile, &filename_metadata, searchees, options)
         else {
@@ -246,6 +252,17 @@ where
         }
     }
     Ok(summary)
+}
+
+fn safe_saved_torrent_already_in_client(
+    metadata: &SavedTorrentMetadata<'_>,
+    metafile: &Metafile<'_>,
+    options: &SavedInjectionOptions<'_>,
+) -> crate::Result<bool> {
+    if metadata.info_hash.as_str() != metafile.info_hash.as_str() {
+        return Ok(false);
+    }
+    candidate_existing_client(options.injection.clients, metafile).map(|client| client.is_some())
 }
 
 /// Choose a link directory compatible with the source path.
@@ -2427,6 +2444,72 @@ mod tests {
         assert_eq!(summary.deleted, 1);
         assert!(!saved.path.exists());
         assert_eq!(client.calls.lock().expect("calls").clone(), vec!["inject"]);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saved_torrent_injection_deletes_retry_already_in_client() {
+        let root = temp_path("saved-inject-existing");
+        let input_dir = root.join("saved");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("data");
+        fs::write(data.join("Candidate.Release"), b"video-data").expect("source");
+        let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
+        let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+        let saved = save_candidate_torrent(&input_dir, "Tracker", &metafile, &bytes, |_| Ok(()))
+            .expect("save");
+        let mut searchee = Searchee::from_files(
+            "Candidate.Release",
+            "Candidate.Release",
+            vec![File::new("Candidate.Release", 10)],
+        );
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+        let mut client = FakeClient::new("client");
+        client.existing = true;
+        let clients: [&dyn TorrentClient; 1] = [&client];
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let excluded = BTreeSet::from([metafile.info_hash.as_str().to_owned()]);
+        let assessment = AssessmentOptions {
+            match_mode: MatchMode::Strict,
+            fuzzy_size_threshold: 0.05,
+            season_from_episodes: 0.75,
+            include_single_episodes: true,
+            info_hashes_to_exclude: &excluded,
+            blocklist: &blocklist,
+        };
+        let injection = InjectionActionOptions {
+            clients: &clients,
+            output_dir: Some(&input_dir),
+            link_dirs: &[],
+            link_type: LinkType::Symlink,
+            flat_linking: false,
+            unwrap_symlinks: false,
+            skip_recheck: true,
+            match_mode: MatchMode::Strict,
+            auto_resume_max_download: 0,
+            ignore_non_relevant_files_to_resume: false,
+            category: None,
+            tags: vec![ClientLabel::new("cross-seed")],
+        };
+
+        let summary = inject_saved_torrents(
+            &SavedInjectionOptions {
+                input_dir: &input_dir,
+                injection: &injection,
+                assessment: &assessment,
+                ignore_titles: false,
+            },
+            &[searchee],
+            |_| Ok(()),
+        )
+        .expect("inject saved");
+
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.already_exists, 1);
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(!saved.path.exists());
+        assert!(client.calls.lock().expect("calls").is_empty());
         let _cleanup = fs::remove_dir_all(root);
     }
 
