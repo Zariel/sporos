@@ -1,29 +1,35 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
+    collections::VecDeque,
     fs,
     io::{Read, Write},
     net::TcpListener,
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use sporos::config::TorrentClientConfig;
 use sporos::{
     api::{
         AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, JobRequest, JobResponse,
         WebhookRequest, handle_api_request,
     },
+    clients::{InjectionOptions, NewTorrent, TorrentClient, TransmissionClient, client_identities},
     config::{RawConfig, RuntimeConfig},
     domain::{ActionResult, Decision, File, MediaType, Searchee},
     integrations::{
         ArrKind, CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, TorznabCaps,
-        lookup_arr_ids, rss_pager, validate_arr_url,
+        fetch_torznab_caps, lookup_arr_ids, rss_pager, validate_arr_instance, validate_arr_url,
+        validate_torznab_url,
     },
     notifications::NotificationSender,
     persistence::{Database, SqlValue},
     scheduler::DaemonPlan,
     startup::Redactor,
+    torrent::parse_metafile,
 };
 
 #[test]
@@ -145,6 +151,82 @@ fn fake_arr_and_notification_services_cover_external_http_contracts() {
     );
 }
 
+#[test]
+fn fake_services_cover_retry_after_and_unsafe_client_retry() {
+    let torznab = FakeHttpServer::new(vec![
+        HttpResponse::new("429 Too Many Requests", &[("Retry-After", "0")], ""),
+        HttpResponse::new(
+            "200 OK",
+            &[("Content-Type", "application/xml")],
+            r#"<caps><searching searchAvailable="yes" /><limits default="25" max="100" /></caps>"#,
+        ),
+    ]);
+    let torznab_config =
+        validate_torznab_url(&format!("{}/api?apikey=torznab", torznab.url)).expect("torznab");
+    let caps = fetch_torznab_caps(&torznab_config).expect("caps");
+    assert!(caps.search);
+    assert_eq!(torznab.join().len(), 2);
+
+    let arr = FakeHttpServer::new(vec![
+        HttpResponse::new("503 Service Unavailable", &[("Retry-After", "0")], ""),
+        HttpResponse::json(r#"{"current":"4.0.0"}"#),
+    ]);
+    let arr_config =
+        validate_arr_url(&format!("{}?apikey=arr", arr.url), ArrKind::Sonarr).expect("arr");
+    validate_arr_instance(&arr_config, Some(Duration::from_secs(1))).expect("arr validate");
+    assert_eq!(arr.join().len(), 2);
+
+    let notifications = FakeHttpServer::new(vec![
+        HttpResponse::new("503 Service Unavailable", &[("Retry-After", "0")], ""),
+        HttpResponse::json("{}"),
+    ]);
+    let sender = NotificationSender::new(vec![notifications.url.clone()], Redactor::default())
+        .expect("sender");
+    let report = sender.send_test();
+    assert_eq!(report.succeeded, 1);
+    assert_eq!(report.retry_exhausted, 0);
+    assert_eq!(notifications.join().len(), 2);
+
+    let transmission = FakeHttpServer::new_until_idle(
+        vec![
+            HttpResponse::new("502 Bad Gateway", &[], ""),
+            HttpResponse::json(r#"{"result":"success","arguments":{}}"#),
+        ],
+        Duration::from_millis(150),
+    );
+    let identity = client_identities(&[TorrentClientConfig::parse(&format!(
+        "transmission:{}",
+        transmission.url
+    ))
+    .expect("client config")])
+    .expect("identity")
+    .into_iter()
+    .next()
+    .expect("identity");
+    let client = TransmissionClient::new(identity, Some(Duration::from_secs(1))).expect("client");
+    let bytes = torrent_bytes("Unsafe.Inject", 10);
+    let metafile = parse_metafile(&bytes).expect("metafile");
+    let new_torrent = NewTorrent {
+        metafile,
+        bytes: Cow::Owned(bytes),
+    };
+    let searchee = Searchee::from_files("Unsafe.Inject", "Unsafe.Inject", Vec::new());
+
+    assert!(
+        client
+            .inject(
+                &new_torrent,
+                &searchee,
+                Decision::Match,
+                &InjectionOptions::default()
+            )
+            .is_err()
+    );
+    let transmission_requests = transmission.join();
+    assert_eq!(transmission_requests.len(), 1);
+    assert!(transmission_requests[0].contains(r#""method":"torrent-add""#));
+}
+
 #[tokio::test]
 async fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
     let root = temp_path("daemon-api");
@@ -231,6 +313,14 @@ struct HttpResponse {
 }
 
 impl HttpResponse {
+    fn new(status: &'static str, headers: &[(&'static str, &'static str)], body: &str) -> Self {
+        Self {
+            status,
+            headers: headers.to_vec(),
+            body: body.to_owned(),
+        }
+    }
+
     fn json(body: &str) -> Self {
         Self {
             status: "200 OK",
@@ -270,19 +360,49 @@ struct FakeHttpServer {
 
 impl FakeHttpServer {
     fn new(responses: Vec<HttpResponse>) -> Self {
+        Self::with_idle_timeout(responses, None)
+    }
+
+    fn new_until_idle(responses: Vec<HttpResponse>, idle_timeout: Duration) -> Self {
+        Self::with_idle_timeout(responses, Some(idle_timeout))
+    }
+
+    fn with_idle_timeout(responses: Vec<HttpResponse>, idle_timeout: Option<Duration>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+        if idle_timeout.is_some() {
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+        }
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server_requests = Arc::clone(&requests);
         let handle = thread::spawn(move || {
-            for response in responses {
-                let (mut stream, _) = listener.accept().expect("accept request");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .expect("read timeout");
-                let request = read_http_request(&mut stream).expect("read request");
-                server_requests.lock().expect("requests lock").push(request);
-                stream.write_all(&response.bytes()).expect("write response");
+            let mut responses = VecDeque::from(responses);
+            let mut idle_since = Instant::now();
+            while let Some(response) = responses.pop_front() {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        idle_since = Instant::now();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("read timeout");
+                        let request = read_http_request(&mut stream).expect("read request");
+                        server_requests.lock().expect("requests lock").push(request);
+                        stream.write_all(&response.bytes()).expect("write response");
+                    }
+                    Err(error)
+                        if idle_timeout.is_some()
+                            && error.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        responses.push_front(response);
+                        if idle_since.elapsed() >= idle_timeout.expect("idle timeout") {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept request: {error}"),
+                }
             }
         });
         Self {
@@ -383,4 +503,12 @@ fn temp_path(label: &str) -> PathBuf {
         "sporos-integration-{label}-{}-{nanos}",
         std::process::id()
     ))
+}
+
+fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {
+    format!(
+        "d4:infod6:lengthi{length}e4:name{}:{name}12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee",
+        name.len()
+    )
+    .into_bytes()
 }
