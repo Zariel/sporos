@@ -1878,10 +1878,30 @@ CREATE TABLE IF NOT EXISTS decision (
     searchee_id INTEGER NOT NULL REFERENCES searchee(id) ON DELETE CASCADE,
     guid TEXT NOT NULL,
     info_hash TEXT NULL,
-    decision TEXT NOT NULL,
-    first_seen INTEGER NOT NULL,
-    last_seen INTEGER NOT NULL,
-    fuzzy_size_factor REAL NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN (
+        'MATCH',
+        'MATCH_SIZE_ONLY',
+        'MATCH_PARTIAL',
+        'FUZZY_SIZE_MISMATCH',
+        'SIZE_MISMATCH',
+        'PARTIAL_SIZE_MISMATCH',
+        'NO_DOWNLOAD_LINK',
+        'DOWNLOAD_FAILED',
+        'MAGNET_LINK',
+        'RATE_LIMITED',
+        'SAME_INFO_HASH',
+        'INFO_HASH_ALREADY_EXISTS',
+        'FILE_TREE_MISMATCH',
+        'RELEASE_GROUP_MISMATCH',
+        'BLOCKED_RELEASE',
+        'PROPER_REPACK_MISMATCH',
+        'RESOLUTION_MISMATCH',
+        'SOURCE_MISMATCH'
+    )),
+    first_seen INTEGER NOT NULL CHECK (first_seen >= 0),
+    last_seen INTEGER NOT NULL CHECK (last_seen >= 0),
+    fuzzy_size_factor REAL NOT NULL CHECK (fuzzy_size_factor >= 0),
+    CHECK (last_seen >= first_seen),
     UNIQUE(searchee_id, guid)
 );
 CREATE INDEX IF NOT EXISTS idx_decision_info_hash_guid ON decision(info_hash, guid);
@@ -1892,7 +1912,7 @@ CREATE TABLE IF NOT EXISTS decision_guid_alias (
     alias TEXT NOT NULL,
     decision_id INTEGER NOT NULL REFERENCES decision(id) ON DELETE CASCADE,
     info_hash TEXT NOT NULL,
-    last_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL CHECK (last_seen >= 0),
     PRIMARY KEY(alias, decision_id)
 );
 CREATE INDEX IF NOT EXISTS idx_decision_guid_alias_lookup
@@ -1908,7 +1928,7 @@ CREATE TABLE IF NOT EXISTS torrent (
 CREATE TABLE IF NOT EXISTS job_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
-    last_run INTEGER NOT NULL
+    last_run INTEGER NOT NULL CHECK (last_run >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS indexer (
@@ -1917,15 +1937,15 @@ CREATE TABLE IF NOT EXISTS indexer (
     url TEXT NOT NULL UNIQUE,
     apikey TEXT NOT NULL,
     trackers TEXT NULL,
-    active INTEGER NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0, 1)),
     status TEXT NULL,
-    retry_after INTEGER NULL,
-    search_cap INTEGER NULL,
-    tv_search_cap INTEGER NULL,
-    movie_search_cap INTEGER NULL,
-    music_search_cap INTEGER NULL,
-    audio_search_cap INTEGER NULL,
-    book_search_cap INTEGER NULL,
+    retry_after INTEGER NULL CHECK (retry_after IS NULL OR retry_after >= 0),
+    search_cap INTEGER NULL CHECK (search_cap IS NULL OR search_cap IN (0, 1)),
+    tv_search_cap INTEGER NULL CHECK (tv_search_cap IS NULL OR tv_search_cap IN (0, 1)),
+    movie_search_cap INTEGER NULL CHECK (movie_search_cap IS NULL OR movie_search_cap IN (0, 1)),
+    music_search_cap INTEGER NULL CHECK (music_search_cap IS NULL OR music_search_cap IN (0, 1)),
+    audio_search_cap INTEGER NULL CHECK (audio_search_cap IS NULL OR audio_search_cap IN (0, 1)),
+    book_search_cap INTEGER NULL CHECK (book_search_cap IS NULL OR book_search_cap IN (0, 1)),
     tv_id_caps TEXT NULL,
     movie_id_caps TEXT NULL,
     cat_caps TEXT NULL,
@@ -1943,8 +1963,9 @@ ON indexer_tracker(tracker, indexer_id);
 CREATE TABLE IF NOT EXISTS timestamp (
     searchee_id INTEGER NOT NULL REFERENCES searchee(id) ON DELETE CASCADE,
     indexer_id INTEGER NOT NULL REFERENCES indexer(id) ON DELETE CASCADE,
-    first_searched INTEGER NOT NULL,
-    last_searched INTEGER NOT NULL,
+    first_searched INTEGER NOT NULL CHECK (first_searched >= 0),
+    last_searched INTEGER NOT NULL CHECK (last_searched >= 0),
+    CHECK (last_searched >= first_searched),
     PRIMARY KEY(searchee_id, indexer_id)
 );
 
@@ -1984,18 +2005,27 @@ CREATE TABLE IF NOT EXISTS client_searchee (
     name TEXT NOT NULL,
     title TEXT NOT NULL,
     files TEXT NOT NULL,
-    length INTEGER NOT NULL,
+    length INTEGER NOT NULL CHECK (length >= 0),
     save_path TEXT NOT NULL,
     category TEXT NULL,
     tags TEXT NULL,
     trackers TEXT NOT NULL,
     search_key TEXT NULL,
-    media_type TEXT NULL,
-    season INTEGER NULL,
-    episode INTEGER NULL,
-    file_count INTEGER NULL,
-    video_bytes INTEGER NULL,
-    non_video_bytes INTEGER NULL,
+    media_type TEXT NULL CHECK (media_type IS NULL OR media_type IN (
+        'episode',
+        'pack',
+        'movie',
+        'anime',
+        'video',
+        'audio',
+        'book',
+        'unknown'
+    )),
+    season INTEGER NULL CHECK (season IS NULL OR season >= 0),
+    episode INTEGER NULL CHECK (episode IS NULL OR episode >= 0),
+    file_count INTEGER NULL CHECK (file_count IS NULL OR file_count >= 0),
+    video_bytes INTEGER NULL CHECK (video_bytes IS NULL OR video_bytes >= 0),
+    non_video_bytes INTEGER NULL CHECK (non_video_bytes IS NULL OR non_video_bytes >= 0),
     PRIMARY KEY(client_host, info_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_client_searchee_info_hash ON client_searchee(info_hash);
@@ -2006,13 +2036,22 @@ CREATE TABLE IF NOT EXISTS data (
     path TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     search_key TEXT NULL,
-    media_type TEXT NULL,
-    season INTEGER NULL,
-    episode INTEGER NULL,
-    length INTEGER NULL,
-    file_count INTEGER NULL,
-    video_bytes INTEGER NULL,
-    non_video_bytes INTEGER NULL
+    media_type TEXT NULL CHECK (media_type IS NULL OR media_type IN (
+        'episode',
+        'pack',
+        'movie',
+        'anime',
+        'video',
+        'audio',
+        'book',
+        'unknown'
+    )),
+    season INTEGER NULL CHECK (season IS NULL OR season >= 0),
+    episode INTEGER NULL CHECK (episode IS NULL OR episode >= 0),
+    length INTEGER NULL CHECK (length IS NULL OR length >= 0),
+    file_count INTEGER NULL CHECK (file_count IS NULL OR file_count >= 0),
+    video_bytes INTEGER NULL CHECK (video_bytes IS NULL OR video_bytes >= 0),
+    non_video_bytes INTEGER NULL CHECK (non_video_bytes IS NULL OR non_video_bytes >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_data_lookup
 ON data(search_key, media_type, season, episode, length);
@@ -2393,6 +2432,71 @@ mod tests {
         ] {
             assert_index(&database, index);
         }
+
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_constraints_reject_invalid_cache_invariants() {
+        let root = temp_path("schema-constraints");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+
+        database
+            .execute_sql("INSERT INTO searchee (name) VALUES ('Example')", &[])
+            .expect("insert searchee");
+
+        assert_sql_fails(
+            &database,
+            "INSERT INTO decision
+             (searchee_id, guid, info_hash, decision, first_seen, last_seen, fuzzy_size_factor)
+             VALUES (1, 'guid', NULL, 'UNKNOWN', 0, 0, 1.0)",
+        );
+        assert_sql_fails(
+            &database,
+            "INSERT INTO decision
+             (searchee_id, guid, info_hash, decision, first_seen, last_seen, fuzzy_size_factor)
+             VALUES (1, 'guid', NULL, 'MATCH', 20, 10, 1.0)",
+        );
+        assert_sql_fails(
+            &database,
+            "INSERT INTO indexer (url, apikey, active)
+             VALUES ('http://indexer.test', 'secret', 2)",
+        );
+        assert_sql_fails(
+            &database,
+            "INSERT INTO job_log (name, last_run) VALUES ('rss', -1)",
+        );
+
+        database
+            .execute_sql(
+                "INSERT INTO indexer (url, apikey, active)
+                 VALUES ('http://indexer.test', 'secret', 1)",
+                &[],
+            )
+            .expect("insert indexer");
+        assert_sql_fails(
+            &database,
+            "INSERT INTO timestamp
+             (searchee_id, indexer_id, first_searched, last_searched)
+             VALUES (1, 1, 10, 9)",
+        );
+        assert_sql_fails(
+            &database,
+            "INSERT INTO data
+             (path, title, search_key, media_type, length)
+             VALUES ('/data/show', 'Show', 'show', 'series', 1)",
+        );
+        assert_sql_fails(
+            &database,
+            "INSERT INTO client_searchee
+             (client_host, info_hash, name, title, files, length, save_path, trackers, video_bytes)
+             VALUES ('http://client', 'abc', 'Show', 'Show', '[]', 1, '/downloads', '[]', -1)",
+        );
+        assert_sql_fails(
+            &database,
+            "INSERT INTO settings (id, apikey) VALUES (1, 'secret')",
+        );
 
         let _cleanup = fs::remove_dir_all(root);
     }
@@ -3017,6 +3121,10 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-db-{label}-{nanos}"))
+    }
+
+    fn assert_sql_fails(database: &Database, sql: &str) {
+        assert!(database.execute_sql(sql, &[]).is_err(), "{sql}");
     }
 
     fn assert_column(database: &Database, table: &str, column: &str) {
