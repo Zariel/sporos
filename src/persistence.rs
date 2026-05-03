@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     future::Future,
     path::{Path, PathBuf},
 };
@@ -735,13 +736,44 @@ impl Database {
         trackers: &str,
     ) -> crate::Result<()> {
         self.block_on(async {
-            let tracker_values =
-                serde_json::from_str::<Vec<String>>(trackers).map_err(|error| {
-                    persistence_message(format!("failed to parse indexer trackers JSON: {error}"))
-                })?;
+            let incoming = serde_json::from_str::<Vec<String>>(trackers).map_err(|error| {
+                persistence_message(format!("failed to parse indexer trackers JSON: {error}"))
+            })?;
+            let existing_json: Option<String> =
+                sqlx::query_scalar("SELECT trackers FROM indexer WHERE id = ?1")
+                    .bind(indexer_id)
+                    .fetch_optional(self.pool())
+                    .await
+                    .map_err(sqlx_error)?
+                    .flatten();
+            let mut tracker_values = BTreeSet::new();
+            if let Some(existing_json) = existing_json {
+                let existing =
+                    serde_json::from_str::<Vec<String>>(&existing_json).map_err(|error| {
+                        persistence_message(format!(
+                            "failed to parse stored indexer trackers JSON: {error}"
+                        ))
+                    })?;
+                tracker_values.extend(existing);
+            }
+            let existing_child = sqlx::query_scalar::<_, String>(
+                "SELECT tracker FROM indexer_tracker WHERE indexer_id = ?1",
+            )
+            .bind(indexer_id)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            tracker_values.extend(existing_child);
+            tracker_values.extend(incoming);
+            let tracker_values = tracker_values.into_iter().collect::<Vec<_>>();
+            let encoded = serde_json::to_string(&tracker_values).map_err(|error| {
+                persistence_message(format!(
+                    "failed to serialize indexer trackers JSON: {error}"
+                ))
+            })?;
             sqlx::query("UPDATE indexer SET trackers = ?2 WHERE id = ?1")
                 .bind(indexer_id)
-                .bind(trackers)
+                .bind(encoded)
                 .execute(self.pool())
                 .await
                 .map_err(sqlx_error)?;
@@ -2812,6 +2844,24 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "TrackerName");
         assert_eq!(rows[0].trackers, r#"["tracker.a","tracker.b"]"#);
+
+        database
+            .update_indexer_trackers_json(indexer_id, r#"["tracker.c","tracker.a"]"#)
+            .expect("merged trackers");
+
+        let child_count: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM indexer_tracker", &[])
+            .expect("child count");
+        assert_eq!(child_count, 3);
+        let stored_json: String = database
+            .query_scalar(
+                "SELECT trackers FROM indexer WHERE id = ?1",
+                &[SqlValue::I64(indexer_id)],
+            )
+            .expect("stored trackers");
+        assert_eq!(stored_json, r#"["tracker.a","tracker.b","tracker.c"]"#);
+        let rows = database.indexer_tracker_rows().expect("tracker rows");
+        assert_eq!(rows[0].trackers, r#"["tracker.a","tracker.b","tracker.c"]"#);
 
         let _cleanup = fs::remove_dir_all(root);
     }
