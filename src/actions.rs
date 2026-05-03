@@ -748,10 +748,9 @@ fn compatible_link_client<'a>(
         .collect::<Vec<_>>();
     writable.sort_by_key(|client| client.metadata().priority);
     for client in writable {
-        let download_dirs = client.get_all_download_dirs()?;
-        if download_dirs.values().any(|download_dir| {
-            probe_link_dir(source_dir, download_dir, link_type).unwrap_or(false)
-        }) {
+        if client.has_matching_download_dir(&mut |download_dir| {
+            probe_link_dir(source_dir, download_dir, link_type).or(Ok(false))
+        })? {
             return Ok(Some(client));
         }
     }

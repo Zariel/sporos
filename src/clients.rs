@@ -4,14 +4,15 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
+    future::Future,
     path::{Path, PathBuf},
-    thread,
     time::Duration,
 };
 
 use quick_xml::{Reader, events::Event};
-use reqwest::blocking::multipart;
 use reqwest::header::CONTENT_TYPE;
+use reqwest::multipart;
+use tokio::runtime::Builder;
 use url::Url;
 
 use crate::{
@@ -253,13 +254,21 @@ pub trait TorrentClient {
     /// Return known download directories keyed by info hash.
     fn get_all_download_dirs(&self) -> crate::Result<BTreeMap<String, PathBuf>>;
 
-    /// Return bytes still missing for one torrent when the adapter can tell.
-    fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
-        for torrent in self.get_all_torrents()? {
-            if torrent.info_hash == metafile.info_hash {
-                return Ok(Some(if torrent.complete { 0 } else { metafile.length }));
+    /// Visit download directories until the predicate finds a compatible target.
+    fn has_matching_download_dir(
+        &self,
+        predicate: &mut dyn FnMut(&Path) -> crate::Result<bool>,
+    ) -> crate::Result<bool> {
+        for download_dir in self.get_all_download_dirs()?.values() {
+            if predicate(download_dir)? {
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
+
+    /// Return bytes still missing for one torrent when the adapter can tell.
+    fn remaining_bytes(&self, _metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
         Ok(None)
     }
 
@@ -304,14 +313,22 @@ where
         attempts -= 1;
         if client.is_torrent_checking(&metafile.info_hash)? {
             if attempts > 0 {
-                thread::sleep(Duration::from_secs(10));
+                block_on_client_delay(Duration::from_secs(10))?;
             }
             continue;
         }
         if options.max_remaining_bytes == u64::MAX {
             return resume();
         }
-        let remaining = client.remaining_bytes(metafile)?.unwrap_or(0);
+        let Some(remaining) = client.remaining_bytes(metafile)? else {
+            tracing::warn!(
+                info_hash = %metafile.info_hash,
+                max_remaining_bytes = options.max_remaining_bytes,
+                ignore_non_relevant_files = options.ignore_non_relevant_files,
+                "torrent client cannot report remaining bytes for auto-resume policy"
+            );
+            return Ok(());
+        };
         if remaining <= options.max_remaining_bytes {
             return resume();
         }
@@ -334,7 +351,7 @@ pub struct QbittorrentClient {
     username: String,
     password: String,
     torrent_dir: Option<PathBuf>,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 impl QbittorrentClient {
@@ -348,7 +365,7 @@ impl QbittorrentClient {
             .map_err(|()| client_error("failed to sanitize qBittorrent username"))?;
         url.set_password(None)
             .map_err(|()| client_error("failed to sanitize qBittorrent password"))?;
-        let mut builder = reqwest::blocking::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .cookie_store(true)
             .user_agent(format!("CrossSeed/{}", crate::VERSION));
         if let Some(timeout) = timeout {
@@ -374,15 +391,17 @@ impl QbittorrentClient {
     }
 
     fn login(&self) -> crate::Result<()> {
-        let response = self
-            .client
-            .post(self.api_url("/api/v2/auth/login"))
-            .form(&[
-                ("username", self.username.as_str()),
-                ("password", self.password.as_str()),
-            ])
-            .send()
-            .map_err(|error| client_error(format!("qBittorrent login failed: {error}")))?;
+        let response = block_on_client(async {
+            self.client
+                .post(self.api_url("/api/v2/auth/login"))
+                .form(&[
+                    ("username", self.username.as_str()),
+                    ("password", self.password.as_str()),
+                ])
+                .send()
+                .await
+        })?
+        .map_err(|error| client_error(format!("qBittorrent login failed: {error}")))?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -399,66 +418,78 @@ impl QbittorrentClient {
 
     fn get_text(&self, path: &str) -> crate::Result<String> {
         self.login()?;
-        self.client
-            .get(self.api_url(path))
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("qBittorrent request failed: {error}")))?
-            .text()
-            .map_err(|error| client_error(format!("failed to read qBittorrent response: {error}")))
+        block_on_client(async {
+            self.client
+                .get(self.api_url(path))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        })?
+        .map_err(|error| client_error(format!("qBittorrent request failed: {error}")))
     }
 
     fn post_form(&self, path: &str, form: &[(&str, &str)]) -> crate::Result<()> {
         self.login()?;
-        self.client
-            .post(self.api_url(path))
-            .form(form)
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("qBittorrent mutation failed: {error}")))?;
+        block_on_client(async {
+            self.client
+                .post(self.api_url(path))
+                .form(form)
+                .send()
+                .await?
+                .error_for_status()
+        })?
+        .map_err(|error| client_error(format!("qBittorrent mutation failed: {error}")))?;
         Ok(())
     }
 
     fn torrent_info(&self, info_hash: &InfoHash<'_>) -> crate::Result<Option<QbTorrentInfo>> {
         self.login()?;
-        let response = self
-            .client
-            .get(self.api_url("/api/v2/torrents/info"))
-            .query(&[("hashes", info_hash.as_str())])
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("qBittorrent info request failed: {error}")))?
-            .text()
-            .map_err(|error| client_error(format!("failed to read qBittorrent info: {error}")))?;
+        let response = block_on_client(async {
+            self.client
+                .get(self.api_url("/api/v2/torrents/info"))
+                .query(&[("hashes", info_hash.as_str())])
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        })?
+        .map_err(|error| client_error(format!("qBittorrent info request failed: {error}")))?;
         let mut torrents = parse_qb_torrents(&response)?;
         Ok(torrents.pop())
     }
 
     fn torrent_page(&self, offset: usize, limit: usize) -> crate::Result<Vec<QbTorrentInfo>> {
         self.login()?;
-        let response = self
-            .client
-            .get(self.api_url("/api/v2/torrents/info"))
-            .query(&[("offset", offset.to_string()), ("limit", limit.to_string())])
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("qBittorrent info request failed: {error}")))?
-            .text()
-            .map_err(|error| client_error(format!("failed to read qBittorrent info: {error}")))?;
+        let response = block_on_client(async {
+            self.client
+                .get(self.api_url("/api/v2/torrents/info"))
+                .query(&[("offset", offset.to_string()), ("limit", limit.to_string())])
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        })?
+        .map_err(|error| client_error(format!("qBittorrent info request failed: {error}")))?;
         parse_qb_torrents(&response)
     }
 
     fn torrent_files(&self, info_hash: &str) -> crate::Result<Vec<File<'static>>> {
         self.login()?;
-        let response = self
-            .client
-            .get(self.api_url("/api/v2/torrents/files"))
-            .query(&[("hash", info_hash)])
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("qBittorrent files request failed: {error}")))?
-            .text()
-            .map_err(|error| client_error(format!("failed to read qBittorrent files: {error}")))?;
+        let response = block_on_client(async {
+            self.client
+                .get(self.api_url("/api/v2/torrents/files"))
+                .query(&[("hash", info_hash)])
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        })?
+        .map_err(|error| client_error(format!("qBittorrent files request failed: {error}")))?;
         parse_qb_files(&response)
     }
 
@@ -501,17 +532,17 @@ impl QbittorrentClient {
 
     fn torrent_trackers(&self, info_hash: &str) -> crate::Result<Vec<Cow<'static, str>>> {
         self.login()?;
-        let response = self
-            .client
-            .get(self.api_url("/api/v2/torrents/trackers"))
-            .query(&[("hash", info_hash)])
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("qBittorrent trackers request failed: {error}")))?
-            .text()
-            .map_err(|error| {
-                client_error(format!("failed to read qBittorrent trackers: {error}"))
-            })?;
+        let response = block_on_client(async {
+            self.client
+                .get(self.api_url("/api/v2/torrents/trackers"))
+                .query(&[("hash", info_hash)])
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        })?
+        .map_err(|error| client_error(format!("qBittorrent trackers request failed: {error}")))?;
         parse_qb_trackers(&response)
     }
 
@@ -523,7 +554,13 @@ impl QbittorrentClient {
     ) -> crate::Result<()> {
         self.login()?;
         let form = [("hashes", info_hash.as_str())];
-        let primary = self.client.post(self.api_url(primary)).form(&form).send();
+        let primary = block_on_client(async {
+            self.client
+                .post(self.api_url(primary))
+                .form(&form)
+                .send()
+                .await
+        })?;
         match primary {
             Ok(response) if response.status().is_success() => Ok(()),
             _ => self.post_form(fallback, &form),
@@ -622,6 +659,37 @@ impl TorrentClient for QbittorrentClient {
             .collect())
     }
 
+    fn has_matching_download_dir(
+        &self,
+        predicate: &mut dyn FnMut(&Path) -> crate::Result<bool>,
+    ) -> crate::Result<bool> {
+        let mut offset = 0usize;
+        loop {
+            let page = self.torrent_page(offset, CLIENT_INVENTORY_PAGE_SIZE)?;
+            let page_len = page.len();
+            for torrent in page {
+                if predicate(Path::new(&torrent.save_path))? {
+                    return Ok(true);
+                }
+            }
+            if page_len < CLIENT_INVENTORY_PAGE_SIZE {
+                return Ok(false);
+            }
+            offset = offset.saturating_add(CLIENT_INVENTORY_PAGE_SIZE);
+        }
+    }
+
+    fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
+        let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(if torrent.complete() {
+            0
+        } else {
+            torrent.amount_left.unwrap_or(metafile.length)
+        }))
+    }
+
     fn inject(
         &self,
         new_torrent: &NewTorrent<'_>,
@@ -656,12 +724,15 @@ impl TorrentClient for QbittorrentClient {
             .text("paused", options.paused.to_string())
             .text("skip_checking", options.skip_checking.to_string())
             .text("contentLayout", "Original");
-        self.client
-            .post(self.api_url("/api/v2/torrents/add"))
-            .multipart(form)
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("qBittorrent add failed: {error}")))?;
+        block_on_client(async {
+            self.client
+                .post(self.api_url("/api/v2/torrents/add"))
+                .multipart(form)
+                .send()
+                .await?
+                .error_for_status()
+        })?
+        .map_err(|error| client_error(format!("qBittorrent add failed: {error}")))?;
         Ok(InjectionResult::Injected)
     }
 
@@ -715,14 +786,14 @@ impl TorrentClient for QbittorrentClient {
 pub struct TransmissionClient {
     identity: ClientIdentity,
     rpc_url: String,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 impl TransmissionClient {
     /// Build a Transmission adapter from normalized identity metadata.
     pub fn new(identity: ClientIdentity, timeout: Option<Duration>) -> crate::Result<Self> {
-        let mut builder = reqwest::blocking::Client::builder()
-            .user_agent(format!("CrossSeed/{}", crate::VERSION));
+        let mut builder =
+            reqwest::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
@@ -738,35 +809,44 @@ impl TransmissionClient {
 
     fn rpc(&self, body: serde_json::Value) -> crate::Result<serde_json::Value> {
         let body = body.to_string();
-        let response = self
-            .client
-            .post(&self.rpc_url)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body.clone())
-            .send()
-            .map_err(|error| client_error(format!("Transmission RPC request failed: {error}")))?;
-        let response = if response.status() == reqwest::StatusCode::CONFLICT {
-            let session_id = response
-                .headers()
-                .get("X-Transmission-Session-Id")
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| client_error("Transmission session id missing"))?
-                .to_owned();
-            self.client
+        let text = block_on_client(async {
+            let response = self
+                .client
                 .post(&self.rpc_url)
-                .header("X-Transmission-Session-Id", session_id)
                 .header(CONTENT_TYPE, "application/json")
-                .body(body)
+                .body(body.clone())
                 .send()
-                .map_err(|error| client_error(format!("Transmission RPC retry failed: {error}")))?
-        } else {
+                .await
+                .map_err(|error| {
+                    client_error(format!("Transmission RPC request failed: {error}"))
+                })?;
+            let response = if response.status() == reqwest::StatusCode::CONFLICT {
+                let session_id = response
+                    .headers()
+                    .get("X-Transmission-Session-Id")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| client_error("Transmission session id missing"))?
+                    .to_owned();
+                self.client
+                    .post(&self.rpc_url)
+                    .header("X-Transmission-Session-Id", session_id)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        client_error(format!("Transmission RPC retry failed: {error}"))
+                    })?
+            } else {
+                response
+            };
             response
-        };
-        let text = response
-            .error_for_status()
-            .map_err(|error| client_error(format!("Transmission RPC returned error: {error}")))?
-            .text()
-            .map_err(|error| client_error(format!("failed to read Transmission RPC: {error}")))?;
+                .error_for_status()
+                .map_err(|error| client_error(format!("Transmission RPC returned error: {error}")))?
+                .text()
+                .await
+                .map_err(|error| client_error(format!("failed to read Transmission RPC: {error}")))
+        })??;
         let value = serde_json::from_str::<serde_json::Value>(&text)
             .map_err(|error| client_error(format!("failed to parse Transmission RPC: {error}")))?;
         if value.get("result").and_then(serde_json::Value::as_str) == Some("success") {
@@ -905,6 +985,17 @@ impl TorrentClient for TransmissionClient {
             .collect())
     }
 
+    fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
+        let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(if torrent.complete() {
+            0
+        } else {
+            torrent.left_until_done.unwrap_or(metafile.length)
+        }))
+    }
+
     fn inject(
         &self,
         new_torrent: &NewTorrent<'_>,
@@ -970,7 +1061,7 @@ pub struct DelugeClient {
     identity: ClientIdentity,
     rpc_url: String,
     password: String,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 impl DelugeClient {
@@ -983,7 +1074,7 @@ impl DelugeClient {
             .map_err(|()| client_error("failed to sanitize Deluge username"))?;
         url.set_password(None)
             .map_err(|()| client_error("failed to sanitize Deluge password"))?;
-        let mut builder = reqwest::blocking::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .cookie_store(true)
             .user_agent(format!("CrossSeed/{}", crate::VERSION));
         if let Some(timeout) = timeout {
@@ -1013,16 +1104,18 @@ impl DelugeClient {
             "id": 1
         })
         .to_string();
-        let text = self
-            .client
-            .post(&self.rpc_url)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("Deluge RPC request failed: {error}")))?
-            .text()
-            .map_err(|error| client_error(format!("failed to read Deluge RPC: {error}")))?;
+        let text = block_on_client(async {
+            self.client
+                .post(&self.rpc_url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        })?
+        .map_err(|error| client_error(format!("Deluge RPC request failed: {error}")))?;
         let response = serde_json::from_str::<DelugeRpcResponse>(&text)
             .map_err(|error| client_error(format!("failed to parse Deluge RPC: {error}")))?;
         if let Some(error) = response.error {
@@ -1214,6 +1307,17 @@ impl TorrentClient for DelugeClient {
             .collect())
     }
 
+    fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
+        let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(if torrent.complete() {
+            0
+        } else {
+            torrent.total_remaining.unwrap_or(metafile.length)
+        }))
+    }
+
     fn inject(
         &self,
         new_torrent: &NewTorrent<'_>,
@@ -1293,7 +1397,7 @@ pub struct RtorrentClient {
     rpc_url: String,
     username: String,
     password: Option<String>,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 impl RtorrentClient {
@@ -1307,8 +1411,8 @@ impl RtorrentClient {
             .map_err(|()| client_error("failed to sanitize rTorrent username"))?;
         url.set_password(None)
             .map_err(|()| client_error("failed to sanitize rTorrent password"))?;
-        let mut builder = reqwest::blocking::Client::builder()
-            .user_agent(format!("CrossSeed/{}", crate::VERSION));
+        let mut builder =
+            reqwest::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
@@ -1334,12 +1438,11 @@ impl RtorrentClient {
         if let Some(password) = &self.password {
             request = request.basic_auth(&self.username, Some(password));
         }
-        let text = request
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| client_error(format!("rTorrent XML-RPC request failed: {error}")))?
-            .text()
-            .map_err(|error| client_error(format!("failed to read rTorrent XML-RPC: {error}")))?;
+        let text =
+            block_on_client(async { request.send().await?.error_for_status()?.text().await })?
+                .map_err(|error| {
+                    client_error(format!("rTorrent XML-RPC request failed: {error}"))
+                })?;
         rt_parse_response(&text)
     }
 
@@ -1491,6 +1594,17 @@ impl TorrentClient for RtorrentClient {
             output.insert(hash, PathBuf::from(torrent.directory));
         }
         Ok(output)
+    }
+
+    fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
+        let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(if torrent.complete() {
+            0
+        } else {
+            u64::try_from(torrent.left_bytes).unwrap_or(metafile.length)
+        }))
     }
 
     fn inject(
@@ -1749,6 +1863,8 @@ struct QbTorrentInfo {
     #[serde(default)]
     progress: f64,
     #[serde(default)]
+    amount_left: Option<u64>,
+    #[serde(default)]
     state: String,
 }
 
@@ -1844,6 +1960,8 @@ struct TransmissionTorrent {
     labels: Vec<String>,
     #[serde(rename = "percentDone", default)]
     percent_done: f64,
+    #[serde(rename = "leftUntilDone", default)]
+    left_until_done: Option<u64>,
     #[serde(default)]
     status: i64,
 }
@@ -1892,6 +2010,8 @@ struct DelugeTorrent {
     label: Option<String>,
     #[serde(default)]
     progress: f64,
+    #[serde(default)]
+    total_remaining: Option<u64>,
     #[serde(default)]
     state: String,
 }
@@ -2424,6 +2544,23 @@ fn client_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     }
 }
 
+fn block_on_client<F, T>(future: F) -> crate::Result<T>
+where
+    F: Future<Output = T>,
+{
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| client_error(format!("failed to build client runtime: {error}")))?;
+    Ok(runtime.block_on(future))
+}
+
+fn block_on_client_delay(delay: Duration) -> crate::Result<()> {
+    block_on_client(async {
+        tokio::time::sleep(delay).await;
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2444,7 +2581,7 @@ mod tests {
         fs,
         io::{Read, Write},
         net::TcpListener,
-        path::PathBuf,
+        path::{Path, PathBuf},
         thread,
         time::Duration,
     };
@@ -2773,6 +2910,77 @@ mod tests {
             !requests
                 .iter()
                 .any(|request| request.contains("GET /api/v2/torrents/info "))
+        );
+    }
+
+    #[test]
+    fn qbittorrent_download_dir_lookup_stops_at_first_match() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"[{{"hash":"{hash}","name":"Example","save_path":"/downloads","progress":1.0,"state":"uploading"}}]"#
+                ),
+            ),
+        ]);
+        let client = qb_client(&server.url);
+        let mut seen = Vec::new();
+
+        let found = client
+            .has_matching_download_dir(&mut |download_dir| {
+                seen.push(download_dir.to_path_buf());
+                Ok(download_dir == Path::new("/downloads"))
+            })
+            .expect("lookup");
+
+        assert!(found);
+        assert_eq!(seen, vec![PathBuf::from("/downloads")]);
+        let requests = server.join();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("GET /api/v2/torrents/info?offset="))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn qbittorrent_remaining_bytes_uses_single_info_lookup() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response("200 OK", "Ok."),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"[{{"hash":"{hash}","name":"Example","save_path":"/downloads","progress":0.5,"amount_left":42,"state":"downloading"}}]"#
+                ),
+            ),
+        ]);
+        let client = qb_client(&server.url);
+        let metafile = Metafile::from_files(
+            InfoHash::new(hash).expect("hash").into_owned(),
+            "Example".to_owned(),
+            "Example".to_owned(),
+            42,
+            vec![File::new("Example.mkv", 42)],
+        );
+
+        let remaining = client.remaining_bytes(&metafile).expect("remaining");
+
+        assert_eq!(remaining, Some(42));
+        let requests = server.join();
+        assert!(requests.iter().any(|request| {
+            request.contains(
+                "GET /api/v2/torrents/info?hashes=0123456789abcdef0123456789abcdef01234567 ",
+            )
+        }));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("/api/v2/torrents/files"))
         );
     }
 
