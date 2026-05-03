@@ -966,18 +966,24 @@ pub async fn validate_arr_instance_async(
     timeout: Option<Duration>,
 ) -> crate::Result<()> {
     let client = arr_client(timeout)?;
-    let response = client
-        .get(format!("{}/api", config.url))
-        .header("X-Api-Key", &config.apikey)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|error| integration_error(format!("failed to validate Arr instance: {error}")))?
-        .text()
-        .await
-        .map_err(|error| {
-            integration_error(format!("failed to read Arr validation response: {error}"))
-        })?;
+    let response = retry_arr_request(
+        client,
+        format!("{}/api", config.url),
+        config.apikey.clone(),
+        None,
+        "arr_validate",
+        config.url.clone(),
+        current_time_millis(),
+    )
+    .await
+    .map_err(|error| integration_error(format!("failed to validate Arr instance: {error}")))?
+    .error_for_status()
+    .map_err(|error| integration_error(format!("failed to validate Arr instance: {error}")))?
+    .text()
+    .await
+    .map_err(|error| {
+        integration_error(format!("failed to read Arr validation response: {error}"))
+    })?;
     let response: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
         integration_error(format!("failed to read Arr validation JSON: {error}"))
     })?;
@@ -1008,22 +1014,68 @@ pub async fn lookup_arr_ids_async(
     let client = arr_client(timeout.or(Some(Duration::from_secs(30))))?;
     for config in arr_configs_for_media(configs, searchee.media_type) {
         let query_title = prepare_arr_title(searchee, config.kind);
-        let response = client
-            .get(format!("{}/api/v3/parse", config.url))
-            .header("X-Api-Key", &config.apikey)
-            .query(&[("title", query_title.as_str())])
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| integration_error(format!("failed to parse title with Arr: {error}")))?
-            .text()
-            .await
-            .map_err(|error| {
-                integration_error(format!("failed to read Arr parse response: {error}"))
-            })?;
-        let response: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
-            integration_error(format!("failed to read Arr parse JSON: {error}"))
-        })?;
+        let response = match retry_arr_request(
+            client.clone(),
+            format!("{}/api/v3/parse", config.url),
+            config.apikey.clone(),
+            Some(query_title.clone()),
+            "arr_parse",
+            config.url.clone(),
+            current_time_millis(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    arr_kind = ?config.kind,
+                    base_url = %config.url,
+                    title = %query_title,
+                    error = %error,
+                    "Arr parse retries exhausted",
+                );
+                continue;
+            }
+        };
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    arr_kind = ?config.kind,
+                    base_url = %config.url,
+                    title = %query_title,
+                    error = %error,
+                    "Arr parse request failed",
+                );
+                continue;
+            }
+        };
+        let response = match response.text().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    arr_kind = ?config.kind,
+                    base_url = %config.url,
+                    title = %query_title,
+                    error = %error,
+                    "failed to read Arr parse response",
+                );
+                continue;
+            }
+        };
+        let response: serde_json::Value = match serde_json::from_str(&response) {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    arr_kind = ?config.kind,
+                    base_url = %config.url,
+                    title = %query_title,
+                    error = %error,
+                    "failed to read Arr parse JSON",
+                );
+                continue;
+            }
+        };
         let ids = extract_arr_ids(&response);
         if arr_ids_present(&ids) {
             let cache_key = arr_search_cache_key(searchee.title.as_ref(), &ids);
@@ -1406,28 +1458,29 @@ pub async fn fetch_torznab_caps_async(indexer: &TorznabConfig) -> crate::Result<
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct TorznabRetryFailure {
+struct HttpRetryFailure {
     message: String,
     status: Option<reqwest::StatusCode>,
     retry_after: Option<Duration>,
 }
 
-impl std::fmt::Display for TorznabRetryFailure {
+impl std::fmt::Display for HttpRetryFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
-impl std::error::Error for TorznabRetryFailure {}
+impl std::error::Error for HttpRetryFailure {}
 
-async fn retry_torznab_request(
+async fn retry_arr_request(
     client: reqwest::Client,
     request_url: String,
+    api_key: String,
+    title: Option<String>,
     operation: &'static str,
     target: String,
     now_millis: u64,
-    terminal_rate_limit: bool,
-) -> Result<reqwest::Response, RetryError<TorznabRetryFailure>> {
+) -> Result<reqwest::Response, RetryError<HttpRetryFailure>> {
     retry(
         RetryPolicy::idempotent(),
         RetryContext::new(operation, tokio_util::sync::CancellationToken::new())
@@ -1435,21 +1488,25 @@ async fn retry_torznab_request(
         move |_attempt| {
             let client = client.clone();
             let request_url = request_url.clone();
+            let api_key = api_key.clone();
+            let title = title.clone();
             async move {
-                match client.get(request_url).send().await {
-                    Ok(response) => {
-                        classify_torznab_response(response, now_millis, terminal_rate_limit)
-                    }
+                let mut request = client.get(request_url).header("X-Api-Key", api_key);
+                if let Some(title) = title.as_deref() {
+                    request = request.query(&[("title", title)]);
+                }
+                match request.send().await {
+                    Ok(response) => classify_retry_response(response, now_millis, false),
                     Err(error) => match classify_reqwest_error(&error) {
                         RetryClass::Retryable { retry_after } => RetryDecision::Retryable {
-                            error: TorznabRetryFailure {
+                            error: HttpRetryFailure {
                                 message: error.to_string(),
                                 status: error.status(),
                                 retry_after,
                             },
                             retry_after,
                         },
-                        RetryClass::Fatal => RetryDecision::Fatal(TorznabRetryFailure {
+                        RetryClass::Fatal => RetryDecision::Fatal(HttpRetryFailure {
                             message: error.to_string(),
                             status: error.status(),
                             retry_after: None,
@@ -1462,11 +1519,53 @@ async fn retry_torznab_request(
     .await
 }
 
-fn classify_torznab_response(
+async fn retry_torznab_request(
+    client: reqwest::Client,
+    request_url: String,
+    operation: &'static str,
+    target: String,
+    now_millis: u64,
+    terminal_rate_limit: bool,
+) -> Result<reqwest::Response, RetryError<HttpRetryFailure>> {
+    retry(
+        RetryPolicy::idempotent(),
+        RetryContext::new(operation, tokio_util::sync::CancellationToken::new())
+            .with_target(target),
+        move |_attempt| {
+            let client = client.clone();
+            let request_url = request_url.clone();
+            async move {
+                match client.get(request_url).send().await {
+                    Ok(response) => {
+                        classify_retry_response(response, now_millis, terminal_rate_limit)
+                    }
+                    Err(error) => match classify_reqwest_error(&error) {
+                        RetryClass::Retryable { retry_after } => RetryDecision::Retryable {
+                            error: HttpRetryFailure {
+                                message: error.to_string(),
+                                status: error.status(),
+                                retry_after,
+                            },
+                            retry_after,
+                        },
+                        RetryClass::Fatal => RetryDecision::Fatal(HttpRetryFailure {
+                            message: error.to_string(),
+                            status: error.status(),
+                            retry_after: None,
+                        }),
+                    },
+                }
+            }
+        },
+    )
+    .await
+}
+
+fn classify_retry_response(
     response: reqwest::Response,
     now_millis: u64,
     terminal_rate_limit: bool,
-) -> RetryDecision<reqwest::Response, TorznabRetryFailure> {
+) -> RetryDecision<reqwest::Response, HttpRetryFailure> {
     let status = response.status();
     if status.is_success()
         || (terminal_rate_limit && status == reqwest::StatusCode::TOO_MANY_REQUESTS)
@@ -1475,8 +1574,8 @@ fn classify_torznab_response(
     }
     match classify_http_status(status, response.headers(), now_millis) {
         RetryClass::Retryable { retry_after } => RetryDecision::Retryable {
-            error: TorznabRetryFailure {
-                message: format!("Torznab request returned HTTP {status}"),
+            error: HttpRetryFailure {
+                message: format!("HTTP request returned {status}"),
                 status: Some(status),
                 retry_after,
             },
@@ -1498,7 +1597,7 @@ fn torznab_caps_url(indexer: &TorznabConfig) -> crate::Result<String> {
 fn snooze_indexer_for_retry_error(
     database: &Database,
     indexer_id: i64,
-    error: &RetryError<TorznabRetryFailure>,
+    error: &RetryError<HttpRetryFailure>,
     now_millis: u64,
 ) -> crate::Result<()> {
     let failure = match error {
@@ -2605,6 +2704,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_arr_instance_retries_transient_status() {
+        let server = http_server(vec![
+            http_response("503 Service Unavailable", &[], ""),
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/json")],
+                r#"{"current":"4.0.0"}"#,
+            ),
+        ]);
+        let config = validate_arr_url(&format!("{}?apikey=secret", server.url), ArrKind::Sonarr)
+            .expect("config");
+
+        validate_arr_instance(&config, Some(Duration::from_secs(1))).expect("validate");
+
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
     fn looks_up_arr_ids_and_prepares_titles() {
         let server = http_server(vec![http_response(
             "200 OK",
@@ -2631,6 +2749,39 @@ mod tests {
         assert!(lookup.cache_key.contains("tvdbid=123"));
         let requests = server.join();
         assert!(requests[0].contains("/api/v3/parse?title=Example.Show.S01E02"));
+    }
+
+    #[test]
+    fn arr_lookup_continues_after_retry_exhaustion() {
+        let server = http_server(vec![
+            http_response("500 Internal Server Error", &[], ""),
+            http_response("500 Internal Server Error", &[], ""),
+            http_response("500 Internal Server Error", &[], ""),
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/json")],
+                r#"{"movie":{"tmdbId":888,"imdbId":"tt888"}}"#,
+            ),
+        ]);
+        let sonarr = validate_arr_url(&format!("{}?apikey=sonarr", server.url), ArrKind::Sonarr)
+            .expect("sonarr");
+        let radarr = validate_arr_url(&format!("{}?apikey=radarr", server.url), ArrKind::Radarr)
+            .expect("radarr");
+        let mut searchee = Searchee::from_files(
+            "Loose.Video.1080p.WEB-DL-GRP",
+            "Loose.Video.1080p.WEB-DL-GRP",
+            vec![File::new("Loose.Video.1080p.WEB-DL-GRP.mkv", 10)],
+        );
+        searchee.media_type = MediaType::Video;
+
+        let lookup = lookup_arr_ids(&[sonarr, radarr], &searchee, Some(Duration::from_secs(1)))
+            .expect("lookup")
+            .expect("ids");
+
+        assert_eq!(lookup.ids.tmdbid.as_deref(), Some("888"));
+        assert_eq!(lookup.ids.imdbid.as_deref(), Some("tt888"));
+        let requests = server.join();
+        assert_eq!(requests.len(), 4);
     }
 
     #[test]
