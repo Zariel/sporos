@@ -8,8 +8,8 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    AssertSqlSafe, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 
 use crate::{
@@ -441,25 +441,24 @@ impl AsyncDatabase {
     }
 
     /// Open a database file and expose a sqlx SQLite pool.
-    ///
-    /// Schema bootstrap still goes through the existing synchronous
-    /// `Database` boundary until migrations move to sqlx.
     pub async fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        {
-            let database = Database::open(&path)?;
-            drop(database);
-        }
-
         let options = SqliteConnectOptions::new()
             .filename(&path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .connect_with(options)
             .await
             .map_err(sqlx_error)?;
 
-        Ok(Self { path, pool })
+        let database = Self { path, pool };
+        if let Err(error) = database.initialize().await {
+            database.pool.close().await;
+            return Err(error);
+        }
+        Ok(database)
     }
 
     /// Database file path used by this pool.
@@ -472,9 +471,49 @@ impl AsyncDatabase {
         &self.pool
     }
 
+    /// Run pending sqlx schema migrations and set SQLite pragmas.
+    pub async fn initialize(&self) -> crate::Result<()> {
+        sqlx::raw_sql(PRAGMAS)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+
+        let current_version = self.schema_version().await?;
+        if current_version > CURRENT_SCHEMA_VERSION {
+            return Err(persistence_message(format!(
+                "database schema version {current_version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
+            )));
+        }
+        for migration in MIGRATIONS {
+            if migration.version > current_version {
+                sqlx::raw_sql(migration.sql)
+                    .execute(self.pool())
+                    .await
+                    .map_err(sqlx_error)?;
+                self.set_schema_version(migration.version).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Close all pool connections.
     pub async fn close(self) {
         self.pool.close().await;
+    }
+
+    async fn schema_version(&self) -> crate::Result<i64> {
+        sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(self.pool())
+            .await
+            .map_err(sqlx_error)
+    }
+
+    async fn set_schema_version(&self, version: i64) -> crate::Result<()> {
+        sqlx::raw_sql(AssertSqlSafe(format!("PRAGMA user_version = {version}")))
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
     }
 }
 
@@ -821,6 +860,53 @@ mod tests {
             .await
             .expect("schema version");
         assert_eq!(user_version, super::CURRENT_SCHEMA_VERSION);
+
+        database.close().await;
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn async_database_migrates_legacy_schema_with_sqlx() {
+        let root = temp_path("async-migration");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database_path = Database::path_for_app_dir(&root);
+        let connection = rusqlite::Connection::open(&database_path).expect("raw database");
+        connection.execute_batch(super::SCHEMA).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
+                 VALUES (NULL, '/data/show/file.mkv', NULL, 'old show s01', '1');
+                 INSERT INTO ensemble (client_host, path, info_hash, ensemble, element)
+                 VALUES (
+                    NULL,
+                    '/data/show/file.mkv',
+                    '0123456789abcdef0123456789abcdef01234567',
+                    'new show s01',
+                    '2'
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .expect("legacy duplicate rows");
+        drop(connection);
+
+        let database = AsyncDatabase::open(&database_path)
+            .await
+            .expect("migrated database");
+
+        let row: (i64, Option<String>, String, String) =
+            sqlx::query_as("SELECT COUNT(*), info_hash, ensemble, element FROM ensemble")
+                .fetch_one(database.pool())
+                .await
+                .expect("ensemble row");
+        assert_eq!(
+            row,
+            (
+                1,
+                Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+                "new show s01".to_owned(),
+                "2".to_owned()
+            )
+        );
 
         database.close().await;
         let _cleanup = fs::remove_dir_all(root);
