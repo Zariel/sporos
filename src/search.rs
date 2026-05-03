@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -472,16 +472,27 @@ pub struct SearchPipelineRuntime<'a, 'b> {
     pub cache: &'b mut CandidateSearchCache,
 }
 
-/// One-permit guard for RSS and announce reverse lookups.
-#[derive(Debug, Default)]
+static SHARED_REVERSE_LOOKUP_PERMIT: LazyLock<Arc<Mutex<()>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(())));
+
+/// One-permit shared gate for RSS and announce reverse lookups.
+#[derive(Debug, Clone)]
 pub struct ReverseLookupGate {
-    permit: Mutex<()>,
+    permit: Arc<Mutex<()>>,
 }
 
 impl ReverseLookupGate {
-    /// Create a new reverse lookup gate.
+    /// Create a handle to the shared reverse lookup gate.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            permit: Arc::clone(&SHARED_REVERSE_LOOKUP_PERMIT),
+        }
+    }
+}
+
+impl Default for ReverseLookupGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -3416,6 +3427,15 @@ mod tests {
         assert_eq!(attempt.decision, Decision::MatchSizeOnly);
         assert_eq!(actions, 1);
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reverse_lookup_gates_share_one_runtime_permit() {
+        let first = super::ReverseLookupGate::new();
+        let second = super::ReverseLookupGate::new();
+        let _held = first.permit.lock().expect("first gate");
+
+        assert!(second.permit.try_lock().is_err());
     }
 
     #[test]
