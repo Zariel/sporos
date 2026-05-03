@@ -6,7 +6,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{LazyLock, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -29,7 +29,27 @@ use crate::{
     },
 };
 
-static CLIENT_INJECTION: Mutex<()> = Mutex::new(());
+static INJECTION_ACTOR: LazyLock<InjectionActor> = LazyLock::new(InjectionActor::new);
+
+struct InjectionActor {
+    permit: Mutex<()>,
+}
+
+impl InjectionActor {
+    const fn new() -> Self {
+        Self {
+            permit: Mutex::new(()),
+        }
+    }
+
+    fn submit<T>(&self, command: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
+        let _permit = self
+            .permit
+            .lock()
+            .map_err(|_error| action_error("injection actor was poisoned"))?;
+        command()
+    }
+}
 
 /// Options for link creation.
 #[derive(Debug, Clone)]
@@ -146,10 +166,7 @@ pub fn perform_injection_action<N>(
 where
     N: FnMut(&SaveNotification) -> crate::Result<()>,
 {
-    let _guard = CLIENT_INJECTION
-        .lock()
-        .map_err(|_error| action_error("client injection mutex was poisoned"))?;
-    perform_injection_action_without_mutex(action, options, notify_saved)
+    INJECTION_ACTOR.submit(|| perform_injection_action_in_actor(action, options, notify_saved))
 }
 
 /// Retry injection for saved `.torrent` files in `inject_dir` or `output_dir`.
@@ -294,7 +311,7 @@ pub fn link_destination_dir(link_dir: &Path, tracker: &str, flat_linking: bool) 
     }
 }
 
-fn perform_injection_action_without_mutex<N>(
+fn perform_injection_action_in_actor<N>(
     action: &InjectionAction<'_>,
     options: &InjectionActionOptions<'_>,
     mut notify_saved: N,
