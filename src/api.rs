@@ -359,7 +359,7 @@ fn parse_webhook(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<We
     }
     if info_hash
         .as_ref()
-        .is_some_and(|info_hash| info_hash.len() != 40)
+        .is_some_and(|info_hash| !is_hex_hash(info_hash))
     {
         return Err(api_error("infoHash must be 40 hex characters"));
     }
@@ -478,6 +478,10 @@ fn split_target(target: &str) -> (String, BTreeMap<String, String>) {
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
     (path.to_owned(), query)
+}
+
+fn is_hex_hash(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn api_error(message: impl Into<Cow<'static, str>>) -> SporosError {
@@ -614,6 +618,55 @@ mod tests {
         assert_eq!(response.status, 409);
         assert_eq!(response.body, "rss: already running");
         assert_eq!(handlers.jobs[0].name, "rss");
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_non_hex_info_hash() {
+        let mut handlers = TestHandlers::default();
+
+        let response = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/webhook?apikey=secret",
+                BTreeMap::new(),
+                r#"{"infoHash":"gggggggggggggggggggggggggggggggggggggggg"}"#,
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .await
+        .expect("webhook");
+
+        assert_eq!(response.status, 400);
+        assert_eq!(
+            response.body,
+            "api error: infoHash must be 40 hex characters"
+        );
+        assert!(handlers.webhooks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_accepts_uppercase_hex_info_hash() {
+        let mut handlers = TestHandlers::default();
+
+        let response = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/webhook?apikey=secret",
+                BTreeMap::new(),
+                r#"{"infoHash":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .await
+        .expect("webhook");
+
+        assert_eq!(response.status, 204);
+        assert_eq!(
+            handlers.webhooks[0].info_hash.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[tokio::test]
