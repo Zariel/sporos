@@ -735,13 +735,33 @@ impl Database {
         trackers: &str,
     ) -> crate::Result<()> {
         self.block_on(async {
+            let tracker_values =
+                serde_json::from_str::<Vec<String>>(trackers).map_err(|error| {
+                    persistence_message(format!("failed to parse indexer trackers JSON: {error}"))
+                })?;
             sqlx::query("UPDATE indexer SET trackers = ?2 WHERE id = ?1")
                 .bind(indexer_id)
                 .bind(trackers)
                 .execute(self.pool())
                 .await
-                .map(|_| ())
-                .map_err(sqlx_error)
+                .map_err(sqlx_error)?;
+            sqlx::query("DELETE FROM indexer_tracker WHERE indexer_id = ?1")
+                .bind(indexer_id)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            for tracker in tracker_values {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO indexer_tracker (indexer_id, tracker)
+                     VALUES (?1, ?2)",
+                )
+                .bind(indexer_id)
+                .bind(tracker)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+            }
+            Ok(())
         })
     }
 
@@ -1227,20 +1247,67 @@ impl Database {
     pub fn indexer_tracker_rows(&self) -> crate::Result<Vec<IndexerTrackerRecord>> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT COALESCE(name, 'UnknownTracker'), trackers
-                 FROM indexer
-                 WHERE trackers IS NOT NULL",
+                "SELECT i.id, COALESCE(i.name, 'UnknownTracker'), t.tracker
+                 FROM indexer_tracker t
+                 JOIN indexer i ON i.id = t.indexer_id
+                 ORDER BY i.id, t.tracker",
             )
             .fetch_all(self.pool())
             .await
             .map_err(sqlx_error)?;
-            Ok(rows
-                .into_iter()
-                .map(|row| IndexerTrackerRecord {
-                    name: row.get(0),
-                    trackers: row.get(1),
-                })
-                .collect())
+            let mut output = Vec::new();
+            let mut current: Option<(i64, String, Vec<String>)> = None;
+            for row in rows {
+                let id = row.get::<i64, _>(0);
+                let row_name = row.get::<String, _>(1);
+                let tracker = row.get::<String, _>(2);
+                match &mut current {
+                    Some((current_id, _, trackers)) if *current_id == id => {
+                        trackers.push(tracker);
+                    }
+                    Some(_) => {
+                        let (_, name, trackers) = current.take().expect("current row");
+                        output.push(IndexerTrackerRecord {
+                            name,
+                            trackers: serde_json::to_string(&trackers).map_err(|error| {
+                                persistence_message(format!(
+                                    "failed to serialize indexer trackers JSON: {error}"
+                                ))
+                            })?,
+                        });
+                        current = Some((id, row_name, vec![tracker]));
+                    }
+                    None => current = Some((id, row_name, vec![tracker])),
+                }
+            }
+            if let Some((_, name, trackers)) = current {
+                output.push(IndexerTrackerRecord {
+                    name,
+                    trackers: serde_json::to_string(&trackers).map_err(|error| {
+                        persistence_message(format!(
+                            "failed to serialize indexer trackers JSON: {error}"
+                        ))
+                    })?,
+                });
+            }
+
+            let rows = sqlx::query(
+                "SELECT COALESCE(name, 'UnknownTracker'), trackers
+                 FROM indexer
+                 WHERE trackers IS NOT NULL
+                 AND NOT EXISTS (
+                    SELECT 1 FROM indexer_tracker
+                    WHERE indexer_tracker.indexer_id = indexer.id
+                 )",
+            )
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+            output.extend(rows.into_iter().map(|row| IndexerTrackerRecord {
+                name: row.get(0),
+                trackers: row.get(1),
+            }));
+            Ok(output)
         })
     }
 
@@ -1865,6 +1932,14 @@ CREATE TABLE IF NOT EXISTS indexer (
     limits_caps TEXT NULL
 );
 
+CREATE TABLE IF NOT EXISTS indexer_tracker (
+    indexer_id INTEGER NOT NULL REFERENCES indexer(id) ON DELETE CASCADE,
+    tracker TEXT NOT NULL,
+    PRIMARY KEY(indexer_id, tracker)
+);
+CREATE INDEX IF NOT EXISTS idx_indexer_tracker_lookup
+ON indexer_tracker(tracker, indexer_id);
+
 CREATE TABLE IF NOT EXISTS timestamp (
     searchee_id INTEGER NOT NULL REFERENCES searchee(id) ON DELETE CASCADE,
     indexer_id INTEGER NOT NULL REFERENCES indexer(id) ON DELETE CASCADE,
@@ -2258,6 +2333,7 @@ mod tests {
             "torrent",
             "job_log",
             "indexer",
+            "indexer_tracker",
             "timestamp",
             "settings",
             "rss",
@@ -2309,6 +2385,7 @@ mod tests {
         for index in [
             "idx_client_searchee_lookup",
             "idx_decision_guid_alias_lookup",
+            "idx_indexer_tracker_lookup",
             "idx_data_lookup",
             "idx_data_ensemble_root",
             "idx_data_ensemble_lookup",
@@ -2599,6 +2676,38 @@ mod tests {
             database.get_api_key().expect("api key"),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef".to_owned())
         );
+
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mirrors_indexer_trackers_to_child_rows() {
+        let root = temp_path("indexer-trackers");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        database
+            .execute_sql(
+                "INSERT INTO indexer (name, url, apikey, active)
+                 VALUES ('TrackerName', 'https://indexer.example/api', 'secret', 1)",
+                &[],
+            )
+            .expect("indexer");
+        let indexer_id = database
+            .indexer_id("https://indexer.example/api")
+            .expect("indexer id");
+
+        database
+            .update_indexer_trackers_json(indexer_id, r#"["tracker.b","tracker.a","tracker.a"]"#)
+            .expect("trackers");
+
+        let child_count: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM indexer_tracker", &[])
+            .expect("child count");
+        assert_eq!(child_count, 2);
+        let rows = database.indexer_tracker_rows().expect("tracker rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "TrackerName");
+        assert_eq!(rows[0].trackers, r#"["tracker.a","tracker.b"]"#);
 
         let _cleanup = fs::remove_dir_all(root);
     }
