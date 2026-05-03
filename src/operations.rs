@@ -4,7 +4,7 @@ use std::{
     borrow::Cow,
     collections::BTreeSet,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -275,6 +275,26 @@ pub fn cleanup_db(
     cleanup_db_with_clients(database, app_dir, config, now_millis, &[])
 }
 
+/// Run daily database and torrent-cache cleanup from async orchestration.
+pub async fn cleanup_db_async(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+    now_millis: i64,
+) -> crate::Result<CleanupDbResult> {
+    run_blocking_workflow("cleanup", move || {
+        let database = Database::open_app_dir(&app_dir)?;
+        let client_timeout = config.search_timeout.map(Duration::from_millis);
+        let client_adapters = if config.use_client_torrents {
+            build_torrent_clients(&config.torrent_clients, client_timeout)?
+        } else {
+            Vec::new()
+        };
+        let client_refs = client_refs(&client_adapters);
+        cleanup_db_with_clients(&database, &app_dir, &config, now_millis, &client_refs)
+    })
+    .await
+}
+
 /// Run daily database and torrent-cache cleanup with live client refresh.
 pub fn cleanup_db_with_clients(
     database: &Database,
@@ -361,6 +381,19 @@ pub fn run_search_workflow(
     })
 }
 
+/// Run one bulk search workflow from async orchestration.
+pub async fn run_search_workflow_async(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+    notifier: NotificationSender,
+) -> crate::Result<SearchWorkflowResult> {
+    run_blocking_workflow("search workflow", move || {
+        let database = Database::open_app_dir(&app_dir)?;
+        run_search_workflow(&database, &app_dir, &config, &notifier)
+    })
+    .await
+}
+
 /// Run one RSS reverse-match workflow.
 pub fn run_rss_workflow(
     database: &Database,
@@ -425,6 +458,19 @@ pub fn run_rss_workflow(
     })
 }
 
+/// Run one RSS reverse-match workflow from async orchestration.
+pub async fn run_rss_workflow_async(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+    notifier: NotificationSender,
+) -> crate::Result<RssWorkflowResult> {
+    run_blocking_workflow("rss workflow", move || {
+        let database = Database::open_app_dir(&app_dir)?;
+        run_rss_workflow(&database, &app_dir, &config, &notifier)
+    })
+    .await
+}
+
 /// Reverse-match one announce API candidate.
 pub fn run_announce_match(
     database: &Database,
@@ -480,6 +526,20 @@ pub fn run_announce_match(
         decision: attempt.decision,
         action_result: attempt.action_result,
     }))
+}
+
+/// Reverse-match one announce API candidate from async orchestration.
+pub async fn run_announce_match_async(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+    candidate: Candidate<'static>,
+    notifier: NotificationSender,
+) -> crate::Result<Option<ApiOutcome>> {
+    run_blocking_workflow("announce workflow", move || {
+        let database = Database::open_app_dir(&app_dir)?;
+        run_announce_match(&database, &app_dir, &config, candidate, &notifier)
+    })
+    .await
 }
 
 /// Run one targeted webhook search from an info hash or filesystem path.
@@ -567,6 +627,20 @@ pub fn run_webhook_search(
     Ok(summary)
 }
 
+/// Run one targeted webhook search from async orchestration.
+pub async fn run_webhook_search_async(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+    request: WebhookRequest,
+    notifier: NotificationSender,
+) -> crate::Result<PipelineSummary> {
+    run_blocking_workflow("webhook workflow", move || {
+        let database = Database::open_app_dir(&app_dir)?;
+        run_webhook_search(&database, &app_dir, &config, request, &notifier)
+    })
+    .await
+}
+
 /// Run one saved torrent injection workflow.
 pub fn run_inject_workflow(
     database: &Database,
@@ -605,6 +679,18 @@ pub fn run_inject_workflow(
     )
 }
 
+/// Run one saved torrent injection workflow from async orchestration.
+pub async fn run_inject_workflow_async(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+) -> crate::Result<SavedInjectionSummary> {
+    run_blocking_workflow("inject workflow", move || {
+        let database = Database::open_app_dir(&app_dir)?;
+        run_inject_workflow(&database, &app_dir, &config)
+    })
+    .await
+}
+
 /// Run one restore workflow.
 pub fn run_restore_workflow(
     database: &Database,
@@ -612,6 +698,18 @@ pub fn run_restore_workflow(
     config: &RuntimeConfig,
 ) -> crate::Result<RestoreSummary> {
     restore_from_torrent_cache(database, app_dir, &config.output_dir, |_| Ok(()))
+}
+
+/// Run one restore workflow from async orchestration.
+pub async fn run_restore_workflow_async(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+) -> crate::Result<RestoreSummary> {
+    run_blocking_workflow("restore workflow", move || {
+        let database = Database::open_app_dir(&app_dir)?;
+        run_restore_workflow(&database, &app_dir, &config)
+    })
+    .await
 }
 
 /// Refresh capabilities for configured Torznab indexers.
@@ -636,6 +734,18 @@ pub fn run_update_indexer_caps(
         result.updated += 1;
     }
     Ok(result)
+}
+
+/// Refresh capabilities for configured Torznab indexers from async orchestration.
+pub async fn run_update_indexer_caps_async(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+) -> crate::Result<IndexerCapsRefreshResult> {
+    run_blocking_workflow("indexer caps workflow", move || {
+        let database = Database::open_app_dir(&app_dir)?;
+        run_update_indexer_caps(&database, &config)
+    })
+    .await
 }
 
 /// Replace tracker URLs inside cached torrent files.
@@ -1402,6 +1512,18 @@ fn persistence_error(error: rusqlite::Error) -> SporosError {
     SporosError::Persistence {
         message: Cow::Owned(error.to_string()),
     }
+}
+
+async fn run_blocking_workflow<T>(
+    name: &'static str,
+    task: impl FnOnce() -> crate::Result<T> + Send + 'static,
+) -> crate::Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| operation_error(format!("{name} task failed: {error}")))?
 }
 
 fn operation_error(message: impl Into<Cow<'static, str>>) -> SporosError {

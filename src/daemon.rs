@@ -27,7 +27,6 @@ use crate::{
         AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, JobRequest, JobResponse,
         WebhookRequest, handle_api_request,
     },
-    clients::build_torrent_clients,
     config::RuntimeConfig,
     persistence::{AsyncDatabase, DataRootRecord, Database},
     scheduler::{DaemonPlan, DaemonRun, JobName, Scheduler},
@@ -74,7 +73,7 @@ async fn run_plan(
             index_torrents_and_data_dirs(config, database)
         })
         .await?;
-    execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &run.jobs)?;
+    execute_ran_jobs(app_dir, config, &mut plan.scheduler, &run.jobs).await?;
 
     let mut server_state = None;
     let server = if let Some(address) = listen_address(config) {
@@ -114,10 +113,10 @@ async fn run_plan(
                 if let Some(state) = &server_state {
                     let mut scheduler = state.scheduler.lock().await;
                     let results = scheduler.check_jobs_async(&async_database, now, false).await?;
-                    execute_ran_jobs(app_dir, config, database, &mut scheduler, &results)?;
+                    execute_ran_jobs(app_dir, config, &mut scheduler, &results).await?;
                 } else {
                     let results = plan.scheduler.check_jobs_async(&async_database, now, false).await?;
-                    execute_ran_jobs(app_dir, config, database, &mut plan.scheduler, &results)?;
+                    execute_ran_jobs(app_dir, config, &mut plan.scheduler, &results).await?;
                 }
                 iterations = iterations.saturating_add(1);
             }
@@ -229,10 +228,9 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn execute_ran_jobs(
+async fn execute_ran_jobs(
     app_dir: &Path,
     config: &RuntimeConfig,
-    database: &Database,
     scheduler: &mut Scheduler,
     results: &[crate::scheduler::JobCheckResult],
 ) -> crate::Result<()> {
@@ -240,95 +238,103 @@ fn execute_ran_jobs(
         if !result.ran {
             continue;
         }
-        let job_result = (|| -> crate::Result<()> {
-            match result.name {
-                JobName::Rss => {
-                    let notifier = crate::notifications::NotificationSender::from_config(
-                        config,
-                        crate::startup::Redactor::from_config(config),
-                    )?;
-                    let rss =
-                        crate::operations::run_rss_workflow(database, app_dir, config, &notifier)?;
-                    tracing::info!(
-                        candidates = rss.candidates,
-                        attempts = rss.attempts,
-                        "rss job completed"
-                    );
-                }
-                JobName::Search => {
-                    let notifier = crate::notifications::NotificationSender::from_config(
-                        config,
-                        crate::startup::Redactor::from_config(config),
-                    )?;
-                    let search = crate::operations::run_search_workflow(
-                        database, app_dir, config, &notifier,
-                    )?;
-                    tracing::info!(
-                        searchees = search.searchees,
-                        indexers = search.indexers,
-                        candidates = search.pipeline.candidates_assessed,
-                        attempts = search.pipeline.attempts.len(),
-                        "search job completed"
-                    );
-                }
-                JobName::UpdateIndexerCaps => {
-                    let caps = crate::operations::run_update_indexer_caps(database, config)?;
-                    tracing::info!(
-                        indexers = caps.indexers,
-                        updated = caps.updated,
-                        "indexer caps job completed"
-                    );
-                }
-                JobName::Inject => {
-                    let inject = crate::operations::run_inject_workflow(database, app_dir, config)?;
-                    tracing::info!(
-                        scanned = inject.scanned,
-                        injected = inject.injected,
-                        already_exists = inject.already_exists,
-                        incomplete = inject.incomplete,
-                        failed = inject.failed,
-                        deleted = inject.deleted,
-                        "inject job completed"
-                    );
-                }
-                JobName::Cleanup => {
-                    let client_timeout = config.search_timeout.map(Duration::from_millis);
-                    let client_adapters = if config.use_client_torrents {
-                        build_torrent_clients(&config.torrent_clients, client_timeout)?
-                    } else {
-                        Vec::new()
-                    };
-                    let client_refs = client_adapters
-                        .iter()
-                        .map(|client| client.as_ref())
-                        .collect::<Vec<_>>();
-                    let cleanup = crate::operations::cleanup_db_with_clients(
-                        database,
-                        app_dir,
-                        config,
-                        now_millis(),
-                        &client_refs,
-                    )?;
-                    tracing::info!(
-                        client_searchees_refreshed = cleanup.client_searchees_refreshed,
-                        client_searchees_pruned = cleanup.client_searchees_pruned,
-                        client_ensemble_rows_rebuilt = cleanup.client_ensemble_rows_rebuilt,
-                        data_rows_removed = cleanup.data_rows_removed,
-                        ensemble_rows_removed = cleanup.ensemble_rows_removed,
-                        torrent_cache_files_removed = cleanup.torrent_cache_files_removed,
-                        null_decisions_removed = cleanup.null_decisions_removed,
-                        missing_cache_decisions_removed = cleanup.missing_cache_decisions_removed,
-                        catastrophic_decision_cleanup_skipped =
-                            cleanup.catastrophic_decision_cleanup_skipped,
-                        guid_info_hash_rows = cleanup.guid_info_hash_rows,
-                        "cleanup job completed"
-                    );
-                }
-            }
-            Ok(())
-        })();
+        let job_result = execute_ran_job(app_dir, config, result.name).await;
         scheduler.finish_job(result.name);
         job_result?;
+    }
+    Ok(())
+}
+
+async fn execute_ran_job(
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    name: JobName,
+) -> crate::Result<()> {
+    match name {
+        JobName::Rss => {
+            let notifier = crate::notifications::NotificationSender::from_config(
+                config,
+                crate::startup::Redactor::from_config(config),
+            )?;
+            let rss = crate::operations::run_rss_workflow_async(
+                app_dir.to_path_buf(),
+                config.clone(),
+                notifier,
+            )
+            .await?;
+            tracing::info!(
+                candidates = rss.candidates,
+                attempts = rss.attempts,
+                "rss job completed"
+            );
+        }
+        JobName::Search => {
+            let notifier = crate::notifications::NotificationSender::from_config(
+                config,
+                crate::startup::Redactor::from_config(config),
+            )?;
+            let search = crate::operations::run_search_workflow_async(
+                app_dir.to_path_buf(),
+                config.clone(),
+                notifier,
+            )
+            .await?;
+            tracing::info!(
+                searchees = search.searchees,
+                indexers = search.indexers,
+                candidates = search.pipeline.candidates_assessed,
+                attempts = search.pipeline.attempts.len(),
+                "search job completed"
+            );
+        }
+        JobName::UpdateIndexerCaps => {
+            let caps = crate::operations::run_update_indexer_caps_async(
+                app_dir.to_path_buf(),
+                config.clone(),
+            )
+            .await?;
+            tracing::info!(
+                indexers = caps.indexers,
+                updated = caps.updated,
+                "indexer caps job completed"
+            );
+        }
+        JobName::Inject => {
+            let inject =
+                crate::operations::run_inject_workflow_async(app_dir.to_path_buf(), config.clone())
+                    .await?;
+            tracing::info!(
+                scanned = inject.scanned,
+                injected = inject.injected,
+                already_exists = inject.already_exists,
+                incomplete = inject.incomplete,
+                failed = inject.failed,
+                deleted = inject.deleted,
+                "inject job completed"
+            );
+        }
+        JobName::Cleanup => {
+            let cleanup = crate::operations::cleanup_db_async(
+                app_dir.to_path_buf(),
+                config.clone(),
+                now_millis(),
+            )
+            .await?;
+            tracing::info!(
+                client_searchees_refreshed = cleanup.client_searchees_refreshed,
+                client_searchees_pruned = cleanup.client_searchees_pruned,
+                client_ensemble_rows_rebuilt = cleanup.client_ensemble_rows_rebuilt,
+                data_rows_removed = cleanup.data_rows_removed,
+                ensemble_rows_removed = cleanup.ensemble_rows_removed,
+                torrent_cache_files_removed = cleanup.torrent_cache_files_removed,
+                null_decisions_removed = cleanup.null_decisions_removed,
+                missing_cache_decisions_removed = cleanup.missing_cache_decisions_removed,
+                catastrophic_decision_cleanup_skipped =
+                    cleanup.catastrophic_decision_cleanup_skipped,
+                guid_info_hash_rows = cleanup.guid_info_hash_rows,
+                "cleanup job completed"
+            );
+        }
     }
     Ok(())
 }
@@ -407,8 +413,8 @@ impl RuntimeHandlers<'_> {
         for request in self.webhook_requests {
             let app_dir = PathBuf::from(self.app_dir);
             let config = self.config.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Err(error) = run_webhook_worker(&app_dir, &config, request) {
+            tokio::spawn(async move {
+                if let Err(error) = run_webhook_worker(app_dir, config, request).await {
                     tracing::error!("webhook background work failed: {error}");
                 }
             });
@@ -428,14 +434,13 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             self.config,
             crate::startup::Redactor::from_config(self.config),
         )?;
-        let database = Database::open_app_dir(self.app_dir)?;
-        crate::operations::run_announce_match(
-            &database,
-            self.app_dir,
-            self.config,
+        crate::operations::run_announce_match_async(
+            self.app_dir.to_path_buf(),
+            self.config.clone(),
             request.into_candidate(),
-            &notifier,
+            notifier,
         )
+        .await
     }
 
     async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {
@@ -464,26 +469,19 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 .scheduler
                 .check_jobs_async(self.async_database, self.now_millis, false)
                 .await?;
-            let database = Database::open_app_dir(self.app_dir)?;
-            execute_ran_jobs(
-                self.app_dir,
-                self.config,
-                &database,
-                self.scheduler,
-                &results,
-            )?;
+            execute_ran_jobs(self.app_dir, self.config, self.scheduler, &results).await?;
         }
         Ok(response)
     }
 }
 
-fn run_webhook_worker(
-    app_dir: &Path,
-    config: &RuntimeConfig,
+async fn run_webhook_worker(
+    app_dir: PathBuf,
+    config: RuntimeConfig,
     request: WebhookRequest,
 ) -> crate::Result<()> {
-    let database = Database::open_app_dir(app_dir)?;
-    let mut plan = DaemonPlan::from_config(config);
+    let async_database = AsyncDatabase::open_app_dir(&app_dir).await?;
+    let mut plan = DaemonPlan::from_config(&config);
     let now = now_millis();
     if plan
         .scheduler
@@ -493,16 +491,21 @@ fn run_webhook_worker(
     {
         let _response = plan
             .scheduler
-            .request_early_run(&database, JobName::Inject, now)?;
-        let results = plan.scheduler.check_jobs(&database, now, false)?;
-        execute_ran_jobs(app_dir, config, &database, &mut plan.scheduler, &results)?;
+            .request_early_run_async(&async_database, JobName::Inject, now)
+            .await?;
+        let results = plan
+            .scheduler
+            .check_jobs_async(&async_database, now, false)
+            .await?;
+        execute_ran_jobs(&app_dir, &config, &mut plan.scheduler, &results).await?;
     }
     let notifier = crate::notifications::NotificationSender::from_config(
-        config,
-        crate::startup::Redactor::from_config(config),
+        &config,
+        crate::startup::Redactor::from_config(&config),
     )?;
     let summary =
-        crate::operations::run_webhook_search(&database, app_dir, config, request, &notifier)?;
+        crate::operations::run_webhook_search_async(app_dir.clone(), config, request, notifier)
+            .await?;
     tracing::info!(
         searchees = summary.searchees_seen,
         indexer_searches = summary.indexer_searches,
@@ -510,6 +513,7 @@ fn run_webhook_worker(
         attempts = summary.attempts.len(),
         "webhook targeted search completed"
     );
+    async_database.close().await;
     Ok(())
 }
 
