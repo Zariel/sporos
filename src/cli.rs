@@ -143,7 +143,7 @@ where
                 result.searchees,
                 result.indexers,
                 result.pipeline.candidates_assessed,
-                result.pipeline.attempts.len()
+                result.pipeline.attempts_total
             );
         }
         Some(("rss", matches)) => {

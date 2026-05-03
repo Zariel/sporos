@@ -425,7 +425,7 @@ pub fn run_rss_workflow(
         app_dir,
         options: &options,
     };
-    let mut attempts = Vec::new();
+    let mut attempts = 0usize;
     let candidates = for_each_rss_page(
         database,
         &indexers,
@@ -436,7 +436,7 @@ pub fn run_rss_workflow(
             now_millis,
         },
         |page| {
-            attempts.extend(check_new_candidate_matches(
+            let page_attempts = check_new_candidate_matches(
                 &runtime,
                 page,
                 &local,
@@ -445,13 +445,14 @@ pub fn run_rss_workflow(
                     let _report = notifier.send_result(attempt);
                     Ok(())
                 },
-            )?);
+            )?;
+            attempts = attempts.saturating_add(page_attempts.len());
             Ok(())
         },
     )?;
     Ok(RssWorkflowResult {
         candidates,
-        attempts: attempts.len(),
+        attempts,
     })
 }
 
@@ -615,17 +616,7 @@ pub fn run_webhook_search(
                 Ok(())
             },
         )?;
-        summary.searchees_seen = summary.searchees_seen.saturating_add(result.searchees_seen);
-        summary.searchees_filtered = summary
-            .searchees_filtered
-            .saturating_add(result.searchees_filtered);
-        summary.indexer_searches = summary
-            .indexer_searches
-            .saturating_add(result.indexer_searches);
-        summary.candidates_assessed = summary
-            .candidates_assessed
-            .saturating_add(result.candidates_assessed);
-        summary.attempts.extend(result.attempts);
+        summary.merge(result);
     }
     Ok(summary)
 }

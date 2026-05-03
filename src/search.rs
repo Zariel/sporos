@@ -389,8 +389,39 @@ pub struct PipelineSummary {
     pub indexer_searches: usize,
     /// Remote candidates assessed.
     pub candidates_assessed: usize,
+    /// Match/action attempts observed.
+    pub attempts_total: usize,
     /// Match/action attempts.
     pub attempts: Vec<PipelineAttempt>,
+}
+
+/// Detailed attempts retained in workflow summaries for diagnostics.
+pub const PIPELINE_ATTEMPT_RETAIN_LIMIT: usize = 256;
+
+impl PipelineSummary {
+    /// Record one attempt while bounding retained diagnostic rows.
+    pub fn record_attempt(&mut self, attempt: PipelineAttempt) {
+        self.attempts_total = self.attempts_total.saturating_add(1);
+        if self.attempts.len() < PIPELINE_ATTEMPT_RETAIN_LIMIT {
+            self.attempts.push(attempt);
+        }
+    }
+
+    /// Merge another summary while preserving the retained-attempt cap.
+    pub fn merge(&mut self, other: PipelineSummary) {
+        self.searchees_seen = self.searchees_seen.saturating_add(other.searchees_seen);
+        self.searchees_filtered = self
+            .searchees_filtered
+            .saturating_add(other.searchees_filtered);
+        self.indexer_searches = self.indexer_searches.saturating_add(other.indexer_searches);
+        self.candidates_assessed = self
+            .candidates_assessed
+            .saturating_add(other.candidates_assessed);
+        self.attempts_total = self.attempts_total.saturating_add(other.attempts_total);
+        let remaining = PIPELINE_ATTEMPT_RETAIN_LIMIT.saturating_sub(self.attempts.len());
+        self.attempts
+            .extend(other.attempts.into_iter().take(remaining));
+    }
 }
 
 /// Shared candidate cache used by a bulk search batch.
@@ -679,7 +710,7 @@ where
                     )?;
                 }
                 notify(&attempt)?;
-                summary.attempts.push(attempt);
+                summary.record_attempt(attempt);
             }
             if search_result.update_timestamp {
                 update_timestamp(
@@ -2752,14 +2783,15 @@ pub fn lookup_fields(searchee: &Searchee<'_>) -> LookupFields {
 mod tests {
     use super::{
         Blocklist, CachedCandidates, CandidateSearchCache, ContentFilterOptions,
-        ContentFilterRejection, MediaCapabilities, ReverseLookupRuntime, SearchPipelineOptions,
-        SearchPipelineRuntime, SearcheeSources, TimestampDecision, VirtualSeasonOptions,
-        affected_roots_for_changed_path, bulk_search, check_new_candidate_match,
-        create_searchee_from_path, create_virtual_season_searchees, filter_by_content,
-        filter_duplicate_searchees, find_all_searchees, find_potential_nested_roots,
-        find_searchable_searchees, get_media_type, index_torrent_dir, indexer_supports_media,
-        lookup_fields, parse_title, reverse_lookup_client_rows, reverse_lookup_data_rows,
-        reverse_lookup_keys, reverse_lookup_searchees, search_group_key, timestamp_excludes,
+        ContentFilterRejection, MediaCapabilities, PIPELINE_ATTEMPT_RETAIN_LIMIT, PipelineAttempt,
+        PipelineSummary, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
+        SearcheeSources, TimestampDecision, VirtualSeasonOptions, affected_roots_for_changed_path,
+        bulk_search, check_new_candidate_match, create_searchee_from_path,
+        create_virtual_season_searchees, filter_by_content, filter_duplicate_searchees,
+        find_all_searchees, find_potential_nested_roots, find_searchable_searchees, get_media_type,
+        index_torrent_dir, indexer_supports_media, lookup_fields, parse_title,
+        reverse_lookup_client_rows, reverse_lookup_data_rows, reverse_lookup_keys,
+        reverse_lookup_searchees, search_group_key, timestamp_excludes,
     };
     use crate::{
         domain::{
@@ -2781,6 +2813,24 @@ mod tests {
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn pipeline_summary_bounds_retained_attempts() {
+        let mut summary = PipelineSummary::default();
+        for index in 0..PIPELINE_ATTEMPT_RETAIN_LIMIT + 5 {
+            summary.record_attempt(test_attempt(index));
+        }
+
+        assert_eq!(summary.attempts_total, PIPELINE_ATTEMPT_RETAIN_LIMIT + 5);
+        assert_eq!(summary.attempts.len(), PIPELINE_ATTEMPT_RETAIN_LIMIT);
+        assert_eq!(
+            summary
+                .attempts
+                .last()
+                .map(|attempt| attempt.candidate_guid.as_str()),
+            Some("guid-255")
+        );
+    }
 
     #[test]
     fn classifies_media_type_in_documented_order() {
@@ -3944,6 +3994,27 @@ mod tests {
             name.len()
         )
         .into_bytes()
+    }
+
+    fn test_attempt(index: usize) -> PipelineAttempt {
+        PipelineAttempt {
+            label: Label::Search,
+            searchee_title: "Local".to_owned(),
+            candidate_name: "Candidate".to_owned(),
+            candidate_guid: format!("guid-{index}"),
+            candidate_info_hashes: Vec::new(),
+            trackers: Vec::new(),
+            decision: Decision::Match,
+            action_result: None,
+            searchee_category: None,
+            searchee_tags: Vec::new(),
+            searchee_trackers: Vec::new(),
+            searchee_length: 0,
+            searchee_client_host: None,
+            searchee_info_hash: None,
+            searchee_path: None,
+            searchee_source_type: "data".to_owned(),
+        }
     }
 
     fn temp_path(label: &str) -> PathBuf {

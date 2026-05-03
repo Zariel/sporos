@@ -352,7 +352,7 @@ async fn execute_ran_job(
                 searchees = search.searchees,
                 indexers = search.indexers,
                 candidates = search.pipeline.candidates_assessed,
-                attempts = search.pipeline.attempts.len(),
+                attempts = search.pipeline.attempts_total,
                 "search job completed"
             );
         }
@@ -576,7 +576,7 @@ async fn run_webhook_worker(
         searchees = summary.searchees_seen,
         indexer_searches = summary.indexer_searches,
         candidates = summary.candidates_assessed,
-        attempts = summary.attempts.len(),
+        attempts = summary.attempts_total,
         "webhook targeted search completed"
     );
     async_database.close().await;
