@@ -282,18 +282,6 @@ fn apply_shared_options(
             .map(|value| crate::config::TorrentClientConfig::parse(value))
             .collect::<crate::Result<Vec<_>>>()?;
     }
-    if let Some(value) = string_value(matches, "qbittorrent-url") {
-        raw_config.deprecated.qbittorrent_url = Some(value.clone());
-    }
-    if let Some(value) = string_value(matches, "rtorrent-rpc-url") {
-        raw_config.deprecated.rtorrent_rpc_url = Some(value.clone());
-    }
-    if let Some(value) = string_value(matches, "transmission-rpc-url") {
-        raw_config.deprecated.transmission_rpc_url = Some(value.clone());
-    }
-    if let Some(value) = string_value(matches, "deluge-rpc-url") {
-        raw_config.deprecated.deluge_rpc_url = Some(value.clone());
-    }
     if matches.get_flag("duplicate-categories") {
         raw_config.duplicate_categories = Some(true);
     }
@@ -302,9 +290,6 @@ fn apply_shared_options(
     }
     if let Some(values) = path_values(matches, "link-dirs") {
         raw_config.link_dirs = values;
-    }
-    if let Some(value) = string_value(matches, "link-dir") {
-        raw_config.deprecated.link_dir = Some(PathBuf::from(value));
     }
     if let Some(value) = string_value(matches, "link-type") {
         raw_config.link_type = Some(value.clone());
@@ -338,9 +323,6 @@ fn apply_shared_options(
     }
     if let Some(values) = string_values(matches, "notification-webhook-urls") {
         raw_config.notification_webhook_urls = values;
-    }
-    if let Some(value) = string_value(matches, "notification-webhook-url") {
-        raw_config.notification_webhook_urls = vec![value.clone()];
     }
     if let Some(values) = string_values(matches, "block-list") {
         raw_config.block_list = values;
@@ -601,37 +583,12 @@ fn add_shared_options(command: Command) -> Command {
         .arg(Arg::new("output-dir").long("output-dir").num_args(1))
         .arg(repeating("torrent-clients", "torrent-clients"))
         .arg(
-            Arg::new("qbittorrent-url")
-                .long("qbittorrent-url")
-                .num_args(1)
-                .hide(true),
-        )
-        .arg(
-            Arg::new("rtorrent-rpc-url")
-                .long("rtorrent-rpc-url")
-                .num_args(1)
-                .hide(true),
-        )
-        .arg(
-            Arg::new("transmission-rpc-url")
-                .long("transmission-rpc-url")
-                .num_args(1)
-                .hide(true),
-        )
-        .arg(
-            Arg::new("deluge-rpc-url")
-                .long("deluge-rpc-url")
-                .num_args(1)
-                .hide(true),
-        )
-        .arg(
             Arg::new("duplicate-categories")
                 .long("duplicate-categories")
                 .action(ArgAction::SetTrue),
         )
         .arg(Arg::new("link-category").long("link-category").num_args(1))
         .arg(repeating("link-dirs", "link-dirs"))
-        .arg(Arg::new("link-dir").long("link-dir").num_args(1).hide(true))
         .arg(Arg::new("link-type").long("link-type").num_args(1))
         .arg(
             Arg::new("flat-linking")
@@ -686,12 +643,6 @@ fn add_shared_options(command: Command) -> Command {
             "notification-webhook-urls",
             "notification-webhook-urls",
         ))
-        .arg(
-            Arg::new("notification-webhook-url")
-                .long("notification-webhook-url")
-                .num_args(1)
-                .hide(true),
-        )
         .arg(repeating("block-list", "block-list"))
         .arg(repeating("sonarr", "sonarr"))
         .arg(repeating("radarr", "radarr"))
@@ -761,6 +712,22 @@ mod tests {
                 "--no-exclude-older",
             ])
             .expect("search command parses");
+    }
+
+    #[test]
+    fn rejects_removed_hidden_cli_aliases() {
+        for alias in [
+            "--qbittorrent-url",
+            "--rtorrent-rpc-url",
+            "--transmission-rpc-url",
+            "--deluge-rpc-url",
+            "--link-dir",
+            "--notification-webhook-url",
+        ] {
+            let result = build_cli().try_get_matches_from(["cross-seed", "search", alias, "value"]);
+
+            assert!(result.is_err(), "{alias} should not parse");
+        }
     }
 
     #[test]
