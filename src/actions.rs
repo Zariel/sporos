@@ -635,7 +635,9 @@ fn source_save_path(
                 .map(File::into_owned)
                 .collect(),
         );
-        return client.get_download_dir(&metafile, DownloadDirOptions { only_completed });
+        return client
+            .get_download_dir(&metafile, DownloadDirOptions { only_completed })
+            .map(|result| result.and_then(validate_client_download_dir));
     }
 
     let Some(path) = searchee.path.as_ref() else {
@@ -654,6 +656,14 @@ fn source_save_path(
         Ok(Ok(parent.to_path_buf()))
     } else {
         Ok(Err(ClientErrorCode::NotFound))
+    }
+}
+
+fn validate_client_download_dir(path: PathBuf) -> Result<PathBuf, ClientErrorCode> {
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(ClientErrorCode::NotFound)
     }
 }
 
@@ -2150,6 +2160,25 @@ mod tests {
     }
 
     #[test]
+    fn client_source_save_path_requires_existing_download_dir() {
+        let root = temp_path("client-download-dir");
+        let downloads = root.join("downloads");
+        let mut searchee = client_searchee("client");
+        let mut client = FakeClient::new("client");
+        client.download_dir = Ok(downloads.clone());
+        let clients: [&dyn TorrentClient; 1] = [&client];
+
+        let missing = super::source_save_path(&searchee, &clients, true).expect("save path");
+        assert_eq!(missing, Err(ClientErrorCode::NotFound));
+
+        fs::create_dir_all(&downloads).expect("downloads");
+        let existing = super::source_save_path(&searchee, &clients, true).expect("save path");
+        assert_eq!(existing, Ok(downloads));
+        searchee.client = None;
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn injection_action_links_saves_rechecks_and_resumes() {
         let root = temp_path("inject-action");
         let data = root.join("data");
@@ -3091,5 +3120,24 @@ mod tests {
     fn index_searchee_mtime(searchee: &mut Searchee<'_>, path: &std::path::Path) {
         let metadata = fs::metadata(path).expect("source metadata");
         searchee.mtime_millis = super::metadata_mtime_millis(&metadata);
+    }
+
+    fn client_searchee(host: &'static str) -> Searchee<'static> {
+        let mut searchee = Searchee::from_files(
+            "Client.Source",
+            "Client.Source",
+            vec![File::new("file.mkv", 7)],
+        );
+        searchee.client = Some(ClientTorrentMetadata::new(
+            host,
+            "/downloads",
+            None,
+            Vec::new(),
+            Vec::<Cow<'static, str>>::new(),
+        ));
+        searchee.info_hash = Some(InfoHash::from_validated(
+            "0123456789abcdef0123456789abcdef01234567",
+        ));
+        searchee
     }
 }
