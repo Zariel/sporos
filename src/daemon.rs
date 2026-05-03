@@ -75,8 +75,14 @@ async fn run_plan(
             crate::operations::refresh_torrent_and_data_indexes(database, config).map(|_| ())
         })
         .await?;
-    let startup_jobs =
-        execute_ran_jobs(Arc::clone(&runtime_services), app_dir, config, &run.jobs).await;
+    let startup_jobs = execute_ran_jobs(
+        Arc::clone(&runtime_services),
+        app_dir,
+        config,
+        &run.jobs,
+        shutdown.child_token(),
+    )
+    .await;
     finish_executed_jobs(&mut plan.scheduler, startup_jobs)?;
 
     let mut server_state = None;
@@ -121,8 +127,14 @@ async fn run_plan(
                 } else {
                     plan.scheduler.check_jobs_async(&async_database, now, false).await?
                 };
-                let executed_jobs =
-                    execute_ran_jobs(Arc::clone(&runtime_services), app_dir, config, &results).await;
+                let executed_jobs = execute_ran_jobs(
+                    Arc::clone(&runtime_services),
+                    app_dir,
+                    config,
+                    &results,
+                    shutdown.child_token(),
+                )
+                .await;
                 if let Some(state) = &server_state {
                     let mut scheduler = state.scheduler.lock().await;
                     finish_executed_jobs(&mut scheduler, executed_jobs)?;
@@ -243,6 +255,7 @@ async fn handle_runtime_request(
         &state.app_dir,
         &state.config,
         &job_dispatches,
+        state.services.cancellation_token(),
     )
     .await;
     if !executed_jobs.is_empty() {
@@ -269,7 +282,7 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
 
 struct ExecutedJob {
     name: JobName,
-    result: crate::Result<()>,
+    result: Option<crate::Result<()>>,
 }
 
 async fn execute_ran_jobs(
@@ -277,13 +290,30 @@ async fn execute_ran_jobs(
     app_dir: &Path,
     config: &RuntimeConfig,
     results: &[crate::scheduler::JobCheckResult],
+    shutdown: CancellationToken,
 ) -> Vec<ExecutedJob> {
     let mut executed = Vec::new();
     for result in results {
         if !result.ran {
             continue;
         }
-        let job_result = execute_ran_job(Arc::clone(&services), app_dir, config, result).await;
+        if shutdown.is_cancelled() {
+            tracing::info!(job = result.name.as_str(), "job cancelled during shutdown");
+            executed.push(ExecutedJob {
+                name: result.name,
+                result: None,
+            });
+            continue;
+        }
+        let job_result = tokio::select! {
+            () = shutdown.cancelled() => {
+                tracing::info!(job = result.name.as_str(), "job cancelled during shutdown");
+                None
+            }
+            result = execute_ran_job(Arc::clone(&services), app_dir, config, result) => {
+                Some(result)
+            }
+        };
         executed.push(ExecutedJob {
             name: result.name,
             result: job_result,
@@ -299,8 +329,10 @@ fn finish_executed_jobs(
     let mut first_error = None;
     for executed in executed_jobs {
         scheduler.finish_job(executed.name);
-        if first_error.is_none() {
-            if let Err(error) = executed.result {
+        if first_error.is_none()
+            && let Some(result) = executed.result
+        {
+            if let Err(error) = result {
                 first_error = Some(error);
             }
         }
@@ -477,17 +509,16 @@ fn submit_webhook_workers(
         let app_dir = PathBuf::from(app_dir);
         let config = config.clone();
         let worker_services = Arc::clone(&services);
-        let result =
-            services
-                .queues()
-                .webhooks
-                .try_submit("webhook", move |_shutdown| async move {
-                    if let Err(error) =
-                        run_webhook_worker(worker_services, app_dir, config, request).await
-                    {
-                        tracing::error!("webhook background work failed: {error}");
-                    }
-                });
+        let result = services
+            .queues()
+            .webhooks
+            .try_submit("webhook", move |shutdown| async move {
+                if let Err(error) =
+                    run_webhook_worker(worker_services, app_dir, config, request, shutdown).await
+                {
+                    tracing::error!("webhook background work failed: {error}");
+                }
+            });
         if let Err(error) = result {
             tracing::warn!("webhook background work was not queued: {error}");
         }
@@ -558,6 +589,7 @@ async fn run_webhook_worker(
     app_dir: PathBuf,
     config: RuntimeConfig,
     request: WebhookRequest,
+    shutdown: CancellationToken,
 ) -> crate::Result<()> {
     let async_database = AsyncDatabase::open_app_dir(&app_dir).await?;
     let mut plan = DaemonPlan::from_config(&config);
@@ -581,22 +613,34 @@ async fn run_webhook_worker(
             .scheduler
             .check_jobs_async(&async_database, now, false)
             .await?;
-        let executed_jobs =
-            execute_ran_jobs(Arc::clone(&services), &app_dir, &config, &results).await;
+        let executed_jobs = execute_ran_jobs(
+            Arc::clone(&services),
+            &app_dir,
+            &config,
+            &results,
+            shutdown.child_token(),
+        )
+        .await;
         finish_executed_jobs(&mut plan.scheduler, executed_jobs)?;
     }
     let notifier = crate::notifications::NotificationSender::from_config(
         &config,
         crate::startup::Redactor::from_config(&config),
     )?;
-    let summary = crate::operations::run_webhook_search_async(
-        services.blocking().matching.clone(),
-        app_dir.clone(),
-        config,
-        request,
-        notifier,
-    )
-    .await?;
+    let summary = tokio::select! {
+        () = shutdown.cancelled() => {
+            tracing::info!("webhook targeted search cancelled during shutdown");
+            async_database.close().await;
+            return Ok(());
+        }
+        summary = crate::operations::run_webhook_search_async(
+            services.blocking().matching.clone(),
+            app_dir.clone(),
+            config,
+            request,
+            notifier,
+        ) => summary?,
+    };
     tracing::info!(
         searchees = summary.searchees_seen,
         indexer_searches = summary.indexer_searches,
@@ -616,7 +660,7 @@ mod tests {
         config::{RawConfig, RuntimeConfig, TorrentClientConfig},
         persistence::{AsyncDatabase, Database},
         runtime::{RuntimeServices, RuntimeTaskQueue},
-        scheduler::{DaemonPlan, JobConfigOverride, JobName},
+        scheduler::{DaemonPlan, JobCheckResult, JobConfigOverride, JobName},
     };
     use std::{
         collections::BTreeMap,
@@ -917,6 +961,74 @@ mod tests {
         assert_eq!(status.status, 200);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn job_execution_stops_waiting_when_shutdown_is_cancelled() {
+        let root = temp_path("daemon-job-shutdown");
+        let data_dir = temp_path("daemon-job-shutdown-data");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                data_dirs: vec![data_dir.clone()],
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let services = RuntimeServices::start(CancellationToken::new());
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let held_matching = tokio::spawn({
+            let matching = services.blocking().matching.clone();
+            async move {
+                matching
+                    .submit("held matching", move || {
+                        let _result = release_receiver.recv();
+                    })
+                    .await
+            }
+        });
+        for _attempt in 0..20 {
+            if services.blocking().matching.stats().started > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(services.blocking().matching.stats().started, 1);
+        let shutdown = CancellationToken::new();
+        let cancel_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancel_shutdown.cancel();
+        });
+        let results = vec![JobCheckResult {
+            name: JobName::Search,
+            config_override: JobConfigOverride::default(),
+            ran: true,
+            skipped: None,
+        }];
+
+        let executed = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            super::execute_ran_jobs(
+                Arc::clone(&services),
+                &root,
+                &config,
+                &results,
+                shutdown.child_token(),
+            ),
+        )
+        .await
+        .expect("shutdown should interrupt queued job work");
+
+        assert_eq!(executed.len(), 1);
+        assert!(executed[0].result.is_none());
+        services.shutdown().await;
+        let _release = release_sender.send(());
+        let _held = held_matching.await.expect("held matching joins");
+        let _cleanup = std::fs::remove_dir_all(root);
+        let _cleanup = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
