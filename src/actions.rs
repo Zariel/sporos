@@ -791,7 +791,7 @@ fn source_files_unchanged(searchee: &Searchee<'_>) -> bool {
     }
     match (searchee.mtime_millis, newest_mtime) {
         (Some(indexed), Some(current)) => current <= indexed,
-        _ => true,
+        _ => false,
     }
 }
 
@@ -2136,6 +2136,20 @@ mod tests {
     }
 
     #[test]
+    fn source_files_unchanged_requires_indexed_mtime() {
+        let root = temp_path("source-mtime-missing");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::write(data.join("source.mkv"), b"video").expect("source file");
+        let mut searchee =
+            Searchee::from_files("Source", "Source", vec![File::new("source.mkv", 5)]);
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+
+        assert!(!super::source_files_unchanged(&searchee));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn injection_action_links_saves_rechecks_and_resumes() {
         let root = temp_path("inject-action");
         let data = root.join("data");
@@ -2149,6 +2163,7 @@ mod tests {
             vec![File::new("source.mkv", 10)],
         );
         searchee.path = Some(Cow::Owned(data.display().to_string()));
+        index_searchee_mtime(&mut searchee, &data.join("source.mkv"));
         let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
         let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let candidate = Candidate::new(
@@ -2234,6 +2249,7 @@ mod tests {
             vec![File::new("source.mkv", 10)],
         );
         searchee.path = Some(Cow::Owned(data.display().to_string()));
+        index_searchee_mtime(&mut searchee, &data.join("source.mkv"));
         let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
         let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let candidate = Candidate::new(
@@ -2323,6 +2339,7 @@ mod tests {
             vec![File::new("source.mkv", 10)],
         );
         searchee.path = Some(Cow::Owned(data.display().to_string()));
+        index_searchee_mtime(&mut searchee, &data.join("source.mkv"));
         let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
         let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let candidate = Candidate::new(
@@ -2464,6 +2481,7 @@ mod tests {
             vec![File::new("source.mkv", 10)],
         );
         searchee.path = Some(Cow::Owned(data.display().to_string()));
+        index_searchee_mtime(&mut searchee, &data.join("source.mkv"));
         let bytes = torrent_bytes("Candidate.Release", "https://tracker.example/announce", 10);
         let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
         let candidate = Candidate::new(
@@ -2531,6 +2549,7 @@ mod tests {
             vec![File::new("Candidate.Release", 10)],
         );
         searchee.path = Some(Cow::Owned(data.display().to_string()));
+        index_searchee_mtime(&mut searchee, &data.join("Candidate.Release"));
         let client = FakeClient::new("client");
         let clients: [&dyn TorrentClient; 1] = [&client];
         let blocklist = Blocklist::parse(&[]).expect("blocklist");
@@ -2596,6 +2615,7 @@ mod tests {
             vec![File::new("Candidate.Release", 10)],
         );
         searchee.path = Some(Cow::Owned(data.display().to_string()));
+        index_searchee_mtime(&mut searchee, &data.join("Candidate.Release"));
         let mut client = FakeClient::new("client");
         client.existing = true;
         let clients: [&dyn TorrentClient; 1] = [&client];
@@ -2663,6 +2683,7 @@ mod tests {
             vec![File::new("Candidate.Release", 10)],
         );
         searchee.path = Some(Cow::Owned(data.display().to_string()));
+        index_searchee_mtime(&mut searchee, &data.join("Candidate.Release"));
         let client = FakeClient::new("client");
         let clients: [&dyn TorrentClient; 1] = [&client];
         let blocklist = Blocklist::parse(&[]).expect("blocklist");
@@ -3065,5 +3086,10 @@ mod tests {
             .map(|duration| duration.as_millis())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-{name}-{millis}"))
+    }
+
+    fn index_searchee_mtime(searchee: &mut Searchee<'_>, path: &std::path::Path) {
+        let metadata = fs::metadata(path).expect("source metadata");
+        searchee.mtime_millis = super::metadata_mtime_millis(&metadata);
     }
 }

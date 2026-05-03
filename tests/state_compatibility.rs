@@ -376,8 +376,15 @@ fn saved_retry_searchee(data_dir: &std::path::Path) -> Searchee<'static> {
         vec![File::new("Example.Show.S01E01.mkv", 7)],
     );
     searchee.path = Some(Cow::Owned(data_dir.to_string_lossy().into_owned()));
+    searchee.mtime_millis = file_mtime_millis(&data_dir.join("Example.Show.S01E01.mkv"));
     searchee.media_type = MediaType::Episode;
     searchee.into_owned()
+}
+
+fn file_mtime_millis(path: &std::path::Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {

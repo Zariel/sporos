@@ -68,6 +68,7 @@ fn save_link_inject_retry_and_restore_e2e_paths() {
         vec![File::new("Example.Show.S01E01.mkv", 7)],
     );
     searchee.path = Some(Cow::Owned(data_dir.to_string_lossy().into_owned()));
+    searchee.mtime_millis = file_mtime_millis(&source_file);
     searchee.media_type = MediaType::Episode;
     let link_options = FileLinkOptions {
         link_dirs: std::slice::from_ref(&link_dir),
@@ -265,4 +266,10 @@ fn temp_path(label: &str) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("sporos-e2e-{label}-{}-{nanos}", std::process::id()))
+}
+
+fn file_mtime_millis(path: &std::path::Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_millis().min(u128::from(u64::MAX)) as u64)
 }
