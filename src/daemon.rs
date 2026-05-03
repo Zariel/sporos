@@ -209,12 +209,17 @@ async fn handle_runtime_request(
     let async_database = AsyncDatabase::open_app_dir(&state.app_dir).await?;
     let api_key =
         crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await?;
-    let mut scheduler = state.scheduler.lock().await;
+    let needs_scheduler = request.path == "/api/job";
+    let mut scheduler = if needs_scheduler {
+        Some(state.scheduler.lock().await)
+    } else {
+        None
+    };
     let mut handlers = RuntimeHandlers {
         app_dir: &state.app_dir,
         config: &state.config,
         async_database: &async_database,
-        scheduler: &mut scheduler,
+        scheduler: scheduler.as_deref_mut(),
         now_millis: now_millis(),
         webhook_requests: Vec::new(),
         job_dispatches: Vec::new(),
@@ -231,8 +236,10 @@ async fn handle_runtime_request(
         webhook_requests,
     );
     let executed_jobs = execute_ran_jobs(&state.app_dir, &state.config, &job_dispatches).await;
-    let mut scheduler = state.scheduler.lock().await;
-    finish_executed_jobs(&mut scheduler, executed_jobs)?;
+    if !executed_jobs.is_empty() {
+        let mut scheduler = state.scheduler.lock().await;
+        finish_executed_jobs(&mut scheduler, executed_jobs)?;
+    }
     async_database.close().await;
     Ok(response)
 }
@@ -453,7 +460,7 @@ struct RuntimeHandlers<'a> {
     app_dir: &'a Path,
     config: &'a RuntimeConfig,
     async_database: &'a AsyncDatabase,
-    scheduler: &'a mut Scheduler,
+    scheduler: Option<&'a mut Scheduler>,
     now_millis: i64,
     webhook_requests: Vec<WebhookRequest>,
     job_dispatches: Vec<crate::scheduler::JobCheckResult>,
@@ -515,19 +522,20 @@ impl ApiHandlers for RuntimeHandlers<'_> {
     }
 
     async fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse> {
+        let Some(scheduler) = self.scheduler.as_deref_mut() else {
+            return Err(daemon_error("scheduler is unavailable for job request"));
+        };
         let Some(name) = JobName::parse(&request.name) else {
             return Ok(JobResponse::Disabled(format!(
                 "{}: unable to run, disabled in config",
                 request.name
             )));
         };
-        let response = self
-            .scheduler
+        let response = scheduler
             .request_early_run_async(self.async_database, name, self.now_millis)
             .await?;
         if matches!(response, JobResponse::Accepted(_)) {
-            let results = self
-                .scheduler
+            let results = scheduler
                 .check_jobs_async(self.async_database, self.now_millis, false)
                 .await?;
             self.job_dispatches.extend(results);
@@ -653,7 +661,7 @@ mod tests {
             app_dir: &root,
             config: &config,
             async_database: &async_database,
-            scheduler: &mut plan.scheduler,
+            scheduler: Some(&mut plan.scheduler),
             now_millis: 1_000,
             webhook_requests: Vec::new(),
             job_dispatches: Vec::new(),
@@ -677,6 +685,8 @@ mod tests {
         assert_eq!(
             handlers
                 .scheduler
+                .as_deref()
+                .expect("scheduler")
                 .jobs()
                 .iter()
                 .find(|job| job.name == JobName::Inject)
@@ -721,6 +731,44 @@ mod tests {
 
         assert_eq!(ping.status, 200);
         assert_eq!(unauthorized.status, 401);
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn status_request_does_not_wait_for_scheduler_lock() {
+        let root = temp_path("daemon-status-no-scheduler-lock");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let scheduler = DaemonPlan::from_config(&config).scheduler;
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: RuntimeServices::start(CancellationToken::new()),
+            scheduler: Mutex::new(scheduler),
+        });
+        let guard = state.scheduler.lock().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handle_runtime_request(
+                Arc::clone(&state),
+                ApiRequest::new(
+                    ApiMethod::Get,
+                    "/api/status?apikey=secret",
+                    BTreeMap::new(),
+                    "",
+                ),
+            ),
+        )
+        .await
+        .expect("status should not wait for scheduler")
+        .expect("status");
+
+        assert_eq!(response.status, 200);
+        drop(guard);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
