@@ -75,7 +75,8 @@ async fn run_plan(
             index_torrents_and_data_dirs(config, database)
         })
         .await?;
-    let startup_jobs = execute_ran_jobs(app_dir, config, &run.jobs).await;
+    let startup_jobs =
+        execute_ran_jobs(Arc::clone(&runtime_services), app_dir, config, &run.jobs).await;
     finish_executed_jobs(&mut plan.scheduler, startup_jobs)?;
 
     let mut server_state = None;
@@ -120,7 +121,8 @@ async fn run_plan(
                 } else {
                     plan.scheduler.check_jobs_async(&async_database, now, false).await?
                 };
-                let executed_jobs = execute_ran_jobs(app_dir, config, &results).await;
+                let executed_jobs =
+                    execute_ran_jobs(Arc::clone(&runtime_services), app_dir, config, &results).await;
                 if let Some(state) = &server_state {
                     let mut scheduler = state.scheduler.lock().await;
                     finish_executed_jobs(&mut scheduler, executed_jobs)?;
@@ -218,6 +220,7 @@ async fn handle_runtime_request(
     let mut handlers = RuntimeHandlers {
         app_dir: &state.app_dir,
         config: &state.config,
+        services: Arc::clone(&state.services),
         async_database: &async_database,
         scheduler: scheduler.as_deref_mut(),
         now_millis: now_millis(),
@@ -235,7 +238,13 @@ async fn handle_runtime_request(
         &state.config,
         webhook_requests,
     );
-    let executed_jobs = execute_ran_jobs(&state.app_dir, &state.config, &job_dispatches).await;
+    let executed_jobs = execute_ran_jobs(
+        Arc::clone(&state.services),
+        &state.app_dir,
+        &state.config,
+        &job_dispatches,
+    )
+    .await;
     if !executed_jobs.is_empty() {
         let mut scheduler = state.scheduler.lock().await;
         finish_executed_jobs(&mut scheduler, executed_jobs)?;
@@ -264,6 +273,7 @@ struct ExecutedJob {
 }
 
 async fn execute_ran_jobs(
+    services: Arc<RuntimeServices>,
     app_dir: &Path,
     config: &RuntimeConfig,
     results: &[crate::scheduler::JobCheckResult],
@@ -273,7 +283,7 @@ async fn execute_ran_jobs(
         if !result.ran {
             continue;
         }
-        let job_result = execute_ran_job(app_dir, config, result.name).await;
+        let job_result = execute_ran_job(Arc::clone(&services), app_dir, config, result.name).await;
         executed.push(ExecutedJob {
             name: result.name,
             result: job_result,
@@ -302,6 +312,7 @@ fn finish_executed_jobs(
 }
 
 async fn execute_ran_job(
+    services: Arc<RuntimeServices>,
     app_dir: &Path,
     config: &RuntimeConfig,
     name: JobName,
@@ -313,6 +324,7 @@ async fn execute_ran_job(
                 crate::startup::Redactor::from_config(config),
             )?;
             let rss = crate::operations::run_rss_workflow_async(
+                services.blocking().matching.clone(),
                 app_dir.to_path_buf(),
                 config.clone(),
                 notifier,
@@ -330,6 +342,7 @@ async fn execute_ran_job(
                 crate::startup::Redactor::from_config(config),
             )?;
             let search = crate::operations::run_search_workflow_async(
+                services.blocking().matching.clone(),
                 app_dir.to_path_buf(),
                 config.clone(),
                 notifier,
@@ -345,6 +358,7 @@ async fn execute_ran_job(
         }
         JobName::UpdateIndexerCaps => {
             let caps = crate::operations::run_update_indexer_caps_async(
+                services.blocking().torrent_io.clone(),
                 app_dir.to_path_buf(),
                 config.clone(),
             )
@@ -356,9 +370,12 @@ async fn execute_ran_job(
             );
         }
         JobName::Inject => {
-            let inject =
-                crate::operations::run_inject_workflow_async(app_dir.to_path_buf(), config.clone())
-                    .await?;
+            let inject = crate::operations::run_inject_workflow_async(
+                services.blocking().linking.clone(),
+                app_dir.to_path_buf(),
+                config.clone(),
+            )
+            .await?;
             tracing::info!(
                 scanned = inject.scanned,
                 injected = inject.injected,
@@ -371,6 +388,7 @@ async fn execute_ran_job(
         }
         JobName::Cleanup => {
             let cleanup = crate::operations::cleanup_db_async(
+                services.blocking().filesystem.clone(),
                 app_dir.to_path_buf(),
                 config.clone(),
                 now_millis(),
@@ -459,6 +477,7 @@ struct DaemonState {
 struct RuntimeHandlers<'a> {
     app_dir: &'a Path,
     config: &'a RuntimeConfig,
+    services: Arc<RuntimeServices>,
     async_database: &'a AsyncDatabase,
     scheduler: Option<&'a mut Scheduler>,
     now_millis: i64,
@@ -475,12 +494,15 @@ fn submit_webhook_workers(
     for request in webhook_requests {
         let app_dir = PathBuf::from(app_dir);
         let config = config.clone();
+        let worker_services = Arc::clone(&services);
         let result =
             services
                 .queues()
                 .webhooks
                 .try_submit("webhook", move |_shutdown| async move {
-                    if let Err(error) = run_webhook_worker(app_dir, config, request).await {
+                    if let Err(error) =
+                        run_webhook_worker(worker_services, app_dir, config, request).await
+                    {
                         tracing::error!("webhook background work failed: {error}");
                     }
                 });
@@ -503,6 +525,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             crate::startup::Redactor::from_config(self.config),
         )?;
         crate::operations::run_announce_match_async(
+            self.services.blocking().matching.clone(),
             self.app_dir.to_path_buf(),
             self.config.clone(),
             request.into_candidate(),
@@ -545,6 +568,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
 }
 
 async fn run_webhook_worker(
+    services: Arc<RuntimeServices>,
     app_dir: PathBuf,
     config: RuntimeConfig,
     request: WebhookRequest,
@@ -566,16 +590,22 @@ async fn run_webhook_worker(
             .scheduler
             .check_jobs_async(&async_database, now, false)
             .await?;
-        let executed_jobs = execute_ran_jobs(&app_dir, &config, &results).await;
+        let executed_jobs =
+            execute_ran_jobs(Arc::clone(&services), &app_dir, &config, &results).await;
         finish_executed_jobs(&mut plan.scheduler, executed_jobs)?;
     }
     let notifier = crate::notifications::NotificationSender::from_config(
         &config,
         crate::startup::Redactor::from_config(&config),
     )?;
-    let summary =
-        crate::operations::run_webhook_search_async(app_dir.clone(), config, request, notifier)
-            .await?;
+    let summary = crate::operations::run_webhook_search_async(
+        services.blocking().matching.clone(),
+        app_dir.clone(),
+        config,
+        request,
+        notifier,
+    )
+    .await?;
     tracing::info!(
         searchees = summary.searchees_seen,
         indexer_searches = summary.indexer_searches,
@@ -660,6 +690,7 @@ mod tests {
         let mut handlers = super::RuntimeHandlers {
             app_dir: &root,
             config: &config,
+            services: RuntimeServices::start(CancellationToken::new()),
             async_database: &async_database,
             scheduler: Some(&mut plan.scheduler),
             now_millis: 1_000,

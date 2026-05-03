@@ -5,11 +5,8 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-use tokio::sync::Semaphore;
 
 use crate::{
     SporosError,
@@ -32,6 +29,7 @@ use crate::{
     persistence::{
         AsyncDatabase, CacheTable, ClientSearcheeRecord, DataRootRecord, Database, EnsembleRecord,
     },
+    runtime::{BlockingTaskError, RuntimeBlockingExecutor},
     search::{
         Blocklist, CandidateSearchCache, ContentFilterOptions, PipelineAction, PipelineSummary,
         ReverseLookupGate, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
@@ -49,10 +47,6 @@ const ONE_DAY_MILLIS: u64 = 86_400_000;
 const THIRTY_DAYS_MILLIS: u64 = 30 * ONE_DAY_MILLIS;
 const ONE_YEAR_MILLIS: u64 = 365 * ONE_DAY_MILLIS;
 const CLEANUP_DB_PAGE_SIZE: i64 = 1_000;
-const LOCAL_WORK_CONCURRENCY_LIMIT: usize = 4;
-
-static LOCAL_WORK_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(LOCAL_WORK_CONCURRENCY_LIMIT)));
 
 /// Result counts from cache cleanup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -261,11 +255,12 @@ pub fn cleanup_db(
 
 /// Run daily database and torrent-cache cleanup from async orchestration.
 pub async fn cleanup_db_async(
+    blocking: RuntimeBlockingExecutor,
     app_dir: PathBuf,
     config: RuntimeConfig,
     now_millis: i64,
 ) -> crate::Result<CleanupDbResult> {
-    run_blocking_workflow("cleanup", move || {
+    run_blocking_operation(blocking, "cleanup", move || {
         let database = Database::open_app_dir(&app_dir)?;
         let client_timeout = config.search_timeout.map(Duration::from_millis);
         let client_adapters = if config.use_client_torrents {
@@ -364,11 +359,12 @@ pub fn run_search_workflow(
 
 /// Run one bulk search workflow from async orchestration.
 pub async fn run_search_workflow_async(
+    blocking: RuntimeBlockingExecutor,
     app_dir: PathBuf,
     config: RuntimeConfig,
     notifier: NotificationSender,
 ) -> crate::Result<SearchWorkflowResult> {
-    run_blocking_workflow("search workflow", move || {
+    run_blocking_operation(blocking, "search workflow", move || {
         let database = Database::open_app_dir(&app_dir)?;
         run_search_workflow(&database, &app_dir, &config, &notifier)
     })
@@ -441,11 +437,12 @@ pub fn run_rss_workflow(
 
 /// Run one RSS reverse-match workflow from async orchestration.
 pub async fn run_rss_workflow_async(
+    blocking: RuntimeBlockingExecutor,
     app_dir: PathBuf,
     config: RuntimeConfig,
     notifier: NotificationSender,
 ) -> crate::Result<RssWorkflowResult> {
-    run_blocking_workflow("rss workflow", move || {
+    run_blocking_operation(blocking, "rss workflow", move || {
         let database = Database::open_app_dir(&app_dir)?;
         run_rss_workflow(&database, &app_dir, &config, &notifier)
     })
@@ -511,12 +508,13 @@ pub fn run_announce_match(
 
 /// Reverse-match one announce API candidate from async orchestration.
 pub async fn run_announce_match_async(
+    blocking: RuntimeBlockingExecutor,
     app_dir: PathBuf,
     config: RuntimeConfig,
     candidate: Candidate<'static>,
     notifier: NotificationSender,
 ) -> crate::Result<Option<ApiOutcome>> {
-    run_blocking_workflow("announce workflow", move || {
+    run_blocking_operation(blocking, "announce workflow", move || {
         let database = Database::open_app_dir(&app_dir)?;
         run_announce_match(&database, &app_dir, &config, candidate, &notifier)
     })
@@ -610,12 +608,13 @@ pub fn run_webhook_search(
 
 /// Run one targeted webhook search from async orchestration.
 pub async fn run_webhook_search_async(
+    blocking: RuntimeBlockingExecutor,
     app_dir: PathBuf,
     config: RuntimeConfig,
     request: WebhookRequest,
     notifier: NotificationSender,
 ) -> crate::Result<PipelineSummary> {
-    run_blocking_workflow("webhook workflow", move || {
+    run_blocking_operation(blocking, "webhook workflow", move || {
         let database = Database::open_app_dir(&app_dir)?;
         run_webhook_search(&database, &app_dir, &config, request, &notifier)
     })
@@ -662,10 +661,11 @@ pub fn run_inject_workflow(
 
 /// Run one saved torrent injection workflow from async orchestration.
 pub async fn run_inject_workflow_async(
+    blocking: RuntimeBlockingExecutor,
     app_dir: PathBuf,
     config: RuntimeConfig,
 ) -> crate::Result<SavedInjectionSummary> {
-    run_blocking_workflow("inject workflow", move || {
+    run_blocking_operation(blocking, "inject workflow", move || {
         let database = Database::open_app_dir(&app_dir)?;
         run_inject_workflow(&database, &app_dir, &config)
     })
@@ -683,10 +683,11 @@ pub fn run_restore_workflow(
 
 /// Run one restore workflow from async orchestration.
 pub async fn run_restore_workflow_async(
+    blocking: RuntimeBlockingExecutor,
     app_dir: PathBuf,
     config: RuntimeConfig,
 ) -> crate::Result<RestoreSummary> {
-    run_blocking_workflow("restore workflow", move || {
+    run_blocking_operation(blocking, "restore workflow", move || {
         let database = Database::open_app_dir(&app_dir)?;
         run_restore_workflow(&database, &app_dir, &config)
     })
@@ -719,10 +720,11 @@ pub fn run_update_indexer_caps(
 
 /// Refresh capabilities for configured Torznab indexers from async orchestration.
 pub async fn run_update_indexer_caps_async(
+    blocking: RuntimeBlockingExecutor,
     app_dir: PathBuf,
     config: RuntimeConfig,
 ) -> crate::Result<IndexerCapsRefreshResult> {
-    run_blocking_workflow("indexer caps workflow", move || {
+    run_blocking_operation(blocking, "indexer caps workflow", move || {
         let database = Database::open_app_dir(&app_dir)?;
         run_update_indexer_caps(&database, &config)
     })
@@ -1404,29 +1406,38 @@ fn replace_torrent_tracker_urls(
     Ok(changed.then(|| bencode(&decoded)))
 }
 
-async fn run_blocking_workflow<T>(
+async fn run_blocking_operation<T>(
+    blocking: RuntimeBlockingExecutor,
     name: &'static str,
     task: impl FnOnce() -> crate::Result<T> + Send + 'static,
 ) -> crate::Result<T>
 where
     T: Send + 'static,
 {
-    let permit = Arc::clone(&LOCAL_WORK_PERMITS)
-        .acquire_owned()
+    blocking
+        .submit(name, task)
         .await
-        .map_err(|error| operation_error(format!("{name} local-work queue closed: {error}")))?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        task()
-    })
-    .await
-    .map_err(|error| operation_error(format!("{name} task failed: {error}")))?
+        .map_err(|error| blocking_operation_error(name, error))?
 }
 
 fn operation_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Operation {
         message: message.into(),
     }
+}
+
+fn blocking_operation_error(name: &'static str, error: BlockingTaskError) -> SporosError {
+    operation_error(match error {
+        BlockingTaskError::Queue(error) => {
+            format!("{name} local-work queue rejected task: {error}")
+        }
+        BlockingTaskError::Cancelled { executor, kind } => {
+            format!("{name} local-work task cancelled in {executor} for {kind}")
+        }
+        BlockingTaskError::Panicked { executor, kind } => {
+            format!("{name} local-work task panicked in {executor} for {kind}")
+        }
+    })
 }
 
 fn replace_bencode_bytes(value: &mut Bencode<'_>, from: &[u8], to: &[u8]) -> bool {
