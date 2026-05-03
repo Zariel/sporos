@@ -554,6 +554,7 @@ pub fn run_webhook_search(
     request: WebhookRequest,
     notifier: &NotificationSender,
 ) -> crate::Result<PipelineSummary> {
+    request.revalidate_path()?;
     let mut config = config.clone();
     if request.include_single_episodes {
         config.include_single_episodes = true;
@@ -1545,7 +1546,7 @@ mod tests {
         update_torrent_cache_trackers, webhook_matches_request, webhook_targets_and_excluded,
     };
     use crate::{
-        api::WebhookRequest,
+        api::{WebhookPathSnapshot, WebhookRequest},
         clients::{
             ClientErrorCode, ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent,
             ResumeOptions, TorrentClient,
@@ -1993,6 +1994,7 @@ mod tests {
             WebhookRequest {
                 info_hash: None,
                 path: Some(release.display().to_string()),
+                path_snapshot: None,
                 ignore_cross_seeds: false,
                 ignore_exclude_recent_search: true,
                 ignore_exclude_older: true,
@@ -2043,6 +2045,7 @@ mod tests {
                     .display()
                     .to_string(),
             ),
+            path_snapshot: None,
             ignore_cross_seeds: false,
             ignore_exclude_recent_search: false,
             ignore_exclude_older: false,
@@ -2052,6 +2055,42 @@ mod tests {
         };
 
         assert!(webhook_matches_request(&searchee, &request));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn webhook_search_revalidates_path_snapshot() {
+        let root = temp_path("webhook-revalidate");
+        fs::create_dir_all(&root).expect("root dir");
+        let path = root.join("episode.mkv");
+        fs::write(&path, b"video").expect("video");
+        let database = Database::open_app_dir(&root).expect("database");
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let notifier = NotificationSender::new(Vec::new(), Redactor::default()).expect("notifier");
+        let snapshot = WebhookPathSnapshot::capture(&path.display().to_string()).expect("snapshot");
+        let request = WebhookRequest {
+            info_hash: None,
+            path: Some(snapshot.canonical().to_owned()),
+            path_snapshot: Some(snapshot),
+            ignore_cross_seeds: false,
+            ignore_exclude_recent_search: false,
+            ignore_exclude_older: false,
+            ignore_block_list: false,
+            include_single_episodes: false,
+            include_non_videos: false,
+        };
+        fs::write(&path, b"changed video").expect("changed video");
+
+        let error = match run_webhook_search(&database, &root, &config, request, &notifier) {
+            Ok(_) => panic!("webhook search should reject changed path"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("webhook path changed before search")
+        );
         let _cleanup = fs::remove_dir_all(root);
     }
 
@@ -2074,6 +2113,7 @@ mod tests {
         let request = WebhookRequest {
             info_hash: None,
             path: Some("/downloads/target.mkv".to_owned()),
+            path_snapshot: None,
             ignore_cross_seeds: false,
             ignore_exclude_recent_search: false,
             ignore_exclude_older: false,

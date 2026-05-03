@@ -1,6 +1,13 @@
 //! Daemon HTTP API routing, authentication, and response mapping.
 
-use std::{borrow::Cow, collections::BTreeMap, net::IpAddr, path::Path};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    fs,
+    net::IpAddr,
+    path::{Path, PathBuf},
+    time::UNIX_EPOCH,
+};
 
 use async_trait::async_trait;
 use url::{Url, form_urlencoded};
@@ -110,8 +117,10 @@ impl AnnounceRequest {
 pub struct WebhookRequest {
     /// Optional info hash criterion.
     pub info_hash: Option<String>,
-    /// Optional filesystem path criterion.
+    /// Optional canonical filesystem path criterion.
     pub path: Option<String>,
+    /// Filesystem snapshot captured when the request path was validated.
+    pub path_snapshot: Option<WebhookPathSnapshot>,
     /// Ignore cross-seed filtering.
     pub ignore_cross_seeds: bool,
     /// Override exclude_recent_search.
@@ -124,6 +133,85 @@ pub struct WebhookRequest {
     pub include_single_episodes: bool,
     /// Include non-video searchees.
     pub include_non_videos: bool,
+}
+
+/// Validated webhook path metadata used to detect replacement before work runs.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WebhookPathSnapshot {
+    original: String,
+    canonical: String,
+    kind: WebhookPathKind,
+    len: u64,
+    modified_millis: Option<u64>,
+}
+
+impl WebhookPathSnapshot {
+    pub(crate) fn capture(path: &str) -> crate::Result<Self> {
+        let path_ref = Path::new(path);
+        let metadata = fs::metadata(path_ref).map_err(|_error| api_error("path does not exist"))?;
+        let canonical =
+            fs::canonicalize(path_ref).map_err(|_error| api_error("path does not exist"))?;
+        Ok(Self {
+            original: path.to_owned(),
+            canonical: path_to_string(canonical),
+            kind: WebhookPathKind::from_metadata(&metadata),
+            len: metadata.len(),
+            modified_millis: modified_millis(&metadata),
+        })
+    }
+
+    pub(crate) fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    pub(crate) fn revalidate(&self) -> crate::Result<()> {
+        let path_ref = Path::new(&self.original);
+        let metadata = fs::metadata(path_ref)
+            .map_err(|_error| api_error("webhook path no longer exists before search"))?;
+        let canonical = fs::canonicalize(path_ref)
+            .map_err(|_error| api_error("webhook path no longer exists before search"))?;
+        let current = Self {
+            original: self.original.clone(),
+            canonical: path_to_string(canonical),
+            kind: WebhookPathKind::from_metadata(&metadata),
+            len: metadata.len(),
+            modified_millis: modified_millis(&metadata),
+        };
+        if &current == self {
+            Ok(())
+        } else {
+            Err(api_error("webhook path changed before search"))
+        }
+    }
+}
+
+/// Coarse filesystem object kind for webhook path replacement checks.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WebhookPathKind {
+    File,
+    Directory,
+    Other,
+}
+
+impl WebhookPathKind {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        if metadata.is_file() {
+            Self::File
+        } else if metadata.is_dir() {
+            Self::Directory
+        } else {
+            Self::Other
+        }
+    }
+}
+
+impl WebhookRequest {
+    pub(crate) fn revalidate_path(&self) -> crate::Result<()> {
+        if let Some(snapshot) = &self.path_snapshot {
+            snapshot.revalidate()?;
+        }
+        Ok(())
+    }
 }
 
 /// Validated `/api/job` request body.
@@ -336,6 +424,18 @@ fn normalize_body_value(key: &str, value: serde_json::Value) -> serde_json::Valu
     }
 }
 
+fn path_to_string(path: PathBuf) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn modified_millis(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn parse_announce(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<AnnounceRequest> {
     reject_unknown_fields(body, &["name", "guid", "link", "tracker", "cookie"])?;
     let name = required_string(body, "name")?;
@@ -380,14 +480,17 @@ fn parse_webhook(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<We
     {
         return Err(api_error("infoHash must be 40 hex characters"));
     }
-    if let Some(path) = &path {
-        if !Path::new(path).exists() {
-            return Err(api_error("path does not exist"));
-        }
-    }
+    let path_snapshot = path
+        .as_deref()
+        .map(WebhookPathSnapshot::capture)
+        .transpose()?;
+    let path = path_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.canonical().to_owned());
     Ok(WebhookRequest {
         info_hash,
         path,
+        path_snapshot,
         ignore_cross_seeds: bool_field(body, "ignoreCrossSeeds"),
         ignore_exclude_recent_search: bool_field(body, "ignoreExcludeRecentSearch"),
         ignore_exclude_older: bool_field(body, "ignoreExcludeOlder"),
@@ -639,6 +742,15 @@ mod tests {
         assert_eq!(handlers.webhooks.len(), 1);
         assert!(handlers.webhooks[0].ignore_cross_seeds);
         assert!(handlers.webhooks[0].include_non_videos);
+        let canonical = fs::canonicalize(&path)
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            handlers.webhooks[0].path.as_deref(),
+            Some(canonical.as_str())
+        );
+        assert!(handlers.webhooks[0].path_snapshot.is_some());
         let _cleanup = fs::remove_file(path);
     }
 
