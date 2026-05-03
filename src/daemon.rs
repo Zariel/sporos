@@ -75,7 +75,8 @@ async fn run_plan(
             index_torrents_and_data_dirs(config, database)
         })
         .await?;
-    execute_ran_jobs(app_dir, config, &mut plan.scheduler, &run.jobs).await?;
+    let startup_jobs = execute_ran_jobs(app_dir, config, &run.jobs).await;
+    finish_executed_jobs(&mut plan.scheduler, startup_jobs)?;
 
     let mut server_state = None;
     let server = if let Some(address) = listen_address(config) {
@@ -113,13 +114,18 @@ async fn run_plan(
             () = shutdown.cancelled() => break,
             _tick = interval.tick() => {
                 let now = now_millis();
+                let results = if let Some(state) = &server_state {
+                    let mut scheduler = state.scheduler.lock().await;
+                    scheduler.check_jobs_async(&async_database, now, false).await?
+                } else {
+                    plan.scheduler.check_jobs_async(&async_database, now, false).await?
+                };
+                let executed_jobs = execute_ran_jobs(app_dir, config, &results).await;
                 if let Some(state) = &server_state {
                     let mut scheduler = state.scheduler.lock().await;
-                    let results = scheduler.check_jobs_async(&async_database, now, false).await?;
-                    execute_ran_jobs(app_dir, config, &mut scheduler, &results).await?;
+                    finish_executed_jobs(&mut scheduler, executed_jobs)?;
                 } else {
-                    let results = plan.scheduler.check_jobs_async(&async_database, now, false).await?;
-                    execute_ran_jobs(app_dir, config, &mut plan.scheduler, &results).await?;
+                    finish_executed_jobs(&mut plan.scheduler, executed_jobs)?;
                 }
                 iterations = iterations.saturating_add(1);
             }
@@ -207,14 +213,26 @@ async fn handle_runtime_request(
     let mut handlers = RuntimeHandlers {
         app_dir: &state.app_dir,
         config: &state.config,
-        services: Arc::clone(&state.services),
         async_database: &async_database,
         scheduler: &mut scheduler,
         now_millis: now_millis(),
         webhook_requests: Vec::new(),
+        job_dispatches: Vec::new(),
     };
     let response = handle_api_request(request, &api_key, &mut handlers).await?;
-    handlers.submit_webhook_workers();
+    let webhook_requests = std::mem::take(&mut handlers.webhook_requests);
+    let job_dispatches = std::mem::take(&mut handlers.job_dispatches);
+    drop(handlers);
+    drop(scheduler);
+    submit_webhook_workers(
+        Arc::clone(&state.services),
+        &state.app_dir,
+        &state.config,
+        webhook_requests,
+    );
+    let executed_jobs = execute_ran_jobs(&state.app_dir, &state.config, &job_dispatches).await;
+    let mut scheduler = state.scheduler.lock().await;
+    finish_executed_jobs(&mut scheduler, executed_jobs)?;
     async_database.close().await;
     Ok(response)
 }
@@ -233,19 +251,45 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+struct ExecutedJob {
+    name: JobName,
+    result: crate::Result<()>,
+}
+
 async fn execute_ran_jobs(
     app_dir: &Path,
     config: &RuntimeConfig,
-    scheduler: &mut Scheduler,
     results: &[crate::scheduler::JobCheckResult],
-) -> crate::Result<()> {
+) -> Vec<ExecutedJob> {
+    let mut executed = Vec::new();
     for result in results {
         if !result.ran {
             continue;
         }
         let job_result = execute_ran_job(app_dir, config, result.name).await;
-        scheduler.finish_job(result.name);
-        job_result?;
+        executed.push(ExecutedJob {
+            name: result.name,
+            result: job_result,
+        });
+    }
+    executed
+}
+
+fn finish_executed_jobs(
+    scheduler: &mut Scheduler,
+    executed_jobs: Vec<ExecutedJob>,
+) -> crate::Result<()> {
+    let mut first_error = None;
+    for executed in executed_jobs {
+        scheduler.finish_job(executed.name);
+        if first_error.is_none() {
+            if let Err(error) = executed.result {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -408,29 +452,33 @@ struct DaemonState {
 struct RuntimeHandlers<'a> {
     app_dir: &'a Path,
     config: &'a RuntimeConfig,
-    services: Arc<RuntimeServices>,
     async_database: &'a AsyncDatabase,
     scheduler: &'a mut Scheduler,
     now_millis: i64,
     webhook_requests: Vec<WebhookRequest>,
+    job_dispatches: Vec<crate::scheduler::JobCheckResult>,
 }
 
-impl RuntimeHandlers<'_> {
-    fn submit_webhook_workers(self) {
-        for request in self.webhook_requests {
-            let app_dir = PathBuf::from(self.app_dir);
-            let config = self.config.clone();
-            let result = self.services.queues().webhooks.try_submit(
-                "webhook",
-                move |_shutdown| async move {
+fn submit_webhook_workers(
+    services: Arc<RuntimeServices>,
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    webhook_requests: Vec<WebhookRequest>,
+) {
+    for request in webhook_requests {
+        let app_dir = PathBuf::from(app_dir);
+        let config = config.clone();
+        let result =
+            services
+                .queues()
+                .webhooks
+                .try_submit("webhook", move |_shutdown| async move {
                     if let Err(error) = run_webhook_worker(app_dir, config, request).await {
                         tracing::error!("webhook background work failed: {error}");
                     }
-                },
-            );
-            if let Err(error) = result {
-                tracing::warn!("webhook background work was not queued: {error}");
-            }
+                });
+        if let Err(error) = result {
+            tracing::warn!("webhook background work was not queued: {error}");
         }
     }
 }
@@ -482,7 +530,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 .scheduler
                 .check_jobs_async(self.async_database, self.now_millis, false)
                 .await?;
-            execute_ran_jobs(self.app_dir, self.config, self.scheduler, &results).await?;
+            self.job_dispatches.extend(results);
         }
         Ok(response)
     }
@@ -510,7 +558,8 @@ async fn run_webhook_worker(
             .scheduler
             .check_jobs_async(&async_database, now, false)
             .await?;
-        execute_ran_jobs(&app_dir, &config, &mut plan.scheduler, &results).await?;
+        let executed_jobs = execute_ran_jobs(&app_dir, &config, &results).await;
+        finish_executed_jobs(&mut plan.scheduler, executed_jobs)?;
     }
     let notifier = crate::notifications::NotificationSender::from_config(
         &config,
@@ -600,15 +649,14 @@ mod tests {
         .expect("config");
         let mut plan = DaemonPlan::from_config(&config);
         let async_database = AsyncDatabase::open_app_dir(&root).await.expect("database");
-        let services = RuntimeServices::start(CancellationToken::new());
         let mut handlers = super::RuntimeHandlers {
             app_dir: &root,
             config: &config,
-            services: Arc::clone(&services),
             async_database: &async_database,
             scheduler: &mut plan.scheduler,
             now_millis: 1_000,
             webhook_requests: Vec::new(),
+            job_dispatches: Vec::new(),
         };
 
         let response = handle_api_request(
@@ -640,7 +688,6 @@ mod tests {
             .expect("last run");
         assert_eq!(inject_last_run, None);
         async_database.close().await;
-        services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
