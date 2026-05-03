@@ -29,7 +29,7 @@ use crate::{
     },
     clients::build_torrent_clients,
     config::RuntimeConfig,
-    persistence::{DataRootRecord, Database},
+    persistence::{AsyncDatabase, DataRootRecord, Database},
     scheduler::{DaemonPlan, DaemonRun, JobName, Scheduler},
 };
 
@@ -205,8 +205,11 @@ async fn handle_runtime_request(
     state: Arc<DaemonState>,
     request: ApiRequest,
 ) -> crate::Result<crate::api::ApiResponse> {
+    let async_database = AsyncDatabase::open_app_dir(&state.app_dir).await?;
+    let api_key =
+        crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await?;
+    async_database.close().await;
     let database = Database::open_app_dir(&state.app_dir)?;
-    let api_key = crate::operations::api_key(&database, state.config.api_key.as_deref())?;
     let mut scheduler = state.scheduler.lock().await;
     let mut handlers = RuntimeHandlers {
         app_dir: &state.app_dir,

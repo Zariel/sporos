@@ -28,7 +28,9 @@ use crate::{
     },
     matching::AssessmentOptions,
     notifications::NotificationSender,
-    persistence::{ClientSearcheeRecord, DataRootRecord, Database, EnsembleRecord},
+    persistence::{
+        AsyncDatabase, CacheTable, ClientSearcheeRecord, DataRootRecord, Database, EnsembleRecord,
+    },
     search::{
         Blocklist, CandidateSearchCache, ContentFilterOptions, PipelineAction, PipelineSummary,
         ReverseLookupGate, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
@@ -154,10 +156,31 @@ pub fn api_key(database: &Database, configured: Option<&str>) -> crate::Result<S
     reset_api_key(database)
 }
 
+/// Return configured, persisted, or newly generated API key through async persistence.
+pub async fn api_key_async(
+    database: &AsyncDatabase,
+    configured: Option<&str>,
+) -> crate::Result<String> {
+    if let Some(configured) = configured {
+        return Ok(configured.to_owned());
+    }
+    if let Some(stored) = database.get_api_key().await? {
+        return Ok(stored);
+    }
+    reset_api_key_async(database).await
+}
+
 /// Generate and persist a fresh API key.
 pub fn reset_api_key(database: &Database) -> crate::Result<String> {
     let key = generate_api_key()?;
     database.set_api_key(&key)?;
+    Ok(key)
+}
+
+/// Generate and persist a fresh API key through async persistence.
+pub async fn reset_api_key_async(database: &AsyncDatabase) -> crate::Result<String> {
+    let key = generate_api_key()?;
+    database.set_api_key(&key).await?;
     Ok(key)
 }
 
@@ -171,6 +194,16 @@ pub fn clear_cache(database: &Database) -> crate::Result<ClearCacheResult> {
         .connection()
         .execute("DELETE FROM timestamp", [])
         .map_err(persistence_error)?;
+    Ok(ClearCacheResult {
+        decisions_removed,
+        timestamps_removed,
+    })
+}
+
+/// Clear decision cache rows and search timestamps through async persistence.
+pub async fn clear_cache_async(database: &AsyncDatabase) -> crate::Result<ClearCacheResult> {
+    let decisions_removed = database.delete_null_decisions().await?;
+    let timestamps_removed = database.clear_timestamps().await?;
     Ok(ClearCacheResult {
         decisions_removed,
         timestamps_removed,
@@ -203,12 +236,33 @@ pub fn clear_client_cache(database: &Database) -> crate::Result<ClearClientCache
     })
 }
 
+/// Clear cached client, torrent-dir, data-dir, and ensemble state asynchronously.
+pub async fn clear_client_cache_async(
+    database: &AsyncDatabase,
+) -> crate::Result<ClearClientCacheResult> {
+    let torrents_removed = database.clear_table(CacheTable::Torrent).await?;
+    let client_searchees_removed = database.clear_table(CacheTable::ClientSearchee).await?;
+    let data_removed = database.clear_table(CacheTable::Data).await?;
+    let ensemble_removed = database.clear_table(CacheTable::Ensemble).await?;
+    Ok(ClearClientCacheResult {
+        torrents_removed,
+        client_searchees_removed,
+        data_removed,
+        ensemble_removed,
+    })
+}
+
 /// Clear indexer failure status and retry timestamps.
 pub fn clear_indexer_failures(database: &Database) -> crate::Result<usize> {
     database
         .connection()
         .execute("UPDATE indexer SET status = NULL, retry_after = NULL", [])
         .map_err(persistence_error)
+}
+
+/// Clear indexer failure status and retry timestamps asynchronously.
+pub async fn clear_indexer_failures_async(database: &AsyncDatabase) -> crate::Result<usize> {
+    database.clear_indexer_failures().await
 }
 
 /// Run daily database and torrent-cache cleanup.
@@ -1386,10 +1440,11 @@ fn replace_bencode_bytes_recursive(value: &mut Bencode<'_>, from: &[u8], to: &[u
 #[cfg(test)]
 mod tests {
     use super::{
-        api_key, cleanup_db, cleanup_db_with_clients, clear_cache, clear_client_cache,
-        clear_indexer_failures, reset_api_key, rss_time_since_last_run, run_announce_match,
-        run_webhook_search, update_torrent_cache_trackers, webhook_matches_request,
-        webhook_targets_and_excluded,
+        api_key, api_key_async, cleanup_db, cleanup_db_with_clients, clear_cache,
+        clear_cache_async, clear_client_cache, clear_client_cache_async, clear_indexer_failures,
+        clear_indexer_failures_async, reset_api_key, reset_api_key_async, rss_time_since_last_run,
+        run_announce_match, run_webhook_search, update_torrent_cache_trackers,
+        webhook_matches_request, webhook_targets_and_excluded,
     };
     use crate::{
         api::WebhookRequest,
@@ -1403,7 +1458,9 @@ mod tests {
             TorrentClientKind, TorrentClientMetadata,
         },
         notifications::NotificationSender,
-        persistence::{ClientSearcheeRecord, Database, DecisionRecord, EnsembleRecord},
+        persistence::{
+            AsyncDatabase, ClientSearcheeRecord, Database, DecisionRecord, EnsembleRecord,
+        },
         startup::Redactor,
     };
     use std::{
@@ -1434,6 +1491,32 @@ mod tests {
         let _cleanup = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn async_api_key_prefers_config_then_db_then_generated() {
+        let root = temp_path("async-api");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+
+        assert_eq!(
+            api_key_async(&database, Some("configured-api-key"))
+                .await
+                .expect("configured"),
+            "configured-api-key"
+        );
+        let generated = api_key_async(&database, None).await.expect("generated");
+        assert_eq!(generated.len(), 48);
+        assert_eq!(
+            api_key_async(&database, None).await.expect("stored"),
+            generated
+        );
+        let reset = reset_api_key_async(&database).await.expect("reset");
+        assert_eq!(reset.len(), 48);
+        assert_ne!(reset, generated);
+
+        database.close().await;
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn clears_cache_tables() {
         let root = temp_path("clear-cache");
@@ -1457,6 +1540,53 @@ mod tests {
         let result = clear_cache(&database).expect("clear");
 
         assert_eq!(result.decisions_removed, 1);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn async_clears_cache_tables_and_indexer_failures() {
+        let root = temp_path("async-clear-cache");
+        fs::create_dir_all(&root).expect("temp dir");
+        let sync_database = Database::open_app_dir(&root).expect("database");
+        let searchee_id = sync_database
+            .get_or_insert_searchee("name", 1)
+            .expect("searchee");
+        sync_database
+            .upsert_decision(&DecisionRecord {
+                searchee_id,
+                guid: "guid",
+                info_hash: None,
+                decision: crate::domain::Decision::NoDownloadLink,
+                first_seen: 1,
+                last_seen: 1,
+                fuzzy_size_factor: 0.05,
+            })
+            .expect("decision");
+        sync_database
+            .connection()
+            .execute(
+                "INSERT INTO indexer (url, apikey, active, status, retry_after)
+                 VALUES ('https://indexer.example', 'key', 1, 'RATE_LIMITED', 100)",
+                [],
+            )
+            .expect("indexer");
+        drop(sync_database);
+
+        let database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+
+        let cache = clear_cache_async(&database).await.expect("clear");
+        let failures = clear_indexer_failures_async(&database)
+            .await
+            .expect("failures");
+        let client = clear_client_cache_async(&database)
+            .await
+            .expect("client cache");
+
+        assert_eq!(cache.decisions_removed, 1);
+        assert_eq!(failures, 1);
+        assert_eq!(client.torrents_removed, 0);
+
+        database.close().await;
         let _cleanup = fs::remove_dir_all(root);
     }
 

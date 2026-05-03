@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 
-use crate::{SporosError, persistence::Database};
+use crate::{
+    SporosError,
+    persistence::{AsyncDatabase, Database},
+};
 
 /// Run the command-line entry point.
 pub async fn run() -> crate::Result<()> {
@@ -55,21 +58,21 @@ where
             }
         }
         Some(("clear-indexer-failures", _)) => {
-            let database = Database::open_app_dir(&app_dir)?;
-            let updated = crate::operations::clear_indexer_failures(&database)?;
+            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
+            let updated = crate::operations::clear_indexer_failures_async(&database).await?;
             println!("cleared {updated} indexer failures");
         }
         Some(("clear-cache", _)) => {
-            let database = Database::open_app_dir(&app_dir)?;
-            let result = crate::operations::clear_cache(&database)?;
+            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
+            let result = crate::operations::clear_cache_async(&database).await?;
             println!(
                 "cleared {} decisions and {} timestamps",
                 result.decisions_removed, result.timestamps_removed
             );
         }
         Some(("clear-client-cache", _)) => {
-            let database = Database::open_app_dir(&app_dir)?;
-            let result = crate::operations::clear_client_cache(&database)?;
+            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
+            let result = crate::operations::clear_client_cache_async(&database).await?;
             println!(
                 "cleared {} torrents, {} client searchees, {} data rows, and {} ensemble rows",
                 result.torrents_removed,
@@ -79,17 +82,23 @@ where
             );
         }
         Some(("api-key", matches)) => {
-            let database = Database::open_app_dir(&app_dir)?;
+            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
             let raw_config = crate::config::load_file_raw_config(&app_dir)?;
             let configured = matches
                 .get_one::<String>("api-key")
                 .map(String::as_str)
                 .or(raw_config.api_key.as_deref());
-            println!("{}", crate::operations::api_key(&database, configured)?);
+            println!(
+                "{}",
+                crate::operations::api_key_async(&database, configured).await?
+            );
         }
         Some(("reset-api-key", _)) => {
-            let database = Database::open_app_dir(&app_dir)?;
-            println!("{}", crate::operations::reset_api_key(&database)?);
+            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
+            println!(
+                "{}",
+                crate::operations::reset_api_key_async(&database).await?
+            );
         }
         Some(("daemon", matches)) => {
             let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;

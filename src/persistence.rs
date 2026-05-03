@@ -501,6 +501,70 @@ impl AsyncDatabase {
         self.pool.close().await;
     }
 
+    /// Read the generated API key from settings row `id = 0`.
+    pub async fn get_api_key(&self) -> crate::Result<Option<String>> {
+        sqlx::query_scalar("SELECT apikey FROM settings WHERE id = 0")
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)
+    }
+
+    /// Persist the generated API key in settings row `id = 0`.
+    pub async fn set_api_key(&self, api_key: &str) -> crate::Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (id, apikey)
+             VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET apikey = excluded.apikey",
+        )
+        .bind(api_key)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(sqlx_error)
+    }
+
+    /// Delete decision rows that have no cached torrent info hash.
+    pub async fn delete_null_decisions(&self) -> crate::Result<usize> {
+        let result = sqlx::query("DELETE FROM decision WHERE info_hash IS NULL")
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        rows_affected(result.rows_affected())
+    }
+
+    /// Clear all search timestamp rows.
+    pub async fn clear_timestamps(&self) -> crate::Result<usize> {
+        let result = sqlx::query("DELETE FROM timestamp")
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        rows_affected(result.rows_affected())
+    }
+
+    /// Clear one known cache table.
+    pub async fn clear_table(&self, table: CacheTable) -> crate::Result<usize> {
+        let sql = match table {
+            CacheTable::Torrent => "DELETE FROM torrent",
+            CacheTable::ClientSearchee => "DELETE FROM client_searchee",
+            CacheTable::Data => "DELETE FROM data",
+            CacheTable::Ensemble => "DELETE FROM ensemble",
+        };
+        let result = sqlx::query(sql)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        rows_affected(result.rows_affected())
+    }
+
+    /// Clear persisted indexer failure status and retry timestamps.
+    pub async fn clear_indexer_failures(&self) -> crate::Result<usize> {
+        let result = sqlx::query("UPDATE indexer SET status = NULL, retry_after = NULL")
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        rows_affected(result.rows_affected())
+    }
+
     async fn schema_version(&self) -> crate::Result<i64> {
         sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(self.pool())
@@ -515,6 +579,19 @@ impl AsyncDatabase {
             .map(|_| ())
             .map_err(sqlx_error)
     }
+}
+
+/// Cache tables that may be cleared from maintenance commands.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CacheTable {
+    /// Cached torrent-dir metafile rows.
+    Torrent,
+    /// Cached torrent-client inventory rows.
+    ClientSearchee,
+    /// Cached data-dir root rows.
+    Data,
+    /// Cached virtual ensemble lookup rows.
+    Ensemble,
 }
 
 /// Decision cache row for insertion.
@@ -752,6 +829,11 @@ fn sqlx_error(error: sqlx::Error) -> SporosError {
     SporosError::Persistence {
         message: Cow::Owned(error.to_string()),
     }
+}
+
+fn rows_affected(rows: u64) -> crate::Result<usize> {
+    usize::try_from(rows)
+        .map_err(|error| persistence_message(format!("row count exceeds usize: {error}")))
 }
 
 fn persistence_message(message: impl Into<Cow<'static, str>>) -> SporosError {
