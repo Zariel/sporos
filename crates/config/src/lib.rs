@@ -14,7 +14,7 @@ use std::{
 use regex::Regex;
 use serde::{Deserialize, Deserializer, de};
 
-use crate::SporosError;
+pub use sporos_core::{Result, SporosError, domain};
 
 const APP_DIR_NAME: &str = "cross-seed";
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -775,7 +775,9 @@ enum RatioConfigValue {
     Number(f64),
 }
 
-fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+fn deserialize_optional_duration<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -788,7 +790,7 @@ where
     }
 }
 
-fn deserialize_optional_ratio<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+fn deserialize_optional_ratio<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
 where
     D: Deserializer<'de>,
 {

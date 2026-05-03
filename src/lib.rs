@@ -4,24 +4,22 @@ pub mod actions;
 pub mod api;
 pub mod cli;
 pub mod clients;
-pub mod config;
 pub mod daemon;
-pub mod domain;
-pub mod error;
 pub mod integrations;
 pub mod matching;
 pub mod memory;
 pub mod notifications;
 pub mod operations;
-pub mod persistence;
-pub mod retry;
-pub mod runtime;
 pub mod scheduler;
 pub mod search;
 pub mod startup;
 pub mod torrent;
 
-pub use error::{Result, SporosError};
+pub use sporos_config as config;
+pub use sporos_core::{Result, SporosError, domain, error};
+pub use sporos_persistence as persistence;
+pub use sporos_retry as retry;
+pub use sporos_runtime as runtime;
 
 /// Package version reported by the command-line entry point.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

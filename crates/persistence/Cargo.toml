@@ -1,0 +1,16 @@
+[package]
+name = "sporos-persistence"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sporos-core = { path = "../core" }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt"] }
+
+[lints]
+workspace = true

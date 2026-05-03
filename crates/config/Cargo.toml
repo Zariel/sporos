@@ -1,0 +1,15 @@
+[package]
+name = "sporos-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+sporos-core = { path = "../core" }
+toml = "0.8"
+
+[lints]
+workspace = true

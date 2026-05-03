@@ -17,7 +17,8 @@ use sqlx::{
 };
 use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 
-use crate::{
+pub use sporos_core::{Result, domain};
+use sporos_core::{
     SporosError,
     domain::{ClientLabel, Decision, File, LookupFields},
 };
@@ -996,8 +997,7 @@ impl Database {
         })
     }
 
-    /// Load all client searchee cache rows for focused persistence tests.
-    #[cfg(test)]
+    /// Load all client searchee cache rows for focused verification paths.
     pub fn client_searchee_rows(&self) -> crate::Result<Vec<ClientSearcheeCacheRecord>> {
         self.block_on(async {
             let rows = sqlx::query(
