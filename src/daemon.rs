@@ -615,7 +615,7 @@ mod tests {
         api::{ApiMethod, ApiRequest, handle_api_request},
         config::{RawConfig, RuntimeConfig, TorrentClientConfig},
         persistence::{AsyncDatabase, Database},
-        runtime::RuntimeServices,
+        runtime::{RuntimeServices, RuntimeTaskQueue},
         scheduler::{DaemonPlan, JobConfigOverride, JobName},
     };
     use std::{
@@ -861,6 +861,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_requests_ignore_running_and_saturated_work() {
+        let root = temp_path("daemon-health-under-work");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let scheduler = DaemonPlan::from_config(&config).scheduler;
+        let services = RuntimeServices::start(CancellationToken::new());
+        submit_held(&services.queues().jobs, "search");
+        submit_held(&services.queues().jobs, "rss");
+        submit_held(&services.queues().jobs, "cleanup");
+        saturate_queue(&services.queues().jobs, "job-overflow");
+        saturate_queue(&services.queues().webhooks, "webhook");
+        saturate_queue(&services.queues().injection, "injection");
+        saturate_queue(&services.queues().blocking_local, "blocking-local");
+        wait_for_started(&services.queues().jobs).await;
+        wait_for_started(&services.queues().webhooks).await;
+        wait_for_started(&services.queues().injection).await;
+        wait_for_started(&services.queues().blocking_local).await;
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services,
+            scheduler: Mutex::new(scheduler),
+        });
+
+        let ping = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handle_runtime_request(
+                Arc::clone(&state),
+                ApiRequest::new(ApiMethod::Get, "/api/ping", BTreeMap::new(), ""),
+            ),
+        )
+        .await
+        .expect("ping should not wait for work queues")
+        .expect("ping");
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handle_runtime_request(
+                Arc::clone(&state),
+                ApiRequest::new(
+                    ApiMethod::Get,
+                    "/api/status?apikey=secret",
+                    BTreeMap::new(),
+                    "",
+                ),
+            ),
+        )
+        .await
+        .expect("status should not wait for work queues")
+        .expect("status");
+
+        assert_eq!(ping.status, 200);
+        assert_eq!(status.status, 200);
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn max_request_body_limit_matches_compatibility_limit() {
         assert_eq!(MAX_REQUEST_BODY_BYTES, 64 * 1024);
     }
@@ -896,5 +955,40 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn submit_held(queue: &RuntimeTaskQueue, kind: &'static str) {
+        queue
+            .try_submit(kind, |shutdown| async move {
+                shutdown.cancelled().await;
+            })
+            .expect("submit held work");
+    }
+
+    fn saturate_queue(queue: &RuntimeTaskQueue, kind: &'static str) {
+        for _task in 0..queue.capacity().saturating_add(2) {
+            let _result = queue.try_submit(kind, |shutdown| async move {
+                shutdown.cancelled().await;
+            });
+        }
+        assert!(
+            queue.stats().rejected > 0,
+            "{} queue should reject overflow",
+            queue.name()
+        );
+    }
+
+    async fn wait_for_started(queue: &RuntimeTaskQueue) {
+        for _attempt in 0..20 {
+            if queue.stats().started > 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            queue.stats().started > 0,
+            "{} queue should start held work",
+            queue.name()
+        );
     }
 }
