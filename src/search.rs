@@ -1243,13 +1243,44 @@ where
 
 /// Discover candidate release roots below a data-dir using a bounded walk.
 pub fn find_potential_nested_roots(root: &Path, max_depth: u32) -> crate::Result<Vec<PathBuf>> {
-    let mut roots = BTreeSet::new();
-    for entry in WalkDir::new(root)
-        .max_depth(max_depth as usize + 1)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !ignored_directory(entry))
-    {
+    let mut roots = Vec::new();
+    for_each_potential_nested_root(root, max_depth, |root| {
+        roots.push(root.to_path_buf());
+        Ok(())
+    })?;
+    Ok(roots)
+}
+
+/// Stream candidate release roots below a data-dir without retaining the tree.
+pub fn for_each_potential_nested_root<F>(
+    root: &Path,
+    max_depth: u32,
+    mut handle: F,
+) -> crate::Result<()>
+where
+    F: FnMut(&Path) -> crate::Result<()>,
+{
+    visit_potential_nested_roots(root, max_depth, &mut handle)
+}
+
+fn visit_potential_nested_roots<F>(
+    root: &Path,
+    remaining_depth: u32,
+    handle: &mut F,
+) -> crate::Result<()>
+where
+    F: FnMut(&Path) -> crate::Result<()>,
+{
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!("skipping data-dir entry {}: {error}", root.display());
+            return Ok(());
+        }
+    };
+    let mut has_video = false;
+    let mut child_dirs = Vec::new();
+    for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -1257,23 +1288,31 @@ pub fn find_potential_nested_roots(root: &Path, max_depth: u32) -> crate::Result
                 continue;
             }
         };
-        if !entry.file_type().is_file() || !path_has_extension(entry.path(), VIDEO_EXTENSIONS) {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                tracing::debug!("skipping data-dir metadata: {error}");
+                continue;
+            }
+        };
+        if file_type.is_dir() {
+            if remaining_depth > 0 && !ignored_directory_name(&entry.file_name()) {
+                child_dirs.push(entry.path());
+            }
             continue;
         }
-        if let Some(parent) = entry.path().parent() {
-            roots.insert(parent.to_path_buf());
+        if file_type.is_file() && path_has_extension(&entry.path(), VIDEO_EXTENSIONS) {
+            has_video = true;
         }
     }
-
-    let mut roots = roots.into_iter().collect::<Vec<_>>();
-    roots.sort_by(|left, right| {
-        right
-            .components()
-            .count()
-            .cmp(&left.components().count())
-            .then_with(|| left.cmp(right))
-    });
-    Ok(roots)
+    child_dirs.sort();
+    for child in child_dirs {
+        visit_potential_nested_roots(&child, remaining_depth - 1, handle)?;
+    }
+    if has_video {
+        handle(root)?;
+    }
+    Ok(())
 }
 
 /// Recompute affected parent roots for a changed path up to `max_data_depth`.
@@ -1357,12 +1396,13 @@ where
 {
     let mut seen = 0usize;
     for data_dir in data_dirs {
-        for root in find_potential_nested_roots(data_dir, max_depth)? {
-            if let Some(searchee) = create_searchee_from_path(&root)? {
+        for_each_potential_nested_root(data_dir, max_depth, |root| {
+            if let Some(searchee) = create_searchee_from_path(root)? {
                 handle(searchee)?;
                 seen = seen.saturating_add(1);
             }
-        }
+            Ok(())
+        })?;
     }
     Ok(seen)
 }
@@ -1811,7 +1851,11 @@ fn ignored_directory(entry: &DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return false;
     }
-    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+    ignored_directory_name(entry.file_name())
+}
+
+fn ignored_directory_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
     [
         "sample",
         "proof",
@@ -2702,6 +2746,7 @@ mod tests {
         fs::create_dir_all(root.join("Show/Season 1")).expect("season dir");
         fs::create_dir_all(root.join("Show/Sample")).expect("sample dir");
         fs::write(root.join("Show/Season 1/Show.S01E01.mkv"), b"video").expect("episode");
+        fs::write(root.join("Show/Season 1/Show.S01E02.mkv"), b"video").expect("episode");
         fs::write(root.join("Show/Sample/sample.mkv"), b"sample").expect("sample");
         fs::write(root.join("readme.txt"), b"text").expect("text");
 
