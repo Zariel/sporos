@@ -29,6 +29,7 @@ use crate::{
     },
     config::RuntimeConfig,
     persistence::{AsyncDatabase, DataRootRecord, Database},
+    runtime::RuntimeServices,
     scheduler::{DaemonPlan, DaemonRun, JobName, Scheduler},
 };
 
@@ -68,6 +69,7 @@ async fn run_plan(
     max_iterations: Option<usize>,
 ) -> crate::Result<DaemonRun> {
     let async_database = AsyncDatabase::open_app_dir(app_dir).await?;
+    let runtime_services = RuntimeServices::start(shutdown.child_token());
     let mut run = plan
         .run_startup_async(&async_database, now_millis(), || {
             index_torrents_and_data_dirs(config, database)
@@ -88,6 +90,7 @@ async fn run_plan(
         let state = Arc::new(DaemonState {
             app_dir: app_dir.to_owned(),
             config: config.clone(),
+            services: Arc::clone(&runtime_services),
             scheduler: Mutex::new(std::mem::replace(
                 &mut plan.scheduler,
                 Scheduler::new(Vec::new()),
@@ -129,6 +132,7 @@ async fn run_plan(
             .await
             .map_err(|error| daemon_error(format!("HTTP server task failed: {error}")))??;
     }
+    runtime_services.shutdown().await;
     async_database.close().await;
     Ok(run)
 }
@@ -203,13 +207,14 @@ async fn handle_runtime_request(
     let mut handlers = RuntimeHandlers {
         app_dir: &state.app_dir,
         config: &state.config,
+        services: Arc::clone(&state.services),
         async_database: &async_database,
         scheduler: &mut scheduler,
         now_millis: now_millis(),
         webhook_requests: Vec::new(),
     };
     let response = handle_api_request(request, &api_key, &mut handlers).await?;
-    handlers.spawn_webhook_workers();
+    handlers.submit_webhook_workers();
     async_database.close().await;
     Ok(response)
 }
@@ -396,12 +401,14 @@ fn daemon_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 struct DaemonState {
     app_dir: PathBuf,
     config: RuntimeConfig,
+    services: Arc<RuntimeServices>,
     scheduler: Mutex<Scheduler>,
 }
 
 struct RuntimeHandlers<'a> {
     app_dir: &'a Path,
     config: &'a RuntimeConfig,
+    services: Arc<RuntimeServices>,
     async_database: &'a AsyncDatabase,
     scheduler: &'a mut Scheduler,
     now_millis: i64,
@@ -409,15 +416,21 @@ struct RuntimeHandlers<'a> {
 }
 
 impl RuntimeHandlers<'_> {
-    fn spawn_webhook_workers(self) {
+    fn submit_webhook_workers(self) {
         for request in self.webhook_requests {
             let app_dir = PathBuf::from(self.app_dir);
             let config = self.config.clone();
-            tokio::spawn(async move {
-                if let Err(error) = run_webhook_worker(app_dir, config, request).await {
-                    tracing::error!("webhook background work failed: {error}");
-                }
-            });
+            let result = self.services.queues().webhooks.try_submit(
+                "webhook",
+                move |_shutdown| async move {
+                    if let Err(error) = run_webhook_worker(app_dir, config, request).await {
+                        tracing::error!("webhook background work failed: {error}");
+                    }
+                },
+            );
+            if let Err(error) = result {
+                tracing::warn!("webhook background work was not queued: {error}");
+            }
         }
     }
 }
@@ -524,6 +537,7 @@ mod tests {
         api::{ApiMethod, ApiRequest, handle_api_request},
         config::{RawConfig, RuntimeConfig, TorrentClientConfig},
         persistence::{AsyncDatabase, Database},
+        runtime::RuntimeServices,
         scheduler::{DaemonPlan, JobName},
     };
     use std::{
@@ -586,9 +600,11 @@ mod tests {
         .expect("config");
         let mut plan = DaemonPlan::from_config(&config);
         let async_database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+        let services = RuntimeServices::start(CancellationToken::new());
         let mut handlers = super::RuntimeHandlers {
             app_dir: &root,
             config: &config,
+            services: Arc::clone(&services),
             async_database: &async_database,
             scheduler: &mut plan.scheduler,
             now_millis: 1_000,
@@ -624,6 +640,7 @@ mod tests {
             .expect("last run");
         assert_eq!(inject_last_run, None);
         async_database.close().await;
+        services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
@@ -638,6 +655,7 @@ mod tests {
         let state = Arc::new(super::DaemonState {
             app_dir: root.clone(),
             config,
+            services: RuntimeServices::start(CancellationToken::new()),
             scheduler: Mutex::new(scheduler),
         });
 
@@ -648,7 +666,7 @@ mod tests {
         .await
         .expect("ping");
         let unauthorized = handle_runtime_request(
-            state,
+            Arc::clone(&state),
             ApiRequest::new(ApiMethod::Get, "/api/status", BTreeMap::new(), ""),
         )
         .await
@@ -656,6 +674,7 @@ mod tests {
 
         assert_eq!(ping.status, 200);
         assert_eq!(unauthorized.status, 401);
+        state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
