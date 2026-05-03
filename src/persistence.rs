@@ -7,6 +7,10 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 
 use crate::{
     SporosError,
@@ -37,6 +41,13 @@ const MIGRATIONS: &[Migration] = &[
 /// SQLite database handle with compatibility schema helpers.
 pub struct Database {
     connection: Connection,
+}
+
+/// Async SQLite database handle for sqlx-backed persistence call sites.
+#[derive(Debug, Clone)]
+pub struct AsyncDatabase {
+    path: PathBuf,
+    pool: SqlitePool,
 }
 
 impl Database {
@@ -423,6 +434,50 @@ impl Database {
     }
 }
 
+impl AsyncDatabase {
+    /// Open `<appDir>/cross-seed.db` through the async sqlx boundary.
+    pub async fn open_app_dir(app_dir: &Path) -> crate::Result<Self> {
+        Self::open(Database::path_for_app_dir(app_dir)).await
+    }
+
+    /// Open a database file and expose a sqlx SQLite pool.
+    ///
+    /// Schema bootstrap still goes through the existing synchronous
+    /// `Database` boundary until migrations move to sqlx.
+    pub async fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        {
+            let database = Database::open(&path)?;
+            drop(database);
+        }
+
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .map_err(sqlx_error)?;
+
+        Ok(Self { path, pool })
+    }
+
+    /// Database file path used by this pool.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Access the raw sqlx pool for async persistence queries.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Close all pool connections.
+    pub async fn close(self) {
+        self.pool.close().await;
+    }
+}
+
 /// Decision cache row for insertion.
 #[derive(Debug, Clone, Copy)]
 pub struct DecisionRecord<'a> {
@@ -654,6 +709,12 @@ fn sql_error(error: rusqlite::Error) -> SporosError {
     }
 }
 
+fn sqlx_error(error: sqlx::Error) -> SporosError {
+    SporosError::Persistence {
+        message: Cow::Owned(error.to_string()),
+    }
+}
+
 fn persistence_message(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Persistence {
         message: message.into(),
@@ -690,7 +751,10 @@ fn strings_json(values: &[std::borrow::Cow<'_, str>]) -> crate::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord, EnsembleRecord};
+    use super::{
+        AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord,
+        EnsembleRecord,
+    };
     use crate::domain::{ClientLabel, Decision, File};
     use std::{
         borrow::Cow,
@@ -740,6 +804,25 @@ mod tests {
             assert_eq!(count, 1, "{table}");
         }
 
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn async_database_opens_same_file_with_sqlx_pool() {
+        let root = temp_path("async-boundary");
+        fs::create_dir_all(&root).expect("temp dir");
+        let expected_path = Database::path_for_app_dir(&root);
+
+        let database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+
+        assert_eq!(database.path(), expected_path.as_path());
+        let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(database.pool())
+            .await
+            .expect("schema version");
+        assert_eq!(user_version, super::CURRENT_SCHEMA_VERSION);
+
+        database.close().await;
         let _cleanup = fs::remove_dir_all(root);
     }
 
