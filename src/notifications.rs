@@ -1,10 +1,11 @@
 //! Push notification webhook payloads and delivery.
 
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, future::Future, time::Duration};
 
-use reqwest::{blocking::Client, header::CONTENT_TYPE};
+use reqwest::{Client, header::CONTENT_TYPE};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::runtime::Builder;
 
 use crate::{
     SporosError, VERSION,
@@ -57,26 +58,52 @@ impl NotificationSender {
 
     /// Send the documented test notification payload.
     pub fn send_test(&self) -> NotificationReport {
-        self.post_all(&NotificationPayload {
+        block_on_notification(self.send_test_async()).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "failed to run notification delivery");
+            NotificationReport {
+                attempted: self.urls.len(),
+                succeeded: 0,
+                failed: self.urls.len(),
+            }
+        })
+    }
+
+    /// Send the documented test notification payload asynchronously.
+    pub async fn send_test_async(&self) -> NotificationReport {
+        self.post_all(NotificationPayload {
             title: "cross-seed".to_owned(),
             body: "test notification".to_owned(),
             extra: json!({ "event": "TEST" }),
         })
+        .await
     }
 
     /// Send a result notification when an attempt has a notifiable action result.
     pub fn send_result(&self, attempt: &PipelineAttempt) -> NotificationReport {
-        result_payload(attempt).map_or_else(NotificationReport::default, |payload| {
-            self.post_all(&payload)
+        block_on_notification(self.send_result_async(attempt)).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "failed to run notification delivery");
+            NotificationReport {
+                attempted: self.urls.len(),
+                succeeded: 0,
+                failed: self.urls.len(),
+            }
         })
     }
 
-    fn post_all(&self, payload: &NotificationPayload) -> NotificationReport {
+    /// Send a result notification asynchronously when an attempt has a notifiable action result.
+    pub async fn send_result_async(&self, attempt: &PipelineAttempt) -> NotificationReport {
+        let Some(payload) = result_payload(attempt) else {
+            return NotificationReport::default();
+        };
+        self.post_all(payload).await
+    }
+
+    async fn post_all(&self, payload: NotificationPayload) -> NotificationReport {
         let mut report = NotificationReport {
             attempted: self.urls.len(),
             ..NotificationReport::default()
         };
-        let body = match serde_json::to_vec(payload) {
+        let body = match serde_json::to_vec(&payload) {
             Ok(body) => body,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to serialize notification payload");
@@ -91,6 +118,7 @@ impl NotificationSender {
                 .header(CONTENT_TYPE, "application/json")
                 .body(body.clone())
                 .send()
+                .await
             {
                 Ok(response) if response.status().is_success() => {
                     report.succeeded += 1;
@@ -168,6 +196,19 @@ fn notification_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Integration {
         message: message.into(),
     }
+}
+
+fn block_on_notification<F, T>(future: F) -> crate::Result<T>
+where
+    F: Future<Output = T>,
+{
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            notification_error(format!("failed to build notifier runtime: {error}"))
+        })?;
+    Ok(runtime.block_on(future))
 }
 
 #[cfg(test)]
