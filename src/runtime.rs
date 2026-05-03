@@ -1,6 +1,14 @@
 //! Runtime-owned bounded queues and worker lifecycle management.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use tokio::{
     sync::{Mutex, mpsc},
@@ -56,12 +64,37 @@ struct RuntimeTask {
     run: RuntimeTaskFn,
 }
 
+#[derive(Debug, Default)]
+struct RuntimeQueueMetrics {
+    enqueued: AtomicUsize,
+    rejected: AtomicUsize,
+    started: AtomicUsize,
+    finished: AtomicUsize,
+    cancelled: AtomicUsize,
+}
+
+/// Snapshot of one runtime queue's observable counters.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct RuntimeQueueStats {
+    /// Commands accepted by the queue.
+    pub enqueued: usize,
+    /// Commands rejected because the queue was full or closed.
+    pub rejected: usize,
+    /// Commands started by the worker.
+    pub started: usize,
+    /// Commands that completed normally.
+    pub finished: usize,
+    /// Commands cancelled after start.
+    pub cancelled: usize,
+}
+
 /// Cloneable handle for one bounded runtime queue.
 #[derive(Clone)]
 pub struct RuntimeTaskQueue {
     name: &'static str,
     capacity: usize,
     sender: mpsc::Sender<RuntimeTask>,
+    metrics: Arc<RuntimeQueueMetrics>,
 }
 
 impl RuntimeTaskQueue {
@@ -75,6 +108,17 @@ impl RuntimeTaskQueue {
         self.capacity
     }
 
+    /// Return current queue counters.
+    pub fn stats(&self) -> RuntimeQueueStats {
+        RuntimeQueueStats {
+            enqueued: self.metrics.enqueued.load(Ordering::Relaxed),
+            rejected: self.metrics.rejected.load(Ordering::Relaxed),
+            started: self.metrics.started.load(Ordering::Relaxed),
+            finished: self.metrics.finished.load(Ordering::Relaxed),
+            cancelled: self.metrics.cancelled.load(Ordering::Relaxed),
+        }
+    }
+
     /// Submit one async task without awaiting queue capacity.
     pub fn try_submit<F, Fut>(&self, kind: &'static str, task: F) -> Result<(), QueueSubmitError>
     where
@@ -85,16 +129,41 @@ impl RuntimeTaskQueue {
             kind,
             run: Box::new(move |shutdown| Box::pin(task(shutdown))),
         };
-        self.sender.try_send(command).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_command) => QueueSubmitError::Full {
-                queue: self.name,
-                kind,
-            },
-            mpsc::error::TrySendError::Closed(_command) => QueueSubmitError::Closed {
-                queue: self.name,
-                kind,
-            },
-        })
+        match self.sender.try_send(command) {
+            Ok(()) => {
+                self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    queue = self.name,
+                    kind,
+                    capacity = self.capacity,
+                    enqueue_result = "accepted",
+                    "runtime command enqueued",
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                let error = match error {
+                    mpsc::error::TrySendError::Full(_command) => QueueSubmitError::Full {
+                        queue: self.name,
+                        kind,
+                    },
+                    mpsc::error::TrySendError::Closed(_command) => QueueSubmitError::Closed {
+                        queue: self.name,
+                        kind,
+                    },
+                };
+                tracing::warn!(
+                    queue = self.name,
+                    kind,
+                    capacity = self.capacity,
+                    enqueue_result = "rejected",
+                    error = %error,
+                    "runtime command rejected",
+                );
+                Err(error)
+            }
+        }
     }
 }
 
@@ -185,12 +254,14 @@ impl RuntimeTaskQueue {
         shutdown: CancellationToken,
     ) -> (Self, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(capacity);
+        let metrics = Arc::new(RuntimeQueueMetrics::default());
         let queue = Self {
             name,
             capacity,
             sender,
+            metrics: Arc::clone(&metrics),
         };
-        let worker = tokio::spawn(run_worker(name, shutdown, receiver));
+        let worker = tokio::spawn(run_worker(name, shutdown, receiver, metrics));
         (queue, worker)
     }
 }
@@ -199,6 +270,7 @@ async fn run_worker(
     queue: &'static str,
     shutdown: CancellationToken,
     mut receiver: mpsc::Receiver<RuntimeTask>,
+    metrics: Arc<RuntimeQueueMetrics>,
 ) {
     loop {
         tokio::select! {
@@ -209,12 +281,14 @@ async fn run_worker(
                 };
                 let kind = command.kind;
                 let queued_at = Instant::now();
+                metrics.started.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(queue, kind, "runtime command started");
                 let command_shutdown = shutdown.child_token();
                 let started_at = Instant::now();
                 tokio::select! {
                     () = shutdown.cancelled() => {
                         command_shutdown.cancel();
+                        metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(
                             queue,
                             kind,
@@ -223,6 +297,7 @@ async fn run_worker(
                         );
                     }
                     () = (command.run)(command_shutdown.clone()) => {
+                        metrics.finished.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(
                             queue,
                             kind,
@@ -240,7 +315,7 @@ async fn run_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{QueueSubmitError, RuntimeServices, RuntimeTaskQueue};
+    use super::{QueueSubmitError, RuntimeQueueMetrics, RuntimeServices, RuntimeTaskQueue};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -274,10 +349,12 @@ mod tests {
     #[tokio::test]
     async fn runtime_queue_reports_full_capacity() {
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let metrics = Arc::new(RuntimeQueueMetrics::default());
         let queue = RuntimeTaskQueue {
             name: "webhooks",
             capacity: 1,
             sender,
+            metrics,
         };
 
         queue
@@ -294,5 +371,32 @@ mod tests {
                 kind: "overflow",
             }
         );
+        assert_eq!(queue.stats().enqueued, 1);
+        assert_eq!(queue.stats().rejected, 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_queue_stats_track_worker_lifecycle() {
+        let services = RuntimeServices::start(CancellationToken::new());
+        services
+            .queues()
+            .webhooks
+            .try_submit("observed", |_shutdown| async {})
+            .expect("submit");
+
+        for _attempt in 0..10 {
+            let stats = services.queues().webhooks.stats();
+            if stats.finished == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let stats = services.queues().webhooks.stats();
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.started, 1);
+        assert_eq!(stats.finished, 1);
+        assert_eq!(stats.cancelled, 0);
+        services.shutdown().await;
     }
 }
