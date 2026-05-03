@@ -2758,8 +2758,8 @@ mod tests {
         create_searchee_from_path, create_virtual_season_searchees, filter_by_content,
         filter_duplicate_searchees, find_all_searchees, find_potential_nested_roots,
         find_searchable_searchees, get_media_type, index_torrent_dir, indexer_supports_media,
-        lookup_fields, parse_title, reverse_lookup_data_rows, reverse_lookup_keys,
-        reverse_lookup_searchees, search_group_key, timestamp_excludes,
+        lookup_fields, parse_title, reverse_lookup_client_rows, reverse_lookup_data_rows,
+        reverse_lookup_keys, reverse_lookup_searchees, search_group_key, timestamp_excludes,
     };
     use crate::{
         domain::{
@@ -3735,6 +3735,132 @@ mod tests {
             .expect("data reverse lookup");
 
         assert!(rows.is_empty());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reverse_lookup_selectors_skip_large_unrelated_caches() {
+        let root = temp_path("reverse-large-selector");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("data dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let blocklist = Blocklist::parse(&[]).expect("blocklist");
+        let exclude = BTreeSet::new();
+        let mut options = pipeline_options(&blocklist, &exclude, &root, Label::Rss);
+        options.filter.include_single_episodes = true;
+
+        for index in 0..300 {
+            let info_hash = format!("{index:040x}");
+            let data_path = data.join(format!("missing-{index}"));
+            database
+                .execute_sql(
+                    "INSERT INTO client_searchee
+                        (client_host, info_hash, name, title, files, length, save_path, trackers, search_key, media_type, season, episode, file_count, video_bytes, non_video_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    &[
+                        SqlValue::Text(Cow::Borrowed("client-a")),
+                        SqlValue::Text(Cow::Owned(info_hash)),
+                        SqlValue::Text(Cow::Borrowed("Example.Show.S01E01.poison")),
+                        SqlValue::Text(Cow::Borrowed("Example Show S01E01")),
+                        SqlValue::Text(Cow::Borrowed("not-json")),
+                        SqlValue::I64(10),
+                        SqlValue::Text(Cow::Borrowed("/downloads")),
+                        SqlValue::Text(Cow::Borrowed("[]")),
+                        SqlValue::Text(Cow::Borrowed("other.show.s01e01")),
+                        SqlValue::Text(Cow::Borrowed("episode")),
+                        SqlValue::I64(1),
+                        SqlValue::I64(1),
+                        SqlValue::I64(1),
+                        SqlValue::I64(10),
+                        SqlValue::I64(0),
+                    ],
+                )
+                .expect("client poison row");
+            database
+                .execute_sql(
+                    "INSERT INTO data
+                        (path, title, search_key, media_type, season, episode, length, file_count, video_bytes, non_video_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    &[
+                        SqlValue::Text(Cow::Owned(data_path.display().to_string())),
+                        SqlValue::Text(Cow::Borrowed("Example Show S01E01")),
+                        SqlValue::Text(Cow::Borrowed("other.show.s01e01")),
+                        SqlValue::Text(Cow::Borrowed("episode")),
+                        SqlValue::I64(1),
+                        SqlValue::I64(1),
+                        SqlValue::I64(10),
+                        SqlValue::I64(1),
+                        SqlValue::I64(10),
+                        SqlValue::I64(0),
+                    ],
+                )
+                .expect("data poison row");
+        }
+
+        let false_positive = data.join("Different.Show.S01E01");
+        fs::create_dir_all(&false_positive).expect("false-positive dir");
+        fs::write(false_positive.join("Different.Show.S01E01.mkv"), b"video")
+            .expect("false-positive file");
+        database
+            .execute_sql(
+                "INSERT INTO client_searchee
+                    (client_host, info_hash, name, title, files, length, save_path, trackers, search_key, media_type, season, episode, file_count, video_bytes, non_video_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                &[
+                    SqlValue::Text(Cow::Borrowed("client-a")),
+                    SqlValue::Text(Cow::Borrowed("ffffffffffffffffffffffffffffffffffffffff")),
+                    SqlValue::Text(Cow::Borrowed("Different.Show.S01E01")),
+                    SqlValue::Text(Cow::Borrowed("Different Show S01E01")),
+                    SqlValue::Text(Cow::Borrowed(
+                        r#"[{"name":"Different.Show.S01E01.mkv","path":"Different.Show.S01E01.mkv","length":5}]"#,
+                    )),
+                    SqlValue::I64(5),
+                    SqlValue::Text(Cow::Borrowed("/downloads")),
+                    SqlValue::Text(Cow::Borrowed("[]")),
+                    SqlValue::Text(Cow::Borrowed("example.show.s01e01")),
+                    SqlValue::Text(Cow::Borrowed("episode")),
+                    SqlValue::I64(1),
+                    SqlValue::I64(1),
+                    SqlValue::I64(1),
+                    SqlValue::I64(5),
+                    SqlValue::I64(0),
+                ],
+            )
+            .expect("client false-positive row");
+        database
+            .execute_sql(
+                "INSERT INTO data
+                    (path, title, search_key, media_type, season, episode, length, file_count, video_bytes, non_video_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    SqlValue::Text(Cow::Owned(false_positive.display().to_string())),
+                    SqlValue::Text(Cow::Borrowed("Different Show S01E01")),
+                    SqlValue::Text(Cow::Borrowed("example.show.s01e01")),
+                    SqlValue::Text(Cow::Borrowed("episode")),
+                    SqlValue::I64(1),
+                    SqlValue::I64(1),
+                    SqlValue::I64(5),
+                    SqlValue::I64(1),
+                    SqlValue::I64(5),
+                    SqlValue::I64(0),
+                ],
+            )
+            .expect("data false-positive row");
+
+        let candidate = Candidate::new(
+            "Example.Show.S01E01",
+            "guid-large",
+            None::<String>,
+            "tracker",
+        );
+        let keys = reverse_lookup_keys(candidate.name.as_ref());
+        let client_rows = reverse_lookup_client_rows(&database, &candidate, &keys, &options.filter)
+            .expect("client reverse lookup");
+        let data_rows = reverse_lookup_data_rows(&database, &candidate, &keys, &options.filter)
+            .expect("data reverse lookup");
+
+        assert!(client_rows.is_empty());
+        assert!(data_rows.is_empty());
         let _cleanup = fs::remove_dir_all(root);
     }
 
