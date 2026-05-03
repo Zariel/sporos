@@ -19,7 +19,7 @@ use sporos::{
         ResumeOptions, TorrentClient,
     },
     config::{
-        ApiIntegrationConfig, DeprecatedConfig, LinkType, MatchMode, RawConfig, RuntimeConfig,
+        ApiIntegrationConfig, LinkType, MatchMode, RawConfig, RuntimeConfig, TorrentClientConfig,
     },
     domain::{
         ClientLabel, Decision, File, InfoHash, InjectionResult, MediaType, Metafile, Searchee,
@@ -57,11 +57,10 @@ fn current_bootstrap_reopen_preserves_compatibility_state() {
             action: Some("inject".to_owned()),
             include_single_episodes: Some(true),
             fuzzy_size_threshold: Some(0.05),
-            deprecated: DeprecatedConfig {
-                notification_webhook_url: Some("https://hooks.example/cross-seed".to_owned()),
-                qbittorrent_url: Some("http://localhost:8080".to_owned()),
-                ..DeprecatedConfig::default()
-            },
+            notification_webhook_urls: vec!["https://hooks.example/cross-seed".to_owned()],
+            torrent_clients: vec![
+                TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client"),
+            ],
             ..RawConfig::default()
         },
         &app_dir,

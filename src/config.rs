@@ -24,7 +24,7 @@ const MIN_RSS_CADENCE_MILLIS: u64 = 10 * 60 * 1_000;
 const MAX_RSS_CADENCE_MILLIS: u64 = 2 * 60 * 60 * 1_000;
 const MIN_SEARCH_CADENCE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 
-/// Match mode after deprecated names have been normalized.
+/// Match mode after configured text has been parsed.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MatchMode {
     /// Exact file-tree match only.
@@ -36,7 +36,7 @@ pub enum MatchMode {
 }
 
 impl MatchMode {
-    /// Normalize current and deprecated config spellings.
+    /// Parse configured match-mode text.
     pub fn parse(value: &str) -> crate::Result<Self> {
         match value {
             "strict" | "safe" => Ok(Self::Strict),
@@ -178,24 +178,6 @@ impl ApiIntegrationConfig {
     }
 }
 
-/// Deprecated config fields that map into current options.
-#[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct DeprecatedConfig {
-    /// Deprecated singular link dir.
-    pub link_dir: Option<PathBuf>,
-    /// Deprecated singular notification URL.
-    pub notification_webhook_url: Option<String>,
-    /// Deprecated qBittorrent URL.
-    pub qbittorrent_url: Option<String>,
-    /// Deprecated rTorrent URL.
-    pub rtorrent_rpc_url: Option<String>,
-    /// Deprecated Transmission URL.
-    pub transmission_rpc_url: Option<String>,
-    /// Deprecated Deluge URL.
-    pub deluge_rpc_url: Option<String>,
-}
-
 /// Raw options before defaults and cross-option validation.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -287,9 +269,6 @@ pub struct RawConfig {
     pub sonarr: Vec<ApiIntegrationConfig>,
     /// Radarr instances.
     pub radarr: Vec<ApiIntegrationConfig>,
-    /// Deprecated fields.
-    #[serde(skip)]
-    pub deprecated: DeprecatedConfig,
 }
 
 /// Runtime config after defaults and validation.
@@ -380,43 +359,9 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     /// Normalize raw options and run documented cross-option checks.
     pub fn normalize(raw: RawConfig, app_dir: &Path) -> crate::Result<Self> {
-        let mut link_dirs = raw.link_dirs;
-        if link_dirs.is_empty() {
-            if let Some(link_dir) = raw.deprecated.link_dir {
-                link_dirs.push(link_dir);
-            }
-        }
-
-        let mut notification_webhook_urls = raw.notification_webhook_urls;
-        if notification_webhook_urls.is_empty() {
-            if let Some(url) = raw.deprecated.notification_webhook_url {
-                notification_webhook_urls.push(url);
-            }
-        }
-
-        let mut torrent_clients = raw.torrent_clients;
-        if torrent_clients.is_empty() {
-            push_deprecated_client(
-                &mut torrent_clients,
-                "qbittorrent",
-                raw.deprecated.qbittorrent_url,
-            );
-            push_deprecated_client(
-                &mut torrent_clients,
-                "rtorrent",
-                raw.deprecated.rtorrent_rpc_url,
-            );
-            push_deprecated_client(
-                &mut torrent_clients,
-                "transmission",
-                raw.deprecated.transmission_rpc_url,
-            );
-            push_deprecated_client(
-                &mut torrent_clients,
-                "deluge",
-                raw.deprecated.deluge_rpc_url,
-            );
-        }
+        let link_dirs = raw.link_dirs;
+        let notification_webhook_urls = raw.notification_webhook_urls;
+        let torrent_clients = raw.torrent_clients;
 
         for client in &torrent_clients {
             client.validate()?;
@@ -783,16 +728,6 @@ fn verify_read_write_dir(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-fn push_deprecated_client(clients: &mut Vec<TorrentClientConfig>, kind: &str, url: Option<String>) {
-    if let Some(url) = url {
-        clients.push(TorrentClientConfig {
-            kind: kind.to_owned(),
-            readonly: false,
-            url,
-        });
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum DurationConfigValue {
@@ -931,22 +866,21 @@ fn dev_mode_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, ApiIntegrationConfig, DeprecatedConfig, LinkType, MatchMode, RawConfig,
-        RuntimeConfig, TorrentClientConfig, parse_duration_millis, raw_config_from_source,
+        Action, ApiIntegrationConfig, LinkType, MatchMode, RawConfig, RuntimeConfig,
+        TorrentClientConfig, parse_duration_millis, raw_config_from_source,
     };
     use std::path::Path;
 
     #[test]
-    fn normalizes_defaults_and_deprecated_names() {
+    fn normalizes_defaults_and_supported_names() {
         let raw = RawConfig {
             match_mode: Some("safe".to_owned()),
             link_type: Some("reflink_or_copy".to_owned()),
-            deprecated: DeprecatedConfig {
-                link_dir: Some("/links".into()),
-                notification_webhook_url: Some("https://notify.example".to_owned()),
-                qbittorrent_url: Some("http://localhost:8080".to_owned()),
-                ..DeprecatedConfig::default()
-            },
+            link_dirs: vec!["/links".into()],
+            notification_webhook_urls: vec!["https://notify.example".to_owned()],
+            torrent_clients: vec![
+                TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client"),
+            ],
             ..RawConfig::default()
         };
 
