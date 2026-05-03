@@ -1010,16 +1010,18 @@ impl Database {
         element: Option<&str>,
     ) -> crate::Result<Vec<EnsembleCacheRecord>> {
         self.block_on(async {
-            let rows = sqlx::query(
-                "SELECT NULL AS client_host, path, info_hash
-                 FROM data_ensemble
-                 WHERE ensemble = ?1
-                 AND (?2 IS NULL OR element = ?2)",
-            )
-            .bind(ensemble)
-            .bind(element)
-            .fetch_all(self.pool())
-            .await
+            let rows = if let Some(element) = element {
+                sqlx::query(ensemble_data_sql(true))
+                    .bind(ensemble)
+                    .bind(element)
+                    .fetch_all(self.pool())
+                    .await
+            } else {
+                sqlx::query(ensemble_data_sql(false))
+                    .bind(ensemble)
+                    .fetch_all(self.pool())
+                    .await
+            }
             .map_err(sqlx_error)?;
             let mut records = rows
                 .into_iter()
@@ -1029,16 +1031,18 @@ impl Database {
                     info_hash: row.get(2),
                 })
                 .collect::<Vec<_>>();
-            let rows = sqlx::query(
-                "SELECT client_host, path, info_hash
-                 FROM client_ensemble
-                 WHERE ensemble = ?1
-                 AND (?2 IS NULL OR element = ?2)",
-            )
-            .bind(ensemble)
-            .bind(element)
-            .fetch_all(self.pool())
-            .await
+            let rows = if let Some(element) = element {
+                sqlx::query(ensemble_client_sql(true))
+                    .bind(ensemble)
+                    .bind(element)
+                    .fetch_all(self.pool())
+                    .await
+            } else {
+                sqlx::query(ensemble_client_sql(false))
+                    .bind(ensemble)
+                    .fetch_all(self.pool())
+                    .await
+            }
             .map_err(sqlx_error)?;
             records.extend(rows.into_iter().map(|row| EnsembleCacheRecord {
                 client_host: row.get(0),
@@ -1989,6 +1993,30 @@ fn placeholders(count: usize) -> String {
         .join(", ")
 }
 
+fn ensemble_data_sql(has_element: bool) -> &'static str {
+    if has_element {
+        "SELECT NULL AS client_host, path, info_hash
+         FROM data_ensemble
+         WHERE ensemble = ?1 AND element = ?2"
+    } else {
+        "SELECT NULL AS client_host, path, info_hash
+         FROM data_ensemble
+         WHERE ensemble = ?1"
+    }
+}
+
+fn ensemble_client_sql(has_element: bool) -> &'static str {
+    if has_element {
+        "SELECT client_host, path, info_hash
+         FROM client_ensemble
+         WHERE ensemble = ?1 AND element = ?2"
+    } else {
+        "SELECT client_host, path, info_hash
+         FROM client_ensemble
+         WHERE ensemble = ?1"
+    }
+}
+
 fn reverse_lookup_client_sql(search_key_count: usize) -> String {
     let key_placeholders = placeholders(search_key_count);
     format!(
@@ -2161,8 +2189,9 @@ fn strings_json(values: &[std::borrow::Cow<'_, str>]) -> crate::Result<String> {
 mod tests {
     use super::{
         AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord,
-        EnsembleRecord, ReverseLookupCriteria, SqlValue, bind_values, reverse_lookup_client_sql,
-        reverse_lookup_data_sql, reverse_lookup_params, sqlx_error,
+        EnsembleRecord, ReverseLookupCriteria, SqlValue, bind_values, ensemble_client_sql,
+        ensemble_data_sql, reverse_lookup_client_sql, reverse_lookup_data_sql,
+        reverse_lookup_params, sqlx_error,
     };
     use crate::domain::{ClientLabel, Decision, File, LookupFields, MediaType};
     use sqlx::Row;
@@ -2385,39 +2414,45 @@ mod tests {
             assert!(data_plan.contains("idx_data_lookup"), "{data_plan}");
             assert!(data_plan.contains("search_key=?"), "{data_plan}");
         }
-        let data_ensemble_plan = explain_detail(
-            &database,
-            "EXPLAIN QUERY PLAN
-             SELECT rowid FROM data_ensemble
-             WHERE ensemble = ?1 AND element = ?2
-             ORDER BY rowid
-             LIMIT 100",
-            &[
-                SqlValue::Text(Cow::Borrowed("example show s01")),
-                SqlValue::Text(Cow::Borrowed("01")),
-            ],
-        );
-        let client_ensemble_plan = explain_detail(
-            &database,
-            "EXPLAIN QUERY PLAN
-             SELECT rowid FROM client_ensemble
-             WHERE ensemble = ?1 AND element = ?2
-             ORDER BY rowid
-             LIMIT 100",
-            &[
-                SqlValue::Text(Cow::Borrowed("example show s01")),
-                SqlValue::Text(Cow::Borrowed("01")),
-            ],
-        );
+        for has_element in [true, false] {
+            let params = if has_element {
+                vec![
+                    SqlValue::Text(Cow::Borrowed("example show s01")),
+                    SqlValue::Text(Cow::Borrowed("01")),
+                ]
+            } else {
+                vec![SqlValue::Text(Cow::Borrowed("example show s01"))]
+            };
+            let data_ensemble_plan = explain_detail(
+                &database,
+                &format!("EXPLAIN QUERY PLAN {}", ensemble_data_sql(has_element)),
+                &params,
+            );
+            let client_ensemble_plan = explain_detail(
+                &database,
+                &format!("EXPLAIN QUERY PLAN {}", ensemble_client_sql(has_element)),
+                &params,
+            );
 
-        assert!(
-            data_ensemble_plan.contains("idx_data_ensemble_lookup"),
-            "{data_ensemble_plan}"
-        );
-        assert!(
-            client_ensemble_plan.contains("idx_client_ensemble_lookup"),
-            "{client_ensemble_plan}"
-        );
+            assert!(
+                data_ensemble_plan.contains("idx_data_ensemble_lookup"),
+                "{data_ensemble_plan}"
+            );
+            assert!(
+                client_ensemble_plan.contains("idx_client_ensemble_lookup"),
+                "{client_ensemble_plan}"
+            );
+            if has_element {
+                assert!(
+                    data_ensemble_plan.contains("ensemble=? AND element=?"),
+                    "{data_ensemble_plan}"
+                );
+                assert!(
+                    client_ensemble_plan.contains("ensemble=? AND element=?"),
+                    "{client_ensemble_plan}"
+                );
+            }
+        }
 
         let _cleanup = fs::remove_dir_all(root);
     }
