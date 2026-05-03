@@ -172,6 +172,28 @@ impl fmt::Display for MediaType {
     }
 }
 
+/// Persisted scalar facts used to shortlist reverse lookup rows before
+/// hydrating full file trees.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct LookupFields {
+    /// Normalized title key used by SQLite selectors.
+    pub search_key: String,
+    /// Parsed media type.
+    pub media_type: MediaType,
+    /// Parsed season when present.
+    pub season: Option<u32>,
+    /// Parsed episode when present.
+    pub episode: Option<u32>,
+    /// Total byte length.
+    pub length: ByteLength,
+    /// Number of files in the normalized tree.
+    pub file_count: usize,
+    /// Bytes attributed to video-like files.
+    pub video_bytes: ByteLength,
+    /// Bytes attributed to non-video files.
+    pub non_video_bytes: ByteLength,
+}
+
 /// Torrent-client family behind an adapter.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TorrentClientKind {

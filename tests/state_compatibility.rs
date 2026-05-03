@@ -273,6 +273,7 @@ fn seed_database_state(database: &Database, info_hash: &str) {
                 category: Some("tv"),
                 tags: &tags,
                 trackers: &trackers,
+                lookup: None,
             }],
         )
         .expect("client searchee");
@@ -289,6 +290,7 @@ fn seed_database_state(database: &Database, info_hash: &str) {
         .refresh_data_roots([DataRootRecord {
             path: "/data/example",
             title: "Example Show",
+            lookup: None,
         }])
         .expect("data root");
     database

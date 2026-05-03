@@ -19,7 +19,7 @@ use crate::{
     SporosError,
     domain::{
         ActionResult, Candidate, ClientLabel, ClientTorrentMetadata, File, InfoHash, Label,
-        MediaType, Searchee,
+        LookupFields, MediaType, Searchee,
     },
     integrations::{
         ArrConfig, CategoryCaps, SearchIndexer, SnatchHistory, SnatchOptions, TorznabCaps,
@@ -2630,6 +2630,36 @@ pub fn parsed_name_and_media<'a>(
         .unwrap_or((Cow::Borrowed(name), MediaType::Unknown))
 }
 
+/// Build persisted scalar facts for reverse lookup selectors.
+pub fn lookup_fields(searchee: &Searchee<'_>) -> LookupFields {
+    let (season, episode) =
+        if let Some((season_key, episode)) = episode_key_from_title(searchee.title.as_ref()) {
+            (Some(season_key.season), Some(episode))
+        } else if let Some(season_key) = season_key_from_title(searchee.title.as_ref()) {
+            (Some(season_key.season), None)
+        } else {
+            (None, None)
+        };
+    let video_bytes = searchee
+        .files
+        .iter()
+        .filter(|file| is_video_file(file))
+        .map(|file| file.length)
+        .sum::<u64>();
+    let non_video_bytes = searchee.length.saturating_sub(video_bytes);
+
+    LookupFields {
+        search_key: normalized_query_key(searchee.title.as_ref()),
+        media_type: searchee.media_type,
+        season,
+        episode,
+        length: searchee.length,
+        file_count: searchee.files.len(),
+        video_bytes,
+        non_video_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3504,6 +3534,7 @@ mod tests {
                 category: None,
                 tags: &[],
                 trackers: &[Cow::Borrowed("tracker.example")],
+                lookup: None,
             })
             .expect("client searchee");
         let searchee_id = database

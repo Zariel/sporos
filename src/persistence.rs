@@ -18,7 +18,7 @@ use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 
 use crate::{
     SporosError,
-    domain::{ClientLabel, Decision, File},
+    domain::{ClientLabel, Decision, File, LookupFields},
 };
 
 const DATABASE_FILE_NAME: &str = "cross-seed.db";
@@ -181,14 +181,35 @@ impl Database {
 
     /// Insert or update one data-dir root row.
     pub fn upsert_data_root(&self, record: &DataRootRecord<'_>) -> crate::Result<()> {
+        let lookup = record.lookup;
         self.block_on(async {
             sqlx::query(
-                "INSERT INTO data (path, title)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(path) DO UPDATE SET title = excluded.title",
+                "INSERT INTO data
+                    (path, title, search_key, media_type, season, episode, length, file_count, video_bytes, non_video_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(path) DO UPDATE SET
+                    title = excluded.title,
+                    search_key = excluded.search_key,
+                    media_type = excluded.media_type,
+                    season = excluded.season,
+                    episode = excluded.episode,
+                    length = excluded.length,
+                    file_count = excluded.file_count,
+                    video_bytes = excluded.video_bytes,
+                    non_video_bytes = excluded.non_video_bytes",
             )
             .bind(record.path)
             .bind(record.title)
+            .bind(lookup.map(|fields| fields.search_key.as_str()))
+            .bind(lookup.map(|fields| fields.media_type.as_str()))
+            .bind(lookup.and_then(|fields| fields.season.map(i64::from)))
+            .bind(lookup.and_then(|fields| fields.episode.map(i64::from)))
+            .bind(lookup.map(|fields| i64::try_from(fields.length).unwrap_or(i64::MAX)))
+            .bind(lookup.map(|fields| i64::try_from(fields.file_count).unwrap_or(i64::MAX)))
+            .bind(lookup.map(|fields| i64::try_from(fields.video_bytes).unwrap_or(i64::MAX)))
+            .bind(lookup.map(|fields| {
+                i64::try_from(fields.non_video_bytes).unwrap_or(i64::MAX)
+            }))
             .execute(self.pool())
             .await
             .map(|_| ())
@@ -268,11 +289,12 @@ impl Database {
         let files = files_json(record.files)?;
         let tags = labels_json(record.tags)?;
         let trackers = strings_json(record.trackers)?;
+        let lookup = record.lookup;
         self.block_on(async {
             sqlx::query(
                 "INSERT INTO client_searchee
-                    (client_host, info_hash, name, title, files, length, save_path, category, tags, trackers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    (client_host, info_hash, name, title, files, length, save_path, category, tags, trackers, search_key, media_type, season, episode, file_count, video_bytes, non_video_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(client_host, info_hash) DO UPDATE SET
                     name = excluded.name,
                     title = excluded.title,
@@ -281,7 +303,14 @@ impl Database {
                     save_path = excluded.save_path,
                     category = excluded.category,
                     tags = excluded.tags,
-                    trackers = excluded.trackers",
+                    trackers = excluded.trackers,
+                    search_key = excluded.search_key,
+                    media_type = excluded.media_type,
+                    season = excluded.season,
+                    episode = excluded.episode,
+                    file_count = excluded.file_count,
+                    video_bytes = excluded.video_bytes,
+                    non_video_bytes = excluded.non_video_bytes",
             )
             .bind(record.client_host)
             .bind(record.info_hash)
@@ -293,6 +322,15 @@ impl Database {
             .bind(record.category)
             .bind(tags)
             .bind(trackers)
+            .bind(lookup.map(|fields| fields.search_key.as_str()))
+            .bind(lookup.map(|fields| fields.media_type.as_str()))
+            .bind(lookup.and_then(|fields| fields.season.map(i64::from)))
+            .bind(lookup.and_then(|fields| fields.episode.map(i64::from)))
+            .bind(lookup.map(|fields| i64::try_from(fields.file_count).unwrap_or(i64::MAX)))
+            .bind(lookup.map(|fields| i64::try_from(fields.video_bytes).unwrap_or(i64::MAX)))
+            .bind(lookup.map(|fields| {
+                i64::try_from(fields.non_video_bytes).unwrap_or(i64::MAX)
+            }))
             .execute(self.pool())
             .await
             .map(|_| ())
@@ -1416,6 +1454,8 @@ pub struct DataRootRecord<'a> {
     pub path: &'a str,
     /// Parsed title.
     pub title: &'a str,
+    /// Scalar facts used by bounded reverse lookup selectors.
+    pub lookup: Option<&'a LookupFields>,
 }
 
 /// Client searchee cache row.
@@ -1441,6 +1481,8 @@ pub struct ClientSearcheeRecord<'a> {
     pub tags: &'a [ClientLabel<'a>],
     /// Tracker hosts serialized to JSON.
     pub trackers: &'a [std::borrow::Cow<'a, str>],
+    /// Scalar facts used by bounded reverse lookup selectors.
+    pub lookup: Option<&'a LookupFields>,
 }
 
 /// Ensemble row used for virtual seasons and reverse lookup.
@@ -2035,10 +2077,12 @@ mod tests {
                 DataRootRecord {
                     path: "/data/one",
                     title: "One",
+                    lookup: None,
                 },
                 DataRootRecord {
                     path: "/data/two",
                     title: "Two",
+                    lookup: None,
                 },
             ])
             .expect("refresh");
@@ -2056,6 +2100,7 @@ mod tests {
             .refresh_data_roots([DataRootRecord {
                 path: "/data/one",
                 title: "One Updated",
+                lookup: None,
             }])
             .expect("refresh");
 
@@ -2138,6 +2183,7 @@ mod tests {
                     category: Some("tv"),
                     tags: &tags,
                     trackers: &trackers,
+                    lookup: None,
                 }],
             )
             .expect("refresh");

@@ -36,7 +36,7 @@ use crate::{
         SearcheeSources, TorrentDirIndexResult, VirtualSeasonOptions, bulk_search,
         check_new_candidate_match, check_new_candidate_matches, episode_ensemble,
         find_all_searchees, find_on_other_sites, find_searchable_searchees,
-        for_each_data_dir_searchee,
+        for_each_data_dir_searchee, lookup_fields,
     },
     torrent::{
         Bencode, BencodeValue, bdecode, bencode, parse_metafile, torrent_cache_dir,
@@ -871,9 +871,11 @@ pub fn refresh_torrent_and_data_indexes(
                 let Some(path) = searchee.path.as_deref() else {
                     return Ok(());
                 };
+                let lookup = lookup_fields(&searchee);
                 database.upsert_data_root(&DataRootRecord {
                     path,
                     title: searchee.title.as_ref(),
+                    lookup: Some(&lookup),
                 })?;
                 database.mark_refreshed_data_root(path)
             })?;
@@ -1177,6 +1179,7 @@ fn refresh_cleanup_client_searchees(
             let Some(info_hash) = searchee.info_hash.as_ref() else {
                 return Ok(());
             };
+            let lookup = lookup_fields(&searchee);
             database.upsert_client_searchee(&ClientSearcheeRecord {
                 client_host: metadata.host.as_ref(),
                 info_hash: info_hash.as_str(),
@@ -1191,6 +1194,7 @@ fn refresh_cleanup_client_searchees(
                     .map(|label| label.as_str()),
                 tags: &client_metadata.tags,
                 trackers: &client_metadata.trackers,
+                lookup: Some(&lookup),
             })?;
             database.mark_refreshed_client_info_hash(info_hash.as_str())?;
             refreshed = refreshed.saturating_add(1);
@@ -1888,6 +1892,7 @@ mod tests {
                 category: None,
                 tags: &[],
                 trackers: &[Cow::Borrowed("tracker.example")],
+                lookup: None,
             })
             .expect("client searchee");
         let searchee_id = database
@@ -1968,6 +1973,18 @@ mod tests {
 
         assert_eq!(summary.searchees_seen, 1);
         assert_eq!(summary.indexer_searches, 0);
+        let search_key: String = database
+            .query_scalar("SELECT search_key FROM data", &[])
+            .expect("data search key");
+        let media_type: String = database
+            .query_scalar("SELECT media_type FROM data", &[])
+            .expect("data media type");
+        let length: i64 = database
+            .query_scalar("SELECT length FROM data", &[])
+            .expect("data length");
+        assert_eq!(search_key, "example.show.s01e01");
+        assert_eq!(media_type, "episode");
+        assert_eq!(length, 5);
         let _cleanup = fs::remove_dir_all(root);
     }
 
@@ -2059,6 +2076,7 @@ mod tests {
                     category: None,
                     tags: &[],
                     trackers: &[],
+                    lookup: None,
                 }],
             )
             .expect("seed client");
@@ -2125,6 +2143,18 @@ mod tests {
         assert_eq!(client_rows, 1);
         assert_eq!(ensemble_rows, 1);
         assert_eq!(ensemble_path, "/downloads/Example.Show.S01E01.mkv");
+        let search_key: String = database
+            .query_scalar("SELECT search_key FROM client_searchee", &[])
+            .expect("client search key");
+        let media_type: String = database
+            .query_scalar("SELECT media_type FROM client_searchee", &[])
+            .expect("client media type");
+        let video_bytes: i64 = database
+            .query_scalar("SELECT video_bytes FROM client_searchee", &[])
+            .expect("client video bytes");
+        assert_eq!(search_key, "example.show.s01e01");
+        assert_eq!(media_type, "episode");
+        assert_eq!(video_bytes, 42);
         let _cleanup = fs::remove_dir_all(root);
     }
 
