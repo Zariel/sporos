@@ -1,6 +1,10 @@
 //! Push notification webhook payloads and delivery.
 
-use std::{borrow::Cow, future::Future, time::Duration};
+use std::{
+    borrow::Cow,
+    future::Future,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use reqwest::{Client, header::CONTENT_TYPE};
 use serde::Serialize;
@@ -11,6 +15,10 @@ use crate::{
     SporosError, VERSION,
     config::RuntimeConfig,
     domain::{ActionResult, InjectionResult, SaveResult},
+    retry::{
+        RetryClass, RetryContext, RetryDecision, RetryError, RetryPolicy, classify_http_status,
+        classify_reqwest_error, retry,
+    },
     search::PipelineAttempt,
     startup::Redactor,
 };
@@ -26,6 +34,8 @@ pub struct NotificationReport {
     pub succeeded: usize,
     /// Webhook URLs that failed or returned an error status.
     pub failed: usize,
+    /// Webhook URLs whose retry policy was exhausted.
+    pub retry_exhausted: usize,
 }
 
 /// Webhook notification sender.
@@ -64,6 +74,7 @@ impl NotificationSender {
                 attempted: self.urls.len(),
                 succeeded: 0,
                 failed: self.urls.len(),
+                retry_exhausted: 0,
             }
         })
     }
@@ -86,6 +97,7 @@ impl NotificationSender {
                 attempted: self.urls.len(),
                 succeeded: 0,
                 failed: self.urls.len(),
+                retry_exhausted: 0,
             }
         })
     }
@@ -112,36 +124,112 @@ impl NotificationSender {
             }
         };
         for url in &self.urls {
-            match self
-                .client
-                .post(url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body.clone())
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {
+            match self.post_one(url, body.clone()).await {
+                Ok(()) => {
                     report.succeeded += 1;
-                }
-                Ok(response) => {
-                    report.failed += 1;
-                    tracing::warn!(
-                        url = self.redactor.redact(url),
-                        status = response.status().as_u16(),
-                        "notification webhook returned an error status"
-                    );
                 }
                 Err(error) => {
                     report.failed += 1;
+                    if matches!(error, RetryError::Exhausted { .. }) {
+                        report.retry_exhausted += 1;
+                    }
                     tracing::warn!(
                         url = self.redactor.redact(url),
                         error = self.redactor.redact(&error.to_string()),
-                        "notification webhook request failed"
+                        "notification webhook delivery failed"
                     );
                 }
             }
         }
         report
+    }
+
+    async fn post_one(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<(), RetryError<NotificationFailure>> {
+        let client = self.client.clone();
+        let url = url.to_owned();
+        retry(
+            RetryPolicy::idempotent(),
+            RetryContext::new(
+                "notification_webhook",
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .with_target(self.redactor.redact(&url)),
+            move |_attempt| {
+                let client = client.clone();
+                let url = url.clone();
+                let body = body.clone();
+                async move {
+                    match client
+                        .post(&url)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .send()
+                        .await
+                    {
+                        Ok(response) => classify_notification_response(response),
+                        Err(error) => match classify_reqwest_error(&error) {
+                            RetryClass::Retryable { retry_after } => RetryDecision::Retryable {
+                                error: NotificationFailure {
+                                    message: error.to_string(),
+                                    status: error.status(),
+                                    retry_after,
+                                },
+                                retry_after,
+                            },
+                            RetryClass::Fatal => RetryDecision::Fatal(NotificationFailure {
+                                message: error.to_string(),
+                                status: error.status(),
+                                retry_after: None,
+                            }),
+                        },
+                    }
+                }
+            },
+        )
+        .await
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NotificationFailure {
+    message: String,
+    status: Option<reqwest::StatusCode>,
+    retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for NotificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NotificationFailure {}
+
+fn classify_notification_response(
+    response: reqwest::Response,
+) -> RetryDecision<(), NotificationFailure> {
+    let status = response.status();
+    if status.is_success() {
+        return RetryDecision::Success(());
+    }
+    match classify_http_status(status, response.headers(), current_time_millis()) {
+        RetryClass::Retryable { retry_after } => RetryDecision::Retryable {
+            error: NotificationFailure {
+                message: format!("notification webhook returned HTTP {status}"),
+                status: Some(status),
+                retry_after,
+            },
+            retry_after,
+        },
+        RetryClass::Fatal => RetryDecision::Fatal(NotificationFailure {
+            message: format!("notification webhook returned HTTP {status}"),
+            status: Some(status),
+            retry_after: None,
+        }),
     }
 }
 
@@ -198,6 +286,17 @@ fn notification_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     }
 }
 
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(duration_millis)
+        .unwrap_or(0)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn block_on_notification<F, T>(future: F) -> crate::Result<T>
 where
     F: Future<Output = T>,
@@ -222,6 +321,7 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::{TcpListener, TcpStream},
+        thread,
     };
 
     #[test]
@@ -243,8 +343,48 @@ mod tests {
 
         assert_eq!(report.attempted, 1);
         assert_eq!(report.succeeded, 1);
+        assert_eq!(report.retry_exhausted, 0);
         assert!(request.contains("user-agent: crossseed/"));
         assert!(request.contains(r#""event":"TEST""#));
+    }
+
+    #[test]
+    fn notification_retries_transient_status() {
+        let server = notification_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+        ]);
+        let sender =
+            NotificationSender::new(vec![server.url.clone()], Redactor::default()).expect("sender");
+
+        let report = sender.send_test();
+        let requests = server.join();
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.retry_exhausted, 0);
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn notification_reports_retry_exhaustion() {
+        let server = notification_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        ]);
+        let sender =
+            NotificationSender::new(vec![server.url.clone()], Redactor::default()).expect("sender");
+
+        let report = sender.send_test();
+        let requests = server.join();
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.retry_exhausted, 1);
+        assert_eq!(requests.len(), 3);
     }
 
     #[test]
@@ -321,5 +461,31 @@ mod tests {
         reader.read_exact(&mut body).expect("body");
         request.push_str(&String::from_utf8_lossy(&body));
         request
+    }
+
+    struct TestNotificationServer {
+        url: String,
+        handle: thread::JoinHandle<Vec<String>>,
+    }
+
+    impl TestNotificationServer {
+        fn join(self) -> Vec<String> {
+            self.handle.join().expect("server")
+        }
+    }
+
+    fn notification_server(responses: Vec<&'static str>) -> TestNotificationServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _remote) = listener.accept().expect("accept");
+                requests.push(read_http_request(&mut stream));
+                stream.write_all(response.as_bytes()).expect("response");
+            }
+            requests
+        });
+        TestNotificationServer { url, handle }
     }
 }
