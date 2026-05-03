@@ -125,8 +125,67 @@ impl StartupHooks for NoopStartupHooks {}
 pub struct RuntimeStartupHooks;
 
 impl StartupHooks for RuntimeStartupHooks {
+    fn initialize_push_notifier(&self, config: &RuntimeConfig) -> crate::Result<()> {
+        crate::notifications::NotificationSender::from_config_with_timeout(
+            config,
+            Redactor::from_config(config),
+            std::time::Duration::from_secs(10),
+        )?
+        .validate_startup()
+    }
+
     fn validate_clients(&self, config: &RuntimeConfig) -> crate::Result<()> {
         crate::clients::validate_configured_torrent_clients(config)
+    }
+
+    fn validate_indexers(&self, config: &RuntimeConfig) -> crate::Result<()> {
+        let mut working = 0usize;
+        for entry in &config.torznab {
+            let indexer = crate::integrations::validate_torznab_config(entry)?;
+            let caps = crate::integrations::fetch_torznab_caps(&indexer)?;
+            if caps.search
+                || caps.tv_search
+                || caps.movie_search
+                || caps.music_search
+                || caps.audio_search
+                || caps.book_search
+            {
+                working += 1;
+            } else {
+                tracing::warn!(
+                    indexer = indexer.url.as_str(),
+                    "Torznab indexer has no searchable capabilities"
+                );
+            }
+        }
+        if !config.torznab.is_empty() && working == 0 {
+            tracing::warn!("no configured Torznab indexers advertise search support");
+        }
+        Ok(())
+    }
+
+    fn validate_arrs(&self, config: &RuntimeConfig) -> crate::Result<()> {
+        for entry in &config.sonarr {
+            let arr = crate::integrations::validate_arr_config(
+                entry,
+                crate::integrations::ArrKind::Sonarr,
+            )?;
+            crate::integrations::validate_arr_instance(
+                &arr,
+                Some(std::time::Duration::from_secs(10)),
+            )?;
+        }
+        for entry in &config.radarr {
+            let arr = crate::integrations::validate_arr_config(
+                entry,
+                crate::integrations::ArrKind::Radarr,
+            )?;
+            crate::integrations::validate_arr_instance(
+                &arr,
+                Some(std::time::Duration::from_secs(10)),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -327,17 +386,20 @@ fn startup_error(message: impl Into<std::borrow::Cow<'static, str>>) -> SporosEr
 #[cfg(test)]
 mod tests {
     use super::{
-        Redactor, StartupHooks, StartupMode, check_config_paths, full_runtime, initialize_logger,
-        minimal_runtime,
+        Redactor, RuntimeStartupHooks, StartupHooks, StartupMode, check_config_paths, full_runtime,
+        initialize_logger, minimal_runtime,
     };
     use crate::config::{Action, ApiIntegrationConfig, RuntimeConfig};
     use std::{
         fs,
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
         path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -415,6 +477,48 @@ mod tests {
     }
 
     #[test]
+    fn runtime_hooks_validate_external_integrations() {
+        let torznab = http_server(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/xml")],
+            r#"<caps><searching searchAvailable="yes" /><limits default="25" max="100" /></caps>"#,
+        )]);
+        let arr = http_server(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            r#"{"current":"4.0.0"}"#,
+        )]);
+        let notification = http_server(vec![http_response("204 No Content", &[], "")]);
+        let mut config = test_config(temp_path("runtime-hooks"));
+        config.torznab = vec![ApiIntegrationConfig {
+            url: format!("{}/api", torznab.url),
+            api_key: "indexer-secret".to_owned(),
+        }];
+        config.sonarr = vec![ApiIntegrationConfig {
+            url: format!("{}/sonarr", arr.url),
+            api_key: "arr-secret".to_owned(),
+        }];
+        config.notification_webhook_urls = vec![notification.url.clone()];
+        let hooks = RuntimeStartupHooks;
+
+        hooks
+            .initialize_push_notifier(&config)
+            .expect("notification validation");
+        hooks
+            .validate_indexers(&config)
+            .expect("indexer validation");
+        hooks.validate_arrs(&config).expect("arr validation");
+
+        let notification_requests = notification.join();
+        let torznab_requests = torznab.join();
+        let arr_requests = arr.join();
+        assert!(notification_requests[0].contains(r#""event":"STARTUP_VALIDATION""#));
+        assert!(torznab_requests[0].contains("get /api?apikey=indexer-secret&t=caps "));
+        assert!(arr_requests[0].contains("get /sonarr/api "));
+        assert!(arr_requests[0].contains("x-api-key: arr-secret"));
+    }
+
+    #[test]
     fn minimal_runtime_has_no_config() {
         let runtime = minimal_runtime(PathBuf::from("/tmp/sporos-minimal"));
 
@@ -447,6 +551,68 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    struct TestHttpServer {
+        url: String,
+        handle: thread::JoinHandle<Vec<String>>,
+    }
+
+    impl TestHttpServer {
+        fn join(self) -> Vec<String> {
+            self.handle.join().expect("server")
+        }
+    }
+
+    fn http_server(responses: Vec<String>) -> TestHttpServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _remote) = listener.accept().expect("accept");
+                requests.push(read_http_request(&mut stream));
+                stream.write_all(response.as_bytes()).expect("response");
+            }
+            requests
+        });
+        TestHttpServer { url, handle }
+    }
+
+    fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
+        for (name, value) in headers {
+            response.push_str(name);
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        response
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("line");
+            if line.eq_ignore_ascii_case("\r\n") || line == "\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().expect("length");
+                }
+            }
+            request.push_str(&line.to_ascii_lowercase());
+        }
+        let mut body = vec![0_u8; content_length];
+        reader.read_exact(&mut body).expect("body");
+        request.push_str(&String::from_utf8_lossy(&body));
+        request
     }
 
     fn test_config(root: PathBuf) -> RuntimeConfig {

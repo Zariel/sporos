@@ -52,10 +52,27 @@ impl NotificationSender {
         Self::new(config.notification_webhook_urls.clone(), redactor)
     }
 
+    /// Build a sender from normalized runtime config with an explicit timeout.
+    pub(crate) fn from_config_with_timeout(
+        config: &RuntimeConfig,
+        redactor: Redactor,
+        timeout: Duration,
+    ) -> crate::Result<Self> {
+        Self::new_with_timeout(config.notification_webhook_urls.clone(), redactor, timeout)
+    }
+
     /// Build a sender from explicit URLs.
     pub fn new(urls: Vec<String>, redactor: Redactor) -> crate::Result<Self> {
+        Self::new_with_timeout(urls, redactor, NOTIFICATION_TIMEOUT)
+    }
+
+    fn new_with_timeout(
+        urls: Vec<String>,
+        redactor: Redactor,
+        timeout: Duration,
+    ) -> crate::Result<Self> {
         let client = Client::builder()
-            .timeout(NOTIFICATION_TIMEOUT)
+            .timeout(timeout)
             .user_agent(format!("CrossSeed/{VERSION}"))
             .build()
             .map_err(|error| notification_error(format!("failed to build notifier: {error}")))?;
@@ -79,12 +96,34 @@ impl NotificationSender {
         })
     }
 
+    /// Validate configured notification webhooks during startup.
+    pub fn validate_startup(&self) -> crate::Result<()> {
+        let report = block_on_notification(self.validate_startup_async())?;
+        if report.failed == 0 {
+            Ok(())
+        } else {
+            Err(notification_error(format!(
+                "failed to validate {}/{} notification webhooks",
+                report.failed, report.attempted
+            )))
+        }
+    }
+
     /// Send the documented test notification payload asynchronously.
     pub async fn send_test_async(&self) -> NotificationReport {
         self.post_all(NotificationPayload {
             title: "cross-seed".to_owned(),
             body: "test notification".to_owned(),
             extra: json!({ "event": "TEST" }),
+        })
+        .await
+    }
+
+    async fn validate_startup_async(&self) -> NotificationReport {
+        self.post_all(NotificationPayload {
+            title: "cross-seed".to_owned(),
+            body: "startup validation".to_owned(),
+            extra: json!({ "event": "STARTUP_VALIDATION" }),
         })
         .await
     }
