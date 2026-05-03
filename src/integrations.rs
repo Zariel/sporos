@@ -262,6 +262,9 @@ impl Default for RssPagerOptions {
     }
 }
 
+const RSS_MAX_PAGES: u32 = 10;
+const RSS_MAX_CANDIDATES: usize = 10_000;
+
 /// Retry behavior for candidate torrent downloads.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SnatchOptions {
@@ -1222,16 +1225,31 @@ pub async fn rss_pager_async(
     indexer: &SearchIndexer,
     options: RssPagerOptions,
 ) -> crate::Result<Vec<Candidate<'static>>> {
-    const MAX_PAGES: u32 = 10;
-    const MAX_CANDIDATES: usize = 10_000;
+    let mut output = Vec::new();
+    rss_pager_pages_async(database, indexer, options, |page| {
+        output.extend_from_slice(page);
+        Ok(())
+    })
+    .await?;
+    Ok(output)
+}
 
+async fn rss_pager_pages_async<F>(
+    database: &Database,
+    indexer: &SearchIndexer,
+    options: RssPagerOptions,
+    mut handle_page: F,
+) -> crate::Result<usize>
+where
+    F: FnMut(&[Candidate<'static>]) -> crate::Result<()>,
+{
     let previous_guid = read_rss_cursor(database, indexer.id)?;
     let limit = indexer.caps.limits.max.max(1);
-    let mut output = Vec::new();
+    let mut emitted = 0usize;
     let mut first_seen_guid = None;
     let mut page_back_until = None;
 
-    for page in 0..MAX_PAGES {
+    for page in 0..RSS_MAX_PAGES {
         let query = TorznabQuery {
             params: vec![
                 ("t".to_owned(), "search".to_owned()),
@@ -1287,9 +1305,15 @@ pub async fn rss_pager_async(
             }
         }
         let filtered_len = filtered.len();
-        output.append(&mut filtered);
-        if output.len() >= MAX_CANDIDATES {
-            output.truncate(MAX_CANDIDATES);
+        let remaining = RSS_MAX_CANDIDATES.saturating_sub(emitted);
+        if filtered.len() > remaining {
+            filtered.truncate(remaining);
+        }
+        if !filtered.is_empty() {
+            handle_page(&filtered)?;
+            emitted += filtered.len();
+        }
+        if emitted >= RSS_MAX_CANDIDATES {
             break;
         }
         if reached_previous || filtered_len == 0 || filtered_len < raw_len {
@@ -1303,7 +1327,7 @@ pub async fn rss_pager_async(
     if let Some(guid) = first_seen_guid {
         update_rss_cursor(database, indexer.id, &guid)?;
     }
-    Ok(output)
+    Ok(emitted)
 }
 
 /// Page all enabled RSS feeds.
@@ -1322,10 +1346,47 @@ pub async fn query_rss_feeds_async(
     options: RssPagerOptions,
 ) -> crate::Result<Vec<Candidate<'static>>> {
     let mut output = Vec::new();
-    for indexer in indexers {
-        output.extend(rss_pager_async(database, indexer, options).await?);
-    }
+    for_each_rss_page_async(database, indexers, options, |page| {
+        output.extend_from_slice(page);
+        Ok(())
+    })
+    .await?;
     Ok(output)
+}
+
+/// Process all enabled RSS feeds one page at a time.
+pub fn for_each_rss_page<F>(
+    database: &Database,
+    indexers: &[SearchIndexer],
+    options: RssPagerOptions,
+    handle_page: F,
+) -> crate::Result<usize>
+where
+    F: FnMut(&[Candidate<'static>]) -> crate::Result<()>,
+{
+    block_on_integration(for_each_rss_page_async(
+        database,
+        indexers,
+        options,
+        handle_page,
+    ))
+}
+
+/// Process all enabled RSS feeds asynchronously one page at a time.
+pub async fn for_each_rss_page_async<F>(
+    database: &Database,
+    indexers: &[SearchIndexer],
+    options: RssPagerOptions,
+    mut handle_page: F,
+) -> crate::Result<usize>
+where
+    F: FnMut(&[Candidate<'static>]) -> crate::Result<()>,
+{
+    let mut count = 0;
+    for indexer in indexers {
+        count += rss_pager_pages_async(database, indexer, options, &mut handle_page).await?;
+    }
+    Ok(count)
 }
 
 /// Parse a Torznab RSS response into candidates.
@@ -2149,11 +2210,12 @@ mod tests {
         ArrKind, CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, SnatchHistory,
         SnatchOptions, SnatchResult, TorznabCaps, TorznabConfig, TorznabQuery, TorznabSearchIds,
         TorznabSearchOptions, arr_search_cache_key, cache_torrent_file,
-        create_torznab_search_queries, enabled_indexers, fetch_torznab_caps, get_cached_torrent,
-        guid_lookup, ids_for_torznab_caps, lookup_arr_ids, parse_retry_after_delay_millis,
-        parse_torznab_caps, parse_torznab_rss, rss_pager, search_torznab_indexer,
-        set_indexer_status, snatch, snatch_once, sync_torznab_indexers, torznab_request_url,
-        update_indexer_caps, validate_arr_instance, validate_arr_url, validate_torznab_url,
+        create_torznab_search_queries, enabled_indexers, fetch_torznab_caps, for_each_rss_page,
+        get_cached_torrent, guid_lookup, ids_for_torznab_caps, lookup_arr_ids,
+        parse_retry_after_delay_millis, parse_torznab_caps, parse_torznab_rss, rss_pager,
+        search_torznab_indexer, set_indexer_status, snatch, snatch_once, sync_torznab_indexers,
+        torznab_request_url, update_indexer_caps, validate_arr_instance, validate_arr_url,
+        validate_torznab_url,
     };
     use crate::{
         domain::{Candidate, Decision, File, MediaType, Searchee},
@@ -2674,6 +2736,84 @@ mod tests {
         assert!(requests[0].contains("limit=1"));
         assert!(requests[0].contains("offset=0"));
         assert!(requests[1].contains("offset=1"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rss_page_handler_receives_pages_without_cross_feed_buffer() {
+        let first = http_server(vec![
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/rss+xml")],
+                r#"<rss><channel>
+                  <item><title>First A</title><guid>first-a</guid><link>https://idx/first-a</link><pubDate>Thu, 01 Jan 1970 00:00:10 +0000</pubDate></item>
+                </channel></rss>"#,
+            ),
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/rss+xml")],
+                "<rss><channel></channel></rss>",
+            ),
+        ]);
+        let second = http_server(vec![
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/rss+xml")],
+                r#"<rss><channel>
+                  <item><title>Second A</title><guid>second-a</guid><link>https://idx/second-a</link><pubDate>Thu, 01 Jan 1970 00:00:11 +0000</pubDate></item>
+                </channel></rss>"#,
+            ),
+            http_response(
+                "200 OK",
+                &[("Content-Type", "application/rss+xml")],
+                "<rss><channel></channel></rss>",
+            ),
+        ]);
+        let root = temp_path("rss-pages");
+        fs::create_dir_all(&root).expect("temp dir");
+        let database = Database::open_app_dir(&root).expect("database");
+        let indexers = vec![
+            insert_search_indexer(&database, &first.url, 1),
+            insert_search_indexer(&database, &second.url, 1),
+        ];
+        let mut pages = Vec::new();
+
+        let candidates = for_each_rss_page(
+            &database,
+            &indexers,
+            RssPagerOptions {
+                now_millis: 20_000,
+                ..RssPagerOptions::default()
+            },
+            |page| {
+                pages.push(
+                    page.iter()
+                        .map(|candidate| candidate.guid.to_string())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(())
+            },
+        )
+        .expect("rss");
+
+        assert_eq!(candidates, 2);
+        assert_eq!(pages, vec![vec!["first-a"], vec!["second-a"]]);
+        assert_eq!(
+            database
+                .read_rss_cursor(indexers[0].id)
+                .expect("cursor")
+                .expect("cursor"),
+            "first-a"
+        );
+        assert_eq!(
+            database
+                .read_rss_cursor(indexers[1].id)
+                .expect("cursor")
+                .expect("cursor"),
+            "second-a"
+        );
+        first.join();
+        second.join();
         let _cleanup = fs::remove_dir_all(root);
     }
 

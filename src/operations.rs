@@ -21,7 +21,7 @@ use crate::{
     domain::{ActionResult, Candidate, ClientLabel, InfoHash, Label},
     integrations::{
         ArrConfig, ArrKind, RssPagerOptions, SnatchOptions, TorznabSearchOptions,
-        enabled_search_indexers, fetch_torznab_caps, query_rss_feeds, sync_torznab_indexers,
+        enabled_search_indexers, fetch_torznab_caps, for_each_rss_page, sync_torznab_indexers,
         update_indexer_caps, validate_arr_config, validate_torznab_config,
     },
     matching::AssessmentOptions,
@@ -400,16 +400,6 @@ pub fn run_rss_workflow(
     let arr_configs = build_arr_configs(config)?;
     let now_millis = current_time_millis();
     let time_since_last_run = rss_time_since_last_run(database, config, now_millis)?;
-    let candidates = query_rss_feeds(
-        database,
-        &indexers,
-        RssPagerOptions {
-            time_since_last_run,
-            timeout: config.search_timeout.map(Duration::from_millis),
-            delay: Duration::from_secs(config.delay),
-            now_millis,
-        },
-    )?;
     let local = find_all_searchees(
         &SearcheeSources {
             torrents: None,
@@ -431,18 +421,32 @@ pub fn run_rss_workflow(
         app_dir,
         options: &options,
     };
-    let attempts = check_new_candidate_matches(
-        &runtime,
-        &candidates,
-        &local,
-        |action| dispatch_pipeline_action(app_dir, config, &injection, action),
-        |attempt| {
-            let _report = notifier.send_result(attempt);
+    let mut attempts = Vec::new();
+    let candidates = for_each_rss_page(
+        database,
+        &indexers,
+        RssPagerOptions {
+            time_since_last_run,
+            timeout: config.search_timeout.map(Duration::from_millis),
+            delay: Duration::from_secs(config.delay),
+            now_millis,
+        },
+        |page| {
+            attempts.extend(check_new_candidate_matches(
+                &runtime,
+                page,
+                &local,
+                |action| dispatch_pipeline_action(app_dir, config, &injection, action),
+                |attempt| {
+                    let _report = notifier.send_result(attempt);
+                    Ok(())
+                },
+            )?);
             Ok(())
         },
     )?;
     Ok(RssWorkflowResult {
-        candidates: candidates.len(),
+        candidates,
         attempts: attempts.len(),
     })
 }
