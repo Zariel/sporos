@@ -212,16 +212,14 @@ fn fake_services_cover_retry_after_and_unsafe_client_retry() {
     };
     let searchee = Searchee::from_files("Unsafe.Inject", "Unsafe.Inject", Vec::new());
 
-    assert!(
-        client
-            .inject(
-                &new_torrent,
-                &searchee,
-                Decision::Match,
-                &InjectionOptions::default()
-            )
-            .is_err()
-    );
+    let _error = client
+        .inject(
+            &new_torrent,
+            &searchee,
+            Decision::Match,
+            &InjectionOptions::default(),
+        )
+        .expect_err("unsafe inject should fail without retrying");
     let transmission_requests = transmission.join();
     assert_eq!(transmission_requests.len(), 1);
     assert!(transmission_requests[0].contains(r#""method":"torrent-add""#));
@@ -401,7 +399,13 @@ impl FakeHttpServer {
                         }
                         thread::sleep(Duration::from_millis(10));
                     }
-                    Err(error) => panic!("accept request: {error}"),
+                    Err(error) => {
+                        server_requests
+                            .lock()
+                            .expect("requests lock")
+                            .push(format!("accept error: {error}"));
+                        break;
+                    }
                 }
             }
         });

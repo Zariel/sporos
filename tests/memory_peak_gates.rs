@@ -31,7 +31,7 @@ fn client_inventory_conversion_stays_under_allocation_gate() {
         "qbittorrent",
     );
     let torrents = synthetic_client_torrents(gate.fixture_items);
-    let region = Region::new(&GLOBAL);
+    let region = Region::new(GLOBAL);
 
     let searchees = torrents
         .into_iter()
@@ -54,7 +54,7 @@ fn rss_parsing_stays_under_allocation_gate() {
     let _guard = allocation_gate_lock();
     let gate = allocation_gate("RSS candidate parsing");
     let rss = synthetic_rss(gate.fixture_items);
-    let region = Region::new(&GLOBAL);
+    let region = Region::new(GLOBAL);
 
     let candidates = parse_torznab_rss(&rss, 1).expect("rss candidates");
     let stats = region.change();
@@ -84,7 +84,7 @@ fn candidate_assessment_stays_under_allocation_gate() {
         info_hashes_to_exclude: &excluded,
         blocklist: &blocklist,
     };
-    let region = Region::new(&GLOBAL);
+    let region = Region::new(GLOBAL);
 
     let mut matches = 0usize;
     for _ in 0..gate.fixture_items {
@@ -136,8 +136,16 @@ fn assert_allocation_gate(
 }
 
 fn live_bytes(stats: Stats) -> usize {
-    let allocated = stats.bytes_allocated as isize + stats.bytes_reallocated;
-    allocated.saturating_sub(stats.bytes_deallocated as isize) as usize
+    let allocated = if stats.bytes_reallocated >= 0 {
+        stats
+            .bytes_allocated
+            .saturating_add(stats.bytes_reallocated.unsigned_abs())
+    } else {
+        stats
+            .bytes_allocated
+            .saturating_sub(stats.bytes_reallocated.unsigned_abs())
+    };
+    allocated.saturating_sub(stats.bytes_deallocated)
 }
 
 fn synthetic_client_torrents(count: usize) -> Vec<ClientTorrent<'static>> {
