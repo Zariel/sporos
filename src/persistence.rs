@@ -915,7 +915,8 @@ impl Database {
         })
     }
 
-    /// Load all client searchee cache rows.
+    /// Load all client searchee cache rows for focused persistence tests.
+    #[cfg(test)]
     pub fn client_searchee_rows(&self) -> crate::Result<Vec<ClientSearcheeCacheRecord>> {
         self.block_on(async {
             let rows = sqlx::query(
@@ -926,23 +927,6 @@ impl Database {
             .await
             .map_err(sqlx_error)?;
             Ok(rows.into_iter().map(client_searchee_record).collect())
-        })
-    }
-
-    /// Load all data-dir cache rows.
-    pub fn data_rows(&self) -> crate::Result<Vec<DataCacheRecord>> {
-        self.block_on(async {
-            let rows = sqlx::query("SELECT path, title FROM data")
-                .fetch_all(self.pool())
-                .await
-                .map_err(sqlx_error)?;
-            Ok(rows
-                .into_iter()
-                .map(|row| DataCacheRecord {
-                    path: row.get(0),
-                    title: row.get(1),
-                })
-                .collect())
         })
     }
 
@@ -1689,15 +1673,6 @@ pub struct ClientSearcheeCacheRecord {
     pub tags: Option<String>,
     /// Serialized tracker JSON.
     pub trackers: String,
-}
-
-/// Data-dir cache row.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DataCacheRecord {
-    /// Cached path.
-    pub path: String,
-    /// Parsed title.
-    pub title: String,
 }
 
 /// Candidate-derived filters for paged reverse lookup selectors.
