@@ -36,6 +36,7 @@ walkdir = "2"
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"] }
+stats_alloc = "0.1.10"
 
 [[bench]]
 name = "memory_baseline"

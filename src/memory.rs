@@ -32,6 +32,19 @@ pub struct MemoryRegressionGate {
     pub max_active_items: usize,
 }
 
+/// Deterministic allocation budget enforced by `tests/memory_peak_gates.rs`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AllocationRegressionGate {
+    /// Workflow covered by the measured allocation gate.
+    pub name: &'static str,
+    /// Stable fixture scale used by the gate.
+    pub fixture_items: usize,
+    /// Maximum live heap bytes allowed while fixture output is retained.
+    pub max_live_bytes: usize,
+    /// Maximum total heap bytes allocated while processing the fixture.
+    pub max_total_allocated_bytes: usize,
+}
+
 /// Initial budgets for memory-sensitive runtime paths.
 pub const COLLECTION_BUDGETS: &[CollectionBudget] = &[
     CollectionBudget {
@@ -112,11 +125,33 @@ pub const MEMORY_REGRESSION_GATES: &[MemoryRegressionGate] = &[
     },
 ];
 
+/// Allocation gates run in CI with an instrumented global allocator.
+pub const ALLOCATION_REGRESSION_GATES: &[AllocationRegressionGate] = &[
+    AllocationRegressionGate {
+        name: "client inventory to searchees",
+        fixture_items: CLIENT_INVENTORY_BASELINE_TORRENTS,
+        max_live_bytes: 12 * 1024 * 1024,
+        max_total_allocated_bytes: 20 * 1024 * 1024,
+    },
+    AllocationRegressionGate {
+        name: "RSS candidate parsing",
+        fixture_items: 1_000,
+        max_live_bytes: 2 * 1024 * 1024,
+        max_total_allocated_bytes: 4 * 1024 * 1024,
+    },
+    AllocationRegressionGate {
+        name: "candidate assessment",
+        fixture_items: 10_000,
+        max_live_bytes: 128 * 1024,
+        max_total_allocated_bytes: 5 * 1024 * 1024,
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CLIENT_INVENTORY_BASELINE_TORRENTS, CLIENT_INVENTORY_TARGET_TORRENTS, COLLECTION_BUDGETS,
-        MEMORY_REGRESSION_GATES,
+        ALLOCATION_REGRESSION_GATES, CLIENT_INVENTORY_BASELINE_TORRENTS,
+        CLIENT_INVENTORY_TARGET_TORRENTS, COLLECTION_BUDGETS, MEMORY_REGRESSION_GATES,
     };
 
     #[test]
@@ -165,5 +200,27 @@ mod tests {
             .find(|gate| gate.name == "qBittorrent file-list refresh")
             .expect("qBittorrent file-list gate");
         assert_eq!(qb_files.max_active_items, 1);
+    }
+
+    #[test]
+    fn allocation_gates_cover_measured_release_paths() {
+        let required = [
+            "client inventory to searchees",
+            "RSS candidate parsing",
+            "candidate assessment",
+        ];
+        for name in required {
+            assert!(
+                ALLOCATION_REGRESSION_GATES
+                    .iter()
+                    .any(|gate| gate.name == name),
+                "missing allocation regression gate for {name}"
+            );
+        }
+        for gate in ALLOCATION_REGRESSION_GATES {
+            assert!(gate.fixture_items > 0);
+            assert!(gate.max_live_bytes > 0);
+            assert!(gate.max_total_allocated_bytes >= gate.max_live_bytes);
+        }
     }
 }
