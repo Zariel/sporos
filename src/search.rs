@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
@@ -428,9 +428,16 @@ impl PipelineSummary {
 #[derive(Debug, Default, Clone)]
 pub struct CandidateSearchCache {
     entries: BTreeMap<(String, i64), CachedCandidates>,
+    entry_order: VecDeque<(String, i64)>,
     indexer_search_counts: BTreeMap<i64, usize>,
     last_indexer_search: Option<Instant>,
 }
+
+/// Cached search groups retained in one workflow.
+pub const CANDIDATE_SEARCH_CACHE_ENTRY_LIMIT: usize = 128;
+
+/// Remote candidates retained per cached search group.
+pub const CANDIDATE_SEARCH_CACHE_CANDIDATE_LIMIT: usize = 256;
 
 impl CandidateSearchCache {
     fn remaining_search_limit(&self, indexer_id: i64, limit: usize) -> usize {
@@ -462,6 +469,33 @@ impl CandidateSearchCache {
 
     fn mark_indexer_search(&mut self) {
         self.last_indexer_search = Some(Instant::now());
+    }
+
+    fn insert_candidates(
+        &mut self,
+        key: (String, i64),
+        ids_key: String,
+        candidates: &[Candidate<'static>],
+    ) {
+        if candidates.len() > CANDIDATE_SEARCH_CACHE_CANDIDATE_LIMIT {
+            return;
+        }
+        if !self.entries.contains_key(&key) {
+            while self.entries.len() >= CANDIDATE_SEARCH_CACHE_ENTRY_LIMIT {
+                let Some(oldest) = self.entry_order.pop_front() else {
+                    break;
+                };
+                self.entries.remove(&oldest);
+            }
+            self.entry_order.push_back(key.clone());
+        }
+        self.entries.insert(
+            key,
+            CachedCandidates {
+                ids_key,
+                candidates: candidates.to_vec(),
+            },
+        );
     }
 }
 
@@ -2137,13 +2171,7 @@ fn cached_or_search_candidates(
         indexer_ids.as_ref(),
     );
     if queries.is_empty() {
-        cache.entries.insert(
-            cache_key,
-            CachedCandidates {
-                ids_key: request.ids_key.to_owned(),
-                candidates: Vec::new(),
-            },
-        );
+        cache.insert_candidates(cache_key, request.ids_key.to_owned(), &[]);
         return Ok(CandidateSearchResult {
             candidates: Vec::new(),
             update_timestamp: true,
@@ -2157,13 +2185,7 @@ fn cached_or_search_candidates(
     let candidates = candidates?;
     cache.record_indexer_candidates(request.indexer.id, candidates.len());
     summary.indexer_searches += 1;
-    cache.entries.insert(
-        cache_key,
-        CachedCandidates {
-            ids_key: request.ids_key.to_owned(),
-            candidates: candidates.clone(),
-        },
-    );
+    cache.insert_candidates(cache_key, request.ids_key.to_owned(), candidates.as_slice());
     Ok(CandidateSearchResult {
         candidates,
         update_timestamp: true,
@@ -2782,16 +2804,17 @@ pub fn lookup_fields(searchee: &Searchee<'_>) -> LookupFields {
 #[cfg(test)]
 mod tests {
     use super::{
-        Blocklist, CachedCandidates, CandidateSearchCache, ContentFilterOptions,
-        ContentFilterRejection, MediaCapabilities, PIPELINE_ATTEMPT_RETAIN_LIMIT, PipelineAttempt,
-        PipelineSummary, ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime,
-        SearcheeSources, TimestampDecision, VirtualSeasonOptions, affected_roots_for_changed_path,
-        bulk_search, check_new_candidate_match, create_searchee_from_path,
-        create_virtual_season_searchees, filter_by_content, filter_duplicate_searchees,
-        find_all_searchees, find_potential_nested_roots, find_searchable_searchees, get_media_type,
-        index_torrent_dir, indexer_supports_media, lookup_fields, parse_title,
-        reverse_lookup_client_rows, reverse_lookup_data_rows, reverse_lookup_keys,
-        reverse_lookup_searchees, search_group_key, timestamp_excludes,
+        Blocklist, CANDIDATE_SEARCH_CACHE_CANDIDATE_LIMIT, CANDIDATE_SEARCH_CACHE_ENTRY_LIMIT,
+        CachedCandidates, CandidateSearchCache, ContentFilterOptions, ContentFilterRejection,
+        MediaCapabilities, PIPELINE_ATTEMPT_RETAIN_LIMIT, PipelineAttempt, PipelineSummary,
+        ReverseLookupRuntime, SearchPipelineOptions, SearchPipelineRuntime, SearcheeSources,
+        TimestampDecision, VirtualSeasonOptions, affected_roots_for_changed_path, bulk_search,
+        check_new_candidate_match, create_searchee_from_path, create_virtual_season_searchees,
+        filter_by_content, filter_duplicate_searchees, find_all_searchees,
+        find_potential_nested_roots, find_searchable_searchees, get_media_type, index_torrent_dir,
+        indexer_supports_media, lookup_fields, parse_title, reverse_lookup_client_rows,
+        reverse_lookup_data_rows, reverse_lookup_keys, reverse_lookup_searchees, search_group_key,
+        timestamp_excludes,
     };
     use crate::{
         domain::{
@@ -2830,6 +2853,43 @@ mod tests {
                 .map(|attempt| attempt.candidate_guid.as_str()),
             Some("guid-255")
         );
+    }
+
+    #[test]
+    fn candidate_search_cache_bounds_entries_and_large_results() {
+        let mut cache = CandidateSearchCache::default();
+        let small = vec![Candidate::new(
+            "Small",
+            "small-guid",
+            None::<String>,
+            "tracker",
+        )];
+        for index in 0..CANDIDATE_SEARCH_CACHE_ENTRY_LIMIT + 5 {
+            cache.insert_candidates(
+                (format!("group-{index}"), 1),
+                format!("ids-{index}"),
+                &small,
+            );
+        }
+        assert_eq!(cache.entries.len(), CANDIDATE_SEARCH_CACHE_ENTRY_LIMIT);
+        assert!(!cache.entries.contains_key(&("group-0".to_owned(), 1)));
+        assert!(cache.entries.contains_key(&(
+            format!("group-{}", CANDIDATE_SEARCH_CACHE_ENTRY_LIMIT + 4),
+            1
+        )));
+
+        let large = (0..CANDIDATE_SEARCH_CACHE_CANDIDATE_LIMIT + 1)
+            .map(|index| {
+                Candidate::new(
+                    format!("Large {index}"),
+                    format!("large-{index}"),
+                    None::<String>,
+                    "tracker",
+                )
+            })
+            .collect::<Vec<_>>();
+        cache.insert_candidates(("large".to_owned(), 1), "large".to_owned(), &large);
+        assert!(!cache.entries.contains_key(&("large".to_owned(), 1)));
     }
 
     #[test]
