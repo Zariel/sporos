@@ -1251,6 +1251,20 @@ impl TorrentClient for TransmissionClient {
             .collect())
     }
 
+    fn has_matching_download_dir(
+        &self,
+        predicate: &mut dyn FnMut(&Path) -> crate::Result<bool>,
+    ) -> crate::Result<bool> {
+        for hash in self.torrent_hashes()? {
+            for torrent in self.torrent_get_fields(Some(&[hash]), &["hashString", "downloadDir"])? {
+                if predicate(Path::new(&torrent.download_dir))? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
         let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
             return Ok(None);
@@ -1653,6 +1667,20 @@ impl TorrentClient for DelugeClient {
             .collect())
     }
 
+    fn has_matching_download_dir(
+        &self,
+        predicate: &mut dyn FnMut(&Path) -> crate::Result<bool>,
+    ) -> crate::Result<bool> {
+        for hash in self.torrent_hashes()? {
+            for torrent in self.update_ui_fields(Some(&[hash]), &["hash", "save_path"])? {
+                if predicate(Path::new(&torrent.save_path))? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
         let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
             return Ok(None);
@@ -2008,6 +2036,19 @@ impl TorrentClient for RtorrentClient {
         Ok(output)
     }
 
+    fn has_matching_download_dir(
+        &self,
+        predicate: &mut dyn FnMut(&Path) -> crate::Result<bool>,
+    ) -> crate::Result<bool> {
+        for hash in self.hashes()? {
+            let torrent = self.fetch_torrent(&hash)?;
+            if predicate(Path::new(&torrent.directory))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn remaining_bytes(&self, metafile: &Metafile<'_>) -> crate::Result<Option<u64>> {
         let Some(torrent) = self.torrent_info(&metafile.info_hash)? else {
             return Ok(None);
@@ -2361,6 +2402,7 @@ fn validate_qb_fastresume_dir(torrent_dir: &Path) -> crate::Result<()> {
 struct TransmissionTorrent {
     #[serde(rename = "hashString")]
     hash_string: String,
+    #[serde(default)]
     name: String,
     #[serde(rename = "downloadDir", default)]
     download_dir: String,
@@ -2411,6 +2453,7 @@ struct DelugeRpcResponse {
 struct DelugeTorrent {
     #[serde(default)]
     hash: String,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     save_path: String,
@@ -3524,6 +3567,43 @@ mod tests {
     }
 
     #[test]
+    fn transmission_download_dir_lookup_stops_at_first_match() {
+        let first = "0123456789abcdef0123456789abcdef01234567";
+        let second = "89abcdef012345670123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response_with_headers("409 Conflict", &[("X-Transmission-Session-Id", "sid")], ""),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{first}"}},{{"hashString":"{second}"}}]}}}}"#
+                ),
+            ),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{first}","downloadDir":"/match"}}]}}}}"#
+                ),
+            ),
+        ]);
+        let client = transmission_client(&server.url);
+
+        let found = client
+            .has_matching_download_dir(&mut |download_dir| Ok(download_dir == Path::new("/match")))
+            .expect("lookup");
+
+        assert!(found);
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains(r#""ids":["0123456789abcdef0123456789abcdef01234567"]"#));
+        assert!(
+            !requests
+                .iter()
+                .skip(2)
+                .any(|request| request.contains(second))
+        );
+    }
+
+    #[test]
     fn deluge_remaining_bytes_uses_single_info_lookup() {
         let hash = "0123456789abcdef0123456789abcdef01234567";
         let server = http_server(vec![
@@ -3549,6 +3629,40 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(requests[2].contains(r#""id":["0123456789abcdef0123456789abcdef01234567"]"#));
         assert!(requests[2].contains("total_remaining"));
+    }
+
+    #[test]
+    fn deluge_download_dir_lookup_stops_at_first_match() {
+        let first = "0123456789abcdef0123456789abcdef01234567";
+        let second = "89abcdef012345670123456789abcdef01234567";
+        let server = http_server(vec![
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&format!(
+                r#"{{"torrents":{{"{first}":{{"hash":"{first}"}},"{second}":{{"hash":"{second}"}}}}}}"#
+            )),
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&format!(
+                r#"{{"torrents":{{"{first}":{{"hash":"{first}","save_path":"/match"}}}}}}"#
+            )),
+        ]);
+        let client = deluge_client(&server.url);
+
+        let found = client
+            .has_matching_download_dir(&mut |download_dir| Ok(download_dir == Path::new("/match")))
+            .expect("lookup");
+
+        assert!(found);
+        let requests = server.join();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[5].contains(r#""id":["0123456789abcdef0123456789abcdef01234567"]"#));
+        assert!(
+            !requests
+                .iter()
+                .skip(3)
+                .any(|request| request.contains(second))
+        );
     }
 
     #[test]
