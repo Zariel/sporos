@@ -150,6 +150,10 @@ Decision rows may describe external candidates that were never cached locally,
 while torrent, client, and ensemble rows describe local state. Add foreign keys
 only where the ownership boundary is explicit.
 
+Keep the configured `client_host` value as the persisted client identity unless
+a real client metadata table reduces repeated state or is needed for multi-client
+ownership. Existing client-owned tables should key by `client_host` directly.
+
 ## Conventions & Patterns
 
 ### Rust design
