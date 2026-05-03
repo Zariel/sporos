@@ -28,9 +28,13 @@ use crate::{
         search_torznab_indexer, set_indexer_status,
     },
     matching::{Assessment, AssessmentOptions, CandidateAssessmentContext, assess_candidate},
-    persistence::{ClientSearcheeCacheRecord, Database, EnsembleCacheRecord},
+    persistence::{
+        ClientSearcheeCacheRecord, Database, EnsembleCacheRecord, ReverseLookupCriteria,
+    },
     torrent::parse_metafile,
 };
+
+const REVERSE_LOOKUP_PAGE_SIZE: i64 = 256;
 
 static EPISODE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?P<title>.*?)[ ._\-\[]+s(?P<season>\d{1,2})[ ._\-\]]*e(?P<episode>\d{1,3})\b")
@@ -814,6 +818,7 @@ fn reverse_lookup_candidates(
     let mut output = reverse_lookup_searchees(candidate, local_searchees, &runtime.options.filter);
     output.extend(reverse_lookup_client_rows(
         runtime.database,
+        candidate,
         &keys,
         &runtime.options.filter,
     )?);
@@ -2261,21 +2266,92 @@ fn reverse_lookup_keys(name: &str) -> Vec<String> {
 
 fn reverse_lookup_client_rows(
     database: &Database,
+    candidate: &Candidate<'_>,
     keys: &[String],
     filter: &ContentFilterOptions<'_>,
 ) -> crate::Result<Vec<Searchee<'static>>> {
     let mut output = Vec::new();
-    for row in database.client_searchee_rows()? {
-        if !reverse_keys_match(keys, &row.title) {
-            continue;
-        }
-        if let Some(searchee) = ClientSearcheeCacheRow::from(row).into_searchee()? {
-            if filter_by_content(&searchee, filter).is_none() {
-                output.push(searchee);
+    let criteria = reverse_lookup_criteria(candidate, keys, filter);
+    let mut after_rowid = 0_i64;
+    loop {
+        let rows = database.reverse_lookup_client_page(
+            &criteria,
+            after_rowid,
+            REVERSE_LOOKUP_PAGE_SIZE,
+        )?;
+        let Some(last) = rows.last() else {
+            break;
+        };
+        after_rowid = last.rowid;
+        for row in rows {
+            if !reverse_keys_match(keys, &row.title) {
+                continue;
+            }
+            if let Some(searchee) =
+                client_searchee_by_hash(database, &row.client_host, &row.info_hash)?
+            {
+                if filter_by_content(&searchee, filter).is_none() {
+                    output.push(searchee);
+                }
             }
         }
     }
     Ok(output)
+}
+
+fn reverse_lookup_criteria<'a>(
+    candidate: &Candidate<'_>,
+    keys: &'a [String],
+    filter: &ContentFilterOptions<'_>,
+) -> ReverseLookupCriteria<'a> {
+    let parsed_title = parse_title(candidate.name.as_ref(), &[], None);
+    let title = parsed_title
+        .as_ref()
+        .map(|parsed| parsed.title.as_str())
+        .unwrap_or(candidate.name.as_ref());
+    let (season, episode) = if let Some((season_key, episode)) = episode_key_from_title(title) {
+        (Some(season_key.season), Some(episode))
+    } else if let Some(season_key) = season_key_from_title(title) {
+        (Some(season_key.season), None)
+    } else {
+        (None, None)
+    };
+    let (min_length, max_length) = candidate.size.map_or((None, None), |size| {
+        let factor = filter.fuzzy_size_threshold;
+        let min = saturated_f64_length((size as f64 / (1.0 + factor)).floor());
+        let max = if factor >= 1.0 {
+            u64::MAX
+        } else {
+            saturated_f64_length((size as f64 / (1.0 - factor)).ceil())
+        };
+        (Some(min), Some(max))
+    });
+
+    ReverseLookupCriteria {
+        search_keys: keys,
+        media_type: parsed_title
+            .as_ref()
+            .map(|parsed| parsed.media_type.as_str()),
+        season,
+        episode,
+        min_length,
+        max_length,
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "reverse lookup length bounds are range-checked before saturating to u64"
+)]
+fn saturated_f64_length(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        value as u64
+    }
 }
 
 fn reverse_lookup_data_rows(
@@ -2670,7 +2746,7 @@ mod tests {
         create_searchee_from_path, create_virtual_season_searchees, filter_by_content,
         filter_duplicate_searchees, find_all_searchees, find_potential_nested_roots,
         find_searchable_searchees, get_media_type, index_torrent_dir, indexer_supports_media,
-        parse_title, reverse_lookup_searchees, search_group_key, timestamp_excludes,
+        lookup_fields, parse_title, reverse_lookup_searchees, search_group_key, timestamp_excludes,
     };
     use crate::{
         domain::{
@@ -3522,21 +3598,50 @@ mod tests {
         let exclude = BTreeSet::new();
         let mut options = pipeline_options(&blocklist, &exclude, &root, Label::Rss);
         options.filter.include_single_episodes = true;
+        let files = [File::new("Example.Show.S01E01.mkv", 10)];
+        let mut cached =
+            Searchee::from_files("Example.Show.S01E01", "Example Show S01E01", files.to_vec());
+        cached.media_type = MediaType::Episode;
+        let lookup = lookup_fields(&cached);
         database
             .upsert_client_searchee(&ClientSearcheeRecord {
                 client_host: "client-a",
                 info_hash: "0123456789abcdef0123456789abcdef01234567",
                 name: "Example.Show.S01E01",
                 title: "Example Show S01E01",
-                files: &[File::new("Example.Show.S01E01.mkv", 10)],
+                files: &files,
                 length: 10,
                 save_path: "/downloads",
                 category: None,
                 tags: &[],
                 trackers: &[Cow::Borrowed("tracker.example")],
-                lookup: None,
+                lookup: Some(&lookup),
             })
             .expect("client searchee");
+        database
+            .execute_sql(
+                "INSERT INTO client_searchee
+                    (client_host, info_hash, name, title, files, length, save_path, trackers, search_key, media_type, season, episode, file_count, video_bytes, non_video_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                &[
+                    SqlValue::Text(Cow::Borrowed("client-a")),
+                    SqlValue::Text(Cow::Borrowed("fedcba9876543210fedcba9876543210fedcba98")),
+                    SqlValue::Text(Cow::Borrowed("Example.Show.S01E01.poison")),
+                    SqlValue::Text(Cow::Borrowed("Example Show S01E01")),
+                    SqlValue::Text(Cow::Borrowed("not-json")),
+                    SqlValue::I64(10),
+                    SqlValue::Text(Cow::Borrowed("/downloads")),
+                    SqlValue::Text(Cow::Borrowed("[]")),
+                    SqlValue::Text(Cow::Borrowed("other.show.s01e01")),
+                    SqlValue::Text(Cow::Borrowed("episode")),
+                    SqlValue::I64(1),
+                    SqlValue::I64(1),
+                    SqlValue::I64(1),
+                    SqlValue::I64(10),
+                    SqlValue::I64(0),
+                ],
+            )
+            .expect("poison row");
         let searchee_id = database
             .get_or_insert_searchee("Example Show S01E01", 1_000)
             .expect("searchee");
