@@ -1126,6 +1126,7 @@ impl TransmissionClient {
                 "trackers",
                 "labels",
                 "percentDone",
+                "leftUntilDone",
                 "status",
             ],
         )
@@ -1511,6 +1512,7 @@ impl DelugeClient {
                 "tracker_host",
                 "label",
                 "progress",
+                "total_remaining",
                 "state",
             ],
         )
@@ -3489,6 +3491,64 @@ mod tests {
                 .iter()
                 .all(|request| !request.contains("/api/v2/torrents/files"))
         );
+    }
+
+    #[test]
+    fn transmission_remaining_bytes_uses_single_info_lookup() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            http_response_with_headers("409 Conflict", &[("X-Transmission-Session-Id", "sid")], ""),
+            http_response(
+                "200 OK",
+                &format!(
+                    r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example","downloadDir":"/downloads","files":[],"trackers":[],"labels":[],"percentDone":0.5,"leftUntilDone":7,"status":4}}]}}}}"#
+                ),
+            ),
+        ]);
+        let client = transmission_client(&server.url);
+        let metafile = Metafile::from_files(
+            InfoHash::new(hash).expect("hash").into_owned(),
+            "Example".to_owned(),
+            "Example".to_owned(),
+            42,
+            vec![File::new("Example.mkv", 42)],
+        );
+
+        let remaining = client.remaining_bytes(&metafile).expect("remaining");
+
+        assert_eq!(remaining, Some(7));
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#""ids":["0123456789abcdef0123456789abcdef01234567"]"#));
+        assert!(requests[1].contains("leftUntilDone"));
+    }
+
+    #[test]
+    fn deluge_remaining_bytes_uses_single_info_lookup() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let server = http_server(vec![
+            deluge_response("true"),
+            deluge_response("true"),
+            deluge_response(&format!(
+                r#"{{"torrents":{{"{hash}":{{"name":"Example","save_path":"/downloads","files":[],"tracker_host":"","label":"","progress":50.0,"total_remaining":7,"state":"Downloading"}}}}}}"#
+            )),
+        ]);
+        let client = deluge_client(&server.url);
+        let metafile = Metafile::from_files(
+            InfoHash::new(hash).expect("hash").into_owned(),
+            "Example".to_owned(),
+            "Example".to_owned(),
+            42,
+            vec![File::new("Example.mkv", 42)],
+        );
+
+        let remaining = client.remaining_bytes(&metafile).expect("remaining");
+
+        assert_eq!(remaining, Some(7));
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains(r#""id":["0123456789abcdef0123456789abcdef01234567"]"#));
+        assert!(requests[2].contains("total_remaining"));
     }
 
     #[test]
