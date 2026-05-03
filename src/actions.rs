@@ -5,6 +5,7 @@ use std::{
     cmp::Reverse,
     collections::BTreeSet,
     fs,
+    io::Write,
     path::{Component, Path, PathBuf},
     sync::{LazyLock, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -1111,12 +1112,11 @@ where
     fs::create_dir_all(output_dir)
         .map_err(|error| action_error(format!("failed to create output_dir: {error}")))?;
     let path = torrent_save_path(output_dir, metadata);
-    let existed = path.exists();
+    let mut existed = saved_torrent_path_exists_without_symlink(&path)?;
     if existed {
         touch_existing_file(&path)?;
     } else {
-        fs::write(&path, bytes)
-            .map_err(|error| action_error(format!("failed to save torrent: {error}")))?;
+        existed = write_new_saved_torrent(&path, bytes)?;
     }
     notify(&SaveNotification {
         path: path.clone(),
@@ -1129,6 +1129,49 @@ where
         path,
         existed,
     })
+}
+
+fn saved_torrent_path_exists_without_symlink(path: &Path) -> crate::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(action_error(format!(
+            "refusing to save torrent through symlink: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(action_error(format!(
+            "failed to inspect saved torrent path {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn write_new_saved_torrent(path: &Path, bytes: &[u8]) -> crate::Result<bool> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(Some)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Ok(None);
+            }
+            Err(error)
+        })
+        .map_err(|error| action_error(format!("failed to create saved torrent: {error}")))?;
+    let Some(mut file) = file else {
+        if saved_torrent_path_exists_without_symlink(path)? {
+            touch_existing_file(path)?;
+            return Ok(true);
+        }
+        return Err(action_error(format!(
+            "saved torrent path disappeared before write: {}",
+            path.display()
+        )));
+    };
+    file.write_all(bytes)
+        .map_err(|error| action_error(format!("failed to save torrent: {error}")))?;
+    Ok(false)
 }
 
 /// Restore cached candidate torrents into `output_dir` without deleting cache files.
@@ -1499,7 +1542,10 @@ mod tests {
         matching::AssessmentOptions,
         persistence::{Database, SqlValue},
         search::Blocklist,
-        torrent::{SavedTorrentMetadata, parse_metadata_from_filename, torrent_cache_path},
+        torrent::{
+            SavedTorrentMetadata, parse_metadata_from_filename, torrent_cache_path,
+            torrent_save_path,
+        },
     };
     use std::{
         borrow::Cow,
@@ -1621,6 +1667,36 @@ mod tests {
         let parsed = parse_metadata_from_filename(filename).expect("metadata");
         assert_eq!(parsed.tracker, "UnknownTracker");
         assert!(parsed.cached);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_torrent_save_refuses_symlink_target() {
+        let root = temp_path("metadata-save-symlink");
+        fs::create_dir_all(&root).expect("root");
+        let target = root.join("outside.torrent");
+        fs::write(&target, b"outside").expect("outside");
+        let hash = InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567");
+        let metadata = SavedTorrentMetadata::new(
+            MediaType::Unknown,
+            "UnknownTracker",
+            "Symlink.Release",
+            hash,
+            true,
+        );
+        let path = torrent_save_path(&root, &metadata);
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        let error = save_torrent_with_metadata(&root, &metadata, b"torrent", true, |_| Ok(()))
+            .expect_err("symlink rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to save torrent through symlink")
+        );
+        assert_eq!(fs::read(&target).expect("target"), b"outside");
         let _cleanup = fs::remove_dir_all(root);
     }
 
