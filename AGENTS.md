@@ -140,6 +140,11 @@ effects. The Rust-native TOML configuration and initial Rust schema are the
 supported contract; do not add alternate configuration loaders or schema
 compatibility layers unless a ticket explicitly changes that contract.
 
+SQLite schema changes are folded into the inline initial schema until the first
+Rust release. Do not add migration files for unreleased schema changes. After
+the first release, schema changes must use append-only numbered migrations and
+compatibility tests from released schema fixtures.
+
 ## Conventions & Patterns
 
 ### Rust design
