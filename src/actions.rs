@@ -7,6 +7,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -738,12 +739,29 @@ fn compatible_link_client<'a>(
 }
 
 fn source_files_unchanged(searchee: &Searchee<'_>) -> bool {
-    searchee.files.iter().all(|file| {
+    let mut newest_mtime = None;
+    for file in &searchee.files {
         let path = source_file_path(file, source_root(searchee).as_ref());
-        path.metadata()
-            .ok()
-            .is_some_and(|metadata| metadata.len() == file.length)
-    })
+        let Ok(metadata) = path.metadata() else {
+            return false;
+        };
+        if metadata.len() != file.length {
+            return false;
+        }
+        if let Some(millis) = metadata_mtime_millis(&metadata) {
+            newest_mtime = Some(newest_mtime.map_or(millis, |current: u64| current.max(millis)));
+        }
+    }
+    match (searchee.mtime_millis, newest_mtime) {
+        (Some(indexed), Some(current)) => current <= indexed,
+        _ => true,
+    }
+}
+
+fn metadata_mtime_millis(metadata: &fs::Metadata) -> Option<u64> {
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 fn save_for_retry<N>(
@@ -857,6 +875,7 @@ pub fn link_all_files_in_metafile(
                 action_error(format!("failed to create link destination: {error}"))
             })?;
         }
+        ensure_link_parent_within_destination(destination_dir, &destination)?;
         create_link(&source, &destination, options.link_type)?;
         result.linked += 1;
         if let Some(root) = created_root {
@@ -897,6 +916,37 @@ fn safe_link_destination(destination_dir: &Path, relative: &Path) -> crate::Resu
         }
     }
     Ok(destination_dir.join(relative))
+}
+
+fn ensure_link_parent_within_destination(
+    destination_dir: &Path,
+    destination: &Path,
+) -> crate::Result<()> {
+    let Some(parent) = destination.parent() else {
+        return Err(action_error(format!(
+            "link destination has no parent: {}",
+            destination.display()
+        )));
+    };
+    let root = fs::canonicalize(destination_dir).map_err(|error| {
+        action_error(format!(
+            "failed to canonicalize link destination root {}: {error}",
+            destination_dir.display()
+        ))
+    })?;
+    let parent = fs::canonicalize(parent).map_err(|error| {
+        action_error(format!(
+            "failed to canonicalize link destination parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if !parent.starts_with(&root) {
+        return Err(action_error(format!(
+            "unsafe link destination escapes link root: {}",
+            destination.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1277,14 +1327,30 @@ fn probe_link_dir(source_path: &Path, link_dir: &Path, link_type: LinkType) -> c
     fs::create_dir_all(link_dir)
         .map_err(|error| action_error(format!("failed to create link_dir: {error}")))?;
     let (probe_source, created_probe) = probe_source_path(source_path)?;
-    let probe_dest = link_dir.join(".cross-seed-link-probe-dest");
-    let _cleanup = fs::remove_file(&probe_dest);
+    let probe_dest = unique_probe_destination(link_dir)?;
     let result = create_link(&probe_source, &probe_dest, link_type).is_ok();
     let _cleanup = fs::remove_file(&probe_dest);
     if created_probe {
         let _cleanup = fs::remove_file(&probe_source);
     }
     Ok(result)
+}
+
+fn unique_probe_destination(link_dir: &Path) -> crate::Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..128 {
+        let candidate = link_dir.join(format!(
+            ".cross-seed-link-probe-dest-{}-{nanos}-{attempt}",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(action_error("failed to allocate unique link probe path"))
 }
 
 fn probe_source_path(source_path: &Path) -> crate::Result<(PathBuf, bool)> {
@@ -1628,6 +1694,49 @@ mod tests {
         let _cleanup = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn linking_rejects_destination_parent_symlink_escape() {
+        let root = temp_path("link-parent-symlink");
+        let data = root.join("data");
+        let destination = root.join("links");
+        let outside = root.join("outside");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::create_dir_all(&destination).expect("destination");
+        fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, destination.join("Release")).expect("escape symlink");
+        fs::write(data.join("source.mkv"), b"video").expect("source file");
+        let mut searchee =
+            Searchee::from_files("Source", "Source", vec![File::new("source.mkv", 5)]);
+        searchee.path = Some(Cow::Owned(data.join("source.mkv").display().to_string()));
+        let candidate = Metafile::from_files(
+            InfoHash::from_validated("0123456789abcdef0123456789abcdef01234567"),
+            "Release",
+            "Release",
+            1,
+            vec![File::new("Release/file.mkv", 5)],
+        );
+
+        let error = link_all_files_in_metafile(
+            &searchee,
+            &candidate,
+            Decision::MatchSizeOnly,
+            &destination,
+            &FileLinkOptions {
+                link_dirs: std::slice::from_ref(&destination),
+                link_type: LinkType::Hardlink,
+                flat_linking: false,
+                ignore_missing: false,
+                unwrap_symlinks: false,
+            },
+        )
+        .expect_err("symlink escape rejected");
+
+        assert!(error.to_string().contains("escapes link root"));
+        assert!(!outside.join("file.mkv").exists());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn linking_rejects_filesystem_root_destination() {
         let root = temp_path("link-root-destination");
@@ -1843,6 +1952,43 @@ mod tests {
         assert!(probe.exists());
         assert!(!link_dir.join(".cross-seed-link-probe-source").exists());
         fs::remove_file(&probe).expect("cleanup probe");
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn link_probe_does_not_remove_existing_probe_destination() {
+        let root = temp_path("link-probe-collision");
+        let source = root.join("source");
+        let link_dir = root.join("links");
+        let existing_probe = link_dir.join(".cross-seed-link-probe-dest");
+        fs::create_dir_all(&source).expect("source dir");
+        fs::create_dir_all(&link_dir).expect("link dir");
+        fs::write(source.join("episode.mkv"), b"video").expect("source file");
+        fs::write(&existing_probe, b"user data").expect("existing probe");
+
+        let compatible =
+            super::probe_link_dir(&source, &link_dir, LinkType::Hardlink).expect("probe link dir");
+
+        assert!(compatible);
+        assert_eq!(
+            fs::read(&existing_probe).expect("existing probe"),
+            b"user data"
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_files_unchanged_rejects_same_size_modified_file() {
+        let root = temp_path("source-mtime");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::write(data.join("source.mkv"), b"video").expect("source file");
+        let mut searchee =
+            Searchee::from_files("Source", "Source", vec![File::new("source.mkv", 5)]);
+        searchee.path = Some(Cow::Owned(data.display().to_string()));
+        searchee.mtime_millis = Some(0);
+
+        assert!(!super::source_files_unchanged(&searchee));
         let _cleanup = fs::remove_dir_all(root);
     }
 

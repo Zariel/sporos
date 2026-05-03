@@ -773,8 +773,27 @@ fn webhook_matches_request(
     let Some(path) = request.path.as_deref() else {
         return false;
     };
-    searchee.path.as_deref() == Some(path)
-        || searchee.files.iter().any(|file| file.path.as_ref() == path)
+    searchee
+        .path
+        .as_deref()
+        .is_some_and(|local| webhook_path_matches(local, path))
+        || searchee
+            .files
+            .iter()
+            .any(|file| webhook_path_matches(file.path.as_ref(), path))
+}
+
+fn webhook_path_matches(local: &str, requested: &str) -> bool {
+    if local == requested {
+        return true;
+    }
+    let Ok(local) = fs::canonicalize(Path::new(local)) else {
+        return false;
+    };
+    let Ok(requested) = fs::canonicalize(Path::new(requested)) else {
+        return false;
+    };
+    local == requested
 }
 
 fn search_pipeline_options<'a>(
@@ -1360,7 +1379,7 @@ mod tests {
     use super::{
         api_key, cleanup_db, cleanup_db_with_clients, clear_cache, clear_client_cache,
         clear_indexer_failures, reset_api_key, rss_time_since_last_run, run_announce_match,
-        run_webhook_search, update_torrent_cache_trackers,
+        run_webhook_search, update_torrent_cache_trackers, webhook_matches_request,
     };
     use crate::{
         api::WebhookRequest,
@@ -1752,6 +1771,40 @@ mod tests {
 
         assert_eq!(summary.searchees_seen, 1);
         assert_eq!(summary.indexer_searches, 0);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn webhook_match_canonicalizes_requested_path() {
+        let root = temp_path("webhook-canonical");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("data dir");
+        let file = data.join("episode.mkv");
+        fs::write(&file, b"video").expect("video");
+        let mut searchee = Searchee::from_files(
+            "Episode",
+            "Episode",
+            vec![File::new(file.display().to_string(), 5)],
+        );
+        searchee.path = Some(Cow::Owned(file.display().to_string()));
+        let request = WebhookRequest {
+            info_hash: None,
+            path: Some(
+                data.join("..")
+                    .join("data")
+                    .join("episode.mkv")
+                    .display()
+                    .to_string(),
+            ),
+            ignore_cross_seeds: false,
+            ignore_exclude_recent_search: false,
+            ignore_exclude_older: false,
+            ignore_block_list: false,
+            include_single_episodes: false,
+            include_non_videos: false,
+        };
+
+        assert!(webhook_matches_request(&searchee, &request));
         let _cleanup = fs::remove_dir_all(root);
     }
 
