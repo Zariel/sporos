@@ -179,22 +179,10 @@ async fn handle_axum_request(
         remote_addr: Some(remote_addr.to_string()),
     };
 
-    let runtime = tokio::runtime::Handle::current();
-    let response = match tokio::task::spawn_blocking(move || {
-        runtime.block_on(handle_runtime_request(state, request))
-    })
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            tracing::error!("API request failed: {error}");
-            crate::api::ApiResponse {
-                status: 500,
-                body: error.to_string(),
-            }
-        }
+    let response = match handle_runtime_request(state, request).await {
+        Ok(response) => response,
         Err(error) => {
-            tracing::error!("API request task failed: {error}");
+            tracing::error!("API request failed: {error}");
             crate::api::ApiResponse {
                 status: 500,
                 body: error.to_string(),
@@ -212,13 +200,11 @@ async fn handle_runtime_request(
     let async_database = AsyncDatabase::open_app_dir(&state.app_dir).await?;
     let api_key =
         crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await?;
-    let database = Database::open_app_dir(&state.app_dir)?;
     let mut scheduler = state.scheduler.lock().await;
     let mut handlers = RuntimeHandlers {
         app_dir: &state.app_dir,
         config: &state.config,
         async_database: &async_database,
-        database: &database,
         scheduler: &mut scheduler,
         now_millis: now_millis(),
         webhook_requests: Vec::new(),
@@ -411,7 +397,6 @@ struct RuntimeHandlers<'a> {
     app_dir: &'a Path,
     config: &'a RuntimeConfig,
     async_database: &'a AsyncDatabase,
-    database: &'a Database,
     scheduler: &'a mut Scheduler,
     now_millis: i64,
     webhook_requests: Vec<WebhookRequest>,
@@ -431,7 +416,7 @@ impl RuntimeHandlers<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ApiHandlers for RuntimeHandlers<'_> {
     async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>> {
         tracing::info!(
@@ -443,8 +428,9 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             self.config,
             crate::startup::Redactor::from_config(self.config),
         )?;
+        let database = Database::open_app_dir(self.app_dir)?;
         crate::operations::run_announce_match(
-            self.database,
+            &database,
             self.app_dir,
             self.config,
             request.into_candidate(),
@@ -478,10 +464,11 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 .scheduler
                 .check_jobs_async(self.async_database, self.now_millis, false)
                 .await?;
+            let database = Database::open_app_dir(self.app_dir)?;
             execute_ran_jobs(
                 self.app_dir,
                 self.config,
-                self.database,
+                &database,
                 self.scheduler,
                 &results,
             )?;
@@ -599,7 +586,6 @@ mod tests {
             app_dir: &root,
             config: &config,
             async_database: &async_database,
-            database: &database,
             scheduler: &mut plan.scheduler,
             now_millis: 1_000,
             webhook_requests: Vec::new(),

@@ -151,7 +151,7 @@ pub enum JobResponse {
 }
 
 /// Handler callbacks supplied by the daemon runtime.
-#[async_trait(?Send)]
+#[async_trait]
 pub trait ApiHandlers {
     /// Reverse-match an announce candidate.
     async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>>;
@@ -695,7 +695,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait(?Send)]
+    #[async_trait::async_trait]
     impl ApiHandlers for TestHandlers {
         async fn announce(
             &mut self,

@@ -357,7 +357,7 @@ struct TestHandlers {
     jobs: usize,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl ApiHandlers for TestHandlers {
     async fn announce(&mut self, _request: AnnounceRequest) -> sporos::Result<Option<ApiOutcome>> {
         Ok(Some(ApiOutcome {
