@@ -39,8 +39,8 @@ impl MatchMode {
     /// Parse configured match-mode text.
     pub fn parse(value: &str) -> crate::Result<Self> {
         match value {
-            "strict" | "safe" => Ok(Self::Strict),
-            "flexible" | "risky" => Ok(Self::Flexible),
+            "strict" => Ok(Self::Strict),
+            "flexible" => Ok(Self::Flexible),
             "partial" => Ok(Self::Partial),
             _ => Err(config_error(format!("invalid match_mode: {value}"))),
         }
@@ -874,7 +874,7 @@ mod tests {
     #[test]
     fn normalizes_defaults_and_supported_names() {
         let raw = RawConfig {
-            match_mode: Some("safe".to_owned()),
+            match_mode: Some("strict".to_owned()),
             link_type: Some("reflink_or_copy".to_owned()),
             link_dirs: vec!["/links".into()],
             notification_webhook_urls: vec!["https://notify.example".to_owned()],
@@ -894,6 +894,22 @@ mod tests {
             vec!["https://notify.example"]
         );
         assert_eq!(config.torrent_clients[0].kind, "qbittorrent");
+    }
+
+    #[test]
+    fn rejects_legacy_match_mode_names() {
+        for match_mode in ["safe", "risky"] {
+            let error = RuntimeConfig::normalize(
+                RawConfig {
+                    match_mode: Some(match_mode.to_owned()),
+                    ..RawConfig::default()
+                },
+                Path::new("/config"),
+            )
+            .expect_err("legacy match mode rejected");
+
+            assert!(error.to_string().contains("invalid match_mode"));
+        }
     }
 
     #[test]
@@ -1016,7 +1032,7 @@ mod tests {
     #[test]
     fn parses_enums() {
         assert_eq!(
-            MatchMode::parse("risky").expect("mode"),
+            MatchMode::parse("flexible").expect("mode"),
             MatchMode::Flexible
         );
         assert_eq!(Action::parse("inject").expect("action"), Action::Inject);
