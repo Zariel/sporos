@@ -2,8 +2,6 @@
 
 use std::{borrow::Cow, collections::BTreeSet, path::Path};
 
-use rusqlite::{OptionalExtension, params};
-
 use crate::{
     SporosError,
     config::MatchMode,
@@ -565,22 +563,12 @@ fn cached_decision(
     searchee_id: i64,
     guid: &str,
 ) -> crate::Result<Option<CachedDecision>> {
-    database
-        .connection()
-        .query_row(
-            "SELECT decision, info_hash FROM decision
-             WHERE searchee_id = ?1 AND guid = ?2",
-            params![searchee_id, guid],
-            |row| {
-                let decision: String = row.get(0)?;
-                Ok(CachedDecision {
-                    decision: Decision::parse(&decision).unwrap_or(Decision::DownloadFailed),
-                    info_hash: row.get(1)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(persistence_error)
+    Ok(database
+        .cached_decision(searchee_id, guid)?
+        .map(|cached| CachedDecision {
+            decision: Decision::parse(&cached.decision).unwrap_or(Decision::DownloadFailed),
+            info_hash: cached.info_hash,
+        }))
 }
 
 #[derive(Debug)]
@@ -631,14 +619,7 @@ fn update_indexer_trackers(
     let encoded = serde_json::to_string(&unique).map_err(|error| SporosError::Persistence {
         message: Cow::Owned(error.to_string()),
     })?;
-    database
-        .connection()
-        .execute(
-            "UPDATE indexer SET trackers = ?2 WHERE id = ?1",
-            params![indexer_id, encoded],
-        )
-        .map_err(persistence_error)?;
-    Ok(())
+    database.update_indexer_trackers_json(indexer_id, &encoded)
 }
 
 fn both_present_differ(left: Option<&str>, right: Option<&str>) -> bool {
@@ -675,12 +656,6 @@ fn decision_reason(decision: Decision) -> &'static str {
         | Decision::ProperRepackMismatch
         | Decision::ResolutionMismatch
         | Decision::SourceMismatch => decision.as_str(),
-    }
-}
-
-fn persistence_error(error: rusqlite::Error) -> SporosError {
-    SporosError::Persistence {
-        message: Cow::Owned(error.to_string()),
     }
 }
 

@@ -1423,22 +1423,10 @@ fn touch_existing_file(path: &Path) -> crate::Result<()> {
 }
 
 fn indexer_tracker_names(database: &Database) -> crate::Result<Vec<(String, Vec<String>)>> {
-    let mut statement = database
-        .connection()
-        .prepare("SELECT COALESCE(name, 'UnknownTracker'), trackers FROM indexer WHERE trackers IS NOT NULL")
-        .map_err(persistence_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            let name: String = row.get(0)?;
-            let trackers: String = row.get(1)?;
-            Ok((name, trackers))
-        })
-        .map_err(persistence_error)?;
     let mut output = Vec::new();
-    for row in rows {
-        let (name, trackers) = row.map_err(persistence_error)?;
-        let trackers = serde_json::from_str::<Vec<String>>(&trackers).map_err(json_error)?;
-        output.push((name, trackers));
+    for row in database.indexer_tracker_rows()? {
+        let trackers = serde_json::from_str::<Vec<String>>(&row.trackers).map_err(json_error)?;
+        output.push((row.name, trackers));
     }
     Ok(output)
 }
@@ -1463,12 +1451,6 @@ fn tracker_name_for_metafile(
 fn action_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Action {
         message: message.into(),
-    }
-}
-
-fn persistence_error(error: rusqlite::Error) -> SporosError {
-    SporosError::Persistence {
-        message: Cow::Owned(error.to_string()),
     }
 }
 

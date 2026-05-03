@@ -13,7 +13,6 @@ use std::{
 use filetime::FileTime;
 use quick_xml::{Reader, events::Event};
 use regex::Regex;
-use rusqlite::{OptionalExtension, params};
 use tokio::runtime::Builder;
 use url::{Url, form_urlencoded};
 
@@ -21,7 +20,7 @@ use crate::{
     SporosError,
     config::ApiIntegrationConfig,
     domain::{Candidate, InfoHash, MediaType, Metafile, Searchee},
-    persistence::Database,
+    persistence::{Database, IndexerCapsRecord},
     torrent::{parse_metafile, torrent_cache_path},
 };
 
@@ -138,20 +137,6 @@ pub struct SearchIndexer {
     pub apikey: String,
     /// Parsed caps.
     pub caps: TorznabCaps,
-}
-
-#[derive(Debug, Clone)]
-struct RawSearchCaps {
-    search: bool,
-    tv_search: bool,
-    movie_search: bool,
-    music_search: bool,
-    audio_search: bool,
-    book_search: bool,
-    tv_ids: String,
-    movie_ids: String,
-    categories: String,
-    limits: String,
 }
 
 /// Optional Arr IDs available for Torznab ID searches.
@@ -487,17 +472,7 @@ pub fn guid_lookup(
     }
     if let Some(id) = link.and_then(tracker_torrent_id) {
         let like = format!("%/torrent/{id}/%");
-        return database
-            .connection()
-            .query_row(
-                "SELECT info_hash FROM decision
-                 WHERE info_hash IS NOT NULL AND guid LIKE ?1
-                 ORDER BY id DESC LIMIT 1",
-                params![like],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(persistence_error);
+        return database.decision_info_hash_by_guid_like(&like);
     }
     Ok(None)
 }
@@ -664,56 +639,16 @@ pub fn sync_torznab_indexers(
     database: &Database,
     configured: &[TorznabConfig],
 ) -> crate::Result<IndexerSyncResult> {
-    let connection = database.connection();
-    connection
-        .execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS current_indexer_urls (
-                url TEXT PRIMARY KEY
-            );
-            DELETE FROM current_indexer_urls;",
-        )
-        .map_err(persistence_error)?;
-    let mut result = IndexerSyncResult::default();
-    for indexer in configured {
-        connection
-            .execute(
-                "INSERT OR IGNORE INTO current_indexer_urls (url) VALUES (?1)",
-                params![indexer.url],
-            )
-            .map_err(persistence_error)?;
-        let changed = connection
-            .execute(
-                "UPDATE indexer
-                 SET apikey = ?2,
-                     active = 1,
-                     status = CASE WHEN status = 'UNKNOWN_ERROR' THEN NULL ELSE status END
-                 WHERE url = ?1",
-                params![indexer.url, indexer.apikey],
-            )
-            .map_err(persistence_error)?;
-        if changed == 0 {
-            connection
-                .execute(
-                    "INSERT INTO indexer (url, apikey, active)
-                     VALUES (?1, ?2, 1)",
-                    params![indexer.url, indexer.apikey],
-                )
-                .map_err(persistence_error)?;
-            result.inserted += 1;
-        } else {
-            result.updated += changed;
-        }
-    }
-    result.deactivated = connection
-        .execute(
-            "UPDATE indexer
-             SET active = 0
-             WHERE active = 1
-             AND url NOT IN (SELECT url FROM current_indexer_urls)",
-            [],
-        )
-        .map_err(persistence_error)?;
-    Ok(result)
+    let result = database.sync_indexers(
+        configured
+            .iter()
+            .map(|indexer| (indexer.url.as_str(), indexer.apikey.as_str())),
+    )?;
+    Ok(IndexerSyncResult {
+        inserted: result.inserted,
+        updated: result.updated,
+        deactivated: result.deactivated,
+    })
 }
 
 /// Persist parsed caps for an indexer row.
@@ -722,39 +657,23 @@ pub fn update_indexer_caps(
     indexer_id: i64,
     caps: &TorznabCaps,
 ) -> crate::Result<()> {
-    database
-        .connection()
-        .execute(
-            "UPDATE indexer SET
-                search_cap = ?2,
-                tv_search_cap = ?3,
-                movie_search_cap = ?4,
-                music_search_cap = ?5,
-                audio_search_cap = ?6,
-                book_search_cap = ?7,
-                tv_id_caps = ?8,
-                movie_id_caps = ?9,
-                cat_caps = ?10,
-                limits_caps = ?11,
-                status = NULL,
-                retry_after = NULL
-             WHERE id = ?1",
-            params![
-                indexer_id,
-                caps.search,
-                caps.tv_search,
-                caps.movie_search,
-                caps.music_search,
-                caps.audio_search,
-                caps.book_search,
-                serde_json::to_string(&caps.tv_ids).map_err(json_error)?,
-                serde_json::to_string(&caps.movie_ids).map_err(json_error)?,
-                serde_json::to_string(&caps.categories).map_err(json_error)?,
-                serde_json::to_string(&caps.limits).map_err(json_error)?,
-            ],
-        )
-        .map_err(persistence_error)?;
-    Ok(())
+    let tv_ids = serde_json::to_string(&caps.tv_ids).map_err(json_error)?;
+    let movie_ids = serde_json::to_string(&caps.movie_ids).map_err(json_error)?;
+    let categories = serde_json::to_string(&caps.categories).map_err(json_error)?;
+    let limits = serde_json::to_string(&caps.limits).map_err(json_error)?;
+    database.update_indexer_caps(&IndexerCapsRecord {
+        indexer_id,
+        search: caps.search,
+        tv_search: caps.tv_search,
+        movie_search: caps.movie_search,
+        music_search: caps.music_search,
+        audio_search: caps.audio_search,
+        book_search: caps.book_search,
+        tv_ids: &tv_ids,
+        movie_ids: &movie_ids,
+        categories: &categories,
+        limits: &limits,
+    })
 }
 
 /// Mark an indexer status and retry timestamp.
@@ -764,14 +683,7 @@ pub fn set_indexer_status(
     status: Option<&str>,
     retry_after: Option<u64>,
 ) -> crate::Result<()> {
-    database
-        .connection()
-        .execute(
-            "UPDATE indexer SET status = ?2, retry_after = ?3 WHERE id = ?1",
-            params![indexer_id, status, retry_after],
-        )
-        .map_err(persistence_error)?;
-    Ok(())
+    database.set_indexer_status(indexer_id, status, retry_after)
 }
 
 /// Load enabled indexers for the current timestamp.
@@ -779,30 +691,15 @@ pub fn enabled_indexers(
     database: &Database,
     now_millis: u64,
 ) -> crate::Result<Vec<EnabledIndexer>> {
-    let mut statement = database
-        .connection()
-        .prepare(
-            "SELECT id, url, apikey
-             FROM indexer
-             WHERE active = 1
-               AND search_cap = 1
-               AND (status IS NULL OR status = 'OK' OR retry_after < ?1)",
-        )
-        .map_err(persistence_error)?;
-    let rows = statement
-        .query_map(params![now_millis], |row| {
-            Ok(EnabledIndexer {
-                id: row.get(0)?,
-                url: row.get(1)?,
-                apikey: row.get(2)?,
-            })
+    Ok(database
+        .enabled_indexers(now_millis)?
+        .into_iter()
+        .map(|row| EnabledIndexer {
+            id: row.id,
+            url: row.url,
+            apikey: row.apikey,
         })
-        .map_err(persistence_error)?;
-    let mut output = Vec::new();
-    for row in rows {
-        output.push(row.map_err(persistence_error)?);
-    }
-    Ok(output)
+        .collect::<Vec<_>>())
 }
 
 /// Load enabled indexers with parsed caps for search.
@@ -810,62 +707,23 @@ pub fn enabled_search_indexers(
     database: &Database,
     now_millis: u64,
 ) -> crate::Result<Vec<SearchIndexer>> {
-    let mut statement = database
-        .connection()
-        .prepare(
-            "SELECT id, url, apikey,
-                    search_cap, tv_search_cap, movie_search_cap, music_search_cap,
-                    audio_search_cap, book_search_cap, tv_id_caps, movie_id_caps,
-                    cat_caps, limits_caps
-             FROM indexer
-             WHERE active = 1
-               AND search_cap = 1
-               AND (status IS NULL OR status = 'OK' OR retry_after < ?1)",
-        )
-        .map_err(persistence_error)?;
-    let rows = statement
-        .query_map(params![now_millis], |row| {
-            let tv_ids: String = row.get(9)?;
-            let movie_ids: String = row.get(10)?;
-            let categories: String = row.get(11)?;
-            let limits: String = row.get(12)?;
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                RawSearchCaps {
-                    search: row.get(3)?,
-                    tv_search: row.get(4)?,
-                    movie_search: row.get(5)?,
-                    music_search: row.get(6)?,
-                    audio_search: row.get(7)?,
-                    book_search: row.get(8)?,
-                    tv_ids,
-                    movie_ids,
-                    categories,
-                    limits,
-                },
-            ))
-        })
-        .map_err(persistence_error)?;
     let mut output = Vec::new();
-    for row in rows {
-        let (id, url, apikey, raw_caps) = row.map_err(persistence_error)?;
+    for row in database.enabled_search_indexers(now_millis)? {
         output.push(SearchIndexer {
-            id,
-            url,
-            apikey,
+            id: row.id,
+            url: row.url,
+            apikey: row.apikey,
             caps: TorznabCaps {
-                search: raw_caps.search,
-                tv_search: raw_caps.tv_search,
-                movie_search: raw_caps.movie_search,
-                music_search: raw_caps.music_search,
-                audio_search: raw_caps.audio_search,
-                book_search: raw_caps.book_search,
-                tv_ids: serde_json::from_str(&raw_caps.tv_ids).map_err(json_error)?,
-                movie_ids: serde_json::from_str(&raw_caps.movie_ids).map_err(json_error)?,
-                categories: serde_json::from_str(&raw_caps.categories).map_err(json_error)?,
-                limits: serde_json::from_str(&raw_caps.limits).map_err(json_error)?,
+                search: row.search,
+                tv_search: row.tv_search,
+                movie_search: row.movie_search,
+                music_search: row.music_search,
+                audio_search: row.audio_search,
+                book_search: row.book_search,
+                tv_ids: serde_json::from_str(&row.tv_ids).map_err(json_error)?,
+                movie_ids: serde_json::from_str(&row.movie_ids).map_err(json_error)?,
+                categories: serde_json::from_str(&row.categories).map_err(json_error)?,
+                limits: serde_json::from_str(&row.limits).map_err(json_error)?,
             },
         });
     }
@@ -1684,39 +1542,15 @@ fn retry_after_millis(
 }
 
 fn update_indexer_name(database: &Database, indexer_id: i64, name: &str) -> crate::Result<()> {
-    database
-        .connection()
-        .execute(
-            "UPDATE indexer SET name = ?2 WHERE id = ?1",
-            params![indexer_id, name],
-        )
-        .map_err(persistence_error)?;
-    Ok(())
+    database.update_indexer_name(indexer_id, name)
 }
 
 fn read_rss_cursor(database: &Database, indexer_id: i64) -> crate::Result<Option<String>> {
-    database
-        .connection()
-        .query_row(
-            "SELECT last_seen_guid FROM rss WHERE indexer_id = ?1",
-            params![indexer_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(persistence_error)
+    database.read_rss_cursor(indexer_id)
 }
 
 fn update_rss_cursor(database: &Database, indexer_id: i64, guid: &str) -> crate::Result<()> {
-    database
-        .connection()
-        .execute(
-            "INSERT INTO rss (indexer_id, last_seen_guid)
-             VALUES (?1, ?2)
-             ON CONFLICT(indexer_id) DO UPDATE SET last_seen_guid = excluded.last_seen_guid",
-            params![indexer_id, guid],
-        )
-        .map_err(persistence_error)?;
-    Ok(())
+    database.update_rss_cursor(indexer_id, guid)
 }
 
 #[derive(Debug, Default)]
@@ -1915,17 +1749,7 @@ fn parse_limits(limits: &mut LimitCaps, attributes: &[(String, String)]) {
 }
 
 fn lookup_decision_info_hash(database: &Database, key: &str) -> crate::Result<Option<String>> {
-    database
-        .connection()
-        .query_row(
-            "SELECT info_hash FROM decision
-             WHERE guid = ?1 AND info_hash IS NOT NULL
-             ORDER BY id DESC LIMIT 1",
-            params![key],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(persistence_error)
+    database.decision_info_hash_by_guid(key)
 }
 
 fn tracker_torrent_id(link: &str) -> Option<String> {
@@ -1979,12 +1803,6 @@ fn bool_attr(value: &str) -> bool {
 fn integration_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Integration {
         message: message.into(),
-    }
-}
-
-fn persistence_error(error: rusqlite::Error) -> SporosError {
-    SporosError::Persistence {
-        message: Cow::Owned(error.to_string()),
     }
 }
 

@@ -9,7 +9,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::OptionalExtension;
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -192,14 +191,8 @@ pub async fn reset_api_key_async(database: &AsyncDatabase) -> crate::Result<Stri
 
 /// Clear decision cache rows without cached torrents and search timestamps.
 pub fn clear_cache(database: &Database) -> crate::Result<ClearCacheResult> {
-    let decisions_removed = database
-        .connection()
-        .execute("DELETE FROM decision WHERE info_hash IS NULL", [])
-        .map_err(persistence_error)?;
-    let timestamps_removed = database
-        .connection()
-        .execute("DELETE FROM timestamp", [])
-        .map_err(persistence_error)?;
+    let decisions_removed = database.delete_null_decisions()?;
+    let timestamps_removed = database.clear_timestamps()?;
     Ok(ClearCacheResult {
         decisions_removed,
         timestamps_removed,
@@ -218,22 +211,10 @@ pub async fn clear_cache_async(database: &AsyncDatabase) -> crate::Result<ClearC
 
 /// Clear cached client, torrent-dir, data-dir, and ensemble state.
 pub fn clear_client_cache(database: &Database) -> crate::Result<ClearClientCacheResult> {
-    let torrents_removed = database
-        .connection()
-        .execute("DELETE FROM torrent", [])
-        .map_err(persistence_error)?;
-    let client_searchees_removed = database
-        .connection()
-        .execute("DELETE FROM client_searchee", [])
-        .map_err(persistence_error)?;
-    let data_removed = database
-        .connection()
-        .execute("DELETE FROM data", [])
-        .map_err(persistence_error)?;
-    let ensemble_removed = database
-        .connection()
-        .execute("DELETE FROM ensemble", [])
-        .map_err(persistence_error)?;
+    let torrents_removed = database.clear_table(CacheTable::Torrent)?;
+    let client_searchees_removed = database.clear_table(CacheTable::ClientSearchee)?;
+    let data_removed = database.clear_table(CacheTable::Data)?;
+    let ensemble_removed = database.clear_table(CacheTable::Ensemble)?;
     Ok(ClearClientCacheResult {
         torrents_removed,
         client_searchees_removed,
@@ -260,10 +241,7 @@ pub async fn clear_client_cache_async(
 
 /// Clear indexer failure status and retry timestamps.
 pub fn clear_indexer_failures(database: &Database) -> crate::Result<usize> {
-    database
-        .connection()
-        .execute("UPDATE indexer SET status = NULL, retry_after = NULL", [])
-        .map_err(persistence_error)
+    database.clear_indexer_failures()
 }
 
 /// Clear indexer failure status and retry timestamps asynchronously.
@@ -321,10 +299,7 @@ pub fn cleanup_db_with_clients(
     }
     result.torrent_cache_files_removed =
         prune_unused_torrent_cache(database, app_dir, config, now_millis)?;
-    result.null_decisions_removed = database
-        .connection()
-        .execute("DELETE FROM decision WHERE info_hash IS NULL", [])
-        .map_err(persistence_error)?;
+    result.null_decisions_removed = database.delete_null_decisions()?;
     let decision_cleanup = prune_missing_cache_decisions(database, app_dir)?;
     result.missing_cache_decisions_removed = decision_cleanup.removed;
     result.catastrophic_decision_cleanup_skipped = decision_cleanup.catastrophic_skipped;
@@ -855,12 +830,7 @@ fn build_arr_configs(config: &RuntimeConfig) -> crate::Result<Vec<ArrConfig>> {
 }
 
 fn indexer_id(database: &Database, url: &str) -> crate::Result<i64> {
-    database
-        .connection()
-        .query_row("SELECT id FROM indexer WHERE url = ?1", [url], |row| {
-            row.get(0)
-        })
-        .map_err(persistence_error)
+    database.indexer_id(url)
 }
 
 fn index_torrents_and_data_dirs(database: &Database, config: &RuntimeConfig) -> crate::Result<()> {
@@ -1117,15 +1087,7 @@ fn rss_time_since_last_run(
         .rss_cadence
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO);
-    let last_run = database
-        .connection()
-        .query_row(
-            "SELECT last_run FROM job_log WHERE name = 'rss'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(persistence_error)?;
+    let last_run = database.read_last_run("rss")?;
     let Some(last_run) = last_run.and_then(|value| u64::try_from(value).ok()) else {
         return Ok(fallback);
     };
@@ -1146,24 +1108,15 @@ fn prune_missing_data_rows(database: &Database) -> crate::Result<usize> {
     let mut removed = 0usize;
     let mut after_rowid = 0_i64;
     loop {
-        let rows = rowid_path_page(
-            database,
-            "SELECT rowid, path FROM data
-             WHERE rowid > ?1
-             ORDER BY rowid
-             LIMIT ?2",
-            after_rowid,
-        )?;
+        let rows = database.data_rowid_path_page(after_rowid, CLEANUP_DB_PAGE_SIZE)?;
         let Some(last) = rows.last() else {
             break;
         };
-        after_rowid = last.0;
-        for (rowid, path) in rows {
+        after_rowid = last.rowid;
+        for row in rows {
+            let path = row.path;
             if !Path::new(&path).exists() {
-                removed += database
-                    .connection()
-                    .execute("DELETE FROM data WHERE rowid = ?1", [rowid])
-                    .map_err(persistence_error)?;
+                removed += database.delete_data_rowid(row.rowid)?;
             }
         }
     }
@@ -1239,25 +1192,15 @@ fn prune_missing_ensemble_rows(database: &Database) -> crate::Result<usize> {
     let mut removed = 0usize;
     let mut after_rowid = 0_i64;
     loop {
-        let rows = rowid_path_page(
-            database,
-            "SELECT rowid, path FROM ensemble
-             WHERE client_host IS NULL
-             AND rowid > ?1
-             ORDER BY rowid
-             LIMIT ?2",
-            after_rowid,
-        )?;
+        let rows = database.data_ensemble_rowid_path_page(after_rowid, CLEANUP_DB_PAGE_SIZE)?;
         let Some(last) = rows.last() else {
             break;
         };
-        after_rowid = last.0;
-        for (rowid, path) in rows {
+        after_rowid = last.rowid;
+        for row in rows {
+            let path = row.path;
             if !Path::new(&path).exists() {
-                removed += database
-                    .connection()
-                    .execute("DELETE FROM ensemble WHERE rowid = ?1", [rowid])
-                    .map_err(persistence_error)?;
+                removed += database.delete_ensemble_rowid(row.rowid)?;
             }
         }
     }
@@ -1335,10 +1278,7 @@ fn prune_missing_cache_decisions(
     for_each_decision_info_hash(database, |info_hash| {
         if let Some(hash) = InfoHash::new(info_hash) {
             if !torrent_cache_path(app_dir, &hash).exists() {
-                removed += database
-                    .connection()
-                    .execute("DELETE FROM decision WHERE info_hash = ?1", [info_hash])
-                    .map_err(persistence_error)?;
+                removed += database.delete_decisions_by_info_hash(info_hash)?;
             }
         }
         Ok(())
@@ -1368,38 +1308,7 @@ fn recent_decision_exists(
     info_hash: &str,
     cutoff_millis: i64,
 ) -> crate::Result<bool> {
-    database
-        .connection()
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM decision
-                WHERE info_hash = ?1 AND last_seen >= ?2
-            )",
-            rusqlite::params![info_hash, cutoff_millis],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(persistence_error)
-}
-
-fn rowid_path_page(
-    database: &Database,
-    sql: &str,
-    after_rowid: i64,
-) -> crate::Result<Vec<(i64, String)>> {
-    let mut statement = database
-        .connection()
-        .prepare(sql)
-        .map_err(persistence_error)?;
-    let rows = statement
-        .query_map([after_rowid, CLEANUP_DB_PAGE_SIZE], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .map_err(persistence_error)?;
-    let mut output = Vec::new();
-    for row in rows {
-        output.push(row.map_err(persistence_error)?);
-    }
-    Ok(output)
+    database.recent_decision_exists(info_hash, cutoff_millis)
 }
 
 fn for_each_decision_info_hash<F>(database: &Database, mut handle: F) -> crate::Result<()>
@@ -1408,27 +1317,8 @@ where
 {
     let mut after_info_hash: Option<String> = None;
     loop {
-        let mut statement = database
-            .connection()
-            .prepare(
-                "SELECT DISTINCT info_hash
-                 FROM decision
-                 WHERE info_hash IS NOT NULL
-                 AND (?1 IS NULL OR info_hash > ?1)
-                 ORDER BY info_hash
-                 LIMIT ?2",
-            )
-            .map_err(persistence_error)?;
-        let rows = statement
-            .query_map(
-                rusqlite::params![after_info_hash.as_deref(), CLEANUP_DB_PAGE_SIZE],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(persistence_error)?;
-        let mut page = Vec::new();
-        for row in rows {
-            page.push(row.map_err(persistence_error)?);
-        }
+        let page =
+            database.decision_info_hash_page(after_info_hash.as_deref(), CLEANUP_DB_PAGE_SIZE)?;
         let Some(last) = page.last() else {
             break;
         };
@@ -1512,12 +1402,6 @@ fn replace_torrent_tracker_urls(
     }
 
     Ok(changed.then(|| bencode(&decoded)))
-}
-
-fn persistence_error(error: rusqlite::Error) -> SporosError {
-    SporosError::Persistence {
-        message: Cow::Owned(error.to_string()),
-    }
 }
 
 async fn run_blocking_workflow<T>(

@@ -11,7 +11,6 @@ use std::{
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
-use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use tokio::runtime::Builder;
 use walkdir::{DirEntry, WalkDir};
@@ -29,7 +28,7 @@ use crate::{
         search_torznab_indexer, set_indexer_status,
     },
     matching::{Assessment, AssessmentOptions, CandidateAssessmentContext, assess_candidate},
-    persistence::Database,
+    persistence::{ClientSearcheeCacheRecord, Database, EnsembleCacheRecord},
     torrent::parse_metafile,
 };
 
@@ -1122,15 +1121,7 @@ pub fn index_torrent_dir(
     database: &Database,
     torrent_dir: &Path,
 ) -> crate::Result<TorrentDirIndexResult> {
-    let connection = database.connection();
-    connection
-        .execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS current_torrent_dir (
-                file_path TEXT PRIMARY KEY
-            );
-            DELETE FROM current_torrent_dir;",
-        )
-        .map_err(persistence_error)?;
+    database.begin_torrent_dir_refresh()?;
 
     let mut result = TorrentDirIndexResult {
         files_seen: 0,
@@ -1141,9 +1132,8 @@ pub fn index_torrent_dir(
     let entries = match fs::read_dir(torrent_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            result.torrents_removed = connection
-                .execute("DELETE FROM torrent", [])
-                .map_err(persistence_error)?;
+            result.torrents_removed =
+                database.clear_table(crate::persistence::CacheTable::Torrent)?;
             return Ok(result);
         }
         Err(error) => {
@@ -1169,12 +1159,7 @@ pub fn index_torrent_dir(
         }
         result.files_seen += 1;
         let file_path = path.display().to_string();
-        connection
-            .execute(
-                "INSERT OR IGNORE INTO current_torrent_dir (file_path) VALUES (?1)",
-                params![file_path],
-            )
-            .map_err(persistence_error)?;
+        database.mark_refreshed_torrent_path(&file_path)?;
 
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -1183,32 +1168,18 @@ pub fn index_torrent_dir(
                     "failed to read torrent_dir file {}: {error}",
                     path.display()
                 );
-                connection
-                    .execute(
-                        "DELETE FROM torrent WHERE file_path = ?1",
-                        params![file_path],
-                    )
-                    .map_err(persistence_error)?;
+                database.delete_torrent_path(&file_path)?;
                 result.files_failed += 1;
                 continue;
             }
         };
         match parse_metafile(&bytes) {
             Ok(metafile) => {
-                connection
-                    .execute(
-                        "INSERT INTO torrent (info_hash, name, file_path)
-                         VALUES (?1, ?2, ?3)
-                         ON CONFLICT(file_path) DO UPDATE SET
-                            info_hash = excluded.info_hash,
-                            name = excluded.name",
-                        params![
-                            metafile.info_hash.as_str(),
-                            metafile.name.as_ref(),
-                            file_path
-                        ],
-                    )
-                    .map_err(persistence_error)?;
+                database.upsert_torrent_path(
+                    metafile.info_hash.as_str(),
+                    metafile.name.as_ref(),
+                    &file_path,
+                )?;
                 result.torrents_indexed += 1;
             }
             Err(error) => {
@@ -1216,24 +1187,13 @@ pub fn index_torrent_dir(
                     "failed to parse torrent_dir file {}: {error}",
                     path.display()
                 );
-                connection
-                    .execute(
-                        "DELETE FROM torrent WHERE file_path = ?1",
-                        params![file_path],
-                    )
-                    .map_err(persistence_error)?;
+                database.delete_torrent_path(&file_path)?;
                 result.files_failed += 1;
             }
         }
     }
 
-    result.torrents_removed = connection
-        .execute(
-            "DELETE FROM torrent
-             WHERE file_path NOT IN (SELECT file_path FROM current_torrent_dir)",
-            [],
-        )
-        .map_err(persistence_error)?;
+    result.torrents_removed = database.finish_torrent_dir_refresh()?;
     Ok(result)
 }
 
@@ -2212,22 +2172,12 @@ fn read_timestamp(
     searchee_id: i64,
     indexer_id: i64,
 ) -> crate::Result<Option<TimestampDecision>> {
-    database
-        .connection()
-        .query_row(
-            "SELECT first_searched, last_searched
-             FROM timestamp
-             WHERE searchee_id = ?1 AND indexer_id = ?2",
-            params![searchee_id, indexer_id],
-            |row| {
-                Ok(TimestampDecision {
-                    first_searched: row.get(0)?,
-                    last_searched: row.get(1)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(persistence_error)
+    Ok(database
+        .read_timestamp(searchee_id, indexer_id)?
+        .map(|record| TimestampDecision {
+            first_searched: record.first_searched,
+            last_searched: record.last_searched,
+        }))
 }
 
 fn update_timestamp(
@@ -2236,17 +2186,7 @@ fn update_timestamp(
     indexer_id: i64,
     now_millis: u64,
 ) -> crate::Result<()> {
-    database
-        .connection()
-        .execute(
-            "INSERT INTO timestamp (searchee_id, indexer_id, first_searched, last_searched)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(searchee_id, indexer_id) DO UPDATE SET
-                last_searched = excluded.last_searched",
-            params![searchee_id, indexer_id, now_millis],
-        )
-        .map_err(persistence_error)?;
-    Ok(())
+    database.update_timestamp(searchee_id, indexer_id, now_millis)
 }
 
 fn reverse_lookup_keys(name: &str) -> Vec<String> {
@@ -2269,36 +2209,12 @@ fn reverse_lookup_client_rows(
     keys: &[String],
     filter: &ContentFilterOptions<'_>,
 ) -> crate::Result<Vec<Searchee<'static>>> {
-    let mut statement = database
-        .connection()
-        .prepare(
-            "SELECT client_host, info_hash, name, title, files, save_path, category, tags, trackers
-             FROM client_searchee",
-        )
-        .map_err(persistence_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok(ClientSearcheeCacheRow {
-                client_host: row.get(0)?,
-                info_hash: row.get(1)?,
-                name: row.get(2)?,
-                title: row.get(3)?,
-                files: row.get(4)?,
-                save_path: row.get(5)?,
-                category: row.get(6)?,
-                tags: row.get(7)?,
-                trackers: row.get(8)?,
-            })
-        })
-        .map_err(persistence_error)?;
-
     let mut output = Vec::new();
-    for row in rows {
-        let row = row.map_err(persistence_error)?;
+    for row in database.client_searchee_rows()? {
         if !reverse_keys_match(keys, &row.title) {
             continue;
         }
-        if let Some(searchee) = row.into_searchee()? {
+        if let Some(searchee) = ClientSearcheeCacheRow::from(row).into_searchee()? {
             if filter_by_content(&searchee, filter).is_none() {
                 output.push(searchee);
             }
@@ -2312,29 +2228,21 @@ fn reverse_lookup_data_rows(
     keys: &[String],
     filter: &ContentFilterOptions<'_>,
 ) -> crate::Result<Vec<Searchee<'static>>> {
-    let mut statement = database
-        .connection()
-        .prepare("SELECT path, title FROM data")
-        .map_err(persistence_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(persistence_error)?;
-
     let mut output = Vec::new();
-    for row in rows {
-        let (path, title) = row.map_err(persistence_error)?;
-        if !reverse_keys_match(keys, &title) {
+    for row in database.data_rows()? {
+        if !reverse_keys_match(keys, &row.title) {
             continue;
         }
-        match create_searchee_from_path(Path::new(&path)) {
+        match create_searchee_from_path(Path::new(&row.path)) {
             Ok(Some(searchee)) if filter_by_content(&searchee, filter).is_none() => {
                 output.push(searchee);
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::debug!("skipping stale reverse lookup data path {path}: {error}")
+                tracing::debug!(
+                    "skipping stale reverse lookup data path {}: {error}",
+                    row.path
+                )
             }
         }
     }
@@ -2370,29 +2278,9 @@ fn ensemble_rows(
     element: Option<&str>,
     filter: &ContentFilterOptions<'_>,
 ) -> crate::Result<Vec<Searchee<'static>>> {
-    let mut statement = database
-        .connection()
-        .prepare(
-            "SELECT client_host, path, info_hash
-             FROM ensemble
-             WHERE ensemble = ?1
-             AND (?2 IS NULL OR element = ?2)",
-        )
-        .map_err(persistence_error)?;
-    let rows = statement
-        .query_map(params![ensemble, element], |row| {
-            Ok(EnsembleCacheRow {
-                client_host: row.get(0)?,
-                path: row.get(1)?,
-                info_hash: row.get(2)?,
-            })
-        })
-        .map_err(persistence_error)?;
-
     let mut output = Vec::new();
-    for row in rows {
-        let row = row.map_err(persistence_error)?;
-        if let Some(searchee) = row.into_searchee(database)? {
+    for row in database.ensemble_rows(ensemble, element)? {
+        if let Some(searchee) = EnsembleCacheRow::from(row).into_searchee(database)? {
             if filter_by_content(&searchee, filter).is_none() {
                 output.push(searchee);
             }
@@ -2440,6 +2328,22 @@ struct ClientSearcheeCacheRow {
     trackers: String,
 }
 
+impl From<ClientSearcheeCacheRecord> for ClientSearcheeCacheRow {
+    fn from(record: ClientSearcheeCacheRecord) -> Self {
+        Self {
+            client_host: record.client_host,
+            info_hash: record.info_hash,
+            name: record.name,
+            title: record.title,
+            files: record.files,
+            save_path: record.save_path,
+            category: record.category,
+            tags: record.tags,
+            trackers: record.trackers,
+        }
+    }
+}
+
 impl ClientSearcheeCacheRow {
     fn into_searchee(self) -> crate::Result<Option<Searchee<'static>>> {
         let Some(info_hash) = InfoHash::new(self.info_hash) else {
@@ -2470,6 +2374,16 @@ struct EnsembleCacheRow {
     info_hash: Option<String>,
 }
 
+impl From<EnsembleCacheRecord> for EnsembleCacheRow {
+    fn from(record: EnsembleCacheRecord) -> Self {
+        Self {
+            client_host: record.client_host,
+            path: record.path,
+            info_hash: record.info_hash,
+        }
+    }
+}
+
 impl EnsembleCacheRow {
     fn into_searchee(self, database: &Database) -> crate::Result<Option<Searchee<'static>>> {
         if let (Some(client_host), Some(info_hash)) = (self.client_host, self.info_hash) {
@@ -2494,28 +2408,8 @@ fn client_searchee_by_hash(
     info_hash: &str,
 ) -> crate::Result<Option<Searchee<'static>>> {
     database
-        .connection()
-        .query_row(
-            "SELECT client_host, info_hash, name, title, files, save_path, category, tags, trackers
-             FROM client_searchee
-             WHERE client_host = ?1 AND info_hash = ?2",
-            params![client_host, info_hash],
-            |row| {
-                Ok(ClientSearcheeCacheRow {
-                    client_host: row.get(0)?,
-                    info_hash: row.get(1)?,
-                    name: row.get(2)?,
-                    title: row.get(3)?,
-                    files: row.get(4)?,
-                    save_path: row.get(5)?,
-                    category: row.get(6)?,
-                    tags: row.get(7)?,
-                    trackers: row.get(8)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(persistence_error)?
+        .client_searchee_by_hash(client_host, info_hash)?
+        .map(ClientSearcheeCacheRow::from)
         .map(ClientSearcheeCacheRow::into_searchee)
         .transpose()
         .map(Option::flatten)
@@ -2656,12 +2550,6 @@ fn failure_rank(decision: crate::domain::Decision) -> u8 {
 fn search_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Search {
         message: message.into(),
-    }
-}
-
-fn persistence_error(error: rusqlite::Error) -> SporosError {
-    SporosError::Persistence {
-        message: Cow::Owned(error.to_string()),
     }
 }
 

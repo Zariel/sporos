@@ -2,8 +2,6 @@
 
 use std::{borrow::Cow, sync::Mutex};
 
-use rusqlite::{OptionalExtension, params};
-
 use crate::{
     SporosError,
     api::JobResponse,
@@ -510,39 +508,16 @@ impl Scheduler {
 }
 
 fn read_last_run(database: &Database, name: JobName) -> crate::Result<Option<i64>> {
-    database
-        .connection()
-        .query_row(
-            "SELECT last_run FROM job_log WHERE name = ?1",
-            [name.as_str()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(persistence_error)
+    database.read_last_run(name.as_str())
 }
 
 fn write_last_run(database: &Database, name: JobName, last_run: i64) -> crate::Result<()> {
-    database
-        .connection()
-        .execute(
-            "INSERT INTO job_log (name, last_run)
-             VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET last_run = excluded.last_run",
-            params![name.as_str(), last_run],
-        )
-        .map_err(persistence_error)?;
-    Ok(())
+    database.write_last_run(name.as_str(), last_run)
 }
 
 fn scheduler_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     SporosError::Scheduler {
         message: message.into(),
-    }
-}
-
-fn persistence_error(error: rusqlite::Error) -> SporosError {
-    SporosError::Persistence {
-        message: Cow::Owned(error.to_string()),
     }
 }
 

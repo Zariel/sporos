@@ -428,6 +428,666 @@ impl Database {
         Ok(())
     }
 
+    /// Delete decision rows that have no cached torrent info hash.
+    pub fn delete_null_decisions(&self) -> crate::Result<usize> {
+        self.connection
+            .execute("DELETE FROM decision WHERE info_hash IS NULL", [])
+            .map_err(sql_error)
+    }
+
+    /// Clear all search timestamp rows.
+    pub fn clear_timestamps(&self) -> crate::Result<usize> {
+        self.connection
+            .execute("DELETE FROM timestamp", [])
+            .map_err(sql_error)
+    }
+
+    /// Clear one known cache table.
+    pub fn clear_table(&self, table: CacheTable) -> crate::Result<usize> {
+        let sql = match table {
+            CacheTable::Torrent => "DELETE FROM torrent",
+            CacheTable::ClientSearchee => "DELETE FROM client_searchee",
+            CacheTable::Data => "DELETE FROM data",
+            CacheTable::Ensemble => "DELETE FROM ensemble",
+        };
+        self.connection.execute(sql, []).map_err(sql_error)
+    }
+
+    /// Clear persisted indexer failure status and retry timestamps.
+    pub fn clear_indexer_failures(&self) -> crate::Result<usize> {
+        self.connection
+            .execute("UPDATE indexer SET status = NULL, retry_after = NULL", [])
+            .map_err(sql_error)
+    }
+
+    /// Read a scheduler job's last run timestamp.
+    pub fn read_last_run(&self, name: &str) -> crate::Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT last_run FROM job_log WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Insert or update a scheduler job's last run timestamp.
+    pub fn write_last_run(&self, name: &str, last_run: i64) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO job_log (name, last_run)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET last_run = excluded.last_run",
+                params![name, last_run],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Return a persisted indexer id for a configured URL.
+    pub fn indexer_id(&self, url: &str) -> crate::Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT id FROM indexer WHERE url = ?1",
+                params![url],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// Synchronize configured Torznab indexers with persisted rows.
+    pub fn sync_indexers<'a>(
+        &self,
+        configured: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> crate::Result<IndexerSyncStats> {
+        self.connection
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS current_indexer_urls (
+                    url TEXT PRIMARY KEY
+                );
+                DELETE FROM current_indexer_urls;",
+            )
+            .map_err(sql_error)?;
+        let mut result = IndexerSyncStats::default();
+        for (url, apikey) in configured {
+            self.connection
+                .execute(
+                    "INSERT OR IGNORE INTO current_indexer_urls (url) VALUES (?1)",
+                    params![url],
+                )
+                .map_err(sql_error)?;
+            let changed = self
+                .connection
+                .execute(
+                    "UPDATE indexer
+                     SET apikey = ?2,
+                         active = 1,
+                         status = CASE WHEN status = 'UNKNOWN_ERROR' THEN NULL ELSE status END
+                     WHERE url = ?1",
+                    params![url, apikey],
+                )
+                .map_err(sql_error)?;
+            if changed == 0 {
+                self.connection
+                    .execute(
+                        "INSERT INTO indexer (url, apikey, active)
+                         VALUES (?1, ?2, 1)",
+                        params![url, apikey],
+                    )
+                    .map_err(sql_error)?;
+                result.inserted += 1;
+            } else {
+                result.updated += changed;
+            }
+        }
+        result.deactivated = self
+            .connection
+            .execute(
+                "UPDATE indexer
+                 SET active = 0
+                 WHERE active = 1
+                 AND url NOT IN (SELECT url FROM current_indexer_urls)",
+                [],
+            )
+            .map_err(sql_error)?;
+        Ok(result)
+    }
+
+    /// Persist parsed caps for an indexer row.
+    pub fn update_indexer_caps(&self, record: &IndexerCapsRecord<'_>) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "UPDATE indexer SET
+                    search_cap = ?2,
+                    tv_search_cap = ?3,
+                    movie_search_cap = ?4,
+                    music_search_cap = ?5,
+                    audio_search_cap = ?6,
+                    book_search_cap = ?7,
+                    tv_id_caps = ?8,
+                    movie_id_caps = ?9,
+                    cat_caps = ?10,
+                    limits_caps = ?11,
+                    status = NULL,
+                    retry_after = NULL
+                 WHERE id = ?1",
+                params![
+                    record.indexer_id,
+                    record.search,
+                    record.tv_search,
+                    record.movie_search,
+                    record.music_search,
+                    record.audio_search,
+                    record.book_search,
+                    record.tv_ids,
+                    record.movie_ids,
+                    record.categories,
+                    record.limits,
+                ],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Mark an indexer status and retry timestamp.
+    pub fn set_indexer_status(
+        &self,
+        indexer_id: i64,
+        status: Option<&str>,
+        retry_after: Option<u64>,
+    ) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "UPDATE indexer SET status = ?2, retry_after = ?3 WHERE id = ?1",
+                params![indexer_id, status, retry_after],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Load enabled indexers for the current timestamp.
+    pub fn enabled_indexers(&self, now_millis: u64) -> crate::Result<Vec<IndexerRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, url, apikey
+                 FROM indexer
+                 WHERE active = 1
+                   AND search_cap = 1
+                   AND (status IS NULL OR status = 'OK' OR retry_after < ?1)",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![now_millis], |row| {
+                Ok(IndexerRow {
+                    id: row.get(0)?,
+                    url: row.get(1)?,
+                    apikey: row.get(2)?,
+                })
+            })
+            .map_err(sql_error)?;
+        collect_rows(rows)
+    }
+
+    /// Load enabled indexers and serialized caps for search.
+    pub fn enabled_search_indexers(&self, now_millis: u64) -> crate::Result<Vec<SearchIndexerRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, url, apikey,
+                        search_cap, tv_search_cap, movie_search_cap, music_search_cap,
+                        audio_search_cap, book_search_cap, tv_id_caps, movie_id_caps,
+                        cat_caps, limits_caps
+                 FROM indexer
+                 WHERE active = 1
+                   AND search_cap = 1
+                   AND (status IS NULL OR status = 'OK' OR retry_after < ?1)",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![now_millis], |row| {
+                Ok(SearchIndexerRow {
+                    id: row.get(0)?,
+                    url: row.get(1)?,
+                    apikey: row.get(2)?,
+                    search: row.get(3)?,
+                    tv_search: row.get(4)?,
+                    movie_search: row.get(5)?,
+                    music_search: row.get(6)?,
+                    audio_search: row.get(7)?,
+                    book_search: row.get(8)?,
+                    tv_ids: row.get(9)?,
+                    movie_ids: row.get(10)?,
+                    categories: row.get(11)?,
+                    limits: row.get(12)?,
+                })
+            })
+            .map_err(sql_error)?;
+        collect_rows(rows)
+    }
+
+    /// Update an indexer display name.
+    pub fn update_indexer_name(&self, indexer_id: i64, name: &str) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "UPDATE indexer SET name = ?2 WHERE id = ?1",
+                params![indexer_id, name],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Update indexer tracker names with caller-encoded JSON.
+    pub fn update_indexer_trackers_json(
+        &self,
+        indexer_id: i64,
+        trackers: &str,
+    ) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "UPDATE indexer SET trackers = ?2 WHERE id = ?1",
+                params![indexer_id, trackers],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Read a stored RSS cursor.
+    pub fn read_rss_cursor(&self, indexer_id: i64) -> crate::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT last_seen_guid FROM rss WHERE indexer_id = ?1",
+                params![indexer_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Insert or update a stored RSS cursor.
+    pub fn update_rss_cursor(&self, indexer_id: i64, guid: &str) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO rss (indexer_id, last_seen_guid)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(indexer_id) DO UPDATE SET last_seen_guid = excluded.last_seen_guid",
+                params![indexer_id, guid],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Look up a cached decision by searchee and GUID.
+    pub fn cached_decision(
+        &self,
+        searchee_id: i64,
+        guid: &str,
+    ) -> crate::Result<Option<CachedDecisionRecord>> {
+        self.connection
+            .query_row(
+                "SELECT decision, info_hash FROM decision
+                 WHERE searchee_id = ?1 AND guid = ?2",
+                params![searchee_id, guid],
+                |row| {
+                    Ok(CachedDecisionRecord {
+                        decision: row.get(0)?,
+                        info_hash: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Look up a cached candidate info hash by exact GUID/link.
+    pub fn decision_info_hash_by_guid(&self, key: &str) -> crate::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT info_hash FROM decision
+                 WHERE guid = ?1 AND info_hash IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Look up a cached candidate info hash by GUID LIKE pattern.
+    pub fn decision_info_hash_by_guid_like(&self, like: &str) -> crate::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT info_hash FROM decision
+                 WHERE info_hash IS NOT NULL AND guid LIKE ?1
+                 ORDER BY id DESC LIMIT 1",
+                params![like],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Read a search timestamp row.
+    pub fn read_timestamp(
+        &self,
+        searchee_id: i64,
+        indexer_id: i64,
+    ) -> crate::Result<Option<TimestampRecord>> {
+        self.connection
+            .query_row(
+                "SELECT first_searched, last_searched
+                 FROM timestamp
+                 WHERE searchee_id = ?1 AND indexer_id = ?2",
+                params![searchee_id, indexer_id],
+                |row| {
+                    Ok(TimestampRecord {
+                        first_searched: row.get(0)?,
+                        last_searched: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Insert or update a search timestamp row.
+    pub fn update_timestamp(
+        &self,
+        searchee_id: i64,
+        indexer_id: i64,
+        now_millis: u64,
+    ) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO timestamp (searchee_id, indexer_id, first_searched, last_searched)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(searchee_id, indexer_id) DO UPDATE SET
+                    last_searched = excluded.last_searched",
+                params![searchee_id, indexer_id, now_millis],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Start a bounded refresh for torrent-dir rows.
+    pub fn begin_torrent_dir_refresh(&self) -> crate::Result<()> {
+        self.connection
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS current_torrent_dir (
+                    file_path TEXT PRIMARY KEY
+                );
+                DELETE FROM current_torrent_dir;",
+            )
+            .map_err(sql_error)
+    }
+
+    /// Mark one torrent-dir path as present during refresh.
+    pub fn mark_refreshed_torrent_path(&self, file_path: &str) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO current_torrent_dir (file_path) VALUES (?1)",
+                params![file_path],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Delete one torrent-dir cache row.
+    pub fn delete_torrent_path(&self, file_path: &str) -> crate::Result<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM torrent WHERE file_path = ?1",
+                params![file_path],
+            )
+            .map_err(sql_error)
+    }
+
+    /// Insert or update one torrent-dir cache row.
+    pub fn upsert_torrent_path(
+        &self,
+        info_hash: &str,
+        name: &str,
+        file_path: &str,
+    ) -> crate::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO torrent (info_hash, name, file_path)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(file_path) DO UPDATE SET
+                    info_hash = excluded.info_hash,
+                    name = excluded.name",
+                params![info_hash, name, file_path],
+            )
+            .map(|_| ())
+            .map_err(sql_error)
+    }
+
+    /// Prune torrent-dir rows absent from the current bounded refresh.
+    pub fn finish_torrent_dir_refresh(&self) -> crate::Result<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM torrent
+                 WHERE file_path NOT IN (SELECT file_path FROM current_torrent_dir)",
+                [],
+            )
+            .map_err(sql_error)
+    }
+
+    /// Load all client searchee cache rows.
+    pub fn client_searchee_rows(&self) -> crate::Result<Vec<ClientSearcheeCacheRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT client_host, info_hash, name, title, files, save_path, category, tags, trackers
+                 FROM client_searchee",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], client_searchee_record)
+            .map_err(sql_error)?;
+        collect_rows(rows)
+    }
+
+    /// Load all data-dir cache rows.
+    pub fn data_rows(&self) -> crate::Result<Vec<DataCacheRecord>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path, title FROM data")
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(DataCacheRecord {
+                    path: row.get(0)?,
+                    title: row.get(1)?,
+                })
+            })
+            .map_err(sql_error)?;
+        collect_rows(rows)
+    }
+
+    /// Load virtual season and episode rows.
+    pub fn ensemble_rows(
+        &self,
+        ensemble: &str,
+        element: Option<&str>,
+    ) -> crate::Result<Vec<EnsembleCacheRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT client_host, path, info_hash
+                 FROM ensemble
+                 WHERE ensemble = ?1
+                 AND (?2 IS NULL OR element = ?2)",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![ensemble, element], |row| {
+                Ok(EnsembleCacheRecord {
+                    client_host: row.get(0)?,
+                    path: row.get(1)?,
+                    info_hash: row.get(2)?,
+                })
+            })
+            .map_err(sql_error)?;
+        collect_rows(rows)
+    }
+
+    /// Load one client searchee row by client host and info hash.
+    pub fn client_searchee_by_hash(
+        &self,
+        client_host: &str,
+        info_hash: &str,
+    ) -> crate::Result<Option<ClientSearcheeCacheRecord>> {
+        self.connection
+            .query_row(
+                "SELECT client_host, info_hash, name, title, files, save_path, category, tags, trackers
+                 FROM client_searchee
+                 WHERE client_host = ?1 AND info_hash = ?2",
+                params![client_host, info_hash],
+                client_searchee_record,
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    /// Load a bounded rowid/path page from data rows.
+    pub fn data_rowid_path_page(
+        &self,
+        after_rowid: i64,
+        limit: i64,
+    ) -> crate::Result<Vec<RowidPath>> {
+        self.rowid_path_page(
+            "SELECT rowid, path FROM data
+             WHERE rowid > ?1
+             ORDER BY rowid
+             LIMIT ?2",
+            after_rowid,
+            limit,
+        )
+    }
+
+    /// Load a bounded rowid/path page from data-dir ensemble rows.
+    pub fn data_ensemble_rowid_path_page(
+        &self,
+        after_rowid: i64,
+        limit: i64,
+    ) -> crate::Result<Vec<RowidPath>> {
+        self.rowid_path_page(
+            "SELECT rowid, path FROM ensemble
+             WHERE client_host IS NULL
+             AND rowid > ?1
+             ORDER BY rowid
+             LIMIT ?2",
+            after_rowid,
+            limit,
+        )
+    }
+
+    fn rowid_path_page(
+        &self,
+        sql: &str,
+        after_rowid: i64,
+        limit: i64,
+    ) -> crate::Result<Vec<RowidPath>> {
+        let mut statement = self.connection.prepare(sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![after_rowid, limit], |row| {
+                Ok(RowidPath {
+                    rowid: row.get(0)?,
+                    path: row.get(1)?,
+                })
+            })
+            .map_err(sql_error)?;
+        collect_rows(rows)
+    }
+
+    /// Delete one data row by rowid.
+    pub fn delete_data_rowid(&self, rowid: i64) -> crate::Result<usize> {
+        self.connection
+            .execute("DELETE FROM data WHERE rowid = ?1", params![rowid])
+            .map_err(sql_error)
+    }
+
+    /// Delete one data-dir ensemble row by rowid.
+    pub fn delete_ensemble_rowid(&self, rowid: i64) -> crate::Result<usize> {
+        self.connection
+            .execute("DELETE FROM ensemble WHERE rowid = ?1", params![rowid])
+            .map_err(sql_error)
+    }
+
+    /// Return whether a recent cached decision exists for an info hash.
+    pub fn recent_decision_exists(
+        &self,
+        info_hash: &str,
+        cutoff_millis: i64,
+    ) -> crate::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM decision
+                    WHERE info_hash = ?1 AND last_seen >= ?2
+                )",
+                params![info_hash, cutoff_millis],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// Stream distinct decision info hashes in stable bounded pages.
+    pub fn decision_info_hash_page(
+        &self,
+        after_info_hash: Option<&str>,
+        limit: i64,
+    ) -> crate::Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT info_hash
+                 FROM decision
+                 WHERE info_hash IS NOT NULL
+                 AND (?1 IS NULL OR info_hash > ?1)
+                 ORDER BY info_hash
+                 LIMIT ?2",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![after_info_hash, limit], |row| row.get(0))
+            .map_err(sql_error)?;
+        collect_rows(rows)
+    }
+
+    /// Delete cached decisions for one info hash.
+    pub fn delete_decisions_by_info_hash(&self, info_hash: &str) -> crate::Result<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM decision WHERE info_hash = ?1",
+                params![info_hash],
+            )
+            .map_err(sql_error)
+    }
+
+    /// Load indexer tracker names with caller-decoded tracker JSON.
+    pub fn indexer_tracker_rows(&self) -> crate::Result<Vec<IndexerTrackerRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT COALESCE(name, 'UnknownTracker'), trackers
+                 FROM indexer
+                 WHERE trackers IS NOT NULL",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(IndexerTrackerRecord {
+                    name: row.get(0)?,
+                    trackers: row.get(1)?,
+                })
+            })
+            .map_err(sql_error)?;
+        collect_rows(rows)
+    }
+
     /// Database path under an app directory.
     pub fn path_for_app_dir(app_dir: &Path) -> PathBuf {
         app_dir.join(DATABASE_FILE_NAME)
@@ -697,6 +1357,165 @@ pub struct EnsembleRecord<'a> {
     pub element: &'a str,
 }
 
+/// Row counts returned by an indexer synchronization.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct IndexerSyncStats {
+    /// Newly inserted indexers.
+    pub inserted: usize,
+    /// Re-enabled or updated indexers.
+    pub updated: usize,
+    /// Indexers deactivated because they are no longer configured.
+    pub deactivated: usize,
+}
+
+/// Serialized Torznab caps fields ready for persistence.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexerCapsRecord<'a> {
+    /// Indexer row id.
+    pub indexer_id: i64,
+    /// Basic search support.
+    pub search: bool,
+    /// TV search support.
+    pub tv_search: bool,
+    /// Movie search support.
+    pub movie_search: bool,
+    /// Music search support.
+    pub music_search: bool,
+    /// Audio search support.
+    pub audio_search: bool,
+    /// Book search support.
+    pub book_search: bool,
+    /// Serialized TV id caps.
+    pub tv_ids: &'a str,
+    /// Serialized movie id caps.
+    pub movie_ids: &'a str,
+    /// Serialized category caps.
+    pub categories: &'a str,
+    /// Serialized limit caps.
+    pub limits: &'a str,
+}
+
+/// Enabled indexer row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IndexerRow {
+    /// Database row id.
+    pub id: i64,
+    /// Base Torznab URL.
+    pub url: String,
+    /// API key.
+    pub apikey: String,
+}
+
+/// Enabled search indexer row with serialized caps.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchIndexerRow {
+    /// Database row id.
+    pub id: i64,
+    /// Base Torznab URL.
+    pub url: String,
+    /// API key.
+    pub apikey: String,
+    /// Basic search support.
+    pub search: bool,
+    /// TV search support.
+    pub tv_search: bool,
+    /// Movie search support.
+    pub movie_search: bool,
+    /// Music search support.
+    pub music_search: bool,
+    /// Audio search support.
+    pub audio_search: bool,
+    /// Book search support.
+    pub book_search: bool,
+    /// Serialized TV id caps.
+    pub tv_ids: String,
+    /// Serialized movie id caps.
+    pub movie_ids: String,
+    /// Serialized category caps.
+    pub categories: String,
+    /// Serialized limit caps.
+    pub limits: String,
+}
+
+/// Cached decision row loaded by searchee and GUID.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CachedDecisionRecord {
+    /// Persisted decision string.
+    pub decision: String,
+    /// Persisted candidate info hash when available.
+    pub info_hash: Option<String>,
+}
+
+/// Search timestamp row.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TimestampRecord {
+    /// First search timestamp.
+    pub first_searched: u64,
+    /// Last search timestamp.
+    pub last_searched: u64,
+}
+
+/// Client searchee cache row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ClientSearcheeCacheRecord {
+    /// Client host.
+    pub client_host: String,
+    /// Torrent info hash.
+    pub info_hash: String,
+    /// Torrent name.
+    pub name: String,
+    /// Parsed title.
+    pub title: String,
+    /// Serialized files JSON.
+    pub files: String,
+    /// Client save path.
+    pub save_path: String,
+    /// Optional category.
+    pub category: Option<String>,
+    /// Serialized tags JSON.
+    pub tags: Option<String>,
+    /// Serialized tracker JSON.
+    pub trackers: String,
+}
+
+/// Data-dir cache row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DataCacheRecord {
+    /// Cached path.
+    pub path: String,
+    /// Parsed title.
+    pub title: String,
+}
+
+/// Ensemble cache row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EnsembleCacheRecord {
+    /// Optional client host.
+    pub client_host: Option<String>,
+    /// Cached path.
+    pub path: String,
+    /// Optional torrent info hash.
+    pub info_hash: Option<String>,
+}
+
+/// Rowid/path pair used by cleanup pages.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RowidPath {
+    /// SQLite rowid.
+    pub rowid: i64,
+    /// Cached filesystem path.
+    pub path: String,
+}
+
+/// Indexer name plus serialized tracker JSON.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IndexerTrackerRecord {
+    /// Display name.
+    pub name: String,
+    /// Serialized tracker JSON.
+    pub trackers: String,
+}
+
 #[derive(Serialize)]
 struct FileJson<'a> {
     name: &'a str,
@@ -841,6 +1660,20 @@ fn collect_rows<T>(
         output.push(row.map_err(sql_error)?);
     }
     Ok(output)
+}
+
+fn client_searchee_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientSearcheeCacheRecord> {
+    Ok(ClientSearcheeCacheRecord {
+        client_host: row.get(0)?,
+        info_hash: row.get(1)?,
+        name: row.get(2)?,
+        title: row.get(3)?,
+        files: row.get(4)?,
+        save_path: row.get(5)?,
+        category: row.get(6)?,
+        tags: row.get(7)?,
+        trackers: row.get(8)?,
+    })
 }
 
 fn sql_error(error: rusqlite::Error) -> SporosError {
