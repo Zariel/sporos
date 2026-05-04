@@ -825,6 +825,8 @@ mod tests {
             notification_webhook_urls: Vec::new(),
             port: Some(2468),
             host: None,
+            listen_port: Some(9000),
+            listen_host: "0.0.0.0".parse().expect("listen host"),
             rss_cadence: None,
             search_cadence: None,
             snatch_timeout: None,

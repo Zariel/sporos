@@ -188,7 +188,7 @@ impl DaemonPlan {
             ScheduledJob::new(JobName::Cleanup, ONE_DAY_MILLIS, true),
         ];
         Self {
-            serve_http: config.port.is_some(),
+            serve_http: config.listen_port.is_some(),
             scheduler: Scheduler::new(jobs),
         }
     }

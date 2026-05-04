@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -904,10 +904,9 @@ fn config_with_job_override(
 }
 
 fn listen_address(config: &RuntimeConfig) -> Option<SocketAddr> {
-    config.port.map(|port| {
-        let host = config.host.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        SocketAddr::new(host, port)
-    })
+    config
+        .listen_port
+        .map(|port| SocketAddr::new(config.listen_host, port))
 }
 
 fn now_millis() -> i64 {

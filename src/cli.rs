@@ -428,12 +428,12 @@ fn apply_daemon_options(
     raw_config: &mut crate::config::RawConfig,
 ) -> crate::Result<()> {
     if matches.get_flag("no-port") {
-        raw_config.port = Some(None);
+        raw_config.listen_port = Some(None);
     } else if let Some(port) = matches.get_one::<u16>("port") {
-        raw_config.port = Some(Some(*port));
+        raw_config.listen_port = Some(Some(*port));
     }
     if let Some(host) = string_value(matches, "host") {
-        raw_config.host = Some(host.parse().map_err(|error| {
+        raw_config.listen_host = Some(host.parse().map_err(|error| {
             crate::SporosError::configuration(format!("invalid --host: {error}"))
         })?);
     }
@@ -1019,7 +1019,7 @@ mod tests {
         .expect("env");
         apply_daemon_options(matches, &mut raw).expect("daemon");
 
-        assert_eq!(raw.port, Some(Some(3333)));
+        assert_eq!(raw.listen_port, Some(Some(3333)));
         assert_eq!(raw.api_key.as_deref(), Some("cli-cli-cli-cli-cli-cli"));
     }
 }

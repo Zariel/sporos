@@ -22,7 +22,7 @@ const APP_DIR_NAME: &str = "cross-seed";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CONFIG_FILE_ENV: &str = "SPOROS__CONFIG_FILE";
 const DEFAULT_DELAY_SECONDS: u64 = 30;
-const DEFAULT_PORT: u16 = 2468;
+const DEFAULT_LISTEN_PORT: u16 = 9000;
 const DEFAULT_MAX_DATA_DEPTH: u32 = 2;
 const DEFAULT_FUZZY_SIZE_THRESHOLD: f64 = 0.05;
 const DEFAULT_SNATCH_RETRIES: u32 = 2;
@@ -255,6 +255,10 @@ pub struct RawConfig {
     pub port: Option<Option<u16>>,
     /// Daemon host.
     pub host: Option<IpAddr>,
+    /// Service listener port.
+    pub listen_port: Option<Option<u16>>,
+    /// Service listener host.
+    pub listen_host: Option<IpAddr>,
     /// RSS cadence in ms.
     #[serde(deserialize_with = "deserialize_optional_duration")]
     pub rss_cadence: Option<u64>,
@@ -354,6 +358,10 @@ pub struct RuntimeConfig {
     pub port: Option<u16>,
     /// Daemon host.
     pub host: Option<IpAddr>,
+    /// Service listener port. `None` disables HTTP intentionally.
+    pub listen_port: Option<u16>,
+    /// Service listener host.
+    pub listen_host: IpAddr,
     /// RSS cadence in ms.
     pub rss_cadence: Option<u64>,
     /// Search cadence in ms.
@@ -445,8 +453,22 @@ impl RuntimeConfig {
             torrent_clients,
             duplicate_categories: raw.duplicate_categories.unwrap_or(false),
             notification_webhook_urls,
-            port: raw.port.unwrap_or(Some(DEFAULT_PORT)),
-            host: raw.host,
+            listen_port: raw
+                .listen_port
+                .or(raw.port)
+                .unwrap_or(Some(DEFAULT_LISTEN_PORT)),
+            listen_host: raw
+                .listen_host
+                .or(raw.host)
+                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            port: raw
+                .listen_port
+                .or(raw.port)
+                .unwrap_or(Some(DEFAULT_LISTEN_PORT)),
+            host: raw
+                .listen_host
+                .or(raw.host)
+                .or(Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))),
             rss_cadence: raw.rss_cadence,
             search_cadence: raw.search_cadence,
             snatch_timeout: raw.snatch_timeout,
@@ -877,12 +899,12 @@ pub fn apply_env_overrides_from(
             "SPOROS__LOG_FORMAT" => raw.log_format = Some(value),
             "SPOROS__LOG_LEVEL" => raw.log_level = Some(value),
             "SPOROS__LISTEN_HOST" => {
-                raw.host = Some(value.parse().map_err(|error| {
+                raw.listen_host = Some(value.parse().map_err(|error| {
                     config_error(format!("invalid SPOROS__LISTEN_HOST: {error}"))
                 })?);
             }
             "SPOROS__LISTEN_PORT" => {
-                raw.port = Some(Some(value.parse().map_err(|error| {
+                raw.listen_port = Some(Some(value.parse().map_err(|error| {
                     config_error(format!("invalid SPOROS__LISTEN_PORT: {error}"))
                 })?));
             }
@@ -1085,6 +1107,7 @@ mod tests {
     use std::{
         ffi::OsStr,
         fs,
+        net::IpAddr,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1123,6 +1146,37 @@ mod tests {
         assert_eq!(config.state_dir, Path::new("/state"));
         assert_eq!(config.database_path, Path::new("/state/sporos.db"));
         assert_eq!(config.output_dir, Path::new("/state/cross-seeds"));
+    }
+
+    #[test]
+    fn defaults_service_listener_for_container_runtime() {
+        let config =
+            RuntimeConfig::normalize(RawConfig::default(), Path::new("/state")).expect("config");
+
+        assert_eq!(
+            config.listen_host,
+            "0.0.0.0".parse::<IpAddr>().expect("host")
+        );
+        assert_eq!(config.listen_port, Some(9000));
+    }
+
+    #[test]
+    fn maps_legacy_daemon_listener_fields_into_new_contract() {
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                host: Some("127.0.0.1".parse().expect("host")),
+                port: Some(None),
+                ..RawConfig::default()
+            },
+            Path::new("/state"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.listen_host,
+            "127.0.0.1".parse::<IpAddr>().expect("host")
+        );
+        assert_eq!(config.listen_port, None);
     }
 
     #[test]
@@ -1461,8 +1515,8 @@ mod tests {
         .expect("env overrides");
 
         assert_eq!(raw.api_key.as_deref(), Some("env-env-env-env-env-env"));
-        assert_eq!(raw.host, Some("127.0.0.1".parse().expect("ip")));
-        assert_eq!(raw.port, Some(Some(2222)));
+        assert_eq!(raw.listen_host, Some("127.0.0.1".parse().expect("ip")));
+        assert_eq!(raw.listen_port, Some(Some(2222)));
         assert_eq!(raw.log_format.as_deref(), Some("json"));
         assert_eq!(raw.log_level.as_deref(), Some("debug"));
         assert_eq!(raw.rss_cadence, Some(1_800_000));
