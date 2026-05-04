@@ -343,6 +343,14 @@ fn parse_log_level(value: &str) -> Option<Level> {
 
 /// Check configured filesystem paths and create writable output/link paths.
 pub fn check_config_paths(config: &RuntimeConfig) -> crate::Result<()> {
+    ensure_read_write_dir(&config.state_dir, "state_dir")?;
+    if let Some(parent) = config
+        .database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_read_write_dir(parent, "database_path parent")?;
+    }
     if let Some(torrent_dir) = &config.torrent_dir {
         verify_readable_dir(torrent_dir, "torrent_dir")?;
     }
@@ -750,6 +758,8 @@ mod tests {
 
     fn test_config(root: PathBuf) -> RuntimeConfig {
         RuntimeConfig {
+            state_dir: root.clone(),
+            database_path: root.join("sporos.db"),
             delay: 30,
             torznab: Vec::new(),
             use_client_torrents: false,

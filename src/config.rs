@@ -190,6 +190,10 @@ impl ApiIntegrationConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
+    /// Writable runtime state directory.
+    pub state_dir: Option<PathBuf>,
+    /// SQLite database path.
+    pub database_path: Option<PathBuf>,
     /// Delay in seconds.
     pub delay: Option<u64>,
     /// Torznab indexers.
@@ -284,6 +288,10 @@ pub struct RawConfig {
 /// Runtime config after defaults and validation.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    /// Writable runtime state directory.
+    pub state_dir: PathBuf,
+    /// SQLite database path.
+    pub database_path: PathBuf,
     /// Delay in seconds.
     pub delay: u64,
     /// Torznab indexers.
@@ -370,10 +378,16 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     /// Normalize raw options and run documented cross-option checks.
-    pub fn normalize(raw: RawConfig, app_dir: &Path) -> crate::Result<Self> {
+    pub fn normalize(raw: RawConfig, default_state_dir: &Path) -> crate::Result<Self> {
         let link_dirs = raw.link_dirs;
         let notification_webhook_urls = raw.notification_webhook_urls;
         let torrent_clients = raw.torrent_clients;
+        let state_dir = raw
+            .state_dir
+            .unwrap_or_else(|| default_state_dir.to_owned());
+        let database_path = raw
+            .database_path
+            .unwrap_or_else(|| state_dir.join("sporos.db"));
 
         for client in &torrent_clients {
             client.validate()?;
@@ -388,6 +402,8 @@ impl RuntimeConfig {
             arr.validate("radarr")?;
         }
         let config = Self {
+            state_dir: state_dir.clone(),
+            database_path,
             delay: raw.delay.unwrap_or(DEFAULT_DELAY_SECONDS),
             torznab: raw.torznab,
             use_client_torrents: raw.use_client_torrents.unwrap_or(false),
@@ -406,7 +422,7 @@ impl RuntimeConfig {
             torrent_dir: raw.torrent_dir,
             output_dir: raw
                 .output_dir
-                .unwrap_or_else(|| app_dir.join("cross-seeds")),
+                .unwrap_or_else(|| state_dir.join("cross-seeds")),
             inject_dir: raw.inject_dir,
             ignore_titles: raw.ignore_titles,
             include_single_episodes: raw.include_single_episodes.unwrap_or(false),
@@ -1066,6 +1082,35 @@ mod tests {
     }
 
     #[test]
+    fn defaults_runtime_paths_from_state_dir() {
+        let config =
+            RuntimeConfig::normalize(RawConfig::default(), Path::new("/state")).expect("config");
+
+        assert_eq!(config.state_dir, Path::new("/state"));
+        assert_eq!(config.database_path, Path::new("/state/sporos.db"));
+        assert_eq!(config.output_dir, Path::new("/state/cross-seeds"));
+    }
+
+    #[test]
+    fn explicit_state_and_database_paths_do_not_follow_config_file_location() {
+        let raw = RawConfig {
+            state_dir: Some("/writable/state".into()),
+            database_path: Some("/writable/db/custom.sqlite".into()),
+            ..RawConfig::default()
+        };
+
+        let config =
+            RuntimeConfig::normalize(raw, Path::new("/readonly/config-parent")).expect("config");
+
+        assert_eq!(config.state_dir, Path::new("/writable/state"));
+        assert_eq!(
+            config.database_path,
+            Path::new("/writable/db/custom.sqlite")
+        );
+        assert_eq!(config.output_dir, Path::new("/writable/state/cross-seeds"));
+    }
+
+    #[test]
     fn validates_snatch_retries_bound() {
         let config = RuntimeConfig::normalize(
             RawConfig {
@@ -1249,6 +1294,8 @@ mod tests {
             season_from_episodes = 0.75
             snatch_retries = 4
             link_dirs = ["/links"]
+            state_dir = "/state"
+            database_path = "/state/sporos.db"
 
             [[torznab]]
             url = "https://indexer.example/api"
@@ -1275,6 +1322,11 @@ mod tests {
         assert_eq!(raw.exclude_recent_search, Some(86_400_000));
         assert_eq!(raw.season_from_episodes, Some(0.75));
         assert_eq!(raw.snatch_retries, Some(4));
+        assert_eq!(raw.state_dir.as_deref(), Some(Path::new("/state")));
+        assert_eq!(
+            raw.database_path.as_deref(),
+            Some(Path::new("/state/sporos.db"))
+        );
         assert_eq!(
             raw.torrent_clients,
             vec![TorrentClientConfig {

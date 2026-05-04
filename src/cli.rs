@@ -24,7 +24,6 @@ where
         .try_get_matches_from(args)
         .map_err(|error| crate::SporosError::configuration(error.to_string()))?;
     let config_file = crate::config::selected_config_file(config_arg(&matches))?;
-    let app_dir = config_file.app_dir.clone();
 
     match matches.subcommand() {
         Some(("gen-config", _)) => {
@@ -32,8 +31,9 @@ where
             println!("{}", path.display());
         }
         Some(("update-torrent-cache-trackers", matches)) => {
+            let config = load_runtime_config(&config_file)?;
             let result = crate::operations::update_torrent_cache_trackers(
-                &app_dir,
+                &config.state_dir,
                 required_string(matches, "old-announce-url")?,
                 required_string(matches, "new-announce-url")?,
             )?;
@@ -59,12 +59,14 @@ where
             }
         }
         Some(("clear-indexer-failures", _)) => {
-            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
+            let config = load_runtime_config(&config_file)?;
+            let database = AsyncDatabase::open(&config.database_path).await?;
             let updated = crate::operations::clear_indexer_failures_async(&database).await?;
             println!("cleared {updated} indexer failures");
         }
         Some(("clear-cache", _)) => {
-            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
+            let config = load_runtime_config(&config_file)?;
+            let database = AsyncDatabase::open(&config.database_path).await?;
             let result = crate::operations::clear_cache_async(&database).await?;
             println!(
                 "cleared {} decisions and {} timestamps",
@@ -72,7 +74,8 @@ where
             );
         }
         Some(("clear-client-cache", _)) => {
-            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
+            let config = load_runtime_config(&config_file)?;
+            let database = AsyncDatabase::open(&config.database_path).await?;
             let result = crate::operations::clear_client_cache_async(&database).await?;
             println!(
                 "cleared {} torrents, {} client searchees, {} data rows, and {} ensemble rows",
@@ -83,39 +86,40 @@ where
             );
         }
         Some(("api-key", matches)) => {
-            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
-            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
-            crate::config::apply_env_overrides(&mut raw_config)?;
+            let raw_config = load_raw_config(&config_file)?;
+            let config = normalize_config(&config_file, raw_config)?;
+            let database = AsyncDatabase::open(&config.database_path).await?;
             let configured = matches
                 .get_one::<String>("api-key")
                 .map(String::as_str)
-                .or(raw_config.api_key.as_deref());
+                .or(config.api_key.as_deref());
             println!(
                 "{}",
                 crate::operations::api_key_async(&database, configured).await?
             );
         }
         Some(("reset-api-key", _)) => {
-            let database = AsyncDatabase::open_app_dir(&app_dir).await?;
+            let config = load_runtime_config(&config_file)?;
+            let database = AsyncDatabase::open(&config.database_path).await?;
             println!(
                 "{}",
                 crate::operations::reset_api_key_async(&database).await?
             );
         }
         Some(("daemon", matches)) => {
-            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
-            crate::config::apply_env_overrides(&mut raw_config)?;
+            let mut raw_config = load_raw_config(&config_file)?;
             apply_shared_options(matches, &mut raw_config)?;
             apply_daemon_options(matches, &mut raw_config)?;
-            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let config = normalize_config(&config_file, raw_config)?;
+            let state_dir = config.state_dir.clone();
             let _runtime = crate::startup::full_runtime(
-                app_dir.clone(),
+                state_dir.clone(),
                 config.clone(),
                 &crate::startup::RuntimeStartupHooks,
             )?;
-            let database = Database::open_app_dir(&app_dir)?;
+            let database = Database::open(&config.database_path)?;
             let shutdown = crate::daemon::install_shutdown_handler();
-            let run = crate::daemon::run_daemon(&app_dir, &config, &database, shutdown).await?;
+            let run = crate::daemon::run_daemon(&state_dir, &config, &database, shutdown).await?;
             println!(
                 "daemon stopped: serving={}, jobs={}",
                 run.listen_addr
@@ -125,23 +129,23 @@ where
             );
         }
         Some(("search", matches)) => {
-            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
-            crate::config::apply_env_overrides(&mut raw_config)?;
+            let mut raw_config = load_raw_config(&config_file)?;
             apply_shared_options(matches, &mut raw_config)?;
             apply_search_options(matches, &mut raw_config)?;
-            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let config = normalize_config(&config_file, raw_config)?;
+            let state_dir = config.state_dir.clone();
             let _runtime = crate::startup::full_runtime(
-                app_dir.clone(),
+                state_dir.clone(),
                 config.clone(),
                 &crate::startup::RuntimeStartupHooks,
             )?;
-            let database = Database::open_app_dir(&app_dir)?;
+            let database = Database::open(&config.database_path)?;
             let notifier = crate::notifications::NotificationSender::from_config(
                 &config,
                 crate::startup::Redactor::from_config(&config),
             )?;
             let result =
-                crate::operations::run_search_workflow(&database, &app_dir, &config, &notifier)?;
+                crate::operations::run_search_workflow(&database, &state_dir, &config, &notifier)?;
             println!(
                 "searched {} searchees across {} indexers: {} candidates, {} attempts",
                 result.searchees,
@@ -151,69 +155,69 @@ where
             );
         }
         Some(("rss", matches)) => {
-            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
-            crate::config::apply_env_overrides(&mut raw_config)?;
+            let mut raw_config = load_raw_config(&config_file)?;
             apply_shared_options(matches, &mut raw_config)?;
-            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let config = normalize_config(&config_file, raw_config)?;
+            let state_dir = config.state_dir.clone();
             let _runtime = crate::startup::full_runtime(
-                app_dir.clone(),
+                state_dir.clone(),
                 config.clone(),
                 &crate::startup::RuntimeStartupHooks,
             )?;
-            let database = Database::open_app_dir(&app_dir)?;
+            let database = Database::open(&config.database_path)?;
             let notifier = crate::notifications::NotificationSender::from_config(
                 &config,
                 crate::startup::Redactor::from_config(&config),
             )?;
             let result =
-                crate::operations::run_rss_workflow(&database, &app_dir, &config, &notifier)?;
+                crate::operations::run_rss_workflow(&database, &state_dir, &config, &notifier)?;
             println!(
                 "rss matched {} of {} candidates",
                 result.attempts, result.candidates
             );
         }
         Some(("inject", matches)) => {
-            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
-            crate::config::apply_env_overrides(&mut raw_config)?;
+            let mut raw_config = load_raw_config(&config_file)?;
             apply_shared_options(matches, &mut raw_config)?;
             apply_inject_options(matches, &mut raw_config);
-            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let config = normalize_config(&config_file, raw_config)?;
+            let state_dir = config.state_dir.clone();
             let _runtime = crate::startup::full_runtime(
-                app_dir.clone(),
+                state_dir.clone(),
                 config.clone(),
                 &crate::startup::RuntimeStartupHooks,
             )?;
-            let database = Database::open_app_dir(&app_dir)?;
-            let result = crate::operations::run_inject_workflow(&database, &app_dir, &config)?;
+            let database = Database::open(&config.database_path)?;
+            let result = crate::operations::run_inject_workflow(&database, &state_dir, &config)?;
             println!(
                 "injected {} saved torrents, {} already existed, {} incomplete, {} failed",
                 result.injected, result.already_exists, result.incomplete, result.failed
             );
         }
         Some(("restore", matches)) => {
-            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
-            crate::config::apply_env_overrides(&mut raw_config)?;
+            let mut raw_config = load_raw_config(&config_file)?;
             apply_shared_options(matches, &mut raw_config)?;
-            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let config = normalize_config(&config_file, raw_config)?;
+            let state_dir = config.state_dir.clone();
             let _runtime = crate::startup::full_runtime(
-                app_dir.clone(),
+                state_dir.clone(),
                 config.clone(),
                 &crate::startup::RuntimeStartupHooks,
             )?;
-            let database = Database::open_app_dir(&app_dir)?;
-            let result = crate::operations::run_restore_workflow(&database, &app_dir, &config)?;
+            let database = Database::open(&config.database_path)?;
+            let result = crate::operations::run_restore_workflow(&database, &state_dir, &config)?;
             println!(
                 "restored {} of {} cached torrents, failed {}",
                 result.restored, result.scanned, result.failed
             );
         }
         Some(("test-notification", matches)) => {
-            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
-            crate::config::apply_env_overrides(&mut raw_config)?;
+            let mut raw_config = load_raw_config(&config_file)?;
             apply_shared_options(matches, &mut raw_config)?;
-            let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
+            let config = normalize_config(&config_file, raw_config)?;
+            let state_dir = config.state_dir.clone();
             let _runtime = crate::startup::full_runtime(
-                app_dir.clone(),
+                state_dir,
                 config.clone(),
                 &crate::startup::RuntimeStartupHooks,
             )?;
@@ -238,6 +242,28 @@ where
 
 fn config_arg(matches: &ArgMatches) -> Option<&Path> {
     matches.get_one::<String>("config").map(Path::new)
+}
+
+fn load_raw_config(
+    config_file: &crate::config::ConfigFileTarget,
+) -> crate::Result<crate::config::RawConfig> {
+    let mut raw_config = crate::config::load_selected_raw_config(config_file)?;
+    crate::config::apply_env_overrides(&mut raw_config)?;
+    Ok(raw_config)
+}
+
+fn normalize_config(
+    config_file: &crate::config::ConfigFileTarget,
+    raw_config: crate::config::RawConfig,
+) -> crate::Result<crate::config::RuntimeConfig> {
+    crate::config::RuntimeConfig::normalize(raw_config, &config_file.app_dir)
+}
+
+fn load_runtime_config(
+    config_file: &crate::config::ConfigFileTarget,
+) -> crate::Result<crate::config::RuntimeConfig> {
+    let raw_config = load_raw_config(config_file)?;
+    normalize_config(config_file, raw_config)
 }
 
 fn required_string<'a>(matches: &'a ArgMatches, name: &str) -> crate::Result<&'a str> {

@@ -269,12 +269,12 @@ pub fn cleanup_db(
 /// Run daily database and torrent-cache cleanup from async orchestration.
 pub async fn cleanup_db_async(
     blocking: RuntimeBlockingExecutor,
-    app_dir: PathBuf,
+    _app_dir: PathBuf,
     config: RuntimeConfig,
     now_millis: i64,
 ) -> crate::Result<CleanupDbResult> {
     run_blocking_operation(blocking, "cleanup", move || {
-        let database = Database::open_app_dir(&app_dir)?;
+        let database = Database::open(&config.database_path)?;
         let client_timeout = config.search_timeout.map(Duration::from_millis);
         let client_adapters = if config.use_client_torrents {
             build_torrent_clients(&config.torrent_clients, client_timeout)?
@@ -282,7 +282,13 @@ pub async fn cleanup_db_async(
             Vec::new()
         };
         let client_refs = client_refs(&client_adapters);
-        cleanup_db_with_clients(&database, &app_dir, &config, now_millis, &client_refs)
+        cleanup_db_with_clients(
+            &database,
+            &config.state_dir,
+            &config,
+            now_millis,
+            &client_refs,
+        )
     })
     .await
 }
@@ -373,13 +379,13 @@ pub fn run_search_workflow(
 /// Run one bulk search workflow from async orchestration.
 pub async fn run_search_workflow_async(
     blocking: RuntimeBlockingExecutor,
-    app_dir: PathBuf,
+    _app_dir: PathBuf,
     config: RuntimeConfig,
     notifier: NotificationSender,
 ) -> crate::Result<SearchWorkflowResult> {
     run_blocking_operation(blocking, "search workflow", move || {
-        let database = Database::open_app_dir(&app_dir)?;
-        run_search_workflow(&database, &app_dir, &config, &notifier)
+        let database = Database::open(&config.database_path)?;
+        run_search_workflow(&database, &config.state_dir, &config, &notifier)
     })
     .await
 }
@@ -460,13 +466,13 @@ pub fn run_rss_workflow(
 /// Run one RSS reverse-match workflow from async orchestration.
 pub async fn run_rss_workflow_async(
     blocking: RuntimeBlockingExecutor,
-    app_dir: PathBuf,
+    _app_dir: PathBuf,
     config: RuntimeConfig,
     notifier: NotificationSender,
 ) -> crate::Result<RssWorkflowResult> {
     run_blocking_operation(blocking, "rss workflow", move || {
-        let database = Database::open_app_dir(&app_dir)?;
-        run_rss_workflow(&database, &app_dir, &config, &notifier)
+        let database = Database::open(&config.database_path)?;
+        run_rss_workflow(&database, &config.state_dir, &config, &notifier)
     })
     .await
 }
@@ -535,14 +541,14 @@ pub fn run_announce_match(
 /// Reverse-match one announce API candidate from async orchestration.
 pub async fn run_announce_match_async(
     blocking: RuntimeBlockingExecutor,
-    app_dir: PathBuf,
+    _app_dir: PathBuf,
     config: RuntimeConfig,
     candidate: Candidate<'static>,
     notifier: NotificationSender,
 ) -> crate::Result<Option<ApiOutcome>> {
     run_blocking_operation(blocking, "announce workflow", move || {
-        let database = Database::open_app_dir(&app_dir)?;
-        run_announce_match(&database, &app_dir, &config, candidate, &notifier)
+        let database = Database::open(&config.database_path)?;
+        run_announce_match(&database, &config.state_dir, &config, candidate, &notifier)
     })
     .await
 }
@@ -626,14 +632,14 @@ pub fn run_webhook_search(
 /// Run one targeted webhook search from async orchestration.
 pub async fn run_webhook_search_async(
     blocking: RuntimeBlockingExecutor,
-    app_dir: PathBuf,
+    _app_dir: PathBuf,
     config: RuntimeConfig,
     request: WebhookRequest,
     notifier: NotificationSender,
 ) -> crate::Result<PipelineSummary> {
     run_blocking_operation(blocking, "webhook workflow", move || {
-        let database = Database::open_app_dir(&app_dir)?;
-        run_webhook_search(&database, &app_dir, &config, request, &notifier)
+        let database = Database::open(&config.database_path)?;
+        run_webhook_search(&database, &config.state_dir, &config, request, &notifier)
     })
     .await
 }
@@ -679,12 +685,12 @@ pub fn run_inject_workflow(
 /// Run one saved torrent injection workflow from async orchestration.
 pub async fn run_inject_workflow_async(
     blocking: RuntimeBlockingExecutor,
-    app_dir: PathBuf,
+    _app_dir: PathBuf,
     config: RuntimeConfig,
 ) -> crate::Result<SavedInjectionSummary> {
     run_blocking_operation(blocking, "inject workflow", move || {
-        let database = Database::open_app_dir(&app_dir)?;
-        run_inject_workflow(&database, &app_dir, &config)
+        let database = Database::open(&config.database_path)?;
+        run_inject_workflow(&database, &config.state_dir, &config)
     })
     .await
 }
@@ -701,12 +707,12 @@ pub fn run_restore_workflow(
 /// Run one restore workflow from async orchestration.
 pub async fn run_restore_workflow_async(
     blocking: RuntimeBlockingExecutor,
-    app_dir: PathBuf,
+    _app_dir: PathBuf,
     config: RuntimeConfig,
 ) -> crate::Result<RestoreSummary> {
     run_blocking_operation(blocking, "restore workflow", move || {
-        let database = Database::open_app_dir(&app_dir)?;
-        run_restore_workflow(&database, &app_dir, &config)
+        let database = Database::open(&config.database_path)?;
+        run_restore_workflow(&database, &config.state_dir, &config)
     })
     .await
 }
@@ -738,11 +744,11 @@ pub fn run_update_indexer_caps(
 /// Refresh capabilities for configured Torznab indexers from async orchestration.
 pub async fn run_update_indexer_caps_async(
     blocking: RuntimeBlockingExecutor,
-    app_dir: PathBuf,
+    _app_dir: PathBuf,
     config: RuntimeConfig,
 ) -> crate::Result<IndexerCapsRefreshResult> {
     run_blocking_operation(blocking, "indexer caps workflow", move || {
-        let database = Database::open_app_dir(&app_dir)?;
+        let database = Database::open(&config.database_path)?;
         run_update_indexer_caps(&database, &config)
     })
     .await

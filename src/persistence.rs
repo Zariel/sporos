@@ -23,7 +23,7 @@ use crate::{
     domain::{ClientLabel, Decision, File, LookupFields},
 };
 
-const DATABASE_FILE_NAME: &str = "cross-seed.db";
+const DATABASE_FILE_NAME: &str = "sporos.db";
 const SCHEMA_VERSION: i64 = 1;
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;";
 
@@ -52,7 +52,7 @@ pub struct AsyncDatabase {
 }
 
 impl Database {
-    /// Open `<appDir>/cross-seed.db`, enable WAL, and run migrations.
+    /// Open `<state_dir>/sporos.db`, enable WAL, and run migrations.
     pub fn open_app_dir(app_dir: &Path) -> crate::Result<Self> {
         Self::open(app_dir.join(DATABASE_FILE_NAME))
     }
@@ -1395,7 +1395,7 @@ impl Database {
         })
     }
 
-    /// Database path under an app directory.
+    /// Database path under a state directory.
     pub fn path_for_app_dir(app_dir: &Path) -> PathBuf {
         app_dir.join(DATABASE_FILE_NAME)
     }
@@ -1410,7 +1410,7 @@ impl Drop for Database {
 }
 
 impl AsyncDatabase {
-    /// Open `<appDir>/cross-seed.db` through the async sqlx boundary.
+    /// Open `<state_dir>/sporos.db` through the async sqlx boundary.
     pub async fn open_app_dir(app_dir: &Path) -> crate::Result<Self> {
         Self::open(Database::path_for_app_dir(app_dir)).await
     }

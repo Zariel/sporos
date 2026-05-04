@@ -120,7 +120,7 @@ async fn run_plan(
     shutdown: CancellationToken,
     max_iterations: Option<usize>,
 ) -> crate::Result<DaemonRun> {
-    let async_database = AsyncDatabase::open_app_dir(app_dir).await?;
+    let async_database = AsyncDatabase::open(&config.database_path).await?;
     let runtime_services = RuntimeServices::start(shutdown.child_token());
     let metrics = Arc::new(DaemonMetrics::default());
     let mut run = plan
@@ -282,7 +282,7 @@ async fn handle_runtime_request(
         return Ok(response);
     }
 
-    let async_database = AsyncDatabase::open_app_dir(&state.app_dir).await?;
+    let async_database = AsyncDatabase::open(&state.config.database_path).await?;
     let api_key =
         crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await?;
     let needs_scheduler = request.path == "/api/job";
@@ -438,7 +438,7 @@ async fn metrics_response(
     );
 
     observe_job_metrics(&registry, &state).await?;
-    observe_indexer_metrics(&registry, &state.app_dir).await?;
+    observe_indexer_metrics(&registry, &state.config).await?;
 
     let encoder = TextEncoder::new();
     let mut output = Vec::new();
@@ -541,7 +541,7 @@ async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate:
         .register(Box::new(job_last_run.clone()))
         .map_err(metrics_error)?;
 
-    let database = AsyncDatabase::open_app_dir(&state.app_dir).await?;
+    let database = AsyncDatabase::open(&state.config.database_path).await?;
     if let Ok(scheduler) = state.scheduler.try_lock() {
         for job in scheduler.jobs() {
             let name = job.name.as_str();
@@ -566,7 +566,7 @@ async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate:
     Ok(())
 }
 
-async fn observe_indexer_metrics(registry: &Registry, app_dir: &Path) -> crate::Result<()> {
+async fn observe_indexer_metrics(registry: &Registry, config: &RuntimeConfig) -> crate::Result<()> {
     let indexer_active = IntGaugeVec::new(
         Opts::new("sporos_indexer_active", "Whether an indexer row is active."),
         &["indexer"],
@@ -609,7 +609,7 @@ async fn observe_indexer_metrics(registry: &Registry, app_dir: &Path) -> crate::
         .register(Box::new(indexer_retry_after.clone()))
         .map_err(metrics_error)?;
 
-    let database = AsyncDatabase::open_app_dir(app_dir).await?;
+    let database = AsyncDatabase::open(&config.database_path).await?;
     for indexer in database.indexer_health_rows().await? {
         let label = indexer.url.as_str();
         indexer_active
@@ -662,7 +662,7 @@ async fn health_readyz_response(
     let app_dir_ready = tokio::fs::metadata(&state.app_dir)
         .await
         .is_ok_and(|metadata| metadata.is_dir());
-    let database_ready = match AsyncDatabase::open_app_dir(&state.app_dir).await {
+    let database_ready = match AsyncDatabase::open(&state.config.database_path).await {
         Ok(database) => {
             database.close().await;
             true
@@ -1081,7 +1081,7 @@ async fn run_webhook_worker(
     request: WebhookRequest,
     shutdown: CancellationToken,
 ) -> crate::Result<()> {
-    let async_database = AsyncDatabase::open_app_dir(&app_dir).await?;
+    let async_database = AsyncDatabase::open(&config.database_path).await?;
     let mut plan = DaemonPlan::from_config(&config);
     let now = now_millis();
     if plan
