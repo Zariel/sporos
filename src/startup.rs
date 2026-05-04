@@ -258,7 +258,12 @@ pub fn full_runtime(
     config: RuntimeConfig,
     hooks: &impl StartupHooks,
 ) -> crate::Result<RuntimeContext> {
-    initialize_logger(&app_dir, config.verbose)?;
+    initialize_logger_with_config(
+        &app_dir,
+        config.verbose,
+        config.log_format.as_deref(),
+        config.log_level.as_deref(),
+    )?;
     check_config_paths(&config)?;
     hooks.initialize_push_notifier(&config)?;
     hooks.validate_clients(&config)?;
@@ -276,8 +281,17 @@ pub fn full_runtime(
 
 /// Initialize stderr tracing without requiring app-directory log files.
 pub fn initialize_logger(_app_dir: &Path, verbose: bool) -> crate::Result<()> {
-    let level = log_level_from_env(verbose);
-    let format = log_format_from_env();
+    initialize_logger_with_config(_app_dir, verbose, None, None)
+}
+
+fn initialize_logger_with_config(
+    _app_dir: &Path,
+    verbose: bool,
+    configured_format: Option<&str>,
+    configured_level: Option<&str>,
+) -> crate::Result<()> {
+    let level = log_level_from_config_or_env(configured_level, verbose);
+    let format = log_format_from_config_or_env(configured_format);
     let _already_initialized = LOGGER.get_or_init(|| match format {
         LogFormat::Text => {
             let subscriber = tracing_subscriber::fmt()
@@ -307,18 +321,40 @@ enum LogFormat {
     Json,
 }
 
-fn log_format_from_env() -> LogFormat {
-    std::env::var("SPOROS_LOG_FORMAT")
-        .ok()
-        .and_then(|value| parse_log_format(&value))
+fn log_format_from_config_or_env(configured: Option<&str>) -> LogFormat {
+    configured
+        .and_then(parse_log_format)
+        .or_else(|| {
+            std::env::var("SPOROS__LOG_FORMAT")
+                .ok()
+                .and_then(|value| parse_log_format(&value))
+        })
+        .or_else(|| {
+            std::env::var("SPOROS_LOG_FORMAT")
+                .ok()
+                .and_then(|value| parse_log_format(&value))
+        })
         .unwrap_or(LogFormat::Text)
 }
 
-fn log_level_from_env(verbose: bool) -> Level {
-    std::env::var("SPOROS_LOG_LEVEL")
-        .ok()
-        .or_else(|| std::env::var("RUST_LOG").ok())
-        .and_then(|value| parse_log_level(&value))
+fn log_level_from_config_or_env(configured: Option<&str>, verbose: bool) -> Level {
+    configured
+        .and_then(parse_log_level)
+        .or_else(|| {
+            std::env::var("SPOROS__LOG_LEVEL")
+                .ok()
+                .and_then(|value| parse_log_level(&value))
+        })
+        .or_else(|| {
+            std::env::var("SPOROS_LOG_LEVEL")
+                .ok()
+                .and_then(|value| parse_log_level(&value))
+        })
+        .or_else(|| {
+            std::env::var("RUST_LOG")
+                .ok()
+                .and_then(|value| parse_log_level(&value))
+        })
         .unwrap_or(if verbose { Level::TRACE } else { Level::INFO })
 }
 
@@ -795,6 +831,8 @@ mod tests {
             snatch_retries: 2,
             search_timeout: None,
             search_limit: None,
+            log_format: None,
+            log_level: None,
             verbose: false,
             torrents: None,
             block_list: Vec::new(),

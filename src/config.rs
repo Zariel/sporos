@@ -271,6 +271,10 @@ pub struct RawConfig {
     pub search_timeout: Option<u64>,
     /// Search limit.
     pub search_limit: Option<u32>,
+    /// Logging format text.
+    pub log_format: Option<String>,
+    /// Logging level text.
+    pub log_level: Option<String>,
     /// Verbose logs.
     pub verbose: Option<bool>,
     /// Hidden targeted torrent paths.
@@ -362,6 +366,10 @@ pub struct RuntimeConfig {
     pub search_timeout: Option<u64>,
     /// Search limit.
     pub search_limit: Option<u32>,
+    /// Logging format.
+    pub log_format: Option<String>,
+    /// Logging level.
+    pub log_level: Option<String>,
     /// Verbose logs.
     pub verbose: bool,
     /// Hidden targeted torrent paths.
@@ -445,6 +453,8 @@ impl RuntimeConfig {
             snatch_retries: raw.snatch_retries.unwrap_or(DEFAULT_SNATCH_RETRIES),
             search_timeout: raw.search_timeout,
             search_limit: raw.search_limit,
+            log_format: raw.log_format,
+            log_level: raw.log_level,
             verbose: raw.verbose.unwrap_or(false),
             torrents: raw.torrents,
             block_list: raw.block_list,
@@ -463,6 +473,12 @@ impl RuntimeConfig {
         }
         if self.snatch_retries > MAX_SNATCH_RETRIES {
             return Err(config_error("snatch_retries must be <= 10"));
+        }
+        if let Some(log_format) = &self.log_format {
+            validate_log_format(log_format)?;
+        }
+        if let Some(log_level) = &self.log_level {
+            validate_log_level(log_level)?;
         }
         if self.max_data_depth == 0 {
             return Err(config_error("max_data_depth must be at least 1"));
@@ -858,6 +874,8 @@ pub fn apply_env_overrides_from(
         match key.as_str() {
             CONFIG_FILE_ENV => {}
             "SPOROS__API_KEY" => raw.api_key = Some(value),
+            "SPOROS__LOG_FORMAT" => raw.log_format = Some(value),
+            "SPOROS__LOG_LEVEL" => raw.log_level = Some(value),
             "SPOROS__LISTEN_HOST" => {
                 raw.host = Some(value.parse().map_err(|error| {
                     config_error(format!("invalid SPOROS__LISTEN_HOST: {error}"))
@@ -868,6 +886,8 @@ pub fn apply_env_overrides_from(
                     config_error(format!("invalid SPOROS__LISTEN_PORT: {error}"))
                 })?));
             }
+            "SPOROS__RSS_CADENCE" => raw.rss_cadence = Some(parse_duration_millis(&value)?),
+            "SPOROS__SEARCH_CADENCE" => raw.search_cadence = Some(parse_duration_millis(&value)?),
             _ => {}
         }
     }
@@ -1022,6 +1042,20 @@ fn validate_block_list(entries: &[String]) -> crate::Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_log_format(value: &str) -> crate::Result<()> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "text" | "plain" | "pretty" | "json" => Ok(()),
+        _ => Err(config_error(format!("invalid log_format: {value}"))),
+    }
+}
+
+fn validate_log_level(value: &str) -> crate::Result<()> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trace" | "verbose" | "debug" | "info" | "warn" | "warning" | "error" => Ok(()),
+        _ => Err(config_error(format!("invalid log_level: {value}"))),
+    }
 }
 
 fn parse_blocklist_size(entry: &str, value: &str) -> crate::Result<u64> {
@@ -1293,6 +1327,8 @@ mod tests {
             exclude_recent_search = 86400000
             season_from_episodes = 0.75
             snatch_retries = 4
+            log_format = "json"
+            log_level = "debug"
             link_dirs = ["/links"]
             state_dir = "/state"
             database_path = "/state/sporos.db"
@@ -1322,6 +1358,8 @@ mod tests {
         assert_eq!(raw.exclude_recent_search, Some(86_400_000));
         assert_eq!(raw.season_from_episodes, Some(0.75));
         assert_eq!(raw.snatch_retries, Some(4));
+        assert_eq!(raw.log_format.as_deref(), Some("json"));
+        assert_eq!(raw.log_level.as_deref(), Some("debug"));
         assert_eq!(raw.state_dir.as_deref(), Some(Path::new("/state")));
         assert_eq!(
             raw.database_path.as_deref(),
@@ -1409,6 +1447,14 @@ mod tests {
                 ),
                 ("SPOROS__LISTEN_HOST".to_owned(), "127.0.0.1".to_owned()),
                 ("SPOROS__LISTEN_PORT".to_owned(), "2222".to_owned()),
+                ("SPOROS__LOG_FORMAT".to_owned(), "json".to_owned()),
+                ("SPOROS__LOG_LEVEL".to_owned(), "debug".to_owned()),
+                ("SPOROS__RSS_CADENCE".to_owned(), "30 minutes".to_owned()),
+                ("SPOROS__SEARCH_CADENCE".to_owned(), "1 day".to_owned()),
+                (
+                    "SPOROS__TORZNAB".to_owned(),
+                    "https://indexer.example/api?apikey=ignored".to_owned(),
+                ),
             ],
             &mut raw,
         )
@@ -1417,6 +1463,46 @@ mod tests {
         assert_eq!(raw.api_key.as_deref(), Some("env-env-env-env-env-env"));
         assert_eq!(raw.host, Some("127.0.0.1".parse().expect("ip")));
         assert_eq!(raw.port, Some(Some(2222)));
+        assert_eq!(raw.log_format.as_deref(), Some("json"));
+        assert_eq!(raw.log_level.as_deref(), Some("debug"));
+        assert_eq!(raw.rss_cadence, Some(1_800_000));
+        assert_eq!(raw.search_cadence, Some(86_400_000));
+        assert!(raw.torznab.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_scalar_env_overrides() {
+        for (key, value) in [
+            ("SPOROS__LISTEN_HOST", "not an ip"),
+            ("SPOROS__LISTEN_PORT", "not a port"),
+            ("SPOROS__RSS_CADENCE", "not a duration"),
+            ("SPOROS__SEARCH_CADENCE", "not a duration"),
+        ] {
+            let mut raw = RawConfig::default();
+            let error = apply_env_overrides_from([(key.to_owned(), value.to_owned())], &mut raw)
+                .expect_err("invalid env rejected");
+
+            assert!(error.to_string().contains("configuration error"));
+        }
+    }
+
+    #[test]
+    fn validates_configured_logging_scalars() {
+        for raw in [
+            RawConfig {
+                log_format: Some("xml".to_owned()),
+                ..RawConfig::default()
+            },
+            RawConfig {
+                log_level: Some("crate=debug".to_owned()),
+                ..RawConfig::default()
+            },
+        ] {
+            let error = RuntimeConfig::normalize(raw, Path::new("/config"))
+                .expect_err("invalid logging config");
+
+            assert!(error.to_string().contains("log_"));
+        }
     }
 
     #[test]
