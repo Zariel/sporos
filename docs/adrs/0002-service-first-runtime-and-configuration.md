@@ -106,6 +106,8 @@ In scope:
 - making the long-running service the primary runtime mode;
 - defining service startup, shutdown, health, metrics, logging, and config
   behavior around Kubernetes-friendly process semantics;
+- defining the service-wide observability contract for logs, probes, status,
+  metrics, and degraded dependency reporting;
 - replacing implicit app-directory discovery with an explicit config file path
   and explicit runtime paths;
 - introducing prefixed environment variable overrides for appropriate scalar
@@ -120,6 +122,8 @@ Out of scope:
 - supporting every structured config item as environment variables immediately;
 - removing all existing CLI commands in one change;
 - adding multi-replica coordination before the single-writer model is replaced;
+- defining durable announce inbox storage, retry, expiry, dedupe, or API
+  semantics; those belong to ADR 0001;
 - changing conservative matching or torrent-client side effects as part of the
   runtime shape change.
 
@@ -129,8 +133,9 @@ The service should own these runtime responsibilities:
 
 - HTTP API intake for announces, webhooks, job control, health, and metrics;
 - scheduled RSS/search/inject/cleanup work;
-- durable announce work processing;
-- retry and circuit-breaker state for transient dependencies;
+- durable announce work processing as defined by ADR 0001;
+- service-wide reporting for retry and circuit-breaker state used by transient
+  dependencies;
 - torrent-client and filesystem side effects through bounded runtime services;
 - status and degraded-state reporting.
 
@@ -229,6 +234,63 @@ This keeps common deployment choices simple: a user can change the port without
 changing bind address behavior, or bind to a narrower address without changing
 service port.
 
+## Service Observability Gap
+
+ADR 0001 owns the durable announce inbox and asynchronous retry model. ADR 0002
+owns the service-level surfaces that make a long-running process observable,
+including the places where ADR 0001 queue state appears once that queue exists.
+
+The current implementation already has useful primitives:
+
+- stderr logging with text or JSON formatting and configurable level;
+- unauthenticated `/_health/livez` and `/_health/readyz`;
+- `/metrics` using a Prometheus client crate;
+- metrics for total HTTP requests, runtime queue lifecycle counters, queue
+  capacity, scheduler job state, job failures, successful job last-run time, and
+  indexer status;
+- startup validation that logs remote dependency failures and continues;
+- fail-fast validation for configured local filesystem paths.
+
+Those primitives are not yet a complete service observability contract. The ADR
+0002 gap is to make the service debuggable as a service, without moving the
+announce inbox design from ADR 0001 into this ADR.
+
+Required ADR 0002 observability changes:
+
+- standardize logging configuration under the `SPOROS__` environment namespace
+  while keeping logs on stderr/stdout and avoiding runtime log files;
+- add request lifecycle logging with method, route, status, latency, and
+  redacted request context;
+- define stable probe semantics: liveness reports whether the process should be
+  restarted, while readiness reports local service ability to accept and make
+  progress on work;
+- make readiness depend on local prerequisites and runtime state, such as
+  database access, configured filesystem paths, intake state, scheduler state,
+  and worker cancellation state;
+- report remote dependency degradation in readiness detail without making every
+  tracker, indexer, notification, Arr, or torrent-client outage turn into
+  `not_ready`;
+- replace the authenticated `/api/status` `OK` response with structured status
+  JSON covering version, config file path, state and database paths, listener,
+  readiness checks, scheduler jobs, runtime queues, degraded dependencies, and
+  recent service errors;
+- extend metrics with bounded-label HTTP request counts, status codes, latency,
+  service uptime/build information, queue depth and in-flight gauges, job
+  outcomes and durations, dependency failures, retry-after or cooldown state,
+  and local database/filesystem readiness;
+- ensure Prometheus output uses stable metric names, bounded cardinality, and
+  the correct exposition content type;
+- use tracing spans or equivalent stable context for service operations that
+  cross HTTP, scheduler, database, filesystem, indexer, notification, and
+  torrent-client boundaries, without logging secrets.
+
+ADR 0001 queue observability should plug into these same surfaces. ADR 0001
+defines the durable announce fields, retry classification, dedupe, expiry,
+`202 Accepted` API direction, and circuit-breaker scheduling behavior. ADR 0002
+requires that the resulting backlog, oldest age, attempts, outcomes, retry
+delays, and breaker/degraded state are visible through logs, status, and
+metrics once ADR 0001 is implemented.
+
 ## Kubernetes-Native Behavior
 
 The service should be Kubernetes-native by behavior:
@@ -237,8 +299,9 @@ The service should be Kubernetes-native by behavior:
   config, invalid paths, missing writable state directories, and schema errors;
 - startup does not fail just because remote trackers, indexers, notification
   endpoints, Arr instances, or torrent clients are temporarily unavailable;
-- degraded remote dependency state is logged and exposed through readiness,
-  status, and metrics;
+- degraded remote dependency state is logged, exposed through status and
+  metrics, and included in readiness detail without automatically making the
+  service unready;
 - liveness reports whether the process should be restarted;
 - readiness reports whether the service can accept and make useful progress on
   work;
@@ -277,9 +340,14 @@ should be modeled separately.
 6. Align existing workflow commands with the same service runtime boundaries or
    reclassify them as administrative tools.
 7. Remove runtime log-file assumptions and log to stderr/stdout.
-8. Finalize health, metrics, SIGTERM, degraded startup, and durable work queue
-   behavior as part of the service contract.
-9. Decide what compatibility behavior remains before `0.1`.
+8. Finalize service observability: log configuration, probe semantics,
+   diagnostic status JSON, metrics, degraded dependency state, and tracing
+   context.
+9. Align SIGTERM, degraded startup, and local prerequisite failure policy with
+   the service contract.
+10. Integrate ADR 0001 durable announce queue state into the service status,
+    health detail, logs, and metrics when ADR 0001 lands.
+11. Decide what compatibility behavior remains before `0.1`.
 
 ## Consequences
 
