@@ -23,26 +23,40 @@ a daemon. That makes the operational model less clear:
 - Kubernetes users need the binary to behave like a normal service even though
   the project does not intend to ship Kubernetes manifests or a Helm chart.
 
+The core problem is production ownership. Today a user can think of Sporos as a
+set of commands to run, a scheduler to start, and API endpoints to call. That
+pushes orchestration choices to cron jobs, wrapper scripts, webhook callers, and
+deployment manifests. A Kubernetes-first application should instead have one
+clear production process that owns the ongoing cross-seeding lifecycle.
+
 First-party Kubernetes support means the binary works naturally as a container
 workload: it runs in the foreground, receives configuration predictably, writes
 logs to stderr/stdout, responds to standard health probes, exposes metrics, shuts
-down on SIGTERM, and keeps durable state in configured paths. It does not mean
-the repository must own every possible deployment manifest.
+down on SIGTERM, and keeps durable state in configured paths. Those operational
+surfaces support the service model. They are not the main product goal. The main
+goal is that users run Sporos as one long-running application, not as a mixture
+of CLI workflows, cron, and a daemon mode.
 
 The project should therefore move away from "CLI plus daemon plus implicit app
-directory" as the primary mental model and toward "service with optional
-administrative commands".
+directory" as the primary mental model and toward "service as the production
+runtime, with optional administrative commands".
 
 ## Decision
 
 Make Sporos a service-first application. The long-running service command is
-`sporos serve`.
+`sporos serve`, and it is the primary production runtime.
 
-The primary runtime should be a long-running foreground service that owns
-scheduling, announce/webhook/API intake, durable work queues, retry behavior,
-health, metrics, and graceful shutdown. One-off CLI commands should be limited
-to administration, diagnostics, migration, and explicit maintenance tasks. They
-should not be the main way production workflows are orchestrated.
+The service should be the owner of cross-seeding orchestration. It should run in
+the foreground and own scheduling, announce/webhook/API intake, runtime workers,
+local state, graceful shutdown, and the operational surfaces needed to run it.
+ADR 0001 defines the durable announce inbox and asynchronous retry model that
+feeds this service runtime.
+
+One-off CLI commands should be limited to administration, diagnostics,
+migration, validation, and explicit maintenance tasks. They should not be the
+main way production workflows are orchestrated, and users should not need cron
+or wrapper scripts to make normal search, RSS, injection, cleanup, or retry
+behavior happen.
 
 Configuration should be loaded from an explicit config file path and optional
 prefixed environment variable overrides.
@@ -83,6 +97,21 @@ cron separate CLI commands, run separate "search" and "rss" jobs, or rely on an
 external caller to retry transient workflow states that the service can manage
 itself.
 
+The desired production shape is:
+
+- one container process is the normal way to run Sporos;
+- one explicit config file, plus namespaced scalar environment overrides, defines
+  how that process runs;
+- the service owns scheduler ticks, HTTP intake, background workers, local state,
+  and graceful shutdown;
+- external systems submit events or requests, but they do not orchestrate the
+  workflow;
+- local prerequisites controlled by the pod fail fast when invalid;
+- remote dependency outages degrade service capability without causing startup
+  crash loops;
+- administrative commands exist to inspect, repair, migrate, or validate the
+  service, not to replace the service loop.
+
 For Kubernetes, the desired behavior is:
 
 - the process runs in the foreground as PID 1 or behind a minimal init;
@@ -104,10 +133,11 @@ For Kubernetes, the desired behavior is:
 In scope:
 
 - making the long-running service the primary runtime mode;
-- defining service startup, shutdown, health, metrics, logging, and config
-  behavior around Kubernetes-friendly process semantics;
-- defining the service-wide observability contract for logs, probes, status,
-  metrics, and degraded dependency reporting;
+- defining service startup, shutdown, config, state, and runtime ownership
+  around Kubernetes-friendly process semantics;
+- defining the minimum operational surfaces required to run and troubleshoot
+  that service in Kubernetes: logs, probes, status, metrics, and degraded
+  dependency reporting;
 - replacing implicit app-directory discovery with an explicit config file path
   and explicit runtime paths;
 - introducing prefixed environment variable overrides for appropriate scalar
@@ -131,13 +161,21 @@ Out of scope:
 
 The service should own these runtime responsibilities:
 
-- HTTP API intake for announces, webhooks, job control, health, and metrics;
-- scheduled RSS/search/inject/cleanup work;
+- HTTP API intake for announces, webhooks, job control, health, status, and
+  metrics;
+- scheduled RSS, search, inject, cleanup, and maintenance work;
 - durable announce work processing as defined by ADR 0001;
+- coordination of runtime workers, bounded queues, local filesystem work,
+  torrent-client side effects, and database access;
+- lifecycle ownership: startup validation, readiness, graceful shutdown, worker
+  cancellation, database closure, and durable state handoff;
 - service-wide reporting for retry and circuit-breaker state used by transient
   dependencies;
-- torrent-client and filesystem side effects through bounded runtime services;
 - status and degraded-state reporting.
+
+There should be one production orchestrator: the service runtime. Scheduler
+ticks, HTTP intake, and administrative API actions should feed that runtime
+rather than each workflow having an equally valid standalone production path.
 
 One-off commands should be treated as administrative tools. Examples include:
 
@@ -234,10 +272,16 @@ This keeps common deployment choices simple: a user can change the port without
 changing bind address behavior, or bind to a narrower address without changing
 service port.
 
-## Service Observability Gap
+## Operational Visibility
+
+Observability is a supporting requirement for the service-first model. Once
+Sporos owns ongoing work, operators need enough visibility to understand what the
+service is doing and why it is or is not making progress. This ADR does not make
+monitoring the goal; it requires monitoring because a Kubernetes service without
+useful visibility is not operable.
 
 ADR 0001 owns the durable announce inbox and asynchronous retry model. ADR 0002
-owns the service-level surfaces that make a long-running process observable,
+owns the service-level surfaces that make the long-running process observable,
 including the places where ADR 0001 queue state appears once that queue exists.
 
 The current implementation already has useful primitives:
@@ -251,11 +295,11 @@ The current implementation already has useful primitives:
 - startup validation that logs remote dependency failures and continues;
 - fail-fast validation for configured local filesystem paths.
 
-Those primitives are not yet a complete service observability contract. The ADR
-0002 gap is to make the service debuggable as a service, without moving the
-announce inbox design from ADR 0001 into this ADR.
+Those primitives are not yet enough for a service that owns production
+orchestration. The ADR 0002 gap is to make the service debuggable as a service,
+without moving the announce inbox design from ADR 0001 into this ADR.
 
-Required ADR 0002 observability changes:
+Required supporting visibility changes:
 
 - standardize logging configuration under the `SPOROS__` environment namespace
   while keeping logs on stderr/stdout and avoiding runtime log files;
@@ -340,9 +384,9 @@ should be modeled separately.
 6. Align existing workflow commands with the same service runtime boundaries or
    reclassify them as administrative tools.
 7. Remove runtime log-file assumptions and log to stderr/stdout.
-8. Finalize service observability: log configuration, probe semantics,
-   diagnostic status JSON, metrics, degraded dependency state, and tracing
-   context.
+8. Finalize supporting operational visibility: log configuration, probe
+   semantics, diagnostic status JSON, metrics, degraded dependency state, and
+   tracing context.
 9. Align SIGTERM, degraded startup, and local prerequisite failure policy with
    the service contract.
 10. Integrate ADR 0001 durable announce queue state into the service status,
