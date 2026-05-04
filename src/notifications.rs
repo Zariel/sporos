@@ -98,7 +98,7 @@ impl NotificationSender {
 
     /// Validate configured notification webhooks during startup.
     pub fn validate_startup(&self) -> crate::Result<()> {
-        let report = block_on_notification(self.validate_startup_async())?;
+        let report = self.validate_startup_report();
         if report.failed == 0 {
             Ok(())
         } else {
@@ -107,6 +107,19 @@ impl NotificationSender {
                 report.failed, report.attempted
             )))
         }
+    }
+
+    /// Validate configured notification webhooks and return the delivery report.
+    pub fn validate_startup_report(&self) -> NotificationReport {
+        block_on_notification(self.validate_startup_async()).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "failed to run notification startup validation");
+            NotificationReport {
+                attempted: self.urls.len(),
+                succeeded: 0,
+                failed: self.urls.len(),
+                retry_exhausted: 0,
+            }
+        })
     }
 
     /// Send the documented test notification payload asynchronously.

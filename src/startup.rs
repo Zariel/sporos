@@ -23,6 +23,89 @@ pub enum StartupMode {
     Full,
 }
 
+/// External dependency family reported when startup enters degraded mode.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum StartupDependencyKind {
+    /// Notification webhook dependency.
+    Notification,
+    /// Configured torrent client dependency.
+    TorrentClient,
+    /// Configured Torznab indexer dependency.
+    Indexer,
+    /// Configured Sonarr/Radarr dependency.
+    Arr,
+}
+
+impl StartupDependencyKind {
+    /// Stable lowercase label for status and metrics output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Notification => "notification",
+            Self::TorrentClient => "torrent_client",
+            Self::Indexer => "indexer",
+            Self::Arr => "arr",
+        }
+    }
+}
+
+/// One external dependency that failed startup validation but can recover later.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StartupDependencyDegradation {
+    /// Dependency family.
+    pub kind: StartupDependencyKind,
+    /// Safe dependency identifier.
+    pub target: String,
+    /// Redacted reason captured during startup validation.
+    pub reason: String,
+}
+
+/// Startup dependency policy state.
+///
+/// Invalid config, app directories, schema setup, and unsafe local paths still
+/// fail fast. External dependency validation failures are captured here so the
+/// daemon can start degraded and expose `ready == false` until normal runtime
+/// paths observe recovery.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct StartupDependencyState {
+    degraded: Vec<StartupDependencyDegradation>,
+}
+
+impl StartupDependencyState {
+    /// Record one degraded dependency.
+    pub fn push(
+        &mut self,
+        kind: StartupDependencyKind,
+        target: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.degraded.push(StartupDependencyDegradation {
+            kind,
+            target: target.into(),
+            reason: reason.into(),
+        });
+    }
+
+    /// Merge another dependency state into this state.
+    pub fn extend(&mut self, mut other: StartupDependencyState) {
+        self.degraded.append(&mut other.degraded);
+    }
+
+    /// Whether startup saw transient dependency failures.
+    pub fn is_degraded(&self) -> bool {
+        !self.degraded.is_empty()
+    }
+
+    /// Kubernetes readiness policy from startup state alone.
+    pub fn ready(&self) -> bool {
+        !self.is_degraded()
+    }
+
+    /// Recorded degraded dependencies.
+    pub fn degraded_dependencies(&self) -> &[StartupDependencyDegradation] {
+        &self.degraded
+    }
+}
+
 /// Redacts secrets from startup and integration diagnostics.
 #[derive(Debug, Default, Clone)]
 pub struct Redactor {
@@ -74,6 +157,8 @@ pub struct RuntimeContext {
     pub config: Option<RuntimeConfig>,
     /// Secret redactor.
     pub redactor: Redactor,
+    /// External dependency state captured during startup.
+    pub dependency_state: StartupDependencyState,
     cleanup_hooks: Vec<Box<dyn FnOnce() + Send + 'static>>,
 }
 
@@ -94,23 +179,26 @@ impl RuntimeContext {
 /// Hooks supplied by later runtime layers.
 pub trait StartupHooks {
     /// Initialize push notification state.
-    fn initialize_push_notifier(&self, _config: &RuntimeConfig) -> crate::Result<()> {
-        Ok(())
+    fn initialize_push_notifier(
+        &self,
+        _config: &RuntimeConfig,
+    ) -> crate::Result<StartupDependencyState> {
+        Ok(StartupDependencyState::default())
     }
 
     /// Validate configured torrent clients.
-    fn validate_clients(&self, _config: &RuntimeConfig) -> crate::Result<()> {
-        Ok(())
+    fn validate_clients(&self, _config: &RuntimeConfig) -> crate::Result<StartupDependencyState> {
+        Ok(StartupDependencyState::default())
     }
 
     /// Validate configured indexer URLs and state.
-    fn validate_indexers(&self, _config: &RuntimeConfig) -> crate::Result<()> {
-        Ok(())
+    fn validate_indexers(&self, _config: &RuntimeConfig) -> crate::Result<StartupDependencyState> {
+        Ok(StartupDependencyState::default())
     }
 
     /// Validate configured Arr URLs and state.
-    fn validate_arrs(&self, _config: &RuntimeConfig) -> crate::Result<()> {
-        Ok(())
+    fn validate_arrs(&self, _config: &RuntimeConfig) -> crate::Result<StartupDependencyState> {
+        Ok(StartupDependencyState::default())
     }
 }
 
@@ -125,24 +213,68 @@ impl StartupHooks for NoopStartupHooks {}
 pub struct RuntimeStartupHooks;
 
 impl StartupHooks for RuntimeStartupHooks {
-    fn initialize_push_notifier(&self, config: &RuntimeConfig) -> crate::Result<()> {
-        crate::notifications::NotificationSender::from_config_with_timeout(
+    fn initialize_push_notifier(
+        &self,
+        config: &RuntimeConfig,
+    ) -> crate::Result<StartupDependencyState> {
+        let redactor = Redactor::from_config(config);
+        let report = crate::notifications::NotificationSender::from_config_with_timeout(
             config,
-            Redactor::from_config(config),
+            redactor.clone(),
             std::time::Duration::from_secs(10),
         )?
-        .validate_startup()
+        .validate_startup_report();
+        let mut state = StartupDependencyState::default();
+        if report.failed > 0 {
+            state.push(
+                StartupDependencyKind::Notification,
+                "configured_webhooks",
+                redactor.redact(&format!(
+                    "failed to validate {}/{} notification webhooks",
+                    report.failed, report.attempted
+                )),
+            );
+        }
+        Ok(state)
     }
 
-    fn validate_clients(&self, config: &RuntimeConfig) -> crate::Result<()> {
-        crate::clients::validate_configured_torrent_clients(config)
+    fn validate_clients(&self, config: &RuntimeConfig) -> crate::Result<StartupDependencyState> {
+        let redactor = Redactor::from_config(config);
+        let clients = crate::clients::build_torrent_clients_with_torrent_dir(
+            &config.torrent_clients,
+            config.search_timeout.map(std::time::Duration::from_millis),
+            config.torrent_dir.as_deref(),
+        )?;
+        let mut state = StartupDependencyState::default();
+        for client in clients {
+            if let Err(error) = client.validate_config() {
+                state.push(
+                    StartupDependencyKind::TorrentClient,
+                    client.metadata().host.as_ref(),
+                    redactor.redact(&error.to_string()),
+                );
+            }
+        }
+        Ok(state)
     }
 
-    fn validate_indexers(&self, config: &RuntimeConfig) -> crate::Result<()> {
+    fn validate_indexers(&self, config: &RuntimeConfig) -> crate::Result<StartupDependencyState> {
+        let redactor = Redactor::from_config(config);
+        let mut state = StartupDependencyState::default();
         let mut working = 0usize;
         for entry in &config.torznab {
             let indexer = crate::integrations::validate_torznab_config(entry)?;
-            let caps = crate::integrations::fetch_torznab_caps(&indexer)?;
+            let caps = match crate::integrations::fetch_torznab_caps(&indexer) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    state.push(
+                        StartupDependencyKind::Indexer,
+                        indexer.url.clone(),
+                        redactor.redact(&error.to_string()),
+                    );
+                    continue;
+                }
+            };
             if caps.search
                 || caps.tv_search
                 || caps.movie_search
@@ -161,31 +293,45 @@ impl StartupHooks for RuntimeStartupHooks {
         if !config.torznab.is_empty() && working == 0 {
             tracing::warn!("no configured Torznab indexers advertise search support");
         }
-        Ok(())
+        Ok(state)
     }
 
-    fn validate_arrs(&self, config: &RuntimeConfig) -> crate::Result<()> {
+    fn validate_arrs(&self, config: &RuntimeConfig) -> crate::Result<StartupDependencyState> {
+        let redactor = Redactor::from_config(config);
+        let mut state = StartupDependencyState::default();
         for entry in &config.sonarr {
             let arr = crate::integrations::validate_arr_config(
                 entry,
                 crate::integrations::ArrKind::Sonarr,
             )?;
-            crate::integrations::validate_arr_instance(
+            if let Err(error) = crate::integrations::validate_arr_instance(
                 &arr,
                 Some(std::time::Duration::from_secs(10)),
-            )?;
+            ) {
+                state.push(
+                    StartupDependencyKind::Arr,
+                    arr.url.clone(),
+                    redactor.redact(&error.to_string()),
+                );
+            }
         }
         for entry in &config.radarr {
             let arr = crate::integrations::validate_arr_config(
                 entry,
                 crate::integrations::ArrKind::Radarr,
             )?;
-            crate::integrations::validate_arr_instance(
+            if let Err(error) = crate::integrations::validate_arr_instance(
                 &arr,
                 Some(std::time::Duration::from_secs(10)),
-            )?;
+            ) {
+                state.push(
+                    StartupDependencyKind::Arr,
+                    arr.url.clone(),
+                    redactor.redact(&error.to_string()),
+                );
+            }
         }
-        Ok(())
+        Ok(state)
     }
 }
 
@@ -196,6 +342,7 @@ pub fn minimal_runtime(app_dir: PathBuf) -> RuntimeContext {
         mode: StartupMode::Minimal,
         config: None,
         redactor: Redactor::default(),
+        dependency_state: StartupDependencyState::default(),
         cleanup_hooks: Vec::new(),
     }
 }
@@ -208,15 +355,25 @@ pub fn full_runtime(
 ) -> crate::Result<RuntimeContext> {
     initialize_logger(&app_dir, config.verbose)?;
     check_config_paths(&config)?;
-    hooks.initialize_push_notifier(&config)?;
-    hooks.validate_clients(&config)?;
-    hooks.validate_indexers(&config)?;
-    hooks.validate_arrs(&config)?;
+    let mut dependency_state = StartupDependencyState::default();
+    dependency_state.extend(hooks.initialize_push_notifier(&config)?);
+    dependency_state.extend(hooks.validate_clients(&config)?);
+    dependency_state.extend(hooks.validate_indexers(&config)?);
+    dependency_state.extend(hooks.validate_arrs(&config)?);
+    for dependency in dependency_state.degraded_dependencies() {
+        tracing::warn!(
+            dependency = dependency.kind.as_str(),
+            target = dependency.target.as_str(),
+            reason = dependency.reason.as_str(),
+            "startup dependency degraded"
+        );
+    }
 
     Ok(RuntimeContext {
         app_dir,
         mode: StartupMode::Full,
         redactor: Redactor::from_config(&config),
+        dependency_state,
         config: Some(config),
         cleanup_hooks: Vec::new(),
     })
@@ -386,8 +543,8 @@ fn startup_error(message: impl Into<std::borrow::Cow<'static, str>>) -> SporosEr
 #[cfg(test)]
 mod tests {
     use super::{
-        Redactor, RuntimeStartupHooks, StartupHooks, StartupMode, check_config_paths, full_runtime,
-        initialize_logger, minimal_runtime,
+        Redactor, RuntimeStartupHooks, StartupDependencyKind, StartupDependencyState, StartupHooks,
+        StartupMode, check_config_paths, full_runtime, initialize_logger, minimal_runtime,
     };
     use crate::config::{Action, ApiIntegrationConfig, RuntimeConfig};
     use std::{
@@ -464,6 +621,7 @@ mod tests {
         let mut runtime = full_runtime(root.clone(), config, &hooks).expect("runtime");
         assert_eq!(runtime.mode, StartupMode::Full);
         assert_eq!(hooks.count.load(Ordering::SeqCst), 4);
+        assert!(runtime.dependency_state.ready());
 
         let cleanup_count = Arc::new(AtomicUsize::new(0));
         let cleanup_count_clone = Arc::clone(&cleanup_count);
@@ -473,6 +631,40 @@ mod tests {
         runtime.shutdown();
 
         assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_runtime_captures_transient_dependency_degradation() {
+        let root = temp_path("runtime-degraded");
+        let config = test_config(root.clone());
+        let hooks = DegradedHooks;
+
+        let runtime = full_runtime(root.clone(), config, &hooks).expect("runtime");
+
+        assert!(!runtime.dependency_state.ready());
+        assert_eq!(
+            runtime.dependency_state.degraded_dependencies(),
+            &[super::StartupDependencyDegradation {
+                kind: StartupDependencyKind::Indexer,
+                target: "https://indexer.example/api".to_owned(),
+                reason: "connection refused".to_owned(),
+            }]
+        );
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_runtime_still_fails_fast_on_startup_errors() {
+        let root = temp_path("runtime-fail-fast");
+        let config = test_config(root.clone());
+        let hooks = FailingHooks;
+
+        let error = full_runtime(root.clone(), config, &hooks)
+            .err()
+            .expect("startup should fail");
+
+        assert!(error.to_string().contains("invalid local startup state"));
         let _cleanup = fs::remove_dir_all(root);
     }
 
@@ -532,24 +724,63 @@ mod tests {
     }
 
     impl StartupHooks for CountingHooks {
-        fn initialize_push_notifier(&self, _config: &RuntimeConfig) -> crate::Result<()> {
+        fn initialize_push_notifier(
+            &self,
+            _config: &RuntimeConfig,
+        ) -> crate::Result<StartupDependencyState> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(StartupDependencyState::default())
         }
 
-        fn validate_clients(&self, _config: &RuntimeConfig) -> crate::Result<()> {
+        fn validate_clients(
+            &self,
+            _config: &RuntimeConfig,
+        ) -> crate::Result<StartupDependencyState> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(StartupDependencyState::default())
         }
 
-        fn validate_indexers(&self, _config: &RuntimeConfig) -> crate::Result<()> {
+        fn validate_indexers(
+            &self,
+            _config: &RuntimeConfig,
+        ) -> crate::Result<StartupDependencyState> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(StartupDependencyState::default())
         }
 
-        fn validate_arrs(&self, _config: &RuntimeConfig) -> crate::Result<()> {
+        fn validate_arrs(&self, _config: &RuntimeConfig) -> crate::Result<StartupDependencyState> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(StartupDependencyState::default())
+        }
+    }
+
+    struct DegradedHooks;
+
+    impl StartupHooks for DegradedHooks {
+        fn validate_indexers(
+            &self,
+            _config: &RuntimeConfig,
+        ) -> crate::Result<StartupDependencyState> {
+            let mut state = StartupDependencyState::default();
+            state.push(
+                StartupDependencyKind::Indexer,
+                "https://indexer.example/api",
+                "connection refused",
+            );
+            Ok(state)
+        }
+    }
+
+    struct FailingHooks;
+
+    impl StartupHooks for FailingHooks {
+        fn validate_clients(
+            &self,
+            _config: &RuntimeConfig,
+        ) -> crate::Result<StartupDependencyState> {
+            Err(crate::SporosError::Startup {
+                message: "invalid local startup state".into(),
+            })
         }
     }
 
