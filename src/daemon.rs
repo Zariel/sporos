@@ -354,15 +354,67 @@ fn api_response_to_axum(
         net.peer.addr = %remote_addr,
         "http request completed"
     );
-    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
-    let mut response = (status, response.body).into_response();
-    if route == "/metrics" && status == StatusCode::OK {
-        response.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
-        );
+    DaemonHttpResponse::from_api(route, response).into_response()
+}
+
+enum DaemonHttpBody {
+    Empty,
+    Json(String),
+    Metrics(String),
+    Text(String),
+}
+
+struct DaemonHttpResponse {
+    status: StatusCode,
+    body: DaemonHttpBody,
+}
+
+impl DaemonHttpResponse {
+    fn from_api(route: &'static str, response: ApiResponse) -> Self {
+        let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
+        let body = if status == StatusCode::NO_CONTENT || response.body.is_empty() {
+            DaemonHttpBody::Empty
+        } else if route == "/metrics" && status == StatusCode::OK {
+            DaemonHttpBody::Metrics(response.body)
+        } else if route_returns_json(route) && looks_like_json_object(&response.body) {
+            DaemonHttpBody::Json(response.body)
+        } else {
+            DaemonHttpBody::Text(response.body)
+        };
+        Self { status, body }
     }
-    response
+}
+
+impl IntoResponse for DaemonHttpResponse {
+    fn into_response(self) -> Response {
+        match self.body {
+            DaemonHttpBody::Empty => self.status.into_response(),
+            DaemonHttpBody::Json(body) => {
+                let mut response = (self.status, body).into_response();
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                response
+            }
+            DaemonHttpBody::Metrics(body) => {
+                let mut response = (self.status, body).into_response();
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+                );
+                response
+            }
+            DaemonHttpBody::Text(body) => (self.status, body).into_response(),
+        }
+    }
+}
+
+fn route_returns_json(route: &str) -> bool {
+    matches!(route, "/_health/livez" | "/_health/readyz" | "/api/status")
+}
+
+fn looks_like_json_object(body: &str) -> bool {
+    body.trim_start().starts_with('{')
 }
 
 fn http_route(path: &str) -> &'static str {
@@ -2232,6 +2284,7 @@ mod tests {
             .await
             .expect("livez response");
         assert_eq!(livez.status(), reqwest::StatusCode::OK);
+        assert_eq!(content_type(&livez), Some("application/json"));
         assert_eq!(
             livez.text().await.expect("livez body"),
             r#"{"status":"live"}"#
@@ -2243,6 +2296,7 @@ mod tests {
             .await
             .expect("readyz response");
         assert_eq!(readyz.status(), reqwest::StatusCode::OK);
+        assert_eq!(content_type(&readyz), Some("application/json"));
 
         let metrics = client
             .get(format!("{base_url}/metrics"))
@@ -2272,9 +2326,20 @@ mod tests {
             .await
             .expect("status response");
         assert_eq!(status.status(), reqwest::StatusCode::OK);
+        assert_eq!(content_type(&status), Some("application/json"));
         let status_body: serde_json::Value =
             serde_json::from_str(&status.text().await.expect("status body")).expect("status json");
         assert_eq!(status_body["version"], crate::VERSION);
+
+        let webhook = client
+            .post(format!("{base_url}/api/webhook?apikey=secret"))
+            .body("infoHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .send()
+            .await
+            .expect("webhook response");
+        assert_eq!(webhook.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(content_type(&webhook), None);
+        assert!(webhook.bytes().await.expect("webhook body").is_empty());
 
         for path in ["/api/announce", "/api/webhook", "/api/job"] {
             let response = client
@@ -2289,6 +2354,10 @@ mod tests {
                 reqwest::StatusCode::BAD_REQUEST,
                 "{path} should route to API validation"
             );
+            assert!(
+                content_type(&response).is_some_and(|value| value.starts_with("text/plain")),
+                "{path} should return text errors"
+            );
         }
 
         let unsupported_method = client
@@ -2299,6 +2368,9 @@ mod tests {
         assert_eq!(
             unsupported_method.status(),
             reqwest::StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert!(
+            content_type(&unsupported_method).is_some_and(|value| value.starts_with("text/plain"))
         );
         assert_eq!(
             unsupported_method.text().await.expect("method body"),
@@ -2311,6 +2383,7 @@ mod tests {
             .await
             .expect("not found response");
         assert_eq!(not_found.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(content_type(&not_found).is_some_and(|value| value.starts_with("text/plain")));
         assert_eq!(not_found.text().await.expect("not found body"), "Not Found");
 
         shutdown.cancel();
@@ -2722,6 +2795,13 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn content_type(response: &reqwest::Response) -> Option<&str> {
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
     }
 
     fn submit_held(queue: &RuntimeTaskQueue, kind: &'static str) {
