@@ -35,7 +35,8 @@ administrative commands".
 
 ## Decision
 
-Make Sporos a service-first application.
+Make Sporos a service-first application. The long-running service command is
+`sporos serve`.
 
 The primary runtime should be a long-running foreground service that owns
 scheduling, announce/webhook/API intake, durable work queues, retry behavior,
@@ -177,7 +178,7 @@ The config schema should distinguish these concepts:
 - torrent directory;
 - data directories;
 - link directories;
-- HTTP bind address and port;
+- HTTP listener host and port, set separately;
 - logging format and level;
 - metrics and health behavior;
 - scheduler cadences and workflow policy.
@@ -196,8 +197,8 @@ Good candidates include:
 - `SPOROS__CONFIG_FILE`;
 - `SPOROS__LOG_LEVEL`;
 - `SPOROS__LOG_FORMAT`;
-- `SPOROS__HTTP_HOST`;
-- `SPOROS__HTTP_PORT`;
+- `SPOROS__LISTEN_HOST`;
+- `SPOROS__LISTEN_PORT`;
 - `SPOROS__METRICS_ENABLED`;
 - `SPOROS__API_KEY`, subject to secret-handling policy;
 - scheduler cadence overrides where scalar values are clear.
@@ -210,6 +211,23 @@ a deliberate representation before being supported through env vars.
 The environment model should not make secrets easier to leak. Logging and error
 messages must redact configured secret values regardless of whether they came
 from a file or environment.
+
+## HTTP Listener
+
+The service HTTP listener should have separate host and port settings.
+
+The default listen host should be `0.0.0.0`, which is suitable for
+containerized service operation. The default listen port should be `9000`.
+
+Configuration and environment override names should keep host and port separate,
+for example:
+
+- `listen_host`, overridden by `SPOROS__LISTEN_HOST`;
+- `listen_port`, overridden by `SPOROS__LISTEN_PORT`.
+
+This keeps common deployment choices simple: a user can change the port without
+changing bind address behavior, or bind to a narrower address without changing
+service port.
 
 ## Kubernetes-Native Behavior
 
@@ -255,8 +273,7 @@ should be modeled separately.
 3. Add explicit `state_dir` and `database_path` config fields, with
    `database_path` defaulting to `state_dir/sporos.db`.
 4. Introduce `SPOROS__` environment overrides for simple scalar settings.
-5. Add service command naming and make the long-running service the primary
-   documented runtime.
+5. Add `sporos serve` and make it the primary documented runtime.
 6. Align existing workflow commands with the same service runtime boundaries or
    reclassify them as administrative tools.
 7. Remove runtime log-file assumptions and log to stderr/stdout.
@@ -305,7 +322,6 @@ themselves. The runtime contract should be correct first.
 
 ## Open Questions
 
-- What is the exact service command name: `serve`, `daemon`, or default command?
 - Which existing workflow commands remain for `0.1`, and which become service
   API actions only?
 - What defaults should be used when `SPOROS__CONFIG_FILE` is not set?
