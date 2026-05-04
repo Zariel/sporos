@@ -274,28 +274,71 @@ pub fn full_runtime(
     })
 }
 
-/// Initialize console tracing and create log files under `appDir()/logs`.
-pub fn initialize_logger(app_dir: &Path, verbose: bool) -> crate::Result<()> {
-    let logs_dir = app_dir.join("logs");
-    fs::create_dir_all(&logs_dir)
-        .map_err(|error| startup_error(format!("failed to create logs directory: {error}")))?;
-    for file_name in ["error.log", "info.log", "verbose.log"] {
-        let path = logs_dir.join(file_name);
-        if !path.exists() {
-            fs::File::create(&path)
-                .map_err(|error| startup_error(format!("failed to create log file: {error}")))?;
+/// Initialize stderr tracing without requiring app-directory log files.
+pub fn initialize_logger(_app_dir: &Path, verbose: bool) -> crate::Result<()> {
+    let level = log_level_from_env(verbose);
+    let format = log_format_from_env();
+    let _already_initialized = LOGGER.get_or_init(|| match format {
+        LogFormat::Text => {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .finish();
+            let _result = tracing::subscriber::set_global_default(subscriber);
         }
-    }
-
-    let level = if verbose { Level::TRACE } else { Level::INFO };
-    let _already_initialized = LOGGER.get_or_init(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(level)
-            .with_target(false)
-            .finish();
-        let _result = tracing::subscriber::set_global_default(subscriber);
+        LogFormat::Json => {
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_max_level(level)
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_writer(std::io::stderr)
+                .finish();
+            let _result = tracing::subscriber::set_global_default(subscriber);
+        }
     });
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+fn log_format_from_env() -> LogFormat {
+    std::env::var("SPOROS_LOG_FORMAT")
+        .ok()
+        .and_then(|value| parse_log_format(&value))
+        .unwrap_or(LogFormat::Text)
+}
+
+fn log_level_from_env(verbose: bool) -> Level {
+    std::env::var("SPOROS_LOG_LEVEL")
+        .ok()
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .and_then(|value| parse_log_level(&value))
+        .unwrap_or(if verbose { Level::TRACE } else { Level::INFO })
+}
+
+fn parse_log_format(value: &str) -> Option<LogFormat> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "text" | "plain" | "pretty" => Some(LogFormat::Text),
+        "json" => Some(LogFormat::Json),
+        _ => None,
+    }
+}
+
+fn parse_log_level(value: &str) -> Option<Level> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trace" | "verbose" => Some(Level::TRACE),
+        "debug" => Some(Level::DEBUG),
+        "info" => Some(Level::INFO),
+        "warn" | "warning" => Some(Level::WARN),
+        "error" => Some(Level::ERROR),
+        _ => None,
+    }
 }
 
 /// Check configured filesystem paths and create writable output/link paths.
@@ -438,8 +481,8 @@ fn startup_error(message: impl Into<std::borrow::Cow<'static, str>>) -> SporosEr
 #[cfg(test)]
 mod tests {
     use super::{
-        Redactor, RuntimeStartupHooks, StartupHooks, StartupMode, check_config_paths, full_runtime,
-        initialize_logger, minimal_runtime,
+        LogFormat, Redactor, RuntimeStartupHooks, StartupHooks, StartupMode, check_config_paths,
+        full_runtime, initialize_logger, minimal_runtime, parse_log_format, parse_log_level,
     };
     use crate::config::{Action, ApiIntegrationConfig, RuntimeConfig};
     use std::{
@@ -478,16 +521,30 @@ mod tests {
     }
 
     #[test]
-    fn startup_creates_logs_and_configured_output_dirs() {
+    fn startup_uses_stderr_logging_and_configured_output_dirs() {
         let root = temp_path("startup");
         let config = test_config(root.clone());
 
         initialize_logger(&root, false).expect("logger");
         check_config_paths(&config).expect("paths");
 
-        assert!(root.join("logs/error.log").exists());
+        assert!(!root.join("logs").exists());
         assert!(root.join("cross-seeds").exists());
         let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_logging_format_and_level_controls() {
+        assert_eq!(parse_log_format("json"), Some(LogFormat::Json));
+        assert_eq!(parse_log_format("text"), Some(LogFormat::Text));
+        assert_eq!(parse_log_format("bogus"), None);
+        assert_eq!(parse_log_level("trace"), Some(tracing::Level::TRACE));
+        assert_eq!(parse_log_level("verbose"), Some(tracing::Level::TRACE));
+        assert_eq!(parse_log_level("debug"), Some(tracing::Level::DEBUG));
+        assert_eq!(parse_log_level("info"), Some(tracing::Level::INFO));
+        assert_eq!(parse_log_level("warning"), Some(tracing::Level::WARN));
+        assert_eq!(parse_log_level("error"), Some(tracing::Level::ERROR));
+        assert_eq!(parse_log_level("sporos=debug"), None);
     }
 
     #[test]
