@@ -509,38 +509,60 @@ pub fn build_cli() -> Command {
                 .global(true)
                 .help("Read configuration from an explicit TOML file"),
         )
-        .subcommand(Command::new("gen-config"))
+        .subcommand(Command::new("gen-config").about("Write a starter TOML configuration file"))
         .subcommand(
             Command::new("update-torrent-cache-trackers")
+                .about("Repair cached torrent tracker URLs")
                 .arg(Arg::new("old-announce-url").required(true))
                 .arg(Arg::new("new-announce-url").required(true)),
         )
         .subcommand(
             Command::new("diff")
+                .about("Inspect matching differences between two torrents")
                 .arg(Arg::new("searchee").required(true))
                 .arg(Arg::new("candidate").required(true)),
         )
-        .subcommand(Command::new("tree").arg(Arg::new("torrent").required(true)))
-        .subcommand(Command::new("clear-indexer-failures"))
-        .subcommand(Command::new("clear-cache"))
-        .subcommand(Command::new("clear-client-cache"))
-        .subcommand(Command::new("api-key").arg(Arg::new("api-key").long("api-key").num_args(1)))
-        .subcommand(Command::new("reset-api-key"))
+        .subcommand(
+            Command::new("tree")
+                .about("Print a torrent file tree")
+                .arg(Arg::new("torrent").required(true)),
+        )
+        .subcommand(Command::new("clear-indexer-failures").about("Clear indexer degradation state"))
+        .subcommand(Command::new("clear-cache").about("Clear cached decisions and timestamps"))
+        .subcommand(Command::new("clear-client-cache").about("Clear cached client inventory state"))
+        .subcommand(
+            Command::new("api-key")
+                .about("Print or persist the service API key")
+                .arg(Arg::new("api-key").long("api-key").num_args(1)),
+        )
+        .subcommand(Command::new("reset-api-key").about("Generate and store a new service API key"))
         .subcommand(add_daemon_options(add_shared_options(
             Command::new("serve").about("Run the single-writer service runtime"),
         )))
-        .subcommand(add_daemon_options(add_shared_options(Command::new(
-            "daemon",
-        ))))
-        .subcommand(add_shared_options(Command::new("rss")))
-        .subcommand(add_search_options(add_shared_options(Command::new(
-            "search",
-        ))))
-        .subcommand(add_inject_options(add_shared_options(Command::new(
-            "inject",
-        ))))
-        .subcommand(add_shared_options(Command::new("restore")))
-        .subcommand(add_shared_options(Command::new("test-notification")))
+        .subcommand(add_daemon_options(add_shared_options(
+            Command::new("daemon")
+                .about("Deprecated compatibility alias for serve")
+                .hide(true),
+        )))
+        .subcommand(
+            add_shared_options(Command::new("rss"))
+                .about("Run one administrative RSS processing pass"),
+        )
+        .subcommand(add_search_options(add_shared_options(
+            Command::new("search").about("Run one administrative search pass"),
+        )))
+        .subcommand(
+            add_inject_options(add_shared_options(Command::new("inject")))
+                .about("Run one administrative saved-torrent injection pass"),
+        )
+        .subcommand(
+            add_shared_options(Command::new("restore"))
+                .about("Run one administrative torrent-cache restore pass"),
+        )
+        .subcommand(
+            add_shared_options(Command::new("test-notification"))
+                .about("Send an administrative notification test"),
+        )
 }
 
 fn add_daemon_options(command: Command) -> Command {
@@ -766,6 +788,60 @@ mod tests {
             "test-notification",
         ] {
             assert!(names.contains(&expected));
+        }
+    }
+
+    #[test]
+    fn reclassifies_workflow_commands_as_administrative() {
+        let cli = build_cli();
+
+        for (name, expected_about) in [
+            ("serve", "Run the single-writer service runtime"),
+            ("rss", "Run one administrative RSS processing pass"),
+            ("search", "Run one administrative search pass"),
+            (
+                "inject",
+                "Run one administrative saved-torrent injection pass",
+            ),
+            (
+                "restore",
+                "Run one administrative torrent-cache restore pass",
+            ),
+        ] {
+            let command = cli
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("missing {name} command"));
+
+            assert_eq!(
+                command.get_about().map(ToString::to_string).as_deref(),
+                Some(expected_about)
+            );
+            assert!(!command.is_hide_set());
+        }
+    }
+
+    #[test]
+    fn daemon_is_hidden_compatibility_alias() {
+        let cli = build_cli();
+        let command = cli.find_subcommand("daemon").expect("daemon command");
+
+        assert_eq!(
+            command.get_about().map(ToString::to_string).as_deref(),
+            Some("Deprecated compatibility alias for serve")
+        );
+        assert!(command.is_hide_set());
+    }
+
+    #[test]
+    fn all_commands_have_explicit_roles() {
+        let cli = build_cli();
+
+        for command in cli.get_subcommands() {
+            assert!(
+                command.get_about().is_some(),
+                "{} should describe its operational role",
+                command.get_name()
+            );
         }
     }
 
