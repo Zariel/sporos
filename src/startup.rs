@@ -852,6 +852,7 @@ mod tests {
 
     fn test_config(root: PathBuf) -> RuntimeConfig {
         RuntimeConfig {
+            config_path: root.join("config.toml"),
             state_dir: root.clone(),
             database_path: root.join("sporos.db"),
             delay: 30,

@@ -30,13 +30,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     SporosError,
     api::{
-        AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, JobRequest, JobResponse,
-        WebhookRequest, handle_api_request,
+        AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, ApiResponse, JobRequest,
+        JobResponse, WebhookRequest, handle_api_request,
     },
     config::RuntimeConfig,
     persistence::{AsyncDatabase, Database},
     runtime::{RuntimeBlockingExecutor, RuntimeServices, RuntimeTaskQueue},
-    scheduler::{DaemonPlan, DaemonRun, JobConfigOverride, JobName, Scheduler},
+    scheduler::{DaemonPlan, DaemonRun, JobConfigOverride, JobName, ScheduledJob, Scheduler},
 };
 
 const JOB_LOOP_INTERVAL: Duration = Duration::from_secs(60);
@@ -320,6 +320,16 @@ async fn handle_runtime_request(
     let api_key =
         crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await?;
     let needs_scheduler = request.path == "/api/job";
+    let scheduler_snapshot = if request.path == "/api/status" {
+        state
+            .scheduler
+            .try_lock()
+            .ok()
+            .map(|scheduler| scheduler.jobs().to_vec())
+    } else {
+        None
+    };
+    let scheduler_available = request.path != "/api/status" || scheduler_snapshot.is_some();
     let mut scheduler = if needs_scheduler {
         Some(state.scheduler.lock().await)
     } else {
@@ -329,8 +339,11 @@ async fn handle_runtime_request(
         app_dir: &state.app_dir,
         config: &state.config,
         services: Arc::clone(&state.services),
+        metrics: Arc::clone(&state.metrics),
         async_database: &async_database,
         scheduler: scheduler.as_deref_mut(),
+        scheduler_snapshot,
+        scheduler_available,
         now_millis: now_millis(),
         webhook_requests: Vec::new(),
         job_dispatches: Vec::new(),
@@ -522,6 +535,36 @@ fn observe_blocking_metrics(
             .with_label_values(&[executor.name(), event])
             .inc_by(usize_to_u64(value));
     }
+}
+
+fn queue_status(queue: &RuntimeTaskQueue) -> serde_json::Value {
+    let stats = queue.stats();
+    serde_json::json!({
+        "name": queue.name(),
+        "capacity": queue.capacity(),
+        "depth": stats.enqueued.saturating_sub(stats.started),
+        "running": stats.started.saturating_sub(stats.finished.saturating_add(stats.cancelled)),
+        "accepted": stats.enqueued,
+        "rejected": stats.rejected,
+        "started": stats.started,
+        "finished": stats.finished,
+        "cancelled": stats.cancelled,
+    })
+}
+
+fn blocking_status(executor: &RuntimeBlockingExecutor) -> serde_json::Value {
+    let stats = executor.stats();
+    serde_json::json!({
+        "name": executor.name(),
+        "capacity": executor.capacity(),
+        "depth": stats.enqueued.saturating_sub(stats.started),
+        "running": stats.started.saturating_sub(stats.finished.saturating_add(stats.cancelled)),
+        "accepted": stats.enqueued,
+        "rejected": stats.rejected,
+        "started": stats.started,
+        "finished": stats.finished,
+        "cancelled": stats.cancelled,
+    })
 }
 
 async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate::Result<()> {
@@ -974,6 +1017,10 @@ fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 #[derive(Debug, Default)]
 struct DaemonMetrics {
     http_requests: AtomicUsize,
@@ -1017,8 +1064,11 @@ struct RuntimeHandlers<'a> {
     app_dir: &'a Path,
     config: &'a RuntimeConfig,
     services: Arc<RuntimeServices>,
+    metrics: Arc<DaemonMetrics>,
     async_database: &'a AsyncDatabase,
     scheduler: Option<&'a mut Scheduler>,
+    scheduler_snapshot: Option<Vec<ScheduledJob>>,
+    scheduler_available: bool,
     now_millis: i64,
     webhook_requests: Vec<WebhookRequest>,
     job_dispatches: Vec<crate::scheduler::JobCheckResult>,
@@ -1052,6 +1102,109 @@ fn submit_webhook_workers(
 
 #[async_trait]
 impl ApiHandlers for RuntimeHandlers<'_> {
+    async fn status(&mut self) -> crate::Result<ApiResponse> {
+        let state_dir_ready = tokio::fs::metadata(&self.config.state_dir)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir());
+        let database_ready = tokio::fs::metadata(&self.config.database_path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file());
+        let runtime_ready = !self.services.cancellation_token().is_cancelled();
+        let mut jobs = Vec::new();
+        let mut recent_service_errors = Vec::new();
+        if let Some(scheduler) = &self.scheduler_snapshot {
+            for job in scheduler {
+                let name = job.name.as_str();
+                let last_success = self.async_database.read_last_run(name).await?;
+                let failure_count = self.metrics.job_failures(job.name);
+                if failure_count > 0 {
+                    recent_service_errors.push(serde_json::json!({
+                        "kind": "job",
+                        "job": name,
+                        "count": failure_count,
+                    }));
+                }
+                jobs.push(serde_json::json!({
+                    "name": name,
+                    "enabled": job.enabled,
+                    "running": job.is_active,
+                    "cadenceMillis": job.cadence_millis,
+                    "lastSuccess": last_success,
+                    "lastFailure": null,
+                    "failureCount": failure_count,
+                    "nextDue": last_success.map(|last_run| last_run.saturating_add(job.cadence_millis as i64)),
+                }));
+            }
+        }
+        let indexers = self.async_database.indexer_health_rows().await?;
+        let degraded_dependencies = indexers
+            .iter()
+            .filter(|indexer| {
+                !indexer.active
+                    || indexer
+                        .status
+                        .as_deref()
+                        .is_some_and(|status| status != "OK")
+            })
+            .map(|indexer| {
+                serde_json::json!({
+                    "kind": "indexer",
+                    "target": indexer.url,
+                    "active": indexer.active,
+                    "status": indexer.status,
+                    "retryAfter": indexer.retry_after,
+                })
+            })
+            .collect::<Vec<_>>();
+        let ready = state_dir_ready && database_ready && runtime_ready;
+        let body = serde_json::json!({
+            "version": crate::VERSION,
+            "config": {
+                "path": display_path(&self.config.config_path),
+            },
+            "listener": {
+                "enabled": self.config.listen_port.is_some(),
+                "host": self.config.listen_host.to_string(),
+                "port": self.config.listen_port,
+            },
+            "state": {
+                "stateDir": display_path(&self.config.state_dir),
+                "databasePath": display_path(&self.config.database_path),
+                "stateDirReady": state_dir_ready,
+                "databaseReady": database_ready,
+            },
+            "readiness": {
+                "status": if ready { "ready" } else { "not_ready" },
+                "checks": {
+                    "stateDir": state_dir_ready,
+                    "database": database_ready,
+                    "runtime": runtime_ready,
+                },
+            },
+            "scheduler": {
+                "available": self.scheduler_available,
+                "jobs": jobs,
+            },
+            "runtime": {
+                "queues": {
+                    "jobs": queue_status(&self.services.queues().jobs),
+                    "webhooks": queue_status(&self.services.queues().webhooks),
+                    "reverseLookup": queue_status(&self.services.queues().reverse_lookup),
+                    "injection": queue_status(&self.services.queues().injection),
+                    "blockingLocal": queue_status(&self.services.queues().blocking_local),
+                    "blockingFilesystem": blocking_status(&self.services.blocking().filesystem),
+                    "blockingTorrentIo": blocking_status(&self.services.blocking().torrent_io),
+                    "blockingLinking": blocking_status(&self.services.blocking().linking),
+                    "blockingMatching": blocking_status(&self.services.blocking().matching),
+                },
+            },
+            "degradedDependencies": degraded_dependencies,
+            "recentServiceErrors": recent_service_errors,
+        })
+        .to_string();
+        Ok(ApiResponse { status: 200, body })
+    }
+
     async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>> {
         tracing::info!(
             tracker = request.tracker.as_str(),
@@ -1298,8 +1451,11 @@ mod tests {
             app_dir: &root,
             config: &config,
             services: RuntimeServices::start(CancellationToken::new()),
+            metrics: Arc::new(super::DaemonMetrics::default()),
             async_database: &async_database,
             scheduler: Some(&mut plan.scheduler),
+            scheduler_snapshot: None,
+            scheduler_available: true,
             now_millis: 1_000,
             webhook_requests: Vec::new(),
             job_dispatches: Vec::new(),
@@ -1364,8 +1520,11 @@ mod tests {
             app_dir: &root,
             config: &config,
             services,
+            metrics: Arc::new(super::DaemonMetrics::default()),
             async_database: &async_database,
             scheduler: Some(&mut plan.scheduler),
+            scheduler_snapshot: None,
+            scheduler_available: true,
             now_millis: 1_000,
             webhook_requests: Vec::new(),
             job_dispatches: Vec::new(),
@@ -1655,6 +1814,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_reports_runtime_diagnostics() {
+        let root = temp_path("daemon-status-diagnostics");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        database
+            .sync_indexers([("https://indexer.example/api", "indexer-secret")])
+            .expect("indexer sync");
+        let indexer_id = database
+            .indexer_id("https://indexer.example/api")
+            .expect("indexer id");
+        database
+            .set_indexer_status(indexer_id, Some("RATE_LIMITED"), Some(2_000))
+            .expect("indexer status");
+        let async_database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+        async_database
+            .write_last_run(JobName::Search.as_str(), 1_000)
+            .await
+            .expect("last run");
+        async_database.close().await;
+
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let mut search = ScheduledJob::new(JobName::Search, 60_000, true);
+        search.is_active = true;
+        let services = RuntimeServices::start(CancellationToken::new());
+        services
+            .queues()
+            .jobs
+            .try_submit("observed", |_shutdown| async {})
+            .expect("submit observed job");
+        wait_for_finished(&services.queues().jobs).await;
+        let metrics = Arc::new(super::DaemonMetrics::default());
+        metrics.record_job_failure(JobName::Search);
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services,
+            scheduler: Mutex::new(Scheduler::new(vec![search])),
+            metrics,
+        });
+
+        let response = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(
+                ApiMethod::Get,
+                "/api/status?apikey=secret",
+                BTreeMap::new(),
+                "",
+            ),
+        )
+        .await
+        .expect("status");
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body).expect("status json");
+        assert_eq!(body["version"], crate::VERSION);
+        assert_eq!(
+            body["config"]["path"].as_str(),
+            Some(root.join("config.toml").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            body["state"]["databasePath"].as_str(),
+            Some(root.join("sporos.db").to_string_lossy().as_ref())
+        );
+        assert_eq!(body["readiness"]["status"], "ready");
+        assert_eq!(body["scheduler"]["available"], true);
+        assert_eq!(body["scheduler"]["jobs"][0]["name"], "search");
+        assert_eq!(body["scheduler"]["jobs"][0]["running"], true);
+        assert_eq!(body["scheduler"]["jobs"][0]["lastSuccess"], 1_000);
+        assert_eq!(body["scheduler"]["jobs"][0]["failureCount"], 1);
+        assert_eq!(body["runtime"]["queues"]["jobs"]["accepted"], 1);
+        assert_eq!(body["degradedDependencies"][0]["status"], "RATE_LIMITED");
+        assert_eq!(body["recentServiceErrors"][0]["job"], "search");
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn status_request_does_not_wait_for_scheduler_lock() {
         let root = temp_path("daemon-status-no-scheduler-lock");
         std::fs::create_dir_all(&root).expect("root");
@@ -1688,6 +1925,8 @@ mod tests {
         .expect("status");
 
         assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body).expect("status json");
+        assert_eq!(body["scheduler"]["available"], false);
         drop(guard);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);

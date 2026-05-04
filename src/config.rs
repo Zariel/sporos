@@ -296,6 +296,8 @@ pub struct RawConfig {
 /// Runtime config after defaults and validation.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    /// Selected config file path.
+    pub config_path: PathBuf,
     /// Writable runtime state directory.
     pub state_dir: PathBuf,
     /// SQLite database path.
@@ -418,6 +420,7 @@ impl RuntimeConfig {
             arr.validate("radarr")?;
         }
         let config = Self {
+            config_path: state_dir.join(CONFIG_FILE_NAME),
             state_dir: state_dir.clone(),
             database_path,
             delay: raw.delay.unwrap_or(DEFAULT_DELAY_SECONDS),

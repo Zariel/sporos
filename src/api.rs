@@ -241,6 +241,10 @@ pub enum JobResponse {
 /// Handler callbacks supplied by the daemon runtime.
 #[async_trait]
 pub trait ApiHandlers {
+    /// Return authenticated service diagnostics.
+    async fn status(&mut self) -> crate::Result<ApiResponse> {
+        Ok(ApiResponse::new(200, "OK"))
+    }
     /// Reverse-match an announce candidate.
     async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>>;
     /// Start webhook work after the immediate 204 response is selected.
@@ -259,7 +263,7 @@ pub struct ApiOutcome {
 }
 
 /// Route one API request.
-pub async fn handle_api_request<H: ApiHandlers>(
+pub async fn handle_api_request<H: ApiHandlers + Send>(
     request: ApiRequest,
     api_key: &str,
     handlers: &mut H,
@@ -281,7 +285,7 @@ pub async fn handle_api_request<H: ApiHandlers>(
             if let Some(response) = method_guard(request.method, ApiMethod::Get) {
                 return Ok(response);
             }
-            Ok(ApiResponse::new(200, "OK"))
+            handlers.status().await
         }
         "/api/announce" => {
             if let Some(response) = method_guard(request.method, ApiMethod::Post) {
