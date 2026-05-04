@@ -20,14 +20,15 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let app_dir = crate::config::app_dir()?;
     let matches = build_cli()
         .try_get_matches_from(args)
         .map_err(|error| crate::SporosError::configuration(error.to_string()))?;
+    let config_file = crate::config::selected_config_file(config_arg(&matches))?;
+    let app_dir = config_file.app_dir.clone();
 
     match matches.subcommand() {
         Some(("gen-config", _)) => {
-            let path = crate::config::generate_config(&app_dir)?;
+            let path = crate::config::generate_config_file(&config_file.path)?;
             println!("{}", path.display());
         }
         Some(("update-torrent-cache-trackers", matches)) => {
@@ -83,7 +84,8 @@ where
         }
         Some(("api-key", matches)) => {
             let database = AsyncDatabase::open_app_dir(&app_dir).await?;
-            let raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
+            crate::config::apply_env_overrides(&mut raw_config)?;
             let configured = matches
                 .get_one::<String>("api-key")
                 .map(String::as_str)
@@ -101,7 +103,8 @@ where
             );
         }
         Some(("daemon", matches)) => {
-            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
+            crate::config::apply_env_overrides(&mut raw_config)?;
             apply_shared_options(matches, &mut raw_config)?;
             apply_daemon_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
@@ -122,7 +125,8 @@ where
             );
         }
         Some(("search", matches)) => {
-            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
+            crate::config::apply_env_overrides(&mut raw_config)?;
             apply_shared_options(matches, &mut raw_config)?;
             apply_search_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
@@ -147,7 +151,8 @@ where
             );
         }
         Some(("rss", matches)) => {
-            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
+            crate::config::apply_env_overrides(&mut raw_config)?;
             apply_shared_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
             let _runtime = crate::startup::full_runtime(
@@ -168,7 +173,8 @@ where
             );
         }
         Some(("inject", matches)) => {
-            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
+            crate::config::apply_env_overrides(&mut raw_config)?;
             apply_shared_options(matches, &mut raw_config)?;
             apply_inject_options(matches, &mut raw_config);
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
@@ -185,7 +191,8 @@ where
             );
         }
         Some(("restore", matches)) => {
-            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
+            crate::config::apply_env_overrides(&mut raw_config)?;
             apply_shared_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
             let _runtime = crate::startup::full_runtime(
@@ -201,7 +208,8 @@ where
             );
         }
         Some(("test-notification", matches)) => {
-            let mut raw_config = crate::config::load_file_raw_config(&app_dir)?;
+            let mut raw_config = crate::config::load_selected_raw_config(&config_file)?;
+            crate::config::apply_env_overrides(&mut raw_config)?;
             apply_shared_options(matches, &mut raw_config)?;
             let config = crate::config::RuntimeConfig::normalize(raw_config, &app_dir)?;
             let _runtime = crate::startup::full_runtime(
@@ -226,6 +234,10 @@ where
     }
 
     Ok(())
+}
+
+fn config_arg(matches: &ArgMatches) -> Option<&Path> {
+    matches.get_one::<String>("config").map(Path::new)
 }
 
 fn required_string<'a>(matches: &'a ArgMatches, name: &str) -> crate::Result<&'a str> {
@@ -461,6 +473,13 @@ pub fn build_cli() -> Command {
         .about("Torrent cross-seeding automation")
         .subcommand_required(false)
         .arg_required_else_help(false)
+        .arg(
+            Arg::new("config")
+                .long("config")
+                .num_args(1)
+                .global(true)
+                .help("Read configuration from an explicit TOML file"),
+        )
         .subcommand(Command::new("gen-config"))
         .subcommand(
             Command::new("update-torrent-cache-trackers")
@@ -681,7 +700,10 @@ fn repeating(name: &'static str, long: &'static str) -> Arg {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_inject_options, apply_search_options, apply_shared_options, build_cli};
+    use super::{
+        apply_daemon_options, apply_inject_options, apply_search_options, apply_shared_options,
+        build_cli,
+    };
     use crate::config::{ApiIntegrationConfig, RawConfig, TorrentClientConfig};
     use std::path::Path;
 
@@ -753,6 +775,8 @@ mod tests {
         build_cli()
             .try_get_matches_from([
                 "cross-seed",
+                "--config",
+                "/etc/sporos/config.toml",
                 "daemon",
                 "--port",
                 "2468",
@@ -769,6 +793,8 @@ mod tests {
             .try_get_matches_from([
                 "cross-seed",
                 "inject",
+                "--config",
+                "/etc/sporos/config.toml",
                 "--inject-dir",
                 "/output",
                 "--ignore-titles",
@@ -933,5 +959,41 @@ mod tests {
 
         assert_eq!(raw.inject_dir.as_deref(), Some(Path::new("/saved")));
         assert_eq!(raw.ignore_titles, Some(true));
+    }
+
+    #[test]
+    fn applies_command_flags_after_env_overrides() {
+        let matches = build_cli()
+            .try_get_matches_from([
+                "cross-seed",
+                "daemon",
+                "--port",
+                "3333",
+                "--api-key",
+                "cli-cli-cli-cli-cli-cli",
+            ])
+            .expect("matches");
+        let (_, matches) = matches.subcommand().expect("subcommand");
+        let mut raw = RawConfig {
+            port: Some(Some(1111)),
+            api_key: Some("file-file-file-file-file".to_owned()),
+            ..RawConfig::default()
+        };
+
+        crate::config::apply_env_overrides_from(
+            [
+                ("SPOROS__LISTEN_PORT".to_owned(), "2222".to_owned()),
+                (
+                    "SPOROS__API_KEY".to_owned(),
+                    "env-env-env-env-env-env".to_owned(),
+                ),
+            ],
+            &mut raw,
+        )
+        .expect("env");
+        apply_daemon_options(matches, &mut raw).expect("daemon");
+
+        assert_eq!(raw.port, Some(Some(3333)));
+        assert_eq!(raw.api_key.as_deref(), Some("cli-cli-cli-cli-cli-cli"));
     }
 }

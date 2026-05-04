@@ -4,6 +4,7 @@ use std::{
     borrow::Cow,
     collections::BTreeSet,
     env,
+    ffi::OsStr,
     fs::{self, OpenOptions},
     io::Write,
     net::IpAddr,
@@ -19,6 +20,7 @@ pub use crate::{Result, domain};
 
 const APP_DIR_NAME: &str = "cross-seed";
 const CONFIG_FILE_NAME: &str = "config.toml";
+const CONFIG_FILE_ENV: &str = "SPOROS__CONFIG_FILE";
 const DEFAULT_DELAY_SECONDS: u64 = 30;
 const DEFAULT_PORT: u16 = 2468;
 const DEFAULT_MAX_DATA_DEPTH: u32 = 2;
@@ -605,8 +607,12 @@ impl RuntimeConfig {
 
 /// Parse raw `config.toml` source into typed raw options.
 pub fn raw_config_from_source(source: &str) -> crate::Result<RawConfig> {
+    raw_config_from_named_source(Path::new(CONFIG_FILE_NAME), source)
+}
+
+fn raw_config_from_named_source(path: &Path, source: &str) -> crate::Result<RawConfig> {
     toml::from_str(source)
-        .map_err(|error| config_error(format!("failed to parse config.toml: {error}")))
+        .map_err(|error| config_error(format!("failed to parse {}: {error}", path.display())))
 }
 
 /// Minimal representation of discovered `config.toml`.
@@ -618,8 +624,20 @@ pub struct FileConfig {
     pub source: Option<String>,
 }
 
-/// Resolve and create the cross-seed app directory.
+/// Selected config file path plus the compatibility app directory used for state.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ConfigFileTarget {
+    /// Compatibility app directory for database, cache, and default output paths.
+    pub app_dir: PathBuf,
+    /// Exact config file path to read or generate.
+    pub path: PathBuf,
+    /// Whether the path came from `--config` or `SPOROS__CONFIG_FILE`.
+    pub explicit: bool,
+}
+
+/// Resolve and create the compatibility app directory.
 pub fn app_dir() -> crate::Result<PathBuf> {
+    // CONFIG_DIR is retained as compatibility input and container state location.
     let dir = if let Some(config_dir) = env::var_os("CONFIG_DIR") {
         PathBuf::from(config_dir)
     } else if cfg!(windows) {
@@ -640,52 +658,138 @@ pub fn app_dir() -> crate::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Resolve config-file selection from CLI, env, or the local default.
+pub fn selected_config_file(cli_path: Option<&Path>) -> crate::Result<ConfigFileTarget> {
+    let app_dir = app_dir()?;
+    config_file_from_sources(cli_path, env::var_os(CONFIG_FILE_ENV).as_deref(), &app_dir)
+}
+
+/// Resolve config-file selection with explicit source precedence.
+pub fn config_file_from_sources(
+    cli_path: Option<&Path>,
+    env_path: Option<&OsStr>,
+    app_dir: &Path,
+) -> crate::Result<ConfigFileTarget> {
+    if let Some(path) = cli_path {
+        if path.as_os_str().is_empty() {
+            return Err(config_error("--config cannot be empty"));
+        }
+        return Ok(ConfigFileTarget {
+            app_dir: app_dir.to_owned(),
+            path: path.to_owned(),
+            explicit: true,
+        });
+    }
+
+    if let Some(path) = env_path {
+        if path.to_string_lossy().is_empty() {
+            return Err(config_error(format!("{CONFIG_FILE_ENV} cannot be empty")));
+        }
+        return Ok(ConfigFileTarget {
+            app_dir: app_dir.to_owned(),
+            path: PathBuf::from(path),
+            explicit: true,
+        });
+    }
+
+    Ok(ConfigFileTarget {
+        app_dir: app_dir.to_owned(),
+        path: config_path(app_dir),
+        explicit: false,
+    })
+}
+
 /// Path to `config.toml` under the app directory.
 pub fn config_path(app_dir: &Path) -> PathBuf {
     app_dir.join(CONFIG_FILE_NAME)
 }
 
-/// Load raw `config.toml` source if present.
-pub fn get_file_config(app_dir: &Path) -> crate::Result<FileConfig> {
-    let path = config_path(app_dir);
-    let source = match fs::read_to_string(&path) {
+/// Load raw config-file source if present.
+pub fn get_selected_file_config(target: &ConfigFileTarget) -> crate::Result<FileConfig> {
+    let source = match fs::read_to_string(&target.path) {
         Ok(source) => Some(source),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if target.explicit {
+                return Err(config_error(format!(
+                    "config file not found: {}",
+                    target.path.display()
+                )));
+            }
             if env::var_os("DOCKER_ENV").is_some() {
-                generate_config(app_dir)?;
-                Some(fs::read_to_string(&path).map_err(|error| {
-                    config_error(format!("failed to read generated config.toml: {error}"))
+                generate_config_file(&target.path)?;
+                Some(fs::read_to_string(&target.path).map_err(|error| {
+                    config_error(format!(
+                        "failed to read generated config file {}: {error}",
+                        target.path.display()
+                    ))
                 })?)
             } else {
                 None
             }
         }
-        Err(error) => return Err(config_error(format!("failed to read config.toml: {error}"))),
+        Err(error) => {
+            return Err(config_error(format!(
+                "failed to read config file {}: {error}",
+                target.path.display()
+            )));
+        }
     };
 
-    Ok(FileConfig { path, source })
+    Ok(FileConfig {
+        path: target.path.clone(),
+        source,
+    })
 }
 
-/// Load and parse `config.toml` when present.
-pub fn load_file_raw_config(app_dir: &Path) -> crate::Result<RawConfig> {
-    let file_config = get_file_config(app_dir)?;
+/// Load raw `config.toml` source if present under the app directory.
+pub fn get_file_config(app_dir: &Path) -> crate::Result<FileConfig> {
+    let target = ConfigFileTarget {
+        app_dir: app_dir.to_owned(),
+        path: config_path(app_dir),
+        explicit: false,
+    };
+    get_selected_file_config(&target)
+}
+
+/// Load and parse the selected config file when present.
+pub fn load_selected_raw_config(target: &ConfigFileTarget) -> crate::Result<RawConfig> {
+    let file_config = get_selected_file_config(target)?;
     match file_config.source {
-        Some(source) => raw_config_from_source(&source),
+        Some(source) => raw_config_from_named_source(&file_config.path, &source),
         None => Ok(RawConfig::default()),
     }
 }
 
+/// Load and parse `config.toml` when present under the app directory.
+pub fn load_file_raw_config(app_dir: &Path) -> crate::Result<RawConfig> {
+    let target = ConfigFileTarget {
+        app_dir: app_dir.to_owned(),
+        path: config_path(app_dir),
+        explicit: false,
+    };
+    load_selected_raw_config(&target)
+}
+
 /// Generate a starter config file if one does not exist.
 pub fn generate_config(app_dir: &Path) -> crate::Result<PathBuf> {
-    fs::create_dir_all(app_dir)
-        .map_err(|error| config_error(format!("failed to create app directory: {error}")))?;
-    let path = config_path(app_dir);
-    if path.exists() {
-        return Ok(path);
+    generate_config_file(&config_path(app_dir))
+}
+
+/// Generate a starter config file at an explicit path if one does not exist.
+pub fn generate_config_file(path: &Path) -> crate::Result<PathBuf> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| config_error(format!("failed to create config directory: {error}")))?;
     }
-    fs::write(&path, config_template())
-        .map_err(|error| config_error(format!("failed to write config.toml: {error}")))?;
-    Ok(path)
+    if path.exists() {
+        return Ok(path.to_owned());
+    }
+    fs::write(path, config_template())
+        .map_err(|error| config_error(format!("failed to write config file: {error}")))?;
+    Ok(path.to_owned())
 }
 
 /// Starter config template.
@@ -722,6 +826,36 @@ pub fn parse_duration_millis(value: &str) -> crate::Result<u64> {
     number
         .checked_mul(multiplier)
         .ok_or_else(|| config_error("duration is too large"))
+}
+
+/// Apply supported `SPOROS__` scalar environment overrides.
+pub fn apply_env_overrides(raw: &mut RawConfig) -> crate::Result<()> {
+    apply_env_overrides_from(env::vars(), raw)
+}
+
+/// Apply supported env overrides from an explicit iterator for tests.
+pub fn apply_env_overrides_from(
+    values: impl IntoIterator<Item = (String, String)>,
+    raw: &mut RawConfig,
+) -> crate::Result<()> {
+    for (key, value) in values {
+        match key.as_str() {
+            CONFIG_FILE_ENV => {}
+            "SPOROS__API_KEY" => raw.api_key = Some(value),
+            "SPOROS__LISTEN_HOST" => {
+                raw.host = Some(value.parse().map_err(|error| {
+                    config_error(format!("invalid SPOROS__LISTEN_HOST: {error}"))
+                })?);
+            }
+            "SPOROS__LISTEN_PORT" => {
+                raw.port = Some(Some(value.parse().map_err(|error| {
+                    config_error(format!("invalid SPOROS__LISTEN_PORT: {error}"))
+                })?));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn verify_read_write_dir(path: &Path) -> crate::Result<()> {
@@ -895,9 +1029,11 @@ fn dev_mode_enabled() -> bool {
 mod tests {
     use super::{
         Action, ApiIntegrationConfig, LinkType, MatchMode, RawConfig, RuntimeConfig,
-        TorrentClientConfig, parse_duration_millis, raw_config_from_source,
+        TorrentClientConfig, apply_env_overrides_from, config_file_from_sources,
+        load_selected_raw_config, parse_duration_millis, raw_config_from_source,
     };
     use std::{
+        ffi::OsStr,
         fs,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
@@ -1148,6 +1284,87 @@ mod tests {
             }]
         );
         assert_eq!(raw.link_dirs, vec![Path::new("/links")]);
+    }
+
+    #[test]
+    fn selects_explicit_config_file_before_env_and_default() {
+        let app_dir = Path::new("/state");
+        let target = config_file_from_sources(
+            Some(Path::new("/cli/config.toml")),
+            Some(OsStr::new("/env/config.toml")),
+            app_dir,
+        )
+        .expect("selected");
+
+        assert_eq!(target.app_dir, app_dir);
+        assert_eq!(target.path, Path::new("/cli/config.toml"));
+        assert!(target.explicit);
+    }
+
+    #[test]
+    fn selects_env_config_file_before_local_default() {
+        let app_dir = Path::new("/state");
+        let target = config_file_from_sources(None, Some(OsStr::new("/env/config.toml")), app_dir)
+            .expect("selected");
+
+        assert_eq!(target.app_dir, app_dir);
+        assert_eq!(target.path, Path::new("/env/config.toml"));
+        assert!(target.explicit);
+    }
+
+    #[test]
+    fn keeps_local_default_config_file_compatible() {
+        let app_dir = Path::new("/state");
+        let target = config_file_from_sources(None, None, app_dir).expect("selected");
+
+        assert_eq!(target.app_dir, app_dir);
+        assert_eq!(target.path, Path::new("/state/config.toml"));
+        assert!(!target.explicit);
+    }
+
+    #[test]
+    fn reports_explicit_config_read_errors_with_path() {
+        let target = config_file_from_sources(
+            Some(Path::new("/definitely/missing/sporos.toml")),
+            None,
+            Path::new("/state"),
+        )
+        .expect("selected");
+
+        let error = load_selected_raw_config(&target).expect_err("missing file");
+
+        assert!(error.to_string().contains("config file not found"));
+        assert!(
+            error
+                .to_string()
+                .contains("/definitely/missing/sporos.toml")
+        );
+    }
+
+    #[test]
+    fn applies_namespaced_scalar_env_overrides() {
+        let mut raw = RawConfig {
+            api_key: Some("file-file-file-file-file".to_owned()),
+            port: Some(Some(1111)),
+            ..RawConfig::default()
+        };
+
+        apply_env_overrides_from(
+            [
+                (
+                    "SPOROS__API_KEY".to_owned(),
+                    "env-env-env-env-env-env".to_owned(),
+                ),
+                ("SPOROS__LISTEN_HOST".to_owned(), "127.0.0.1".to_owned()),
+                ("SPOROS__LISTEN_PORT".to_owned(), "2222".to_owned()),
+            ],
+            &mut raw,
+        )
+        .expect("env overrides");
+
+        assert_eq!(raw.api_key.as_deref(), Some("env-env-env-env-env-env"));
+        assert_eq!(raw.host, Some("127.0.0.1".parse().expect("ip")));
+        assert_eq!(raw.port, Some(Some(2222)));
     }
 
     #[test]
