@@ -268,6 +268,10 @@ async fn handle_runtime_request(
     state: Arc<DaemonState>,
     request: ApiRequest,
 ) -> crate::Result<crate::api::ApiResponse> {
+    if let Some(response) = handle_health_request(Arc::clone(&state), &request).await {
+        return Ok(response);
+    }
+
     let async_database = AsyncDatabase::open_app_dir(&state.app_dir).await?;
     let api_key =
         crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await?;
@@ -312,6 +316,72 @@ async fn handle_runtime_request(
     }
     async_database.close().await;
     Ok(response)
+}
+
+async fn handle_health_request(
+    state: Arc<DaemonState>,
+    request: &ApiRequest,
+) -> Option<crate::api::ApiResponse> {
+    match request.path.as_str() {
+        "/_health/livez" => Some(health_livez_response(request.method)),
+        "/_health/readyz" => Some(health_readyz_response(state, request.method).await),
+        _ => None,
+    }
+}
+
+fn health_livez_response(method: ApiMethod) -> crate::api::ApiResponse {
+    if method != ApiMethod::Get {
+        return crate::api::ApiResponse {
+            status: 405,
+            body: "Method Not Allowed".to_owned(),
+        };
+    }
+    crate::api::ApiResponse {
+        status: 200,
+        body: r#"{"status":"live"}"#.to_owned(),
+    }
+}
+
+async fn health_readyz_response(
+    state: Arc<DaemonState>,
+    method: ApiMethod,
+) -> crate::api::ApiResponse {
+    if method != ApiMethod::Get {
+        return crate::api::ApiResponse {
+            status: 405,
+            body: "Method Not Allowed".to_owned(),
+        };
+    }
+
+    let app_dir_ready = tokio::fs::metadata(&state.app_dir)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir());
+    let database_ready = match AsyncDatabase::open_app_dir(&state.app_dir).await {
+        Ok(database) => {
+            database.close().await;
+            true
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "readiness database check failed");
+            false
+        }
+    };
+    let runtime_ready = !state.services.cancellation_token().is_cancelled();
+    let ready = app_dir_ready && database_ready && runtime_ready;
+    let body = serde_json::json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "checks": {
+            "appDir": app_dir_ready,
+            "database": database_ready,
+            "runtime": runtime_ready,
+        },
+    })
+    .to_string();
+
+    crate::api::ApiResponse {
+        status: if ready { 200 } else { 503 },
+        body,
+    }
 }
 
 fn api_method(method: &Method) -> ApiMethod {
@@ -934,6 +1004,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_probes_skip_auth_and_report_readiness() {
+        let root = temp_path("daemon-health-probes");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: RuntimeServices::start(CancellationToken::new()),
+            scheduler: Mutex::new(Scheduler::new(Vec::new())),
+        });
+
+        let livez = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(ApiMethod::Get, "/_health/livez", BTreeMap::new(), ""),
+        )
+        .await
+        .expect("livez");
+        let readyz = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(ApiMethod::Get, "/_health/readyz", BTreeMap::new(), ""),
+        )
+        .await
+        .expect("readyz");
+        let status = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(ApiMethod::Get, "/api/status", BTreeMap::new(), ""),
+        )
+        .await
+        .expect("status");
+
+        assert_eq!(livez.status, 200);
+        assert_eq!(livez.body, r#"{"status":"live"}"#);
+        assert_eq!(readyz.status, 200);
+        assert!(readyz.body.contains(r#""status":"ready""#));
+        assert_eq!(status.status, 401);
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn status_request_does_not_wait_for_scheduler_lock() {
         let root = temp_path("daemon-status-no-scheduler-lock");
         std::fs::create_dir_all(&root).expect("root");
@@ -1023,9 +1135,20 @@ mod tests {
         .await
         .expect("status should not wait for work queues")
         .expect("status");
+        let readyz = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handle_runtime_request(
+                Arc::clone(&state),
+                ApiRequest::new(ApiMethod::Get, "/_health/readyz", BTreeMap::new(), ""),
+            ),
+        )
+        .await
+        .expect("readyz should not wait for work queues")
+        .expect("readyz");
 
         assert_eq!(ping.status, 200);
         assert_eq!(status.status, 200);
+        assert_eq!(readyz.status, 200);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
