@@ -385,13 +385,21 @@ impl RuntimeServices {
 
     /// Cancel workers and wait for their tasks to finish.
     pub async fn shutdown(&self) {
+        let started_at = Instant::now();
+        tracing::info!("runtime worker shutdown starting");
         self.shutdown.cancel();
         let mut handles = self.handles.lock().await;
+        let worker_count = handles.len();
         while let Some(handle) = handles.pop() {
             if let Err(error) = handle.await {
                 tracing::error!("runtime worker task failed: {error}");
             }
         }
+        tracing::info!(
+            workers = worker_count,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "runtime worker shutdown complete"
+        );
     }
 }
 

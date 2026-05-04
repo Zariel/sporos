@@ -200,14 +200,21 @@ async fn run_plan(
         }
     }
 
+    let shutdown_started = Instant::now();
+    tracing::info!("service shutdown starting");
     shutdown.cancel();
     if let Some(server) = server {
         server
             .await
             .map_err(|error| daemon_error(format!("HTTP server task failed: {error}")))??;
+        tracing::info!("HTTP intake stopped");
     }
     runtime_services.shutdown().await;
     async_database.close().await;
+    tracing::info!(
+        elapsed_ms = shutdown_started.elapsed().as_millis(),
+        "service shutdown complete"
+    );
     Ok(run)
 }
 
@@ -1226,6 +1233,42 @@ mod tests {
                 .iter()
                 .any(|result| result.name == JobName::Cleanup && result.ran)
         );
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_http_intake_and_runtime_workers() {
+        let root = temp_path("daemon-shutdown-http");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                listen_host: Some("127.0.0.1".parse().expect("listen host")),
+                listen_port: Some(Some(0)),
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let shutdown = CancellationToken::new();
+        let mut plan = DaemonPlan::from_config(&config);
+
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_plan(&root, &config, &database, &mut plan, shutdown, Some(0)),
+        )
+        .await
+        .expect("service shutdown should complete")
+        .expect("run daemon");
+
+        let address = run.listen_addr.expect("listener address");
+        assert!(run.serving);
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await;
+        assert!(matches!(stopped, Err(_) | Ok(Err(_))));
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
