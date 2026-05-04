@@ -3,6 +3,8 @@
 use std::{
     borrow::Cow,
     collections::BTreeMap,
+    future::Future,
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -39,14 +41,60 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 /// Install process signal handling for daemon shutdown.
 pub fn install_shutdown_handler() -> CancellationToken {
     let shutdown = CancellationToken::new();
-    let signal_shutdown = shutdown.clone();
+    spawn_shutdown_signal_listener("ctrl-c", shutdown.clone(), tokio::signal::ctrl_c());
+    spawn_sigterm_listener(shutdown.clone());
+    shutdown
+}
+
+fn spawn_shutdown_signal_listener<F>(name: &'static str, shutdown: CancellationToken, signal: F)
+where
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
     tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => signal_shutdown.cancel(),
-            Err(error) => tracing::error!("failed to listen for shutdown signal: {error}"),
+        match signal.await {
+            Ok(()) => {
+                tracing::info!(signal = name, "shutdown signal received");
+                shutdown.cancel();
+            }
+            Err(error) => tracing::error!(
+                signal = name,
+                "failed to listen for shutdown signal: {error}"
+            ),
         }
     });
-    shutdown
+}
+
+#[cfg(unix)]
+fn spawn_sigterm_listener(shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        let mut signal =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::error!(
+                        signal = "sigterm",
+                        "failed to listen for shutdown signal: {error}"
+                    );
+                    return;
+                }
+            };
+
+        match signal.recv().await {
+            Some(()) => {
+                tracing::info!(signal = "sigterm", "shutdown signal received");
+                shutdown.cancel();
+            }
+            None => tracing::error!(
+                signal = "sigterm",
+                "failed to listen for shutdown signal: stream closed"
+            ),
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_sigterm_listener(_shutdown: CancellationToken) {
+    tracing::debug!("SIGTERM shutdown listener is unavailable on this platform");
 }
 
 /// Run the daemon until cancellation is requested.
