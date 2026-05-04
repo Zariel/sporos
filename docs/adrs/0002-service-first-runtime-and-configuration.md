@@ -53,6 +53,11 @@ torrent directories, data directories, and link directories. Defaults may still
 exist, but they must be deliberate and documented by the schema rather than
 emerging from a broad `CONFIG_DIR` convention.
 
+`database_path` should be an explicit configuration field. When omitted, it
+should default from `state_dir`, for example `state_dir/sporos.db`. This keeps
+database placement predictable while still giving deployments one simple state
+directory default.
+
 Environment variables should use a project prefix, for example `SPOROS__`, and
 should cover simple scalar settings where that is operationally useful. Complex
 collection configuration such as Torznab indexer tables may remain config-file
@@ -164,7 +169,8 @@ with a defined migration path.
 The config schema should distinguish these concepts:
 
 - config file location;
-- state directory or database path;
+- state directory;
+- database path, defaulting to `state_dir/sporos.db`;
 - torrent cache directory;
 - output directory;
 - inject directory;
@@ -246,15 +252,17 @@ should be modeled separately.
 
 1. Add an explicit config file path option and `SPOROS__CONFIG_FILE`.
 2. Split config-file discovery from runtime state/cache/output path defaults.
-3. Introduce `SPOROS__` environment overrides for simple scalar settings.
-4. Add service command naming and make the long-running service the primary
+3. Add explicit `state_dir` and `database_path` config fields, with
+   `database_path` defaulting to `state_dir/sporos.db`.
+4. Introduce `SPOROS__` environment overrides for simple scalar settings.
+5. Add service command naming and make the long-running service the primary
    documented runtime.
-5. Align existing workflow commands with the same service runtime boundaries or
+6. Align existing workflow commands with the same service runtime boundaries or
    reclassify them as administrative tools.
-6. Remove runtime log-file assumptions and log to stderr/stdout.
-7. Finalize health, metrics, SIGTERM, degraded startup, and durable work queue
+7. Remove runtime log-file assumptions and log to stderr/stdout.
+8. Finalize health, metrics, SIGTERM, degraded startup, and durable work queue
    behavior as part of the service contract.
-8. Decide what compatibility behavior remains before `0.1`.
+9. Decide what compatibility behavior remains before `0.1`.
 
 ## Consequences
 
@@ -301,7 +309,5 @@ themselves. The runtime contract should be correct first.
 - Which existing workflow commands remain for `0.1`, and which become service
   API actions only?
 - What defaults should be used when `SPOROS__CONFIG_FILE` is not set?
-- Should state be configured as a single `state_dir`, an explicit
-  `database_path`, or both?
 - Which complex config structures, if any, should be representable through
   environment variables after `0.1`?
