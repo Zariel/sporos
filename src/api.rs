@@ -19,7 +19,7 @@ use crate::{
 
 const AUTH_MESSAGE: &str = "Specify the API key in an X-Api-Key header or an apikey query param.";
 
-/// Minimal HTTP method model used by the no-framework daemon router.
+/// Minimal HTTP method model used by the daemon API router.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ApiMethod {
     /// GET request.
@@ -30,7 +30,7 @@ pub enum ApiMethod {
     Other,
 }
 
-/// Parsed request passed from the HTTP server into the API router.
+/// Parsed request passed from the HTTP layer into the API router.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ApiRequest {
     /// HTTP method.

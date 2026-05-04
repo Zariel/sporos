@@ -21,7 +21,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
-    routing::any,
+    routing::{get, post},
 };
 use prometheus::{
     Encoder, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
@@ -226,10 +226,7 @@ fn serve_http(
     shutdown: CancellationToken,
 ) -> JoinHandle<crate::Result<()>> {
     tokio::spawn(async move {
-        let router = Router::new()
-            .fallback(any(handle_axum_request))
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-            .with_state(state);
+        let router = http_router(state);
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -238,6 +235,22 @@ fn serve_http(
         .await
         .map_err(|error| daemon_error(format!("HTTP server failed: {error}")))
     })
+}
+
+fn http_router(state: Arc<DaemonState>) -> Router {
+    Router::new()
+        .route("/_health/livez", get(handle_axum_request))
+        .route("/_health/readyz", get(handle_axum_request))
+        .route("/metrics", get(handle_axum_request))
+        .route("/api/ping", get(handle_axum_request))
+        .route("/api/status", get(handle_axum_request))
+        .route("/api/announce", post(handle_axum_request))
+        .route("/api/webhook", post(handle_axum_request))
+        .route("/api/job", post(handle_axum_request))
+        .fallback(handle_not_found)
+        .method_not_allowed_fallback(handle_method_not_allowed)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(state)
 }
 
 async fn handle_axum_request(
@@ -280,6 +293,55 @@ async fn handle_axum_request(
             }
         }
     };
+    api_response_to_axum(state, method_label, route, remote_addr, started, response)
+}
+
+async fn handle_not_found(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+) -> Response {
+    api_response_to_axum(
+        state,
+        method.as_str().to_owned(),
+        http_route(uri.path()),
+        remote_addr.to_string(),
+        Instant::now(),
+        ApiResponse {
+            status: 404,
+            body: "Not Found".to_owned(),
+        },
+    )
+}
+
+async fn handle_method_not_allowed(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+) -> Response {
+    api_response_to_axum(
+        state,
+        method.as_str().to_owned(),
+        http_route(uri.path()),
+        remote_addr.to_string(),
+        Instant::now(),
+        ApiResponse {
+            status: 405,
+            body: "Method Not Allowed".to_owned(),
+        },
+    )
+}
+
+fn api_response_to_axum(
+    state: Arc<DaemonState>,
+    method_label: String,
+    route: &'static str,
+    remote_addr: String,
+    started: Instant,
+    response: ApiResponse,
+) -> Response {
     let latency_ms = started.elapsed().as_millis();
     state
         .metrics
@@ -2136,6 +2198,126 @@ mod tests {
                 "text/plain; version=0.0.4; charset=utf-8"
             ))
         );
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn explicit_axum_routes_cover_public_endpoints() {
+        let root = temp_path("daemon-routes");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let scheduler = DaemonPlan::from_config(&config).scheduler;
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: RuntimeServices::start(CancellationToken::new()),
+            scheduler: Mutex::new(scheduler),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route test listener");
+        let address = listener.local_addr().expect("listener address");
+        let shutdown = CancellationToken::new();
+        let server = super::serve_http(listener, Arc::clone(&state), shutdown.clone());
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{address}");
+
+        let livez = client
+            .get(format!("{base_url}/_health/livez"))
+            .send()
+            .await
+            .expect("livez response");
+        assert_eq!(livez.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            livez.text().await.expect("livez body"),
+            r#"{"status":"live"}"#
+        );
+
+        let readyz = client
+            .get(format!("{base_url}/_health/readyz"))
+            .send()
+            .await
+            .expect("readyz response");
+        assert_eq!(readyz.status(), reqwest::StatusCode::OK);
+
+        let metrics = client
+            .get(format!("{base_url}/metrics"))
+            .send()
+            .await
+            .expect("metrics response");
+        assert_eq!(metrics.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            metrics
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+
+        let ping = client
+            .get(format!("{base_url}/api/ping"))
+            .send()
+            .await
+            .expect("ping response");
+        assert_eq!(ping.status(), reqwest::StatusCode::OK);
+        assert_eq!(ping.text().await.expect("ping body"), "OK");
+
+        let status = client
+            .get(format!("{base_url}/api/status?apikey=secret"))
+            .send()
+            .await
+            .expect("status response");
+        assert_eq!(status.status(), reqwest::StatusCode::OK);
+        let status_body: serde_json::Value =
+            serde_json::from_str(&status.text().await.expect("status body")).expect("status json");
+        assert_eq!(status_body["version"], crate::VERSION);
+
+        for path in ["/api/announce", "/api/webhook", "/api/job"] {
+            let response = client
+                .post(format!("{base_url}{path}?apikey=secret"))
+                .body("{")
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{path} response: {error}"));
+
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{path} should route to API validation"
+            );
+        }
+
+        let unsupported_method = client
+            .get(format!("{base_url}/api/announce?apikey=secret"))
+            .send()
+            .await
+            .expect("method response");
+        assert_eq!(
+            unsupported_method.status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            unsupported_method.text().await.expect("method body"),
+            "Method Not Allowed"
+        );
+
+        let not_found = client
+            .get(format!("{base_url}/missing"))
+            .send()
+            .await
+            .expect("not found response");
+        assert_eq!(not_found.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(not_found.text().await.expect("not found body"), "Not Found");
+
+        shutdown.cancel();
+        server
+            .await
+            .expect("server task joins")
+            .expect("server stops");
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
