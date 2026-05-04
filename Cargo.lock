@@ -1830,68 +1830,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
- "sporos-config",
- "sporos-core",
- "sporos-persistence",
- "sporos-retry",
- "sporos-runtime",
  "sqlx",
  "stats_alloc",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "url",
  "walkdir",
-]
-
-[[package]]
-name = "sporos-config"
-version = "0.1.0"
-dependencies = [
- "regex",
- "serde",
- "sporos-core",
- "toml",
-]
-
-[[package]]
-name = "sporos-core"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "sporos-persistence"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sporos-core",
- "sqlx",
- "tokio",
-]
-
-[[package]]
-name = "sporos-retry"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "reqwest",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "sporos-runtime"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

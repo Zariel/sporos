@@ -14,7 +14,8 @@ use std::{
 use regex::Regex;
 use serde::{Deserialize, Deserializer, de};
 
-pub use sporos_core::{Result, SporosError, domain};
+use crate::SporosError;
+pub use crate::{Result, domain};
 
 const APP_DIR_NAME: &str = "cross-seed";
 const CONFIG_FILE_NAME: &str = "config.toml";

@@ -17,8 +17,8 @@ use sqlx::{
 };
 use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 
-pub use sporos_core::{Result, domain};
-use sporos_core::{
+pub use crate::{Result, domain};
+use crate::{
     SporosError,
     domain::{ClientLabel, Decision, File, LookupFields},
 };
