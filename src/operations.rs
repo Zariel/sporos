@@ -1365,6 +1365,11 @@ async fn run_blocking_operation<T>(
 where
     T: Send + 'static,
 {
+    let task = move || {
+        let span = tracing::info_span!("blocking operation", operation = name);
+        let _guard = span.enter();
+        task()
+    };
     blocking
         .submit(name, task)
         .await

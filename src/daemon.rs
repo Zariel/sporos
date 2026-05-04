@@ -11,7 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -239,10 +239,15 @@ async fn handle_axum_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let started = Instant::now();
     state.metrics.http_requests.fetch_add(1, Ordering::Relaxed);
+    let path = uri.path().to_owned();
+    let route = http_route(&path);
+    let method_label = method.as_str().to_owned();
+    let remote_addr = remote_addr.to_string();
     let request = ApiRequest {
         method: api_method(&method),
-        path: uri.path().to_owned(),
+        path,
         query: uri.query().map(parse_query).unwrap_or_default(),
         headers: headers
             .iter()
@@ -254,7 +259,7 @@ async fn handle_axum_request(
             })
             .collect(),
         body: String::from_utf8_lossy(&body).into_owned(),
-        remote_addr: Some(remote_addr.to_string()),
+        remote_addr: Some(remote_addr.clone()),
     };
 
     let response = match handle_runtime_request(state, request).await {
@@ -267,8 +272,30 @@ async fn handle_axum_request(
             }
         }
     };
+    tracing::info!(
+        http.method = %method_label,
+        http.route = route,
+        http.status_code = response.status,
+        http.latency_ms = started.elapsed().as_millis(),
+        net.peer.addr = %remote_addr,
+        "http request completed"
+    );
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
     (status, response.body).into_response()
+}
+
+fn http_route(path: &str) -> &'static str {
+    match path {
+        "/_health/livez" => "/_health/livez",
+        "/_health/readyz" => "/_health/readyz",
+        "/api/announce" => "/api/announce",
+        "/api/job" => "/api/job",
+        "/api/ping" => "/api/ping",
+        "/api/status" => "/api/status",
+        "/api/webhook" => "/api/webhook",
+        "/metrics" => "/metrics",
+        _ => "unmatched",
+    }
 }
 
 async fn handle_runtime_request(
@@ -791,6 +818,8 @@ async fn execute_ran_job(
     config: &RuntimeConfig,
     job: &crate::scheduler::JobCheckResult,
 ) -> crate::Result<()> {
+    let span = tracing::info_span!("service job", job = job.name.as_str());
+    let _guard = span.enter();
     match job.name {
         JobName::Rss => {
             let config = config_with_job_override(config, job.config_override);
@@ -1150,7 +1179,7 @@ async fn run_webhook_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REQUEST_BODY_BYTES, handle_runtime_request, run_plan};
+    use super::{MAX_REQUEST_BODY_BYTES, handle_runtime_request, http_route, run_plan};
     use crate::{
         SporosError,
         api::{ApiMethod, ApiRequest, handle_api_request},
@@ -1724,6 +1753,14 @@ mod tests {
     #[tokio::test]
     async fn max_request_body_limit_matches_compatibility_limit() {
         assert_eq!(MAX_REQUEST_BODY_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    fn http_route_labels_are_bounded() {
+        assert_eq!(http_route("/api/status"), "/api/status");
+        assert_eq!(http_route("/_health/readyz"), "/_health/readyz");
+        assert_eq!(http_route("/api/status/extra"), "unmatched");
+        assert_eq!(http_route("/secret-token-in-path"), "unmatched");
     }
 
     #[test]
