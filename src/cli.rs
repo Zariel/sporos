@@ -106,7 +106,7 @@ where
                 crate::operations::reset_api_key_async(&database).await?
             );
         }
-        Some(("daemon", matches)) => {
+        Some((command @ ("daemon" | "serve"), matches)) => {
             let mut raw_config = load_raw_config(&config_file)?;
             apply_shared_options(matches, &mut raw_config)?;
             apply_daemon_options(matches, &mut raw_config)?;
@@ -121,7 +121,8 @@ where
             let shutdown = crate::daemon::install_shutdown_handler();
             let run = crate::daemon::run_daemon(&state_dir, &config, &database, shutdown).await?;
             println!(
-                "daemon stopped: serving={}, jobs={}",
+                "{} stopped: serving={}, jobs={}",
+                command,
                 run.listen_addr
                     .map(|address| address.to_string())
                     .unwrap_or_else(|| "disabled".to_owned()),
@@ -524,6 +525,9 @@ pub fn build_cli() -> Command {
         .subcommand(Command::new("api-key").arg(Arg::new("api-key").long("api-key").num_args(1)))
         .subcommand(Command::new("reset-api-key"))
         .subcommand(add_daemon_options(add_shared_options(Command::new(
+            "serve",
+        ))))
+        .subcommand(add_daemon_options(add_shared_options(Command::new(
             "daemon",
         ))))
         .subcommand(add_shared_options(Command::new("rss")))
@@ -751,6 +755,7 @@ mod tests {
             "clear-client-cache",
             "api-key",
             "reset-api-key",
+            "serve",
             "daemon",
             "rss",
             "search",
@@ -814,6 +819,19 @@ mod tests {
                 "30 minutes",
             ])
             .expect("daemon command parses");
+
+        build_cli()
+            .try_get_matches_from([
+                "cross-seed",
+                "serve",
+                "--config",
+                "/etc/sporos/config.toml",
+                "--port",
+                "9000",
+                "--host",
+                "0.0.0.0",
+            ])
+            .expect("serve command parses");
 
         build_cli()
             .try_get_matches_from([
