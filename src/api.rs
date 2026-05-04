@@ -17,7 +17,8 @@ use crate::{
     domain::{ActionResult, Candidate, Decision, InjectionResult, SaveResult},
 };
 
-const AUTH_MESSAGE: &str = "Specify the API key in an X-Api-Key header or an apikey query param.";
+pub const AUTH_MESSAGE: &str =
+    "Specify the API key in an X-Api-Key header or an apikey query param.";
 
 /// Minimal HTTP method model used by the daemon API router.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -268,13 +269,29 @@ pub async fn handle_api_request<H: ApiHandlers + Send>(
     api_key: &str,
     handlers: &mut H,
 ) -> crate::Result<ApiResponse> {
+    handle_api_request_inner(request, Some(api_key), handlers).await
+}
+
+/// Route one request after the HTTP service auth layer has authorized it.
+pub async fn handle_trusted_api_request<H: ApiHandlers + Send>(
+    request: ApiRequest,
+    handlers: &mut H,
+) -> crate::Result<ApiResponse> {
+    handle_api_request_inner(request, None, handlers).await
+}
+
+async fn handle_api_request_inner<H: ApiHandlers + Send>(
+    request: ApiRequest,
+    api_key: Option<&str>,
+    handlers: &mut H,
+) -> crate::Result<ApiResponse> {
     if request.path == "/api/ping" {
         if let Some(response) = method_guard(request.method, ApiMethod::Get) {
             return Ok(response);
         }
         return Ok(ApiResponse::new(200, "OK"));
     }
-    if !authorized(&request, api_key) {
+    if api_key.is_some_and(|api_key| !authorized(&request, api_key)) {
         if let Some(client_addr) = logged_client_addr(&request) {
             tracing::warn!("unauthorized API request from {client_addr}");
         }

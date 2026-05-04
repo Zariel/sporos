@@ -18,8 +18,9 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Bytes,
-    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -32,8 +33,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     SporosError,
     api::{
-        AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, ApiResponse, JobRequest,
-        JobResponse, WebhookRequest, handle_api_request,
+        AUTH_MESSAGE, AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, ApiResponse,
+        JobRequest, JobResponse, WebhookRequest, handle_trusted_api_request,
     },
     config::RuntimeConfig,
     persistence::{AsyncDatabase, Database},
@@ -238,31 +239,140 @@ fn serve_http(
 }
 
 fn http_router(state: Arc<DaemonState>) -> Router {
+    let protected_api = Router::new()
+        .route("/api/status", get(handle_status))
+        .route("/api/announce", post(handle_announce))
+        .route("/api/webhook", post(handle_webhook))
+        .route("/api/job", post(handle_job))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_auth,
+        ));
+
     Router::new()
         .route("/_health/livez", get(handle_livez))
         .route("/_health/readyz", get(handle_readyz))
         .route("/metrics", get(handle_metrics))
         .route("/api/ping", get(handle_ping))
-        .route("/api/status", get(handle_status))
-        .route("/api/announce", post(handle_announce))
-        .route("/api/webhook", post(handle_webhook))
-        .route("/api/job", post(handle_job))
+        .merge(protected_api)
         .fallback(handle_not_found)
         .method_not_allowed_fallback(handle_method_not_allowed)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            record_http_request,
+        ))
         .with_state(state)
+}
+
+async fn require_api_auth(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match configured_api_key(&state).await {
+        Ok(api_key) if request_authorized(&headers, &query, &api_key) => next.run(request).await,
+        Ok(_) => {
+            tracing::warn!(
+                net.peer.addr = %client_addr(&headers, Some(remote_addr)),
+                "unauthorized API request"
+            );
+            DaemonHttpResponse {
+                status: StatusCode::UNAUTHORIZED,
+                body: DaemonHttpBody::Text(AUTH_MESSAGE.to_owned()),
+            }
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!("API auth failed: {error}");
+            DaemonHttpResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: DaemonHttpBody::Text(error.to_string()),
+            }
+            .into_response()
+        }
+    }
+}
+
+async fn configured_api_key(state: &DaemonState) -> crate::Result<String> {
+    let async_database = AsyncDatabase::open(&state.config.database_path).await?;
+    let api_key =
+        crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await;
+    async_database.close().await;
+    api_key
+}
+
+fn request_authorized(
+    headers: &HeaderMap,
+    query: &BTreeMap<String, String>,
+    api_key: &str,
+) -> bool {
+    headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| query.get("apikey").map(String::as_str))
+        .is_some_and(|value| value == api_key)
+}
+
+async fn record_http_request(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let method_label = request.method().as_str().to_owned();
+    let route = http_route(request.uri().path());
+    let remote_addr = client_addr(request.headers(), Some(remote_addr));
+    let response = next.run(request).await;
+    let status = response.status().as_u16();
+    let latency_ms = started.elapsed().as_millis();
+
+    state
+        .metrics
+        .record_http_request(&method_label, route, status, latency_ms);
+    tracing::info!(
+        http.method = %method_label,
+        http.route = route,
+        http.status_code = status,
+        http.latency_ms = latency_ms,
+        net.peer.addr = %remote_addr,
+        "http request completed"
+    );
+    response
+}
+
+fn client_addr(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(forwarded_client_addr)
+        .unwrap_or_else(|| {
+            remote_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        })
+}
+
+fn forwarded_client_addr(value: &str) -> Option<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|addr| addr.parse::<std::net::IpAddr>().is_ok())
+        .map(ToOwned::to_owned)
 }
 
 async fn handle_livez(
     State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
     handle_api_parts(
         state,
-        remote_addr,
         method,
         "/_health/livez",
         query,
@@ -274,14 +384,12 @@ async fn handle_livez(
 
 async fn handle_readyz(
     State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
     handle_api_parts(
         state,
-        remote_addr,
         method,
         "/_health/readyz",
         query,
@@ -293,64 +401,33 @@ async fn handle_readyz(
 
 async fn handle_metrics(
     State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    handle_api_parts(
-        state,
-        remote_addr,
-        method,
-        "/metrics",
-        query,
-        headers,
-        String::new(),
-    )
-    .await
+    handle_api_parts(state, method, "/metrics", query, headers, String::new()).await
 }
 
 async fn handle_ping(
     State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    handle_api_parts(
-        state,
-        remote_addr,
-        method,
-        "/api/ping",
-        query,
-        headers,
-        String::new(),
-    )
-    .await
+    handle_api_parts(state, method, "/api/ping", query, headers, String::new()).await
 }
 
 async fn handle_status(
     State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    handle_api_parts(
-        state,
-        remote_addr,
-        method,
-        "/api/status",
-        query,
-        headers,
-        String::new(),
-    )
-    .await
+    handle_api_parts(state, method, "/api/status", query, headers, String::new()).await
 }
 
 async fn handle_announce(
     State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
@@ -358,7 +435,6 @@ async fn handle_announce(
 ) -> Response {
     handle_api_parts(
         state,
-        remote_addr,
         method,
         "/api/announce",
         query,
@@ -370,7 +446,6 @@ async fn handle_announce(
 
 async fn handle_webhook(
     State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
@@ -378,7 +453,6 @@ async fn handle_webhook(
 ) -> Response {
     handle_api_parts(
         state,
-        remote_addr,
         method,
         "/api/webhook",
         query,
@@ -390,7 +464,6 @@ async fn handle_webhook(
 
 async fn handle_job(
     State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(query): Query<BTreeMap<String, String>>,
@@ -398,7 +471,6 @@ async fn handle_job(
 ) -> Response {
     handle_api_parts(
         state,
-        remote_addr,
         method,
         "/api/job",
         query,
@@ -410,24 +482,19 @@ async fn handle_job(
 
 async fn handle_api_parts(
     state: Arc<DaemonState>,
-    remote_addr: SocketAddr,
     method: Method,
     path: &'static str,
     query: BTreeMap<String, String>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let started = Instant::now();
-    let route = http_route(path);
-    let method_label = method.as_str().to_owned();
-    let remote_addr = remote_addr.to_string();
     let request = ApiRequest {
         method: api_method(&method),
         path: path.to_owned(),
         query,
         headers: api_headers(&headers),
         body,
-        remote_addr: Some(remote_addr.clone()),
+        remote_addr: None,
     };
 
     let response = match handle_runtime_request(Arc::clone(&state), request).await {
@@ -440,7 +507,7 @@ async fn handle_api_parts(
             }
         }
     };
-    api_response_to_axum(state, method_label, route, remote_addr, started, response)
+    DaemonHttpResponse::from_api(path, response).into_response()
 }
 
 fn api_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
@@ -456,64 +523,35 @@ fn api_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
 }
 
 async fn handle_not_found(
-    State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
-    method: Method,
+    State(_state): State<Arc<DaemonState>>,
+    _method: Method,
     uri: Uri,
 ) -> Response {
-    api_response_to_axum(
-        state,
-        method.as_str().to_owned(),
-        http_route(uri.path()),
-        remote_addr.to_string(),
-        Instant::now(),
+    let route = http_route(uri.path());
+    DaemonHttpResponse::from_api(
+        route,
         ApiResponse {
             status: 404,
             body: "Not Found".to_owned(),
         },
     )
+    .into_response()
 }
 
 async fn handle_method_not_allowed(
-    State(state): State<Arc<DaemonState>>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
-    method: Method,
+    State(_state): State<Arc<DaemonState>>,
+    _method: Method,
     uri: Uri,
 ) -> Response {
-    api_response_to_axum(
-        state,
-        method.as_str().to_owned(),
-        http_route(uri.path()),
-        remote_addr.to_string(),
-        Instant::now(),
+    let route = http_route(uri.path());
+    DaemonHttpResponse::from_api(
+        route,
         ApiResponse {
             status: 405,
             body: "Method Not Allowed".to_owned(),
         },
     )
-}
-
-fn api_response_to_axum(
-    state: Arc<DaemonState>,
-    method_label: String,
-    route: &'static str,
-    remote_addr: String,
-    started: Instant,
-    response: ApiResponse,
-) -> Response {
-    let latency_ms = started.elapsed().as_millis();
-    state
-        .metrics
-        .record_http_request(&method_label, route, response.status, latency_ms);
-    tracing::info!(
-        http.method = %method_label,
-        http.route = route,
-        http.status_code = response.status,
-        http.latency_ms = latency_ms,
-        net.peer.addr = %remote_addr,
-        "http request completed"
-    );
-    DaemonHttpResponse::from_api(route, response).into_response()
+    .into_response()
 }
 
 enum DaemonHttpBody {
@@ -602,8 +640,6 @@ async fn handle_runtime_request(
     }
 
     let async_database = AsyncDatabase::open(&state.config.database_path).await?;
-    let api_key =
-        crate::operations::api_key_async(&async_database, state.config.api_key.as_deref()).await?;
     let needs_scheduler = request.path == "/api/job";
     let scheduler_snapshot = if request.path == "/api/status" {
         state
@@ -633,7 +669,7 @@ async fn handle_runtime_request(
         webhook_requests: Vec::new(),
         job_dispatches: Vec::new(),
     };
-    let response = handle_api_request(request, &api_key, &mut handlers).await?;
+    let response = handle_trusted_api_request(request, &mut handlers).await?;
     let webhook_requests = std::mem::take(&mut handlers.webhook_requests);
     let job_dispatches = std::mem::take(&mut handlers.job_dispatches);
     drop(handlers);
@@ -2205,7 +2241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn axum_request_state_routes_ping_and_auth() {
+    async fn axum_request_state_routes_ping() {
         let root = temp_path("daemon-axum-state");
         std::fs::create_dir_all(&root).expect("root");
         let database = Database::open_app_dir(&root).expect("database");
@@ -2226,15 +2262,8 @@ mod tests {
         )
         .await
         .expect("ping");
-        let unauthorized = handle_runtime_request(
-            Arc::clone(&state),
-            ApiRequest::new(ApiMethod::Get, "/api/status", BTreeMap::new(), ""),
-        )
-        .await
-        .expect("status");
 
         assert_eq!(ping.status, 200);
-        assert_eq!(unauthorized.status, 401);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -2266,18 +2295,11 @@ mod tests {
         )
         .await
         .expect("readyz");
-        let status = handle_runtime_request(
-            Arc::clone(&state),
-            ApiRequest::new(ApiMethod::Get, "/api/status", BTreeMap::new(), ""),
-        )
-        .await
-        .expect("status");
 
         assert_eq!(livez.status, 200);
         assert_eq!(livez.body, r#"{"status":"live"}"#);
         assert_eq!(readyz.status, 200);
         assert!(readyz.body.contains(r#""status":"ready""#));
-        assert_eq!(status.status, 401);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -2454,6 +2476,23 @@ mod tests {
         assert_eq!(ping.status(), reqwest::StatusCode::OK);
         assert_eq!(ping.text().await.expect("ping body"), "OK");
 
+        let unauthorized_status = client
+            .get(format!("{base_url}/api/status"))
+            .send()
+            .await
+            .expect("unauthorized status response");
+        assert_eq!(
+            unauthorized_status.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            content_type(&unauthorized_status).is_some_and(|value| value.starts_with("text/plain"))
+        );
+        assert_eq!(
+            unauthorized_status.text().await.expect("unauthorized body"),
+            crate::api::AUTH_MESSAGE
+        );
+
         let status = client
             .get(format!("{base_url}/api/status?apikey=secret"))
             .send()
@@ -2528,6 +2567,17 @@ mod tests {
         assert_eq!(not_found.status(), reqwest::StatusCode::NOT_FOUND);
         assert!(content_type(&not_found).is_some_and(|value| value.starts_with("text/plain")));
         assert_eq!(not_found.text().await.expect("not found body"), "Not Found");
+
+        let http_metrics = state.metrics.http_metrics();
+        assert!(http_metrics.iter().any(|(key, value)| {
+            key.method == "GET"
+                && key.route == "/api/status"
+                && key.status == 401
+                && value.count == 1
+        }));
+        assert!(http_metrics.iter().any(|(key, value)| {
+            key.method == "GET" && key.route == "/metrics" && key.status == 200 && value.count == 1
+        }));
 
         shutdown.cancel();
         server
