@@ -644,6 +644,64 @@ mod tests {
     }
 
     #[test]
+    fn full_runtime_fails_fast_on_invalid_local_paths() {
+        let root = temp_path("runtime-local-path-fail-fast");
+        let mut config = test_config(root.clone());
+        config.data_dirs = vec![root.join("missing-data")];
+
+        let error = full_runtime(root.clone(), config, &RuntimeStartupHooks)
+            .err()
+            .expect("startup should fail");
+
+        assert!(error.to_string().contains("data_dir is not readable"));
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_hooks_do_not_block_on_remote_startup_failures() {
+        let notification = http_server(vec![
+            http_response("503 Service Unavailable", &[], ""),
+            http_response("503 Service Unavailable", &[], ""),
+            http_response("503 Service Unavailable", &[], ""),
+        ]);
+        let torznab = http_server(vec![
+            http_response("503 Service Unavailable", &[], ""),
+            http_response("503 Service Unavailable", &[], ""),
+            http_response("503 Service Unavailable", &[], ""),
+        ]);
+        let arr = http_server(vec![
+            http_response("503 Service Unavailable", &[], ""),
+            http_response("503 Service Unavailable", &[], ""),
+            http_response("503 Service Unavailable", &[], ""),
+        ]);
+        let mut config = test_config(temp_path("runtime-remote-degraded"));
+        config.notification_webhook_urls = vec![notification.url.clone()];
+        config.torznab = vec![ApiIntegrationConfig {
+            url: format!("{}/api", torznab.url),
+            api_key: "indexer-secret".to_owned(),
+        }];
+        config.sonarr = vec![ApiIntegrationConfig {
+            url: format!("{}/sonarr", arr.url),
+            api_key: "arr-secret".to_owned(),
+        }];
+        let hooks = RuntimeStartupHooks;
+
+        hooks
+            .initialize_push_notifier(&config)
+            .expect("notification failures are degraded");
+        hooks
+            .validate_indexers(&config)
+            .expect("indexer failures are degraded");
+        hooks
+            .validate_arrs(&config)
+            .expect("arr failures are degraded");
+
+        assert_eq!(notification.join().len(), 3);
+        assert_eq!(torznab.join().len(), 3);
+        assert_eq!(arr.join().len(), 3);
+    }
+
+    #[test]
     fn runtime_hooks_validate_external_integrations() {
         let torznab = http_server(vec![http_response(
             "200 OK",
