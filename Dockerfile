@@ -50,10 +50,11 @@ COPY --from=builder /workspace/artifacts/sporos /app/sporos
 COPY --from=builder --chown=nonroot:nonroot /workspace/data /data
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
-ENV CONFIG_DIR=/data
-ENV DOCKER_ENV=1
+ENV SPOROS__CONFIG_FILE=/config/config.toml
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
-EXPOSE 2468
+VOLUME ["/config", "/data"]
+EXPOSE 9000
 USER nonroot:nonroot
 ENTRYPOINT ["/app/sporos"]
+CMD ["serve"]
