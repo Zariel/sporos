@@ -53,7 +53,7 @@ torrent directories, data directories, and link directories. Defaults may still
 exist, but they must be deliberate and documented by the schema rather than
 emerging from a broad `CONFIG_DIR` convention.
 
-Environment variables should use a project prefix, for example `SPOROS_`, and
+Environment variables should use a project prefix, for example `SPOROS__`, and
 should cover simple scalar settings where that is operationally useful. Complex
 collection configuration such as Torznab indexer tables may remain config-file
 only until the project defines a safe and readable environment representation.
@@ -69,7 +69,7 @@ sporos serve --config /etc/sporos/config.toml
 or the equivalent environment-driven form:
 
 ```text
-SPOROS_CONFIG_FILE=/etc/sporos/config.toml sporos serve
+SPOROS__CONFIG_FILE=/etc/sporos/config.toml sporos serve
 ```
 
 After startup, that process should own ongoing work. Users should not need to
@@ -154,7 +154,7 @@ Configuration should have a clear precedence order:
 The config file path should be provided by:
 
 - `--config <path>` where supported;
-- `SPOROS_CONFIG_FILE=<path>` for service deployments;
+- `SPOROS__CONFIG_FILE=<path>` for service deployments;
 - a sensible user default only for local interactive use.
 
 `CONFIG_DIR` should not remain the primary configuration contract. If retained,
@@ -182,17 +182,18 @@ persistent volumes.
 
 ## Environment Variables
 
-Environment variables should be prefixed, explicit, and predictable.
+Environment variables should be prefixed, explicit, and predictable. The
+project prefix uses a double underscore separator: `SPOROS__`.
 
 Good candidates include:
 
-- `SPOROS_CONFIG_FILE`;
-- `SPOROS_LOG_LEVEL`;
-- `SPOROS_LOG_FORMAT`;
-- `SPOROS_HTTP_HOST`;
-- `SPOROS_HTTP_PORT`;
-- `SPOROS_METRICS_ENABLED`;
-- `SPOROS_API_KEY`, subject to secret-handling policy;
+- `SPOROS__CONFIG_FILE`;
+- `SPOROS__LOG_LEVEL`;
+- `SPOROS__LOG_FORMAT`;
+- `SPOROS__HTTP_HOST`;
+- `SPOROS__HTTP_PORT`;
+- `SPOROS__METRICS_ENABLED`;
+- `SPOROS__API_KEY`, subject to secret-handling policy;
 - scheduler cadence overrides where scalar values are clear.
 
 Poor initial candidates include complex lists or tables that become hard to
@@ -243,9 +244,9 @@ should be modeled separately.
 
 ## Incremental Plan
 
-1. Add an explicit config file path option and `SPOROS_CONFIG_FILE`.
+1. Add an explicit config file path option and `SPOROS__CONFIG_FILE`.
 2. Split config-file discovery from runtime state/cache/output path defaults.
-3. Introduce `SPOROS_` environment overrides for simple scalar settings.
+3. Introduce `SPOROS__` environment overrides for simple scalar settings.
 4. Add service command naming and make the long-running service the primary
    documented runtime.
 5. Align existing workflow commands with the same service runtime boundaries or
@@ -299,7 +300,7 @@ themselves. The runtime contract should be correct first.
 - What is the exact service command name: `serve`, `daemon`, or default command?
 - Which existing workflow commands remain for `0.1`, and which become service
   API actions only?
-- What defaults should be used when `SPOROS_CONFIG_FILE` is not set?
+- What defaults should be used when `SPOROS__CONFIG_FILE` is not set?
 - Should state be configured as a single `state_dir`, an explicit
   `database_path`, or both?
 - Which complex config structures, if any, should be representable through
