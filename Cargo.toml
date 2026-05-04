@@ -16,6 +16,7 @@ futures-util = "0.3"
 getrandom = "0.3"
 notify = "8"
 quick-xml = "0.38"
+prometheus = { version = "0.14", default-features = false }
 regex = "1"
 reflink-copy = "0.1.29"
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "multipart", "rustls-tls"] }

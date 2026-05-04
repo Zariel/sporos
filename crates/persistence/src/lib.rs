@@ -518,6 +518,11 @@ impl Database {
         self.block_on(self.inner.clear_indexer_failures())
     }
 
+    /// Load indexer status rows for observability.
+    pub fn indexer_health_rows(&self) -> crate::Result<Vec<IndexerHealthRow>> {
+        self.block_on(self.inner.indexer_health_rows())
+    }
+
     /// Read a scheduler job's last run timestamp.
     pub fn read_last_run(&self, name: &str) -> crate::Result<Option<i64>> {
         self.block_on(self.inner.read_last_run(name))
@@ -1546,6 +1551,28 @@ impl AsyncDatabase {
         rows_affected(result.rows_affected())
     }
 
+    /// Load indexer status rows for observability.
+    pub async fn indexer_health_rows(&self) -> crate::Result<Vec<IndexerHealthRow>> {
+        let rows = sqlx::query(
+            "SELECT id, url, active, status, retry_after
+             FROM indexer
+             ORDER BY id",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| IndexerHealthRow {
+                id: row.get(0),
+                url: row.get(1),
+                active: row.get(2),
+                status: row.get(3),
+                retry_after: row.get(4),
+            })
+            .collect())
+    }
+
     /// Read a scheduler job's last run timestamp.
     pub async fn read_last_run(&self, name: &str) -> crate::Result<Option<i64>> {
         sqlx::query_scalar("SELECT last_run FROM job_log WHERE name = ?1")
@@ -1729,6 +1756,21 @@ pub struct IndexerRow {
     pub url: String,
     /// API key.
     pub apikey: String,
+}
+
+/// Indexer status row safe for metrics and health reporting.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IndexerHealthRow {
+    /// Database row id.
+    pub id: i64,
+    /// Base Torznab URL without API key.
+    pub url: String,
+    /// Whether the indexer is active in the current config.
+    pub active: bool,
+    /// Persisted indexer status such as `OK` or `RATE_LIMITED`.
+    pub status: Option<String>,
+    /// Retry timestamp in milliseconds since the Unix epoch.
+    pub retry_after: Option<i64>,
 }
 
 /// Enabled search indexer row with serialized caps.

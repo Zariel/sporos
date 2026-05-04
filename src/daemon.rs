@@ -7,7 +7,10 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +23,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
+use prometheus::{Encoder, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +35,7 @@ use crate::{
     },
     config::RuntimeConfig,
     persistence::{AsyncDatabase, Database},
-    runtime::RuntimeServices,
+    runtime::{RuntimeBlockingExecutor, RuntimeServices, RuntimeTaskQueue},
     scheduler::{DaemonPlan, DaemonRun, JobConfigOverride, JobName, Scheduler},
 };
 
@@ -118,6 +122,7 @@ async fn run_plan(
 ) -> crate::Result<DaemonRun> {
     let async_database = AsyncDatabase::open_app_dir(app_dir).await?;
     let runtime_services = RuntimeServices::start(shutdown.child_token());
+    let metrics = Arc::new(DaemonMetrics::default());
     let mut run = plan
         .run_startup_async(&async_database, now_millis(), || {
             crate::operations::refresh_torrent_and_data_indexes(database, config).map(|_| ())
@@ -131,7 +136,7 @@ async fn run_plan(
         shutdown.child_token(),
     )
     .await;
-    finish_executed_jobs(&mut plan.scheduler, &async_database, startup_jobs).await?;
+    finish_executed_jobs(&mut plan.scheduler, &async_database, startup_jobs, &metrics).await?;
 
     let mut server_state = None;
     let server = if let Some(address) = listen_address(config) {
@@ -151,6 +156,7 @@ async fn run_plan(
                 &mut plan.scheduler,
                 Scheduler::new(Vec::new()),
             )),
+            metrics: Arc::clone(&metrics),
         });
         server_state = Some(Arc::clone(&state));
         Some(serve_http(listener, state, shutdown.clone()))
@@ -185,9 +191,9 @@ async fn run_plan(
                 .await;
                 if let Some(state) = &server_state {
                     let mut scheduler = state.scheduler.lock().await;
-                    finish_executed_jobs(&mut scheduler, &async_database, executed_jobs).await?;
+                    finish_executed_jobs(&mut scheduler, &async_database, executed_jobs, &metrics).await?;
                 } else {
-                    finish_executed_jobs(&mut plan.scheduler, &async_database, executed_jobs).await?;
+                    finish_executed_jobs(&mut plan.scheduler, &async_database, executed_jobs, &metrics).await?;
                 }
                 iterations = iterations.saturating_add(1);
             }
@@ -233,6 +239,7 @@ async fn handle_axum_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    state.metrics.http_requests.fetch_add(1, Ordering::Relaxed);
     let request = ApiRequest {
         method: api_method(&method),
         path: uri.path().to_owned(),
@@ -268,6 +275,9 @@ async fn handle_runtime_request(
     state: Arc<DaemonState>,
     request: ApiRequest,
 ) -> crate::Result<crate::api::ApiResponse> {
+    if request.path == "/metrics" {
+        return metrics_response(state, request.method).await;
+    }
     if let Some(response) = handle_health_request(Arc::clone(&state), &request).await {
         return Ok(response);
     }
@@ -312,7 +322,13 @@ async fn handle_runtime_request(
     .await;
     if !executed_jobs.is_empty() {
         let mut scheduler = state.scheduler.lock().await;
-        finish_executed_jobs(&mut scheduler, &async_database, executed_jobs).await?;
+        finish_executed_jobs(
+            &mut scheduler,
+            &async_database,
+            executed_jobs,
+            &state.metrics,
+        )
+        .await?;
     }
     async_database.close().await;
     Ok(response)
@@ -327,6 +343,296 @@ async fn handle_health_request(
         "/_health/readyz" => Some(health_readyz_response(state, request.method).await),
         _ => None,
     }
+}
+
+async fn metrics_response(
+    state: Arc<DaemonState>,
+    method: ApiMethod,
+) -> crate::Result<crate::api::ApiResponse> {
+    if method != ApiMethod::Get {
+        return Ok(crate::api::ApiResponse {
+            status: 405,
+            body: "Method Not Allowed".to_owned(),
+        });
+    }
+
+    let registry = Registry::new();
+    let http_requests = IntCounter::with_opts(Opts::new(
+        "sporos_http_requests_total",
+        "Total HTTP requests received by the daemon.",
+    ))
+    .map_err(metrics_error)?;
+    registry
+        .register(Box::new(http_requests.clone()))
+        .map_err(metrics_error)?;
+    http_requests.inc_by(usize_to_u64(
+        state.metrics.http_requests.load(Ordering::Relaxed),
+    ));
+
+    let queue_events = IntCounterVec::new(
+        Opts::new(
+            "sporos_runtime_queue_events_total",
+            "Runtime queue lifecycle events.",
+        ),
+        &["queue", "event"],
+    )
+    .map_err(metrics_error)?;
+    let queue_capacity = IntGaugeVec::new(
+        Opts::new(
+            "sporos_runtime_queue_capacity",
+            "Configured runtime queue capacity.",
+        ),
+        &["queue"],
+    )
+    .map_err(metrics_error)?;
+    registry
+        .register(Box::new(queue_events.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(queue_capacity.clone()))
+        .map_err(metrics_error)?;
+    observe_queue_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.queues().jobs,
+    );
+    observe_queue_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.queues().webhooks,
+    );
+    observe_queue_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.queues().reverse_lookup,
+    );
+    observe_queue_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.queues().injection,
+    );
+    observe_queue_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.queues().blocking_local,
+    );
+    observe_blocking_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.blocking().filesystem,
+    );
+    observe_blocking_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.blocking().torrent_io,
+    );
+    observe_blocking_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.blocking().linking,
+    );
+    observe_blocking_metrics(
+        &queue_events,
+        &queue_capacity,
+        &state.services.blocking().matching,
+    );
+
+    observe_job_metrics(&registry, &state).await?;
+    observe_indexer_metrics(&registry, &state.app_dir).await?;
+
+    let encoder = TextEncoder::new();
+    let mut output = Vec::new();
+    encoder
+        .encode(&registry.gather(), &mut output)
+        .map_err(metrics_error)?;
+    let body = String::from_utf8(output)
+        .map_err(|error| daemon_error(format!("failed to encode metrics as UTF-8: {error}")))?;
+    Ok(crate::api::ApiResponse { status: 200, body })
+}
+
+fn observe_queue_metrics(events: &IntCounterVec, capacity: &IntGaugeVec, queue: &RuntimeTaskQueue) {
+    let stats = queue.stats();
+    capacity
+        .with_label_values(&[queue.name()])
+        .set(usize_to_i64(queue.capacity()));
+    for (event, value) in [
+        ("accepted", stats.enqueued),
+        ("rejected", stats.rejected),
+        ("started", stats.started),
+        ("finished", stats.finished),
+        ("cancelled", stats.cancelled),
+    ] {
+        events
+            .with_label_values(&[queue.name(), event])
+            .inc_by(usize_to_u64(value));
+    }
+}
+
+fn observe_blocking_metrics(
+    events: &IntCounterVec,
+    capacity: &IntGaugeVec,
+    executor: &RuntimeBlockingExecutor,
+) {
+    let stats = executor.stats();
+    capacity
+        .with_label_values(&[executor.name()])
+        .set(usize_to_i64(executor.capacity()));
+    for (event, value) in [
+        ("accepted", stats.enqueued),
+        ("rejected", stats.rejected),
+        ("started", stats.started),
+        ("finished", stats.finished),
+        ("cancelled", stats.cancelled),
+    ] {
+        events
+            .with_label_values(&[executor.name(), event])
+            .inc_by(usize_to_u64(value));
+    }
+}
+
+async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate::Result<()> {
+    let job_enabled = IntGaugeVec::new(
+        Opts::new("sporos_job_enabled", "Whether a scheduled job is enabled."),
+        &["job"],
+    )
+    .map_err(metrics_error)?;
+    let job_active = IntGaugeVec::new(
+        Opts::new("sporos_job_active", "Whether a scheduled job is active."),
+        &["job"],
+    )
+    .map_err(metrics_error)?;
+    let job_runs = IntCounterVec::new(
+        Opts::new(
+            "sporos_job_runs_total",
+            "Scheduled job dispatches accepted by the daemon.",
+        ),
+        &["job"],
+    )
+    .map_err(metrics_error)?;
+    let job_failures = IntCounterVec::new(
+        Opts::new(
+            "sporos_job_failures_total",
+            "Scheduled job executions that returned an error.",
+        ),
+        &["job"],
+    )
+    .map_err(metrics_error)?;
+    let job_last_run = IntGaugeVec::new(
+        Opts::new(
+            "sporos_job_last_run_timestamp_seconds",
+            "Persisted successful scheduler job last-run timestamp.",
+        ),
+        &["job"],
+    )
+    .map_err(metrics_error)?;
+    registry
+        .register(Box::new(job_enabled.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(job_active.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(job_runs.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(job_failures.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(job_last_run.clone()))
+        .map_err(metrics_error)?;
+
+    let database = AsyncDatabase::open_app_dir(&state.app_dir).await?;
+    if let Ok(scheduler) = state.scheduler.try_lock() {
+        for job in scheduler.jobs() {
+            let name = job.name.as_str();
+            job_enabled
+                .with_label_values(&[name])
+                .set(bool_to_i64(job.enabled));
+            job_active
+                .with_label_values(&[name])
+                .set(bool_to_i64(job.is_active));
+            job_runs.with_label_values(&[name]).inc_by(job.runs);
+            job_failures
+                .with_label_values(&[name])
+                .inc_by(usize_to_u64(state.metrics.job_failures(job.name)));
+            if let Some(last_run) = database.read_last_run(name).await? {
+                job_last_run
+                    .with_label_values(&[name])
+                    .set(last_run / 1_000);
+            }
+        }
+    }
+    database.close().await;
+    Ok(())
+}
+
+async fn observe_indexer_metrics(registry: &Registry, app_dir: &Path) -> crate::Result<()> {
+    let indexer_active = IntGaugeVec::new(
+        Opts::new("sporos_indexer_active", "Whether an indexer row is active."),
+        &["indexer"],
+    )
+    .map_err(metrics_error)?;
+    let indexer_rate_limited = IntGaugeVec::new(
+        Opts::new(
+            "sporos_indexer_rate_limited",
+            "Whether an indexer is currently marked rate limited.",
+        ),
+        &["indexer"],
+    )
+    .map_err(metrics_error)?;
+    let indexer_unknown_error = IntGaugeVec::new(
+        Opts::new(
+            "sporos_indexer_unknown_error",
+            "Whether an indexer is currently marked with an unknown error.",
+        ),
+        &["indexer"],
+    )
+    .map_err(metrics_error)?;
+    let indexer_retry_after = IntGaugeVec::new(
+        Opts::new(
+            "sporos_indexer_retry_after_timestamp_seconds",
+            "Indexer retry-after timestamp when present.",
+        ),
+        &["indexer"],
+    )
+    .map_err(metrics_error)?;
+    registry
+        .register(Box::new(indexer_active.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(indexer_rate_limited.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(indexer_unknown_error.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(indexer_retry_after.clone()))
+        .map_err(metrics_error)?;
+
+    let database = AsyncDatabase::open_app_dir(app_dir).await?;
+    for indexer in database.indexer_health_rows().await? {
+        let label = indexer.url.as_str();
+        indexer_active
+            .with_label_values(&[label])
+            .set(bool_to_i64(indexer.active));
+        indexer_rate_limited
+            .with_label_values(&[label])
+            .set(bool_to_i64(
+                indexer.status.as_deref() == Some("RATE_LIMITED"),
+            ));
+        indexer_unknown_error
+            .with_label_values(&[label])
+            .set(bool_to_i64(
+                indexer.status.as_deref() == Some("UNKNOWN_ERROR"),
+            ));
+        if let Some(retry_after) = indexer.retry_after {
+            indexer_retry_after
+                .with_label_values(&[label])
+                .set(retry_after / 1_000);
+        }
+    }
+    database.close().await;
+    Ok(())
 }
 
 fn health_livez_response(method: ApiMethod) -> crate::api::ApiResponse {
@@ -447,6 +753,7 @@ async fn finish_executed_jobs(
     scheduler: &mut Scheduler,
     database: &AsyncDatabase,
     executed_jobs: Vec<ExecutedJob>,
+    metrics: &DaemonMetrics,
 ) -> crate::Result<()> {
     let mut first_error = None;
     for executed in executed_jobs {
@@ -464,6 +771,7 @@ async fn finish_executed_jobs(
                     }
                 }
                 Err(error) => {
+                    metrics.record_job_failure(executed.name);
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -615,11 +923,59 @@ fn daemon_error(message: impl Into<Cow<'static, str>>) -> SporosError {
     }
 }
 
+fn metrics_error(error: prometheus::Error) -> SporosError {
+    daemon_error(format!("failed to render Prometheus metrics: {error}"))
+}
+
+fn bool_to_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Default)]
+struct DaemonMetrics {
+    http_requests: AtomicUsize,
+    rss_failures: AtomicUsize,
+    search_failures: AtomicUsize,
+    update_indexer_caps_failures: AtomicUsize,
+    inject_failures: AtomicUsize,
+    cleanup_failures: AtomicUsize,
+}
+
+impl DaemonMetrics {
+    fn record_job_failure(&self, name: JobName) {
+        self.job_failure_counter(name)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn job_failures(&self, name: JobName) -> usize {
+        self.job_failure_counter(name).load(Ordering::Relaxed)
+    }
+
+    fn job_failure_counter(&self, name: JobName) -> &AtomicUsize {
+        match name {
+            JobName::Rss => &self.rss_failures,
+            JobName::Search => &self.search_failures,
+            JobName::UpdateIndexerCaps => &self.update_indexer_caps_failures,
+            JobName::Inject => &self.inject_failures,
+            JobName::Cleanup => &self.cleanup_failures,
+        }
+    }
+}
+
 struct DaemonState {
     app_dir: PathBuf,
     config: RuntimeConfig,
     services: Arc<RuntimeServices>,
     scheduler: Mutex<Scheduler>,
+    metrics: Arc<DaemonMetrics>,
 }
 
 struct RuntimeHandlers<'a> {
@@ -755,7 +1111,14 @@ async fn run_webhook_worker(
             shutdown.child_token(),
         )
         .await;
-        finish_executed_jobs(&mut plan.scheduler, &async_database, executed_jobs).await?;
+        let metrics = DaemonMetrics::default();
+        finish_executed_jobs(
+            &mut plan.scheduler,
+            &async_database,
+            executed_jobs,
+            &metrics,
+        )
+        .await?;
     }
     let notifier = crate::notifications::NotificationSender::from_config(
         &config,
@@ -802,6 +1165,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         sync::Arc,
+        sync::atomic::Ordering,
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::Mutex;
@@ -982,6 +1346,7 @@ mod tests {
             config,
             services: RuntimeServices::start(CancellationToken::new()),
             scheduler: Mutex::new(scheduler),
+            metrics: Arc::new(super::DaemonMetrics::default()),
         });
 
         let ping = handle_runtime_request(
@@ -1015,6 +1380,7 @@ mod tests {
             config,
             services: RuntimeServices::start(CancellationToken::new()),
             scheduler: Mutex::new(Scheduler::new(Vec::new())),
+            metrics: Arc::new(super::DaemonMetrics::default()),
         });
 
         let livez = handle_runtime_request(
@@ -1046,6 +1412,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_endpoint_exports_runtime_jobs_and_indexers() {
+        let root = temp_path("daemon-metrics");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        database
+            .sync_indexers([("https://indexer.example/api", "indexer-secret")])
+            .expect("indexer sync");
+        let indexer_id = database
+            .indexer_id("https://indexer.example/api")
+            .expect("indexer id");
+        database
+            .set_indexer_status(indexer_id, Some("RATE_LIMITED"), Some(2_000))
+            .expect("indexer status");
+        let async_database = AsyncDatabase::open_app_dir(&root).await.expect("database");
+        async_database
+            .write_last_run(JobName::Search.as_str(), 1_000)
+            .await
+            .expect("last run");
+        async_database.close().await;
+
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let mut search = ScheduledJob::new(JobName::Search, 60_000, true);
+        search.is_active = true;
+        search.runs = 2;
+        let services = RuntimeServices::start(CancellationToken::new());
+        let _accepted = services
+            .queues()
+            .jobs
+            .try_submit("search", |_shutdown| async {});
+        wait_for_finished(&services.queues().jobs).await;
+        let metrics = Arc::new(super::DaemonMetrics::default());
+        metrics.http_requests.store(3, Ordering::Relaxed);
+        metrics.record_job_failure(JobName::Search);
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services,
+            scheduler: Mutex::new(Scheduler::new(vec![search])),
+            metrics,
+        });
+
+        let response = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(ApiMethod::Get, "/metrics", BTreeMap::new(), ""),
+        )
+        .await
+        .expect("metrics");
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("sporos_http_requests_total 3"));
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_runtime_queue_events_total{event="accepted",queue="jobs"} 1"#)
+        );
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_job_runs_total{job="search"} 2"#)
+        );
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_job_failures_total{job="search"} 1"#)
+        );
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_job_last_run_timestamp_seconds{job="search"} 1"#)
+        );
+        assert!(
+            response.body.contains(
+                r#"sporos_indexer_rate_limited{indexer="https://indexer.example/api"} 1"#
+            )
+        );
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn status_request_does_not_wait_for_scheduler_lock() {
         let root = temp_path("daemon-status-no-scheduler-lock");
         std::fs::create_dir_all(&root).expect("root");
@@ -1058,6 +1505,7 @@ mod tests {
             config,
             services: RuntimeServices::start(CancellationToken::new()),
             scheduler: Mutex::new(scheduler),
+            metrics: Arc::new(super::DaemonMetrics::default()),
         });
         let guard = state.scheduler.lock().await;
 
@@ -1108,6 +1556,7 @@ mod tests {
             config,
             services,
             scheduler: Mutex::new(scheduler),
+            metrics: Arc::new(super::DaemonMetrics::default()),
         });
 
         let ping = tokio::time::timeout(
@@ -1248,6 +1697,7 @@ mod tests {
                     result: Some(Err(SporosError::configuration("rss failed"))),
                 },
             ],
+            &super::DaemonMetrics::default(),
         )
         .await;
 
@@ -1341,6 +1791,20 @@ mod tests {
         assert!(
             queue.stats().started > 0,
             "{} queue should start held work",
+            queue.name()
+        );
+    }
+
+    async fn wait_for_finished(queue: &RuntimeTaskQueue) {
+        for _attempt in 0..20 {
+            if queue.stats().finished > 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            queue.stats().finished > 0,
+            "{} queue should finish work",
             queue.name()
         );
     }
