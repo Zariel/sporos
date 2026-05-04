@@ -842,7 +842,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         let database = Database::open_app_dir(&root).expect("database");
         let raw = RawConfig {
-            port: Some(None),
+            listen_port: Some(None),
             ..RawConfig::default()
         };
         let config = RuntimeConfig::normalize(raw, &root).expect("config");

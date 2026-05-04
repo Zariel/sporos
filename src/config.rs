@@ -251,10 +251,6 @@ pub struct RawConfig {
     pub duplicate_categories: Option<bool>,
     /// Notification URLs.
     pub notification_webhook_urls: Vec<String>,
-    /// Daemon port.
-    pub port: Option<Option<u16>>,
-    /// Daemon host.
-    pub host: Option<IpAddr>,
     /// Service listener port.
     pub listen_port: Option<Option<u16>>,
     /// Service listener host.
@@ -356,10 +352,6 @@ pub struct RuntimeConfig {
     pub duplicate_categories: bool,
     /// Notification URLs.
     pub notification_webhook_urls: Vec<String>,
-    /// Daemon port. `None` preserves `--no-port`.
-    pub port: Option<u16>,
-    /// Daemon host.
-    pub host: Option<IpAddr>,
     /// Service listener port. `None` disables HTTP intentionally.
     pub listen_port: Option<u16>,
     /// Service listener host.
@@ -456,22 +448,10 @@ impl RuntimeConfig {
             torrent_clients,
             duplicate_categories: raw.duplicate_categories.unwrap_or(false),
             notification_webhook_urls,
-            listen_port: raw
-                .listen_port
-                .or(raw.port)
-                .unwrap_or(Some(DEFAULT_LISTEN_PORT)),
+            listen_port: raw.listen_port.unwrap_or(Some(DEFAULT_LISTEN_PORT)),
             listen_host: raw
                 .listen_host
-                .or(raw.host)
                 .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-            port: raw
-                .listen_port
-                .or(raw.port)
-                .unwrap_or(Some(DEFAULT_LISTEN_PORT)),
-            host: raw
-                .listen_host
-                .or(raw.host)
-                .or(Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))),
             rss_cadence: raw.rss_cadence,
             search_cadence: raw.search_cadence,
             snatch_timeout: raw.snatch_timeout,
@@ -681,10 +661,10 @@ pub struct FileConfig {
     pub source: Option<String>,
 }
 
-/// Selected config file path plus the compatibility app directory used for state.
+/// Selected config file path plus the default state directory.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConfigFileTarget {
-    /// Compatibility app directory for database, cache, and default output paths.
+    /// Default state directory for database, cache, and output paths.
     pub app_dir: PathBuf,
     /// Exact config file path to read or generate.
     pub path: PathBuf,
@@ -692,12 +672,9 @@ pub struct ConfigFileTarget {
     pub explicit: bool,
 }
 
-/// Resolve and create the compatibility app directory.
+/// Resolve and create the local default state directory.
 pub fn app_dir() -> crate::Result<PathBuf> {
-    // CONFIG_DIR is retained as compatibility input and container state location.
-    let dir = if let Some(config_dir) = env::var_os("CONFIG_DIR") {
-        PathBuf::from(config_dir)
-    } else if cfg!(windows) {
+    let dir = if cfg!(windows) {
         env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .ok_or_else(|| config_error("LOCALAPPDATA is not set"))?
@@ -1164,25 +1141,6 @@ mod tests {
     }
 
     #[test]
-    fn maps_legacy_daemon_listener_fields_into_new_contract() {
-        let config = RuntimeConfig::normalize(
-            RawConfig {
-                host: Some("127.0.0.1".parse().expect("host")),
-                port: Some(None),
-                ..RawConfig::default()
-            },
-            Path::new("/state"),
-        )
-        .expect("config");
-
-        assert_eq!(
-            config.listen_host,
-            "127.0.0.1".parse::<IpAddr>().expect("host")
-        );
-        assert_eq!(config.listen_port, None);
-    }
-
-    #[test]
     fn explicit_state_and_database_paths_do_not_follow_config_file_location() {
         let raw = RawConfig {
             state_dir: Some("/writable/state".into()),
@@ -1492,7 +1450,7 @@ mod tests {
     fn applies_namespaced_scalar_env_overrides() {
         let mut raw = RawConfig {
             api_key: Some("file-file-file-file-file".to_owned()),
-            port: Some(Some(1111)),
+            listen_port: Some(Some(1111)),
             ..RawConfig::default()
         };
 
@@ -1586,6 +1544,15 @@ mod tests {
             .expect_err("camelCase key is rejected");
 
         assert!(error.to_string().contains("failed to parse config.toml"));
+    }
+
+    #[test]
+    fn rejects_legacy_daemon_listener_keys() {
+        for source in ["port = 9000", "host = \"127.0.0.1\""] {
+            let error = raw_config_from_source(source).expect_err("legacy listener key rejected");
+
+            assert!(error.to_string().contains("failed to parse config.toml"));
+        }
     }
 
     #[test]

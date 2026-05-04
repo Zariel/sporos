@@ -106,10 +106,10 @@ where
                 crate::operations::reset_api_key_async(&database).await?
             );
         }
-        Some((command @ ("daemon" | "serve"), matches)) => {
+        Some(("serve", matches)) => {
             let mut raw_config = load_raw_config(&config_file)?;
             apply_shared_options(matches, &mut raw_config)?;
-            apply_daemon_options(matches, &mut raw_config)?;
+            apply_service_options(matches, &mut raw_config)?;
             let config = normalize_config(&config_file, raw_config)?;
             let state_dir = config.state_dir.clone();
             let _runtime = crate::startup::full_runtime(
@@ -121,8 +121,7 @@ where
             let shutdown = crate::daemon::install_shutdown_handler();
             let run = crate::daemon::run_daemon(&state_dir, &config, &database, shutdown).await?;
             println!(
-                "{} stopped: serving={}, jobs={}",
-                command,
+                "serve stopped: serving={}, jobs={}",
                 run.listen_addr
                     .map(|address| address.to_string())
                     .unwrap_or_else(|| "disabled".to_owned()),
@@ -426,7 +425,7 @@ fn apply_inject_options(matches: &ArgMatches, raw_config: &mut crate::config::Ra
     }
 }
 
-fn apply_daemon_options(
+fn apply_service_options(
     matches: &ArgMatches,
     raw_config: &mut crate::config::RawConfig,
 ) -> crate::Result<()> {
@@ -536,13 +535,8 @@ pub fn build_cli() -> Command {
                 .arg(Arg::new("api-key").long("api-key").num_args(1)),
         )
         .subcommand(Command::new("reset-api-key").about("Generate and store a new service API key"))
-        .subcommand(add_daemon_options(add_shared_options(
+        .subcommand(add_service_options(add_shared_options(
             Command::new("serve").about("Run the single-writer service runtime"),
-        )))
-        .subcommand(add_daemon_options(add_shared_options(
-            Command::new("daemon")
-                .about("Deprecated compatibility alias for serve")
-                .hide(true),
         )))
         .subcommand(
             add_shared_options(Command::new("rss"))
@@ -565,7 +559,7 @@ pub fn build_cli() -> Command {
         )
 }
 
-fn add_daemon_options(command: Command) -> Command {
+fn add_service_options(command: Command) -> Command {
     command
         .arg(
             Arg::new("port")
@@ -755,7 +749,7 @@ fn repeating(name: &'static str, long: &'static str) -> Arg {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_daemon_options, apply_inject_options, apply_search_options, apply_shared_options,
+        apply_inject_options, apply_search_options, apply_service_options, apply_shared_options,
         build_cli,
     };
     use crate::config::{ApiIntegrationConfig, RawConfig, TorrentClientConfig};
@@ -780,7 +774,6 @@ mod tests {
             "api-key",
             "reset-api-key",
             "serve",
-            "daemon",
             "rss",
             "search",
             "inject",
@@ -818,18 +811,6 @@ mod tests {
             );
             assert!(!command.is_hide_set());
         }
-    }
-
-    #[test]
-    fn daemon_is_hidden_compatibility_alias() {
-        let cli = build_cli();
-        let command = cli.find_subcommand("daemon").expect("daemon command");
-
-        assert_eq!(
-            command.get_about().map(ToString::to_string).as_deref(),
-            Some("Deprecated compatibility alias for serve")
-        );
-        assert!(command.is_hide_set());
     }
 
     #[test]
@@ -880,24 +861,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_daemon_and_inject_specific_options() {
-        build_cli()
-            .try_get_matches_from([
-                "cross-seed",
-                "--config",
-                "/etc/sporos/config.toml",
-                "daemon",
-                "--port",
-                "2468",
-                "--host",
-                "127.0.0.1",
-                "--search-cadence",
-                "1 day",
-                "--rss-cadence",
-                "30 minutes",
-            ])
-            .expect("daemon command parses");
+    fn rejects_removed_daemon_alias() {
+        let result = build_cli().try_get_matches_from(["cross-seed", "daemon"]);
 
+        assert!(result.is_err(), "daemon alias should not parse");
+    }
+
+    #[test]
+    fn parses_serve_and_inject_specific_options() {
         build_cli()
             .try_get_matches_from([
                 "cross-seed",
@@ -1088,7 +1059,7 @@ mod tests {
         let matches = build_cli()
             .try_get_matches_from([
                 "cross-seed",
-                "daemon",
+                "serve",
                 "--port",
                 "3333",
                 "--api-key",
@@ -1097,7 +1068,7 @@ mod tests {
             .expect("matches");
         let (_, matches) = matches.subcommand().expect("subcommand");
         let mut raw = RawConfig {
-            port: Some(Some(1111)),
+            listen_port: Some(Some(1111)),
             api_key: Some("file-file-file-file-file".to_owned()),
             ..RawConfig::default()
         };
@@ -1113,7 +1084,7 @@ mod tests {
             &mut raw,
         )
         .expect("env");
-        apply_daemon_options(matches, &mut raw).expect("daemon");
+        apply_service_options(matches, &mut raw).expect("serve");
 
         assert_eq!(raw.listen_port, Some(Some(3333)));
         assert_eq!(raw.api_key.as_deref(), Some("cli-cli-cli-cli-cli-cli"));

@@ -234,7 +234,7 @@ async fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
     let database = Database::open_app_dir(&root).expect("database");
     let config = RuntimeConfig::normalize(
         RawConfig {
-            port: Some(None),
+            listen_port: Some(None),
             rss_cadence: Some(600_000),
             data_dirs: vec![data_dir],
             ..RawConfig::default()

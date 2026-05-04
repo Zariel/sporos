@@ -1715,7 +1715,7 @@ mod tests {
         let database = Database::open_app_dir(&root).expect("database");
         let config = RuntimeConfig::normalize(
             RawConfig {
-                port: Some(None),
+                listen_port: Some(None),
                 ..RawConfig::default()
             },
             &root,
@@ -1788,7 +1788,7 @@ mod tests {
                     TorrentClientConfig::parse("qbittorrent:http://localhost:8080")
                         .expect("client"),
                 ],
-                port: Some(None),
+                listen_port: Some(None),
                 ..RawConfig::default()
             },
             &root,
@@ -1852,7 +1852,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("data dir");
         let config = RuntimeConfig::normalize(
             RawConfig {
-                port: Some(None),
+                listen_port: Some(None),
                 search_cadence: Some(86_400_000),
                 exclude_recent_search: Some(259_200_000),
                 exclude_older: Some(518_400_000),
