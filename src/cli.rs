@@ -526,9 +526,9 @@ pub fn build_cli() -> Command {
         .subcommand(Command::new("clear-client-cache"))
         .subcommand(Command::new("api-key").arg(Arg::new("api-key").long("api-key").num_args(1)))
         .subcommand(Command::new("reset-api-key"))
-        .subcommand(add_daemon_options(add_shared_options(Command::new(
-            "serve",
-        ))))
+        .subcommand(add_daemon_options(add_shared_options(
+            Command::new("serve").about("Run the single-writer service runtime"),
+        )))
         .subcommand(add_daemon_options(add_shared_options(Command::new(
             "daemon",
         ))))

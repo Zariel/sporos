@@ -1449,6 +1449,13 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 "stateDirReady": state_dir_ready,
                 "databaseReady": database_ready,
             },
+            "ownership": {
+                "mode": "single_writer",
+                "singleWriter": true,
+                "stateLockPath": display_path(&self.config.state_dir.join("sporos.lock")),
+                "stateDir": display_path(&self.config.state_dir),
+                "databasePath": display_path(&self.config.database_path),
+            },
             "readiness": {
                 "status": if ready { "ready" } else { "not_ready" },
                 "checks": {
@@ -2197,6 +2204,12 @@ mod tests {
         assert_eq!(
             body["state"]["databasePath"].as_str(),
             Some(root.join("sporos.db").to_string_lossy().as_ref())
+        );
+        assert_eq!(body["ownership"]["mode"], "single_writer");
+        assert_eq!(body["ownership"]["singleWriter"], true);
+        assert_eq!(
+            body["ownership"]["stateLockPath"].as_str(),
+            Some(root.join("sporos.lock").to_string_lossy().as_ref())
         );
         assert_eq!(body["readiness"]["status"], "ready");
         assert_eq!(body["scheduler"]["available"], true);

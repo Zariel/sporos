@@ -1,7 +1,7 @@
 //! Startup validation, logger setup, runtime wiring, and graceful shutdown.
 
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -269,14 +269,31 @@ pub fn full_runtime(
     hooks.validate_clients(&config)?;
     hooks.validate_indexers(&config)?;
     hooks.validate_arrs(&config)?;
+    let state_lock = acquire_state_lock(&config)?;
+    tracing::info!(
+        state_dir = %config.state_dir.display(),
+        database_path = %config.database_path.display(),
+        lock_path = %state_lock.path.display(),
+        "single-writer service ownership acquired"
+    );
 
-    Ok(RuntimeContext {
+    let mut context = RuntimeContext {
         app_dir,
         mode: StartupMode::Full,
         redactor: Redactor::from_config(&config),
         config: Some(config),
         cleanup_hooks: Vec::new(),
-    })
+    };
+    context.push_cleanup(move || {
+        let path = state_lock.path.clone();
+        drop(state_lock);
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(lock_path = %path.display(), "failed to remove state lock: {error}");
+        }
+    });
+    Ok(context)
 }
 
 /// Initialize stderr tracing without requiring app-directory log files.
@@ -406,6 +423,46 @@ pub fn check_config_paths(config: &RuntimeConfig) -> crate::Result<()> {
         }
     }
     Ok(())
+}
+
+struct StateLock {
+    path: PathBuf,
+    _file: File,
+}
+
+fn acquire_state_lock(config: &RuntimeConfig) -> crate::Result<StateLock> {
+    let path = config.state_dir.join("sporos.lock");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                SporosError::configuration(format!(
+                    "state directory is already owned by another Sporos service: {}",
+                    path.display()
+                ))
+            } else {
+                SporosError::configuration(format!(
+                    "failed to acquire state lock {}: {error}",
+                    path.display()
+                ))
+            }
+        })?;
+    writeln!(
+        file,
+        "pid={}\nstate_dir={}\ndatabase_path={}",
+        std::process::id(),
+        config.state_dir.display(),
+        config.database_path.display()
+    )
+    .map_err(|error| {
+        SporosError::configuration(format!(
+            "failed to write state lock {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(StateLock { path, _file: file })
 }
 
 fn verify_readable_dir(path: &Path, label: &str) -> crate::Result<()> {
@@ -612,11 +669,13 @@ mod tests {
     fn full_runtime_runs_hooks_and_shutdown_callbacks() {
         let root = temp_path("runtime");
         let config = test_config(root.clone());
+        let lock_path = config.state_dir.join("sporos.lock");
         let hooks = CountingHooks::default();
 
         let mut runtime = full_runtime(root.clone(), config, &hooks).expect("runtime");
         assert_eq!(runtime.mode, StartupMode::Full);
         assert_eq!(hooks.count.load(Ordering::SeqCst), 4);
+        assert!(lock_path.exists());
 
         let cleanup_count = Arc::new(AtomicUsize::new(0));
         let cleanup_count_clone = Arc::clone(&cleanup_count);
@@ -626,6 +685,25 @@ mod tests {
         runtime.shutdown();
 
         assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+        assert!(!lock_path.exists());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_runtime_rejects_shared_state_until_lock_released() {
+        let root = temp_path("runtime-single-writer");
+        let config = test_config(root.clone());
+        let hooks = CountingHooks::default();
+
+        let runtime = full_runtime(root.clone(), config.clone(), &hooks).expect("runtime");
+        let error = full_runtime(root.clone(), config.clone(), &hooks)
+            .err()
+            .expect("second runtime should fail");
+        assert!(error.to_string().contains("already owned"));
+
+        runtime.shutdown();
+        let runtime = full_runtime(root.clone(), config, &hooks).expect("runtime after release");
+        runtime.shutdown();
         let _cleanup = fs::remove_dir_all(root);
     }
 
