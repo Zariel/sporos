@@ -8,7 +8,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -19,11 +19,13 @@ use axum::{
     Router,
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::any,
 };
-use prometheus::{Encoder, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -247,7 +249,6 @@ async fn handle_axum_request(
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
-    state.metrics.http_requests.fetch_add(1, Ordering::Relaxed);
     let path = uri.path().to_owned();
     let route = http_route(&path);
     let method_label = method.as_str().to_owned();
@@ -269,7 +270,7 @@ async fn handle_axum_request(
         remote_addr: Some(remote_addr.clone()),
     };
 
-    let response = match handle_runtime_request(state, request).await {
+    let response = match handle_runtime_request(Arc::clone(&state), request).await {
         Ok(response) => response,
         Err(error) => {
             tracing::error!("API request failed: {error}");
@@ -279,16 +280,27 @@ async fn handle_axum_request(
             }
         }
     };
+    let latency_ms = started.elapsed().as_millis();
+    state
+        .metrics
+        .record_http_request(&method_label, route, response.status, latency_ms);
     tracing::info!(
         http.method = %method_label,
         http.route = route,
         http.status_code = response.status,
-        http.latency_ms = started.elapsed().as_millis(),
+        http.latency_ms = latency_ms,
         net.peer.addr = %remote_addr,
         "http request completed"
     );
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
-    (status, response.body).into_response()
+    let mut response = (status, response.body).into_response();
+    if route == "/metrics" && status == StatusCode::OK {
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        );
+    }
+    response
 }
 
 fn http_route(path: &str) -> &'static str {
@@ -404,6 +416,26 @@ async fn metrics_response(
     }
 
     let registry = Registry::new();
+    let service_info = IntGaugeVec::new(
+        Opts::new("sporos_service_info", "Static service information."),
+        &["version"],
+    )
+    .map_err(metrics_error)?;
+    let service_uptime = IntGauge::with_opts(Opts::new(
+        "sporos_service_uptime_seconds",
+        "Seconds since this service runtime started.",
+    ))
+    .map_err(metrics_error)?;
+    registry
+        .register(Box::new(service_info.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(service_uptime.clone()))
+        .map_err(metrics_error)?;
+    service_info.with_label_values(&[crate::VERSION]).set(1);
+    service_uptime
+        .set(i64::try_from(state.metrics.started_at.elapsed().as_secs()).unwrap_or(i64::MAX));
+
     let http_requests = IntCounter::with_opts(Opts::new(
         "sporos_http_requests_total",
         "Total HTTP requests received by the daemon.",
@@ -415,6 +447,37 @@ async fn metrics_response(
     http_requests.inc_by(usize_to_u64(
         state.metrics.http_requests.load(Ordering::Relaxed),
     ));
+    let http_requests_by_route = IntCounterVec::new(
+        Opts::new(
+            "sporos_http_requests_by_route_total",
+            "Total HTTP requests by bounded method, route, and status labels.",
+        ),
+        &["method", "route", "status"],
+    )
+    .map_err(metrics_error)?;
+    let http_latency_by_route = IntCounterVec::new(
+        Opts::new(
+            "sporos_http_request_latency_ms_total",
+            "Total HTTP request latency in milliseconds by bounded labels.",
+        ),
+        &["method", "route", "status"],
+    )
+    .map_err(metrics_error)?;
+    registry
+        .register(Box::new(http_requests_by_route.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(http_latency_by_route.clone()))
+        .map_err(metrics_error)?;
+    for (key, value) in state.metrics.http_metrics() {
+        let status = key.status.to_string();
+        http_requests_by_route
+            .with_label_values(&[&key.method, &key.route, &status])
+            .inc_by(usize_to_u64(value.count));
+        http_latency_by_route
+            .with_label_values(&[&key.method, &key.route, &status])
+            .inc_by(usize_to_u64(value.latency_ms_total));
+    }
 
     let queue_events = IntCounterVec::new(
         Opts::new(
@@ -432,55 +495,95 @@ async fn metrics_response(
         &["queue"],
     )
     .map_err(metrics_error)?;
+    let queue_depth = IntGaugeVec::new(
+        Opts::new(
+            "sporos_runtime_queue_depth",
+            "Runtime commands queued but not started.",
+        ),
+        &["queue"],
+    )
+    .map_err(metrics_error)?;
+    let queue_in_flight = IntGaugeVec::new(
+        Opts::new(
+            "sporos_runtime_queue_in_flight",
+            "Runtime commands started and not yet finished or cancelled.",
+        ),
+        &["queue"],
+    )
+    .map_err(metrics_error)?;
     registry
         .register(Box::new(queue_events.clone()))
         .map_err(metrics_error)?;
     registry
         .register(Box::new(queue_capacity.clone()))
         .map_err(metrics_error)?;
+    registry
+        .register(Box::new(queue_depth.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(queue_in_flight.clone()))
+        .map_err(metrics_error)?;
     observe_queue_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.queues().jobs,
     );
     observe_queue_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.queues().webhooks,
     );
     observe_queue_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.queues().reverse_lookup,
     );
     observe_queue_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.queues().injection,
     );
     observe_queue_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.queues().blocking_local,
     );
     observe_blocking_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.blocking().filesystem,
     );
     observe_blocking_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.blocking().torrent_io,
     );
     observe_blocking_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.blocking().linking,
     );
     observe_blocking_metrics(
         &queue_events,
         &queue_capacity,
+        &queue_depth,
+        &queue_in_flight,
         &state.services.blocking().matching,
     );
 
@@ -497,11 +600,25 @@ async fn metrics_response(
     Ok(crate::api::ApiResponse { status: 200, body })
 }
 
-fn observe_queue_metrics(events: &IntCounterVec, capacity: &IntGaugeVec, queue: &RuntimeTaskQueue) {
+fn observe_queue_metrics(
+    events: &IntCounterVec,
+    capacity: &IntGaugeVec,
+    depth: &IntGaugeVec,
+    in_flight: &IntGaugeVec,
+    queue: &RuntimeTaskQueue,
+) {
     let stats = queue.stats();
     capacity
         .with_label_values(&[queue.name()])
         .set(usize_to_i64(queue.capacity()));
+    depth
+        .with_label_values(&[queue.name()])
+        .set(usize_to_i64(stats.enqueued.saturating_sub(stats.started)));
+    in_flight
+        .with_label_values(&[queue.name()])
+        .set(usize_to_i64(stats.started.saturating_sub(
+            stats.finished.saturating_add(stats.cancelled),
+        )));
     for (event, value) in [
         ("accepted", stats.enqueued),
         ("rejected", stats.rejected),
@@ -518,12 +635,22 @@ fn observe_queue_metrics(events: &IntCounterVec, capacity: &IntGaugeVec, queue: 
 fn observe_blocking_metrics(
     events: &IntCounterVec,
     capacity: &IntGaugeVec,
+    depth: &IntGaugeVec,
+    in_flight: &IntGaugeVec,
     executor: &RuntimeBlockingExecutor,
 ) {
     let stats = executor.stats();
     capacity
         .with_label_values(&[executor.name()])
         .set(usize_to_i64(executor.capacity()));
+    depth
+        .with_label_values(&[executor.name()])
+        .set(usize_to_i64(stats.enqueued.saturating_sub(stats.started)));
+    in_flight
+        .with_label_values(&[executor.name()])
+        .set(usize_to_i64(stats.started.saturating_sub(
+            stats.finished.saturating_add(stats.cancelled),
+        )));
     for (event, value) in [
         ("accepted", stats.enqueued),
         ("rejected", stats.rejected),
@@ -594,6 +721,14 @@ async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate:
         &["job"],
     )
     .map_err(metrics_error)?;
+    let job_duration = IntCounterVec::new(
+        Opts::new(
+            "sporos_job_duration_ms_total",
+            "Total wall-clock duration of completed scheduled job executions.",
+        ),
+        &["job"],
+    )
+    .map_err(metrics_error)?;
     let job_last_run = IntGaugeVec::new(
         Opts::new(
             "sporos_job_last_run_timestamp_seconds",
@@ -615,28 +750,39 @@ async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate:
         .register(Box::new(job_failures.clone()))
         .map_err(metrics_error)?;
     registry
+        .register(Box::new(job_duration.clone()))
+        .map_err(metrics_error)?;
+    registry
         .register(Box::new(job_last_run.clone()))
         .map_err(metrics_error)?;
 
     let database = AsyncDatabase::open(&state.config.database_path).await?;
-    if let Ok(scheduler) = state.scheduler.try_lock() {
-        for job in scheduler.jobs() {
-            let name = job.name.as_str();
-            job_enabled
+    let jobs = match state.scheduler.try_lock() {
+        Ok(scheduler) => scheduler.jobs().to_vec(),
+        Err(_error) => DaemonPlan::from_config(&state.config)
+            .scheduler
+            .jobs()
+            .to_vec(),
+    };
+    for job in jobs {
+        let name = job.name.as_str();
+        job_enabled
+            .with_label_values(&[name])
+            .set(bool_to_i64(job.enabled));
+        job_active
+            .with_label_values(&[name])
+            .set(bool_to_i64(job.is_active));
+        job_runs.with_label_values(&[name]).inc_by(job.runs);
+        job_failures
+            .with_label_values(&[name])
+            .inc_by(usize_to_u64(state.metrics.job_failures(job.name)));
+        job_duration
+            .with_label_values(&[name])
+            .inc_by(usize_to_u64(state.metrics.job_duration_ms(job.name)));
+        if let Some(last_run) = database.read_last_run(name).await? {
+            job_last_run
                 .with_label_values(&[name])
-                .set(bool_to_i64(job.enabled));
-            job_active
-                .with_label_values(&[name])
-                .set(bool_to_i64(job.is_active));
-            job_runs.with_label_values(&[name]).inc_by(job.runs);
-            job_failures
-                .with_label_values(&[name])
-                .inc_by(usize_to_u64(state.metrics.job_failures(job.name)));
-            if let Some(last_run) = database.read_last_run(name).await? {
-                job_last_run
-                    .with_label_values(&[name])
-                    .set(last_run / 1_000);
-            }
+                .set(last_run / 1_000);
         }
     }
     database.close().await;
@@ -736,7 +882,7 @@ async fn health_readyz_response(
         };
     }
 
-    let app_dir_ready = tokio::fs::metadata(&state.app_dir)
+    let state_dir_ready = tokio::fs::metadata(&state.app_dir)
         .await
         .is_ok_and(|metadata| metadata.is_dir());
     let database_ready = match AsyncDatabase::open(&state.config.database_path).await {
@@ -750,13 +896,24 @@ async fn health_readyz_response(
         }
     };
     let runtime_ready = !state.services.cancellation_token().is_cancelled();
-    let ready = app_dir_ready && database_ready && runtime_ready;
+    let scheduler_ready = state.scheduler.try_lock().is_ok();
+    let local_paths_ready = configured_local_paths_ready(&state.config).await;
+    let intake_ready = state.config.listen_port.is_some() && runtime_ready;
+    let ready = state_dir_ready
+        && database_ready
+        && runtime_ready
+        && scheduler_ready
+        && local_paths_ready
+        && intake_ready;
     let body = serde_json::json!({
         "status": if ready { "ready" } else { "not_ready" },
         "checks": {
-            "appDir": app_dir_ready,
+            "stateDir": state_dir_ready,
             "database": database_ready,
             "runtime": runtime_ready,
+            "scheduler": scheduler_ready,
+            "localPaths": local_paths_ready,
+            "intake": intake_ready,
         },
     })
     .to_string();
@@ -765,6 +922,24 @@ async fn health_readyz_response(
         status: if ready { 200 } else { 503 },
         body,
     }
+}
+
+async fn configured_local_paths_ready(config: &RuntimeConfig) -> bool {
+    for path in config
+        .data_dirs
+        .iter()
+        .chain(config.link_dirs.iter())
+        .chain(config.torrent_dir.iter())
+        .chain(config.inject_dir.iter())
+    {
+        if !tokio::fs::metadata(path)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir() || metadata.is_file())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn api_method(method: &Method) -> ApiMethod {
@@ -784,6 +959,7 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
 struct ExecutedJob {
     name: JobName,
     completion_last_run: Option<i64>,
+    duration_ms: Option<u128>,
     result: Option<crate::Result<()>>,
 }
 
@@ -804,10 +980,12 @@ async fn execute_ran_jobs(
             executed.push(ExecutedJob {
                 name: result.name,
                 completion_last_run: result.completion_last_run,
+                duration_ms: None,
                 result: None,
             });
             continue;
         }
+        let started_at = Instant::now();
         let job_result = tokio::select! {
             () = shutdown.cancelled() => {
                 tracing::info!(job = result.name.as_str(), "job cancelled during shutdown");
@@ -820,6 +998,9 @@ async fn execute_ran_jobs(
         executed.push(ExecutedJob {
             name: result.name,
             completion_last_run: result.completion_last_run,
+            duration_ms: job_result
+                .as_ref()
+                .map(|_result| started_at.elapsed().as_millis()),
             result: job_result,
         });
     }
@@ -836,6 +1017,9 @@ async fn finish_executed_jobs(
     for executed in executed_jobs {
         scheduler.finish_job(executed.name);
         if let Some(result) = executed.result {
+            if let Some(duration_ms) = executed.duration_ms {
+                metrics.record_job_duration(executed.name, duration_ms);
+            }
             match result {
                 Ok(()) => {
                     if let Some(last_run) = executed.completion_last_run
@@ -1017,28 +1201,90 @@ fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+fn u128_to_usize(value: u128) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct HttpMetricKey {
+    method: String,
+    route: String,
+    status: u16,
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+struct HttpMetricValue {
+    count: usize,
+    latency_ms_total: usize,
+}
+
+#[derive(Debug)]
 struct DaemonMetrics {
+    started_at: Instant,
     http_requests: AtomicUsize,
+    http_by_route: StdMutex<BTreeMap<HttpMetricKey, HttpMetricValue>>,
     rss_failures: AtomicUsize,
     search_failures: AtomicUsize,
     update_indexer_caps_failures: AtomicUsize,
     inject_failures: AtomicUsize,
     cleanup_failures: AtomicUsize,
+    rss_duration_ms: AtomicUsize,
+    search_duration_ms: AtomicUsize,
+    update_indexer_caps_duration_ms: AtomicUsize,
+    inject_duration_ms: AtomicUsize,
+    cleanup_duration_ms: AtomicUsize,
 }
 
 impl DaemonMetrics {
+    fn record_http_request(&self, method: &str, route: &str, status: u16, latency_ms: u128) {
+        self.http_requests.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut metrics) = self.http_by_route.lock() {
+            let value = metrics
+                .entry(HttpMetricKey {
+                    method: method.to_owned(),
+                    route: route.to_owned(),
+                    status,
+                })
+                .or_default();
+            value.count = value.count.saturating_add(1);
+            value.latency_ms_total = value
+                .latency_ms_total
+                .saturating_add(u128_to_usize(latency_ms));
+        }
+    }
+
+    fn http_metrics(&self) -> Vec<(HttpMetricKey, HttpMetricValue)> {
+        self.http_by_route
+            .lock()
+            .map(|metrics| {
+                metrics
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn record_job_failure(&self, name: JobName) {
         self.job_failure_counter(name)
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_job_duration(&self, name: JobName, duration_ms: u128) {
+        self.job_duration_counter(name)
+            .fetch_add(u128_to_usize(duration_ms), Ordering::Relaxed);
+    }
+
     fn job_failures(&self, name: JobName) -> usize {
         self.job_failure_counter(name).load(Ordering::Relaxed)
+    }
+
+    fn job_duration_ms(&self, name: JobName) -> usize {
+        self.job_duration_counter(name).load(Ordering::Relaxed)
     }
 
     fn job_failure_counter(&self, name: JobName) -> &AtomicUsize {
@@ -1048,6 +1294,36 @@ impl DaemonMetrics {
             JobName::UpdateIndexerCaps => &self.update_indexer_caps_failures,
             JobName::Inject => &self.inject_failures,
             JobName::Cleanup => &self.cleanup_failures,
+        }
+    }
+
+    fn job_duration_counter(&self, name: JobName) -> &AtomicUsize {
+        match name {
+            JobName::Rss => &self.rss_duration_ms,
+            JobName::Search => &self.search_duration_ms,
+            JobName::UpdateIndexerCaps => &self.update_indexer_caps_duration_ms,
+            JobName::Inject => &self.inject_duration_ms,
+            JobName::Cleanup => &self.cleanup_duration_ms,
+        }
+    }
+}
+
+impl Default for DaemonMetrics {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            http_requests: AtomicUsize::new(0),
+            http_by_route: StdMutex::new(BTreeMap::new()),
+            rss_failures: AtomicUsize::new(0),
+            search_failures: AtomicUsize::new(0),
+            update_indexer_caps_failures: AtomicUsize::new(0),
+            inject_failures: AtomicUsize::new(0),
+            cleanup_failures: AtomicUsize::new(0),
+            rss_duration_ms: AtomicUsize::new(0),
+            search_duration_ms: AtomicUsize::new(0),
+            update_indexer_caps_duration_ms: AtomicUsize::new(0),
+            inject_duration_ms: AtomicUsize::new(0),
+            cleanup_duration_ms: AtomicUsize::new(0),
         }
     }
 }
@@ -1339,7 +1615,9 @@ async fn run_webhook_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REQUEST_BODY_BYTES, handle_runtime_request, http_route, run_plan};
+    use super::{
+        MAX_REQUEST_BODY_BYTES, handle_axum_request, handle_runtime_request, http_route, run_plan,
+    };
     use crate::{
         SporosError,
         api::{ApiMethod, ApiRequest, handle_api_request},
@@ -1350,10 +1628,12 @@ mod tests {
             DaemonPlan, JobCheckResult, JobConfigOverride, JobName, ScheduledJob, Scheduler,
         },
     };
+    use axum::body::Bytes;
+    use axum::extract::{ConnectInfo, State};
+    use axum::http::{HeaderMap, HeaderValue, Method, Uri, header::CONTENT_TYPE};
     use std::{
         collections::BTreeMap,
         sync::Arc,
-        sync::atomic::Ordering,
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::Mutex;
@@ -1765,8 +2045,10 @@ mod tests {
             .try_submit("search", |_shutdown| async {});
         wait_for_finished(&services.queues().jobs).await;
         let metrics = Arc::new(super::DaemonMetrics::default());
-        metrics.http_requests.store(3, Ordering::Relaxed);
+        metrics.record_http_request("GET", "/api/status", 200, 12);
+        metrics.record_http_request("POST", "/api/job", 409, 3);
         metrics.record_job_failure(JobName::Search);
+        metrics.record_job_duration(JobName::Search, 42);
         let state = Arc::new(super::DaemonState {
             app_dir: root.clone(),
             config,
@@ -1783,11 +2065,29 @@ mod tests {
         .expect("metrics");
 
         assert_eq!(response.status, 200);
-        assert!(response.body.contains("sporos_http_requests_total 3"));
+        assert!(response.body.contains("sporos_service_info"));
+        assert!(response.body.contains("sporos_service_uptime_seconds"));
+        assert!(response.body.contains("sporos_http_requests_total 2"));
+        assert!(response.body.contains(
+            r#"sporos_http_requests_by_route_total{method="GET",route="/api/status",status="200"} 1"#
+        ));
+        assert!(response.body.contains(
+            r#"sporos_http_request_latency_ms_total{method="GET",route="/api/status",status="200"} 12"#
+        ));
         assert!(
             response
                 .body
                 .contains(r#"sporos_runtime_queue_events_total{event="accepted",queue="jobs"} 1"#)
+        );
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_runtime_queue_depth{queue="jobs"} 0"#)
+        );
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_runtime_queue_in_flight{queue="jobs"} 0"#)
         );
         assert!(
             response
@@ -1802,12 +2102,32 @@ mod tests {
         assert!(
             response
                 .body
+                .contains(r#"sporos_job_duration_ms_total{job="search"} 42"#)
+        );
+        assert!(
+            response
+                .body
                 .contains(r#"sporos_job_last_run_timestamp_seconds{job="search"} 1"#)
         );
         assert!(
             response.body.contains(
                 r#"sporos_indexer_rate_limited{indexer="https://indexer.example/api"} 1"#
             )
+        );
+        let axum_response = handle_axum_request(
+            State(Arc::clone(&state)),
+            ConnectInfo("127.0.0.1:12345".parse().expect("remote addr")),
+            Method::GET,
+            Uri::from_static("/metrics"),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(
+            axum_response.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "text/plain; version=0.0.4; charset=utf-8"
+            ))
         );
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
@@ -1887,6 +2207,44 @@ mod tests {
         assert_eq!(body["runtime"]["queues"]["jobs"]["accepted"], 1);
         assert_eq!(body["degradedDependencies"][0]["status"], "RATE_LIMITED");
         assert_eq!(body["recentServiceErrors"][0]["job"], "search");
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn metrics_reports_configured_jobs_when_scheduler_is_locked() {
+        let root = temp_path("daemon-metrics-locked-scheduler");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: RuntimeServices::start(CancellationToken::new()),
+            scheduler: Mutex::new(Scheduler::new(Vec::new())),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+        let guard = state.scheduler.lock().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handle_runtime_request(
+                Arc::clone(&state),
+                ApiRequest::new(ApiMethod::Get, "/metrics", BTreeMap::new(), ""),
+            ),
+        )
+        .await
+        .expect("metrics should not wait for scheduler")
+        .expect("metrics");
+
+        assert_eq!(response.status, 200);
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_job_enabled{job="cleanup"} 1"#)
+        );
+        drop(guard);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -2090,11 +2448,13 @@ mod tests {
                 super::ExecutedJob {
                     name: JobName::Search,
                     completion_last_run: Some(1_000),
+                    duration_ms: Some(5),
                     result: Some(Ok(())),
                 },
                 super::ExecutedJob {
                     name: JobName::Rss,
                     completion_last_run: Some(2_000),
+                    duration_ms: Some(7),
                     result: Some(Err(SporosError::configuration("rss failed"))),
                 },
             ],
