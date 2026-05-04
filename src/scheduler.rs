@@ -589,7 +589,7 @@ mod tests {
     use super::{DaemonPlan, JobConfigOverride, JobName, ScheduledJob, Scheduler};
     use crate::{
         api::JobResponse,
-        config::{RawConfig, RuntimeConfig},
+        config::{ApiIntegrationConfig, RawConfig, RuntimeConfig, TorrentClientConfig},
         persistence::{AsyncDatabase, Database},
     };
     use std::{
@@ -864,6 +864,48 @@ mod tests {
             run.jobs
                 .iter()
                 .any(|result| result.name == JobName::Cleanup && result.ran)
+        );
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_plan_reaches_production_workflows_from_service_runtime() {
+        let root = temp_path("daemon-plan-workflows");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let raw = RawConfig {
+            torznab: vec![ApiIntegrationConfig {
+                url: "https://indexer.example/api".to_owned(),
+                api_key: "secret".to_owned(),
+            }],
+            torrent_clients: vec![
+                TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client"),
+            ],
+            action: Some("inject".to_owned()),
+            rss_cadence: Some(900_000),
+            search_cadence: Some(86_400_000),
+            exclude_recent_search: Some(259_200_000),
+            exclude_older: Some(518_400_000),
+            data_dirs: vec![data_dir.clone()],
+            ..RawConfig::default()
+        };
+        let config = RuntimeConfig::normalize(raw, &root).expect("config");
+        let plan = DaemonPlan::from_config(&config);
+
+        assert!(plan.serve_http);
+        assert_eq!(
+            plan.scheduler
+                .jobs()
+                .iter()
+                .map(|job| (job.name, job.enabled))
+                .collect::<Vec<_>>(),
+            vec![
+                (JobName::Rss, true),
+                (JobName::Search, true),
+                (JobName::UpdateIndexerCaps, true),
+                (JobName::Inject, true),
+                (JobName::Cleanup, true),
+            ]
         );
         let _cleanup = std::fs::remove_dir_all(root);
     }

@@ -1362,6 +1362,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_job_does_not_hold_scheduler_lock_while_workflow_waits() {
+        let root = temp_path("daemon-api-job-lock");
+        let data_dir = temp_path("daemon-api-job-lock-data");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let _database = Database::open_app_dir(&root).expect("database");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                api_key: Some("test-api-key-with-24-bytes".to_owned()),
+                search_cadence: Some(86_400_000),
+                exclude_recent_search: Some(259_200_000),
+                exclude_older: Some(518_400_000),
+                data_dirs: vec![data_dir.clone()],
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let scheduler = DaemonPlan::from_config(&config).scheduler;
+        let services = RuntimeServices::start(CancellationToken::new());
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let held_matching = tokio::spawn({
+            let matching = services.blocking().matching.clone();
+            async move {
+                matching
+                    .submit("held matching", move || {
+                        let _result = release_receiver.recv();
+                    })
+                    .await
+            }
+        });
+        for _attempt in 0..20 {
+            if services.blocking().matching.stats().started > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(services.blocking().matching.stats().started, 1);
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services,
+            scheduler: Mutex::new(scheduler),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+        let request = tokio::spawn(handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/job?apikey=test-api-key-with-24-bytes",
+                BTreeMap::new(),
+                r#"{"name":"search"}"#,
+            ),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.services.blocking().matching.stats().enqueued > 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("search workflow should be queued behind held matching work");
+        assert_eq!(state.services.blocking().matching.stats().enqueued, 2);
+        let scheduler = state
+            .scheduler
+            .try_lock()
+            .expect("scheduler lock should be free while job body waits");
+        assert!(
+            scheduler
+                .jobs()
+                .iter()
+                .any(|job| job.name == JobName::Search && job.is_active)
+        );
+        drop(scheduler);
+
+        state.services.shutdown().await;
+        let response = request
+            .await
+            .expect("request task joins")
+            .expect("job request");
+        assert_eq!(response.status, 200);
+        let _release = release_sender.send(());
+        let _held = held_matching.await.expect("held matching joins");
+        let _cleanup = std::fs::remove_dir_all(root);
+        let _cleanup = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn axum_request_state_routes_ping_and_auth() {
         let root = temp_path("daemon-axum-state");
         std::fs::create_dir_all(&root).expect("root");
