@@ -27,6 +27,7 @@ use axum::{
 use prometheus::{
     Encoder, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
+use sha1::{Digest, Sha1};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -44,6 +45,8 @@ use crate::{
 
 const JOB_LOOP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const ANNOUNCE_QUEUE_ATTEMPT_RESULTS: &[&str] = &["started", "retry_scheduled", "exhausted"];
+const ANNOUNCE_QUEUE_OUTCOMES: &[&str] = &["succeeded", "terminal_failed", "expired"];
 
 /// Install process signal handling for daemon shutdown.
 pub fn install_shutdown_handler() -> CancellationToken {
@@ -896,6 +899,7 @@ async fn metrics_response(
         &state.services.blocking().matching,
     );
 
+    observe_announce_queue_metrics(&registry, &AnnounceQueueStatus::current())?;
     observe_job_metrics(&registry, &state).await?;
     observe_indexer_metrics(&registry, &state.config).await?;
 
@@ -973,6 +977,106 @@ fn observe_blocking_metrics(
     }
 }
 
+fn observe_announce_queue_metrics(
+    registry: &Registry,
+    queue: &AnnounceQueueStatus,
+) -> crate::Result<()> {
+    let enabled = IntGauge::with_opts(Opts::new(
+        "sporos_announce_queue_enabled",
+        "Whether the durable announce queue is configured.",
+    ))
+    .map_err(metrics_error)?;
+    let backlog = IntGauge::with_opts(Opts::new(
+        "sporos_announce_queue_backlog",
+        "Durable announce work items waiting to run.",
+    ))
+    .map_err(metrics_error)?;
+    let running = IntGauge::with_opts(Opts::new(
+        "sporos_announce_queue_running",
+        "Durable announce work items currently running.",
+    ))
+    .map_err(metrics_error)?;
+    let oldest_age = IntGauge::with_opts(Opts::new(
+        "sporos_announce_queue_oldest_queued_age_seconds",
+        "Age in seconds of the oldest queued durable announce work item.",
+    ))
+    .map_err(metrics_error)?;
+    let retry_delay = IntGauge::with_opts(Opts::new(
+        "sporos_announce_queue_retry_delay_seconds",
+        "Current retry delay in seconds for durable announce work.",
+    ))
+    .map_err(metrics_error)?;
+    let breaker_open = IntGauge::with_opts(Opts::new(
+        "sporos_announce_queue_breaker_open",
+        "Whether durable announce processing is blocked by an open breaker.",
+    ))
+    .map_err(metrics_error)?;
+    let attempts = IntCounterVec::new(
+        Opts::new(
+            "sporos_announce_queue_attempts_total",
+            "Durable announce processing attempts by bounded result.",
+        ),
+        &["result"],
+    )
+    .map_err(metrics_error)?;
+    let outcomes = IntCounterVec::new(
+        Opts::new(
+            "sporos_announce_queue_outcomes_total",
+            "Durable announce terminal outcomes by bounded result.",
+        ),
+        &["outcome"],
+    )
+    .map_err(metrics_error)?;
+    let expired = IntCounter::with_opts(Opts::new(
+        "sporos_announce_queue_expired_total",
+        "Durable announce work items expired before completion.",
+    ))
+    .map_err(metrics_error)?;
+
+    registry
+        .register(Box::new(enabled.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(backlog.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(running.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(oldest_age.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(retry_delay.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(breaker_open.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(attempts.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(outcomes.clone()))
+        .map_err(metrics_error)?;
+    registry
+        .register(Box::new(expired.clone()))
+        .map_err(metrics_error)?;
+
+    enabled.set(bool_to_i64(queue.enabled));
+    backlog.set(usize_to_i64(queue.backlog));
+    running.set(usize_to_i64(queue.running));
+    oldest_age.set(queue.oldest_queued_age_seconds.unwrap_or_default());
+    retry_delay.set(queue.retry_delay_seconds.unwrap_or_default());
+    breaker_open.set(bool_to_i64(queue.breaker_open));
+    for result in ANNOUNCE_QUEUE_ATTEMPT_RESULTS {
+        attempts.with_label_values(&[result]).inc_by(0);
+    }
+    for outcome in ANNOUNCE_QUEUE_OUTCOMES {
+        outcomes.with_label_values(&[outcome]).inc_by(0);
+    }
+    expired.inc_by(usize_to_u64(queue.expired));
+    Ok(())
+}
+
 fn queue_status(queue: &RuntimeTaskQueue) -> serde_json::Value {
     let stats = queue.stats();
     serde_json::json!({
@@ -1001,6 +1105,65 @@ fn blocking_status(executor: &RuntimeBlockingExecutor) -> serde_json::Value {
         "finished": stats.finished,
         "cancelled": stats.cancelled,
     })
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AnnounceQueueStatus {
+    enabled: bool,
+    status: &'static str,
+    backlog: usize,
+    running: usize,
+    oldest_queued_age_seconds: Option<i64>,
+    retry_delay_seconds: Option<i64>,
+    expired: usize,
+    breaker_open: bool,
+    breaker_state: &'static str,
+}
+
+impl AnnounceQueueStatus {
+    fn current() -> Self {
+        Self {
+            enabled: false,
+            status: "not_configured",
+            backlog: 0,
+            running: 0,
+            oldest_queued_age_seconds: None,
+            retry_delay_seconds: None,
+            expired: 0,
+            breaker_open: false,
+            breaker_state: "closed",
+        }
+    }
+
+    const fn ready(&self) -> bool {
+        !self.breaker_open
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.enabled,
+            "status": self.status,
+            "backlog": self.backlog,
+            "running": self.running,
+            "oldestQueuedAgeSeconds": self.oldest_queued_age_seconds,
+            "attempts": {
+                "started": 0,
+                "retryScheduled": 0,
+                "exhausted": 0,
+            },
+            "outcomes": {
+                "succeeded": 0,
+                "terminalFailed": 0,
+                "expired": self.expired,
+            },
+            "retryDelaySeconds": self.retry_delay_seconds,
+            "expiryCount": self.expired,
+            "breaker": {
+                "state": self.breaker_state,
+                "open": self.breaker_open,
+            },
+        })
+    }
 }
 
 async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate::Result<()> {
@@ -1208,12 +1371,15 @@ async fn health_readyz_response(
     let scheduler_ready = state.scheduler.try_lock().is_ok();
     let local_paths_ready = configured_local_paths_ready(&state.config).await;
     let intake_ready = state.config.listen_port.is_some() && runtime_ready;
+    let announce_queue = AnnounceQueueStatus::current();
+    let announce_queue_ready = announce_queue.ready();
     let ready = state_dir_ready
         && database_ready
         && runtime_ready
         && scheduler_ready
         && local_paths_ready
-        && intake_ready;
+        && intake_ready
+        && announce_queue_ready;
     let body = serde_json::json!({
         "status": if ready { "ready" } else { "not_ready" },
         "checks": {
@@ -1223,7 +1389,9 @@ async fn health_readyz_response(
             "scheduler": scheduler_ready,
             "localPaths": local_paths_ready,
             "intake": intake_ready,
+            "durableAnnounceQueue": announce_queue_ready,
         },
+        "durableAnnounceQueue": announce_queue.to_json(),
     })
     .to_string();
 
@@ -1679,6 +1847,18 @@ fn submit_webhook_workers(
     }
 }
 
+fn announce_work_id(request: &AnnounceRequest) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(request.tracker.as_bytes());
+    hasher.update([0]);
+    hasher.update(request.guid.as_bytes());
+    hasher.update([0]);
+    hasher.update(request.link.as_bytes());
+    hasher.update([0]);
+    hasher.update(request.name.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[async_trait]
 impl ApiHandlers for RuntimeHandlers<'_> {
     async fn status(&mut self) -> crate::Result<ApiResponse> {
@@ -1689,6 +1869,8 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             .await
             .is_ok_and(|metadata| metadata.is_file());
         let runtime_ready = !self.services.cancellation_token().is_cancelled();
+        let announce_queue = AnnounceQueueStatus::current();
+        let announce_queue_ready = announce_queue.ready();
         let mut jobs = Vec::new();
         let mut recent_service_errors = Vec::new();
         if let Some(scheduler) = &self.scheduler_snapshot {
@@ -1735,7 +1917,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 })
             })
             .collect::<Vec<_>>();
-        let ready = state_dir_ready && database_ready && runtime_ready;
+        let ready = state_dir_ready && database_ready && runtime_ready && announce_queue_ready;
         let body = serde_json::json!({
             "version": crate::VERSION,
             "config": {
@@ -1765,6 +1947,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                     "stateDir": state_dir_ready,
                     "database": database_ready,
                     "runtime": runtime_ready,
+                    "durableAnnounceQueue": announce_queue_ready,
                 },
             },
             "scheduler": {
@@ -1772,6 +1955,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 "jobs": jobs,
             },
             "runtime": {
+                "durableAnnounceQueue": announce_queue.to_json(),
                 "queues": {
                     "jobs": queue_status(&self.services.queues().jobs),
                     "webhooks": queue_status(&self.services.queues().webhooks),
@@ -1792,7 +1976,9 @@ impl ApiHandlers for RuntimeHandlers<'_> {
     }
 
     async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>> {
+        let work_id = announce_work_id(&request);
         tracing::info!(
+            work_id = work_id.as_str(),
             tracker = request.tracker.as_str(),
             name = request.name.as_str(),
             "received announce request"
@@ -2300,6 +2486,7 @@ mod tests {
         assert_eq!(livez.body, r#"{"status":"live"}"#);
         assert_eq!(readyz.status, 200);
         assert!(readyz.body.contains(r#""status":"ready""#));
+        assert!(readyz.body.contains(r#""durableAnnounceQueue":true"#));
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -2380,6 +2567,33 @@ mod tests {
             response
                 .body
                 .contains(r#"sporos_runtime_queue_in_flight{queue="jobs"} 0"#)
+        );
+        assert!(response.body.contains("sporos_announce_queue_enabled 0"));
+        assert!(response.body.contains("sporos_announce_queue_backlog 0"));
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_announce_queue_attempts_total{result="started"} 0"#)
+        );
+        assert!(
+            response
+                .body
+                .contains(r#"sporos_announce_queue_outcomes_total{outcome="expired"} 0"#)
+        );
+        assert!(
+            response
+                .body
+                .contains("sporos_announce_queue_retry_delay_seconds 0")
+        );
+        assert!(
+            response
+                .body
+                .contains("sporos_announce_queue_expired_total 0")
+        );
+        assert!(
+            response
+                .body
+                .contains("sporos_announce_queue_breaker_open 0")
         );
         assert!(
             response
@@ -2660,12 +2874,34 @@ mod tests {
             Some(root.join("sporos.lock").to_string_lossy().as_ref())
         );
         assert_eq!(body["readiness"]["status"], "ready");
+        assert_eq!(body["readiness"]["checks"]["durableAnnounceQueue"], true);
         assert_eq!(body["scheduler"]["available"], true);
         assert_eq!(body["scheduler"]["jobs"][0]["name"], "search");
         assert_eq!(body["scheduler"]["jobs"][0]["running"], true);
         assert_eq!(body["scheduler"]["jobs"][0]["lastSuccess"], 1_000);
         assert_eq!(body["scheduler"]["jobs"][0]["failureCount"], 1);
         assert_eq!(body["runtime"]["queues"]["jobs"]["accepted"], 1);
+        assert_eq!(
+            body["runtime"]["durableAnnounceQueue"]["status"],
+            "not_configured"
+        );
+        assert_eq!(
+            body["runtime"]["durableAnnounceQueue"]["oldestQueuedAgeSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(body["runtime"]["durableAnnounceQueue"]["backlog"], 0);
+        assert_eq!(
+            body["runtime"]["durableAnnounceQueue"]["attempts"]["started"],
+            0
+        );
+        assert_eq!(
+            body["runtime"]["durableAnnounceQueue"]["outcomes"]["expired"],
+            0
+        );
+        assert_eq!(
+            body["runtime"]["durableAnnounceQueue"]["breaker"]["open"],
+            false
+        );
         assert_eq!(body["degradedDependencies"][0]["status"], "RATE_LIMITED");
         assert_eq!(body["recentServiceErrors"][0]["job"], "search");
         state.services.shutdown().await;
