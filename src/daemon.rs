@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Bytes,
-    extract::{ConnectInfo, DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -239,47 +239,194 @@ fn serve_http(
 
 fn http_router(state: Arc<DaemonState>) -> Router {
     Router::new()
-        .route("/_health/livez", get(handle_axum_request))
-        .route("/_health/readyz", get(handle_axum_request))
-        .route("/metrics", get(handle_axum_request))
-        .route("/api/ping", get(handle_axum_request))
-        .route("/api/status", get(handle_axum_request))
-        .route("/api/announce", post(handle_axum_request))
-        .route("/api/webhook", post(handle_axum_request))
-        .route("/api/job", post(handle_axum_request))
+        .route("/_health/livez", get(handle_livez))
+        .route("/_health/readyz", get(handle_readyz))
+        .route("/metrics", get(handle_metrics))
+        .route("/api/ping", get(handle_ping))
+        .route("/api/status", get(handle_status))
+        .route("/api/announce", post(handle_announce))
+        .route("/api/webhook", post(handle_webhook))
+        .route("/api/job", post(handle_job))
         .fallback(handle_not_found)
         .method_not_allowed_fallback(handle_method_not_allowed)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
-async fn handle_axum_request(
+async fn handle_livez(
     State(state): State<Arc<DaemonState>>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     method: Method,
-    uri: Uri,
     headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    handle_api_parts(
+        state,
+        remote_addr,
+        method,
+        "/_health/livez",
+        query,
+        headers,
+        String::new(),
+    )
+    .await
+}
+
+async fn handle_readyz(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    handle_api_parts(
+        state,
+        remote_addr,
+        method,
+        "/_health/readyz",
+        query,
+        headers,
+        String::new(),
+    )
+    .await
+}
+
+async fn handle_metrics(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    handle_api_parts(
+        state,
+        remote_addr,
+        method,
+        "/metrics",
+        query,
+        headers,
+        String::new(),
+    )
+    .await
+}
+
+async fn handle_ping(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    handle_api_parts(
+        state,
+        remote_addr,
+        method,
+        "/api/ping",
+        query,
+        headers,
+        String::new(),
+    )
+    .await
+}
+
+async fn handle_status(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    handle_api_parts(
+        state,
+        remote_addr,
+        method,
+        "/api/status",
+        query,
+        headers,
+        String::new(),
+    )
+    .await
+}
+
+async fn handle_announce(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
     body: Bytes,
 ) -> Response {
+    handle_api_parts(
+        state,
+        remote_addr,
+        method,
+        "/api/announce",
+        query,
+        headers,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
+    .await
+}
+
+async fn handle_webhook(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    handle_api_parts(
+        state,
+        remote_addr,
+        method,
+        "/api/webhook",
+        query,
+        headers,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
+    .await
+}
+
+async fn handle_job(
+    State(state): State<Arc<DaemonState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    handle_api_parts(
+        state,
+        remote_addr,
+        method,
+        "/api/job",
+        query,
+        headers,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
+    .await
+}
+
+async fn handle_api_parts(
+    state: Arc<DaemonState>,
+    remote_addr: SocketAddr,
+    method: Method,
+    path: &'static str,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let started = Instant::now();
-    let path = uri.path().to_owned();
-    let route = http_route(&path);
+    let route = http_route(path);
     let method_label = method.as_str().to_owned();
     let remote_addr = remote_addr.to_string();
     let request = ApiRequest {
         method: api_method(&method),
-        path,
-        query: uri.query().map(parse_query).unwrap_or_default(),
-        headers: headers
-            .iter()
-            .filter_map(|(key, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (key.as_str().to_ascii_lowercase(), value.to_owned()))
-            })
-            .collect(),
-        body: String::from_utf8_lossy(&body).into_owned(),
+        path: path.to_owned(),
+        query,
+        headers: api_headers(&headers),
+        body,
         remote_addr: Some(remote_addr.clone()),
     };
 
@@ -294,6 +441,18 @@ async fn handle_axum_request(
         }
     };
     api_response_to_axum(state, method_label, route, remote_addr, started, response)
+}
+
+fn api_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (key.as_str().to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect()
 }
 
 async fn handle_not_found(
@@ -1064,12 +1223,6 @@ fn api_method(method: &Method) -> ApiMethod {
     }
 }
 
-fn parse_query(query: &str) -> BTreeMap<String, String> {
-    url::form_urlencoded::parse(query.as_bytes())
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect()
-}
-
 struct ExecutedJob {
     name: JobName,
     completion_last_run: Option<i64>,
@@ -1736,9 +1889,7 @@ async fn run_webhook_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_REQUEST_BODY_BYTES, handle_axum_request, handle_runtime_request, http_route, run_plan,
-    };
+    use super::{MAX_REQUEST_BODY_BYTES, handle_runtime_request, http_route, run_plan};
     use crate::{
         SporosError,
         api::{ApiMethod, ApiRequest, handle_api_request},
@@ -1749,9 +1900,7 @@ mod tests {
             DaemonPlan, JobCheckResult, JobConfigOverride, JobName, ScheduledJob, Scheduler,
         },
     };
-    use axum::body::Bytes;
-    use axum::extract::{ConnectInfo, State};
-    use axum::http::{HeaderMap, HeaderValue, Method, Uri, header::CONTENT_TYPE};
+    use axum::http::header::CONTENT_TYPE;
     use std::{
         collections::BTreeMap,
         sync::Arc,
@@ -2235,21 +2384,6 @@ mod tests {
                 r#"sporos_indexer_rate_limited{indexer="https://indexer.example/api"} 1"#
             )
         );
-        let axum_response = handle_axum_request(
-            State(Arc::clone(&state)),
-            ConnectInfo("127.0.0.1:12345".parse().expect("remote addr")),
-            Method::GET,
-            Uri::from_static("/metrics"),
-            HeaderMap::new(),
-            Bytes::new(),
-        )
-        .await;
-        assert_eq!(
-            axum_response.headers().get(CONTENT_TYPE),
-            Some(&HeaderValue::from_static(
-                "text/plain; version=0.0.4; charset=utf-8"
-            ))
-        );
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -2330,6 +2464,15 @@ mod tests {
         let status_body: serde_json::Value =
             serde_json::from_str(&status.text().await.expect("status body")).expect("status json");
         assert_eq!(status_body["version"], crate::VERSION);
+
+        let header_status = client
+            .get(format!("{base_url}/api/status"))
+            .header("X-Api-Key", "secret")
+            .send()
+            .await
+            .expect("header status response");
+        assert_eq!(header_status.status(), reqwest::StatusCode::OK);
+        assert_eq!(content_type(&header_status), Some("application/json"));
 
         let webhook = client
             .post(format!("{base_url}/api/webhook?apikey=secret"))
