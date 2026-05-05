@@ -551,26 +551,24 @@ fn classify_announce_work_result(
     }
 
     match result {
-        Ok(Some(outcome)) => classify_announce_outcome(outcome, now, config),
+        Ok(Some(outcome)) => classify_announce_outcome(outcome, work, now, config),
         Ok(None) => AnnounceWorkExecution::TerminalFailed {
             error_class: "no_match",
             error_message: None,
             context: "no_match",
         },
-        Err(error) => {
-            let delay = i64::try_from(config.announce_queue.retry_delay_min).unwrap_or(i64::MAX);
-            AnnounceWorkExecution::Retryable {
-                next_attempt_at: now.saturating_add(delay),
-                error_class: "workflow_error",
-                error_message: error.to_string(),
-                context: "retryable_workflow_error",
-            }
-        }
+        Err(error) => AnnounceWorkExecution::Retryable {
+            next_attempt_at: retry_next_attempt_at(now, work.attempts, config, None),
+            error_class: "workflow_error",
+            error_message: error.to_string(),
+            context: "retryable_workflow_error",
+        },
     }
 }
 
 fn classify_announce_outcome(
     outcome: ApiOutcome,
+    work: &AnnounceWorkRecord,
     now: i64,
     config: &RuntimeConfig,
 ) -> AnnounceWorkExecution {
@@ -584,12 +582,17 @@ fn classify_announce_outcome(
             }
         }
         Some(ActionResult::Injection(InjectionResult::TorrentNotComplete)) => {
-            let delay = i64::try_from(config.announce_queue.retry_delay_min).unwrap_or(i64::MAX);
             AnnounceWorkExecution::Waiting {
-                next_attempt_at: now.saturating_add(delay),
+                next_attempt_at: retry_next_attempt_at(now, work.attempts, config, None),
                 context: "waiting_source_torrent_incomplete",
             }
         }
+        None if outcome.decision == Decision::RateLimited => AnnounceWorkExecution::Retryable {
+            next_attempt_at: retry_next_attempt_at(now, work.attempts, config, None),
+            error_class: "rate_limited",
+            error_message: "announce workflow hit a rate limit".to_owned(),
+            context: "rate_limited_decision",
+        },
         None if matches!(
             outcome.decision,
             Decision::InfoHashAlreadyExists | Decision::SameInfoHash
@@ -607,6 +610,28 @@ fn classify_announce_outcome(
             context: decision_context(outcome.decision),
         },
     }
+}
+
+fn retry_next_attempt_at(
+    now: i64,
+    attempts: i64,
+    config: &RuntimeConfig,
+    retry_after_at: Option<i64>,
+) -> i64 {
+    let min_delay = i64::try_from(config.announce_queue.retry_delay_min).unwrap_or(i64::MAX);
+    let max_delay = i64::try_from(config.announce_queue.retry_delay_max).unwrap_or(i64::MAX);
+    let growth = attempts
+        .saturating_sub(1)
+        .try_into()
+        .ok()
+        .and_then(|power| 1_i64.checked_shl(power))
+        .unwrap_or(i64::MAX);
+    let policy_delay = min_delay.saturating_mul(growth).min(max_delay);
+    let policy_next = now.saturating_add(policy_delay);
+    retry_after_at
+        .filter(|retry_after| *retry_after > now)
+        .filter(|retry_after| retry_after.saturating_sub(now) <= max_delay)
+        .map_or(policy_next, |retry_after| retry_after.max(policy_next))
 }
 
 fn decision_context(decision: Decision) -> &'static str {
@@ -3521,6 +3546,23 @@ mod tests {
             }
         );
         assert_eq!(
+            super::classify_announce_work_result(
+                Ok(Some(ApiOutcome {
+                    decision: Decision::RateLimited,
+                    action_result: None,
+                })),
+                &work,
+                10_000,
+                &config,
+            ),
+            super::AnnounceWorkExecution::Retryable {
+                next_attempt_at: 15_000,
+                error_class: "rate_limited",
+                error_message: "announce workflow hit a rate limit".to_owned(),
+                context: "rate_limited_decision",
+            }
+        );
+        assert_eq!(
             super::classify_announce_work_result(Ok(None), &work, 10_000, &config),
             super::AnnounceWorkExecution::TerminalFailed {
                 error_class: "no_match",
@@ -3533,6 +3575,43 @@ mod tests {
             super::AnnounceWorkExecution::Expired {
                 context: "expired_during_processing"
             }
+        );
+    }
+
+    #[test]
+    fn announce_retry_policy_grows_bounds_and_preserves_retry_after() {
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                announce_queue: RawAnnounceQueueConfig {
+                    retry_delay_min: Some(5_000),
+                    retry_delay_max: Some(20_000),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            Path::new("/state"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            super::retry_next_attempt_at(100_000, 1, &config, None),
+            105_000
+        );
+        assert_eq!(
+            super::retry_next_attempt_at(100_000, 2, &config, None),
+            110_000
+        );
+        assert_eq!(
+            super::retry_next_attempt_at(100_000, 4, &config, None),
+            120_000
+        );
+        assert_eq!(
+            super::retry_next_attempt_at(100_000, 2, &config, Some(115_000)),
+            115_000
+        );
+        assert_eq!(
+            super::retry_next_attempt_at(100_000, 2, &config, Some(200_000)),
+            110_000
         );
     }
 
