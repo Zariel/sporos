@@ -43,6 +43,7 @@ use crate::{
     persistence::{
         AnnounceQueueStats, AnnounceWorkFinish, AnnounceWorkInsert, AnnounceWorkRecord,
         AnnounceWorkRetry, AnnounceWorkTerminalStatus, AsyncDatabase, Database,
+        EndpointBreakerFailure, EndpointBreakerStats,
     },
     runtime::{RuntimeBlockingExecutor, RuntimeServices, RuntimeTaskQueue},
     scheduler::{DaemonPlan, DaemonRun, JobConfigOverride, JobName, ScheduledJob, Scheduler},
@@ -52,6 +53,7 @@ const JOB_LOOP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const ANNOUNCE_QUEUE_ATTEMPT_RESULTS: &[&str] = &["started", "retry_scheduled", "exhausted"];
 const ANNOUNCE_QUEUE_OUTCOMES: &[&str] = &["succeeded", "terminal_failed", "expired"];
+const ANNOUNCE_BREAKER_OPERATION: &str = "announce";
 
 /// Install process signal handling for daemon shutdown.
 pub fn install_shutdown_handler() -> CancellationToken {
@@ -385,6 +387,42 @@ impl AnnounceWorker {
             attempt = work.attempts,
             "processing announce work"
         );
+        if let Some(breaker) = database
+            .open_endpoint_breaker(
+                announce_breaker_key(&work),
+                ANNOUNCE_BREAKER_OPERATION,
+                now_millis(),
+            )
+            .await?
+        {
+            let now = now_millis();
+            let next_attempt_at = breaker
+                .retry_after
+                .unwrap_or_else(|| retry_next_attempt_at(now, work.attempts, &self.config, None));
+            database
+                .schedule_announce_retry(&AnnounceWorkRetry {
+                    work_id: &work.work_id,
+                    now,
+                    next_attempt_at,
+                    error_class: Some("circuit_breaker_open"),
+                    error_message: breaker.last_error_message.as_deref(),
+                    outcome_context: Some("delayed_by_endpoint_breaker"),
+                })
+                .await?;
+            tracing::warn!(
+                work_id = work.work_id.as_str(),
+                dedupe_key = work.dedupe_key.as_str(),
+                attempt = work.attempts,
+                status = "retrying",
+                transition = "breaker_delay",
+                endpoint_key = breaker.endpoint_key.as_str(),
+                operation = breaker.operation.as_str(),
+                next_attempt_at,
+                error_class = breaker.last_error_class.as_deref().unwrap_or_default(),
+                "announce work delayed by open endpoint breaker"
+            );
+            return Ok(());
+        }
         let notifier = crate::notifications::NotificationSender::from_config(
             &self.config,
             crate::startup::Redactor::from_config(&self.config),
@@ -409,6 +447,13 @@ impl AnnounceWorker {
                         error_message: None,
                         outcome_context: Some(context),
                     })
+                    .await?;
+                database
+                    .close_endpoint_breaker(
+                        announce_breaker_key(&work),
+                        ANNOUNCE_BREAKER_OPERATION,
+                        now,
+                    )
                     .await?;
                 tracing::info!(
                     work_id = work.work_id.as_str(),
@@ -459,6 +504,16 @@ impl AnnounceWorker {
                         error_class: Some(error_class),
                         error_message: Some(&error_message),
                         outcome_context: Some(context),
+                    })
+                    .await?;
+                database
+                    .record_endpoint_breaker_failure(&EndpointBreakerFailure {
+                        endpoint_key: announce_breaker_key(&work),
+                        operation: ANNOUNCE_BREAKER_OPERATION,
+                        now,
+                        retry_after: Some(next_attempt_at),
+                        error_class,
+                        error_message: Some(&error_message),
                     })
                     .await?;
                 tracing::warn!(
@@ -534,6 +589,14 @@ fn announce_candidate(work: &AnnounceWorkRecord) -> Candidate<'static> {
     );
     candidate.cookie = work.cookie.clone().map(Cow::Owned);
     candidate
+}
+
+fn announce_breaker_key(work: &AnnounceWorkRecord) -> &str {
+    if work.tracker.is_empty() {
+        "unknown"
+    } else {
+        work.tracker.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1586,6 +1649,7 @@ fn blocking_status(executor: &RuntimeBlockingExecutor) -> serde_json::Value {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct AnnounceQueueStatus {
+    ready: bool,
     enabled: bool,
     status: &'static str,
     backlog: i64,
@@ -1601,6 +1665,11 @@ struct AnnounceQueueStatus {
     expired: i64,
     breaker_open: bool,
     breaker_state: &'static str,
+    breaker_count: i64,
+    breaker_half_open: i64,
+    breaker_next_retry_seconds: Option<i64>,
+    breaker_endpoint: Option<String>,
+    breaker_operation: Option<String>,
     last_error_class: Option<String>,
     last_error_message: Option<String>,
     last_outcome_context: Option<String>,
@@ -1609,6 +1678,7 @@ struct AnnounceQueueStatus {
 impl AnnounceQueueStatus {
     fn unavailable(status: &'static str) -> Self {
         Self {
+            ready: false,
             enabled: false,
             status,
             backlog: 0,
@@ -1624,17 +1694,38 @@ impl AnnounceQueueStatus {
             expired: 0,
             breaker_open: true,
             breaker_state: "blocked",
+            breaker_count: 0,
+            breaker_half_open: 0,
+            breaker_next_retry_seconds: None,
+            breaker_endpoint: None,
+            breaker_operation: None,
             last_error_class: Some(status.to_owned()),
             last_error_message: None,
             last_outcome_context: None,
         }
     }
 
-    fn from_stats(config: &RuntimeConfig, stats: AnnounceQueueStats, now: i64) -> Self {
+    fn from_stats(
+        config: &RuntimeConfig,
+        stats: AnnounceQueueStats,
+        breaker: EndpointBreakerStats,
+        now: i64,
+    ) -> Self {
         let enabled = config.listen_port.is_some() && config.announce_queue.worker_concurrency > 0;
+        let breaker_open = breaker.open > 0;
+        let breaker_half_open = breaker.half_open > 0;
         Self {
+            ready: true,
             enabled,
-            status: if enabled { "ready" } else { "disabled" },
+            status: if breaker_open {
+                "degraded"
+            } else if breaker_half_open {
+                "probing"
+            } else if enabled {
+                "ready"
+            } else {
+                "disabled"
+            },
             backlog: stats.backlog,
             running: stats.running,
             oldest_queued_age_seconds: stats
@@ -1650,16 +1741,29 @@ impl AnnounceQueueStatus {
             outcomes_terminal_failed: stats.terminal_failed,
             outcomes_expired: stats.expired,
             expired: stats.expired,
-            breaker_open: false,
-            breaker_state: "closed",
-            last_error_class: stats.last_error_class,
-            last_error_message: stats.last_error_message,
+            breaker_open,
+            breaker_state: if breaker_open {
+                "open"
+            } else if breaker_half_open {
+                "half_open"
+            } else {
+                "closed"
+            },
+            breaker_count: breaker.open,
+            breaker_half_open: breaker.half_open,
+            breaker_next_retry_seconds: breaker
+                .next_retry_at
+                .map(|retry_at| retry_at.saturating_sub(now).max(0) / 1_000),
+            breaker_endpoint: breaker.last_endpoint_key,
+            breaker_operation: breaker.last_operation,
+            last_error_class: breaker.last_error_class.or(stats.last_error_class),
+            last_error_message: breaker.last_error_message.or(stats.last_error_message),
             last_outcome_context: stats.last_outcome_context,
         }
     }
 
     const fn ready(&self) -> bool {
-        !self.breaker_open
+        self.ready
     }
 
     fn to_json(&self) -> serde_json::Value {
@@ -1684,6 +1788,11 @@ impl AnnounceQueueStatus {
             "breaker": {
                 "state": self.breaker_state,
                 "open": self.breaker_open,
+                "openCount": self.breaker_count,
+                "halfOpenCount": self.breaker_half_open,
+                "nextRetrySeconds": self.breaker_next_retry_seconds,
+                "lastEndpoint": self.breaker_endpoint,
+                "lastOperation": self.breaker_operation,
             },
             "lastError": {
                 "class": self.last_error_class,
@@ -1700,7 +1809,8 @@ async fn announce_queue_status(
     now: i64,
 ) -> crate::Result<AnnounceQueueStatus> {
     let stats = database.announce_queue_stats(now).await?;
-    Ok(AnnounceQueueStatus::from_stats(config, stats, now))
+    let breaker = database.endpoint_breaker_stats(now).await?;
+    Ok(AnnounceQueueStatus::from_stats(config, stats, breaker, now))
 }
 
 async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate::Result<()> {
@@ -2717,7 +2827,7 @@ mod tests {
         domain::{ActionResult, Decision, InjectionResult, SaveResult},
         persistence::{
             AnnounceWorkFinish, AnnounceWorkInsert, AnnounceWorkRecord, AnnounceWorkRetry,
-            AnnounceWorkTerminalStatus, AsyncDatabase, Database,
+            AnnounceWorkTerminalStatus, AsyncDatabase, Database, EndpointBreakerFailure,
         },
         runtime::{RuntimeServices, RuntimeTaskQueue},
         scheduler::{
@@ -3695,6 +3805,7 @@ mod tests {
         let root = temp_path("daemon-announce-workers");
         std::fs::create_dir_all(&root).expect("root");
         let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
         let now = super::now_millis();
         database
             .insert_or_dedupe_announce_work(&AnnounceWorkInsert {
@@ -3898,6 +4009,130 @@ mod tests {
             metrics
                 .body
                 .contains(r#"sporos_announce_queue_outcomes_total{outcome="expired"} 1"#)
+        );
+
+        workers.shutdown().await.expect("workers stop");
+        services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn announce_workers_delay_work_behind_open_endpoint_breaker() {
+        let root = temp_path("daemon-announce-breaker");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let now = super::now_millis();
+        database
+            .record_endpoint_breaker_failure(&EndpointBreakerFailure {
+                endpoint_key: "Tracker",
+                operation: super::ANNOUNCE_BREAKER_OPERATION,
+                now,
+                retry_after: Some(now + 60_000),
+                error_class: "http_503",
+                error_message: Some("tracker unavailable"),
+            })
+            .expect("open breaker");
+        insert_announce_work(
+            &database,
+            "breaker-delayed",
+            now.saturating_sub(1_000),
+            now + 120_000,
+        );
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                announce_queue: RawAnnounceQueueConfig {
+                    worker_concurrency: Some(1),
+                    retry_delay_min: Some(5_000),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let services = RuntimeServices::start(CancellationToken::new());
+        let workers = super::start_announce_workers(
+            &root,
+            &config,
+            Arc::clone(&services),
+            CancellationToken::new(),
+            now,
+        )
+        .await
+        .expect("workers");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let stats = database
+                    .announce_queue_stats(super::now_millis())
+                    .expect("stats");
+                if stats.total_attempts == 1 {
+                    assert_eq!(stats.backlog, 1);
+                    assert_eq!(stats.running, 0);
+                    assert_eq!(
+                        stats.last_error_class.as_deref(),
+                        Some("circuit_breaker_open")
+                    );
+                    assert_eq!(
+                        stats.last_outcome_context.as_deref(),
+                        Some("delayed_by_endpoint_breaker")
+                    );
+                    assert!(
+                        stats
+                            .next_retry_at
+                            .is_some_and(|retry_at| retry_at >= now + 60_000)
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("breaker delay observed");
+
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: Arc::clone(&services),
+            scheduler: Mutex::new(Scheduler::new(Vec::new())),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+        let status = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(
+                ApiMethod::Get,
+                "/api/status?apikey=secret",
+                BTreeMap::new(),
+                "",
+            ),
+        )
+        .await
+        .expect("status");
+        let body: serde_json::Value = serde_json::from_str(&status.body).expect("status json");
+        assert_eq!(body["readiness"]["checks"]["durableAnnounceQueue"], true);
+        assert_eq!(
+            body["runtime"]["durableAnnounceQueue"]["status"],
+            "degraded"
+        );
+        assert_eq!(
+            body["runtime"]["durableAnnounceQueue"]["breaker"]["state"],
+            "open"
+        );
+        assert_eq!(
+            body["runtime"]["durableAnnounceQueue"]["breaker"]["lastEndpoint"],
+            "Tracker"
+        );
+
+        let metrics = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(ApiMethod::Get, "/metrics", BTreeMap::new(), ""),
+        )
+        .await
+        .expect("metrics");
+        assert!(
+            metrics
+                .body
+                .contains("sporos_announce_queue_breaker_open 1")
         );
 
         workers.shutdown().await.expect("workers stop");

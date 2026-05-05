@@ -1,9 +1,9 @@
 use super::{
     AnnounceWorkFinish, AnnounceWorkInsert, AnnounceWorkRetry, AnnounceWorkTerminalStatus,
-    AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord, EnsembleRecord,
-    ReverseLookupCriteria, SqlValue, bind_values, decision_guid_alias_lookup_sql,
-    ensemble_client_sql, ensemble_data_sql, reverse_lookup_client_sql, reverse_lookup_data_sql,
-    reverse_lookup_params, sqlx_error,
+    AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord,
+    EndpointBreakerFailure, EnsembleRecord, ReverseLookupCriteria, SqlValue, bind_values,
+    decision_guid_alias_lookup_sql, ensemble_client_sql, ensemble_data_sql,
+    reverse_lookup_client_sql, reverse_lookup_data_sql, reverse_lookup_params, sqlx_error,
 };
 use crate::domain::{ClientLabel, Decision, File, LookupFields, MediaType};
 use sqlx::Row;
@@ -37,6 +37,7 @@ fn initializes_schema_with_wal_and_documented_tables() {
         "job_log",
         "indexer",
         "indexer_tracker",
+        "endpoint_breaker",
         "timestamp",
         "settings",
         "rss",
@@ -346,6 +347,81 @@ fn announce_work_updates_terminal_expiry_and_stats() {
     assert_eq!(stats.total_attempts, 4);
     assert_eq!(stats.retry_scheduled, 0);
     assert_eq!(stats.last_error_class.as_deref(), Some("terminal"));
+
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
+fn endpoint_breakers_open_half_open_and_close() {
+    let root = temp_path("endpoint-breakers");
+    fs::create_dir_all(&root).expect("temp dir");
+    let database = Database::open_app_dir(&root).expect("database");
+
+    let first = database
+        .record_endpoint_breaker_failure(&EndpointBreakerFailure {
+            endpoint_key: "https://indexer.example/api",
+            operation: "torznab_search",
+            now: 1_000,
+            retry_after: None,
+            error_class: "http_503",
+            error_message: Some("service unavailable"),
+        })
+        .expect("first failure");
+    assert_eq!(first.state, "closed");
+    assert_eq!(first.failure_count, 1);
+    assert!(
+        database
+            .open_endpoint_breaker("https://indexer.example/api", "torznab_search", 1_000)
+            .expect("closed breaker")
+            .is_none()
+    );
+
+    let second = database
+        .record_endpoint_breaker_failure(&EndpointBreakerFailure {
+            endpoint_key: "https://indexer.example/api",
+            operation: "torznab_search",
+            now: 2_000,
+            retry_after: Some(7_000),
+            error_class: "http_429",
+            error_message: Some("rate limited"),
+        })
+        .expect("second failure");
+    assert_eq!(second.state, "open");
+    assert_eq!(second.failure_count, 2);
+    assert_eq!(second.retry_after, Some(7_000));
+    assert!(
+        database
+            .open_endpoint_breaker("https://indexer.example/api", "torznab_search", 3_000)
+            .expect("open breaker")
+            .is_some()
+    );
+
+    let open_stats = database.endpoint_breaker_stats(3_000).expect("open stats");
+    assert_eq!(open_stats.open, 1);
+    assert_eq!(open_stats.half_open, 0);
+    assert_eq!(open_stats.next_retry_at, Some(7_000));
+    assert_eq!(open_stats.last_error_class.as_deref(), Some("http_429"));
+
+    let half_open = database
+        .endpoint_breaker_stats(7_000)
+        .expect("half-open stats");
+    assert_eq!(half_open.open, 0);
+    assert_eq!(half_open.half_open, 1);
+    assert!(
+        database
+            .open_endpoint_breaker("https://indexer.example/api", "torznab_search", 7_000)
+            .expect("half-open probe")
+            .is_none()
+    );
+
+    database
+        .close_endpoint_breaker("https://indexer.example/api", "torznab_search", 8_000)
+        .expect("close breaker");
+    let closed = database
+        .endpoint_breaker_stats(8_000)
+        .expect("closed stats");
+    assert_eq!(closed.open, 0);
+    assert_eq!(closed.half_open, 0);
 
     let _cleanup = fs::remove_dir_all(root);
 }

@@ -523,6 +523,45 @@ impl Database {
         self.block_on(self.inner.indexer_health_rows())
     }
 
+    /// Record a safe remote endpoint breaker failure.
+    pub fn record_endpoint_breaker_failure(
+        &self,
+        failure: &EndpointBreakerFailure<'_>,
+    ) -> crate::Result<EndpointBreakerRow> {
+        self.block_on(self.inner.record_endpoint_breaker_failure(failure))
+    }
+
+    /// Close one endpoint breaker after a successful probe.
+    pub fn close_endpoint_breaker(
+        &self,
+        endpoint_key: &str,
+        operation: &str,
+        now: i64,
+    ) -> crate::Result<()> {
+        self.block_on(
+            self.inner
+                .close_endpoint_breaker(endpoint_key, operation, now),
+        )
+    }
+
+    /// Return the currently open breaker for an endpoint operation.
+    pub fn open_endpoint_breaker(
+        &self,
+        endpoint_key: &str,
+        operation: &str,
+        now: i64,
+    ) -> crate::Result<Option<EndpointBreakerRow>> {
+        self.block_on(
+            self.inner
+                .open_endpoint_breaker(endpoint_key, operation, now),
+        )
+    }
+
+    /// Load endpoint breaker aggregate state for observability.
+    pub fn endpoint_breaker_stats(&self, now: i64) -> crate::Result<EndpointBreakerStats> {
+        self.block_on(self.inner.endpoint_breaker_stats(now))
+    }
+
     /// Read a scheduler job's last run timestamp.
     pub fn read_last_run(&self, name: &str) -> crate::Result<Option<i64>> {
         self.block_on(self.inner.read_last_run(name))
@@ -1632,6 +1671,162 @@ impl AsyncDatabase {
             .collect())
     }
 
+    /// Record a safe remote endpoint breaker failure.
+    pub async fn record_endpoint_breaker_failure(
+        &self,
+        failure: &EndpointBreakerFailure<'_>,
+    ) -> crate::Result<EndpointBreakerRow> {
+        let existing = sqlx::query(
+            "SELECT failure_count
+             FROM endpoint_breaker
+             WHERE endpoint_key = ?1 AND operation = ?2",
+        )
+        .bind(failure.endpoint_key)
+        .bind(failure.operation)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        let failure_count = existing
+            .as_ref()
+            .map(|row| row.get::<i64, _>(0))
+            .unwrap_or(0)
+            .saturating_add(1);
+        let should_open = failure_count >= 2 || failure.retry_after.is_some();
+        let retry_after = if should_open {
+            Some(
+                failure
+                    .retry_after
+                    .unwrap_or_else(|| failure.now.saturating_add(60_000)),
+            )
+        } else {
+            failure.retry_after
+        };
+        let opened_at = if should_open { Some(failure.now) } else { None };
+        sqlx::query(
+            "INSERT INTO endpoint_breaker
+                (endpoint_key, operation, state, failure_count, opened_at,
+                 retry_after, updated_at, last_error_class, last_error_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(endpoint_key, operation) DO UPDATE SET
+                state = excluded.state,
+                failure_count = excluded.failure_count,
+                opened_at = COALESCE(endpoint_breaker.opened_at, excluded.opened_at),
+                retry_after = excluded.retry_after,
+                updated_at = excluded.updated_at,
+                last_error_class = excluded.last_error_class,
+                last_error_message = excluded.last_error_message",
+        )
+        .bind(failure.endpoint_key)
+        .bind(failure.operation)
+        .bind(if should_open { "open" } else { "closed" })
+        .bind(failure_count)
+        .bind(opened_at)
+        .bind(retry_after)
+        .bind(failure.now)
+        .bind(failure.error_class)
+        .bind(failure.error_message)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        self.endpoint_breaker_row(failure.endpoint_key, failure.operation)
+            .await?
+            .ok_or_else(|| persistence_message("endpoint breaker disappeared after update"))
+    }
+
+    /// Close one endpoint breaker after a successful probe.
+    pub async fn close_endpoint_breaker(
+        &self,
+        endpoint_key: &str,
+        operation: &str,
+        now: i64,
+    ) -> crate::Result<()> {
+        sqlx::query(
+            "INSERT INTO endpoint_breaker
+                (endpoint_key, operation, state, failure_count, opened_at,
+                 retry_after, updated_at, last_error_class, last_error_message)
+             VALUES (?1, ?2, 'closed', 0, NULL, NULL, ?3, NULL, NULL)
+             ON CONFLICT(endpoint_key, operation) DO UPDATE SET
+                state = 'closed',
+                failure_count = 0,
+                opened_at = NULL,
+                retry_after = NULL,
+                updated_at = excluded.updated_at,
+                last_error_class = NULL,
+                last_error_message = NULL",
+        )
+        .bind(endpoint_key)
+        .bind(operation)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(sqlx_error)
+    }
+
+    /// Return the currently open breaker for an endpoint operation.
+    pub async fn open_endpoint_breaker(
+        &self,
+        endpoint_key: &str,
+        operation: &str,
+        now: i64,
+    ) -> crate::Result<Option<EndpointBreakerRow>> {
+        let row = self.endpoint_breaker_row(endpoint_key, operation).await?;
+        Ok(row.filter(|row| row.state == "open" && row.retry_after.is_some_and(|at| at > now)))
+    }
+
+    /// Load endpoint breaker aggregate state for observability.
+    pub async fn endpoint_breaker_stats(&self, now: i64) -> crate::Result<EndpointBreakerStats> {
+        let row = sqlx::query(
+            "SELECT
+                COALESCE(SUM(CASE WHEN state = 'open' AND retry_after > ?1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state = 'open' AND (retry_after IS NULL OR retry_after <= ?1) THEN 1 ELSE 0 END), 0),
+                MIN(CASE WHEN state = 'open' AND retry_after > ?1 THEN retry_after END)
+             FROM endpoint_breaker",
+        )
+        .bind(now)
+        .fetch_one(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        let last_error = sqlx::query(
+            "SELECT endpoint_key, operation, last_error_class, last_error_message
+             FROM endpoint_breaker
+             WHERE last_error_class IS NOT NULL OR last_error_message IS NOT NULL
+             ORDER BY updated_at DESC, endpoint_key, operation
+             LIMIT 1",
+        )
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(EndpointBreakerStats {
+            open: row.get(0),
+            half_open: row.get(1),
+            next_retry_at: row.get(2),
+            last_endpoint_key: last_error.as_ref().map(|row| row.get(0)),
+            last_operation: last_error.as_ref().map(|row| row.get(1)),
+            last_error_class: last_error.as_ref().and_then(|row| row.get(2)),
+            last_error_message: last_error.as_ref().and_then(|row| row.get(3)),
+        })
+    }
+
+    async fn endpoint_breaker_row(
+        &self,
+        endpoint_key: &str,
+        operation: &str,
+    ) -> crate::Result<Option<EndpointBreakerRow>> {
+        let row = sqlx::query(
+            "SELECT endpoint_key, operation, state, failure_count, opened_at,
+                    retry_after, updated_at, last_error_class, last_error_message
+             FROM endpoint_breaker
+             WHERE endpoint_key = ?1 AND operation = ?2",
+        )
+        .bind(endpoint_key)
+        .bind(operation)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(row.map(endpoint_breaker_row))
+    }
+
     /// Read a scheduler job's last run timestamp.
     pub async fn read_last_run(&self, name: &str) -> crate::Result<Option<i64>> {
         sqlx::query_scalar("SELECT last_run FROM job_log WHERE name = ?1")
@@ -2154,6 +2349,65 @@ pub struct IndexerHealthRow {
     pub retry_after: Option<i64>,
 }
 
+/// Durable endpoint breaker failure update.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EndpointBreakerFailure<'a> {
+    /// Bounded endpoint identity, such as an indexer URL or tracker label.
+    pub endpoint_key: &'a str,
+    /// Bounded operation class.
+    pub operation: &'a str,
+    /// Update timestamp in milliseconds since the Unix epoch.
+    pub now: i64,
+    /// Absolute retry timestamp in milliseconds since the Unix epoch.
+    pub retry_after: Option<i64>,
+    /// Bounded error class.
+    pub error_class: &'a str,
+    /// Redacted error message.
+    pub error_message: Option<&'a str>,
+}
+
+/// Durable endpoint breaker row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EndpointBreakerRow {
+    /// Bounded endpoint identity.
+    pub endpoint_key: String,
+    /// Bounded operation class.
+    pub operation: String,
+    /// Breaker state.
+    pub state: String,
+    /// Consecutive failure count.
+    pub failure_count: i64,
+    /// Timestamp when the breaker opened.
+    pub opened_at: Option<i64>,
+    /// Timestamp when the next probe is allowed.
+    pub retry_after: Option<i64>,
+    /// Last update timestamp.
+    pub updated_at: i64,
+    /// Bounded error class.
+    pub last_error_class: Option<String>,
+    /// Redacted error message.
+    pub last_error_message: Option<String>,
+}
+
+/// Durable endpoint breaker aggregate state.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EndpointBreakerStats {
+    /// Open breakers still cooling down.
+    pub open: i64,
+    /// Open breakers whose cooldown has elapsed.
+    pub half_open: i64,
+    /// Nearest future retry timestamp.
+    pub next_retry_at: Option<i64>,
+    /// Last endpoint key with error context.
+    pub last_endpoint_key: Option<String>,
+    /// Last operation with error context.
+    pub last_operation: Option<String>,
+    /// Last bounded error class.
+    pub last_error_class: Option<String>,
+    /// Last redacted error message.
+    pub last_error_message: Option<String>,
+}
+
 /// Enabled search indexer row with serialized caps.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SearchIndexerRow {
@@ -2572,6 +2826,21 @@ CREATE TABLE IF NOT EXISTS indexer_tracker (
 CREATE INDEX IF NOT EXISTS idx_indexer_tracker_lookup
 ON indexer_tracker(tracker, indexer_id);
 
+CREATE TABLE IF NOT EXISTS endpoint_breaker (
+    endpoint_key TEXT NOT NULL CHECK (length(endpoint_key) > 0 AND length(endpoint_key) <= 256),
+    operation TEXT NOT NULL CHECK (length(operation) > 0 AND length(operation) <= 64),
+    state TEXT NOT NULL CHECK (state IN ('closed', 'open')),
+    failure_count INTEGER NOT NULL CHECK (failure_count >= 0),
+    opened_at INTEGER NULL CHECK (opened_at IS NULL OR opened_at >= 0),
+    retry_after INTEGER NULL CHECK (retry_after IS NULL OR retry_after >= 0),
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+    last_error_class TEXT NULL CHECK (last_error_class IS NULL OR length(last_error_class) <= 64),
+    last_error_message TEXT NULL CHECK (last_error_message IS NULL OR length(last_error_message) <= 512),
+    PRIMARY KEY(endpoint_key, operation)
+);
+CREATE INDEX IF NOT EXISTS idx_endpoint_breaker_open
+ON endpoint_breaker(state, retry_after, endpoint_key, operation);
+
 CREATE TABLE IF NOT EXISTS timestamp (
     searchee_id INTEGER NOT NULL REFERENCES searchee(id) ON DELETE CASCADE,
     indexer_id INTEGER NOT NULL REFERENCES indexer(id) ON DELETE CASCADE,
@@ -2980,6 +3249,20 @@ fn announce_work_record(row: SqliteRow) -> AnnounceWorkRecord {
         last_error_class: row.get(15),
         last_error_message: row.get(16),
         last_outcome_context: row.get(17),
+    }
+}
+
+fn endpoint_breaker_row(row: SqliteRow) -> EndpointBreakerRow {
+    EndpointBreakerRow {
+        endpoint_key: row.get(0),
+        operation: row.get(1),
+        state: row.get(2),
+        failure_count: row.get(3),
+        opened_at: row.get(4),
+        retry_after: row.get(5),
+        updated_at: row.get(6),
+        last_error_class: row.get(7),
+        last_error_message: row.get(8),
     }
 }
 
