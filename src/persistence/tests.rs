@@ -344,6 +344,7 @@ fn announce_work_updates_terminal_expiry_and_stats() {
     assert_eq!(stats.terminal_failed, 1);
     assert_eq!(stats.expired, 1);
     assert_eq!(stats.total_attempts, 4);
+    assert_eq!(stats.retry_scheduled, 0);
     assert_eq!(stats.last_error_class.as_deref(), Some("terminal"));
 
     let _cleanup = fs::remove_dir_all(root);

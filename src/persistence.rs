@@ -1914,6 +1914,7 @@ impl AsyncDatabase {
                 COALESCE(SUM(CASE WHEN status = 'terminal_failed' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(attempts), 0),
+                COALESCE(SUM(CASE WHEN status = 'retrying' THEN 1 ELSE 0 END), 0),
                 MIN(CASE WHEN status IN ('queued', 'retrying') THEN created_at END),
                 MIN(CASE WHEN status = 'retrying' AND next_attempt_at > ?1 THEN next_attempt_at END)
              FROM announce_work",
@@ -1940,8 +1941,9 @@ impl AsyncDatabase {
             terminal_failed: row.get(3),
             expired: row.get(4),
             total_attempts: row.get(5),
-            oldest_queued_at: row.get(6),
-            next_retry_at: row.get(7),
+            retry_scheduled: row.get(6),
+            oldest_queued_at: row.get(7),
+            next_retry_at: row.get(8),
             last_error_class: last_error.as_ref().and_then(|row| row.get(0)),
             last_error_message: last_error.as_ref().and_then(|row| row.get(1)),
             last_outcome_context: last_error.as_ref().and_then(|row| row.get(2)),
@@ -2344,6 +2346,8 @@ pub struct AnnounceQueueStats {
     pub expired: i64,
     /// Total claimed attempts currently visible in retained rows.
     pub total_attempts: i64,
+    /// Retry rows waiting for their next attempt.
+    pub retry_scheduled: i64,
     /// Created timestamp for the oldest queued or retrying row.
     pub oldest_queued_at: Option<i64>,
     /// Nearest retry timestamp in the future.
