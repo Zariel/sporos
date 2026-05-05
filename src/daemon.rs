@@ -3753,6 +3753,158 @@ mod tests {
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn durable_announce_queue_survives_restart_and_reports_retry() {
+        let root = temp_path("daemon-announce-queue-e2e");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                announce_queue: RawAnnounceQueueConfig {
+                    worker_concurrency: Some(1),
+                    retry_delay_min: Some(60_000),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config: config.clone(),
+            services: RuntimeServices::start(CancellationToken::new()),
+            scheduler: Mutex::new(Scheduler::new(Vec::new())),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+
+        let accepted = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/announce?apikey=secret",
+                BTreeMap::new(),
+                r#"{"name":"Restarted Release","guid":"https://idx/restart","link":"https://idx/restart","tracker":"Tracker"}"#,
+            ),
+        )
+        .await
+        .expect("announce accepted");
+        assert_eq!(accepted.status, 202);
+        let accepted_body: serde_json::Value =
+            serde_json::from_str(&accepted.body).expect("accepted json");
+        assert_eq!(accepted_body["status"], "queued");
+        assert_eq!(
+            database
+                .announce_queue_stats(super::now_millis())
+                .expect("queued stats")
+                .backlog,
+            1
+        );
+        state.services.shutdown().await;
+
+        let restart_database = Database::open_app_dir(&root).expect("reopened database");
+        assert_eq!(
+            restart_database
+                .announce_queue_stats(super::now_millis())
+                .expect("persisted stats")
+                .backlog,
+            1
+        );
+        let now = super::now_millis();
+        insert_announce_work(
+            &restart_database,
+            "expired-before-restart",
+            now.saturating_sub(120_000),
+            now - 1,
+        );
+
+        let services = RuntimeServices::start(CancellationToken::new());
+        let workers = super::start_announce_workers(
+            &root,
+            &config,
+            Arc::clone(&services),
+            CancellationToken::new(),
+            now,
+        )
+        .await
+        .expect("workers");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let stats = restart_database
+                    .announce_queue_stats(super::now_millis())
+                    .expect("retry stats");
+                if stats.total_attempts == 1 && stats.retry_scheduled == 1 && stats.expired == 1 {
+                    assert_eq!(stats.backlog, 1);
+                    assert_eq!(stats.running, 0);
+                    assert_eq!(stats.last_error_class.as_deref(), Some("workflow_error"));
+                    assert_eq!(
+                        stats.last_outcome_context.as_deref(),
+                        Some("retryable_workflow_error")
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("worker retry and expiry observed");
+
+        let observed_state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: Arc::clone(&services),
+            scheduler: Mutex::new(Scheduler::new(Vec::new())),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+        let status = handle_runtime_request(
+            Arc::clone(&observed_state),
+            ApiRequest::new(
+                ApiMethod::Get,
+                "/api/status?apikey=secret",
+                BTreeMap::new(),
+                "",
+            ),
+        )
+        .await
+        .expect("status");
+        let status_body: serde_json::Value =
+            serde_json::from_str(&status.body).expect("status json");
+        let queue = &status_body["runtime"]["durableAnnounceQueue"];
+        assert_eq!(queue["attempts"]["started"], 1);
+        assert_eq!(queue["attempts"]["retryScheduled"], 1);
+        assert_eq!(queue["outcomes"]["expired"], 1);
+        assert_eq!(queue["lastError"]["class"], "workflow_error");
+        assert_eq!(queue["lastError"]["context"], "retryable_workflow_error");
+
+        let metrics = handle_runtime_request(
+            Arc::clone(&observed_state),
+            ApiRequest::new(ApiMethod::Get, "/metrics", BTreeMap::new(), ""),
+        )
+        .await
+        .expect("metrics");
+        assert!(
+            metrics
+                .body
+                .contains(r#"sporos_announce_queue_attempts_total{result="started"} 1"#)
+        );
+        assert!(
+            metrics
+                .body
+                .contains(r#"sporos_announce_queue_attempts_total{result="retry_scheduled"} 1"#)
+        );
+        assert!(
+            metrics
+                .body
+                .contains(r#"sporos_announce_queue_outcomes_total{outcome="expired"} 1"#)
+        );
+
+        workers.shutdown().await.expect("workers stop");
+        services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn announce_work_outcome_classification_covers_queue_states() {
         let config = RuntimeConfig::normalize(
