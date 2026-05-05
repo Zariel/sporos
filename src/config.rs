@@ -31,6 +31,14 @@ const MAX_AUTO_RESUME_DOWNLOAD_BYTES: u64 = 52_428_800;
 const MIN_RSS_CADENCE_MILLIS: u64 = 10 * 60 * 1_000;
 const MAX_RSS_CADENCE_MILLIS: u64 = 2 * 60 * 60 * 1_000;
 const MIN_SEARCH_CADENCE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_ANNOUNCE_QUEUE_WORKERS: u32 = 1;
+const DEFAULT_ANNOUNCE_QUEUE_MAX_BACKLOG: u32 = 1_000;
+const DEFAULT_ANNOUNCE_QUEUE_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_ANNOUNCE_QUEUE_RETRY_MIN_MILLIS: u64 = 30 * 1_000;
+const DEFAULT_ANNOUNCE_QUEUE_RETRY_MAX_MILLIS: u64 = 30 * 60 * 1_000;
+const DEFAULT_ANNOUNCE_QUEUE_LEASE_MILLIS: u64 = 15 * 60 * 1_000;
+const DEFAULT_ANNOUNCE_QUEUE_CLAIM_BATCH_SIZE: u32 = 1;
+const MAX_ANNOUNCE_QUEUE_WORKERS: u32 = 64;
 
 /// Match mode after configured text has been parsed.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -168,6 +176,130 @@ pub struct ApiIntegrationConfig {
     pub api_key: String,
 }
 
+/// Raw durable announce queue policy before defaults.
+#[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawAnnounceQueueConfig {
+    /// Worker tasks allowed to process announce work concurrently.
+    pub worker_concurrency: Option<u32>,
+    /// Maximum active durable work accepted before backpressure.
+    pub max_accepted_backlog: Option<u32>,
+    /// Default work expiry duration in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
+    pub default_ttl: Option<u64>,
+    /// Retry delay floor in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
+    pub retry_delay_min: Option<u64>,
+    /// Retry delay ceiling in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
+    pub retry_delay_max: Option<u64>,
+    /// Running work lease timeout in ms.
+    #[serde(deserialize_with = "deserialize_optional_duration")]
+    pub lease_timeout: Option<u64>,
+    /// Work rows claimed in one database call.
+    pub claim_batch_size: Option<u32>,
+}
+
+/// Durable announce queue policy after defaults and validation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceQueueConfig {
+    /// Worker tasks allowed to process announce work concurrently.
+    pub worker_concurrency: u32,
+    /// Maximum active durable work accepted before backpressure.
+    pub max_accepted_backlog: u32,
+    /// Default work expiry duration in ms.
+    pub default_ttl: u64,
+    /// Retry delay floor in ms.
+    pub retry_delay_min: u64,
+    /// Retry delay ceiling in ms.
+    pub retry_delay_max: u64,
+    /// Running work lease timeout in ms.
+    pub lease_timeout: u64,
+    /// Work rows claimed in one database call.
+    pub claim_batch_size: u32,
+}
+
+impl AnnounceQueueConfig {
+    fn normalize(raw: RawAnnounceQueueConfig) -> crate::Result<Self> {
+        let config = Self {
+            worker_concurrency: raw
+                .worker_concurrency
+                .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_WORKERS),
+            max_accepted_backlog: raw
+                .max_accepted_backlog
+                .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_MAX_BACKLOG),
+            default_ttl: raw.default_ttl.unwrap_or(DEFAULT_ANNOUNCE_QUEUE_TTL_MILLIS),
+            retry_delay_min: raw
+                .retry_delay_min
+                .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_RETRY_MIN_MILLIS),
+            retry_delay_max: raw
+                .retry_delay_max
+                .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_RETRY_MAX_MILLIS),
+            lease_timeout: raw
+                .lease_timeout
+                .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_LEASE_MILLIS),
+            claim_batch_size: raw
+                .claim_batch_size
+                .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_CLAIM_BATCH_SIZE),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> crate::Result<()> {
+        if self.worker_concurrency == 0 || self.worker_concurrency > MAX_ANNOUNCE_QUEUE_WORKERS {
+            return Err(config_error(
+                "announce_queue.worker_concurrency must be 1..=64",
+            ));
+        }
+        if self.max_accepted_backlog == 0 {
+            return Err(config_error(
+                "announce_queue.max_accepted_backlog must be at least 1",
+            ));
+        }
+        if self.default_ttl == 0 {
+            return Err(config_error(
+                "announce_queue.default_ttl must be greater than 0",
+            ));
+        }
+        if self.retry_delay_min == 0 {
+            return Err(config_error(
+                "announce_queue.retry_delay_min must be greater than 0",
+            ));
+        }
+        if self.retry_delay_max < self.retry_delay_min {
+            return Err(config_error(
+                "announce_queue.retry_delay_max must be >= retry_delay_min",
+            ));
+        }
+        if self.lease_timeout == 0 {
+            return Err(config_error(
+                "announce_queue.lease_timeout must be greater than 0",
+            ));
+        }
+        if self.claim_batch_size == 0 || self.claim_batch_size > self.max_accepted_backlog {
+            return Err(config_error(
+                "announce_queue.claim_batch_size must be 1..=max_accepted_backlog",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for AnnounceQueueConfig {
+    fn default() -> Self {
+        Self {
+            worker_concurrency: DEFAULT_ANNOUNCE_QUEUE_WORKERS,
+            max_accepted_backlog: DEFAULT_ANNOUNCE_QUEUE_MAX_BACKLOG,
+            default_ttl: DEFAULT_ANNOUNCE_QUEUE_TTL_MILLIS,
+            retry_delay_min: DEFAULT_ANNOUNCE_QUEUE_RETRY_MIN_MILLIS,
+            retry_delay_max: DEFAULT_ANNOUNCE_QUEUE_RETRY_MAX_MILLIS,
+            lease_timeout: DEFAULT_ANNOUNCE_QUEUE_LEASE_MILLIS,
+            claim_batch_size: DEFAULT_ANNOUNCE_QUEUE_CLAIM_BATCH_SIZE,
+        }
+    }
+}
+
 impl ApiIntegrationConfig {
     /// Validate fields common to structured integrations.
     pub fn validate(&self, label: &str) -> crate::Result<()> {
@@ -283,6 +415,8 @@ pub struct RawConfig {
     pub block_list: Vec<String>,
     /// API key.
     pub api_key: Option<String>,
+    /// Durable announce queue policy.
+    pub announce_queue: RawAnnounceQueueConfig,
     /// Sonarr instances.
     pub sonarr: Vec<ApiIntegrationConfig>,
     /// Radarr instances.
@@ -380,6 +514,8 @@ pub struct RuntimeConfig {
     pub block_list: Vec<String>,
     /// API key.
     pub api_key: Option<String>,
+    /// Durable announce queue policy.
+    pub announce_queue: AnnounceQueueConfig,
     /// Sonarr instances.
     pub sonarr: Vec<ApiIntegrationConfig>,
     /// Radarr instances.
@@ -464,6 +600,7 @@ impl RuntimeConfig {
             torrents: raw.torrents,
             block_list: raw.block_list,
             api_key: raw.api_key,
+            announce_queue: AnnounceQueueConfig::normalize(raw.announce_queue)?,
             sonarr: raw.sonarr,
             radarr: raw.radarr,
         };
@@ -890,10 +1027,37 @@ pub fn apply_env_overrides_from(
             }
             "SPOROS__RSS_CADENCE" => raw.rss_cadence = Some(parse_duration_millis(&value)?),
             "SPOROS__SEARCH_CADENCE" => raw.search_cadence = Some(parse_duration_millis(&value)?),
+            "SPOROS__ANNOUNCE_QUEUE__WORKER_CONCURRENCY" => {
+                raw.announce_queue.worker_concurrency = Some(parse_env_u32(&key, &value)?);
+            }
+            "SPOROS__ANNOUNCE_QUEUE__MAX_ACCEPTED_BACKLOG" => {
+                raw.announce_queue.max_accepted_backlog = Some(parse_env_u32(&key, &value)?);
+            }
+            "SPOROS__ANNOUNCE_QUEUE__DEFAULT_TTL" => {
+                raw.announce_queue.default_ttl = Some(parse_duration_millis(&value)?);
+            }
+            "SPOROS__ANNOUNCE_QUEUE__RETRY_DELAY_MIN" => {
+                raw.announce_queue.retry_delay_min = Some(parse_duration_millis(&value)?);
+            }
+            "SPOROS__ANNOUNCE_QUEUE__RETRY_DELAY_MAX" => {
+                raw.announce_queue.retry_delay_max = Some(parse_duration_millis(&value)?);
+            }
+            "SPOROS__ANNOUNCE_QUEUE__LEASE_TIMEOUT" => {
+                raw.announce_queue.lease_timeout = Some(parse_duration_millis(&value)?);
+            }
+            "SPOROS__ANNOUNCE_QUEUE__CLAIM_BATCH_SIZE" => {
+                raw.announce_queue.claim_batch_size = Some(parse_env_u32(&key, &value)?);
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn parse_env_u32(key: &str, value: &str) -> crate::Result<u32> {
+    value
+        .parse()
+        .map_err(|error| config_error(format!("invalid {key}: {error}")))
 }
 
 fn verify_read_write_dir(path: &Path) -> crate::Result<()> {
@@ -1141,6 +1305,20 @@ mod tests {
     }
 
     #[test]
+    fn defaults_announce_queue_policy_for_one_replica() {
+        let config =
+            RuntimeConfig::normalize(RawConfig::default(), Path::new("/state")).expect("config");
+
+        assert_eq!(config.announce_queue.worker_concurrency, 1);
+        assert_eq!(config.announce_queue.max_accepted_backlog, 1_000);
+        assert_eq!(config.announce_queue.default_ttl, 86_400_000);
+        assert_eq!(config.announce_queue.retry_delay_min, 30_000);
+        assert_eq!(config.announce_queue.retry_delay_max, 1_800_000);
+        assert_eq!(config.announce_queue.lease_timeout, 900_000);
+        assert_eq!(config.announce_queue.claim_batch_size, 1);
+    }
+
+    #[test]
     fn explicit_state_and_database_paths_do_not_follow_config_file_location() {
         let raw = RawConfig {
             state_dir: Some("/writable/state".into()),
@@ -1348,6 +1526,15 @@ mod tests {
             state_dir = "/state"
             database_path = "/state/sporos.db"
 
+            [announce_queue]
+            worker_concurrency = 2
+            max_accepted_backlog = 200
+            default_ttl = "12 hours"
+            retry_delay_min = "45s"
+            retry_delay_max = "20 minutes"
+            lease_timeout = "5 minutes"
+            claim_batch_size = 2
+
             [[torznab]]
             url = "https://indexer.example/api"
             api_key = "secret"
@@ -1380,6 +1567,13 @@ mod tests {
             raw.database_path.as_deref(),
             Some(Path::new("/state/sporos.db"))
         );
+        assert_eq!(raw.announce_queue.worker_concurrency, Some(2));
+        assert_eq!(raw.announce_queue.max_accepted_backlog, Some(200));
+        assert_eq!(raw.announce_queue.default_ttl, Some(43_200_000));
+        assert_eq!(raw.announce_queue.retry_delay_min, Some(45_000));
+        assert_eq!(raw.announce_queue.retry_delay_max, Some(1_200_000));
+        assert_eq!(raw.announce_queue.lease_timeout, Some(300_000));
+        assert_eq!(raw.announce_queue.claim_batch_size, Some(2));
         assert_eq!(
             raw.torrent_clients,
             vec![TorrentClientConfig {
@@ -1467,6 +1661,34 @@ mod tests {
                 ("SPOROS__RSS_CADENCE".to_owned(), "30 minutes".to_owned()),
                 ("SPOROS__SEARCH_CADENCE".to_owned(), "1 day".to_owned()),
                 (
+                    "SPOROS__ANNOUNCE_QUEUE__WORKER_CONCURRENCY".to_owned(),
+                    "3".to_owned(),
+                ),
+                (
+                    "SPOROS__ANNOUNCE_QUEUE__MAX_ACCEPTED_BACKLOG".to_owned(),
+                    "300".to_owned(),
+                ),
+                (
+                    "SPOROS__ANNOUNCE_QUEUE__DEFAULT_TTL".to_owned(),
+                    "6 hours".to_owned(),
+                ),
+                (
+                    "SPOROS__ANNOUNCE_QUEUE__RETRY_DELAY_MIN".to_owned(),
+                    "10s".to_owned(),
+                ),
+                (
+                    "SPOROS__ANNOUNCE_QUEUE__RETRY_DELAY_MAX".to_owned(),
+                    "5 minutes".to_owned(),
+                ),
+                (
+                    "SPOROS__ANNOUNCE_QUEUE__LEASE_TIMEOUT".to_owned(),
+                    "2 minutes".to_owned(),
+                ),
+                (
+                    "SPOROS__ANNOUNCE_QUEUE__CLAIM_BATCH_SIZE".to_owned(),
+                    "4".to_owned(),
+                ),
+                (
                     "SPOROS__TORZNAB".to_owned(),
                     "https://indexer.example/api?apikey=ignored".to_owned(),
                 ),
@@ -1482,6 +1704,13 @@ mod tests {
         assert_eq!(raw.log_level.as_deref(), Some("debug"));
         assert_eq!(raw.rss_cadence, Some(1_800_000));
         assert_eq!(raw.search_cadence, Some(86_400_000));
+        assert_eq!(raw.announce_queue.worker_concurrency, Some(3));
+        assert_eq!(raw.announce_queue.max_accepted_backlog, Some(300));
+        assert_eq!(raw.announce_queue.default_ttl, Some(21_600_000));
+        assert_eq!(raw.announce_queue.retry_delay_min, Some(10_000));
+        assert_eq!(raw.announce_queue.retry_delay_max, Some(300_000));
+        assert_eq!(raw.announce_queue.lease_timeout, Some(120_000));
+        assert_eq!(raw.announce_queue.claim_batch_size, Some(4));
         assert!(raw.torznab.is_empty());
     }
 
@@ -1492,12 +1721,77 @@ mod tests {
             ("SPOROS__LISTEN_PORT", "not a port"),
             ("SPOROS__RSS_CADENCE", "not a duration"),
             ("SPOROS__SEARCH_CADENCE", "not a duration"),
+            ("SPOROS__ANNOUNCE_QUEUE__WORKER_CONCURRENCY", "many"),
+            ("SPOROS__ANNOUNCE_QUEUE__DEFAULT_TTL", "soon"),
+            ("SPOROS__ANNOUNCE_QUEUE__CLAIM_BATCH_SIZE", "several"),
         ] {
             let mut raw = RawConfig::default();
             let error = apply_env_overrides_from([(key.to_owned(), value.to_owned())], &mut raw)
                 .expect_err("invalid env rejected");
 
             assert!(error.to_string().contains("configuration error"));
+        }
+    }
+
+    #[test]
+    fn validates_announce_queue_policy_bounds() {
+        for raw in [
+            RawConfig {
+                announce_queue: super::RawAnnounceQueueConfig {
+                    worker_concurrency: Some(0),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            RawConfig {
+                announce_queue: super::RawAnnounceQueueConfig {
+                    worker_concurrency: Some(65),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            RawConfig {
+                announce_queue: super::RawAnnounceQueueConfig {
+                    max_accepted_backlog: Some(0),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            RawConfig {
+                announce_queue: super::RawAnnounceQueueConfig {
+                    default_ttl: Some(0),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            RawConfig {
+                announce_queue: super::RawAnnounceQueueConfig {
+                    retry_delay_min: Some(60_000),
+                    retry_delay_max: Some(30_000),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            RawConfig {
+                announce_queue: super::RawAnnounceQueueConfig {
+                    lease_timeout: Some(0),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            RawConfig {
+                announce_queue: super::RawAnnounceQueueConfig {
+                    max_accepted_backlog: Some(2),
+                    claim_batch_size: Some(3),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+        ] {
+            let error = RuntimeConfig::normalize(raw, Path::new("/config"))
+                .expect_err("invalid announce queue policy");
+
+            assert!(error.to_string().contains("announce_queue"));
         }
     }
 

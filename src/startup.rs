@@ -974,6 +974,7 @@ mod tests {
             torrents: None,
             block_list: Vec::new(),
             api_key: None,
+            announce_queue: crate::config::AnnounceQueueConfig::default(),
             sonarr: Vec::new(),
             radarr: Vec::new(),
         }
