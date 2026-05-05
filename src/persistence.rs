@@ -533,6 +533,65 @@ impl Database {
         self.block_on(self.inner.write_last_run(name, last_run))
     }
 
+    /// Insert or dedupe an active durable announce work row.
+    pub fn insert_or_dedupe_announce_work(
+        &self,
+        record: &AnnounceWorkInsert<'_>,
+    ) -> crate::Result<AnnounceWorkEnqueue> {
+        self.block_on(self.inner.insert_or_dedupe_announce_work(record))
+    }
+
+    /// Claim ready durable announce work and mark it running.
+    pub fn claim_announce_work(
+        &self,
+        now: i64,
+        lease_owner: &str,
+        lease_timeout: i64,
+        limit: u32,
+    ) -> crate::Result<Vec<AnnounceWorkRecord>> {
+        self.block_on(
+            self.inner
+                .claim_announce_work(now, lease_owner, lease_timeout, limit),
+        )
+    }
+
+    /// Schedule claimed announce work for another attempt.
+    pub fn schedule_announce_retry(&self, update: &AnnounceWorkRetry<'_>) -> crate::Result<bool> {
+        self.block_on(self.inner.schedule_announce_retry(update))
+    }
+
+    /// Mark announce work as succeeded, terminally failed, or expired.
+    pub fn finish_announce_work(&self, update: &AnnounceWorkFinish<'_>) -> crate::Result<bool> {
+        self.block_on(self.inner.finish_announce_work(update))
+    }
+
+    /// Expire non-terminal announce work whose TTL has elapsed.
+    pub fn expire_announce_work(
+        &self,
+        now: i64,
+        limit: u32,
+    ) -> crate::Result<Vec<AnnounceWorkRecord>> {
+        self.block_on(self.inner.expire_announce_work(now, limit))
+    }
+
+    /// Return abandoned running work to a retryable state after lease timeout.
+    pub fn release_stale_announce_leases(
+        &self,
+        now: i64,
+        next_attempt_at: i64,
+        limit: u32,
+    ) -> crate::Result<Vec<AnnounceWorkRecord>> {
+        self.block_on(
+            self.inner
+                .release_stale_announce_leases(now, next_attempt_at, limit),
+        )
+    }
+
+    /// Load durable announce queue stats for status and metrics.
+    pub fn announce_queue_stats(&self, now: i64) -> crate::Result<AnnounceQueueStats> {
+        self.block_on(self.inner.announce_queue_stats(now))
+    }
+
     /// Return a persisted indexer id for a configured URL.
     pub fn indexer_id(&self, url: &str) -> crate::Result<i64> {
         self.block_on(async {
@@ -1597,6 +1656,318 @@ impl AsyncDatabase {
         .map_err(sqlx_error)
     }
 
+    /// Insert or dedupe an active durable announce work row.
+    pub async fn insert_or_dedupe_announce_work(
+        &self,
+        record: &AnnounceWorkInsert<'_>,
+    ) -> crate::Result<AnnounceWorkEnqueue> {
+        if let Some(work) = self
+            .active_announce_work_by_dedupe(record.dedupe_key)
+            .await?
+        {
+            return Ok(AnnounceWorkEnqueue {
+                work,
+                inserted: false,
+            });
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO announce_work
+                (work_id, dedupe_key, name, guid, link, tracker, cookie, status,
+                 attempts, created_at, updated_at, next_attempt_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued',
+                 0, ?8, ?8, ?8, ?9)",
+        )
+        .bind(record.work_id)
+        .bind(record.dedupe_key)
+        .bind(record.name)
+        .bind(record.guid)
+        .bind(record.link)
+        .bind(record.tracker)
+        .bind(record.cookie)
+        .bind(record.now)
+        .bind(record.expires_at)
+        .execute(self.pool())
+        .await;
+
+        match result {
+            Ok(_) => Ok(AnnounceWorkEnqueue {
+                work: self
+                    .announce_work_by_id(record.work_id)
+                    .await?
+                    .ok_or_else(|| persistence_message("inserted announce work disappeared"))?,
+                inserted: true,
+            }),
+            Err(error) => {
+                if let Some(work) = self
+                    .active_announce_work_by_dedupe(record.dedupe_key)
+                    .await?
+                {
+                    Ok(AnnounceWorkEnqueue {
+                        work,
+                        inserted: false,
+                    })
+                } else {
+                    Err(sqlx_error(error))
+                }
+            }
+        }
+    }
+
+    /// Claim ready durable announce work and mark it running.
+    pub async fn claim_announce_work(
+        &self,
+        now: i64,
+        lease_owner: &str,
+        lease_timeout: i64,
+        limit: u32,
+    ) -> crate::Result<Vec<AnnounceWorkRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "UPDATE announce_work
+             SET status = 'running',
+                 attempts = attempts + 1,
+                 updated_at = ?1,
+                 lease_owner = ?2,
+                 lease_expires_at = ?1 + ?3
+             WHERE work_id IN (
+                 SELECT work_id
+                 FROM announce_work
+                 WHERE status IN ('queued', 'retrying')
+                   AND next_attempt_at <= ?1
+                   AND expires_at > ?1
+                 ORDER BY next_attempt_at, created_at, work_id
+                 LIMIT ?4
+             )
+             RETURNING work_id, dedupe_key, name, guid, link, tracker, cookie,
+                 status, attempts, created_at, updated_at, next_attempt_at,
+                 expires_at, lease_owner, lease_expires_at, last_error_class,
+                 last_error_message, last_outcome_context",
+        )
+        .bind(now)
+        .bind(lease_owner)
+        .bind(lease_timeout)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(rows.into_iter().map(announce_work_record).collect())
+    }
+
+    /// Schedule claimed announce work for another attempt.
+    pub async fn schedule_announce_retry(
+        &self,
+        update: &AnnounceWorkRetry<'_>,
+    ) -> crate::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE announce_work
+             SET status = 'retrying',
+                 updated_at = ?2,
+                 next_attempt_at = ?3,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_error_class = ?4,
+                 last_error_message = ?5,
+                 last_outcome_context = ?6
+             WHERE work_id = ?1 AND status = 'running'",
+        )
+        .bind(update.work_id)
+        .bind(update.now)
+        .bind(update.next_attempt_at)
+        .bind(update.error_class)
+        .bind(update.error_message)
+        .bind(update.outcome_context)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Mark announce work as succeeded, terminally failed, or expired.
+    pub async fn finish_announce_work(
+        &self,
+        update: &AnnounceWorkFinish<'_>,
+    ) -> crate::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE announce_work
+             SET status = ?3,
+                 updated_at = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_error_class = ?4,
+                 last_error_message = ?5,
+                 last_outcome_context = ?6
+             WHERE work_id = ?1
+               AND status IN ('queued', 'retrying', 'running')",
+        )
+        .bind(update.work_id)
+        .bind(update.now)
+        .bind(update.status.as_str())
+        .bind(update.error_class)
+        .bind(update.error_message)
+        .bind(update.outcome_context)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Expire non-terminal announce work whose TTL has elapsed.
+    pub async fn expire_announce_work(
+        &self,
+        now: i64,
+        limit: u32,
+    ) -> crate::Result<Vec<AnnounceWorkRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "UPDATE announce_work
+             SET status = 'expired',
+                 updated_at = ?1,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_error_class = NULL,
+                 last_error_message = NULL,
+                 last_outcome_context = 'ttl_expired'
+             WHERE work_id IN (
+                 SELECT work_id
+                 FROM announce_work
+                 WHERE status IN ('queued', 'retrying', 'running')
+                   AND expires_at <= ?1
+                 ORDER BY expires_at, created_at, work_id
+                 LIMIT ?2
+             )
+             RETURNING work_id, dedupe_key, name, guid, link, tracker, cookie,
+                 status, attempts, created_at, updated_at, next_attempt_at,
+                 expires_at, lease_owner, lease_expires_at, last_error_class,
+                 last_error_message, last_outcome_context",
+        )
+        .bind(now)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(rows.into_iter().map(announce_work_record).collect())
+    }
+
+    /// Return abandoned running work to a retryable state after lease timeout.
+    pub async fn release_stale_announce_leases(
+        &self,
+        now: i64,
+        next_attempt_at: i64,
+        limit: u32,
+    ) -> crate::Result<Vec<AnnounceWorkRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "UPDATE announce_work
+             SET status = 'retrying',
+                 updated_at = ?1,
+                 next_attempt_at = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_error_class = 'lease_timeout',
+                 last_error_message = 'announce work lease expired',
+                 last_outcome_context = 'released_after_lease_timeout'
+             WHERE work_id IN (
+                 SELECT work_id
+                 FROM announce_work
+                 WHERE status = 'running'
+                   AND lease_expires_at <= ?1
+                   AND expires_at > ?1
+                 ORDER BY lease_expires_at, created_at, work_id
+                 LIMIT ?3
+             )
+             RETURNING work_id, dedupe_key, name, guid, link, tracker, cookie,
+                 status, attempts, created_at, updated_at, next_attempt_at,
+                 expires_at, lease_owner, lease_expires_at, last_error_class,
+                 last_error_message, last_outcome_context",
+        )
+        .bind(now)
+        .bind(next_attempt_at)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(rows.into_iter().map(announce_work_record).collect())
+    }
+
+    /// Load durable announce queue stats for status and metrics.
+    pub async fn announce_queue_stats(&self, now: i64) -> crate::Result<AnnounceQueueStats> {
+        let row = sqlx::query(
+            "SELECT
+                COALESCE(SUM(CASE WHEN status IN ('queued', 'retrying') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'terminal_failed' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(attempts), 0),
+                MIN(CASE WHEN status IN ('queued', 'retrying') THEN created_at END),
+                MIN(CASE WHEN status = 'retrying' AND next_attempt_at > ?1 THEN next_attempt_at END)
+             FROM announce_work",
+        )
+        .bind(now)
+        .fetch_one(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        let last_error = sqlx::query(
+            "SELECT last_error_class, last_error_message, last_outcome_context
+             FROM announce_work
+             WHERE last_error_class IS NOT NULL OR last_error_message IS NOT NULL
+             ORDER BY updated_at DESC, work_id DESC
+             LIMIT 1",
+        )
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+
+        Ok(AnnounceQueueStats {
+            backlog: row.get(0),
+            running: row.get(1),
+            succeeded: row.get(2),
+            terminal_failed: row.get(3),
+            expired: row.get(4),
+            total_attempts: row.get(5),
+            oldest_queued_at: row.get(6),
+            next_retry_at: row.get(7),
+            last_error_class: last_error.as_ref().and_then(|row| row.get(0)),
+            last_error_message: last_error.as_ref().and_then(|row| row.get(1)),
+            last_outcome_context: last_error.as_ref().and_then(|row| row.get(2)),
+        })
+    }
+
+    async fn announce_work_by_id(
+        &self,
+        work_id: &str,
+    ) -> crate::Result<Option<AnnounceWorkRecord>> {
+        let sql = announce_work_select_sql("work_id = ?1");
+        let row = sqlx::query(&sql)
+            .bind(work_id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        Ok(row.map(announce_work_record))
+    }
+
+    async fn active_announce_work_by_dedupe(
+        &self,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<AnnounceWorkRecord>> {
+        let sql = announce_work_select_sql(
+            "dedupe_key = ?1 AND status IN ('queued', 'retrying', 'running')",
+        );
+        let row = sqlx::query(&sql)
+            .bind(dedupe_key)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        Ok(row.map(announce_work_record))
+    }
+
     async fn schema_version(&self) -> crate::Result<i64> {
         sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(self.pool())
@@ -1820,6 +2191,161 @@ pub struct TimestampRecord {
     pub first_searched: u64,
     /// Last search timestamp.
     pub last_searched: u64,
+}
+
+/// Durable announce work row for insertion.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnounceWorkInsert<'a> {
+    /// Stable work id returned to callers.
+    pub work_id: &'a str,
+    /// Active-work dedupe key.
+    pub dedupe_key: &'a str,
+    /// Remote release name.
+    pub name: &'a str,
+    /// Candidate GUID URL.
+    pub guid: &'a str,
+    /// Candidate download URL.
+    pub link: &'a str,
+    /// Source tracker.
+    pub tracker: &'a str,
+    /// Optional request cookie.
+    pub cookie: Option<&'a str>,
+    /// Acceptance timestamp in milliseconds since the Unix epoch.
+    pub now: i64,
+    /// Work expiry timestamp in milliseconds since the Unix epoch.
+    pub expires_at: i64,
+}
+
+/// Durable announce work row loaded from SQLite.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceWorkRecord {
+    /// Stable work id returned to callers.
+    pub work_id: String,
+    /// Active-work dedupe key.
+    pub dedupe_key: String,
+    /// Remote release name.
+    pub name: String,
+    /// Candidate GUID URL.
+    pub guid: String,
+    /// Candidate download URL.
+    pub link: String,
+    /// Source tracker.
+    pub tracker: String,
+    /// Optional request cookie.
+    pub cookie: Option<String>,
+    /// Current queue status.
+    pub status: String,
+    /// Number of claimed processing attempts.
+    pub attempts: i64,
+    /// Acceptance timestamp in milliseconds since the Unix epoch.
+    pub created_at: i64,
+    /// Last state transition timestamp in milliseconds since the Unix epoch.
+    pub updated_at: i64,
+    /// Next timestamp when queued work may be claimed.
+    pub next_attempt_at: i64,
+    /// Work expiry timestamp in milliseconds since the Unix epoch.
+    pub expires_at: i64,
+    /// Current lease owner for running work.
+    pub lease_owner: Option<String>,
+    /// Current lease expiry timestamp for running work.
+    pub lease_expires_at: Option<i64>,
+    /// Last bounded error class.
+    pub last_error_class: Option<String>,
+    /// Last redacted error message.
+    pub last_error_message: Option<String>,
+    /// Last bounded outcome context.
+    pub last_outcome_context: Option<String>,
+}
+
+/// Result of inserting or deduping an announce work row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceWorkEnqueue {
+    /// Persisted work row.
+    pub work: AnnounceWorkRecord,
+    /// Whether this call inserted the row instead of returning active work.
+    pub inserted: bool,
+}
+
+/// Retry transition for running announce work.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnounceWorkRetry<'a> {
+    /// Stable work id.
+    pub work_id: &'a str,
+    /// Transition timestamp.
+    pub now: i64,
+    /// Next claim timestamp.
+    pub next_attempt_at: i64,
+    /// Bounded error class.
+    pub error_class: Option<&'a str>,
+    /// Redacted error message.
+    pub error_message: Option<&'a str>,
+    /// Bounded outcome context.
+    pub outcome_context: Option<&'a str>,
+}
+
+/// Terminal announce work status.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AnnounceWorkTerminalStatus {
+    /// Work completed successfully.
+    Succeeded,
+    /// Work reached a non-retryable failure.
+    TerminalFailed,
+    /// Work expired before completion.
+    Expired,
+}
+
+impl AnnounceWorkTerminalStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::TerminalFailed => "terminal_failed",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Terminal transition for announce work.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnounceWorkFinish<'a> {
+    /// Stable work id.
+    pub work_id: &'a str,
+    /// Transition timestamp.
+    pub now: i64,
+    /// Terminal status.
+    pub status: AnnounceWorkTerminalStatus,
+    /// Bounded error class.
+    pub error_class: Option<&'a str>,
+    /// Redacted error message.
+    pub error_message: Option<&'a str>,
+    /// Bounded outcome context.
+    pub outcome_context: Option<&'a str>,
+}
+
+/// Durable announce queue aggregate state.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceQueueStats {
+    /// Work waiting to be claimed.
+    pub backlog: i64,
+    /// Work currently leased to a worker.
+    pub running: i64,
+    /// Succeeded work rows retained for observability.
+    pub succeeded: i64,
+    /// Terminally failed work rows retained for observability.
+    pub terminal_failed: i64,
+    /// Expired work rows retained for observability.
+    pub expired: i64,
+    /// Total claimed attempts currently visible in retained rows.
+    pub total_attempts: i64,
+    /// Created timestamp for the oldest queued or retrying row.
+    pub oldest_queued_at: Option<i64>,
+    /// Nearest retry timestamp in the future.
+    pub next_retry_at: Option<i64>,
+    /// Last bounded error class.
+    pub last_error_class: Option<String>,
+    /// Last redacted error message.
+    pub last_error_message: Option<String>,
+    /// Last bounded outcome context.
+    pub last_outcome_context: Option<String>,
 }
 
 /// Client searchee cache row.
@@ -2052,6 +2578,53 @@ CREATE TABLE IF NOT EXISTS rss (
     indexer_id INTEGER PRIMARY KEY REFERENCES indexer(id) ON DELETE CASCADE,
     last_seen_guid TEXT NULL
 );
+
+CREATE TABLE IF NOT EXISTS announce_work (
+    work_id TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    guid TEXT NOT NULL,
+    link TEXT NOT NULL,
+    tracker TEXT NOT NULL,
+    cookie TEXT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'queued',
+        'running',
+        'retrying',
+        'succeeded',
+        'terminal_failed',
+        'expired'
+    )),
+    attempts INTEGER NOT NULL CHECK (attempts >= 0),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+    next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+    expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+    lease_owner TEXT NULL,
+    lease_expires_at INTEGER NULL CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+    last_error_class TEXT NULL,
+    last_error_message TEXT NULL,
+    last_outcome_context TEXT NULL,
+    CHECK (updated_at >= created_at),
+    CHECK (expires_at >= created_at),
+    CHECK (
+        (status = 'running' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (status != 'running' AND lease_owner IS NULL AND lease_expires_at IS NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_announce_work_active_dedupe
+ON announce_work(dedupe_key)
+WHERE status IN ('queued', 'retrying', 'running');
+CREATE INDEX IF NOT EXISTS idx_announce_work_ready
+ON announce_work(status, next_attempt_at, expires_at, created_at, work_id)
+WHERE status IN ('queued', 'retrying');
+CREATE INDEX IF NOT EXISTS idx_announce_work_running_lease
+ON announce_work(status, lease_expires_at, created_at, work_id)
+WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS idx_announce_work_expiry
+ON announce_work(status, expires_at, created_at, work_id);
+CREATE INDEX IF NOT EXISTS idx_announce_work_status
+ON announce_work(status);
 
 CREATE TABLE IF NOT EXISTS current_data_roots (
     path TEXT PRIMARY KEY
@@ -2359,6 +2932,42 @@ fn client_searchee_record(row: SqliteRow) -> ClientSearcheeCacheRecord {
         category: row.get(6),
         tags: row.get(7),
         trackers: row.get(8),
+    }
+}
+
+fn announce_work_select_sql(predicate: &str) -> String {
+    format!(
+        "SELECT work_id, dedupe_key, name, guid, link, tracker, cookie,
+            status, attempts, created_at, updated_at, next_attempt_at,
+            expires_at, lease_owner, lease_expires_at, last_error_class,
+            last_error_message, last_outcome_context
+         FROM announce_work
+         WHERE {predicate}
+         ORDER BY created_at, work_id
+         LIMIT 1"
+    )
+}
+
+fn announce_work_record(row: SqliteRow) -> AnnounceWorkRecord {
+    AnnounceWorkRecord {
+        work_id: row.get(0),
+        dedupe_key: row.get(1),
+        name: row.get(2),
+        guid: row.get(3),
+        link: row.get(4),
+        tracker: row.get(5),
+        cookie: row.get(6),
+        status: row.get(7),
+        attempts: row.get(8),
+        created_at: row.get(9),
+        updated_at: row.get(10),
+        next_attempt_at: row.get(11),
+        expires_at: row.get(12),
+        lease_owner: row.get(13),
+        lease_expires_at: row.get(14),
+        last_error_class: row.get(15),
+        last_error_message: row.get(16),
+        last_outcome_context: row.get(17),
     }
 }
 

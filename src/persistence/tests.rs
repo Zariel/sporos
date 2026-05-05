@@ -1,4 +1,5 @@
 use super::{
+    AnnounceWorkFinish, AnnounceWorkInsert, AnnounceWorkRetry, AnnounceWorkTerminalStatus,
     AsyncDatabase, ClientSearcheeRecord, DataRootRecord, Database, DecisionRecord, EnsembleRecord,
     ReverseLookupCriteria, SqlValue, bind_values, decision_guid_alias_lookup_sql,
     ensemble_client_sql, ensemble_data_sql, reverse_lookup_client_sql, reverse_lookup_data_sql,
@@ -39,6 +40,7 @@ fn initializes_schema_with_wal_and_documented_tables() {
         "timestamp",
         "settings",
         "rss",
+        "announce_work",
         "current_data_roots",
         "current_client_info_hashes",
         "current_client_ensemble_paths",
@@ -92,6 +94,11 @@ fn initializes_schema_with_wal_and_documented_tables() {
         "idx_data_ensemble_root",
         "idx_data_ensemble_lookup",
         "idx_client_ensemble_lookup",
+        "idx_announce_work_active_dedupe",
+        "idx_announce_work_ready",
+        "idx_announce_work_running_lease",
+        "idx_announce_work_expiry",
+        "idx_announce_work_status",
     ] {
         assert_index(&database, index);
     }
@@ -160,6 +167,184 @@ fn schema_constraints_reject_invalid_cache_invariants() {
         &database,
         "INSERT INTO settings (id, apikey) VALUES (1, 'secret')",
     );
+    assert_sql_fails(
+        &database,
+        "INSERT INTO announce_work
+             (work_id, dedupe_key, name, guid, link, tracker, status,
+              attempts, created_at, updated_at, next_attempt_at, expires_at)
+             VALUES ('work', 'dedupe', 'Name', 'guid', 'link', 'tracker',
+              'running', 0, 10, 10, 10, 20)",
+    );
+    assert_sql_fails(
+        &database,
+        "INSERT INTO announce_work
+             (work_id, dedupe_key, name, guid, link, tracker, status,
+              attempts, created_at, updated_at, next_attempt_at, expires_at)
+             VALUES ('work', 'dedupe', 'Name', 'guid', 'link', 'tracker',
+              'queued', -1, 10, 10, 10, 20)",
+    );
+
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
+fn announce_work_insert_dedupes_and_survives_reopen() {
+    let root = temp_path("announce-work-insert");
+    fs::create_dir_all(&root).expect("temp dir");
+    let path = Database::path_for_app_dir(&root);
+    let database = Database::open(&path).expect("database");
+
+    let inserted = database
+        .insert_or_dedupe_announce_work(&announce_insert("work-1", "dedupe-1", 1_000, 11_000))
+        .expect("insert");
+    assert!(inserted.inserted);
+    assert_eq!(inserted.work.work_id, "work-1");
+    assert_eq!(inserted.work.status, "queued");
+    assert_eq!(inserted.work.cookie.as_deref(), Some("uid=1"));
+
+    let deduped = database
+        .insert_or_dedupe_announce_work(&AnnounceWorkInsert {
+            work_id: "work-2",
+            dedupe_key: "dedupe-1",
+            name: "Other",
+            guid: "https://tracker.example/other",
+            link: "https://tracker.example/other",
+            tracker: "tracker",
+            cookie: None,
+            now: 2_000,
+            expires_at: 12_000,
+        })
+        .expect("dedupe");
+    assert!(!deduped.inserted);
+    assert_eq!(deduped.work.work_id, "work-1");
+
+    drop(database);
+    let reopened = Database::open(&path).expect("reopened");
+    let claimed = reopened
+        .claim_announce_work(1_000, "worker-a", 5_000, 10)
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].work_id, "work-1");
+    assert_eq!(claimed[0].attempts, 1);
+    assert_eq!(claimed[0].lease_owner.as_deref(), Some("worker-a"));
+
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
+fn announce_work_claims_ready_rows_in_order() {
+    let root = temp_path("announce-work-claim");
+    fs::create_dir_all(&root).expect("temp dir");
+    let database = Database::open_app_dir(&root).expect("database");
+
+    database
+        .insert_or_dedupe_announce_work(&announce_insert(
+            "work-later",
+            "dedupe-later",
+            5_000,
+            20_000,
+        ))
+        .expect("insert later");
+    database
+        .insert_or_dedupe_announce_work(&announce_insert("work-now", "dedupe-now", 1_000, 20_000))
+        .expect("insert now");
+
+    let claimed = database
+        .claim_announce_work(2_000, "worker-a", 3_000, 10)
+        .expect("claim");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.work_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["work-now"]
+    );
+    assert_eq!(claimed[0].status, "running");
+    assert_eq!(claimed[0].lease_expires_at, Some(5_000));
+
+    let released = database
+        .release_stale_announce_leases(5_000, 6_000, 10)
+        .expect("release lease");
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].status, "retrying");
+    assert_eq!(released[0].next_attempt_at, 6_000);
+
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
+fn announce_work_updates_terminal_expiry_and_stats() {
+    let root = temp_path("announce-work-stats");
+    fs::create_dir_all(&root).expect("temp dir");
+    let database = Database::open_app_dir(&root).expect("database");
+
+    database
+        .insert_or_dedupe_announce_work(&announce_insert("work-ok", "dedupe-ok", 1_000, 20_000))
+        .expect("insert ok");
+    database
+        .insert_or_dedupe_announce_work(&announce_insert("work-fail", "dedupe-fail", 1_000, 20_000))
+        .expect("insert fail");
+    database
+        .insert_or_dedupe_announce_work(&announce_insert(
+            "work-expire",
+            "dedupe-expire",
+            1_000,
+            2_000,
+        ))
+        .expect("insert expire");
+
+    let claimed = database
+        .claim_announce_work(1_500, "worker-a", 5_000, 3)
+        .expect("claim");
+    assert_eq!(claimed.len(), 3);
+    database
+        .finish_announce_work(&AnnounceWorkFinish {
+            work_id: &claimed[0].work_id,
+            now: 1_600,
+            status: AnnounceWorkTerminalStatus::Succeeded,
+            error_class: None,
+            error_message: None,
+            outcome_context: Some("matched"),
+        })
+        .expect("finish ok");
+    database
+        .schedule_announce_retry(&AnnounceWorkRetry {
+            work_id: &claimed[1].work_id,
+            now: 1_700,
+            next_attempt_at: 1_800,
+            error_class: Some("terminal"),
+            error_message: Some("retry once"),
+            outcome_context: Some("retry_scheduled"),
+        })
+        .expect("retry failed");
+    let retried = database
+        .claim_announce_work(1_800, "worker-a", 5_000, 1)
+        .expect("claim retry");
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].attempts, 2);
+    database
+        .finish_announce_work(&AnnounceWorkFinish {
+            work_id: &retried[0].work_id,
+            now: 1_900,
+            status: AnnounceWorkTerminalStatus::TerminalFailed,
+            error_class: Some("terminal"),
+            error_message: Some("not matchable"),
+            outcome_context: Some("file_tree_mismatch"),
+        })
+        .expect("finish failed");
+
+    let expired = database.expire_announce_work(2_000, 10).expect("expire");
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].status, "expired");
+
+    let stats = database.announce_queue_stats(2_500).expect("stats");
+    assert_eq!(stats.backlog, 0);
+    assert_eq!(stats.running, 0);
+    assert_eq!(stats.succeeded, 1);
+    assert_eq!(stats.terminal_failed, 1);
+    assert_eq!(stats.expired, 1);
+    assert_eq!(stats.total_attempts, 4);
+    assert_eq!(stats.last_error_class.as_deref(), Some("terminal"));
 
     let _cleanup = fs::remove_dir_all(root);
 }
@@ -802,6 +987,25 @@ fn temp_path(label: &str) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("sporos-db-{label}-{nanos}"))
+}
+
+fn announce_insert<'a>(
+    work_id: &'a str,
+    dedupe_key: &'a str,
+    now: i64,
+    expires_at: i64,
+) -> AnnounceWorkInsert<'a> {
+    AnnounceWorkInsert {
+        work_id,
+        dedupe_key,
+        name: "Release",
+        guid: "https://tracker.example/release",
+        link: "https://tracker.example/release",
+        tracker: "tracker",
+        cookie: Some("uid=1"),
+        now,
+        expires_at,
+    }
 }
 
 fn assert_sql_fails(database: &Database, sql: &str) {
