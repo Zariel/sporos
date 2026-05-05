@@ -34,11 +34,12 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     SporosError,
     api::{
-        AUTH_MESSAGE, AnnounceAccepted, AnnounceRequest, ApiHandlers, ApiMethod, ApiRequest,
-        ApiResponse, JobRequest, JobResponse, WebhookRequest, handle_trusted_api_request,
+        AUTH_MESSAGE, AnnounceAccepted, AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome,
+        ApiRequest, ApiResponse, JobRequest, JobResponse, WebhookRequest,
+        handle_trusted_api_request,
     },
     config::RuntimeConfig,
-    domain::Candidate,
+    domain::{ActionResult, Candidate, Decision, InjectionResult, SaveResult},
     persistence::{
         AnnounceWorkFinish, AnnounceWorkInsert, AnnounceWorkRecord, AnnounceWorkRetry,
         AnnounceWorkTerminalStatus, AsyncDatabase, Database,
@@ -390,8 +391,8 @@ impl AnnounceWorker {
         )
         .await;
         let now = now_millis();
-        match result {
-            Ok(_) => {
+        match classify_announce_work_result(result, &work, now, &self.config) {
+            AnnounceWorkExecution::Succeeded { context } => {
                 database
                     .finish_announce_work(&AnnounceWorkFinish {
                         work_id: &work.work_id,
@@ -399,7 +400,7 @@ impl AnnounceWorker {
                         status: AnnounceWorkTerminalStatus::Succeeded,
                         error_class: None,
                         error_message: None,
-                        outcome_context: Some("workflow_completed"),
+                        outcome_context: Some(context),
                     })
                     .await?;
                 tracing::info!(
@@ -409,25 +410,91 @@ impl AnnounceWorker {
                     "announce work completed"
                 );
             }
-            Err(error) => {
-                let delay =
-                    i64::try_from(self.config.announce_queue.retry_delay_min).unwrap_or(i64::MAX);
-                let error_message = error.to_string();
+            AnnounceWorkExecution::Waiting {
+                next_attempt_at,
+                context,
+            } => {
                 database
                     .schedule_announce_retry(&AnnounceWorkRetry {
                         work_id: &work.work_id,
                         now,
-                        next_attempt_at: now.saturating_add(delay),
-                        error_class: Some("workflow_error"),
+                        next_attempt_at,
+                        error_class: None,
+                        error_message: None,
+                        outcome_context: Some(context),
+                    })
+                    .await?;
+                tracing::info!(
+                    work_id = work.work_id.as_str(),
+                    dedupe_key = work.dedupe_key.as_str(),
+                    attempt = work.attempts,
+                    next_attempt_at,
+                    "announce work is waiting"
+                );
+            }
+            AnnounceWorkExecution::Retryable {
+                next_attempt_at,
+                error_class,
+                error_message,
+                context,
+            } => {
+                database
+                    .schedule_announce_retry(&AnnounceWorkRetry {
+                        work_id: &work.work_id,
+                        now,
+                        next_attempt_at,
+                        error_class: Some(error_class),
                         error_message: Some(&error_message),
-                        outcome_context: Some("retry_scheduled"),
+                        outcome_context: Some(context),
                     })
                     .await?;
                 tracing::warn!(
                     work_id = work.work_id.as_str(),
                     dedupe_key = work.dedupe_key.as_str(),
                     attempt = work.attempts,
-                    "announce work scheduled for retry: {error}"
+                    next_attempt_at,
+                    "announce work scheduled for retry: {error_message}"
+                );
+            }
+            AnnounceWorkExecution::TerminalFailed {
+                error_class,
+                error_message,
+                context,
+            } => {
+                database
+                    .finish_announce_work(&AnnounceWorkFinish {
+                        work_id: &work.work_id,
+                        now,
+                        status: AnnounceWorkTerminalStatus::TerminalFailed,
+                        error_class: Some(error_class),
+                        error_message,
+                        outcome_context: Some(context),
+                    })
+                    .await?;
+                tracing::info!(
+                    work_id = work.work_id.as_str(),
+                    dedupe_key = work.dedupe_key.as_str(),
+                    attempt = work.attempts,
+                    context,
+                    "announce work reached terminal state"
+                );
+            }
+            AnnounceWorkExecution::Expired { context } => {
+                database
+                    .finish_announce_work(&AnnounceWorkFinish {
+                        work_id: &work.work_id,
+                        now,
+                        status: AnnounceWorkTerminalStatus::Expired,
+                        error_class: None,
+                        error_message: None,
+                        outcome_context: Some(context),
+                    })
+                    .await?;
+                tracing::warn!(
+                    work_id = work.work_id.as_str(),
+                    dedupe_key = work.dedupe_key.as_str(),
+                    attempt = work.attempts,
+                    "announce work expired during processing"
                 );
             }
         }
@@ -444,6 +511,125 @@ fn announce_candidate(work: &AnnounceWorkRecord) -> Candidate<'static> {
     );
     candidate.cookie = work.cookie.clone().map(Cow::Owned);
     candidate
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum AnnounceWorkExecution {
+    Succeeded {
+        context: &'static str,
+    },
+    Waiting {
+        next_attempt_at: i64,
+        context: &'static str,
+    },
+    Retryable {
+        next_attempt_at: i64,
+        error_class: &'static str,
+        error_message: String,
+        context: &'static str,
+    },
+    TerminalFailed {
+        error_class: &'static str,
+        error_message: Option<&'static str>,
+        context: &'static str,
+    },
+    Expired {
+        context: &'static str,
+    },
+}
+
+fn classify_announce_work_result(
+    result: crate::Result<Option<ApiOutcome>>,
+    work: &AnnounceWorkRecord,
+    now: i64,
+    config: &RuntimeConfig,
+) -> AnnounceWorkExecution {
+    if now >= work.expires_at {
+        return AnnounceWorkExecution::Expired {
+            context: "expired_during_processing",
+        };
+    }
+
+    match result {
+        Ok(Some(outcome)) => classify_announce_outcome(outcome, now, config),
+        Ok(None) => AnnounceWorkExecution::TerminalFailed {
+            error_class: "no_match",
+            error_message: None,
+            context: "no_match",
+        },
+        Err(error) => {
+            let delay = i64::try_from(config.announce_queue.retry_delay_min).unwrap_or(i64::MAX);
+            AnnounceWorkExecution::Retryable {
+                next_attempt_at: now.saturating_add(delay),
+                error_class: "workflow_error",
+                error_message: error.to_string(),
+                context: "retryable_workflow_error",
+            }
+        }
+    }
+}
+
+fn classify_announce_outcome(
+    outcome: ApiOutcome,
+    now: i64,
+    config: &RuntimeConfig,
+) -> AnnounceWorkExecution {
+    match outcome.action_result {
+        Some(ActionResult::Save(SaveResult::Saved))
+        | Some(ActionResult::Injection(InjectionResult::Injected))
+        | Some(ActionResult::Injection(InjectionResult::AlreadyExists))
+        | Some(ActionResult::Injection(InjectionResult::Failure)) => {
+            AnnounceWorkExecution::Succeeded {
+                context: "action_completed",
+            }
+        }
+        Some(ActionResult::Injection(InjectionResult::TorrentNotComplete)) => {
+            let delay = i64::try_from(config.announce_queue.retry_delay_min).unwrap_or(i64::MAX);
+            AnnounceWorkExecution::Waiting {
+                next_attempt_at: now.saturating_add(delay),
+                context: "waiting_source_torrent_incomplete",
+            }
+        }
+        None if matches!(
+            outcome.decision,
+            Decision::InfoHashAlreadyExists | Decision::SameInfoHash
+        ) =>
+        {
+            AnnounceWorkExecution::TerminalFailed {
+                error_class: "already_present",
+                error_message: None,
+                context: "already_present",
+            }
+        }
+        None => AnnounceWorkExecution::TerminalFailed {
+            error_class: "terminal_decision",
+            error_message: None,
+            context: decision_context(outcome.decision),
+        },
+    }
+}
+
+fn decision_context(decision: Decision) -> &'static str {
+    match decision {
+        Decision::BlockedRelease => "blocked_release",
+        Decision::DownloadFailed => "download_failed",
+        Decision::FileTreeMismatch => "file_tree_mismatch",
+        Decision::FuzzySizeMismatch => "fuzzy_size_mismatch",
+        Decision::InfoHashAlreadyExists => "already_present",
+        Decision::MagnetLink => "magnet_link",
+        Decision::NoDownloadLink => "no_download_link",
+        Decision::PartialSizeMismatch => "partial_size_mismatch",
+        Decision::ProperRepackMismatch => "proper_repack_mismatch",
+        Decision::RateLimited => "rate_limited_decision",
+        Decision::ReleaseGroupMismatch => "release_group_mismatch",
+        Decision::ResolutionMismatch => "resolution_mismatch",
+        Decision::SameInfoHash => "already_present",
+        Decision::SizeMismatch => "size_mismatch",
+        Decision::SourceMismatch => "source_mismatch",
+        Decision::Match | Decision::MatchPartial | Decision::MatchSizeOnly => {
+            "match_without_action"
+        }
+    }
 }
 
 fn serve_http(
@@ -2384,9 +2570,10 @@ mod tests {
     use super::{MAX_REQUEST_BODY_BYTES, handle_runtime_request, http_route, run_plan};
     use crate::{
         SporosError,
-        api::{ApiMethod, ApiRequest, handle_api_request},
+        api::{ApiMethod, ApiOutcome, ApiRequest, handle_api_request},
         config::{RawAnnounceQueueConfig, RawConfig, RuntimeConfig, TorrentClientConfig},
-        persistence::{AnnounceWorkInsert, AsyncDatabase, Database},
+        domain::{ActionResult, Decision, InjectionResult, SaveResult},
+        persistence::{AnnounceWorkInsert, AnnounceWorkRecord, AsyncDatabase, Database},
         runtime::{RuntimeServices, RuntimeTaskQueue},
         scheduler::{
             DaemonPlan, JobCheckResult, JobConfigOverride, JobName, ScheduledJob, Scheduler,
@@ -2394,7 +2581,9 @@ mod tests {
     };
     use axum::http::header::CONTENT_TYPE;
     use std::{
+        borrow::Cow,
         collections::BTreeMap,
+        path::Path,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -3237,6 +3426,116 @@ mod tests {
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn announce_work_outcome_classification_covers_queue_states() {
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                announce_queue: RawAnnounceQueueConfig {
+                    retry_delay_min: Some(5_000),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            Path::new("/state"),
+        )
+        .expect("config");
+        let work = announce_work_record(20_000);
+
+        assert_eq!(
+            super::classify_announce_work_result(
+                Ok(Some(ApiOutcome {
+                    decision: Decision::Match,
+                    action_result: Some(ActionResult::Save(SaveResult::Saved)),
+                })),
+                &work,
+                10_000,
+                &config,
+            ),
+            super::AnnounceWorkExecution::Succeeded {
+                context: "action_completed"
+            }
+        );
+        assert_eq!(
+            super::classify_announce_work_result(
+                Ok(Some(ApiOutcome {
+                    decision: Decision::Match,
+                    action_result: Some(ActionResult::Injection(
+                        InjectionResult::TorrentNotComplete
+                    )),
+                })),
+                &work,
+                10_000,
+                &config,
+            ),
+            super::AnnounceWorkExecution::Waiting {
+                next_attempt_at: 15_000,
+                context: "waiting_source_torrent_incomplete"
+            }
+        );
+        assert_eq!(
+            super::classify_announce_work_result(
+                Err(SporosError::Operation {
+                    message: Cow::Borrowed("temporary tracker failure"),
+                }),
+                &work,
+                10_000,
+                &config,
+            ),
+            super::AnnounceWorkExecution::Retryable {
+                next_attempt_at: 15_000,
+                error_class: "workflow_error",
+                error_message: "operation error: temporary tracker failure".to_owned(),
+                context: "retryable_workflow_error",
+            }
+        );
+        assert_eq!(
+            super::classify_announce_work_result(
+                Ok(Some(ApiOutcome {
+                    decision: Decision::SameInfoHash,
+                    action_result: None,
+                })),
+                &work,
+                10_000,
+                &config,
+            ),
+            super::AnnounceWorkExecution::TerminalFailed {
+                error_class: "already_present",
+                error_message: None,
+                context: "already_present",
+            }
+        );
+        assert_eq!(
+            super::classify_announce_work_result(
+                Ok(Some(ApiOutcome {
+                    decision: Decision::BlockedRelease,
+                    action_result: None,
+                })),
+                &work,
+                10_000,
+                &config,
+            ),
+            super::AnnounceWorkExecution::TerminalFailed {
+                error_class: "terminal_decision",
+                error_message: None,
+                context: "blocked_release",
+            }
+        );
+        assert_eq!(
+            super::classify_announce_work_result(Ok(None), &work, 10_000, &config),
+            super::AnnounceWorkExecution::TerminalFailed {
+                error_class: "no_match",
+                error_message: None,
+                context: "no_match",
+            }
+        );
+        assert_eq!(
+            super::classify_announce_work_result(Ok(None), &work, 20_000, &config),
+            super::AnnounceWorkExecution::Expired {
+                context: "expired_during_processing"
+            }
+        );
+    }
+
     #[tokio::test]
     async fn status_reports_runtime_diagnostics() {
         let root = temp_path("daemon-status-diagnostics");
@@ -3659,6 +3958,29 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("sporos-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn announce_work_record(expires_at: i64) -> AnnounceWorkRecord {
+        AnnounceWorkRecord {
+            work_id: "work-1".to_owned(),
+            dedupe_key: "dedupe-1".to_owned(),
+            name: "Release".to_owned(),
+            guid: "https://idx/t".to_owned(),
+            link: "https://idx/t".to_owned(),
+            tracker: "Tracker".to_owned(),
+            cookie: None,
+            status: "running".to_owned(),
+            attempts: 1,
+            created_at: 1_000,
+            updated_at: 10_000,
+            next_attempt_at: 10_000,
+            expires_at,
+            lease_owner: Some("worker".to_owned()),
+            lease_expires_at: Some(30_000),
+            last_error_class: None,
+            last_error_message: None,
+            last_outcome_context: None,
+        }
     }
 
     fn content_type(response: &reqwest::Response) -> Option<&str> {
