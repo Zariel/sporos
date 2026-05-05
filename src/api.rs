@@ -326,7 +326,7 @@ async fn handle_api_request_inner<H: ApiHandlers + Send>(
                 Err(response) => return Ok(response),
             };
             let accepted = handlers.announce(announce).await?;
-            Ok(announce_response(accepted))
+            Ok(announce_accepted_response(accepted))
         }
         "/api/webhook" => {
             if let Some(response) = method_guard(request.method, ApiMethod::Post) {
@@ -561,7 +561,7 @@ fn reject_unknown_fields(
     Ok(())
 }
 
-fn announce_response(accepted: AnnounceAccepted) -> ApiResponse {
+fn announce_accepted_response(accepted: AnnounceAccepted) -> ApiResponse {
     ApiResponse::new(
         202,
         serde_json::json!({
@@ -899,7 +899,7 @@ mod tests {
         announces: Vec<AnnounceRequest>,
         webhooks: Vec<WebhookRequest>,
         jobs: Vec<JobRequest>,
-        announce_response: AnnounceAccepted,
+        announce_accepted: AnnounceAccepted,
         job_response: JobResponse,
     }
 
@@ -909,7 +909,7 @@ mod tests {
                 announces: Vec::new(),
                 webhooks: Vec::new(),
                 jobs: Vec::new(),
-                announce_response: AnnounceAccepted {
+                announce_accepted: AnnounceAccepted {
                     work_id: "work-1".to_owned(),
                     status: "queued".to_owned(),
                 },
@@ -922,7 +922,7 @@ mod tests {
     impl ApiHandlers for TestHandlers {
         async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<AnnounceAccepted> {
             self.announces.push(request);
-            Ok(self.announce_response.clone())
+            Ok(self.announce_accepted.clone())
         }
 
         async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {
