@@ -132,13 +132,14 @@ All tests and clippy must pass with no warnings before the task is complete.
 
 ## Architecture Overview
 
-sporos implements the torrent cross-seeding behavior documented in
-`docs/internal`. Treat those documents as the functional and API contract for
-CLI flags, TOML config semantics, HTTP API behavior, torrent cache and output
-filenames, matching decisions, scheduler behavior, and torrent-client side
-effects. The Rust-native TOML configuration and initial Rust schema are the
-supported contract; do not add alternate configuration loaders or schema
-compatibility layers unless a ticket explicitly changes that contract.
+Sporos is past the TypeScript-to-Rust rewrite phase. Treat the current Rust
+code, tests, ADRs, and beads issues as the active project contract. Do not use
+old rewrite planning material as a source of truth for CLI flags, TOML config
+semantics, HTTP API behavior, torrent cache and output filenames, matching
+decisions, scheduler behavior, or torrent-client side effects. The Rust-native
+TOML configuration and initial Rust schema are the supported contract; do not
+add alternate configuration loaders or schema compatibility layers unless a
+ticket explicitly changes that contract.
 
 SQLite schema changes are folded into the inline initial schema until the first
 Rust release. Do not add migration files for unreleased schema changes. After
@@ -158,8 +159,8 @@ ownership. Existing client-owned tables should key by `client_host` directly.
 
 ### Rust design
 Preserve user-visible behavior before improving internals. When behavior is
-unclear, add a functional/API compatibility test from `docs/internal` before
-changing it.
+unclear, add a focused test around the current Rust behavior or an ADR-backed
+change before modifying it.
 
 Memory efficiency is a primary design goal. The baseline scale is 10,000
 torrents in a client, and the design should expect to handle 100,000. Any path
