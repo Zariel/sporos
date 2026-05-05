@@ -38,7 +38,11 @@ use crate::{
         ApiResponse, JobRequest, JobResponse, WebhookRequest, handle_trusted_api_request,
     },
     config::RuntimeConfig,
-    persistence::{AnnounceWorkInsert, AsyncDatabase, Database},
+    domain::Candidate,
+    persistence::{
+        AnnounceWorkFinish, AnnounceWorkInsert, AnnounceWorkRecord, AnnounceWorkRetry,
+        AnnounceWorkTerminalStatus, AsyncDatabase, Database,
+    },
     runtime::{RuntimeBlockingExecutor, RuntimeServices, RuntimeTaskQueue},
     scheduler::{DaemonPlan, DaemonRun, JobConfigOverride, JobName, ScheduledJob, Scheduler},
 };
@@ -145,7 +149,18 @@ async fn run_plan(
     finish_executed_jobs(&mut plan.scheduler, &async_database, startup_jobs, &metrics).await?;
 
     let mut server_state = None;
+    let mut announce_workers = None;
     let server = if let Some(address) = listen_address(config) {
+        announce_workers = Some(
+            start_announce_workers(
+                app_dir,
+                config,
+                Arc::clone(&runtime_services),
+                shutdown.child_token(),
+                now_millis(),
+            )
+            .await?,
+        );
         let listener = TcpListener::bind(address)
             .await
             .map_err(|error| daemon_error(format!("failed to bind {address}: {error}")))?;
@@ -215,6 +230,10 @@ async fn run_plan(
             .map_err(|error| daemon_error(format!("HTTP server task failed: {error}")))??;
         tracing::info!("HTTP intake stopped");
     }
+    if let Some(workers) = announce_workers {
+        workers.shutdown().await?;
+        tracing::info!("announce queue workers stopped");
+    }
     runtime_services.shutdown().await;
     async_database.close().await;
     tracing::info!(
@@ -222,6 +241,209 @@ async fn run_plan(
         "service shutdown complete"
     );
     Ok(run)
+}
+
+struct AnnounceWorkerGroup {
+    shutdown: CancellationToken,
+    handles: Vec<JoinHandle<crate::Result<()>>>,
+}
+
+impl AnnounceWorkerGroup {
+    async fn shutdown(self) -> crate::Result<()> {
+        self.shutdown.cancel();
+        for handle in self.handles {
+            handle
+                .await
+                .map_err(|error| daemon_error(format!("announce worker task failed: {error}")))??;
+        }
+        Ok(())
+    }
+}
+
+async fn start_announce_workers(
+    app_dir: &Path,
+    config: &RuntimeConfig,
+    services: Arc<RuntimeServices>,
+    shutdown: CancellationToken,
+    now: i64,
+) -> crate::Result<AnnounceWorkerGroup> {
+    let database = AsyncDatabase::open(&config.database_path).await?;
+    let recovered = database
+        .release_stale_announce_leases(now, now, config.announce_queue.max_accepted_backlog)
+        .await?;
+    if !recovered.is_empty() {
+        tracing::warn!(
+            recovered = recovered.len(),
+            "recovered stale announce queue leases"
+        );
+    }
+    database.close().await;
+
+    let worker_shutdown = shutdown.child_token();
+    let mut handles = Vec::new();
+    for worker_index in 0..config.announce_queue.worker_concurrency {
+        let worker_id = format!("announce-worker-{worker_index}");
+        let worker = AnnounceWorker {
+            worker_id,
+            app_dir: app_dir.to_owned(),
+            config: config.clone(),
+            services: Arc::clone(&services),
+            shutdown: worker_shutdown.child_token(),
+        };
+        handles.push(tokio::spawn(worker.run()));
+    }
+    tracing::info!(workers = handles.len(), "announce queue workers started");
+    Ok(AnnounceWorkerGroup {
+        shutdown: worker_shutdown,
+        handles,
+    })
+}
+
+struct AnnounceWorker {
+    worker_id: String,
+    app_dir: PathBuf,
+    config: RuntimeConfig,
+    services: Arc<RuntimeServices>,
+    shutdown: CancellationToken,
+}
+
+impl AnnounceWorker {
+    async fn run(self) -> crate::Result<()> {
+        let database = AsyncDatabase::open(&self.config.database_path).await?;
+        loop {
+            tokio::select! {
+                () = self.shutdown.cancelled() => break,
+                result = self.poll_once(&database) => {
+                    if !result? {
+                        tokio::select! {
+                            () = self.shutdown.cancelled() => break,
+                            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
+                    }
+                }
+            }
+        }
+        database.close().await;
+        Ok(())
+    }
+
+    async fn poll_once(&self, database: &AsyncDatabase) -> crate::Result<bool> {
+        let now = now_millis();
+        let expired = database
+            .expire_announce_work(now, self.config.announce_queue.claim_batch_size)
+            .await?;
+        for work in expired {
+            tracing::warn!(
+                work_id = work.work_id.as_str(),
+                dedupe_key = work.dedupe_key.as_str(),
+                "expired announce work before processing"
+            );
+        }
+
+        let recovered = database
+            .release_stale_announce_leases(now, now, self.config.announce_queue.claim_batch_size)
+            .await?;
+        for work in recovered {
+            tracing::warn!(
+                work_id = work.work_id.as_str(),
+                dedupe_key = work.dedupe_key.as_str(),
+                "released stale announce work lease"
+            );
+        }
+
+        let mut claimed = database
+            .claim_announce_work(
+                now,
+                &self.worker_id,
+                i64::try_from(self.config.announce_queue.lease_timeout).unwrap_or(i64::MAX),
+                1,
+            )
+            .await?;
+        let Some(work) = claimed.pop() else {
+            return Ok(false);
+        };
+        self.process(database, work).await?;
+        Ok(true)
+    }
+
+    async fn process(
+        &self,
+        database: &AsyncDatabase,
+        work: AnnounceWorkRecord,
+    ) -> crate::Result<()> {
+        tracing::info!(
+            work_id = work.work_id.as_str(),
+            dedupe_key = work.dedupe_key.as_str(),
+            attempt = work.attempts,
+            "processing announce work"
+        );
+        let notifier = crate::notifications::NotificationSender::from_config(
+            &self.config,
+            crate::startup::Redactor::from_config(&self.config),
+        )?;
+        let result = crate::operations::run_announce_match_async(
+            self.services.blocking().matching.clone(),
+            self.app_dir.clone(),
+            self.config.clone(),
+            announce_candidate(&work),
+            notifier,
+        )
+        .await;
+        let now = now_millis();
+        match result {
+            Ok(_) => {
+                database
+                    .finish_announce_work(&AnnounceWorkFinish {
+                        work_id: &work.work_id,
+                        now,
+                        status: AnnounceWorkTerminalStatus::Succeeded,
+                        error_class: None,
+                        error_message: None,
+                        outcome_context: Some("workflow_completed"),
+                    })
+                    .await?;
+                tracing::info!(
+                    work_id = work.work_id.as_str(),
+                    dedupe_key = work.dedupe_key.as_str(),
+                    attempt = work.attempts,
+                    "announce work completed"
+                );
+            }
+            Err(error) => {
+                let delay =
+                    i64::try_from(self.config.announce_queue.retry_delay_min).unwrap_or(i64::MAX);
+                let error_message = error.to_string();
+                database
+                    .schedule_announce_retry(&AnnounceWorkRetry {
+                        work_id: &work.work_id,
+                        now,
+                        next_attempt_at: now.saturating_add(delay),
+                        error_class: Some("workflow_error"),
+                        error_message: Some(&error_message),
+                        outcome_context: Some("retry_scheduled"),
+                    })
+                    .await?;
+                tracing::warn!(
+                    work_id = work.work_id.as_str(),
+                    dedupe_key = work.dedupe_key.as_str(),
+                    attempt = work.attempts,
+                    "announce work scheduled for retry: {error}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn announce_candidate(work: &AnnounceWorkRecord) -> Candidate<'static> {
+    let mut candidate = Candidate::new(
+        work.name.clone(),
+        work.guid.clone(),
+        Some(work.link.clone()),
+        work.tracker.clone(),
+    );
+    candidate.cookie = work.cookie.clone().map(Cow::Owned);
+    candidate
 }
 
 fn serve_http(
@@ -2164,7 +2386,7 @@ mod tests {
         SporosError,
         api::{ApiMethod, ApiRequest, handle_api_request},
         config::{RawAnnounceQueueConfig, RawConfig, RuntimeConfig, TorrentClientConfig},
-        persistence::{AsyncDatabase, Database},
+        persistence::{AnnounceWorkInsert, AsyncDatabase, Database},
         runtime::{RuntimeServices, RuntimeTaskQueue},
         scheduler::{
             DaemonPlan, JobCheckResult, JobConfigOverride, JobName, ScheduledJob, Scheduler,
@@ -2949,6 +3171,69 @@ mod tests {
             1
         );
         state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn announce_workers_claim_and_retry_work() {
+        let root = temp_path("daemon-announce-workers");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        let now = super::now_millis();
+        database
+            .insert_or_dedupe_announce_work(&AnnounceWorkInsert {
+                work_id: "work-1",
+                dedupe_key: "dedupe-1",
+                name: "Release",
+                guid: "https://idx/t",
+                link: "https://idx/t",
+                tracker: "Tracker",
+                cookie: None,
+                now,
+                expires_at: now.saturating_add(60_000),
+            })
+            .expect("enqueue");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                announce_queue: RawAnnounceQueueConfig {
+                    worker_concurrency: Some(1),
+                    retry_delay_min: Some(60_000),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let services = RuntimeServices::start(CancellationToken::new());
+        let workers = super::start_announce_workers(
+            &root,
+            &config,
+            Arc::clone(&services),
+            CancellationToken::new(),
+            now,
+        )
+        .await
+        .expect("workers");
+        assert_eq!(workers.handles.len(), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let stats = database.announce_queue_stats(10_000).expect("stats");
+                if stats.total_attempts == 1 {
+                    assert_eq!(stats.backlog, 1);
+                    assert_eq!(stats.running, 0);
+                    assert_eq!(stats.last_error_class.as_deref(), Some("workflow_error"));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("worker retry observed");
+
+        workers.shutdown().await.expect("workers stop");
+        services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
 
