@@ -14,7 +14,7 @@ use url::{Url, form_urlencoded};
 
 use crate::{
     SporosError,
-    domain::{ActionResult, Candidate, Decision, InjectionResult, SaveResult},
+    domain::{ActionResult, Candidate, Decision},
 };
 
 pub const AUTH_MESSAGE: &str =
@@ -246,8 +246,8 @@ pub trait ApiHandlers {
     async fn status(&mut self) -> crate::Result<ApiResponse> {
         Ok(ApiResponse::new(200, "OK"))
     }
-    /// Reverse-match an announce candidate.
-    async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>>;
+    /// Durably accept an announce candidate.
+    async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<AnnounceAccepted>;
     /// Start webhook work after the immediate 204 response is selected.
     async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()>;
     /// Run a scheduled job ahead of schedule.
@@ -261,6 +261,15 @@ pub struct ApiOutcome {
     pub decision: Decision,
     /// Optional action result.
     pub action_result: Option<ActionResult>,
+}
+
+/// Durable announce queue acknowledgement.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceAccepted {
+    /// Stable durable work id.
+    pub work_id: String,
+    /// Queue status for this acceptance, such as `queued` or `existing`.
+    pub status: String,
 }
 
 /// Route one API request.
@@ -316,8 +325,8 @@ async fn handle_api_request_inner<H: ApiHandlers + Send>(
                 Ok(announce) => announce,
                 Err(response) => return Ok(response),
             };
-            let outcome = handlers.announce(announce).await?;
-            Ok(announce_response(outcome))
+            let accepted = handlers.announce(announce).await?;
+            Ok(announce_response(accepted))
         }
         "/api/webhook" => {
             if let Some(response) = method_guard(request.method, ApiMethod::Post) {
@@ -552,29 +561,15 @@ fn reject_unknown_fields(
     Ok(())
 }
 
-fn announce_response(outcome: Option<ApiOutcome>) -> ApiResponse {
-    let Some(outcome) = outcome else {
-        return ApiResponse::new(204, "");
-    };
-    match outcome.action_result {
-        Some(ActionResult::Save(SaveResult::Saved))
-        | Some(ActionResult::Injection(InjectionResult::Injected))
-        | Some(ActionResult::Injection(InjectionResult::Failure))
-        | Some(ActionResult::Injection(InjectionResult::AlreadyExists)) => {
-            ApiResponse::new(200, "")
-        }
-        Some(ActionResult::Injection(InjectionResult::TorrentNotComplete)) => {
-            ApiResponse::new(202, "")
-        }
-        None if matches!(
-            outcome.decision,
-            Decision::InfoHashAlreadyExists | Decision::SameInfoHash
-        ) =>
-        {
-            ApiResponse::new(200, "")
-        }
-        _ => ApiResponse::new(500, "Unexpected announce result"),
-    }
+fn announce_response(accepted: AnnounceAccepted) -> ApiResponse {
+    ApiResponse::new(
+        202,
+        serde_json::json!({
+            "workId": accepted.work_id,
+            "status": accepted.status,
+        })
+        .to_string(),
+    )
 }
 
 fn job_response(response: JobResponse) -> ApiResponse {
@@ -634,10 +629,9 @@ fn api_error(message: impl Into<Cow<'static, str>>) -> SporosError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, JobRequest, JobResponse,
-        WebhookRequest, handle_api_request,
+        AnnounceAccepted, AnnounceRequest, ApiHandlers, ApiMethod, ApiRequest, JobRequest,
+        JobResponse, WebhookRequest, handle_api_request,
     };
-    use crate::domain::{ActionResult, Decision, InjectionResult};
     use std::{collections::BTreeMap, fs};
 
     #[tokio::test]
@@ -708,16 +702,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn announce_validates_body_and_maps_result() {
+    async fn announce_validates_body_and_returns_queue_response() {
         let mut headers = BTreeMap::new();
         headers.insert("X-Api-Key".to_owned(), "secret".to_owned());
-        let mut handlers = TestHandlers {
-            announce_result: Some(ApiOutcome {
-                decision: Decision::Match,
-                action_result: Some(ActionResult::Injection(InjectionResult::TorrentNotComplete)),
-            }),
-            ..TestHandlers::default()
-        };
+        let mut handlers = TestHandlers::default();
 
         let response = handle_api_request(
             ApiRequest::new(
@@ -733,6 +721,9 @@ mod tests {
         .expect("announce");
 
         assert_eq!(response.status, 202);
+        let body: serde_json::Value = serde_json::from_str(&response.body).expect("announce json");
+        assert_eq!(body["workId"], "work-1");
+        assert_eq!(body["status"], "queued");
         assert_eq!(handlers.announces.len(), 1);
         assert_eq!(handlers.announces[0].name, "Release");
     }
@@ -908,7 +899,7 @@ mod tests {
         announces: Vec<AnnounceRequest>,
         webhooks: Vec<WebhookRequest>,
         jobs: Vec<JobRequest>,
-        announce_result: Option<ApiOutcome>,
+        announce_response: AnnounceAccepted,
         job_response: JobResponse,
     }
 
@@ -918,10 +909,10 @@ mod tests {
                 announces: Vec::new(),
                 webhooks: Vec::new(),
                 jobs: Vec::new(),
-                announce_result: Some(ApiOutcome {
-                    decision: Decision::Match,
-                    action_result: Some(ActionResult::Injection(InjectionResult::Injected)),
-                }),
+                announce_response: AnnounceAccepted {
+                    work_id: "work-1".to_owned(),
+                    status: "queued".to_owned(),
+                },
                 job_response: JobResponse::Accepted("search: running ahead of schedule".to_owned()),
             }
         }
@@ -929,12 +920,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ApiHandlers for TestHandlers {
-        async fn announce(
-            &mut self,
-            request: AnnounceRequest,
-        ) -> crate::Result<Option<ApiOutcome>> {
+        async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<AnnounceAccepted> {
             self.announces.push(request);
-            Ok(self.announce_result)
+            Ok(self.announce_response.clone())
         }
 
         async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {

@@ -14,12 +14,12 @@ use std::{
 use sporos::config::TorrentClientConfig;
 use sporos::{
     api::{
-        AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, JobRequest, JobResponse,
-        WebhookRequest, handle_api_request,
+        AnnounceAccepted, AnnounceRequest, ApiHandlers, ApiMethod, ApiRequest, JobRequest,
+        JobResponse, WebhookRequest, handle_api_request,
     },
     clients::{InjectionOptions, NewTorrent, TorrentClient, TransmissionClient, client_identities},
     config::{RawConfig, RuntimeConfig},
-    domain::{ActionResult, Decision, File, MediaType, Searchee},
+    domain::{Decision, File, MediaType, Searchee},
     integrations::{
         ArrKind, CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, TorznabCaps,
         fetch_torznab_caps, lookup_arr_ids, rss_pager, validate_arr_instance, validate_arr_url,
@@ -478,11 +478,11 @@ struct TestHandlers {
 
 #[async_trait::async_trait]
 impl ApiHandlers for TestHandlers {
-    async fn announce(&mut self, _request: AnnounceRequest) -> sporos::Result<Option<ApiOutcome>> {
-        Ok(Some(ApiOutcome {
-            decision: Decision::Match,
-            action_result: Some(ActionResult::Save(sporos::domain::SaveResult::Saved)),
-        }))
+    async fn announce(&mut self, _request: AnnounceRequest) -> sporos::Result<AnnounceAccepted> {
+        Ok(AnnounceAccepted {
+            work_id: "work-1".to_owned(),
+            status: "queued".to_owned(),
+        })
     }
 
     async fn webhook(&mut self, _request: WebhookRequest) -> sporos::Result<()> {

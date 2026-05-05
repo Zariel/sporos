@@ -34,11 +34,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     SporosError,
     api::{
-        AUTH_MESSAGE, AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome, ApiRequest, ApiResponse,
-        JobRequest, JobResponse, WebhookRequest, handle_trusted_api_request,
+        AUTH_MESSAGE, AnnounceAccepted, AnnounceRequest, ApiHandlers, ApiMethod, ApiRequest,
+        ApiResponse, JobRequest, JobResponse, WebhookRequest, handle_trusted_api_request,
     },
     config::RuntimeConfig,
-    persistence::{AsyncDatabase, Database},
+    persistence::{AnnounceWorkInsert, AsyncDatabase, Database},
     runtime::{RuntimeBlockingExecutor, RuntimeServices, RuntimeTaskQueue},
     scheduler::{DaemonPlan, DaemonRun, JobConfigOverride, JobName, ScheduledJob, Scheduler},
 };
@@ -610,7 +610,10 @@ impl IntoResponse for DaemonHttpResponse {
 }
 
 fn route_returns_json(route: &str) -> bool {
-    matches!(route, "/_health/livez" | "/_health/readyz" | "/api/status")
+    matches!(
+        route,
+        "/_health/livez" | "/_health/readyz" | "/api/status" | "/api/announce"
+    )
 }
 
 fn looks_like_json_object(body: &str) -> bool {
@@ -660,7 +663,6 @@ async fn handle_runtime_request(
         None
     };
     let mut handlers = RuntimeHandlers {
-        app_dir: &state.app_dir,
         config: &state.config,
         services: Arc::clone(&state.services),
         metrics: Arc::clone(&state.metrics),
@@ -1808,7 +1810,6 @@ struct DaemonState {
 }
 
 struct RuntimeHandlers<'a> {
-    app_dir: &'a Path,
     config: &'a RuntimeConfig,
     services: Arc<RuntimeServices>,
     metrics: Arc<DaemonMetrics>,
@@ -1975,26 +1976,73 @@ impl ApiHandlers for RuntimeHandlers<'_> {
         Ok(ApiResponse { status: 200, body })
     }
 
-    async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<Option<ApiOutcome>> {
+    async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<AnnounceAccepted> {
         let work_id = announce_work_id(&request);
+        let dedupe_key = work_id.as_str();
         tracing::info!(
             work_id = work_id.as_str(),
+            dedupe_key,
             tracker = request.tracker.as_str(),
             name = request.name.as_str(),
             "received announce request"
         );
-        let notifier = crate::notifications::NotificationSender::from_config(
-            self.config,
-            crate::startup::Redactor::from_config(self.config),
-        )?;
-        crate::operations::run_announce_match_async(
-            self.services.blocking().matching.clone(),
-            self.app_dir.to_path_buf(),
-            self.config.clone(),
-            request.into_candidate(),
-            notifier,
-        )
-        .await
+        if let Some(existing) = self
+            .async_database
+            .active_announce_work_by_dedupe_key(dedupe_key)
+            .await?
+        {
+            tracing::info!(
+                work_id = existing.work_id.as_str(),
+                dedupe_key = existing.dedupe_key.as_str(),
+                status = existing.status.as_str(),
+                "deduped announce request to existing work"
+            );
+            return Ok(AnnounceAccepted {
+                work_id: existing.work_id,
+                status: "existing".to_owned(),
+            });
+        }
+
+        let stats = self
+            .async_database
+            .announce_queue_stats(self.now_millis)
+            .await?;
+        if stats.backlog.saturating_add(stats.running)
+            >= i64::from(self.config.announce_queue.max_accepted_backlog)
+        {
+            return Err(daemon_error("announce queue backlog limit reached"));
+        }
+
+        let ttl = i64::try_from(self.config.announce_queue.default_ttl).unwrap_or(i64::MAX);
+        let accepted = self
+            .async_database
+            .insert_or_dedupe_announce_work(&AnnounceWorkInsert {
+                work_id: &work_id,
+                dedupe_key,
+                name: &request.name,
+                guid: &request.guid,
+                link: &request.link,
+                tracker: &request.tracker,
+                cookie: request.cookie.as_deref(),
+                now: self.now_millis,
+                expires_at: self.now_millis.saturating_add(ttl),
+            })
+            .await?;
+        let status = if accepted.inserted {
+            "queued"
+        } else {
+            "existing"
+        };
+        tracing::info!(
+            work_id = accepted.work.work_id.as_str(),
+            dedupe_key = accepted.work.dedupe_key.as_str(),
+            status,
+            "accepted announce work"
+        );
+        Ok(AnnounceAccepted {
+            work_id: accepted.work.work_id,
+            status: status.to_owned(),
+        })
     }
 
     async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()> {
@@ -2115,7 +2163,7 @@ mod tests {
     use crate::{
         SporosError,
         api::{ApiMethod, ApiRequest, handle_api_request},
-        config::{RawConfig, RuntimeConfig, TorrentClientConfig},
+        config::{RawAnnounceQueueConfig, RawConfig, RuntimeConfig, TorrentClientConfig},
         persistence::{AsyncDatabase, Database},
         runtime::{RuntimeServices, RuntimeTaskQueue},
         scheduler::{
@@ -2220,7 +2268,6 @@ mod tests {
         let mut plan = DaemonPlan::from_config(&config);
         let async_database = AsyncDatabase::open_app_dir(&root).await.expect("database");
         let mut handlers = super::RuntimeHandlers {
-            app_dir: &root,
             config: &config,
             services: RuntimeServices::start(CancellationToken::new()),
             metrics: Arc::new(super::DaemonMetrics::default()),
@@ -2289,7 +2336,6 @@ mod tests {
         let mut plan = DaemonPlan::from_config(&config);
         let services = RuntimeServices::start(CancellationToken::new());
         let mut handlers = super::RuntimeHandlers {
-            app_dir: &root,
             config: &config,
             services,
             metrics: Arc::new(super::DaemonMetrics::default()),
@@ -2737,6 +2783,49 @@ mod tests {
         assert_eq!(content_type(&webhook), None);
         assert!(webhook.bytes().await.expect("webhook body").is_empty());
 
+        let announce_body = r#"{"name":"Release","guid":"https://idx/t","link":"https://idx/t","tracker":"Tracker"}"#;
+        let announce = client
+            .post(format!("{base_url}/api/announce?apikey=secret"))
+            .body(announce_body)
+            .send()
+            .await
+            .expect("announce response");
+        assert_eq!(announce.status(), reqwest::StatusCode::ACCEPTED);
+        assert_eq!(content_type(&announce), Some("application/json"));
+        let announce_json: serde_json::Value =
+            serde_json::from_str(&announce.text().await.expect("announce body"))
+                .expect("announce json");
+        assert_eq!(announce_json["status"], "queued");
+        let work_id = announce_json["workId"].as_str().expect("work id");
+        assert_eq!(work_id.len(), 40);
+        assert_eq!(
+            database
+                .announce_queue_stats(2_000)
+                .expect("queue stats")
+                .backlog,
+            1
+        );
+
+        let deduped_announce = client
+            .post(format!("{base_url}/api/announce?apikey=secret"))
+            .body(announce_body)
+            .send()
+            .await
+            .expect("deduped announce response");
+        assert_eq!(deduped_announce.status(), reqwest::StatusCode::ACCEPTED);
+        let deduped_json: serde_json::Value =
+            serde_json::from_str(&deduped_announce.text().await.expect("dedupe body"))
+                .expect("dedupe json");
+        assert_eq!(deduped_json["workId"], work_id);
+        assert_eq!(deduped_json["status"], "existing");
+        assert_eq!(
+            database
+                .announce_queue_stats(2_000)
+                .expect("queue stats")
+                .backlog,
+            1
+        );
+
         for path in ["/api/announce", "/api/webhook", "/api/job"] {
             let response = client
                 .post(format!("{base_url}{path}?apikey=secret"))
@@ -2798,6 +2887,67 @@ mod tests {
             .await
             .expect("server task joins")
             .expect("server stops");
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn announce_enqueue_rejects_new_work_over_capacity() {
+        let root = temp_path("daemon-announce-capacity");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                announce_queue: RawAnnounceQueueConfig {
+                    max_accepted_backlog: Some(1),
+                    ..Default::default()
+                },
+                ..RawConfig::default()
+            },
+            &root,
+        )
+        .expect("config");
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: RuntimeServices::start(CancellationToken::new()),
+            scheduler: Mutex::new(Scheduler::new(Vec::new())),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+
+        let first = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/announce?apikey=secret",
+                BTreeMap::new(),
+                r#"{"name":"Release One","guid":"https://idx/1","link":"https://idx/1","tracker":"Tracker"}"#,
+            ),
+        )
+        .await
+        .expect("first announce");
+        assert_eq!(first.status, 202);
+
+        let second = handle_runtime_request(
+            Arc::clone(&state),
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/announce?apikey=secret",
+                BTreeMap::new(),
+                r#"{"name":"Release Two","guid":"https://idx/2","link":"https://idx/2","tracker":"Tracker"}"#,
+            ),
+        )
+        .await
+        .expect_err("second announce");
+        assert!(second.to_string().contains("backlog limit"));
+        assert_eq!(
+            database
+                .announce_queue_stats(2_000)
+                .expect("queue stats")
+                .backlog,
+            1
+        );
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }

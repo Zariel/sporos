@@ -1714,6 +1714,14 @@ impl AsyncDatabase {
         }
     }
 
+    /// Find active durable announce work by dedupe key.
+    pub async fn active_announce_work_by_dedupe_key(
+        &self,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<AnnounceWorkRecord>> {
+        self.active_announce_work_by_dedupe(dedupe_key).await
+    }
+
     /// Claim ready durable announce work and mark it running.
     pub async fn claim_announce_work(
         &self,
