@@ -13,23 +13,35 @@ use std::{
 
 use sporos::config::TorrentClientConfig;
 use sporos::{
+    actions::{InjectionActionOptions, SavedInjectionOptions, inject_saved_torrents},
     api::{
         AnnounceAccepted, AnnounceRequest, ApiHandlers, ApiMethod, ApiRequest, JobRequest,
         JobResponse, WebhookRequest, handle_api_request,
     },
-    clients::{InjectionOptions, NewTorrent, TorrentClient, TransmissionClient, client_identities},
-    config::{RawConfig, RuntimeConfig},
-    domain::{Decision, File, MediaType, Searchee},
+    clients::{
+        ClientErrorCode, ClientTorrent, DownloadDirOptions, InjectionOptions, NewTorrent,
+        ResumeOptions, TorrentClient, TransmissionClient, client_identities,
+    },
+    config::{LinkType, MatchMode, RawConfig, RuntimeConfig, raw_config_from_source},
+    domain::{
+        ActionResult, Candidate, ClientLabel, Decision, File, InfoHash, InjectionResult, MediaType,
+        Metafile, Searchee, TorrentClientKind, TorrentClientMetadata,
+    },
     integrations::{
         ArrKind, CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, TorznabCaps,
         fetch_torznab_caps, lookup_arr_ids, rss_pager, validate_arr_instance, validate_arr_url,
         validate_torznab_url,
     },
+    matching::AssessmentOptions,
     notifications::NotificationSender,
+    operations::{
+        run_announce_match, run_rss_workflow, run_search_workflow, run_update_indexer_caps,
+    },
     persistence::{Database, SqlValue},
     scheduler::DaemonPlan,
+    search::Blocklist,
     startup::Redactor,
-    torrent::parse_metafile,
+    torrent::{parse_metafile, torrent_cache_dir},
 };
 
 #[test]
@@ -225,6 +237,204 @@ fn fake_services_cover_retry_after_and_unsafe_client_retry() {
     assert!(transmission_requests[0].contains(r#""method":"torrent-add""#));
 }
 
+#[test]
+fn replacement_workflows_use_fresh_db_and_fake_services() {
+    let root = temp_path("replacement-flow");
+    let app_dir = root.join("app");
+    let data_dir = root.join("data");
+    let release_dir = data_dir.join("Replacement.Show.S01E01");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&app_dir).expect("app dir");
+    fs::create_dir_all(&release_dir).expect("release dir");
+    fs::write(release_dir.join("Replacement.Show.S01E01.mkv"), b"episode").expect("episode");
+
+    let bytes = torrent_bytes("Replacement.Show.S01E01.mkv", 7);
+    let torrent_body = String::from_utf8(bytes.clone()).expect("torrent bytes");
+    let download_path = "/download/replacement.torrent";
+    let torznab = FakeHttpServer::new_with_url_until_idle(
+        |torznab_url| {
+            vec![
+                HttpResponse::new(
+                    "200 OK",
+                    &[("Content-Type", "application/xml")],
+                    r#"<caps><searching searchAvailable="yes" tv-searchAvailable="yes" /><limits default="100" max="100" /></caps>"#,
+                ),
+                HttpResponse::rss(&rss_item(
+                    "Replacement.Show.S01E01",
+                    "search-guid",
+                    &format!("{torznab_url}{download_path}"),
+                )),
+                HttpResponse::new(
+                    "200 OK",
+                    &[("Content-Type", "application/x-bittorrent")],
+                    &torrent_body,
+                ),
+                HttpResponse::rss(&rss_item(
+                    "Replacement.Show.S01E01",
+                    "search-guid",
+                    &format!("{torznab_url}{download_path}"),
+                )),
+                HttpResponse::rss("<rss><channel></channel></rss>"),
+            ]
+        },
+        Duration::from_millis(250),
+    );
+    let torznab_url = torznab.url.clone();
+    let download_url = format!("{torznab_url}{download_path}");
+
+    let raw = raw_config_from_source(&format!(
+        r#"
+        state_dir = "{}"
+        database_path = "{}/sporos.db"
+        data_dirs = ["{}"]
+        output_dir = "{}"
+        use_client_torrents = false
+        include_single_episodes = true
+        match_mode = "partial"
+        action = "save"
+        search_timeout = "1s"
+        snatch_timeout = "1s"
+        skip_recheck = true
+        injection_category = "tv"
+        injection_tags = ["cross-seed"]
+
+        [[torznab]]
+        url = "{}/api"
+        api_key = "key"
+        "#,
+        app_dir.display(),
+        app_dir.display(),
+        data_dir.display(),
+        output_dir.display(),
+        torznab_url,
+    ))
+    .expect("raw config");
+    let mut config = RuntimeConfig::normalize(raw, &app_dir).expect("config");
+    config.delay = 0;
+    let database = Database::open_app_dir(&app_dir).expect("database");
+    let notifier = NotificationSender::new(Vec::new(), Redactor::default()).expect("notifier");
+
+    let caps = run_update_indexer_caps(&database, &config).expect("caps");
+    assert_eq!(caps.indexers, 1);
+    assert_eq!(caps.updated, 1);
+
+    let search = run_search_workflow(&database, &app_dir, &config, &notifier).expect("search");
+    assert_eq!(search.indexers, 1);
+    assert_eq!(search.pipeline.attempts_total, 1);
+    assert!(
+        search
+            .pipeline
+            .attempts
+            .iter()
+            .any(|attempt| attempt.action_result.is_some_and(ActionResult::accepted))
+    );
+    assert_eq!(torrent_file_count(&output_dir), 1);
+
+    let rss = run_rss_workflow(&database, &app_dir, &config, &notifier).expect("rss");
+    assert_eq!(rss.candidates, 1);
+    assert_eq!(rss.attempts, 1);
+
+    let announce = run_announce_match(
+        &database,
+        &app_dir,
+        &config,
+        Candidate::new(
+            "Replacement.Show.S01E01",
+            "search-guid",
+            Some(download_url.clone()),
+            "ReplacementTracker",
+        ),
+        &notifier,
+    )
+    .expect("announce")
+    .expect("announce match");
+    assert_eq!(announce.decision, Decision::Match);
+    assert!(matches!(
+        announce.action_result,
+        Some(ActionResult::Save(_))
+    ));
+
+    let decisions: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM decision", &[])
+        .expect("decision count");
+    assert!(decisions >= 1);
+    let cached_torrents = fs::read_dir(torrent_cache_dir(&app_dir))
+        .expect("cache dir")
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(cached_torrents, 1);
+
+    let client = RecordingClient::new();
+    let clients: [&dyn TorrentClient; 1] = [&client];
+    let blocklist = Blocklist::parse(&[]).expect("blocklist");
+    let excluded = std::collections::BTreeSet::new();
+    let assessment = AssessmentOptions {
+        match_mode: MatchMode::Partial,
+        fuzzy_size_threshold: config.fuzzy_size_threshold,
+        season_from_episodes: 1.0,
+        include_single_episodes: true,
+        info_hashes_to_exclude: &excluded,
+        blocklist: &blocklist,
+    };
+    let injection = InjectionActionOptions {
+        clients: &clients,
+        output_dir: Some(&output_dir),
+        link_dirs: &[],
+        link_type: LinkType::Symlink,
+        flat_linking: false,
+        unwrap_symlinks: false,
+        skip_recheck: true,
+        match_mode: MatchMode::Partial,
+        auto_resume_max_download: 0,
+        ignore_non_relevant_files_to_resume: false,
+        category: Some(ClientLabel::new("tv")),
+        tags: vec![ClientLabel::new("cross-seed")],
+        duplicate_categories: false,
+    };
+    let mut retry_searchee = Searchee::from_files(
+        "Replacement.Show.S01E01",
+        "Replacement.Show.S01E01",
+        vec![File::new("Replacement.Show.S01E01.mkv", 7)],
+    );
+    retry_searchee.path = Some(Cow::Owned(release_dir.display().to_string()));
+    retry_searchee.mtime_millis = Some(u64::MAX);
+    retry_searchee.media_type = MediaType::Episode;
+    let injected = inject_saved_torrents(
+        &SavedInjectionOptions {
+            input_dir: &output_dir,
+            injection: &injection,
+            assessment: &assessment,
+            ignore_titles: true,
+        },
+        &[retry_searchee],
+        |_| Ok(()),
+    )
+    .expect("inject");
+    assert_eq!(injected.scanned, 1);
+    assert_eq!(injected.injected, 1);
+    assert_eq!(client.injected(), 1);
+    assert_eq!(torrent_file_count(&output_dir), 0);
+
+    let torznab_requests = torznab.join();
+    assert!(
+        torznab_requests
+            .iter()
+            .any(|request| request.contains("t=caps"))
+    );
+    assert!(
+        torznab_requests
+            .iter()
+            .any(|request| request.contains("t=search"))
+    );
+    assert!(
+        torznab_requests
+            .iter()
+            .any(|request| request.contains(download_path))
+    );
+
+    let _cleanup = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
     let root = temp_path("daemon-api");
@@ -365,7 +575,21 @@ impl FakeHttpServer {
         Self::with_idle_timeout(responses, Some(idle_timeout))
     }
 
+    fn new_with_url_until_idle<F>(responses: F, idle_timeout: Duration) -> Self
+    where
+        F: FnOnce(&str) -> Vec<HttpResponse>,
+    {
+        Self::with_url_idle_timeout(responses, Some(idle_timeout))
+    }
+
     fn with_idle_timeout(responses: Vec<HttpResponse>, idle_timeout: Option<Duration>) -> Self {
+        Self::with_url_idle_timeout(|_| responses, idle_timeout)
+    }
+
+    fn with_url_idle_timeout<F>(responses: F, idle_timeout: Option<Duration>) -> Self
+    where
+        F: FnOnce(&str) -> Vec<HttpResponse>,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
         if idle_timeout.is_some() {
             listener
@@ -373,6 +597,7 @@ impl FakeHttpServer {
                 .expect("nonblocking listener");
         }
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let responses = responses(&url);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server_requests = Arc::clone(&requests);
         let handle = thread::spawn(move || {
@@ -498,6 +723,104 @@ impl ApiHandlers for TestHandlers {
     }
 }
 
+#[derive(Clone)]
+struct RecordingClient {
+    metadata: TorrentClientMetadata<'static>,
+    injected: Arc<Mutex<usize>>,
+}
+
+impl RecordingClient {
+    fn new() -> Self {
+        Self {
+            metadata: TorrentClientMetadata::new(
+                "fake-client",
+                0,
+                TorrentClientKind::QBittorrent,
+                false,
+                "fake",
+            ),
+            injected: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn injected(&self) -> usize {
+        *self.injected.lock().expect("injected lock")
+    }
+}
+
+impl TorrentClient for RecordingClient {
+    fn metadata(&self) -> &TorrentClientMetadata<'_> {
+        &self.metadata
+    }
+
+    fn is_torrent_in_client(&self, _info_hash: &InfoHash<'_>) -> sporos::Result<bool> {
+        Ok(false)
+    }
+
+    fn is_torrent_complete(&self, _info_hash: &InfoHash<'_>) -> sporos::Result<bool> {
+        Ok(true)
+    }
+
+    fn is_torrent_checking(&self, _info_hash: &InfoHash<'_>) -> sporos::Result<bool> {
+        Ok(false)
+    }
+
+    fn get_all_torrents(&self) -> sporos::Result<Vec<ClientTorrent<'static>>> {
+        Ok(Vec::new())
+    }
+
+    fn get_download_dir(
+        &self,
+        _metafile: &Metafile<'_>,
+        _options: DownloadDirOptions,
+    ) -> sporos::Result<Result<PathBuf, ClientErrorCode>> {
+        Ok(Err(ClientErrorCode::NotFound))
+    }
+
+    fn get_all_download_dirs(&self) -> sporos::Result<BTreeMap<String, PathBuf>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn has_matching_download_dir(
+        &self,
+        _predicate: &mut dyn FnMut(&std::path::Path) -> sporos::Result<bool>,
+    ) -> sporos::Result<bool> {
+        Ok(false)
+    }
+
+    fn remaining_bytes(&self, _metafile: &Metafile<'_>) -> sporos::Result<Option<u64>> {
+        Ok(Some(0))
+    }
+
+    fn inject(
+        &self,
+        _new_torrent: &NewTorrent<'_>,
+        _searchee: &Searchee<'_>,
+        _decision: Decision,
+        _options: &InjectionOptions,
+    ) -> sporos::Result<InjectionResult> {
+        *self.injected.lock().expect("injected lock") += 1;
+        Ok(InjectionResult::Injected)
+    }
+
+    fn recheck_torrent(&self, _info_hash: &InfoHash<'_>) -> sporos::Result<()> {
+        Ok(())
+    }
+
+    fn resume_injection(
+        &self,
+        _metafile: &Metafile<'_>,
+        _decision: Decision,
+        _options: ResumeOptions,
+    ) -> sporos::Result<()> {
+        Ok(())
+    }
+
+    fn validate_config(&self) -> sporos::Result<()> {
+        Ok(())
+    }
+}
+
 fn temp_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -507,6 +830,34 @@ fn temp_path(label: &str) -> PathBuf {
         "sporos-integration-{label}-{}-{nanos}",
         std::process::id()
     ))
+}
+
+fn rss_item(title: &str, guid: &str, link: &str) -> String {
+    format!(
+        r#"<rss><channel>
+            <item>
+                <title>{title}</title>
+                <guid>{guid}</guid>
+                <link>{link}</link>
+                <size>7</size>
+                <pubDate>Fri, 01 May 2026 00:00:00 GMT</pubDate>
+                <indexer>ReplacementTracker</indexer>
+            </item>
+        </channel></rss>"#
+    )
+}
+
+fn torrent_file_count(dir: &std::path::Path) -> usize {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("torrent")
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {

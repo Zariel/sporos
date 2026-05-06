@@ -85,6 +85,9 @@ impl NotificationSender {
 
     /// Send the documented test notification payload.
     pub fn send_test(&self) -> NotificationReport {
+        if self.urls.is_empty() {
+            return NotificationReport::default();
+        }
         block_on_notification(self.send_test_async()).unwrap_or_else(|error| {
             tracing::warn!(error = %error, "failed to run notification delivery");
             NotificationReport {
@@ -111,6 +114,9 @@ impl NotificationSender {
 
     /// Validate configured notification webhooks and return the delivery report.
     pub fn validate_startup_report(&self) -> NotificationReport {
+        if self.urls.is_empty() {
+            return NotificationReport::default();
+        }
         block_on_notification(self.validate_startup_async()).unwrap_or_else(|error| {
             tracing::warn!(error = %error, "failed to run notification startup validation");
             NotificationReport {
@@ -143,6 +149,9 @@ impl NotificationSender {
 
     /// Send a result notification when an attempt has a notifiable action result.
     pub fn send_result(&self, attempt: &PipelineAttempt) -> NotificationReport {
+        if self.urls.is_empty() {
+            return NotificationReport::default();
+        }
         block_on_notification(self.send_result_async(attempt)).unwrap_or_else(|error| {
             tracing::warn!(error = %error, "failed to run notification delivery");
             NotificationReport {
