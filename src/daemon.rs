@@ -54,6 +54,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const ANNOUNCE_QUEUE_ATTEMPT_RESULTS: &[&str] = &["started", "retry_scheduled", "exhausted"];
 const ANNOUNCE_QUEUE_OUTCOMES: &[&str] = &["succeeded", "terminal_failed", "expired"];
 const ANNOUNCE_BREAKER_OPERATION: &str = "announce";
+const AUTH_UNAVAILABLE_MESSAGE: &str = "API authentication is temporarily unavailable.";
 
 /// Install process signal handling for daemon shutdown.
 pub fn install_shutdown_handler() -> CancellationToken {
@@ -859,7 +860,7 @@ async fn require_api_auth(
             tracing::error!("API auth failed: {error}");
             DaemonHttpResponse {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
-                body: DaemonHttpBody::Text(error.to_string()),
+                body: DaemonHttpBody::Text(AUTH_UNAVAILABLE_MESSAGE.to_owned()),
             }
             .into_response()
         }
@@ -876,13 +877,12 @@ async fn configured_api_key(state: &DaemonState) -> crate::Result<String> {
 
 fn request_authorized(
     headers: &HeaderMap,
-    query: &BTreeMap<String, String>,
+    _query: &BTreeMap<String, String>,
     api_key: &str,
 ) -> bool {
     headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
-        .or_else(|| query.get("apikey").map(String::as_str))
         .is_some_and(|value| value == api_key)
 }
 
@@ -2004,23 +2004,23 @@ async fn observe_indexer_metrics(registry: &Registry, config: &RuntimeConfig) ->
 
     let database = AsyncDatabase::open(&config.database_path).await?;
     for indexer in database.indexer_health_rows().await? {
-        let label = indexer.url.as_str();
+        let label = format!("indexer-{}", indexer.id);
         indexer_active
-            .with_label_values(&[label])
+            .with_label_values(&[label.as_str()])
             .set(bool_to_i64(indexer.active));
         indexer_rate_limited
-            .with_label_values(&[label])
+            .with_label_values(&[label.as_str()])
             .set(bool_to_i64(
                 indexer.status.as_deref() == Some("RATE_LIMITED"),
             ));
         indexer_unknown_error
-            .with_label_values(&[label])
+            .with_label_values(&[label.as_str()])
             .set(bool_to_i64(
                 indexer.status.as_deref() == Some("UNKNOWN_ERROR"),
             ));
         if let Some(retry_after) = indexer.retry_after {
             indexer_retry_after
-                .with_label_values(&[label])
+                .with_label_values(&[label.as_str()])
                 .set(retry_after / 1_000);
         }
     }
@@ -2879,6 +2879,10 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
+    fn api_key_headers() -> BTreeMap<String, String> {
+        BTreeMap::from([("X-Api-Key".to_owned(), "secret".to_owned())])
+    }
+
     #[test]
     fn audit_client_addr_ignores_forwarded_headers_by_default() {
         let mut headers = HeaderMap::new();
@@ -3013,8 +3017,8 @@ mod tests {
         let response = handle_api_request(
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/webhook?apikey=secret",
-                BTreeMap::new(),
+                "/api/webhook",
+                api_key_headers(),
                 format!("path={}", webhook_path.display()),
             ),
             "secret",
@@ -3069,8 +3073,8 @@ mod tests {
         let response = handle_api_request(
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/job?apikey=secret",
-                BTreeMap::new(),
+                "/api/job",
+                api_key_headers(),
                 r#"{"name":"search","ignoreExcludeRecentSearch":true,"ignoreExcludeOlder":true}"#,
             ),
             "secret",
@@ -3149,8 +3153,11 @@ mod tests {
             Arc::clone(&state),
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/job?apikey=test-api-key-with-24-bytes",
-                BTreeMap::new(),
+                "/api/job",
+                BTreeMap::from([(
+                    "X-Api-Key".to_owned(),
+                    "test-api-key-with-24-bytes".to_owned(),
+                )]),
                 r#"{"name":"search"}"#,
             ),
         ));
@@ -3214,6 +3221,43 @@ mod tests {
         .expect("ping");
 
         assert_eq!(ping.status, 200);
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn auth_backend_failures_return_generic_body() {
+        let root = temp_path("daemon-auth-backend");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        config.database_path = root.join("missing").join("sporos.db");
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: RuntimeServices::start(CancellationToken::new()),
+            scheduler: Mutex::new(Scheduler::new(Vec::new())),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind auth test listener");
+        let address = listener.local_addr().expect("listener address");
+        let shutdown = CancellationToken::new();
+        let server = super::serve_http(listener, Arc::clone(&state), shutdown.clone());
+
+        let response = reqwest::get(format!("http://{address}/api/status"))
+            .await
+            .expect("auth response");
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.expect("auth body");
+        assert_eq!(body, super::AUTH_UNAVAILABLE_MESSAGE);
+        assert!(!body.contains(root.to_string_lossy().as_ref()));
+        shutdown.cancel();
+        server.await.expect("server join").expect("server");
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -3379,11 +3423,10 @@ mod tests {
                 .body
                 .contains(r#"sporos_job_last_run_timestamp_seconds{job="search"} 1"#)
         );
-        assert!(
-            response.body.contains(
-                r#"sporos_indexer_rate_limited{indexer="https://indexer.example/api"} 1"#
-            )
-        );
+        assert!(response.body.contains(
+            format!(r#"sporos_indexer_rate_limited{{indexer="indexer-{indexer_id}"}} 1"#).as_str()
+        ));
+        assert!(!response.body.contains("https://indexer.example/api"));
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -3489,12 +3532,7 @@ mod tests {
 
         let status = handle_runtime_request(
             Arc::clone(&state),
-            ApiRequest::new(
-                ApiMethod::Get,
-                "/api/status?apikey=secret",
-                BTreeMap::new(),
-                "",
-            ),
+            ApiRequest::new(ApiMethod::Get, "/api/status", api_key_headers(), ""),
         )
         .await
         .expect("status");
@@ -3656,8 +3694,16 @@ mod tests {
             crate::api::AUTH_MESSAGE
         );
 
-        let status = client
+        let query_status = client
             .get(format!("{base_url}/api/status?apikey=secret"))
+            .send()
+            .await
+            .expect("query status response");
+        assert_eq!(query_status.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let status = client
+            .get(format!("{base_url}/api/status"))
+            .header("X-Api-Key", "secret")
             .send()
             .await
             .expect("status response");
@@ -3677,7 +3723,8 @@ mod tests {
         assert_eq!(content_type(&header_status), Some("application/json"));
 
         let webhook = client
-            .post(format!("{base_url}/api/webhook?apikey=secret"))
+            .post(format!("{base_url}/api/webhook"))
+            .header("X-Api-Key", "secret")
             .body("infoHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .send()
             .await
@@ -3688,7 +3735,8 @@ mod tests {
 
         let announce_body = r#"{"name":"Release","guid":"https://idx/t","link":"https://idx/t","tracker":"Tracker"}"#;
         let announce = client
-            .post(format!("{base_url}/api/announce?apikey=secret"))
+            .post(format!("{base_url}/api/announce"))
+            .header("X-Api-Key", "secret")
             .body(announce_body)
             .send()
             .await
@@ -3710,7 +3758,8 @@ mod tests {
         );
 
         let deduped_announce = client
-            .post(format!("{base_url}/api/announce?apikey=secret"))
+            .post(format!("{base_url}/api/announce"))
+            .header("X-Api-Key", "secret")
             .body(announce_body)
             .send()
             .await
@@ -3731,7 +3780,8 @@ mod tests {
 
         for path in ["/api/announce", "/api/webhook", "/api/job"] {
             let response = client
-                .post(format!("{base_url}{path}?apikey=secret"))
+                .post(format!("{base_url}{path}"))
+                .header("X-Api-Key", "secret")
                 .body("{")
                 .send()
                 .await
@@ -3749,7 +3799,8 @@ mod tests {
         }
 
         let unsupported_method = client
-            .get(format!("{base_url}/api/announce?apikey=secret"))
+            .get(format!("{base_url}/api/announce"))
+            .header("X-Api-Key", "secret")
             .send()
             .await
             .expect("method response");
@@ -3779,7 +3830,7 @@ mod tests {
             key.method == "GET"
                 && key.route == "/api/status"
                 && key.status == 401
-                && value.count == 1
+                && value.count == 2
         }));
         assert!(http_metrics.iter().any(|(key, value)| {
             key.method == "GET" && key.route == "/metrics" && key.status == 200 && value.count == 1
@@ -3823,8 +3874,8 @@ mod tests {
             Arc::clone(&state),
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/announce?apikey=secret",
-                BTreeMap::new(),
+                "/api/announce",
+                api_key_headers(),
                 r#"{"name":"Release One","guid":"https://idx/1","link":"https://idx/1","tracker":"Tracker"}"#,
             ),
         )
@@ -3836,8 +3887,8 @@ mod tests {
             Arc::clone(&state),
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/announce?apikey=secret",
-                BTreeMap::new(),
+                "/api/announce",
+                api_key_headers(),
                 r#"{"name":"Release Two","guid":"https://idx/2","link":"https://idx/2","tracker":"Tracker"}"#,
             ),
         )
@@ -3949,8 +4000,8 @@ mod tests {
             Arc::clone(&state),
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/announce?apikey=secret",
-                BTreeMap::new(),
+                "/api/announce",
+                api_key_headers(),
                 r#"{"name":"Restarted Release","guid":"https://idx/restart","link":"https://idx/restart","tracker":"Tracker"}"#,
             ),
         )
@@ -4026,12 +4077,7 @@ mod tests {
         });
         let status = handle_runtime_request(
             Arc::clone(&observed_state),
-            ApiRequest::new(
-                ApiMethod::Get,
-                "/api/status?apikey=secret",
-                BTreeMap::new(),
-                "",
-            ),
+            ApiRequest::new(ApiMethod::Get, "/api/status", api_key_headers(), ""),
         )
         .await
         .expect("status");
@@ -4154,12 +4200,7 @@ mod tests {
         });
         let status = handle_runtime_request(
             Arc::clone(&state),
-            ApiRequest::new(
-                ApiMethod::Get,
-                "/api/status?apikey=secret",
-                BTreeMap::new(),
-                "",
-            ),
+            ApiRequest::new(ApiMethod::Get, "/api/status", api_key_headers(), ""),
         )
         .await
         .expect("status");
@@ -4403,12 +4444,7 @@ mod tests {
 
         let response = handle_runtime_request(
             Arc::clone(&state),
-            ApiRequest::new(
-                ApiMethod::Get,
-                "/api/status?apikey=secret",
-                BTreeMap::new(),
-                "",
-            ),
+            ApiRequest::new(ApiMethod::Get, "/api/status", api_key_headers(), ""),
         )
         .await
         .expect("status");
@@ -4518,12 +4554,7 @@ mod tests {
             std::time::Duration::from_millis(100),
             handle_runtime_request(
                 Arc::clone(&state),
-                ApiRequest::new(
-                    ApiMethod::Get,
-                    "/api/status?apikey=secret",
-                    BTreeMap::new(),
-                    "",
-                ),
+                ApiRequest::new(ApiMethod::Get, "/api/status", api_key_headers(), ""),
             ),
         )
         .await
@@ -4580,12 +4611,7 @@ mod tests {
             std::time::Duration::from_millis(100),
             handle_runtime_request(
                 Arc::clone(&state),
-                ApiRequest::new(
-                    ApiMethod::Get,
-                    "/api/status?apikey=secret",
-                    BTreeMap::new(),
-                    "",
-                ),
+                ApiRequest::new(ApiMethod::Get, "/api/status", api_key_headers(), ""),
             ),
         )
         .await

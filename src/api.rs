@@ -16,8 +16,7 @@ use crate::{
     domain::{ActionResult, Candidate, Decision},
 };
 
-pub const AUTH_MESSAGE: &str =
-    "Specify the API key in an X-Api-Key header or an apikey query param.";
+pub const AUTH_MESSAGE: &str = "Specify the API key in an X-Api-Key header.";
 
 /// Minimal HTTP method model used by the daemon API router.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -372,7 +371,6 @@ fn authorized(request: &ApiRequest, api_key: &str) -> bool {
     request
         .headers
         .get("x-api-key")
-        .or_else(|| request.query.get("apikey"))
         .is_some_and(|value| value == api_key)
 }
 
@@ -617,6 +615,10 @@ mod tests {
     };
     use std::{collections::BTreeMap, fs};
 
+    fn api_key_headers() -> BTreeMap<String, String> {
+        BTreeMap::from([("X-Api-Key".to_owned(), "secret".to_owned())])
+    }
+
     #[tokio::test]
     async fn ping_skips_auth_and_status_requires_auth() {
         let mut handlers = TestHandlers::default();
@@ -639,13 +641,22 @@ mod tests {
         .expect("status");
         assert_eq!(unauthorized.status, 401);
 
-        let status = handle_api_request(
+        let query_auth = handle_api_request(
             ApiRequest::new(
                 ApiMethod::Get,
                 "/api/status?apikey=secret",
                 BTreeMap::new(),
                 "",
             ),
+            "secret",
+            &mut handlers,
+        )
+        .await
+        .expect("query status");
+        assert_eq!(query_auth.status, 401);
+
+        let status = handle_api_request(
+            ApiRequest::new(ApiMethod::Get, "/api/status", api_key_headers(), ""),
             "secret",
             &mut handlers,
         )
@@ -749,8 +760,8 @@ mod tests {
         let response = handle_api_request(
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/webhook?apikey=secret",
-                BTreeMap::new(),
+                "/api/webhook",
+                api_key_headers(),
                 format!(
                     "path={}&ignoreCrossSeeds=true&includeNonVideos=true",
                     path.display()
@@ -787,8 +798,8 @@ mod tests {
         let response = handle_api_request(
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/job?apikey=secret",
-                BTreeMap::new(),
+                "/api/job",
+                api_key_headers(),
                 r#"{"name":"rss"}"#,
             ),
             "secret",
@@ -809,8 +820,8 @@ mod tests {
         let response = handle_api_request(
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/webhook?apikey=secret",
-                BTreeMap::new(),
+                "/api/webhook",
+                api_key_headers(),
                 r#"{"infoHash":"gggggggggggggggggggggggggggggggggggggggg"}"#,
             ),
             "secret",
@@ -834,8 +845,8 @@ mod tests {
         let response = handle_api_request(
             ApiRequest::new(
                 ApiMethod::Post,
-                "/api/webhook?apikey=secret",
-                BTreeMap::new(),
+                "/api/webhook",
+                api_key_headers(),
                 r#"{"infoHash":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
             ),
             "secret",

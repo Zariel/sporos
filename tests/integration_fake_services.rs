@@ -618,11 +618,12 @@ async fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
 
     let webhook_path = root.join("webhook-source.mkv");
     fs::write(&webhook_path, b"data").expect("webhook path");
+    let headers = BTreeMap::from([("X-Api-Key".to_owned(), "secret".to_owned())]);
     let webhook = handle_api_request(
         ApiRequest::new(
             ApiMethod::Post,
-            "/api/webhook?apikey=secret",
-            BTreeMap::new(),
+            "/api/webhook",
+            headers.clone(),
             format!("path={}&includeNonVideos=true", webhook_path.display()),
         ),
         "secret",
@@ -634,12 +635,7 @@ async fn daemon_api_and_scheduler_use_temp_sqlite_app_dir() {
     assert_eq!(handlers.webhooks, 1);
 
     let job = handle_api_request(
-        ApiRequest::new(
-            ApiMethod::Post,
-            "/api/job?apikey=secret",
-            BTreeMap::new(),
-            r#"{"name":"rss"}"#,
-        ),
+        ApiRequest::new(ApiMethod::Post, "/api/job", headers, r#"{"name":"rss"}"#),
         "secret",
         &mut handlers,
     )
