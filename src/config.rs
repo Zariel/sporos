@@ -80,6 +80,29 @@ impl Action {
     }
 }
 
+/// Detail level for outbound notification result payloads.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub enum NotificationPayloadDetail {
+    /// Send only non-identifying result metadata.
+    #[default]
+    Redacted,
+    /// Include candidate, tracker, client, and path details.
+    Full,
+}
+
+impl NotificationPayloadDetail {
+    /// Parse notification payload detail text.
+    pub fn parse(value: &str) -> crate::Result<Self> {
+        match value {
+            "redacted" => Ok(Self::Redacted),
+            "full" => Ok(Self::Full),
+            _ => Err(config_error(format!(
+                "invalid notification_payload_detail: {value}"
+            ))),
+        }
+    }
+}
+
 /// Link type for linked injection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LinkType {
@@ -384,6 +407,8 @@ pub struct RawConfig {
     pub duplicate_categories: Option<bool>,
     /// Notification URLs.
     pub notification_webhook_urls: Vec<String>,
+    /// Notification result payload detail.
+    pub notification_payload_detail: Option<String>,
     /// Service listener port.
     pub listen_port: Option<Option<u16>>,
     /// Service listener host.
@@ -493,6 +518,8 @@ pub struct RuntimeConfig {
     pub duplicate_categories: bool,
     /// Notification URLs.
     pub notification_webhook_urls: Vec<String>,
+    /// Notification result payload detail.
+    pub notification_payload_detail: NotificationPayloadDetail,
     /// Service listener port. `None` disables HTTP intentionally.
     pub listen_port: Option<u16>,
     /// Service listener host.
@@ -593,6 +620,11 @@ impl RuntimeConfig {
             torrent_clients,
             duplicate_categories: raw.duplicate_categories.unwrap_or(false),
             notification_webhook_urls,
+            notification_payload_detail: NotificationPayloadDetail::parse(
+                raw.notification_payload_detail
+                    .as_deref()
+                    .unwrap_or("redacted"),
+            )?,
             listen_port: raw.listen_port.unwrap_or(Some(DEFAULT_LISTEN_PORT)),
             listen_host: raw
                 .listen_host
@@ -1225,8 +1257,8 @@ fn dev_mode_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, ApiIntegrationConfig, LinkType, MatchMode, RawConfig, RuntimeConfig,
-        TorrentClientConfig, apply_env_overrides_from, config_file_from_sources,
+        Action, ApiIntegrationConfig, LinkType, MatchMode, NotificationPayloadDetail, RawConfig,
+        RuntimeConfig, TorrentClientConfig, apply_env_overrides_from, config_file_from_sources,
         load_selected_raw_config, parse_duration_millis, raw_config_from_source,
     };
     use std::{ffi::OsStr, net::IpAddr, path::Path};
@@ -1256,6 +1288,10 @@ mod tests {
         assert_eq!(
             config.notification_webhook_urls,
             vec!["https://notify.example"]
+        );
+        assert_eq!(
+            config.notification_payload_detail,
+            NotificationPayloadDetail::Redacted
         );
         assert_eq!(config.snatch_retries, 2);
         assert_eq!(config.torrent_clients[0].kind, "qbittorrent");
@@ -1359,6 +1395,33 @@ mod tests {
 
             assert!(error.to_string().contains("invalid match_mode"));
         }
+    }
+
+    #[test]
+    fn parses_notification_payload_detail() {
+        let config = RuntimeConfig::normalize(
+            RawConfig {
+                notification_payload_detail: Some("full".to_owned()),
+                ..RawConfig::default()
+            },
+            Path::new("/config"),
+        )
+        .expect("notification detail");
+
+        assert_eq!(
+            config.notification_payload_detail,
+            NotificationPayloadDetail::Full
+        );
+        let error = RuntimeConfig::normalize(
+            RawConfig {
+                notification_payload_detail: Some("verbose".to_owned()),
+                ..RawConfig::default()
+            },
+            Path::new("/config"),
+        )
+        .expect_err("invalid notification detail");
+
+        assert!(error.to_string().contains("notification_payload_detail"));
     }
 
     #[test]
@@ -1500,6 +1563,7 @@ mod tests {
             snatch_retries = 4
             log_format = "json"
             log_level = "debug"
+            notification_payload_detail = "full"
             injection_category = "client-label"
             injection_tags = ["managed", "4k"]
             link_dirs = ["/links"]
@@ -1543,6 +1607,7 @@ mod tests {
         assert_eq!(raw.snatch_retries, Some(4));
         assert_eq!(raw.log_format.as_deref(), Some("json"));
         assert_eq!(raw.log_level.as_deref(), Some("debug"));
+        assert_eq!(raw.notification_payload_detail.as_deref(), Some("full"));
         assert_eq!(raw.injection_category.as_deref(), Some("client-label"));
         assert_eq!(raw.injection_tags, vec!["managed", "4k"]);
         assert_eq!(raw.state_dir.as_deref(), Some(Path::new("/state")));

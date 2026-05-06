@@ -13,7 +13,7 @@ use tokio::runtime::Builder;
 
 use crate::{
     SporosError, VERSION,
-    config::RuntimeConfig,
+    config::{NotificationPayloadDetail, RuntimeConfig},
     domain::{ActionResult, InjectionResult, SaveResult},
     retry::{
         RetryClass, RetryContext, RetryDecision, RetryError, RetryPolicy, classify_http_status,
@@ -44,12 +44,17 @@ pub struct NotificationSender {
     urls: Vec<String>,
     client: Client,
     redactor: Redactor,
+    payload_detail: NotificationPayloadDetail,
 }
 
 impl NotificationSender {
     /// Build a sender from normalized runtime config.
     pub fn from_config(config: &RuntimeConfig, redactor: Redactor) -> crate::Result<Self> {
-        Self::new(config.notification_webhook_urls.clone(), redactor)
+        Self::new_with_payload_detail(
+            config.notification_webhook_urls.clone(),
+            redactor,
+            config.notification_payload_detail,
+        )
     }
 
     /// Build a sender from normalized runtime config with an explicit timeout.
@@ -58,18 +63,32 @@ impl NotificationSender {
         redactor: Redactor,
         timeout: Duration,
     ) -> crate::Result<Self> {
-        Self::new_with_timeout(config.notification_webhook_urls.clone(), redactor, timeout)
+        Self::new_with_timeout(
+            config.notification_webhook_urls.clone(),
+            redactor,
+            timeout,
+            config.notification_payload_detail,
+        )
     }
 
     /// Build a sender from explicit URLs.
     pub fn new(urls: Vec<String>, redactor: Redactor) -> crate::Result<Self> {
-        Self::new_with_timeout(urls, redactor, NOTIFICATION_TIMEOUT)
+        Self::new_with_payload_detail(urls, redactor, NotificationPayloadDetail::default())
+    }
+
+    pub(crate) fn new_with_payload_detail(
+        urls: Vec<String>,
+        redactor: Redactor,
+        payload_detail: NotificationPayloadDetail,
+    ) -> crate::Result<Self> {
+        Self::new_with_timeout(urls, redactor, NOTIFICATION_TIMEOUT, payload_detail)
     }
 
     fn new_with_timeout(
         urls: Vec<String>,
         redactor: Redactor,
         timeout: Duration,
+        payload_detail: NotificationPayloadDetail,
     ) -> crate::Result<Self> {
         let client = Client::builder()
             .timeout(timeout)
@@ -80,6 +99,7 @@ impl NotificationSender {
             urls,
             client,
             redactor,
+            payload_detail,
         })
     }
 
@@ -165,7 +185,7 @@ impl NotificationSender {
 
     /// Send a result notification asynchronously when an attempt has a notifiable action result.
     pub async fn send_result_async(&self, attempt: &PipelineAttempt) -> NotificationReport {
-        let Some(payload) = result_payload(attempt) else {
+        let Some(payload) = result_payload(attempt, self.payload_detail) else {
             return NotificationReport::default();
         };
         self.post_all(payload).await
@@ -301,32 +321,61 @@ struct NotificationPayload {
     extra: Value,
 }
 
-fn result_payload(attempt: &PipelineAttempt) -> Option<NotificationPayload> {
+fn result_payload(
+    attempt: &PipelineAttempt,
+    detail: NotificationPayloadDetail,
+) -> Option<NotificationPayload> {
     let result = notification_result(attempt.action_result?)?;
-    let body = format!("{result}: {}", attempt.searchee_title);
+    let body = match detail {
+        NotificationPayloadDetail::Redacted => format!("{result}: redacted"),
+        NotificationPayloadDetail::Full => format!("{result}: {}", attempt.searchee_title),
+    };
+    let extra = match detail {
+        NotificationPayloadDetail::Redacted => redacted_result_extra(attempt, result),
+        NotificationPayloadDetail::Full => full_result_extra(attempt, result),
+    };
     Some(NotificationPayload {
         title: "cross-seed".to_owned(),
         body,
-        extra: json!({
-            "event": "RESULTS",
-            "name": &attempt.candidate_name,
-            "infoHashes": &attempt.candidate_info_hashes,
-            "trackers": &attempt.trackers,
-            "source": attempt.label.as_str(),
-            "result": result,
-            "paused": null,
-            "decisions": [attempt.decision.as_str()],
-            "searchee": {
-                "category": &attempt.searchee_category,
-                "tags": &attempt.searchee_tags,
-                "trackers": &attempt.searchee_trackers,
-                "length": attempt.searchee_length,
-                "clientHost": &attempt.searchee_client_host,
-                "infoHash": &attempt.searchee_info_hash,
-                "path": &attempt.searchee_path,
-                "sourceType": &attempt.searchee_source_type,
-            }
-        }),
+        extra,
+    })
+}
+
+fn redacted_result_extra(attempt: &PipelineAttempt, result: &str) -> Value {
+    json!({
+        "event": "RESULTS",
+        "source": attempt.label.as_str(),
+        "result": result,
+        "paused": null,
+        "decisions": [attempt.decision.as_str()],
+        "redacted": true,
+        "searchee": {
+            "length": attempt.searchee_length,
+            "sourceType": &attempt.searchee_source_type,
+        }
+    })
+}
+
+fn full_result_extra(attempt: &PipelineAttempt, result: &str) -> Value {
+    json!({
+        "event": "RESULTS",
+        "name": &attempt.candidate_name,
+        "infoHashes": &attempt.candidate_info_hashes,
+        "trackers": &attempt.trackers,
+        "source": attempt.label.as_str(),
+        "result": result,
+        "paused": null,
+        "decisions": [attempt.decision.as_str()],
+        "searchee": {
+            "category": &attempt.searchee_category,
+            "tags": &attempt.searchee_tags,
+            "trackers": &attempt.searchee_trackers,
+            "length": attempt.searchee_length,
+            "clientHost": &attempt.searchee_client_host,
+            "infoHash": &attempt.searchee_info_hash,
+            "path": &attempt.searchee_path,
+            "sourceType": &attempt.searchee_source_type,
+        }
     })
 }
 
@@ -375,7 +424,8 @@ where
 mod tests {
     use super::{NotificationSender, result_payload};
     use crate::{
-        domain::{ActionResult, Decision, InjectionResult, Label},
+        config::NotificationPayloadDetail,
+        domain::{ActionResult, Decision, InjectionResult, Label, SaveResult},
         search::PipelineAttempt,
         startup::Redactor,
     };
@@ -452,7 +502,7 @@ mod tests {
     fn result_payload_contains_contract_fields_and_skips_non_results() {
         let mut attempt = attempt(ActionResult::Injection(InjectionResult::Injected));
 
-        let payload = result_payload(&attempt).expect("payload");
+        let payload = result_payload(&attempt, NotificationPayloadDetail::Full).expect("payload");
 
         assert_eq!(payload.title, "cross-seed");
         assert_eq!(payload.body, "INJECTED: Example Show");
@@ -462,7 +512,33 @@ mod tests {
         assert_eq!(payload.extra["searchee"]["clientHost"], "client-a");
 
         attempt.action_result = Some(ActionResult::Injection(InjectionResult::AlreadyExists));
-        assert!(result_payload(&attempt).is_none());
+        assert!(result_payload(&attempt, NotificationPayloadDetail::Full).is_none());
+    }
+
+    #[test]
+    fn result_payload_redacts_sensitive_fields_by_default() {
+        let attempt = attempt(ActionResult::Save(SaveResult::Saved));
+
+        let payload =
+            result_payload(&attempt, NotificationPayloadDetail::Redacted).expect("payload");
+        let serialized = serde_json::to_string(&payload).expect("payload json");
+
+        assert_eq!(payload.body, "SAVED: redacted");
+        assert_eq!(payload.extra["event"], "RESULTS");
+        assert_eq!(payload.extra["source"], "search");
+        assert_eq!(payload.extra["result"], "SAVED");
+        assert_eq!(payload.extra["redacted"], true);
+        assert_eq!(payload.extra["searchee"]["length"], 123);
+        assert_eq!(payload.extra["searchee"]["sourceType"], "torrentClient");
+        assert!(payload.extra.get("name").is_none());
+        assert!(payload.extra.get("infoHashes").is_none());
+        assert!(payload.extra.get("trackers").is_none());
+        assert!(payload.extra["searchee"].get("clientHost").is_none());
+        assert!(!serialized.contains("Example.Show.2024"));
+        assert!(!serialized.contains("0123456789012345678901234567890123456789"));
+        assert!(!serialized.contains("tracker.example"));
+        assert!(!serialized.contains("client-a"));
+        assert!(!serialized.contains("/data/Example Show"));
     }
 
     #[test]

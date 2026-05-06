@@ -904,6 +904,7 @@ mod tests {
             torrent_clients: Vec::new(),
             duplicate_categories: false,
             notification_webhook_urls: Vec::new(),
+            notification_payload_detail: crate::config::NotificationPayloadDetail::Redacted,
             listen_port: Some(9000),
             listen_host: "0.0.0.0".parse().expect("listen host"),
             trusted_proxy_ips: Vec::new(),
