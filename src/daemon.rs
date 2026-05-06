@@ -2058,7 +2058,7 @@ async fn health_readyz_response(
     let database_result = AsyncDatabase::open(&state.config.database_path).await;
     let database_ready = database_result.is_ok();
     let runtime_ready = !state.services.cancellation_token().is_cancelled();
-    let scheduler_ready = state.scheduler.try_lock().is_ok();
+    let scheduler_ready = runtime_ready;
     let local_paths_ready = configured_local_paths_ready(&state.config).await;
     let intake_ready = state.config.listen_port.is_some() && runtime_ready;
     let announce_queue = match &database_result {
@@ -4565,6 +4565,43 @@ mod tests {
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json::from_str(&response.body).expect("status json");
         assert_eq!(body["scheduler"]["available"], false);
+        drop(guard);
+        state.services.shutdown().await;
+        let _cleanup = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn readiness_does_not_depend_on_scheduler_lock() {
+        let root = temp_path("daemon-readyz-no-scheduler-lock");
+        std::fs::create_dir_all(&root).expect("root");
+        let database = Database::open_app_dir(&root).expect("database");
+        database.set_api_key("secret").expect("api key");
+        let config = RuntimeConfig::normalize(RawConfig::default(), &root).expect("config");
+        let scheduler = DaemonPlan::from_config(&config).scheduler;
+        let state = Arc::new(super::DaemonState {
+            app_dir: root.clone(),
+            config,
+            services: RuntimeServices::start(CancellationToken::new()),
+            scheduler: Mutex::new(scheduler),
+            metrics: Arc::new(super::DaemonMetrics::default()),
+        });
+        let guard = state.scheduler.lock().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handle_runtime_request(
+                Arc::clone(&state),
+                ApiRequest::new(ApiMethod::Get, "/_health/readyz", BTreeMap::new(), ""),
+            ),
+        )
+        .await
+        .expect("readyz should not wait for scheduler")
+        .expect("readyz");
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body).expect("readyz json");
+        assert_eq!(body["checks"]["scheduler"], true);
+        assert_eq!(body["status"], "ready");
         drop(guard);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
