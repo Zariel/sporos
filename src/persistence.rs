@@ -26,6 +26,10 @@ use crate::{
 const DATABASE_FILE_NAME: &str = "sporos.db";
 const SCHEMA_VERSION: i64 = 1;
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;";
+const REFRESH_DATA_ROOTS: &str = "data_roots";
+const REFRESH_CLIENT_SEARCHEES: &str = "client_searchees";
+const REFRESH_INDEXERS: &str = "indexers";
+const REFRESH_TORRENT_DIR: &str = "torrent_dir";
 
 #[derive(Debug, Clone, Copy)]
 struct Migration {
@@ -254,48 +258,59 @@ impl Database {
         &self,
         records: impl IntoIterator<Item = DataRootRecord<'a>>,
     ) -> crate::Result<usize> {
-        self.begin_data_root_refresh()?;
+        let refresh_id = self.begin_data_root_refresh()?;
         for record in records {
             self.upsert_data_root(&record)?;
-            self.mark_refreshed_data_root(record.path)?;
+            self.mark_refreshed_data_root(&refresh_id, record.path)?;
         }
-        self.finish_data_root_refresh()
+        self.finish_data_root_refresh(&refresh_id)
     }
 
     /// Start a bounded refresh for data-dir roots.
-    pub fn begin_data_root_refresh(&self) -> crate::Result<()> {
-        self.block_on(async {
-            sqlx::query("DELETE FROM current_data_roots")
-                .execute(self.pool())
-                .await
-                .map(|_| ())
-                .map_err(sqlx_error)
-        })
+    pub fn begin_data_root_refresh(&self) -> crate::Result<String> {
+        self.block_on(begin_refresh_run(self.pool(), REFRESH_DATA_ROOTS))
     }
 
     /// Mark one data-dir root as present during a bounded refresh.
-    pub fn mark_refreshed_data_root(&self, path: &str) -> crate::Result<()> {
+    pub fn mark_refreshed_data_root(&self, refresh_id: &str, path: &str) -> crate::Result<()> {
         self.block_on(async {
-            sqlx::query("INSERT OR IGNORE INTO current_data_roots (path) VALUES (?1)")
-                .bind(path)
-                .execute(self.pool())
-                .await
-                .map(|_| ())
-                .map_err(sqlx_error)
+            sqlx::query(
+                "INSERT OR IGNORE INTO current_data_roots (refresh_id, path) VALUES (?1, ?2)",
+            )
+            .bind(refresh_id)
+            .bind(path)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
         })
     }
 
     /// Prune data-dir rows absent from the current bounded refresh.
-    pub fn finish_data_root_refresh(&self) -> crate::Result<usize> {
+    pub fn finish_data_root_refresh(&self, refresh_id: &str) -> crate::Result<usize> {
         self.block_on(async {
-            let result = sqlx::query(
-                "DELETE FROM data
-                 WHERE path NOT IN (SELECT path FROM current_data_roots)",
-            )
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
-            rows_affected(result.rows_affected())
+            let mut transaction = self.pool().begin().await.map_err(sqlx_error)?;
+            let overlapped =
+                finish_refresh_run(&mut transaction, REFRESH_DATA_ROOTS, refresh_id).await?;
+            let rows_removed = if overlapped {
+                0
+            } else {
+                let result = sqlx::query(
+                    "DELETE FROM data
+                     WHERE path NOT IN (SELECT path FROM current_data_roots)",
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+                rows_affected(result.rows_affected())?
+            };
+            sqlx::query("DELETE FROM current_data_roots WHERE refresh_id = ?1")
+                .bind(refresh_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+            transaction.commit().await.map_err(sqlx_error)?;
+            Ok(rows_removed)
         })
     }
 
@@ -359,21 +374,32 @@ impl Database {
         client_host: &str,
         records: impl IntoIterator<Item = ClientSearcheeRecord<'a>>,
     ) -> crate::Result<usize> {
-        self.begin_client_searchee_refresh()?;
+        let refresh_id = self.begin_client_searchee_refresh()?;
         for record in records {
             self.upsert_client_searchee(&record)?;
-            self.mark_refreshed_client_info_hash(record.info_hash)?;
+            self.mark_refreshed_client_info_hash(&refresh_id, record.info_hash)?;
         }
-        self.finish_client_searchee_refresh(client_host)
+        self.finish_client_searchee_refresh(&refresh_id, client_host)
     }
 
     /// Start a bounded refresh for one client's searchee rows.
-    pub fn begin_client_searchee_refresh(&self) -> crate::Result<()> {
+    pub fn begin_client_searchee_refresh(&self) -> crate::Result<String> {
+        self.block_on(begin_refresh_run(self.pool(), REFRESH_CLIENT_SEARCHEES))
+    }
+
+    /// Mark one info hash as present during a bounded client searchee refresh.
+    pub fn mark_refreshed_client_info_hash(
+        &self,
+        refresh_id: &str,
+        info_hash: &str,
+    ) -> crate::Result<()> {
         self.block_on(async {
-            sqlx::raw_sql(
-                "DELETE FROM current_client_info_hashes;
-                DELETE FROM current_client_ensemble_paths;",
+            sqlx::query(
+                "INSERT OR IGNORE INTO current_client_info_hashes (refresh_id, info_hash)
+                 VALUES (?1, ?2)",
             )
+            .bind(refresh_id)
+            .bind(info_hash)
             .execute(self.pool())
             .await
             .map(|_| ())
@@ -381,61 +407,80 @@ impl Database {
         })
     }
 
-    /// Mark one info hash as present during a bounded client searchee refresh.
-    pub fn mark_refreshed_client_info_hash(&self, info_hash: &str) -> crate::Result<()> {
-        self.block_on(async {
-            sqlx::query("INSERT OR IGNORE INTO current_client_info_hashes (info_hash) VALUES (?1)")
-                .bind(info_hash)
-                .execute(self.pool())
-                .await
-                .map(|_| ())
-                .map_err(sqlx_error)
-        })
-    }
-
     /// Mark one ensemble path as present during a bounded client searchee refresh.
-    pub fn mark_refreshed_client_ensemble_path(&self, path: &str) -> crate::Result<()> {
+    pub fn mark_refreshed_client_ensemble_path(
+        &self,
+        refresh_id: &str,
+        path: &str,
+    ) -> crate::Result<()> {
         self.block_on(async {
-            sqlx::query("INSERT OR IGNORE INTO current_client_ensemble_paths (path) VALUES (?1)")
-                .bind(path)
-                .execute(self.pool())
-                .await
-                .map(|_| ())
-                .map_err(sqlx_error)
+            sqlx::query(
+                "INSERT OR IGNORE INTO current_client_ensemble_paths (refresh_id, path)
+                 VALUES (?1, ?2)",
+            )
+            .bind(refresh_id)
+            .bind(path)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
         })
     }
 
     /// Prune rows absent from the current bounded client searchee refresh.
-    pub fn finish_client_searchee_refresh(&self, client_host: &str) -> crate::Result<usize> {
+    pub fn finish_client_searchee_refresh(
+        &self,
+        refresh_id: &str,
+        client_host: &str,
+    ) -> crate::Result<usize> {
         self.block_on(async {
-            sqlx::query(
-                "DELETE FROM client_ensemble
-                 WHERE client_host = ?1
-                 AND path NOT IN (SELECT path FROM current_client_ensemble_paths)",
-            )
-            .bind(client_host)
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
-            sqlx::query(
-                "DELETE FROM client_ensemble
-                 WHERE client_host = ?1
-                 AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
-            )
-            .bind(client_host)
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
-            let result = sqlx::query(
-                "DELETE FROM client_searchee
-                 WHERE client_host = ?1
-                 AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
-            )
-            .bind(client_host)
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
-            rows_affected(result.rows_affected())
+            let mut transaction = self.pool().begin().await.map_err(sqlx_error)?;
+            let overlapped =
+                finish_refresh_run(&mut transaction, REFRESH_CLIENT_SEARCHEES, refresh_id).await?;
+            let rows_removed = if overlapped {
+                0
+            } else {
+                sqlx::query(
+                    "DELETE FROM client_ensemble
+                     WHERE client_host = ?1
+                     AND path NOT IN (SELECT path FROM current_client_ensemble_paths)",
+                )
+                .bind(client_host)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+                sqlx::query(
+                    "DELETE FROM client_ensemble
+                     WHERE client_host = ?1
+                     AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
+                )
+                .bind(client_host)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+                let result = sqlx::query(
+                    "DELETE FROM client_searchee
+                     WHERE client_host = ?1
+                     AND info_hash NOT IN (SELECT info_hash FROM current_client_info_hashes)",
+                )
+                .bind(client_host)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+                rows_affected(result.rows_affected())?
+            };
+            sqlx::query("DELETE FROM current_client_info_hashes WHERE refresh_id = ?1")
+                .bind(refresh_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+            sqlx::query("DELETE FROM current_client_ensemble_paths WHERE refresh_id = ?1")
+                .bind(refresh_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+            transaction.commit().await.map_err(sqlx_error)?;
+            Ok(rows_removed)
         })
     }
 
@@ -649,13 +694,14 @@ impl Database {
     ) -> crate::Result<IndexerSyncStats> {
         let configured = configured.into_iter().collect::<Vec<_>>();
         self.block_on(async {
-            sqlx::query("DELETE FROM current_indexer_urls")
-                .execute(self.pool())
-                .await
-                .map_err(sqlx_error)?;
+            let refresh_id = begin_refresh_run(self.pool(), REFRESH_INDEXERS).await?;
             let mut result = IndexerSyncStats::default();
             for (url, apikey) in configured {
-                sqlx::query("INSERT OR IGNORE INTO current_indexer_urls (url) VALUES (?1)")
+                sqlx::query(
+                    "INSERT OR IGNORE INTO current_indexer_urls (refresh_id, url)
+                     VALUES (?1, ?2)",
+                )
+                    .bind(&refresh_id)
                     .bind(url)
                     .execute(self.pool())
                     .await
@@ -703,16 +749,27 @@ impl Database {
                     result.updated += rows_affected(changed.rows_affected())?;
                 }
             }
-            let deactivated = sqlx::query(
-                "UPDATE indexer
-                 SET active = 0
-                 WHERE active = 1
-                 AND url NOT IN (SELECT url FROM current_indexer_urls)",
-            )
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
-            result.deactivated = rows_affected(deactivated.rows_affected())?;
+            let mut transaction = self.pool().begin().await.map_err(sqlx_error)?;
+            let overlapped =
+                finish_refresh_run(&mut transaction, REFRESH_INDEXERS, &refresh_id).await?;
+            if !overlapped {
+                let deactivated = sqlx::query(
+                    "UPDATE indexer
+                     SET active = 0
+                     WHERE active = 1
+                     AND url NOT IN (SELECT url FROM current_indexer_urls)",
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+                result.deactivated = rows_affected(deactivated.rows_affected())?;
+            }
+            sqlx::query("DELETE FROM current_indexer_urls WHERE refresh_id = ?1")
+                .bind(&refresh_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+            transaction.commit().await.map_err(sqlx_error)?;
             Ok(result)
         })
     }
@@ -1043,25 +1100,27 @@ impl Database {
     }
 
     /// Start a bounded refresh for torrent-dir rows.
-    pub fn begin_torrent_dir_refresh(&self) -> crate::Result<()> {
-        self.block_on(async {
-            sqlx::query("DELETE FROM current_torrent_dir")
-                .execute(self.pool())
-                .await
-                .map(|_| ())
-                .map_err(sqlx_error)
-        })
+    pub fn begin_torrent_dir_refresh(&self) -> crate::Result<String> {
+        self.block_on(begin_refresh_run(self.pool(), REFRESH_TORRENT_DIR))
     }
 
     /// Mark one torrent-dir path as present during refresh.
-    pub fn mark_refreshed_torrent_path(&self, file_path: &str) -> crate::Result<()> {
+    pub fn mark_refreshed_torrent_path(
+        &self,
+        refresh_id: &str,
+        file_path: &str,
+    ) -> crate::Result<()> {
         self.block_on(async {
-            sqlx::query("INSERT OR IGNORE INTO current_torrent_dir (file_path) VALUES (?1)")
-                .bind(file_path)
-                .execute(self.pool())
-                .await
-                .map(|_| ())
-                .map_err(sqlx_error)
+            sqlx::query(
+                "INSERT OR IGNORE INTO current_torrent_dir (refresh_id, file_path)
+                 VALUES (?1, ?2)",
+            )
+            .bind(refresh_id)
+            .bind(file_path)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
         })
     }
 
@@ -1103,16 +1162,30 @@ impl Database {
     }
 
     /// Prune torrent-dir rows absent from the current bounded refresh.
-    pub fn finish_torrent_dir_refresh(&self) -> crate::Result<usize> {
+    pub fn finish_torrent_dir_refresh(&self, refresh_id: &str) -> crate::Result<usize> {
         self.block_on(async {
-            let result = sqlx::query(
-                "DELETE FROM torrent
-                 WHERE file_path NOT IN (SELECT file_path FROM current_torrent_dir)",
-            )
-            .execute(self.pool())
-            .await
-            .map_err(sqlx_error)?;
-            rows_affected(result.rows_affected())
+            let mut transaction = self.pool().begin().await.map_err(sqlx_error)?;
+            let overlapped =
+                finish_refresh_run(&mut transaction, REFRESH_TORRENT_DIR, refresh_id).await?;
+            let rows_removed = if overlapped {
+                0
+            } else {
+                let result = sqlx::query(
+                    "DELETE FROM torrent
+                     WHERE file_path NOT IN (SELECT file_path FROM current_torrent_dir)",
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+                rows_affected(result.rows_affected())?
+            };
+            sqlx::query("DELETE FROM current_torrent_dir WHERE refresh_id = ?1")
+                .bind(refresh_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+            transaction.commit().await.map_err(sqlx_error)?;
+            Ok(rows_removed)
         })
     }
 
@@ -2932,24 +3005,40 @@ ON announce_work(status, expires_at, created_at, work_id);
 CREATE INDEX IF NOT EXISTS idx_announce_work_status
 ON announce_work(status);
 
+CREATE TABLE IF NOT EXISTS current_refresh_runs (
+    scope TEXT NOT NULL,
+    refresh_id TEXT PRIMARY KEY,
+    overlapped INTEGER NOT NULL CHECK(overlapped IN (0, 1))
+);
+
 CREATE TABLE IF NOT EXISTS current_data_roots (
-    path TEXT PRIMARY KEY
+    refresh_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    PRIMARY KEY(refresh_id, path)
 );
 
 CREATE TABLE IF NOT EXISTS current_client_info_hashes (
-    info_hash TEXT PRIMARY KEY
+    refresh_id TEXT NOT NULL,
+    info_hash TEXT NOT NULL,
+    PRIMARY KEY(refresh_id, info_hash)
 );
 
 CREATE TABLE IF NOT EXISTS current_client_ensemble_paths (
-    path TEXT PRIMARY KEY
+    refresh_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    PRIMARY KEY(refresh_id, path)
 );
 
 CREATE TABLE IF NOT EXISTS current_indexer_urls (
-    url TEXT PRIMARY KEY
+    refresh_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    PRIMARY KEY(refresh_id, url)
 );
 
 CREATE TABLE IF NOT EXISTS current_torrent_dir (
-    file_path TEXT PRIMARY KEY
+    refresh_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    PRIMARY KEY(refresh_id, file_path)
 );
 
 CREATE TABLE IF NOT EXISTS client_searchee (
@@ -3289,6 +3378,62 @@ fn endpoint_breaker_row(row: SqliteRow) -> EndpointBreakerRow {
         last_error_class: row.get(7),
         last_error_message: row.get(8),
     }
+}
+
+async fn begin_refresh_run(pool: &SqlitePool, scope: &str) -> crate::Result<String> {
+    let mut transaction = pool.begin().await.map_err(sqlx_error)?;
+    let refresh_id: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(sqlx_error)?;
+    let active_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM current_refresh_runs WHERE scope = ?1")
+            .bind(scope)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(sqlx_error)?;
+    if active_count > 0 {
+        sqlx::query("UPDATE current_refresh_runs SET overlapped = 1 WHERE scope = ?1")
+            .bind(scope)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_error)?;
+    }
+    sqlx::query(
+        "INSERT INTO current_refresh_runs (scope, refresh_id, overlapped)
+         VALUES (?1, ?2, ?3)",
+    )
+    .bind(scope)
+    .bind(&refresh_id)
+    .bind(if active_count > 0 { 1_i64 } else { 0_i64 })
+    .execute(&mut *transaction)
+    .await
+    .map_err(sqlx_error)?;
+    transaction.commit().await.map_err(sqlx_error)?;
+    Ok(refresh_id)
+}
+
+async fn finish_refresh_run(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    scope: &str,
+    refresh_id: &str,
+) -> crate::Result<bool> {
+    let overlapped = sqlx::query_scalar::<_, i64>(
+        "SELECT overlapped FROM current_refresh_runs WHERE scope = ?1 AND refresh_id = ?2",
+    )
+    .bind(scope)
+    .bind(refresh_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(sqlx_error)?
+    .unwrap_or(1);
+    sqlx::query("DELETE FROM current_refresh_runs WHERE scope = ?1 AND refresh_id = ?2")
+        .bind(scope)
+        .bind(refresh_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(sqlx_error)?;
+    Ok(overlapped != 0)
 }
 
 fn sqlx_error(error: sqlx::Error) -> SporosError {

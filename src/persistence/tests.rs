@@ -506,32 +506,39 @@ fn refresh_staging_tables_are_connection_independent() {
     let first = Database::open_app_dir(&root).expect("database");
     let second = Database::open(Database::path_for_app_dir(&root)).expect("second database");
 
-    first.begin_data_root_refresh().expect("begin data");
+    let data_refresh = first.begin_data_root_refresh().expect("begin data");
     second
-        .mark_refreshed_data_root("/media")
+        .mark_refreshed_data_root(&data_refresh, "/media")
         .expect("mark data");
-    assert_eq!(first.finish_data_root_refresh().expect("finish data"), 0);
+    assert_eq!(
+        first
+            .finish_data_root_refresh(&data_refresh)
+            .expect("finish data"),
+        0
+    );
 
-    first.begin_client_searchee_refresh().expect("begin client");
+    let client_refresh = first.begin_client_searchee_refresh().expect("begin client");
     second
-        .mark_refreshed_client_info_hash("abcdef")
+        .mark_refreshed_client_info_hash(&client_refresh, "abcdef")
         .expect("mark client hash");
     second
-        .mark_refreshed_client_ensemble_path("/downloads/show")
+        .mark_refreshed_client_ensemble_path(&client_refresh, "/downloads/show")
         .expect("mark client path");
     assert_eq!(
         first
-            .finish_client_searchee_refresh("http://client")
+            .finish_client_searchee_refresh(&client_refresh, "http://client")
             .expect("finish client"),
         0
     );
 
-    first.begin_torrent_dir_refresh().expect("begin torrent");
+    let torrent_refresh = first.begin_torrent_dir_refresh().expect("begin torrent");
     second
-        .mark_refreshed_torrent_path("/torrents/example.torrent")
+        .mark_refreshed_torrent_path(&torrent_refresh, "/torrents/example.torrent")
         .expect("mark torrent");
     assert_eq!(
-        first.finish_torrent_dir_refresh().expect("finish torrent"),
+        first
+            .finish_torrent_dir_refresh(&torrent_refresh)
+            .expect("finish torrent"),
         0
     );
 
@@ -552,6 +559,144 @@ fn refresh_staging_tables_are_connection_independent() {
         )
         .expect("temp table query");
     assert_eq!(temp_tables, 0);
+
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
+fn overlapping_refreshes_do_not_prune_each_other_live_rows() {
+    let root = temp_path("refresh-overlap");
+    fs::create_dir_all(&root).expect("temp dir");
+    let database = Database::open_app_dir(&root).expect("database");
+
+    database
+        .upsert_data_root(&DataRootRecord {
+            path: "/data/a",
+            title: "A",
+            lookup: None,
+        })
+        .expect("data a");
+    database
+        .upsert_data_root(&DataRootRecord {
+            path: "/data/b",
+            title: "B",
+            lookup: None,
+        })
+        .expect("data b");
+    let data_a = database.begin_data_root_refresh().expect("begin data a");
+    database
+        .mark_refreshed_data_root(&data_a, "/data/a")
+        .expect("mark data a");
+    let data_b = database.begin_data_root_refresh().expect("begin data b");
+    database
+        .mark_refreshed_data_root(&data_b, "/data/b")
+        .expect("mark data b");
+    assert_eq!(
+        database
+            .finish_data_root_refresh(&data_a)
+            .expect("finish data a"),
+        0
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>("SELECT COUNT(*) FROM data", &[])
+            .expect("data count"),
+        2
+    );
+    assert_eq!(
+        database
+            .finish_data_root_refresh(&data_b)
+            .expect("finish data b"),
+        0
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>("SELECT COUNT(*) FROM data", &[])
+            .expect("data count after overlap"),
+        2
+    );
+    let data_c = database.begin_data_root_refresh().expect("begin data c");
+    database
+        .mark_refreshed_data_root(&data_c, "/data/b")
+        .expect("mark data c");
+    assert_eq!(
+        database
+            .finish_data_root_refresh(&data_c)
+            .expect("finish data c"),
+        1
+    );
+
+    let files = [File::new("Release/file.mkv", 42)];
+    let tags: [ClientLabel<'static>; 0] = [];
+    let trackers: [Cow<'static, str>; 0] = [];
+    for (info_hash, name) in [
+        ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "A"),
+        ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "B"),
+    ] {
+        database
+            .upsert_client_searchee(&ClientSearcheeRecord {
+                client_host: "client",
+                info_hash,
+                name,
+                title: name,
+                files: &files,
+                length: 42,
+                save_path: "/downloads",
+                category: None,
+                tags: &tags,
+                trackers: &trackers,
+                lookup: None,
+            })
+            .expect("client searchee");
+    }
+    let client_a = database
+        .begin_client_searchee_refresh()
+        .expect("begin client a");
+    database
+        .mark_refreshed_client_info_hash(&client_a, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .expect("mark client a");
+    let client_b = database
+        .begin_client_searchee_refresh()
+        .expect("begin client b");
+    database
+        .mark_refreshed_client_info_hash(&client_b, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .expect("mark client b");
+    assert_eq!(
+        database
+            .finish_client_searchee_refresh(&client_a, "client")
+            .expect("finish client a"),
+        0
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>("SELECT COUNT(*) FROM client_searchee", &[])
+            .expect("client count"),
+        2
+    );
+    assert_eq!(
+        database
+            .finish_client_searchee_refresh(&client_b, "client")
+            .expect("finish client b"),
+        0
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>("SELECT COUNT(*) FROM client_searchee", &[])
+            .expect("client count after overlap"),
+        2
+    );
+    let client_c = database
+        .begin_client_searchee_refresh()
+        .expect("begin client c");
+    database
+        .mark_refreshed_client_info_hash(&client_c, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .expect("mark client c");
+    assert_eq!(
+        database
+            .finish_client_searchee_refresh(&client_c, "client")
+            .expect("finish client c"),
+        1
+    );
 
     let _cleanup = fs::remove_dir_all(root);
 }

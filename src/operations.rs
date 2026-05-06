@@ -800,7 +800,7 @@ pub fn refresh_torrent_and_data_indexes(
         result.torrent_dir = Some(indexed);
     }
     if !config.data_dirs.is_empty() {
-        database.begin_data_root_refresh()?;
+        let refresh_id = database.begin_data_root_refresh()?;
         result.data_roots_indexed =
             for_each_data_dir_searchee(&config.data_dirs, config.max_data_depth, |searchee| {
                 let Some(path) = searchee.path.as_deref() else {
@@ -812,9 +812,9 @@ pub fn refresh_torrent_and_data_indexes(
                     title: searchee.title.as_ref(),
                     lookup: Some(&lookup),
                 })?;
-                database.mark_refreshed_data_root(path)
+                database.mark_refreshed_data_root(&refresh_id, path)
             })?;
-        result.data_roots_removed = database.finish_data_root_refresh()?;
+        result.data_roots_removed = database.finish_data_root_refresh(&refresh_id)?;
         tracing::info!(
             roots_indexed = result.data_roots_indexed,
             roots_removed = result.data_roots_removed,
@@ -885,7 +885,7 @@ fn refresh_client_searchee_cache(
     client: &dyn TorrentClient,
 ) -> crate::Result<ClientSearcheeRefreshCounts> {
     let metadata = client.metadata().clone().into_owned();
-    database.begin_client_searchee_refresh()?;
+    let refresh_id = database.begin_client_searchee_refresh()?;
     let mut counts = ClientSearcheeRefreshCounts::default();
     client.for_each_torrent(&mut |torrent| {
         let Some(searchee) = client_torrent_to_searchee(&metadata, torrent) else {
@@ -914,7 +914,7 @@ fn refresh_client_searchee_cache(
             trackers: &client_metadata.trackers,
             lookup: Some(&lookup),
         })?;
-        database.mark_refreshed_client_info_hash(info_hash.as_str())?;
+        database.mark_refreshed_client_info_hash(&refresh_id, info_hash.as_str())?;
         counts.refreshed = counts.refreshed.saturating_add(1);
         if config.season_from_episodes.is_some() {
             if let Some(ensemble) = episode_ensemble(&searchee) {
@@ -925,13 +925,13 @@ fn refresh_client_searchee_cache(
                     ensemble: &ensemble.ensemble,
                     element: &ensemble.element,
                 })?;
-                database.mark_refreshed_client_ensemble_path(&ensemble.path)?;
+                database.mark_refreshed_client_ensemble_path(&refresh_id, &ensemble.path)?;
                 counts.ensemble_rows = counts.ensemble_rows.saturating_add(1);
             }
         }
         Ok(())
     })?;
-    counts.pruned = database.finish_client_searchee_refresh(metadata.host.as_ref())?;
+    counts.pruned = database.finish_client_searchee_refresh(&refresh_id, metadata.host.as_ref())?;
     Ok(counts)
 }
 

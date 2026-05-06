@@ -1159,7 +1159,7 @@ pub fn index_torrent_dir(
     database: &Database,
     torrent_dir: &Path,
 ) -> crate::Result<TorrentDirIndexResult> {
-    database.begin_torrent_dir_refresh()?;
+    let refresh_id = database.begin_torrent_dir_refresh()?;
 
     let mut result = TorrentDirIndexResult {
         files_seen: 0,
@@ -1197,7 +1197,7 @@ pub fn index_torrent_dir(
         }
         result.files_seen += 1;
         let file_path = path.display().to_string();
-        database.mark_refreshed_torrent_path(&file_path)?;
+        database.mark_refreshed_torrent_path(&refresh_id, &file_path)?;
 
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -1231,7 +1231,7 @@ pub fn index_torrent_dir(
         }
     }
 
-    result.torrents_removed = database.finish_torrent_dir_refresh()?;
+    result.torrents_removed = database.finish_torrent_dir_refresh(&refresh_id)?;
     Ok(result)
 }
 
