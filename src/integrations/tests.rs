@@ -2,11 +2,11 @@ use super::{
     ArrKind, CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, SnatchHistory, SnatchOptions,
     SnatchResult, TorznabCaps, TorznabConfig, TorznabQuery, TorznabSearchIds, TorznabSearchOptions,
     arr_search_cache_key, cache_torrent_file, create_torznab_search_queries, enabled_indexers,
-    fetch_torznab_caps, for_each_rss_page, get_cached_torrent, guid_lookup, ids_for_torznab_caps,
-    lookup_arr_ids, parse_retry_after_delay_millis, parse_torznab_caps, parse_torznab_rss,
-    rss_pager, search_torznab_indexer, set_indexer_status, snatch, snatch_once,
-    sync_torznab_indexers, torznab_request_url, update_indexer_caps, validate_arr_instance,
-    validate_arr_url, validate_torznab_url,
+    enabled_search_indexers, fetch_torznab_caps, for_each_rss_page, get_cached_torrent,
+    guid_lookup, ids_for_torznab_caps, lookup_arr_ids, parse_retry_after_delay_millis,
+    parse_torznab_caps, parse_torznab_rss, rss_pager, search_torznab_indexer, set_indexer_status,
+    snatch, snatch_once, sync_torznab_indexers, torznab_request_url, update_indexer_caps,
+    validate_arr_instance, validate_arr_url, validate_torznab_url,
 };
 use crate::{
     domain::{Candidate, Decision, File, MediaType, Searchee},
@@ -81,6 +81,11 @@ fn syncs_caps_and_enabled_indexers() {
     let result = sync_torznab_indexers(&database, std::slice::from_ref(&first)).expect("sync");
     assert_eq!(result.updated, 1);
     assert_eq!(result.deactivated, 1);
+    let fresh = enabled_search_indexers(&database, 1_000).expect("fresh enabled");
+    assert_eq!(fresh.len(), 1);
+    assert!(fresh[0].caps.search);
+    assert!(fresh[0].caps.tv_search);
+    assert!(fresh[0].caps.movie_search);
 
     let id = database.indexer_id(&first.url).expect("id");
     let caps = parse_torznab_caps(
@@ -88,6 +93,11 @@ fn syncs_caps_and_enabled_indexers() {
         )
         .expect("caps");
     update_indexer_caps(&database, id, &caps).expect("update caps");
+    let refreshed = enabled_search_indexers(&database, 1_000).expect("refreshed enabled");
+    assert_eq!(refreshed.len(), 1);
+    assert!(refreshed[0].caps.search);
+    assert!(!refreshed[0].caps.tv_search);
+    assert!(refreshed[0].caps.categories.tv);
     assert_eq!(
         enabled_indexers(&database, 1_000).expect("enabled").len(),
         1

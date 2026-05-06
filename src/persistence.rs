@@ -664,6 +664,16 @@ impl Database {
                     "UPDATE indexer
                      SET apikey = ?2,
                          active = 1,
+                         search_cap = COALESCE(search_cap, 1),
+                         tv_search_cap = COALESCE(tv_search_cap, 1),
+                         movie_search_cap = COALESCE(movie_search_cap, 1),
+                         music_search_cap = COALESCE(music_search_cap, 1),
+                         audio_search_cap = COALESCE(audio_search_cap, 1),
+                         book_search_cap = COALESCE(book_search_cap, 1),
+                         tv_id_caps = COALESCE(tv_id_caps, '[]'),
+                         movie_id_caps = COALESCE(movie_id_caps, '[]'),
+                         cat_caps = COALESCE(cat_caps, '{\"movie\":false,\"tv\":false,\"anime\":false,\"xxx\":false,\"audio\":false,\"book\":false,\"additional\":false}'),
+                         limits_caps = COALESCE(limits_caps, '{\"default\":100,\"max\":100}'),
                          status = CASE WHEN status = 'UNKNOWN_ERROR' THEN NULL ELSE status END
                      WHERE url = ?1",
                 )
@@ -674,8 +684,14 @@ impl Database {
                 .map_err(sqlx_error)?;
                 if changed.rows_affected() == 0 {
                     sqlx::query(
-                        "INSERT INTO indexer (url, apikey, active)
-                         VALUES (?1, ?2, 1)",
+                        "INSERT INTO indexer
+                            (url, apikey, active, search_cap, tv_search_cap, movie_search_cap,
+                             music_search_cap, audio_search_cap, book_search_cap, tv_id_caps,
+                             movie_id_caps, cat_caps, limits_caps)
+                         VALUES
+                            (?1, ?2, 1, 1, 1, 1, 1, 1, 1, '[]', '[]',
+                             '{\"movie\":false,\"tv\":false,\"anime\":false,\"xxx\":false,\"audio\":false,\"book\":false,\"additional\":false}',
+                             '{\"default\":100,\"max\":100}')",
                     )
                     .bind(url)
                     .bind(apikey)
