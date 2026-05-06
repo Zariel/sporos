@@ -396,6 +396,7 @@ pub fn check_config_paths(config: &RuntimeConfig) -> crate::Result<()> {
     if let Some(torrent_dir) = &config.torrent_dir {
         verify_readable_dir(torrent_dir, "torrent_dir")?;
     }
+    ensure_read_write_dir(&config.torrent_cache_dir, "torrent_cache_dir")?;
     ensure_read_write_dir(&config.output_dir, "output_dir")?;
     for link_dir in &config.link_dirs {
         ensure_read_write_dir(link_dir, "link_dir")?;
@@ -580,6 +581,20 @@ mod tests {
 
         assert!(!root.join("logs").exists());
         assert!(root.join("output").exists());
+        assert!(root.join("torrent_cache").exists());
+        let _cleanup = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_creates_configured_torrent_cache_dir() {
+        let root = temp_path("startup-cache");
+        let mut config = test_config(root.clone());
+        config.torrent_cache_dir = root.join("configured-cache");
+
+        check_config_paths(&config).expect("paths");
+
+        assert!(config.torrent_cache_dir.exists());
+        assert!(!root.join("torrent_cache").exists());
         let _cleanup = fs::remove_dir_all(root);
     }
 
@@ -892,6 +907,7 @@ mod tests {
             max_data_depth: 2,
             torrent_dir: None,
             output_dir: root.join("output"),
+            torrent_cache_dir: root.join("torrent_cache"),
             inject_dir: None,
             ignore_titles: None,
             include_single_episodes: false,

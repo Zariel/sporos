@@ -27,7 +27,9 @@ use crate::{
 
 mod cache;
 
-pub use cache::{cache_torrent_file, get_cached_torrent};
+pub use cache::{
+    cache_torrent_file, cache_torrent_file_in_dir, get_cached_torrent, get_cached_torrent_in_dir,
+};
 
 static EPISODE_QUERY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bS(?P<season>\d{1,2})E(?P<episode>\d{1,3})\b")

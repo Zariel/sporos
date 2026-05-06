@@ -10,8 +10,8 @@ use crate::{
         SearcheeSource,
     },
     integrations::{
-        SnatchHistory, SnatchOptions, SnatchResult, cache_torrent_file, get_cached_torrent,
-        guid_lookup, snatch,
+        SnatchHistory, SnatchOptions, SnatchResult, cache_torrent_file_in_dir,
+        get_cached_torrent_in_dir, guid_lookup, snatch,
     },
     persistence::{Database, DecisionRecord},
     search::{Blocklist, parse_title},
@@ -38,8 +38,8 @@ pub struct AssessmentOptions<'a> {
 pub struct CandidateAssessmentContext<'a> {
     /// SQLite state.
     pub database: &'a Database,
-    /// Application directory containing the torrent cache.
-    pub app_dir: &'a Path,
+    /// Directory containing cached torrents.
+    pub torrent_cache_dir: &'a Path,
     /// Conservative assessment options.
     pub options: &'a AssessmentOptions<'a>,
     /// Candidate snatch retry options.
@@ -85,7 +85,7 @@ pub fn assess_candidate(
     history: &mut SnatchHistory,
 ) -> crate::Result<Assessment> {
     let database = context.database;
-    let app_dir = context.app_dir;
+    let torrent_cache_dir = context.torrent_cache_dir;
     let options = context.options;
     let now_millis = context.now_millis;
     let fuzzy_size_factor = fuzzy_size_factor(searchee, options);
@@ -93,7 +93,7 @@ pub fn assess_candidate(
 
     if let Some(cached) = cached_decision(database, searchee_id, candidate.guid.as_ref())? {
         if let Some(info_hash) = InfoHash::new(cached.info_hash.clone().unwrap_or_default()) {
-            if let Some(metafile) = get_cached_torrent(app_dir, &info_hash)? {
+            if let Some(metafile) = get_cached_torrent_in_dir(torrent_cache_dir, &info_hash)? {
                 let assessment =
                     assess_metafile(&metafile, searchee, options, true, fuzzy_size_factor);
                 if options.info_hashes_to_exclude.contains(info_hash.as_str()) {
@@ -137,7 +137,7 @@ pub fn assess_candidate(
         guid_lookup(database, candidate.guid.as_ref(), candidate.link.as_deref())?
             .and_then(InfoHash::new)
     {
-        if let Some(metafile) = get_cached_torrent(app_dir, &info_hash)? {
+        if let Some(metafile) = get_cached_torrent_in_dir(torrent_cache_dir, &info_hash)? {
             if options.info_hashes_to_exclude.contains(info_hash.as_str()) {
                 let assessment = Assessment::new(
                     Decision::InfoHashAlreadyExists,
@@ -181,7 +181,7 @@ pub fn assess_candidate(
     } else {
         match snatch(candidate, context.snatch_options, history)? {
             SnatchResult::Metafile { bytes, .. } => {
-                let metafile = cache_torrent_file(app_dir, &bytes)?;
+                let metafile = cache_torrent_file_in_dir(torrent_cache_dir, &bytes)?;
                 update_indexer_trackers(database, candidate.indexer_id, &metafile.trackers)?;
                 assess_metafile(&metafile, searchee, options, false, fuzzy_size_factor)
             }
@@ -881,12 +881,13 @@ mod tests {
         let database_root = temp_path("predownload");
         fs::create_dir_all(&database_root).expect("temp dir");
         let database = Database::open_app_dir(&database_root).expect("database");
+        let torrent_cache_dir = crate::torrent::torrent_cache_dir(&database_root);
         let mut history = SnatchHistory::default();
 
         let first_candidate = candidate("Example.Show.S01E01.720p.WEB-DL-GRP", Some(100));
         let mut context = CandidateAssessmentContext {
             database: &database,
-            app_dir: &database_root,
+            torrent_cache_dir: &torrent_cache_dir,
             options: &options,
             snatch_options: SnatchOptions::default(),
             now_millis: 1,
@@ -915,6 +916,7 @@ mod tests {
         let root = temp_path("cache-assess");
         fs::create_dir_all(&root).expect("temp dir");
         let database = Database::open_app_dir(&root).expect("database");
+        let torrent_cache_dir = crate::torrent::torrent_cache_dir(&root);
         let searchee = searchee(
             "Cached.Release",
             "Cached.Release",
@@ -946,7 +948,7 @@ mod tests {
 
         let context = CandidateAssessmentContext {
             database: &database,
-            app_dir: &root,
+            torrent_cache_dir: &torrent_cache_dir,
             options: &options,
             snatch_options: SnatchOptions::default(),
             now_millis: 2,

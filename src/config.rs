@@ -395,6 +395,8 @@ pub struct RawConfig {
     pub torrent_dir: Option<PathBuf>,
     /// Output dir.
     pub output_dir: Option<PathBuf>,
+    /// Torrent cache dir.
+    pub torrent_cache_dir: Option<PathBuf>,
     /// Inject dir.
     pub inject_dir: Option<PathBuf>,
     /// Ignore saved torrent titles.
@@ -509,6 +511,8 @@ pub struct RuntimeConfig {
     pub torrent_dir: Option<PathBuf>,
     /// Output dir.
     pub output_dir: PathBuf,
+    /// Torrent cache dir.
+    pub torrent_cache_dir: PathBuf,
     /// Inject dir.
     pub inject_dir: Option<PathBuf>,
     /// Ignore saved torrent titles.
@@ -621,6 +625,9 @@ impl RuntimeConfig {
             max_data_depth: raw.max_data_depth.unwrap_or(DEFAULT_MAX_DATA_DEPTH),
             torrent_dir: raw.torrent_dir,
             output_dir: raw.output_dir.unwrap_or_else(|| state_dir.join("output")),
+            torrent_cache_dir: raw
+                .torrent_cache_dir
+                .unwrap_or_else(|| state_dir.join("torrent_cache")),
             inject_dir: raw.inject_dir,
             ignore_titles: raw.ignore_titles,
             include_single_episodes: raw.include_single_episodes.unwrap_or(false),
@@ -822,12 +829,13 @@ impl RuntimeConfig {
         }
         if has_nested_paths(
             std::iter::once(self.output_dir.clone())
+                .chain(std::iter::once(self.torrent_cache_dir.clone()))
                 .chain(self.link_dirs.iter().cloned())
                 .chain(self.data_dirs.iter().cloned())
                 .chain(self.torrent_dir.iter().cloned()),
         ) {
             return Err(config_error(
-                "link_dirs, data_dirs, torrent_dir, and output_dir cannot be nested",
+                "link_dirs, data_dirs, torrent_dir, output_dir, and torrent_cache_dir cannot be nested",
             ));
         }
         validate_block_list(&self.block_list)?;
@@ -1012,6 +1020,7 @@ pub const fn config_template() -> &'static str {
 state_dir = "/config"
 database_path = "/config/sporos.db"
 output_dir = "/config/output"
+torrent_cache_dir = "/config/torrent_cache"
 
 # Bind the HTTP API on all interfaces for service/pod networking.
 listen_host = "0.0.0.0"
@@ -1377,6 +1386,7 @@ mod tests {
         assert_eq!(config.state_dir, Path::new("/state"));
         assert_eq!(config.database_path, Path::new("/state/sporos.db"));
         assert_eq!(config.output_dir, Path::new("/state/output"));
+        assert_eq!(config.torrent_cache_dir, Path::new("/state/torrent_cache"));
     }
 
     #[test]
@@ -1412,6 +1422,7 @@ mod tests {
         let raw = RawConfig {
             state_dir: Some("/writable/state".into()),
             database_path: Some("/writable/db/custom.sqlite".into()),
+            torrent_cache_dir: Some("/cache/torrents".into()),
             ..RawConfig::default()
         };
 
@@ -1424,6 +1435,7 @@ mod tests {
             Path::new("/writable/db/custom.sqlite")
         );
         assert_eq!(config.output_dir, Path::new("/writable/state/output"));
+        assert_eq!(config.torrent_cache_dir, Path::new("/cache/torrents"));
     }
 
     #[test]
@@ -1628,6 +1640,7 @@ mod tests {
             link_dirs = ["/links"]
             state_dir = "/state"
             database_path = "/state/sporos.db"
+            torrent_cache_dir = "/state/cache"
             trusted_proxy_ips = ["10.0.0.4", "127.0.0.1"]
 
             [announce_queue]
@@ -1676,6 +1689,10 @@ mod tests {
             Some(Path::new("/state/sporos.db"))
         );
         assert_eq!(
+            raw.torrent_cache_dir.as_deref(),
+            Some(Path::new("/state/cache"))
+        );
+        assert_eq!(
             raw.trusted_proxy_ips,
             vec![
                 "10.0.0.4".parse::<IpAddr>().expect("ip"),
@@ -1709,6 +1726,7 @@ mod tests {
         assert_eq!(config.state_dir, Path::new("/config"));
         assert_eq!(config.database_path, Path::new("/config/sporos.db"));
         assert_eq!(config.output_dir, Path::new("/config/output"));
+        assert_eq!(config.torrent_cache_dir, Path::new("/config/torrent_cache"));
         assert_eq!(config.listen_port, Some(9000));
         assert_eq!(
             config.notification_payload_detail,

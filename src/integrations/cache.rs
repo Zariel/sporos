@@ -11,15 +11,23 @@ use filetime::FileTime;
 
 use crate::{
     domain::{InfoHash, Metafile},
-    torrent::{parse_metafile, torrent_cache_path},
+    torrent::{parse_metafile, torrent_cache_dir, torrent_cache_path_in_dir},
 };
 
 use super::integration_error;
 
 /// Write a valid candidate torrent into the info-hash cache.
 pub fn cache_torrent_file(app_dir: &Path, bytes: &[u8]) -> crate::Result<Metafile<'static>> {
+    cache_torrent_file_in_dir(&torrent_cache_dir(app_dir), bytes)
+}
+
+/// Write a valid candidate torrent into an explicit info-hash cache directory.
+pub fn cache_torrent_file_in_dir(
+    cache_dir: &Path,
+    bytes: &[u8],
+) -> crate::Result<Metafile<'static>> {
     let metafile = parse_metafile(bytes)?;
-    let path = torrent_cache_path(app_dir, &metafile.info_hash);
+    let path = torrent_cache_path_in_dir(cache_dir, &metafile.info_hash);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             integration_error(format!("failed to create torrent cache: {error}"))
@@ -130,7 +138,15 @@ pub fn get_cached_torrent(
     app_dir: &Path,
     info_hash: &InfoHash<'_>,
 ) -> crate::Result<Option<Metafile<'static>>> {
-    let path = torrent_cache_path(app_dir, info_hash);
+    get_cached_torrent_in_dir(&torrent_cache_dir(app_dir), info_hash)
+}
+
+/// Read a cached torrent from an explicit cache directory.
+pub fn get_cached_torrent_in_dir(
+    cache_dir: &Path,
+    info_hash: &InfoHash<'_>,
+) -> crate::Result<Option<Metafile<'static>>> {
+    let path = torrent_cache_path_in_dir(cache_dir, info_hash);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

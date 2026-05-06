@@ -490,8 +490,8 @@ pub struct SearchPipelineOptions<'a> {
 pub struct SearchPipelineRuntime<'a, 'b> {
     /// SQLite state.
     pub database: &'a Database,
-    /// Application directory containing cached torrents.
-    pub app_dir: &'a Path,
+    /// Directory containing cached torrents.
+    pub torrent_cache_dir: &'a Path,
     /// Pipeline settings.
     pub options: &'a SearchPipelineOptions<'a>,
     /// Per-batch shared candidate cache.
@@ -528,8 +528,8 @@ pub struct ReverseLookupRuntime<'a> {
     pub gate: &'a ReverseLookupGate,
     /// SQLite state.
     pub database: &'a Database,
-    /// Application directory containing cached torrents.
-    pub app_dir: &'a Path,
+    /// Directory containing cached torrents.
+    pub torrent_cache_dir: &'a Path,
     /// Pipeline settings.
     pub options: &'a SearchPipelineOptions<'a>,
 }
@@ -683,7 +683,7 @@ where
             for candidate in search_result.candidates {
                 let attempt = assess_and_dispatch(
                     database,
-                    runtime.app_dir,
+                    runtime.torrent_cache_dir,
                     options,
                     searchee,
                     &candidate,
@@ -756,7 +756,7 @@ where
     for searchee in candidates {
         let attempt = assess_and_dispatch(
             runtime.database,
-            runtime.app_dir,
+            runtime.torrent_cache_dir,
             runtime.options,
             &searchee,
             candidate,
@@ -1798,7 +1798,7 @@ fn cached_or_search_candidates(
 
 fn assess_and_dispatch<A>(
     database: &Database,
-    app_dir: &Path,
+    torrent_cache_dir: &Path,
     options: &SearchPipelineOptions<'_>,
     searchee: &Searchee<'_>,
     candidate: &Candidate<'_>,
@@ -1810,7 +1810,7 @@ where
 {
     let context = CandidateAssessmentContext {
         database,
-        app_dir,
+        torrent_cache_dir,
         options: &options.assessment,
         snatch_options: options.snatch,
         now_millis: options.torznab.now_millis as i64,

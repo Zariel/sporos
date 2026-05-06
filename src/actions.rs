@@ -1276,13 +1276,26 @@ pub fn restore_from_torrent_cache<N>(
     database: &Database,
     app_dir: &Path,
     output_dir: &Path,
-    mut notify: N,
+    notify: N,
 ) -> crate::Result<RestoreSummary>
 where
     N: FnMut(&SaveNotification) -> crate::Result<()>,
 {
     let cache_dir = torrent_cache_dir(app_dir);
-    let entries = match fs::read_dir(&cache_dir) {
+    restore_from_torrent_cache_dir(database, &cache_dir, output_dir, notify)
+}
+
+/// Restore cached candidate torrents from an explicit cache directory.
+pub fn restore_from_torrent_cache_dir<N>(
+    database: &Database,
+    cache_dir: &Path,
+    output_dir: &Path,
+    mut notify: N,
+) -> crate::Result<RestoreSummary>
+where
+    N: FnMut(&SaveNotification) -> crate::Result<()>,
+{
+    let entries = match fs::read_dir(cache_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RestoreSummary::default());

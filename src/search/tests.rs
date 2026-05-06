@@ -660,7 +660,7 @@ fn searchable_pipeline_filters_virtuals_and_dispatches_cached_candidates() {
     let mut notifications = 0;
     let mut runtime = SearchPipelineRuntime {
         database: &database,
-        app_dir: &root,
+        torrent_cache_dir: &root,
         options: &options,
         cache: &mut cache,
     };
@@ -731,7 +731,7 @@ fn bulk_search_waits_between_real_indexer_requests() {
     let mut cache = CandidateSearchCache::default();
     let mut runtime = SearchPipelineRuntime {
         database: &database,
-        app_dir: &root,
+        torrent_cache_dir: &root,
         options: &options,
         cache: &mut cache,
     };
@@ -798,7 +798,7 @@ fn bulk_search_counts_search_limit_per_indexer_batch() {
     let mut cache = CandidateSearchCache::default();
     let mut runtime = SearchPipelineRuntime {
         database: &database,
-        app_dir: &root,
+        torrent_cache_dir: &root,
         options: &options,
         cache: &mut cache,
     };
@@ -869,7 +869,7 @@ fn reverse_lookup_filters_sorts_and_stops_after_success() {
     let runtime = ReverseLookupRuntime {
         gate: &gate,
         database: &database,
-        app_dir: &root,
+        torrent_cache_dir: &root,
         options: &options,
     };
     let attempt = check_new_candidate_match(
@@ -970,7 +970,7 @@ fn reverse_lookup_uses_cached_client_rows() {
     let runtime = ReverseLookupRuntime {
         gate: &gate,
         database: &database,
-        app_dir: &root,
+        torrent_cache_dir: &root,
         options: &options,
     };
     let candidate = Candidate::new("Example.Show.S01E01", "guid-db", None::<String>, "tracker");

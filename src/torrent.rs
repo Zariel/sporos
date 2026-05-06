@@ -221,12 +221,20 @@ pub fn torrent_cache_dir(app_dir: &std::path::Path) -> std::path::PathBuf {
     app_dir.join(TORRENT_CACHE_DIR)
 }
 
+/// Cache path inside an explicit torrent cache directory.
+pub fn torrent_cache_path_in_dir(
+    cache_dir: &std::path::Path,
+    info_hash: &InfoHash<'_>,
+) -> std::path::PathBuf {
+    cache_dir.join(format!("{}{}", info_hash.as_str(), CACHED_TORRENT_SUFFIX))
+}
+
 /// Cache path for `<infoHash>.cached.torrent`.
 pub fn torrent_cache_path(
     app_dir: &std::path::Path,
     info_hash: &InfoHash<'_>,
 ) -> std::path::PathBuf {
-    torrent_cache_dir(app_dir).join(format!("{}{}", info_hash.as_str(), CACHED_TORRENT_SUFFIX))
+    torrent_cache_path_in_dir(&torrent_cache_dir(app_dir), info_hash)
 }
 
 /// Build a saved torrent filename without output-dir path truncation.

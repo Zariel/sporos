@@ -3,8 +3,8 @@ use super::{
     clear_client_cache, clear_client_cache_async, clear_indexer_failures,
     clear_indexer_failures_async, injection_options, refresh_workflow_client_searchees,
     reset_api_key, reset_api_key_async, rss_time_since_last_run, run_announce_match,
-    run_webhook_search, update_torrent_cache_trackers, webhook_matches_request,
-    webhook_targets_and_excluded,
+    run_webhook_search, update_torrent_cache_trackers, update_torrent_cache_trackers_in_dir,
+    webhook_matches_request, webhook_targets_and_excluded,
 };
 use crate::{
     api::{WebhookPathSnapshot, WebhookRequest},
@@ -197,6 +197,31 @@ fn updates_cached_torrent_tracker_urls() {
 }
 
 #[test]
+fn updates_cached_torrent_tracker_urls_in_configured_cache() {
+    let root = temp_path("trackers-configured");
+    let cache_dir = root.join("configured-cache");
+    fs::create_dir_all(&cache_dir).expect("cache dir");
+    let path = cache_dir.join("0123456789abcdef0123456789abcdef01234567.cached.torrent");
+    fs::write(&path, b"d8:announce28:https://old.example/announcee").expect("write");
+
+    let result = update_torrent_cache_trackers_in_dir(
+        &cache_dir,
+        "https://old.example/announce",
+        "https://new.example/announce",
+    )
+    .expect("update");
+
+    assert_eq!(result.files_seen, 1);
+    assert_eq!(result.files_updated, 1);
+    assert_eq!(
+        fs::read(&path).expect("read"),
+        b"d8:announce28:https://new.example/announcee"
+    );
+    assert!(!root.join("torrent_cache").exists());
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rss_elapsed_time_uses_persisted_last_run_with_cadence_fallback() {
     let root = temp_path("rss-last-run");
     let app_dir = root.join("app");
@@ -246,7 +271,8 @@ fn rss_elapsed_time_uses_persisted_last_run_with_cadence_fallback() {
 #[test]
 fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
     let root = temp_path("cleanup");
-    fs::create_dir_all(root.join("torrent_cache")).expect("cache dir");
+    let cache_dir = root.join("configured-cache");
+    fs::create_dir_all(&cache_dir).expect("cache dir");
     let database = Database::open_app_dir(&root).expect("database");
     let existing_data_path = root.join("data");
     fs::create_dir_all(&existing_data_path).expect("data dir");
@@ -278,15 +304,9 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
     let old_hash = "0123456789012345678901234567890123456789";
     let recent_hash = "1111111111111111111111111111111111111111";
     let missing_hash = "2222222222222222222222222222222222222222";
+    fs::write(cache_dir.join(format!("{old_hash}.cached.torrent")), b"old").expect("old cache");
     fs::write(
-        root.join("torrent_cache")
-            .join(format!("{old_hash}.cached.torrent")),
-        b"old",
-    )
-    .expect("old cache");
-    fs::write(
-        root.join("torrent_cache")
-            .join(format!("{recent_hash}.cached.torrent")),
+        cache_dir.join(format!("{recent_hash}.cached.torrent")),
         b"recent",
     )
     .expect("recent cache");
@@ -331,6 +351,7 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
     let config = RuntimeConfig::normalize(
         RawConfig {
             data_dirs: vec![existing_data_path],
+            torrent_cache_dir: Some(cache_dir.clone()),
             season_from_episodes: Some(1.0),
             ..RawConfig::default()
         },
@@ -349,8 +370,7 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
     assert!(!result.catastrophic_decision_cleanup_skipped);
     assert_eq!(result.guid_info_hash_rows, 1);
     assert!(
-        !root
-            .join("torrent_cache")
+        !cache_dir
             .join(format!("{old_hash}.cached.torrent"))
             .exists()
     );
@@ -370,10 +390,11 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
         1
     );
     assert!(
-        root.join("torrent_cache")
+        cache_dir
             .join(format!("{recent_hash}.cached.torrent"))
             .exists()
     );
+    assert!(!root.join("torrent_cache").exists());
     let _cleanup = fs::remove_dir_all(root);
 }
 

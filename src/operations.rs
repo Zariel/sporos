@@ -13,7 +13,7 @@ use crate::{
     actions::{
         InjectionAction, InjectionActionOptions, RestoreSummary, SavedInjectionOptions,
         SavedInjectionSummary, inject_saved_torrents, perform_injection_action,
-        restore_from_torrent_cache, save_candidate_torrent,
+        restore_from_torrent_cache_dir, save_candidate_torrent,
     },
     api::{ApiOutcome, WebhookRequest},
     clients::{TorrentClient, build_torrent_clients, client_torrent_to_searchee},
@@ -38,12 +38,14 @@ use crate::{
         find_all_searchees, find_on_other_sites, find_searchable_searchees,
         for_each_data_dir_searchee, lookup_fields,
     },
-    torrent::{torrent_cache_dir, torrent_cache_path},
 };
 
 mod torrents;
 
-pub use torrents::{diff_torrents, torrent_tree, update_torrent_cache_trackers};
+pub use torrents::{
+    diff_torrents, torrent_tree, update_torrent_cache_trackers,
+    update_torrent_cache_trackers_in_dir,
+};
 
 const ONE_DAY_MILLIS: u64 = 86_400_000;
 const THIRTY_DAYS_MILLIS: u64 = 30 * ONE_DAY_MILLIS;
@@ -298,7 +300,7 @@ pub async fn cleanup_db_async(
 /// Run daily database and torrent-cache cleanup with live client refresh.
 pub fn cleanup_db_with_clients(
     database: &Database,
-    app_dir: &Path,
+    _app_dir: &Path,
     config: &RuntimeConfig,
     now_millis: i64,
     clients: &[&dyn TorrentClient],
@@ -313,14 +315,13 @@ pub fn cleanup_db_with_clients(
     if !config.data_dirs.is_empty() || config.season_from_episodes.is_some() {
         result.ensemble_rows_removed += prune_missing_ensemble_rows(database)?;
     }
-    result.torrent_cache_files_removed =
-        prune_unused_torrent_cache(database, app_dir, config, now_millis)?;
+    result.torrent_cache_files_removed = prune_unused_torrent_cache(database, config, now_millis)?;
     result.announce_work_pruned = database.prune_terminal_announce_work(
         now_millis,
         i64::try_from(config.announce_queue.terminal_retention).unwrap_or(i64::MAX),
     )?;
     result.null_decisions_removed = database.delete_null_decisions()?;
-    let decision_cleanup = prune_missing_cache_decisions(database, app_dir)?;
+    let decision_cleanup = prune_missing_cache_decisions(database, &config.torrent_cache_dir)?;
     result.missing_cache_decisions_removed = decision_cleanup.removed;
     result.catastrophic_decision_cleanup_skipped = decision_cleanup.catastrophic_skipped;
     result.guid_info_hash_rows = rebuild_guid_info_hash_map(database)?;
@@ -330,7 +331,7 @@ pub fn cleanup_db_with_clients(
 /// Run one bulk search workflow.
 pub fn run_search_workflow(
     database: &Database,
-    app_dir: &Path,
+    _app_dir: &Path,
     config: &RuntimeConfig,
     notifier: &NotificationSender,
 ) -> crate::Result<SearchWorkflowResult> {
@@ -361,7 +362,7 @@ pub fn run_search_workflow(
     let mut cache = CandidateSearchCache::default();
     let mut runtime = SearchPipelineRuntime {
         database,
-        app_dir,
+        torrent_cache_dir: &config.torrent_cache_dir,
         options: &options,
         cache: &mut cache,
     };
@@ -369,7 +370,7 @@ pub fn run_search_workflow(
         &mut runtime,
         &searchees,
         &indexers,
-        |action| dispatch_pipeline_action(app_dir, config, &injection, action),
+        |action| dispatch_pipeline_action(&config.torrent_cache_dir, config, &injection, action),
         |attempt| {
             let _report = notifier.send_result(attempt);
             Ok(())
@@ -399,7 +400,7 @@ pub async fn run_search_workflow_async(
 /// Run one RSS reverse-match workflow.
 pub fn run_rss_workflow(
     database: &Database,
-    app_dir: &Path,
+    _app_dir: &Path,
     config: &RuntimeConfig,
     notifier: &NotificationSender,
 ) -> crate::Result<RssWorkflowResult> {
@@ -435,7 +436,7 @@ pub fn run_rss_workflow(
     let runtime = ReverseLookupRuntime {
         gate: &gate,
         database,
-        app_dir,
+        torrent_cache_dir: &config.torrent_cache_dir,
         options: &options,
     };
     let mut attempts = 0usize;
@@ -453,7 +454,9 @@ pub fn run_rss_workflow(
                 &runtime,
                 page,
                 &local,
-                |action| dispatch_pipeline_action(app_dir, config, &injection, action),
+                |action| {
+                    dispatch_pipeline_action(&config.torrent_cache_dir, config, &injection, action)
+                },
                 |attempt| {
                     let _report = notifier.send_result(attempt);
                     Ok(())
@@ -486,7 +489,7 @@ pub async fn run_rss_workflow_async(
 /// Reverse-match one announce API candidate.
 pub fn run_announce_match(
     database: &Database,
-    app_dir: &Path,
+    _app_dir: &Path,
     config: &RuntimeConfig,
     candidate: Candidate<'static>,
     notifier: &NotificationSender,
@@ -525,14 +528,14 @@ pub fn run_announce_match(
     let runtime = ReverseLookupRuntime {
         gate: &gate,
         database,
-        app_dir,
+        torrent_cache_dir: &config.torrent_cache_dir,
         options: &options,
     };
     let attempt = check_new_candidate_match(
         &runtime,
         &candidate,
         &local,
-        |action| dispatch_pipeline_action(app_dir, config, &injection, action),
+        |action| dispatch_pipeline_action(&config.torrent_cache_dir, config, &injection, action),
         |attempt| {
             let _report = notifier.send_result(attempt);
             Ok(())
@@ -562,7 +565,7 @@ pub async fn run_announce_match_async(
 /// Run one targeted webhook search from an info hash or filesystem path.
 pub fn run_webhook_search(
     database: &Database,
-    app_dir: &Path,
+    _app_dir: &Path,
     config: &RuntimeConfig,
     request: WebhookRequest,
     notifier: &NotificationSender,
@@ -616,7 +619,7 @@ pub fn run_webhook_search(
     for searchee in targets {
         let mut runtime = SearchPipelineRuntime {
             database,
-            app_dir,
+            torrent_cache_dir: &config.torrent_cache_dir,
             options: &options,
             cache: &mut cache,
         };
@@ -624,7 +627,9 @@ pub fn run_webhook_search(
             &mut runtime,
             searchee,
             &indexers,
-            |action| dispatch_pipeline_action(app_dir, &config, &injection, action),
+            |action| {
+                dispatch_pipeline_action(&config.torrent_cache_dir, &config, &injection, action)
+            },
             |attempt| {
                 let _report = notifier.send_result(attempt);
                 Ok(())
@@ -704,10 +709,15 @@ pub async fn run_inject_workflow_async(
 /// Run one restore workflow.
 pub fn run_restore_workflow(
     database: &Database,
-    app_dir: &Path,
+    _app_dir: &Path,
     config: &RuntimeConfig,
 ) -> crate::Result<RestoreSummary> {
-    restore_from_torrent_cache(database, app_dir, &config.output_dir, |_| Ok(()))
+    restore_from_torrent_cache_dir(
+        database,
+        &config.torrent_cache_dir,
+        &config.output_dir,
+        |_| Ok(()),
+    )
 }
 
 /// Run one restore workflow from async orchestration.
@@ -1099,7 +1109,7 @@ fn injection_options<'a>(
 }
 
 fn dispatch_pipeline_action(
-    app_dir: &Path,
+    torrent_cache_dir: &Path,
     config: &RuntimeConfig,
     injection: &InjectionActionOptions<'_>,
     action: &PipelineAction<'_>,
@@ -1107,7 +1117,11 @@ fn dispatch_pipeline_action(
     let Some(metafile) = action.assessment.metafile.as_ref() else {
         return Ok(None);
     };
-    let bytes = fs::read(torrent_cache_path(app_dir, &metafile.info_hash)).map_err(|error| {
+    let bytes = fs::read(crate::torrent::torrent_cache_path_in_dir(
+        torrent_cache_dir,
+        &metafile.info_hash,
+    ))
+    .map_err(|error| {
         operation_error(format!(
             "failed to read cached candidate torrent {}: {error}",
             metafile.info_hash
@@ -1234,12 +1248,11 @@ fn prune_missing_ensemble_rows(database: &Database) -> crate::Result<usize> {
 
 fn prune_unused_torrent_cache(
     database: &Database,
-    app_dir: &Path,
     config: &RuntimeConfig,
     now_millis: i64,
 ) -> crate::Result<usize> {
-    let cache_dir = torrent_cache_dir(app_dir);
-    let entries = match fs::read_dir(&cache_dir) {
+    let cache_dir = &config.torrent_cache_dir;
+    let entries = match fs::read_dir(cache_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => {
@@ -1278,14 +1291,14 @@ fn prune_unused_torrent_cache(
 
 fn prune_missing_cache_decisions(
     database: &Database,
-    app_dir: &Path,
+    torrent_cache_dir: &Path,
 ) -> crate::Result<MissingCacheDecisionCleanup> {
     let mut valid_count = 0usize;
     let mut missing_count = 0usize;
     for_each_decision_info_hash(database, |info_hash| {
         if let Some(hash) = InfoHash::new(info_hash) {
             valid_count = valid_count.saturating_add(1);
-            if !torrent_cache_path(app_dir, &hash).exists() {
+            if !crate::torrent::torrent_cache_path_in_dir(torrent_cache_dir, &hash).exists() {
                 missing_count = missing_count.saturating_add(1);
             }
         }
@@ -1302,7 +1315,7 @@ fn prune_missing_cache_decisions(
     let mut removed = 0usize;
     for_each_decision_info_hash(database, |info_hash| {
         if let Some(hash) = InfoHash::new(info_hash) {
-            if !torrent_cache_path(app_dir, &hash).exists() {
+            if !crate::torrent::torrent_cache_path_in_dir(torrent_cache_dir, &hash).exists() {
                 removed += database.delete_decisions_by_info_hash(info_hash)?;
             }
         }

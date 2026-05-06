@@ -13,11 +13,20 @@ pub fn update_torrent_cache_trackers(
     new_announce_url: &str,
 ) -> crate::Result<TrackerUpdateResult> {
     let cache_dir = torrent_cache_dir(app_dir);
+    update_torrent_cache_trackers_in_dir(&cache_dir, old_announce_url, new_announce_url)
+}
+
+/// Replace tracker URLs inside an explicitly configured torrent cache directory.
+pub fn update_torrent_cache_trackers_in_dir(
+    cache_dir: &Path,
+    old_announce_url: &str,
+    new_announce_url: &str,
+) -> crate::Result<TrackerUpdateResult> {
     let mut result = TrackerUpdateResult {
         files_seen: 0,
         files_updated: 0,
     };
-    let entries = match fs::read_dir(&cache_dir) {
+    let entries = match fs::read_dir(cache_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(result),
         Err(error) => return Err(operation_error(format!("failed to read cache: {error}"))),

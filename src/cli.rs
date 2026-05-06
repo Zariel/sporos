@@ -32,8 +32,8 @@ where
         }
         Some(("update-torrent-cache-trackers", matches)) => {
             let config = load_runtime_config(&config_file)?;
-            let result = crate::operations::update_torrent_cache_trackers(
-                &config.state_dir,
+            let result = crate::operations::update_torrent_cache_trackers_in_dir(
+                &config.torrent_cache_dir,
                 required_string(matches, "old-announce-url")?,
                 required_string(matches, "new-announce-url")?,
             )?;

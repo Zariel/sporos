@@ -15,7 +15,12 @@ saved torrent output under that volume:
 state_dir = "/config"
 database_path = "/config/sporos.db"
 output_dir = "/config/output"
+torrent_cache_dir = "/config/torrent_cache"
 ```
+
+`torrent_cache_dir` stores downloaded candidate `.torrent` files used for
+decision reuse, cleanup, restore, and tracker rewrite operations. It defaults to
+`<state_dir>/torrent_cache` when unset.
 
 ## API
 
@@ -52,8 +57,8 @@ data_dirs = ["/media"]
 ```
 
 Do not set `torrent_dir` and `use_client_torrents = true` together. Paths are
-validated at startup and nested source, link, torrent, and output directories are
-rejected.
+validated at startup and nested source, link, torrent, output, and torrent
+cache directories are rejected.
 
 ## Clients
 
