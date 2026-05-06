@@ -256,7 +256,7 @@ fn normalize_config(
     config_file: &crate::config::ConfigFileTarget,
     raw_config: crate::config::RawConfig,
 ) -> crate::Result<crate::config::RuntimeConfig> {
-    let mut config = crate::config::RuntimeConfig::normalize(raw_config, &config_file.app_dir)?;
+    let mut config = crate::config::RuntimeConfig::normalize(raw_config, &config_file.base_dir)?;
     config.config_path = config_file.path.clone();
     Ok(config)
 }

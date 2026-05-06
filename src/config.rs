@@ -5,11 +5,9 @@ use std::{
     collections::BTreeSet,
     env,
     ffi::OsStr,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     net::IpAddr,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use regex::Regex;
@@ -18,7 +16,6 @@ use serde::{Deserialize, Deserializer, de};
 use crate::SporosError;
 pub use crate::{Result, domain};
 
-const APP_DIR_NAME: &str = "cross-seed";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CONFIG_FILE_ENV: &str = "SPOROS__CONFIG_FILE";
 const DEFAULT_DELAY_SECONDS: u64 = 30;
@@ -567,9 +564,7 @@ impl RuntimeConfig {
             flat_linking: raw.flat_linking.unwrap_or(false),
             max_data_depth: raw.max_data_depth.unwrap_or(DEFAULT_MAX_DATA_DEPTH),
             torrent_dir: raw.torrent_dir,
-            output_dir: raw
-                .output_dir
-                .unwrap_or_else(|| state_dir.join("cross-seeds")),
+            output_dir: raw.output_dir.unwrap_or_else(|| state_dir.join("output")),
             inject_dir: raw.inject_dir,
             ignore_titles: raw.ignore_titles,
             include_single_episodes: raw.include_single_episodes.unwrap_or(false),
@@ -798,81 +793,66 @@ pub struct FileConfig {
     pub source: Option<String>,
 }
 
-/// Selected config file path plus the default state directory.
+/// Selected config file path plus the default runtime base directory.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConfigFileTarget {
     /// Default state directory for database, cache, and output paths.
-    pub app_dir: PathBuf,
+    pub base_dir: PathBuf,
     /// Exact config file path to read or generate.
     pub path: PathBuf,
     /// Whether the path came from `--config` or `SPOROS__CONFIG_FILE`.
     pub explicit: bool,
 }
 
-/// Resolve and create the local default state directory.
-pub fn app_dir() -> crate::Result<PathBuf> {
-    let dir = if cfg!(windows) {
-        env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or_else(|| config_error("LOCALAPPDATA is not set"))?
-            .join(APP_DIR_NAME)
-    } else {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| config_error("HOME is not set"))?
-            .join(".cross-seed")
-    };
-
-    fs::create_dir_all(&dir)
-        .map_err(|error| config_error(format!("failed to create app directory: {error}")))?;
-    verify_read_write_dir(&dir)?;
-    Ok(dir)
-}
-
-/// Resolve config-file selection from CLI, env, or the local default.
+/// Resolve config-file selection from CLI, env, or `./config.toml`.
 pub fn selected_config_file(cli_path: Option<&Path>) -> crate::Result<ConfigFileTarget> {
-    let app_dir = app_dir()?;
-    config_file_from_sources(cli_path, env::var_os(CONFIG_FILE_ENV).as_deref(), &app_dir)
+    let default_path = env::current_dir()
+        .map_err(|error| config_error(format!("failed to resolve current directory: {error}")))?
+        .join(CONFIG_FILE_NAME);
+    config_file_from_sources(
+        cli_path,
+        env::var_os(CONFIG_FILE_ENV).as_deref(),
+        &default_path,
+    )
 }
 
 /// Resolve config-file selection with explicit source precedence.
 pub fn config_file_from_sources(
     cli_path: Option<&Path>,
     env_path: Option<&OsStr>,
-    app_dir: &Path,
+    default_path: &Path,
 ) -> crate::Result<ConfigFileTarget> {
-    if let Some(path) = cli_path {
+    let (path, explicit) = if let Some(path) = cli_path {
         if path.as_os_str().is_empty() {
             return Err(config_error("--config cannot be empty"));
         }
-        return Ok(ConfigFileTarget {
-            app_dir: app_dir.to_owned(),
-            path: path.to_owned(),
-            explicit: true,
-        });
-    }
-
-    if let Some(path) = env_path {
+        (path.to_owned(), true)
+    } else if let Some(path) = env_path {
         if path.to_string_lossy().is_empty() {
             return Err(config_error(format!("{CONFIG_FILE_ENV} cannot be empty")));
         }
-        return Ok(ConfigFileTarget {
-            app_dir: app_dir.to_owned(),
-            path: PathBuf::from(path),
-            explicit: true,
-        });
-    }
+        (PathBuf::from(path), true)
+    } else {
+        (default_path.to_owned(), false)
+    };
 
     Ok(ConfigFileTarget {
-        app_dir: app_dir.to_owned(),
-        path: config_path(app_dir),
-        explicit: false,
+        base_dir: config_base_dir(&path),
+        path,
+        explicit,
     })
 }
 
-/// Path to `config.toml` under the app directory.
-pub fn config_path(app_dir: &Path) -> PathBuf {
-    app_dir.join(CONFIG_FILE_NAME)
+fn config_base_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Path to `config.toml` under a runtime base directory.
+pub fn config_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(CONFIG_FILE_NAME)
 }
 
 /// Load raw config-file source if present.
@@ -912,11 +892,11 @@ pub fn get_selected_file_config(target: &ConfigFileTarget) -> crate::Result<File
     })
 }
 
-/// Load raw `config.toml` source if present under the app directory.
-pub fn get_file_config(app_dir: &Path) -> crate::Result<FileConfig> {
+/// Load raw `config.toml` source if present under the base directory.
+pub fn get_file_config(base_dir: &Path) -> crate::Result<FileConfig> {
     let target = ConfigFileTarget {
-        app_dir: app_dir.to_owned(),
-        path: config_path(app_dir),
+        base_dir: base_dir.to_owned(),
+        path: config_path(base_dir),
         explicit: false,
     };
     get_selected_file_config(&target)
@@ -931,19 +911,19 @@ pub fn load_selected_raw_config(target: &ConfigFileTarget) -> crate::Result<RawC
     }
 }
 
-/// Load and parse `config.toml` when present under the app directory.
-pub fn load_file_raw_config(app_dir: &Path) -> crate::Result<RawConfig> {
+/// Load and parse `config.toml` when present under the base directory.
+pub fn load_file_raw_config(base_dir: &Path) -> crate::Result<RawConfig> {
     let target = ConfigFileTarget {
-        app_dir: app_dir.to_owned(),
-        path: config_path(app_dir),
+        base_dir: base_dir.to_owned(),
+        path: config_path(base_dir),
         explicit: false,
     };
     load_selected_raw_config(&target)
 }
 
-/// Generate a starter config file if one does not exist.
-pub fn generate_config(app_dir: &Path) -> crate::Result<PathBuf> {
-    generate_config_file(&config_path(app_dir))
+/// Generate a starter config file under the base directory if one does not exist.
+pub fn generate_config(base_dir: &Path) -> crate::Result<PathBuf> {
+    generate_config_file(&config_path(base_dir))
 }
 
 /// Generate a starter config file at an explicit path if one does not exist.
@@ -1058,45 +1038,6 @@ fn parse_env_u32(key: &str, value: &str) -> crate::Result<u32> {
     value
         .parse()
         .map_err(|error| config_error(format!("invalid {key}: {error}")))
-}
-
-fn verify_read_write_dir(path: &Path) -> crate::Result<()> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| config_error(format!("failed to stat app directory: {error}")))?;
-    if !metadata.is_dir() {
-        return Err(config_error(format!(
-            "app directory is not a directory: {}",
-            path.display()
-        )));
-    }
-
-    let probe = create_unique_probe(path, ".sporos-write-test")
-        .map_err(|error| config_error(format!("app directory is not writable: {error}")))?;
-    fs::remove_file(&probe)
-        .map_err(|error| config_error(format!("failed to remove app directory probe: {error}")))?;
-    Ok(())
-}
-
-fn create_unique_probe(dir: &Path, prefix: &str) -> std::io::Result<PathBuf> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    for attempt in 0..128 {
-        let path = dir.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(b"test")?;
-                return Ok(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "failed to allocate unique probe path",
-    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1248,13 +1189,7 @@ mod tests {
         TorrentClientConfig, apply_env_overrides_from, config_file_from_sources,
         load_selected_raw_config, parse_duration_millis, raw_config_from_source,
     };
-    use std::{
-        ffi::OsStr,
-        fs,
-        net::IpAddr,
-        path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{ffi::OsStr, net::IpAddr, path::Path};
 
     #[test]
     fn normalizes_defaults_and_supported_names() {
@@ -1289,7 +1224,7 @@ mod tests {
 
         assert_eq!(config.state_dir, Path::new("/state"));
         assert_eq!(config.database_path, Path::new("/state/sporos.db"));
-        assert_eq!(config.output_dir, Path::new("/state/cross-seeds"));
+        assert_eq!(config.output_dir, Path::new("/state/output"));
     }
 
     #[test]
@@ -1334,7 +1269,7 @@ mod tests {
             config.database_path,
             Path::new("/writable/db/custom.sqlite")
         );
-        assert_eq!(config.output_dir, Path::new("/writable/state/cross-seeds"));
+        assert_eq!(config.output_dir, Path::new("/writable/state/output"));
     }
 
     #[test]
@@ -1494,22 +1429,6 @@ mod tests {
     }
 
     #[test]
-    fn app_dir_write_probe_does_not_clobber_existing_probe_name() {
-        let root = temp_path("config-probe-collision");
-        fs::create_dir_all(&root).expect("root");
-        let existing_probe = root.join(".sporos-write-test");
-        fs::write(&existing_probe, b"user data").expect("existing probe");
-
-        super::verify_read_write_dir(&root).expect("writable app dir");
-
-        assert_eq!(
-            fs::read(existing_probe).expect("existing probe"),
-            b"user data"
-        );
-        let _cleanup = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn loads_config_toml() {
         let raw = raw_config_from_source(
             r#"
@@ -1587,36 +1506,51 @@ mod tests {
 
     #[test]
     fn selects_explicit_config_file_before_env_and_default() {
-        let app_dir = Path::new("/state");
+        let default_path = Path::new("/state/config.toml");
         let target = config_file_from_sources(
             Some(Path::new("/cli/config.toml")),
             Some(OsStr::new("/env/config.toml")),
-            app_dir,
+            default_path,
         )
         .expect("selected");
 
-        assert_eq!(target.app_dir, app_dir);
+        assert_eq!(target.base_dir, Path::new("/cli"));
         assert_eq!(target.path, Path::new("/cli/config.toml"));
         assert!(target.explicit);
     }
 
     #[test]
     fn selects_env_config_file_before_local_default() {
-        let app_dir = Path::new("/state");
-        let target = config_file_from_sources(None, Some(OsStr::new("/env/config.toml")), app_dir)
-            .expect("selected");
+        let default_path = Path::new("/state/config.toml");
+        let target =
+            config_file_from_sources(None, Some(OsStr::new("/env/config.toml")), default_path)
+                .expect("selected");
 
-        assert_eq!(target.app_dir, app_dir);
+        assert_eq!(target.base_dir, Path::new("/env"));
         assert_eq!(target.path, Path::new("/env/config.toml"));
         assert!(target.explicit);
     }
 
     #[test]
-    fn keeps_local_default_config_file_compatible() {
-        let app_dir = Path::new("/state");
-        let target = config_file_from_sources(None, None, app_dir).expect("selected");
+    fn filename_only_config_defaults_base_dir_to_current_directory() {
+        let target = config_file_from_sources(
+            Some(Path::new("config.toml")),
+            None,
+            Path::new("/state/config.toml"),
+        )
+        .expect("selected");
 
-        assert_eq!(target.app_dir, app_dir);
+        assert_eq!(target.base_dir, Path::new("."));
+        assert_eq!(target.path, Path::new("config.toml"));
+        assert!(target.explicit);
+    }
+
+    #[test]
+    fn defaults_config_file_to_configured_default_path() {
+        let default_path = Path::new("/state/config.toml");
+        let target = config_file_from_sources(None, None, default_path).expect("selected");
+
+        assert_eq!(target.base_dir, Path::new("/state"));
         assert_eq!(target.path, Path::new("/state/config.toml"));
         assert!(!target.explicit);
     }
@@ -1626,7 +1560,7 @@ mod tests {
         let target = config_file_from_sources(
             Some(Path::new("/definitely/missing/sporos.toml")),
             None,
-            Path::new("/state"),
+            Path::new("/state/config.toml"),
         )
         .expect("selected");
 
@@ -1912,13 +1846,5 @@ mod tests {
         let error = RuntimeConfig::normalize(raw, Path::new("/config")).expect_err("invalid");
 
         assert!(error.to_string().contains("size_below <= size_above"));
-    }
-
-    fn temp_path(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("sporos-{label}-{nanos}"))
     }
 }

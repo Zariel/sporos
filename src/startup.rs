@@ -579,7 +579,7 @@ mod tests {
         check_config_paths(&config).expect("paths");
 
         assert!(!root.join("logs").exists());
-        assert!(root.join("cross-seeds").exists());
+        assert!(root.join("output").exists());
         let _cleanup = fs::remove_dir_all(root);
     }
 
@@ -889,7 +889,7 @@ mod tests {
             flat_linking: false,
             max_data_depth: 2,
             torrent_dir: None,
-            output_dir: root.join("cross-seeds"),
+            output_dir: root.join("output"),
             inject_dir: None,
             ignore_titles: None,
             include_single_episodes: false,
