@@ -494,11 +494,11 @@ fn parse_ratio(value: &str, name: &str) -> crate::Result<f64> {
         .map_err(|error| SporosError::configuration(format!("invalid --{name}: {error}")))
 }
 
-/// Build the compatibility command tree.
+/// Build the command tree.
 pub fn build_cli() -> Command {
-    Command::new("cross-seed")
+    Command::new("sporos")
         .version(crate::VERSION)
-        .about("Torrent cross-seeding automation")
+        .about("Torrent automation service")
         .subcommand_required(false)
         .arg_required_else_help(false)
         .arg(
@@ -872,7 +872,7 @@ mod tests {
     fn parses_shared_workflow_options() {
         build_cli()
             .try_get_matches_from([
-                "cross-seed",
+                "sporos",
                 "search",
                 "--torznab",
                 "https://indexer.example/api?apikey=secret",
@@ -896,7 +896,7 @@ mod tests {
             "--link-dir",
             "--notification-webhook-url",
         ] {
-            let result = build_cli().try_get_matches_from(["cross-seed", "search", alias, "value"]);
+            let result = build_cli().try_get_matches_from(["sporos", "search", alias, "value"]);
 
             assert!(result.is_err(), "{alias} should not parse");
         }
@@ -904,7 +904,7 @@ mod tests {
 
     #[test]
     fn rejects_removed_daemon_alias() {
-        let result = build_cli().try_get_matches_from(["cross-seed", "daemon"]);
+        let result = build_cli().try_get_matches_from(["sporos", "daemon"]);
 
         assert!(result.is_err(), "daemon alias should not parse");
     }
@@ -913,7 +913,7 @@ mod tests {
     fn parses_serve_and_inject_specific_options() {
         build_cli()
             .try_get_matches_from([
-                "cross-seed",
+                "sporos",
                 "serve",
                 "--config",
                 "/etc/sporos/config.toml",
@@ -926,7 +926,7 @@ mod tests {
 
         build_cli()
             .try_get_matches_from([
-                "cross-seed",
+                "sporos",
                 "inject",
                 "--config",
                 "/etc/sporos/config.toml",
@@ -941,7 +941,7 @@ mod tests {
     fn applies_shared_cli_options_to_raw_config() {
         let matches = build_cli()
             .try_get_matches_from([
-                "cross-seed",
+                "sporos",
                 "search",
                 "--torznab",
                 "https://indexer.example/api?apikey=secret",
@@ -970,7 +970,7 @@ mod tests {
                 "qbittorrent:http://localhost:8080",
                 "--duplicate-categories",
                 "--link-category",
-                "cross-seed",
+                "sporos",
                 "--link-dirs",
                 "/links",
                 "--link-type",
@@ -1036,7 +1036,7 @@ mod tests {
             vec![TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client")]
         );
         assert_eq!(raw.duplicate_categories, Some(true));
-        assert_eq!(raw.link_category.as_deref(), Some("cross-seed"));
+        assert_eq!(raw.link_category.as_deref(), Some("sporos"));
         assert_eq!(raw.link_dirs, vec![Path::new("/links")]);
         assert_eq!(raw.link_type.as_deref(), Some("symlink"));
         assert_eq!(raw.flat_linking, Some(true));
@@ -1079,7 +1079,7 @@ mod tests {
     fn applies_inject_cli_options_to_raw_config() {
         let matches = build_cli()
             .try_get_matches_from([
-                "cross-seed",
+                "sporos",
                 "inject",
                 "--inject-dir",
                 "/saved",
@@ -1100,7 +1100,7 @@ mod tests {
     fn applies_command_flags_after_env_overrides() {
         let matches = build_cli()
             .try_get_matches_from([
-                "cross-seed",
+                "sporos",
                 "serve",
                 "--port",
                 "3333",

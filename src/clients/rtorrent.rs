@@ -45,7 +45,7 @@ impl RtorrentClient {
         url.set_password(None)
             .map_err(|()| client_error("failed to sanitize rTorrent password"))?;
         let mut builder =
-            reqwest::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
+            reqwest::Client::builder().user_agent(format!("Sporos/{}", crate::VERSION));
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
@@ -352,7 +352,7 @@ impl TorrentClient for RtorrentClient {
             .first()
             .or(options.category.as_ref())
             .map(ClientLabel::as_str)
-            .unwrap_or("cross-seed");
+            .unwrap_or("sporos");
         self.rpc(
             "d.custom1.set",
             &[

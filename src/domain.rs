@@ -371,7 +371,7 @@ impl SearcheeSource {
     }
 }
 
-/// Local data that can be searched for cross-seeds.
+/// Local data that can be searched for matching candidates.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Searchee<'a> {
     /// Optional local torrent info hash.
@@ -795,7 +795,7 @@ mod tests {
             "qb.local",
             "/downloads",
             Some(ClientLabel::new("tv")),
-            vec![ClientLabel::new("cross-seed")],
+            vec![ClientLabel::new("managed")],
             vec![Cow::Borrowed("tracker.example")],
         ));
         assert_eq!(searchee.source(), SearcheeSource::TorrentClient);

@@ -409,7 +409,7 @@ fn announce_allows_single_episode_but_non_video_ratio_can_reject() {
 }
 
 #[test]
-fn content_filter_rejects_cross_seed_and_specials() {
+fn content_filter_rejects_legacy_duplicate_labels_and_specials() {
     let empty = Blocklist::parse(&[]).expect("empty");
     let mut options = filter_options(&empty);
     options.ignore_cross_seeds = true;
@@ -426,7 +426,7 @@ fn content_filter_rejects_cross_seed_and_specials() {
 
     assert_eq!(
         filter_by_content(&searchee, &options),
-        Some(ContentFilterRejection::CrossSeed)
+        Some(ContentFilterRejection::ManagedDuplicate)
     );
 
     let mut specials = Searchee::from_files(

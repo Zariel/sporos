@@ -33,7 +33,7 @@ impl TransmissionClient {
     /// Build a Transmission adapter from normalized identity metadata.
     pub fn new(identity: ClientIdentity, timeout: Option<Duration>) -> crate::Result<Self> {
         let mut builder =
-            reqwest::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
+            reqwest::Client::builder().user_agent(format!("Sporos/{}", crate::VERSION));
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }

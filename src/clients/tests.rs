@@ -153,7 +153,6 @@ fn qbittorrent_validates_version_and_preferences() {
         http_response("200 OK", "Ok."),
         http_response("200 OK", "v4.6.2"),
         http_response("200 OK", r#"{"save_path":"/downloads"}"#),
-        http_response("200 OK", ""),
     ]);
     let client = qb_client(&server.url);
 
@@ -174,16 +173,6 @@ fn qbittorrent_validates_version_and_preferences() {
         requests
             .iter()
             .any(|request| request.contains("GET /api/v2/app/preferences "))
-    );
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.contains("POST /api/v2/torrents/createTags "))
-    );
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.contains("tags=cross-seed"))
     );
 }
 
@@ -239,7 +228,7 @@ fn qbittorrent_maps_inventory_files_and_trackers() {
         http_response(
             "200 OK",
             &format!(
-                r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads","category":"tv","tags":"tag, cross-seed","progress":1.0,"state":"uploading"}}]"#
+                r#"[{{"hash":"{hash}","name":"Example.Show.S01E01","save_path":"/downloads","category":"tv","tags":"tag, managed","progress":1.0,"state":"uploading"}}]"#
             ),
         ),
         http_response(
@@ -728,7 +717,7 @@ fn qbittorrent_injects_with_multipart_add_and_starts() {
             &InjectionOptions {
                 destination_dir: Some(PathBuf::from("/linked")),
                 category: Some(ClientLabel::new("tv")),
-                tags: vec![ClientLabel::new("cross-seed")],
+                tags: vec![ClientLabel::new("managed")],
                 duplicate_categories: false,
                 paused: true,
                 skip_checking: true,
@@ -807,7 +796,7 @@ fn qbittorrent_injects_duplicate_source_category() {
         .iter()
         .find(|request| request.contains("POST /api/v2/torrents/add "))
         .expect("add request");
-    assert!(add.contains("movies.cross-seed"));
+    assert!(add.contains("movies.sporos"));
 }
 
 #[test]
@@ -861,7 +850,7 @@ fn qbittorrent_requires_injection_confirmation() {
 fn transmission_negotiates_session_and_maps_inventory() {
     let hash = "0123456789abcdef0123456789abcdef01234567";
     let body = format!(
-        r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example.Show.S01E01","downloadDir":"/downloads","files":[{{"name":"Example.Show.S01E01.mkv","length":123}}],"trackers":[{{"announce":"https://tracker.example/announce"}}],"labels":["tv","cross-seed"],"percentDone":1.0,"status":6}}]}}}}"#
+        r#"{{"result":"success","arguments":{{"torrents":[{{"hashString":"{hash}","name":"Example.Show.S01E01","downloadDir":"/downloads","files":[{{"name":"Example.Show.S01E01.mkv","length":123}}],"trackers":[{{"announce":"https://tracker.example/announce"}}],"labels":["tv","managed"],"percentDone":1.0,"status":6}}]}}}}"#
     );
     let server = http_server(vec![
         http_response_with_headers("409 Conflict", &[("X-Transmission-Session-Id", "sid")], ""),
@@ -939,7 +928,7 @@ fn transmission_injects_and_starts() {
             &InjectionOptions {
                 destination_dir: Some(PathBuf::from("/linked")),
                 category: Some(ClientLabel::new("tv")),
-                tags: vec![ClientLabel::new("cross-seed")],
+                tags: vec![ClientLabel::new("managed")],
                 duplicate_categories: false,
                 paused: true,
                 skip_checking: true,
@@ -962,7 +951,7 @@ fn transmission_injects_and_starts() {
     assert_eq!(requests.len(), 5);
     assert!(requests[0].contains(r#""method":"torrent-add""#));
     assert!(requests[0].contains(r#""download-dir":"/linked""#));
-    assert!(requests[0].contains(r#""labels":["tv","cross-seed"]"#));
+    assert!(requests[0].contains(r#""labels":["tv","managed"]"#));
     assert!(requests[0].contains(r#""paused":true"#));
     assert!(requests[1].contains(r#""method":"torrent-get""#));
     assert!(requests[2].contains(r#""method":"torrent-stop""#));
@@ -1067,7 +1056,7 @@ fn deluge_injects_labels_rechecks_and_resumes() {
             &InjectionOptions {
                 destination_dir: Some(PathBuf::from("/linked")),
                 category: Some(ClientLabel::new("tv")),
-                tags: vec![ClientLabel::new("cross-seed")],
+                tags: vec![ClientLabel::new("managed")],
                 duplicate_categories: false,
                 paused: true,
                 skip_checking: true,
@@ -1146,8 +1135,8 @@ fn deluge_injects_duplicate_source_category_label() {
         .expect("inject");
 
     let requests = server.join();
-    assert!(requests[7].contains("movies.cross-seed"));
-    assert!(requests[8].contains("movies.cross-seed"));
+    assert!(requests[7].contains("movies.sporos"));
+    assert!(requests[8].contains("movies.sporos"));
 }
 
 #[test]
@@ -1163,7 +1152,7 @@ fn rtorrent_maps_inventory_files_and_trackers() {
             rt_array(&[rt_bool(true)]),
             rt_array(&[rt_bool(false)]),
             rt_array(&[rt_bool(false)]),
-            rt_array(&[rt_string("cross-seed")]),
+            rt_array(&[rt_string("managed")]),
             rt_array(&[rt_array(&[rt_array(&[
                 rt_string("Example.Show.S01E01.mkv"),
                 rt_int(123),
@@ -1182,7 +1171,7 @@ fn rtorrent_maps_inventory_files_and_trackers() {
     assert_eq!(torrents[0].info_hash.as_str(), hash);
     assert_eq!(torrents[0].save_path, "/downloads");
     assert_eq!(torrents[0].files[0].path, "Example.Show.S01E01.mkv");
-    assert_eq!(torrents[0].tags[0].as_str(), "cross-seed");
+    assert_eq!(torrents[0].tags[0].as_str(), "managed");
     assert_eq!(torrents[0].trackers[0], "tracker.example");
     assert!(torrents[0].complete);
     let requests = server.join();
@@ -1207,7 +1196,7 @@ fn rtorrent_retries_transient_reads() {
             rt_array(&[rt_bool(true)]),
             rt_array(&[rt_bool(false)]),
             rt_array(&[rt_bool(false)]),
-            rt_array(&[rt_string("cross-seed")]),
+            rt_array(&[rt_string("managed")]),
             rt_array(&[rt_array(&[])]),
             rt_array(&[rt_array(&[])]),
         ])),
@@ -1248,7 +1237,7 @@ fn rtorrent_injects_labels_rechecks_and_resumes() {
             &InjectionOptions {
                 destination_dir: Some(PathBuf::from("/linked")),
                 category: None,
-                tags: vec![ClientLabel::new("cross-seed")],
+                tags: vec![ClientLabel::new("managed")],
                 duplicate_categories: false,
                 paused: true,
                 skip_checking: true,

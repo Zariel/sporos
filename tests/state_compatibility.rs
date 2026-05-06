@@ -59,7 +59,7 @@ fn current_bootstrap_reopen_preserves_compatibility_state() {
             action: Some("inject".to_owned()),
             include_single_episodes: Some(true),
             fuzzy_size_threshold: Some(0.05),
-            notification_webhook_urls: vec!["https://hooks.example/cross-seed".to_owned()],
+            notification_webhook_urls: vec!["https://hooks.example/sporos".to_owned()],
             torrent_clients: vec![
                 TorrentClientConfig::parse("qbittorrent:http://localhost:8080").expect("client"),
             ],
@@ -77,7 +77,7 @@ fn current_bootstrap_reopen_preserves_compatibility_state() {
     assert_eq!(runtime.torrent_clients[0].kind, "qbittorrent");
     assert_eq!(
         runtime.notification_webhook_urls,
-        ["https://hooks.example/cross-seed".to_owned()]
+        ["https://hooks.example/sporos".to_owned()]
     );
 
     let bytes = torrent_bytes("Example.Show.S01E01.mkv", 7);
@@ -168,7 +168,7 @@ fn current_bootstrap_reopen_preserves_compatibility_state() {
         auto_resume_max_download: 0,
         ignore_non_relevant_files_to_resume: false,
         category: Some(ClientLabel::new("tv")),
-        tags: vec![ClientLabel::new("cross-seed")],
+        tags: vec![ClientLabel::new("managed")],
         duplicate_categories: false,
     };
     let saved_options = SavedInjectionOptions {
@@ -257,7 +257,7 @@ fn seed_database_state(database: &Database, info_hash: &str) {
         )
         .expect("rss");
     let files = [File::new("Example.Show.S01E01.mkv", 7)];
-    let tags = [ClientLabel::new("cross-seed")];
+    let tags = [ClientLabel::new("managed")];
     let trackers = [Cow::Borrowed("tracker.example")];
     database
         .refresh_client_searchees(
@@ -357,7 +357,7 @@ fn assert_database_state_survived(database: &Database, info_hash: &str) {
         client_state,
         (
             "tv".to_owned(),
-            "[\"cross-seed\"]".to_owned(),
+            "[\"managed\"]".to_owned(),
             "[\"tracker.example\"]".to_owned(),
             "/downloads".to_owned()
         )

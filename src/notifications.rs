@@ -92,7 +92,7 @@ impl NotificationSender {
     ) -> crate::Result<Self> {
         let client = Client::builder()
             .timeout(timeout)
-            .user_agent(format!("CrossSeed/{VERSION}"))
+            .user_agent(format!("Sporos/{VERSION}"))
             .build()
             .map_err(|error| notification_error(format!("failed to build notifier: {error}")))?;
         Ok(Self {
@@ -151,7 +151,7 @@ impl NotificationSender {
     /// Send the documented test notification payload asynchronously.
     pub async fn send_test_async(&self) -> NotificationReport {
         self.post_all(NotificationPayload {
-            title: "cross-seed".to_owned(),
+            title: "sporos".to_owned(),
             body: "test notification".to_owned(),
             extra: json!({ "event": "TEST" }),
         })
@@ -160,7 +160,7 @@ impl NotificationSender {
 
     async fn validate_startup_async(&self) -> NotificationReport {
         self.post_all(NotificationPayload {
-            title: "cross-seed".to_owned(),
+            title: "sporos".to_owned(),
             body: "startup validation".to_owned(),
             extra: json!({ "event": "STARTUP_VALIDATION" }),
         })
@@ -335,7 +335,7 @@ fn result_payload(
         NotificationPayloadDetail::Full => full_result_extra(attempt, result),
     };
     Some(NotificationPayload {
-        title: "cross-seed".to_owned(),
+        title: "sporos".to_owned(),
         body,
         extra,
     })
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(report.attempted, 1);
         assert_eq!(report.succeeded, 1);
         assert_eq!(report.retry_exhausted, 0);
-        assert!(request.contains("user-agent: crossseed/"));
+        assert!(request.contains("user-agent: sporos/"));
         assert!(request.contains(r#""event":"TEST""#));
     }
 
@@ -504,7 +504,7 @@ mod tests {
 
         let payload = result_payload(&attempt, NotificationPayloadDetail::Full).expect("payload");
 
-        assert_eq!(payload.title, "cross-seed");
+        assert_eq!(payload.title, "sporos");
         assert_eq!(payload.body, "INJECTED: Example Show");
         assert_eq!(payload.extra["event"], "RESULTS");
         assert_eq!(payload.extra["source"], "search");
@@ -567,7 +567,7 @@ mod tests {
             decision: Decision::Match,
             action_result: Some(result),
             searchee_category: Some("tv".to_owned()),
-            searchee_tags: vec!["cross-seed".to_owned()],
+            searchee_tags: vec!["managed".to_owned()],
             searchee_trackers: vec!["local.tracker".to_owned()],
             searchee_length: 123,
             searchee_client_host: Some("client-a".to_owned()),

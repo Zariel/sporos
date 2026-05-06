@@ -232,9 +232,9 @@ pub struct ContentFilterOptions<'a> {
     pub include_non_videos: bool,
     /// Fuzzy size threshold used for non-video ratio checks.
     pub fuzzy_size_threshold: f64,
-    /// Reject known cross-seed client entries.
+    /// Reject client entries created by legacy cross-seed labels.
     pub ignore_cross_seeds: bool,
-    /// Configured link category used by cross-seed detection.
+    /// Configured link category used by duplicate label detection.
     pub link_category: Option<&'a str>,
     /// Current workflow label.
     pub label: Option<Label>,
@@ -251,8 +251,8 @@ pub enum ContentFilterRejection {
     SingleEpisode,
     /// Non-video bytes exceed the configured threshold.
     NonVideoRatio,
-    /// Client metadata identifies an existing cross-seed.
-    CrossSeed,
+    /// Client metadata identifies an existing duplicate label.
+    ManagedDuplicate,
     /// Data-dir root appears to be an Arr library folder rather than a release.
     ArrRoot,
     /// Season 0 or Specials folder.
@@ -290,7 +290,7 @@ pub struct MediaCapabilities {
 pub struct PipelineAction<'a> {
     /// Workflow label for notifications and action side effects.
     pub label: Label,
-    /// Local item being cross-seeded.
+    /// Local item being matched.
     pub searchee: &'a Searchee<'a>,
     /// Remote candidate that matched the searchee.
     pub candidate: &'a Candidate<'a>,
@@ -1138,7 +1138,7 @@ pub fn filter_by_content(
         return Some(ContentFilterRejection::NonVideoRatio);
     }
     if options.ignore_cross_seeds && is_cross_seed(searchee, options.link_category) {
-        return Some(ContentFilterRejection::CrossSeed);
+        return Some(ContentFilterRejection::ManagedDuplicate);
     }
     if looks_like_arr_root(searchee) {
         return Some(ContentFilterRejection::ArrRoot);
@@ -1485,19 +1485,19 @@ fn is_cross_seed(searchee: &Searchee<'_>, link_category: Option<&str>) -> bool {
         return false;
     };
     client.category.as_ref().is_some_and(|category| {
-        label_is_cross_seed(category)
+        label_is_managed_duplicate(category)
             || link_category
                 .is_some_and(|link_category| category.as_str().eq_ignore_ascii_case(link_category))
-    }) || client.tags.iter().any(label_is_cross_seed)
+    }) || client.tags.iter().any(label_is_managed_duplicate)
 }
 
-fn label_is_cross_seed(label: &ClientLabel<'_>) -> bool {
+fn label_is_managed_duplicate(label: &ClientLabel<'_>) -> bool {
     let value = label.as_str();
-    value.eq_ignore_ascii_case("cross-seed")
-        || value
-            .to_ascii_lowercase()
-            .strip_suffix(".cross-seed")
-            .is_some()
+    if value.eq_ignore_ascii_case("sporos") || value.eq_ignore_ascii_case("cross-seed") {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    lower.strip_suffix(".sporos").is_some() || lower.strip_suffix(".cross-seed").is_some()
 }
 
 fn looks_like_arr_root(searchee: &Searchee<'_>) -> bool {

@@ -50,7 +50,7 @@ impl QbittorrentClient {
             .map_err(|()| client_error("failed to sanitize qBittorrent password"))?;
         let mut builder = reqwest::Client::builder()
             .cookie_store(true)
-            .user_agent(format!("CrossSeed/{}", crate::VERSION));
+            .user_agent(format!("Sporos/{}", crate::VERSION));
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
@@ -507,7 +507,6 @@ impl TorrentClient for QbittorrentClient {
             }
             validate_qb_fastresume_dir(torrent_dir)?;
         }
-        self.post_form("/api/v2/torrents/createTags", &[("tags", "cross-seed")])?;
         Ok(())
     }
 }

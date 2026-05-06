@@ -554,10 +554,10 @@ fn link_probe_temp_source_is_created_in_source_directory() {
         probe
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".cross-seed-link-probe-source-"))
+            .is_some_and(|name| name.starts_with(".sporos-link-probe-source-"))
     );
     assert!(probe.exists());
-    assert!(!link_dir.join(".cross-seed-link-probe-source").exists());
+    assert!(!link_dir.join(".sporos-link-probe-source").exists());
     fs::remove_file(&probe).expect("cleanup probe");
     let _cleanup = fs::remove_dir_all(root);
 }
@@ -566,7 +566,7 @@ fn link_probe_temp_source_is_created_in_source_directory() {
 fn link_probe_does_not_clobber_existing_source_probe() {
     let root = temp_path("link-probe-source-collision");
     let source = root.join("source");
-    let existing_probe = source.join(".cross-seed-link-probe-source");
+    let existing_probe = source.join(".sporos-link-probe-source");
     fs::create_dir_all(&source).expect("source dir");
     fs::write(&existing_probe, b"user data").expect("existing probe");
 
@@ -575,7 +575,7 @@ fn link_probe_does_not_clobber_existing_source_probe() {
     assert!(!created);
     assert_eq!(probe, existing_probe);
     assert_eq!(
-        fs::read(source.join(".cross-seed-link-probe-source")).expect("existing probe"),
+        fs::read(source.join(".sporos-link-probe-source")).expect("existing probe"),
         b"user data"
     );
     let _cleanup = fs::remove_dir_all(root);
@@ -586,7 +586,7 @@ fn link_probe_does_not_remove_existing_probe_destination() {
     let root = temp_path("link-probe-collision");
     let source = root.join("source");
     let link_dir = root.join("links");
-    let existing_probe = link_dir.join(".cross-seed-link-probe-dest");
+    let existing_probe = link_dir.join(".sporos-link-probe-dest");
     fs::create_dir_all(&source).expect("source dir");
     fs::create_dir_all(&link_dir).expect("link dir");
     fs::write(source.join("episode.mkv"), b"video").expect("source file");
@@ -696,7 +696,7 @@ fn injection_action_links_saves_rechecks_and_resumes() {
             auto_resume_max_download: 0,
             ignore_non_relevant_files_to_resume: false,
             category: Some(ClientLabel::new("tv")),
-            tags: vec![ClientLabel::new("cross-seed")],
+            tags: vec![ClientLabel::new("managed")],
             duplicate_categories: false,
         },
         |_| {
@@ -1014,7 +1014,7 @@ fn existing_injection_repairs_missing_links_and_rechecks() {
             auto_resume_max_download: 0,
             ignore_non_relevant_files_to_resume: false,
             category: Some(ClientLabel::new("tv")),
-            tags: vec![ClientLabel::new("cross-seed")],
+            tags: vec![ClientLabel::new("managed")],
             duplicate_categories: false,
         },
         |_| Ok(()),
@@ -1074,7 +1074,7 @@ fn saved_torrent_injection_deletes_successful_retry() {
         auto_resume_max_download: 0,
         ignore_non_relevant_files_to_resume: false,
         category: None,
-        tags: vec![ClientLabel::new("cross-seed")],
+        tags: vec![ClientLabel::new("managed")],
         duplicate_categories: false,
     };
 
@@ -1141,7 +1141,7 @@ fn saved_torrent_injection_deletes_retry_already_in_client() {
         auto_resume_max_download: 0,
         ignore_non_relevant_files_to_resume: false,
         category: None,
-        tags: vec![ClientLabel::new("cross-seed")],
+        tags: vec![ClientLabel::new("managed")],
         duplicate_categories: false,
     };
 
@@ -1208,7 +1208,7 @@ fn saved_torrent_injection_keeps_unrecognized_torrent_files() {
         auto_resume_max_download: 0,
         ignore_non_relevant_files_to_resume: false,
         category: None,
-        tags: vec![ClientLabel::new("cross-seed")],
+        tags: vec![ClientLabel::new("managed")],
         duplicate_categories: false,
     };
 

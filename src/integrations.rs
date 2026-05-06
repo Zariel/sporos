@@ -472,7 +472,7 @@ pub async fn snatch_once_async(
         return Ok(SnatchResult::MagnetLink);
     }
     let mut builder = reqwest::Client::builder()
-        .user_agent(format!("CrossSeed/{}", crate::VERSION))
+        .user_agent(format!("Sporos/{}", crate::VERSION))
         .redirect(reqwest::redirect::Policy::none());
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
@@ -994,8 +994,7 @@ pub async fn search_torznab_indexer_async(
     queries: &[TorznabQuery],
     options: TorznabSearchOptions,
 ) -> crate::Result<Vec<Candidate<'static>>> {
-    let mut builder =
-        reqwest::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
+    let mut builder = reqwest::Client::builder().user_agent(format!("Sporos/{}", crate::VERSION));
     if let Some(timeout) = options.timeout {
         builder = builder.timeout(timeout);
     }
@@ -1354,7 +1353,7 @@ pub fn fetch_torznab_caps(indexer: &TorznabConfig) -> crate::Result<TorznabCaps>
 pub async fn fetch_torznab_caps_async(indexer: &TorznabConfig) -> crate::Result<TorznabCaps> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
-        .user_agent(format!("CrossSeed/{}", crate::VERSION))
+        .user_agent(format!("Sporos/{}", crate::VERSION))
         .build()
         .map_err(|error| integration_error(format!("failed to build HTTP client: {error}")))?;
     let request_url = torznab_caps_url(indexer)?;
@@ -1538,8 +1537,7 @@ fn snooze_indexer_for_retry_error(
 }
 
 fn arr_client(timeout: Option<Duration>) -> crate::Result<reqwest::Client> {
-    let mut builder =
-        reqwest::Client::builder().user_agent(format!("CrossSeed/{}", crate::VERSION));
+    let mut builder = reqwest::Client::builder().user_agent(format!("Sporos/{}", crate::VERSION));
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
     }

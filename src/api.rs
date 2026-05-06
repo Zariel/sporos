@@ -121,7 +121,7 @@ pub struct WebhookRequest {
     pub path: Option<String>,
     /// Filesystem snapshot captured when the request path was validated.
     pub path_snapshot: Option<WebhookPathSnapshot>,
-    /// Ignore cross-seed filtering.
+    /// Ignore compatibility duplicate-label filtering.
     pub ignore_cross_seeds: bool,
     /// Override exclude_recent_search.
     pub ignore_exclude_recent_search: bool,

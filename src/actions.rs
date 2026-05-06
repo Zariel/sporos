@@ -82,7 +82,7 @@ pub struct FileLinkResult {
 
 /// Inputs for one matched candidate injection.
 pub struct InjectionAction<'a> {
-    /// Local item being cross-seeded.
+    /// Local item being matched.
     pub searchee: &'a Searchee<'a>,
     /// Remote candidate metadata.
     pub candidate: &'a Candidate<'a>,
@@ -120,7 +120,7 @@ pub struct InjectionActionOptions<'a> {
     pub category: Option<ClientLabel<'static>>,
     /// Tags or labels to apply during injection.
     pub tags: Vec<ClientLabel<'static>>,
-    /// Derive duplicate cross-seed categories from source client metadata.
+    /// Derive duplicate labels from source client metadata.
     pub duplicate_categories: bool,
 }
 
@@ -1534,7 +1534,7 @@ fn unique_probe_destination(link_dir: &Path) -> crate::Result<PathBuf> {
         .unwrap_or(0);
     for attempt in 0..128 {
         let candidate = link_dir.join(format!(
-            ".cross-seed-link-probe-dest-{}-{nanos}-{attempt}",
+            ".sporos-link-probe-dest-{}-{nanos}-{attempt}",
             std::process::id()
         ));
         if !candidate.exists() {
@@ -1557,7 +1557,7 @@ fn probe_source_path(source_path: &Path) -> crate::Result<(PathBuf, bool)> {
     if let Some(file) = representative_probe_file(source_path)? {
         return Ok((file, false));
     }
-    let probe_source = create_unique_probe_file(source_path, ".cross-seed-link-probe-source")
+    let probe_source = create_unique_probe_file(source_path, ".sporos-link-probe-source")
         .map_err(|error| action_error(format!("failed to create link probe: {error}")))?;
     Ok((probe_source, true))
 }

@@ -43,7 +43,7 @@ impl DelugeClient {
             .map_err(|()| client_error("failed to sanitize Deluge password"))?;
         let mut builder = reqwest::Client::builder()
             .cookie_store(true)
-            .user_agent(format!("CrossSeed/{}", crate::VERSION));
+            .user_agent(format!("Sporos/{}", crate::VERSION));
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }

@@ -433,7 +433,7 @@ fn replacement_workflows_use_fresh_db_and_fake_services() {
         snatch_timeout = "1s"
         skip_recheck = true
         injection_category = "tv"
-        injection_tags = ["cross-seed"]
+        injection_tags = ["managed"]
 
         [[torznab]]
         url = "{}/api"
@@ -525,7 +525,7 @@ fn replacement_workflows_use_fresh_db_and_fake_services() {
         auto_resume_max_download: 0,
         ignore_non_relevant_files_to_resume: false,
         category: Some(ClientLabel::new("tv")),
-        tags: vec![ClientLabel::new("cross-seed")],
+        tags: vec![ClientLabel::new("managed")],
         duplicate_categories: false,
     };
     let mut retry_searchee = Searchee::from_files(

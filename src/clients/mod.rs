@@ -118,7 +118,7 @@ pub struct InjectionOptions {
     pub category: Option<ClientLabel<'static>>,
     /// Tags or labels to assign.
     pub tags: Vec<ClientLabel<'static>>,
-    /// Derive a duplicate cross-seed category from the source torrent category.
+    /// Derive a duplicate category from the source torrent category.
     pub duplicate_categories: bool,
     /// Add paused/stopped before recheck.
     pub paused: bool,
@@ -167,10 +167,7 @@ fn duplicate_category_label(
         .client
         .as_ref()
         .and_then(|client| client.category.as_ref())?;
-    Some(ClientLabel::new(format!(
-        "{}.cross-seed",
-        category.as_str()
-    )))
+    Some(ClientLabel::new(format!("{}.sporos", category.as_str())))
 }
 
 fn qbit_category_and_tags(

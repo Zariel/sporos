@@ -846,14 +846,14 @@ mod tests {
         let input =
             b"d4:infod6:lengthi1e4:name4:Test12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
         let mut metafile = parse_metafile(input).expect("torrent parses");
-        let fastresume = b"d8:trackersl32:https://tracker.example/announcee12:qBt-category2:tv8:qBt-tags14:cross-seed, 4ke";
+        let fastresume = b"d8:trackersl32:https://tracker.example/announcee12:qBt-category2:tv8:qBt-tags11:managed, 4ke";
 
         apply_qbittorrent_fastresume_metadata(&mut metafile, fastresume)
             .expect("fastresume parses");
 
         assert_eq!(metafile.category.expect("category").as_str(), "tv");
         assert_eq!(metafile.tags.len(), 2);
-        assert_eq!(metafile.tags[0].as_str(), "cross-seed");
+        assert_eq!(metafile.tags[0].as_str(), "managed");
         assert_eq!(metafile.tags[1].as_str(), "4k");
         assert_eq!(metafile.trackers, vec![Cow::Borrowed("tracker.example")]);
     }

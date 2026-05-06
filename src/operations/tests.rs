@@ -831,7 +831,7 @@ fn injection_options_uses_configured_category_and_tags() {
     let config = RuntimeConfig::normalize(
         RawConfig {
             injection_category: Some("managed".to_owned()),
-            injection_tags: vec!["cross-seed".to_owned(), "4k".to_owned()],
+            injection_tags: vec!["managed".to_owned(), "4k".to_owned()],
             ..RawConfig::default()
         },
         &root,
@@ -851,7 +851,7 @@ fn injection_options_uses_configured_category_and_tags() {
             .iter()
             .map(ClientLabel::as_str)
             .collect::<Vec<_>>(),
-        vec!["cross-seed", "4k"]
+        vec!["managed", "4k"]
     );
 }
 

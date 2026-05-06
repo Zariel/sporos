@@ -1,4 +1,4 @@
-//! Core library for sporos torrent cross-seeding automation.
+//! Core library for the Sporos torrent automation service.
 
 pub mod actions;
 pub mod api;

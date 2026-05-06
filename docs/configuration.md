@@ -4,7 +4,7 @@ Sporos uses the Rust-native `config.toml` contract plus scalar `SPOROS__`
 environment overrides. Generate a starter file with:
 
 ```sh
-cross-seed --config /config/config.toml gen-config
+sporos --config /config/config.toml gen-config
 ```
 
 In Kubernetes, mount one writable state volume at `/config` and use container
@@ -111,7 +111,7 @@ Inject mode requires at least one non-readonly client. Use
 
 ```toml
 action = "inject"
-injection_category = "cross-seed"
+injection_category = "managed"
 injection_tags = ["managed"]
 link_dirs = ["/links"]
 link_type = "symlink"
