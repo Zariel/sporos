@@ -1122,12 +1122,15 @@ where
     fs::create_dir_all(output_dir)
         .map_err(|error| action_error(format!("failed to create output_dir: {error}")))?;
     let path = torrent_save_path(output_dir, metadata);
-    let mut existed = saved_torrent_path_exists_without_symlink(&path)?;
-    if existed {
-        touch_existing_file(&path)?;
-    } else {
-        existed = write_new_saved_torrent(&path, bytes)?;
-    }
+    let existed = match saved_torrent_path_state_without_symlink(&path, metadata)? {
+        SavedTorrentPathState::Valid => {
+            touch_existing_file(&path)?;
+            true
+        }
+        SavedTorrentPathState::Invalid | SavedTorrentPathState::Missing => {
+            write_saved_torrent_atomically(&path, metadata, bytes)?
+        }
+    };
     notify(&SaveNotification {
         path: path.clone(),
         metadata: metadata.clone().into_owned(),
@@ -1141,14 +1144,39 @@ where
     })
 }
 
-fn saved_torrent_path_exists_without_symlink(path: &Path) -> crate::Result<bool> {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SavedTorrentPathState {
+    Missing,
+    Valid,
+    Invalid,
+}
+
+fn saved_torrent_path_state_without_symlink(
+    path: &Path,
+    metadata: &SavedTorrentMetadata<'_>,
+) -> crate::Result<SavedTorrentPathState> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(action_error(format!(
             "refusing to save torrent through symlink: {}",
             path.display()
         ))),
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => {
+            let bytes = fs::read(path).map_err(|error| {
+                action_error(format!(
+                    "failed to read existing saved torrent {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if parse_metafile(&bytes).is_ok_and(|metafile| metafile.info_hash == metadata.info_hash)
+            {
+                Ok(SavedTorrentPathState::Valid)
+            } else {
+                Ok(SavedTorrentPathState::Invalid)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SavedTorrentPathState::Missing)
+        }
         Err(error) => Err(action_error(format!(
             "failed to inspect saved torrent path {}: {error}",
             path.display()
@@ -1156,32 +1184,91 @@ fn saved_torrent_path_exists_without_symlink(path: &Path) -> crate::Result<bool>
     }
 }
 
-fn write_new_saved_torrent(path: &Path, bytes: &[u8]) -> crate::Result<bool> {
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map(Some)
-        .or_else(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Ok(None);
-            }
-            Err(error)
-        })
-        .map_err(|error| action_error(format!("failed to create saved torrent: {error}")))?;
-    let Some(mut file) = file else {
-        if saved_torrent_path_exists_without_symlink(path)? {
-            touch_existing_file(path)?;
-            return Ok(true);
-        }
+fn write_saved_torrent_atomically(
+    path: &Path,
+    metadata: &SavedTorrentMetadata<'_>,
+    bytes: &[u8],
+) -> crate::Result<bool> {
+    let Some(parent) = path.parent() else {
         return Err(action_error(format!(
-            "saved torrent path disappeared before write: {}",
+            "saved torrent path has no parent: {}",
             path.display()
         )));
     };
-    file.write_all(bytes)
-        .map_err(|error| action_error(format!("failed to save torrent: {error}")))?;
+    let temp_path = create_saved_torrent_temp_file(parent, path)?;
+    let write_result = write_saved_torrent_temp_file(&temp_path, bytes);
+    if let Err(error) = write_result {
+        remove_saved_torrent_temp_file(&temp_path);
+        return Err(error);
+    }
+    match saved_torrent_path_state_without_symlink(path, metadata)? {
+        SavedTorrentPathState::Valid => {
+            remove_saved_torrent_temp_file(&temp_path);
+            touch_existing_file(path)?;
+            return Ok(true);
+        }
+        SavedTorrentPathState::Invalid | SavedTorrentPathState::Missing => {}
+    }
+    if let Err(error) = fs::rename(&temp_path, path) {
+        remove_saved_torrent_temp_file(&temp_path);
+        return Err(action_error(format!(
+            "failed to publish saved torrent: {error}"
+        )));
+    }
     Ok(false)
+}
+
+fn create_saved_torrent_temp_file(parent: &Path, path: &Path) -> crate::Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| action_error(format!("invalid saved torrent path: {}", path.display())))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    for attempt in 0..16 {
+        let temp_path = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            nonce + attempt
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(_) => return Ok(temp_path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(action_error(format!(
+                    "failed to create saved torrent temp file: {error}"
+                )));
+            }
+        }
+    }
+    Err(action_error(
+        "failed to create unique saved torrent temp file",
+    ))
+}
+
+fn write_saved_torrent_temp_file(path: &Path, bytes: &[u8]) -> crate::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path).map_err(|error| {
+        action_error(format!("failed to open saved torrent temp file: {error}"))
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| action_error(format!("failed to save torrent: {error}")))?;
+    Ok(())
+}
+
+fn remove_saved_torrent_temp_file(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        tracing::debug!(
+            "failed to remove saved torrent temp file {}: {error}",
+            path.display()
+        );
+    }
 }
 
 /// Restore cached candidate torrents into `output_dir` without deleting cache files.

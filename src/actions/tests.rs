@@ -74,6 +74,42 @@ fn save_action_writes_and_touches_existing_output() {
 }
 
 #[test]
+fn saved_torrent_save_replaces_corrupt_existing_file() {
+    let root = temp_path("save-corrupt-existing");
+    let output_dir = root.join("out");
+    fs::create_dir_all(&output_dir).expect("output dir");
+    let bytes = torrent_bytes("Recovered.Release", "https://tracker.example/announce", 10);
+    let metafile = crate::torrent::parse_metafile(&bytes).expect("metafile");
+    let metadata = SavedTorrentMetadata::new(
+        metafile.media_type,
+        "TrackerOne",
+        metafile.name.as_ref(),
+        metafile.info_hash.clone().into_owned(),
+        false,
+    );
+    let path = torrent_save_path(&output_dir, &metadata);
+    fs::write(&path, b"partial torrent").expect("partial");
+
+    let saved = save_candidate_torrent(&output_dir, "TrackerOne", &metafile, &bytes, |_| Ok(()))
+        .expect("save");
+
+    assert!(!saved.existed);
+    assert_eq!(fs::read(&path).expect("saved bytes"), bytes);
+    let temp_files = fs::read_dir(&output_dir)
+        .expect("output read")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".tmp"))
+        })
+        .count();
+    assert_eq!(temp_files, 0);
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
 fn restore_from_cache_uses_indexer_tracker_names_and_keeps_cache() {
     let root = temp_path("restore-cache");
     fs::create_dir_all(&root).expect("root");
