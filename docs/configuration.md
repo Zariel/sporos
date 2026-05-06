@@ -127,6 +127,14 @@ rss_cadence = "15 minutes"
 Scheduled search and RSS require a local source and
 `fuzzy_size_threshold <= 0.1`.
 
+Daily cleanup also prunes terminal durable announce work after the configured
+retention window:
+
+```toml
+[announce_queue]
+terminal_retention = "7 days"
+```
+
 ## Notifications
 
 Configure webhook URLs and choose the result payload detail:

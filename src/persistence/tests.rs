@@ -99,6 +99,7 @@ fn initializes_schema_with_wal_and_documented_tables() {
         "idx_announce_work_ready",
         "idx_announce_work_running_lease",
         "idx_announce_work_expiry",
+        "idx_announce_work_terminal_retention",
         "idx_announce_work_status",
     ] {
         assert_index(&database, index);

@@ -2319,6 +2319,7 @@ async fn execute_ran_job(
                 data_rows_removed = cleanup.data_rows_removed,
                 ensemble_rows_removed = cleanup.ensemble_rows_removed,
                 torrent_cache_files_removed = cleanup.torrent_cache_files_removed,
+                announce_work_pruned = cleanup.announce_work_pruned,
                 null_decisions_removed = cleanup.null_decisions_removed,
                 missing_cache_decisions_removed = cleanup.missing_cache_decisions_removed,
                 catastrophic_decision_cleanup_skipped =

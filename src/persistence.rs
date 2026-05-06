@@ -670,6 +670,18 @@ impl Database {
         self.block_on(self.inner.expire_announce_work(now, limit))
     }
 
+    /// Delete terminal announce work older than the retention window.
+    pub fn prune_terminal_announce_work(
+        &self,
+        now: i64,
+        retention_millis: i64,
+    ) -> crate::Result<usize> {
+        self.block_on(
+            self.inner
+                .prune_terminal_announce_work(now, retention_millis),
+        )
+    }
+
     /// Return abandoned running work to a retryable state after lease timeout.
     pub fn release_stale_announce_leases(
         &self,
@@ -2217,6 +2229,28 @@ impl AsyncDatabase {
         Ok(rows.into_iter().map(announce_work_record).collect())
     }
 
+    /// Delete terminal announce work older than the retention window.
+    pub async fn prune_terminal_announce_work(
+        &self,
+        now: i64,
+        retention_millis: i64,
+    ) -> crate::Result<usize> {
+        if retention_millis <= 0 {
+            return Ok(0);
+        }
+        let cutoff = now.saturating_sub(retention_millis);
+        let result = sqlx::query(
+            "DELETE FROM announce_work
+             WHERE status IN ('succeeded', 'terminal_failed', 'expired')
+               AND updated_at < ?1",
+        )
+        .bind(cutoff)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        rows_affected(result.rows_affected())
+    }
+
     /// Return abandoned running work to a retryable state after lease timeout.
     pub async fn release_stale_announce_leases(
         &self,
@@ -3069,6 +3103,9 @@ ON announce_work(status, lease_expires_at, created_at, work_id)
 WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS idx_announce_work_expiry
 ON announce_work(status, expires_at, created_at, work_id);
+CREATE INDEX IF NOT EXISTS idx_announce_work_terminal_retention
+ON announce_work(status, updated_at, work_id)
+WHERE status IN ('succeeded', 'terminal_failed', 'expired');
 CREATE INDEX IF NOT EXISTS idx_announce_work_status
 ON announce_work(status);
 

@@ -307,6 +307,27 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
         now,
     );
     insert_decision(&database, searchee_id, "null-guid", None, now);
+    insert_announce_work(
+        &database,
+        "old-terminal",
+        "old-terminal",
+        "succeeded",
+        now - 8 * 86_400_000,
+    );
+    insert_announce_work(
+        &database,
+        "recent-terminal",
+        "recent-terminal",
+        "terminal_failed",
+        now - 86_400_000,
+    );
+    insert_announce_work(
+        &database,
+        "old-active",
+        "old-active",
+        "queued",
+        now - 8 * 86_400_000,
+    );
     let config = RuntimeConfig::normalize(
         RawConfig {
             data_dirs: vec![existing_data_path],
@@ -322,6 +343,7 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
     assert_eq!(result.data_rows_removed, 1);
     assert_eq!(result.ensemble_rows_removed, 1);
     assert_eq!(result.torrent_cache_files_removed, 1);
+    assert_eq!(result.announce_work_pruned, 1);
     assert_eq!(result.null_decisions_removed, 1);
     assert_eq!(result.missing_cache_decisions_removed, 2);
     assert!(!result.catastrophic_decision_cleanup_skipped);
@@ -331,6 +353,21 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
             .join("torrent_cache")
             .join(format!("{old_hash}.cached.torrent"))
             .exists()
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>("SELECT COUNT(*) FROM announce_work", &[])
+            .expect("announce work count"),
+        2
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM announce_work WHERE status = 'queued'",
+                &[],
+            )
+            .expect("active announce work count"),
+        1
     );
     assert!(
         root.join("torrent_cache")
@@ -795,6 +832,31 @@ fn injection_options_uses_configured_category_and_tags() {
             .collect::<Vec<_>>(),
         vec!["cross-seed", "4k"]
     );
+}
+
+fn insert_announce_work(
+    database: &Database,
+    work_id: &str,
+    dedupe_key: &str,
+    status: &str,
+    updated_at: i64,
+) {
+    database
+        .execute_sql(
+            "INSERT INTO announce_work
+                (work_id, dedupe_key, name, guid, link, tracker, cookie, status,
+                 attempts, created_at, updated_at, next_attempt_at, expires_at)
+             VALUES (?1, ?2, 'Release', ?2, ?2, 'tracker', NULL, ?3,
+                 0, ?4, ?4, ?4, ?5)",
+            &[
+                SqlValue::Text(Cow::Borrowed(work_id)),
+                SqlValue::Text(Cow::Borrowed(dedupe_key)),
+                SqlValue::Text(Cow::Borrowed(status)),
+                SqlValue::I64(updated_at),
+                SqlValue::I64(updated_at.saturating_add(86_400_000)),
+            ],
+        )
+        .expect("announce work");
 }
 
 fn temp_path(label: &str) -> PathBuf {
