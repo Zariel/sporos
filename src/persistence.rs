@@ -1990,7 +1990,9 @@ impl AsyncDatabase {
                  last_error_class = ?4,
                  last_error_message = ?5,
                  last_outcome_context = ?6
-             WHERE work_id = ?1 AND status = 'running'",
+             WHERE work_id = ?1
+               AND status = 'running'
+               AND lease_owner = ?7",
         )
         .bind(update.work_id)
         .bind(update.now)
@@ -1998,6 +2000,7 @@ impl AsyncDatabase {
         .bind(update.error_class)
         .bind(update.error_message)
         .bind(update.outcome_context)
+        .bind(update.lease_owner)
         .execute(self.pool())
         .await
         .map_err(sqlx_error)?;
@@ -2019,7 +2022,8 @@ impl AsyncDatabase {
                  last_error_message = ?5,
                  last_outcome_context = ?6
              WHERE work_id = ?1
-               AND status IN ('queued', 'retrying', 'running')",
+               AND status = 'running'
+               AND lease_owner = ?7",
         )
         .bind(update.work_id)
         .bind(update.now)
@@ -2027,6 +2031,7 @@ impl AsyncDatabase {
         .bind(update.error_class)
         .bind(update.error_message)
         .bind(update.outcome_context)
+        .bind(update.lease_owner)
         .execute(self.pool())
         .await
         .map_err(sqlx_error)?;
@@ -2551,6 +2556,8 @@ pub struct AnnounceWorkEnqueue {
 pub struct AnnounceWorkRetry<'a> {
     /// Stable work id.
     pub work_id: &'a str,
+    /// Lease owner allowed to transition this running work.
+    pub lease_owner: &'a str,
     /// Transition timestamp.
     pub now: i64,
     /// Next claim timestamp.
@@ -2589,6 +2596,8 @@ impl AnnounceWorkTerminalStatus {
 pub struct AnnounceWorkFinish<'a> {
     /// Stable work id.
     pub work_id: &'a str,
+    /// Lease owner allowed to transition this running work.
+    pub lease_owner: &'a str,
     /// Transition timestamp.
     pub now: i64,
     /// Terminal status.

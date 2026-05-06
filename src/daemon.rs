@@ -387,6 +387,9 @@ impl AnnounceWorker {
             attempt = work.attempts,
             "processing announce work"
         );
+        let Some(lease_owner) = work.lease_owner.as_deref() else {
+            return Err(daemon_error("claimed announce work has no lease owner"));
+        };
         if let Some(breaker) = database
             .open_endpoint_breaker(
                 announce_breaker_key(&work),
@@ -399,16 +402,21 @@ impl AnnounceWorker {
             let next_attempt_at = breaker
                 .retry_after
                 .unwrap_or_else(|| retry_next_attempt_at(now, work.attempts, &self.config, None));
-            database
+            if !database
                 .schedule_announce_retry(&AnnounceWorkRetry {
                     work_id: &work.work_id,
+                    lease_owner,
                     now,
                     next_attempt_at,
                     error_class: Some("circuit_breaker_open"),
                     error_message: breaker.last_error_message.as_deref(),
                     outcome_context: Some("delayed_by_endpoint_breaker"),
                 })
-                .await?;
+                .await?
+            {
+                log_inactive_announce_lease(&work, "breaker_delay");
+                return Ok(());
+            }
             tracing::warn!(
                 work_id = work.work_id.as_str(),
                 dedupe_key = work.dedupe_key.as_str(),
@@ -438,16 +446,21 @@ impl AnnounceWorker {
         let now = now_millis();
         match classify_announce_work_result(result, &work, now, &self.config) {
             AnnounceWorkExecution::Succeeded { context } => {
-                database
+                if !database
                     .finish_announce_work(&AnnounceWorkFinish {
                         work_id: &work.work_id,
+                        lease_owner,
                         now,
                         status: AnnounceWorkTerminalStatus::Succeeded,
                         error_class: None,
                         error_message: None,
                         outcome_context: Some(context),
                     })
-                    .await?;
+                    .await?
+                {
+                    log_inactive_announce_lease(&work, "succeeded");
+                    return Ok(());
+                }
                 database
                     .close_endpoint_breaker(
                         announce_breaker_key(&work),
@@ -469,16 +482,21 @@ impl AnnounceWorker {
                 next_attempt_at,
                 context,
             } => {
-                database
+                if !database
                     .schedule_announce_retry(&AnnounceWorkRetry {
                         work_id: &work.work_id,
+                        lease_owner,
                         now,
                         next_attempt_at,
                         error_class: None,
                         error_message: None,
                         outcome_context: Some(context),
                     })
-                    .await?;
+                    .await?
+                {
+                    log_inactive_announce_lease(&work, "waiting");
+                    return Ok(());
+                }
                 tracing::info!(
                     work_id = work.work_id.as_str(),
                     dedupe_key = work.dedupe_key.as_str(),
@@ -496,16 +514,21 @@ impl AnnounceWorker {
                 error_message,
                 context,
             } => {
-                database
+                if !database
                     .schedule_announce_retry(&AnnounceWorkRetry {
                         work_id: &work.work_id,
+                        lease_owner,
                         now,
                         next_attempt_at,
                         error_class: Some(error_class),
                         error_message: Some(&error_message),
                         outcome_context: Some(context),
                     })
-                    .await?;
+                    .await?
+                {
+                    log_inactive_announce_lease(&work, "retrying");
+                    return Ok(());
+                }
                 database
                     .record_endpoint_breaker_failure(&EndpointBreakerFailure {
                         endpoint_key: announce_breaker_key(&work),
@@ -533,16 +556,21 @@ impl AnnounceWorker {
                 error_message,
                 context,
             } => {
-                database
+                if !database
                     .finish_announce_work(&AnnounceWorkFinish {
                         work_id: &work.work_id,
+                        lease_owner,
                         now,
                         status: AnnounceWorkTerminalStatus::TerminalFailed,
                         error_class: Some(error_class),
                         error_message,
                         outcome_context: Some(context),
                     })
-                    .await?;
+                    .await?
+                {
+                    log_inactive_announce_lease(&work, "terminal_failed");
+                    return Ok(());
+                }
                 tracing::info!(
                     work_id = work.work_id.as_str(),
                     dedupe_key = work.dedupe_key.as_str(),
@@ -555,16 +583,21 @@ impl AnnounceWorker {
                 );
             }
             AnnounceWorkExecution::Expired { context } => {
-                database
+                if !database
                     .finish_announce_work(&AnnounceWorkFinish {
                         work_id: &work.work_id,
+                        lease_owner,
                         now,
                         status: AnnounceWorkTerminalStatus::Expired,
                         error_class: None,
                         error_message: None,
                         outcome_context: Some(context),
                     })
-                    .await?;
+                    .await?
+                {
+                    log_inactive_announce_lease(&work, "expired");
+                    return Ok(());
+                }
                 tracing::warn!(
                     work_id = work.work_id.as_str(),
                     dedupe_key = work.dedupe_key.as_str(),
@@ -578,6 +611,16 @@ impl AnnounceWorker {
         }
         Ok(())
     }
+}
+
+fn log_inactive_announce_lease(work: &AnnounceWorkRecord, transition: &str) {
+    tracing::warn!(
+        work_id = work.work_id.as_str(),
+        dedupe_key = work.dedupe_key.as_str(),
+        attempt = work.attempts,
+        transition,
+        "announce work lease was no longer active"
+    );
 }
 
 fn announce_candidate(work: &AnnounceWorkRecord) -> Candidate<'static> {
@@ -3362,6 +3405,7 @@ mod tests {
         database
             .schedule_announce_retry(&AnnounceWorkRetry {
                 work_id: &retrying[0].work_id,
+                lease_owner: retrying[0].lease_owner.as_deref().expect("lease owner"),
                 now: now + 2,
                 next_attempt_at: now + 30_000,
                 error_class: Some("workflow_error"),
@@ -3382,6 +3426,7 @@ mod tests {
         database
             .finish_announce_work(&AnnounceWorkFinish {
                 work_id: &succeeded[0].work_id,
+                lease_owner: succeeded[0].lease_owner.as_deref().expect("lease owner"),
                 now: now + 4,
                 status: AnnounceWorkTerminalStatus::Succeeded,
                 error_class: None,
@@ -3402,6 +3447,7 @@ mod tests {
         database
             .finish_announce_work(&AnnounceWorkFinish {
                 work_id: &terminal[0].work_id,
+                lease_owner: terminal[0].lease_owner.as_deref().expect("lease owner"),
                 now: now + 6,
                 status: AnnounceWorkTerminalStatus::TerminalFailed,
                 error_class: Some("terminal_decision"),

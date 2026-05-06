@@ -274,6 +274,76 @@ fn announce_work_claims_ready_rows_in_order() {
 }
 
 #[test]
+fn announce_work_transitions_require_active_lease_owner() {
+    let root = temp_path("announce-work-lease-fence");
+    fs::create_dir_all(&root).expect("temp dir");
+    let database = Database::open_app_dir(&root).expect("database");
+
+    database
+        .insert_or_dedupe_announce_work(&announce_insert("work", "dedupe", 1_000, 20_000))
+        .expect("insert");
+    let first = database
+        .claim_announce_work(1_000, "worker-a", 1_000, 1)
+        .expect("first claim");
+    assert_eq!(first.len(), 1);
+    let released = database
+        .release_stale_announce_leases(2_000, 2_000, 1)
+        .expect("release first lease");
+    assert_eq!(released.len(), 1);
+    let second = database
+        .claim_announce_work(2_000, "worker-b", 5_000, 1)
+        .expect("second claim");
+    assert_eq!(second.len(), 1);
+
+    let stale_retry = database
+        .schedule_announce_retry(&AnnounceWorkRetry {
+            work_id: &first[0].work_id,
+            lease_owner: first[0].lease_owner.as_deref().expect("first lease owner"),
+            now: 2_100,
+            next_attempt_at: 3_000,
+            error_class: Some("stale"),
+            error_message: Some("stale retry"),
+            outcome_context: Some("stale_worker"),
+        })
+        .expect("stale retry");
+    assert!(!stale_retry);
+    let stale_finish = database
+        .finish_announce_work(&AnnounceWorkFinish {
+            work_id: &first[0].work_id,
+            lease_owner: first[0].lease_owner.as_deref().expect("first lease owner"),
+            now: 2_200,
+            status: AnnounceWorkTerminalStatus::Succeeded,
+            error_class: None,
+            error_message: None,
+            outcome_context: Some("stale_worker"),
+        })
+        .expect("stale finish");
+    assert!(!stale_finish);
+
+    let active_finish = database
+        .finish_announce_work(&AnnounceWorkFinish {
+            work_id: &second[0].work_id,
+            lease_owner: second[0]
+                .lease_owner
+                .as_deref()
+                .expect("second lease owner"),
+            now: 2_300,
+            status: AnnounceWorkTerminalStatus::Succeeded,
+            error_class: None,
+            error_message: None,
+            outcome_context: Some("active_worker"),
+        })
+        .expect("active finish");
+    assert!(active_finish);
+
+    let stats = database.announce_queue_stats(2_400).expect("stats");
+    assert_eq!(stats.succeeded, 1);
+    assert_eq!(stats.retry_scheduled, 0);
+
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
 fn announce_work_updates_terminal_expiry_and_stats() {
     let root = temp_path("announce-work-stats");
     fs::create_dir_all(&root).expect("temp dir");
@@ -301,6 +371,7 @@ fn announce_work_updates_terminal_expiry_and_stats() {
     database
         .finish_announce_work(&AnnounceWorkFinish {
             work_id: &claimed[0].work_id,
+            lease_owner: claimed[0].lease_owner.as_deref().expect("lease owner"),
             now: 1_600,
             status: AnnounceWorkTerminalStatus::Succeeded,
             error_class: None,
@@ -311,6 +382,7 @@ fn announce_work_updates_terminal_expiry_and_stats() {
     database
         .schedule_announce_retry(&AnnounceWorkRetry {
             work_id: &claimed[1].work_id,
+            lease_owner: claimed[1].lease_owner.as_deref().expect("lease owner"),
             now: 1_700,
             next_attempt_at: 1_800,
             error_class: Some("terminal"),
@@ -326,6 +398,7 @@ fn announce_work_updates_terminal_expiry_and_stats() {
     database
         .finish_announce_work(&AnnounceWorkFinish {
             work_id: &retried[0].work_id,
+            lease_owner: retried[0].lease_owner.as_deref().expect("lease owner"),
             now: 1_900,
             status: AnnounceWorkTerminalStatus::TerminalFailed,
             error_class: Some("terminal"),
