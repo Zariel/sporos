@@ -2688,31 +2688,27 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             });
         }
 
-        let stats = self
-            .async_database
-            .announce_queue_stats(self.now_millis)
-            .await?;
-        if stats.backlog.saturating_add(stats.running)
-            >= i64::from(self.config.announce_queue.max_accepted_backlog)
-        {
-            return Err(daemon_error(ANNOUNCE_QUEUE_FULL_MESSAGE));
-        }
-
         let ttl = i64::try_from(self.config.announce_queue.default_ttl).unwrap_or(i64::MAX);
-        let accepted = self
+        let Some(accepted) = self
             .async_database
-            .insert_or_dedupe_announce_work(&AnnounceWorkInsert {
-                work_id: &work_id,
-                dedupe_key,
-                name: &request.name,
-                guid: &request.guid,
-                link: &request.link,
-                tracker: &request.tracker,
-                cookie: request.cookie.as_deref(),
-                now: self.now_millis,
-                expires_at: self.now_millis.saturating_add(ttl),
-            })
-            .await?;
+            .insert_or_dedupe_announce_work_bounded(
+                &AnnounceWorkInsert {
+                    work_id: &work_id,
+                    dedupe_key,
+                    name: &request.name,
+                    guid: &request.guid,
+                    link: &request.link,
+                    tracker: &request.tracker,
+                    cookie: request.cookie.as_deref(),
+                    now: self.now_millis,
+                    expires_at: self.now_millis.saturating_add(ttl),
+                },
+                self.config.announce_queue.max_accepted_backlog,
+            )
+            .await?
+        else {
+            return Err(daemon_error(ANNOUNCE_QUEUE_FULL_MESSAGE));
+        };
         let status = if accepted.inserted {
             "queued"
         } else {

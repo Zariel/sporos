@@ -625,6 +625,18 @@ impl Database {
         self.block_on(self.inner.insert_or_dedupe_announce_work(record))
     }
 
+    /// Insert or dedupe an active durable announce work row with an active queue bound.
+    pub fn insert_or_dedupe_announce_work_bounded(
+        &self,
+        record: &AnnounceWorkInsert<'_>,
+        max_active: u32,
+    ) -> crate::Result<Option<AnnounceWorkEnqueue>> {
+        self.block_on(
+            self.inner
+                .insert_or_dedupe_announce_work_bounded(record, max_active),
+        )
+    }
+
     /// Claim ready durable announce work and mark it running.
     pub fn claim_announce_work(
         &self,
@@ -1955,52 +1967,97 @@ impl AsyncDatabase {
         &self,
         record: &AnnounceWorkInsert<'_>,
     ) -> crate::Result<AnnounceWorkEnqueue> {
+        self.insert_or_dedupe_announce_work_with_limit(record, None)
+            .await?
+            .ok_or_else(|| persistence_message("unbounded announce work insert was rejected"))
+    }
+
+    /// Insert or dedupe an active durable announce work row with an active queue bound.
+    pub async fn insert_or_dedupe_announce_work_bounded(
+        &self,
+        record: &AnnounceWorkInsert<'_>,
+        max_active: u32,
+    ) -> crate::Result<Option<AnnounceWorkEnqueue>> {
+        self.insert_or_dedupe_announce_work_with_limit(record, Some(max_active))
+            .await
+    }
+
+    async fn insert_or_dedupe_announce_work_with_limit(
+        &self,
+        record: &AnnounceWorkInsert<'_>,
+        max_active: Option<u32>,
+    ) -> crate::Result<Option<AnnounceWorkEnqueue>> {
         if let Some(work) = self
             .active_announce_work_by_dedupe(record.dedupe_key)
             .await?
         {
-            return Ok(AnnounceWorkEnqueue {
+            return Ok(Some(AnnounceWorkEnqueue {
                 work,
                 inserted: false,
-            });
+            }));
         }
 
-        let result = sqlx::query(
+        let sql = if max_active.is_some() {
+            "INSERT INTO announce_work
+                (work_id, dedupe_key, name, guid, link, tracker, cookie, status,
+                 attempts, created_at, updated_at, next_attempt_at, expires_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued',
+                 0, ?8, ?8, ?8, ?9
+             WHERE (
+                 SELECT COUNT(*)
+                 FROM announce_work
+                 WHERE status IN ('queued', 'retrying', 'running')
+             ) < ?10"
+        } else {
             "INSERT INTO announce_work
                 (work_id, dedupe_key, name, guid, link, tracker, cookie, status,
                  attempts, created_at, updated_at, next_attempt_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued',
-                 0, ?8, ?8, ?8, ?9)",
-        )
-        .bind(record.work_id)
-        .bind(record.dedupe_key)
-        .bind(record.name)
-        .bind(record.guid)
-        .bind(record.link)
-        .bind(record.tracker)
-        .bind(record.cookie)
-        .bind(record.now)
-        .bind(record.expires_at)
-        .execute(self.pool())
-        .await;
+                 0, ?8, ?8, ?8, ?9)"
+        };
+        let mut query = sqlx::query(sql)
+            .bind(record.work_id)
+            .bind(record.dedupe_key)
+            .bind(record.name)
+            .bind(record.guid)
+            .bind(record.link)
+            .bind(record.tracker)
+            .bind(record.cookie)
+            .bind(record.now)
+            .bind(record.expires_at);
+        if let Some(max_active) = max_active {
+            query = query.bind(i64::from(max_active));
+        }
+        let result = query.execute(self.pool()).await;
 
         match result {
-            Ok(_) => Ok(AnnounceWorkEnqueue {
-                work: self
-                    .announce_work_by_id(record.work_id)
-                    .await?
-                    .ok_or_else(|| persistence_message("inserted announce work disappeared"))?,
-                inserted: true,
-            }),
+            Ok(result) => {
+                if result.rows_affected() == 0 {
+                    return Ok(self
+                        .active_announce_work_by_dedupe(record.dedupe_key)
+                        .await?
+                        .map(|work| AnnounceWorkEnqueue {
+                            work,
+                            inserted: false,
+                        }));
+                }
+                Ok(Some(AnnounceWorkEnqueue {
+                    work: self
+                        .announce_work_by_id(record.work_id)
+                        .await?
+                        .ok_or_else(|| persistence_message("inserted announce work disappeared"))?,
+                    inserted: true,
+                }))
+            }
             Err(error) => {
                 if let Some(work) = self
                     .active_announce_work_by_dedupe(record.dedupe_key)
                     .await?
                 {
-                    Ok(AnnounceWorkEnqueue {
+                    Ok(Some(AnnounceWorkEnqueue {
                         work,
                         inserted: false,
-                    })
+                    }))
                 } else {
                     Err(sqlx_error(error))
                 }

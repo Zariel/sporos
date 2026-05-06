@@ -232,6 +232,57 @@ fn announce_work_insert_dedupes_and_survives_reopen() {
     let _cleanup = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn announce_work_bounded_insert_rejects_concurrent_overflow() {
+    let root = temp_path("announce-work-bounded-insert");
+    fs::create_dir_all(&root).expect("temp dir");
+    let path = Database::path_for_app_dir(&root);
+    let database_a = AsyncDatabase::open(&path).await.expect("database a");
+    let database_b = AsyncDatabase::open(&path).await.expect("database b");
+    let first = announce_insert("work-1", "dedupe-1", 1_000, 11_000);
+    let second = announce_insert("work-2", "dedupe-2", 1_000, 11_000);
+
+    let (first_result, second_result) = tokio::join!(
+        database_a.insert_or_dedupe_announce_work_bounded(&first, 1),
+        database_b.insert_or_dedupe_announce_work_bounded(&second, 1),
+    );
+    let results = [
+        first_result.expect("first insert"),
+        second_result.expect("second insert"),
+    ];
+
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.as_ref().is_some_and(|enqueue| enqueue.inserted))
+            .count(),
+        1
+    );
+    assert_eq!(results.iter().filter(|result| result.is_none()).count(), 1);
+    let accepted = results
+        .iter()
+        .find_map(Option::as_ref)
+        .expect("accepted work");
+    let dedupe_key = accepted.work.dedupe_key.clone();
+    let duplicate = AnnounceWorkInsert {
+        dedupe_key: dedupe_key.as_str(),
+        ..announce_insert("work-duplicate", "ignored", 2_000, 12_000)
+    };
+    let deduped = database_a
+        .insert_or_dedupe_announce_work_bounded(&duplicate, 1)
+        .await
+        .expect("dedupe")
+        .expect("existing work");
+
+    assert!(!deduped.inserted);
+    assert_eq!(deduped.work.dedupe_key, dedupe_key);
+    let stats = database_a.announce_queue_stats(2_000).await.expect("stats");
+    assert_eq!(stats.backlog, 1);
+    database_a.close().await;
+    database_b.close().await;
+    let _cleanup = fs::remove_dir_all(root);
+}
+
 #[test]
 fn announce_work_claims_ready_rows_in_order() {
     let root = temp_path("announce-work-claim");
