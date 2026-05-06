@@ -565,21 +565,39 @@ fn add_service_options(command: Command) -> Command {
             Arg::new("port")
                 .long("port")
                 .num_args(1)
-                .value_parser(value_parser!(u16)),
+                .value_parser(value_parser!(u16))
+                .help("Listen port for the service HTTP API"),
         )
-        .arg(Arg::new("host").long("host").num_args(1))
+        .arg(
+            Arg::new("host")
+                .long("host")
+                .num_args(1)
+                .help("Listen host or address for the service HTTP API"),
+        )
         .arg(
             Arg::new("no-port")
                 .long("no-port")
-                .action(ArgAction::SetTrue),
+                .action(ArgAction::SetTrue)
+                .help("Disable HTTP listening after startup jobs complete"),
         )
         .arg(
             Arg::new("search-cadence")
                 .long("search-cadence")
-                .num_args(1),
+                .num_args(1)
+                .help("Run scheduled search at this cadence, such as '24 hours'"),
         )
-        .arg(Arg::new("rss-cadence").long("rss-cadence").num_args(1))
-        .arg(Arg::new("api-key").long("api-key").num_args(1))
+        .arg(
+            Arg::new("rss-cadence")
+                .long("rss-cadence")
+                .num_args(1)
+                .help("Run scheduled RSS processing at this cadence, such as '15 minutes'"),
+        )
+        .arg(
+            Arg::new("api-key")
+                .long("api-key")
+                .num_args(1)
+                .help("Require this X-Api-Key value for service API requests"),
+        )
 }
 
 fn add_search_options(command: Command) -> Command {
@@ -823,6 +841,30 @@ mod tests {
                 "{} should describe its operational role",
                 command.get_name()
             );
+        }
+    }
+
+    #[test]
+    fn service_options_have_help_text() {
+        let cli = build_cli();
+        let serve = cli
+            .find_subcommand("serve")
+            .expect("serve command is documented");
+
+        for name in [
+            "port",
+            "host",
+            "no-port",
+            "search-cadence",
+            "rss-cadence",
+            "api-key",
+        ] {
+            let arg = serve
+                .get_arguments()
+                .find(|arg| arg.get_id() == name)
+                .unwrap_or_else(|| panic!("missing {name} option"));
+
+            assert!(arg.get_help().is_some(), "{name} should explain its role");
         }
     }
 

@@ -992,7 +992,44 @@ pub fn generate_config_file(path: &Path) -> crate::Result<PathBuf> {
 
 /// Starter config template.
 pub const fn config_template() -> &'static str {
-    "torznab = []\nuse_client_torrents = true\ndata_dirs = []\ntorrent_clients = []\n"
+    r#"# Sporos service configuration.
+# Paths are container paths when running in Kubernetes.
+state_dir = "/config"
+database_path = "/config/sporos.db"
+output_dir = "/config/output"
+
+# Bind the HTTP API on all interfaces for service/pod networking.
+listen_host = "0.0.0.0"
+listen_port = 9000
+# api_key = "replace-with-at-least-24-characters"
+# trusted_proxy_ips = ["10.0.0.1"]
+
+# Local sources. Use either torrent_dir or use_client_torrents, not both.
+use_client_torrents = false
+data_dirs = []
+# torrent_dir = "/torrents"
+
+match_mode = "strict"
+action = "save"
+# action = "inject"
+# injection_category = "cross-seed"
+injection_tags = []
+# link_dirs = ["/links"]
+link_type = "symlink"
+
+# Scheduler settings. Leave unset to disable scheduled loops.
+# search_cadence = "24 hours"
+# rss_cadence = "15 minutes"
+
+# Notifications default to redacted result payloads.
+notification_webhook_urls = []
+notification_payload_detail = "redacted"
+
+torznab = []
+torrent_clients = []
+sonarr = []
+radarr = []
+"#
 }
 
 /// Parse simple duration strings used by CLI/config options.
@@ -1259,7 +1296,7 @@ mod tests {
     use super::{
         Action, ApiIntegrationConfig, LinkType, MatchMode, NotificationPayloadDetail, RawConfig,
         RuntimeConfig, TorrentClientConfig, apply_env_overrides_from, config_file_from_sources,
-        load_selected_raw_config, parse_duration_millis, raw_config_from_source,
+        config_template, load_selected_raw_config, parse_duration_millis, raw_config_from_source,
     };
     use std::{ffi::OsStr, net::IpAddr, path::Path};
 
@@ -1638,6 +1675,21 @@ mod tests {
             }]
         );
         assert_eq!(raw.link_dirs, vec![Path::new("/links")]);
+    }
+
+    #[test]
+    fn generated_config_template_is_supported_toml() {
+        let raw = raw_config_from_source(config_template()).expect("template parses");
+        let config = RuntimeConfig::normalize(raw, Path::new("/config")).expect("template config");
+
+        assert_eq!(config.state_dir, Path::new("/config"));
+        assert_eq!(config.database_path, Path::new("/config/sporos.db"));
+        assert_eq!(config.output_dir, Path::new("/config/output"));
+        assert_eq!(config.listen_port, Some(9000));
+        assert_eq!(
+            config.notification_payload_detail,
+            NotificationPayloadDetail::Redacted
+        );
     }
 
     #[test]
