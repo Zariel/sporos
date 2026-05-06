@@ -1,9 +1,10 @@
 use super::{
     api_key, api_key_async, cleanup_db, cleanup_db_with_clients, clear_cache, clear_cache_async,
     clear_client_cache, clear_client_cache_async, clear_indexer_failures,
-    clear_indexer_failures_async, refresh_workflow_client_searchees, reset_api_key,
-    reset_api_key_async, rss_time_since_last_run, run_announce_match, run_webhook_search,
-    update_torrent_cache_trackers, webhook_matches_request, webhook_targets_and_excluded,
+    clear_indexer_failures_async, injection_options, refresh_workflow_client_searchees,
+    reset_api_key, reset_api_key_async, rss_time_since_last_run, run_announce_match,
+    run_webhook_search, update_torrent_cache_trackers, webhook_matches_request,
+    webhook_targets_and_excluded,
 };
 use crate::{
     api::{WebhookPathSnapshot, WebhookRequest},
@@ -13,7 +14,7 @@ use crate::{
     },
     config::{RawConfig, RuntimeConfig},
     domain::{
-        Candidate, Decision, File, InfoHash, InjectionResult, Metafile, Searchee,
+        Candidate, ClientLabel, Decision, File, InfoHash, InjectionResult, Metafile, Searchee,
         TorrentClientKind, TorrentClientMetadata,
     },
     notifications::NotificationSender,
@@ -764,6 +765,36 @@ fn insert_decision(
             fuzzy_size_factor: 0.05,
         })
         .expect("decision");
+}
+
+#[test]
+fn injection_options_uses_configured_category_and_tags() {
+    let root = temp_path("injection-label-config");
+    let config = RuntimeConfig::normalize(
+        RawConfig {
+            injection_category: Some("managed".to_owned()),
+            injection_tags: vec!["cross-seed".to_owned(), "4k".to_owned()],
+            ..RawConfig::default()
+        },
+        &root,
+    )
+    .expect("config");
+    let clients: [&dyn TorrentClient; 0] = [];
+
+    let options = injection_options(&config, &clients);
+
+    assert_eq!(
+        options.category.as_ref().map(ClientLabel::as_str),
+        Some("managed")
+    );
+    assert_eq!(
+        options
+            .tags
+            .iter()
+            .map(ClientLabel::as_str)
+            .collect::<Vec<_>>(),
+        vec!["cross-seed", "4k"]
+    );
 }
 
 fn temp_path(label: &str) -> PathBuf {

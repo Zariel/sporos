@@ -1069,8 +1069,13 @@ fn injection_options<'a>(
         match_mode: config.match_mode,
         auto_resume_max_download: config.auto_resume_max_download,
         ignore_non_relevant_files_to_resume: config.ignore_non_relevant_files_to_resume,
-        category: config.link_category.clone().map(ClientLabel::new),
-        tags: Vec::new(),
+        category: config.injection_category.clone().map(ClientLabel::new),
+        tags: config
+            .injection_tags
+            .iter()
+            .cloned()
+            .map(ClientLabel::new)
+            .collect(),
         duplicate_categories: config.duplicate_categories,
     }
 }

@@ -884,6 +884,8 @@ mod tests {
             auto_resume_max_download: 0,
             ignore_non_relevant_files_to_resume: false,
             link_category: None,
+            injection_category: None,
+            injection_tags: Vec::new(),
             link_dirs: Vec::new(),
             link_type: crate::config::LinkType::Symlink,
             flat_linking: false,

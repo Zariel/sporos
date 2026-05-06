@@ -341,6 +341,10 @@ pub struct RawConfig {
     pub ignore_non_relevant_files_to_resume: Option<bool>,
     /// Link category.
     pub link_category: Option<String>,
+    /// Category or label applied to injected torrents.
+    pub injection_category: Option<String>,
+    /// Tags or labels applied to injected torrents.
+    pub injection_tags: Vec<String>,
     /// Link dirs.
     pub link_dirs: Vec<PathBuf>,
     /// Link type text.
@@ -447,6 +451,10 @@ pub struct RuntimeConfig {
     pub ignore_non_relevant_files_to_resume: bool,
     /// Link category.
     pub link_category: Option<String>,
+    /// Category or label applied to injected torrents.
+    pub injection_category: Option<String>,
+    /// Tags or labels applied to injected torrents.
+    pub injection_tags: Vec<String>,
     /// Link dirs.
     pub link_dirs: Vec<PathBuf>,
     /// Link type.
@@ -558,6 +566,8 @@ impl RuntimeConfig {
             ignore_non_relevant_files_to_resume: raw
                 .ignore_non_relevant_files_to_resume
                 .unwrap_or(false),
+            injection_category: raw.injection_category.or_else(|| raw.link_category.clone()),
+            injection_tags: raw.injection_tags,
             link_category: raw.link_category,
             link_dirs,
             link_type: LinkType::parse(raw.link_type.as_deref().unwrap_or("symlink"))?,
@@ -995,6 +1005,15 @@ pub fn apply_env_overrides_from(
             "SPOROS__API_KEY" => raw.api_key = Some(value),
             "SPOROS__LOG_FORMAT" => raw.log_format = Some(value),
             "SPOROS__LOG_LEVEL" => raw.log_level = Some(value),
+            "SPOROS__INJECTION_CATEGORY" => raw.injection_category = Some(value),
+            "SPOROS__INJECTION_TAGS" => {
+                raw.injection_tags = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+            }
             "SPOROS__LISTEN_HOST" => {
                 raw.listen_host = Some(value.parse().map_err(|error| {
                     config_error(format!("invalid SPOROS__LISTEN_HOST: {error}"))
@@ -1196,6 +1215,8 @@ mod tests {
         let raw = RawConfig {
             match_mode: Some("strict".to_owned()),
             link_type: Some("reflink_or_copy".to_owned()),
+            link_category: Some("linked".to_owned()),
+            injection_tags: vec!["managed".to_owned()],
             link_dirs: vec!["/links".into()],
             notification_webhook_urls: vec!["https://notify.example".to_owned()],
             torrent_clients: vec![
@@ -1208,6 +1229,8 @@ mod tests {
 
         assert_eq!(config.match_mode, MatchMode::Strict);
         assert_eq!(config.link_type, LinkType::ReflinkOrCopy);
+        assert_eq!(config.injection_category.as_deref(), Some("linked"));
+        assert_eq!(config.injection_tags, vec!["managed"]);
         assert_eq!(config.link_dirs, vec![Path::new("/links")]);
         assert_eq!(
             config.notification_webhook_urls,
@@ -1215,6 +1238,20 @@ mod tests {
         );
         assert_eq!(config.snatch_retries, 2);
         assert_eq!(config.torrent_clients[0].kind, "qbittorrent");
+    }
+
+    #[test]
+    fn explicit_injection_category_overrides_link_category() {
+        let raw = RawConfig {
+            link_category: Some("linked".to_owned()),
+            injection_category: Some("client-label".to_owned()),
+            ..RawConfig::default()
+        };
+
+        let config = RuntimeConfig::normalize(raw, Path::new("/config")).expect("valid config");
+
+        assert_eq!(config.link_category.as_deref(), Some("linked"));
+        assert_eq!(config.injection_category.as_deref(), Some("client-label"));
     }
 
     #[test]
@@ -1441,6 +1478,8 @@ mod tests {
             snatch_retries = 4
             log_format = "json"
             log_level = "debug"
+            injection_category = "client-label"
+            injection_tags = ["managed", "4k"]
             link_dirs = ["/links"]
             state_dir = "/state"
             database_path = "/state/sporos.db"
@@ -1481,6 +1520,8 @@ mod tests {
         assert_eq!(raw.snatch_retries, Some(4));
         assert_eq!(raw.log_format.as_deref(), Some("json"));
         assert_eq!(raw.log_level.as_deref(), Some("debug"));
+        assert_eq!(raw.injection_category.as_deref(), Some("client-label"));
+        assert_eq!(raw.injection_tags, vec!["managed", "4k"]);
         assert_eq!(raw.state_dir.as_deref(), Some(Path::new("/state")));
         assert_eq!(
             raw.database_path.as_deref(),
@@ -1592,6 +1633,14 @@ mod tests {
                 ("SPOROS__LISTEN_PORT".to_owned(), "2222".to_owned()),
                 ("SPOROS__LOG_FORMAT".to_owned(), "json".to_owned()),
                 ("SPOROS__LOG_LEVEL".to_owned(), "debug".to_owned()),
+                (
+                    "SPOROS__INJECTION_CATEGORY".to_owned(),
+                    "client-label".to_owned(),
+                ),
+                (
+                    "SPOROS__INJECTION_TAGS".to_owned(),
+                    "managed, 4k".to_owned(),
+                ),
                 ("SPOROS__RSS_CADENCE".to_owned(), "30 minutes".to_owned()),
                 ("SPOROS__SEARCH_CADENCE".to_owned(), "1 day".to_owned()),
                 (
@@ -1636,6 +1685,8 @@ mod tests {
         assert_eq!(raw.listen_port, Some(Some(2222)));
         assert_eq!(raw.log_format.as_deref(), Some("json"));
         assert_eq!(raw.log_level.as_deref(), Some("debug"));
+        assert_eq!(raw.injection_category.as_deref(), Some("client-label"));
+        assert_eq!(raw.injection_tags, vec!["managed", "4k"]);
         assert_eq!(raw.rss_cadence, Some(1_800_000));
         assert_eq!(raw.search_cadence, Some(86_400_000));
         assert_eq!(raw.announce_queue.worker_concurrency, Some(3));
