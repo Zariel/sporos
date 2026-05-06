@@ -34,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     SporosError,
     api::{
-        AUTH_MESSAGE, AnnounceAccepted, AnnounceRequest, ApiHandlers, ApiMethod, ApiOutcome,
-        ApiRequest, ApiResponse, JobRequest, JobResponse, WebhookRequest,
+        ANNOUNCE_QUEUE_FULL_MESSAGE, AUTH_MESSAGE, AnnounceAccepted, AnnounceRequest, ApiHandlers,
+        ApiMethod, ApiOutcome, ApiRequest, ApiResponse, JobRequest, JobResponse, WebhookRequest,
         handle_trusted_api_request,
     },
     config::RuntimeConfig,
@@ -2695,7 +2695,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
         if stats.backlog.saturating_add(stats.running)
             >= i64::from(self.config.announce_queue.max_accepted_backlog)
         {
-            return Err(daemon_error("announce queue backlog limit reached"));
+            return Err(daemon_error(ANNOUNCE_QUEUE_FULL_MESSAGE));
         }
 
         let ttl = i64::try_from(self.config.announce_queue.default_ttl).unwrap_or(i64::MAX);
@@ -3893,8 +3893,9 @@ mod tests {
             ),
         )
         .await
-        .expect_err("second announce");
-        assert!(second.to_string().contains("backlog limit"));
+        .expect("second announce");
+        assert_eq!(second.status, 429);
+        assert_eq!(second.body, super::ANNOUNCE_QUEUE_FULL_MESSAGE);
         assert_eq!(
             database
                 .announce_queue_stats(2_000)

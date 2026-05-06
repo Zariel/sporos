@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub const AUTH_MESSAGE: &str = "Specify the API key in an X-Api-Key header.";
+pub const ANNOUNCE_QUEUE_FULL_MESSAGE: &str = "announce queue backlog limit reached";
 
 /// Minimal HTTP method model used by the daemon API router.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -323,7 +324,13 @@ async fn handle_api_request_inner<H: ApiHandlers + Send>(
                 Ok(announce) => announce,
                 Err(response) => return Ok(response),
             };
-            let accepted = handlers.announce(announce).await?;
+            let accepted = match handlers.announce(announce).await {
+                Ok(accepted) => accepted,
+                Err(error) if announce_queue_full(&error) => {
+                    return Ok(ApiResponse::new(429, ANNOUNCE_QUEUE_FULL_MESSAGE));
+                }
+                Err(error) => return Err(error),
+            };
             Ok(announce_accepted_response(accepted))
         }
         "/api/webhook" => {
@@ -365,6 +372,13 @@ fn method_guard(actual: ApiMethod, expected: ApiMethod) -> Option<ApiResponse> {
     } else {
         Some(ApiResponse::new(405, "Method Not Allowed"))
     }
+}
+
+fn announce_queue_full(error: &SporosError) -> bool {
+    matches!(
+        error,
+        SporosError::Operation { message } if message.as_ref() == ANNOUNCE_QUEUE_FULL_MESSAGE
+    )
 }
 
 fn authorized(request: &ApiRequest, api_key: &str) -> bool {
@@ -613,6 +627,7 @@ mod tests {
         AnnounceAccepted, AnnounceRequest, ApiHandlers, ApiMethod, ApiRequest, JobRequest,
         JobResponse, WebhookRequest, handle_api_request,
     };
+    use crate::SporosError;
     use std::{collections::BTreeMap, fs};
 
     fn api_key_headers() -> BTreeMap<String, String> {
@@ -749,6 +764,57 @@ mod tests {
         assert_eq!(response.status, 400);
         assert!(response.body.contains("link must be a URL"));
         assert!(handlers.announces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn announce_queue_full_maps_to_too_many_requests() {
+        let mut handlers = TestHandlers {
+            announce_error: Some(SporosError::Operation {
+                message: super::ANNOUNCE_QUEUE_FULL_MESSAGE.into(),
+            }),
+            ..TestHandlers::default()
+        };
+
+        let response = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/announce",
+                api_key_headers(),
+                r#"{"name":"Release","guid":"stable-guid-123","link":"https://idx/download/123.torrent","tracker":"Tracker"}"#,
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .await
+        .expect("announce");
+
+        assert_eq!(response.status, 429);
+        assert_eq!(response.body, super::ANNOUNCE_QUEUE_FULL_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn announce_internal_errors_stay_retryable_server_errors() {
+        let mut handlers = TestHandlers {
+            announce_error: Some(SporosError::Operation {
+                message: "database unavailable".into(),
+            }),
+            ..TestHandlers::default()
+        };
+
+        let error = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/announce",
+                api_key_headers(),
+                r#"{"name":"Release","guid":"stable-guid-123","link":"https://idx/download/123.torrent","tracker":"Tracker"}"#,
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .await
+        .expect_err("internal error");
+
+        assert!(error.to_string().contains("database unavailable"));
     }
 
     #[tokio::test]
@@ -923,6 +989,7 @@ mod tests {
         webhooks: Vec<WebhookRequest>,
         jobs: Vec<JobRequest>,
         announce_accepted: AnnounceAccepted,
+        announce_error: Option<SporosError>,
         job_response: JobResponse,
     }
 
@@ -936,6 +1003,7 @@ mod tests {
                     work_id: "work-1".to_owned(),
                     status: "queued".to_owned(),
                 },
+                announce_error: None,
                 job_response: JobResponse::Accepted("search: running ahead of schedule".to_owned()),
             }
         }
@@ -944,6 +1012,9 @@ mod tests {
     #[async_trait::async_trait]
     impl ApiHandlers for TestHandlers {
         async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<AnnounceAccepted> {
+            if let Some(error) = self.announce_error.take() {
+                return Err(error);
+            }
             self.announces.push(request);
             Ok(self.announce_accepted.clone())
         }
