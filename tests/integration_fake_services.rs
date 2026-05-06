@@ -29,15 +29,15 @@ use sporos::{
     },
     integrations::{
         ArrKind, CategoryCaps, LimitCaps, RssPagerOptions, SearchIndexer, TorznabCaps,
-        fetch_torznab_caps, lookup_arr_ids, rss_pager, validate_arr_instance, validate_arr_url,
-        validate_torznab_url,
+        cache_torrent_file, fetch_torznab_caps, lookup_arr_ids, rss_pager, validate_arr_instance,
+        validate_arr_url, validate_torznab_url,
     },
     matching::AssessmentOptions,
     notifications::NotificationSender,
     operations::{
         run_announce_match, run_rss_workflow, run_search_workflow, run_update_indexer_caps,
     },
-    persistence::{Database, SqlValue},
+    persistence::{Database, DecisionRecord, SqlValue},
     scheduler::DaemonPlan,
     search::Blocklist,
     startup::Redactor,
@@ -235,6 +235,143 @@ fn fake_services_cover_retry_after_and_unsafe_client_retry() {
     let transmission_requests = transmission.join();
     assert_eq!(transmission_requests.len(), 1);
     assert!(transmission_requests[0].contains(r#""method":"torrent-add""#));
+}
+
+#[test]
+fn rss_workflow_rejects_client_owned_info_hash_before_save() {
+    let root = temp_path("rss-client-hash");
+    let app_dir = root.join("app");
+    let data_dir = root.join("data");
+    let release_dir = data_dir.join("Existing.Show.S01E01");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&app_dir).expect("app dir");
+    fs::create_dir_all(&release_dir).expect("release dir");
+    fs::write(release_dir.join("Existing.Show.S01E01.mkv"), b"episode").expect("episode");
+
+    let bytes = torrent_bytes("Existing.Show.S01E01.mkv", 7);
+    let metafile = parse_metafile(&bytes).expect("metafile");
+    let info_hash = metafile.info_hash.to_string();
+    cache_torrent_file(&app_dir, &bytes).expect("cache torrent");
+    let client = FakeHttpServer::new_until_idle(
+        qbittorrent_inventory_responses(
+            &info_hash,
+            "Different.Client.Release",
+            "Different.Client.Release.mkv",
+            7,
+        ),
+        Duration::from_millis(250),
+    );
+    let torznab = FakeHttpServer::new_with_url_until_idle(
+        |torznab_url| {
+            vec![
+                HttpResponse::rss(&rss_item(
+                    "Existing.Show.S01E01",
+                    "client-owned-rss",
+                    &format!("{torznab_url}/download/existing.torrent"),
+                )),
+                HttpResponse::rss("<rss><channel></channel></rss>"),
+            ]
+        },
+        Duration::from_millis(250),
+    );
+    let config = client_backed_config(&app_dir, &data_dir, &output_dir, &torznab.url, &client.url);
+    let database = Database::open_app_dir(&app_dir).expect("database");
+    let seed_searchee_id = database
+        .get_or_insert_searchee("seed")
+        .expect("seed searchee");
+    database
+        .upsert_decision(&DecisionRecord {
+            searchee_id: seed_searchee_id,
+            guid: "client-owned-rss",
+            info_hash: Some(&info_hash),
+            decision: Decision::Match,
+            first_seen: 1,
+            last_seen: 1,
+            fuzzy_size_factor: 0.05,
+        })
+        .expect("seed decision");
+    let notifier = NotificationSender::new(Vec::new(), Redactor::default()).expect("notifier");
+
+    let result = run_rss_workflow(&database, &app_dir, &config, &notifier).expect("rss");
+
+    assert_eq!(result.attempts, 1);
+    let existing_decisions: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM decision WHERE decision = ?1",
+            &[SqlValue::Text(Cow::Borrowed(
+                Decision::InfoHashAlreadyExists.as_str(),
+            ))],
+        )
+        .expect("decision");
+    assert_eq!(existing_decisions, 1);
+    assert_eq!(torrent_file_count(&output_dir), 0);
+    assert!(
+        client
+            .join()
+            .iter()
+            .any(|request| request.contains("/api/v2/torrents/info?offset=0&limit=1000"))
+    );
+    let _torznab_requests = torznab.join();
+    let _cleanup = fs::remove_dir_all(root);
+}
+
+#[test]
+fn announce_workflow_rejects_client_owned_info_hash_before_save() {
+    let root = temp_path("announce-client-hash");
+    let app_dir = root.join("app");
+    let data_dir = root.join("data");
+    let release_dir = data_dir.join("Existing.Show.S01E01");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&app_dir).expect("app dir");
+    fs::create_dir_all(&release_dir).expect("release dir");
+    fs::write(release_dir.join("Existing.Show.S01E01.mkv"), b"episode").expect("episode");
+
+    let bytes = torrent_bytes("Existing.Show.S01E01.mkv", 7);
+    let metafile = parse_metafile(&bytes).expect("metafile");
+    let info_hash = metafile.info_hash.to_string();
+    let torrent_body = String::from_utf8(bytes).expect("torrent bytes");
+    let client = FakeHttpServer::new_until_idle(
+        qbittorrent_inventory_responses(
+            &info_hash,
+            "Different.Client.Release",
+            "Different.Client.Release.mkv",
+            7,
+        ),
+        Duration::from_millis(250),
+    );
+    let download = FakeHttpServer::new_until_idle(
+        vec![HttpResponse::new(
+            "200 OK",
+            &[("Content-Type", "application/x-bittorrent")],
+            &torrent_body,
+        )],
+        Duration::from_millis(250),
+    );
+    let config = client_backed_config(&app_dir, &data_dir, &output_dir, &download.url, &client.url);
+    let database = Database::open_app_dir(&app_dir).expect("database");
+    let notifier = NotificationSender::new(Vec::new(), Redactor::default()).expect("notifier");
+    let candidate = Candidate::new(
+        "Existing.Show.S01E01",
+        "client-owned-announce",
+        Some(format!("{}/existing.torrent", download.url)),
+        "tracker",
+    );
+
+    let outcome = run_announce_match(&database, &app_dir, &config, candidate, &notifier)
+        .expect("announce")
+        .expect("outcome");
+
+    assert_eq!(outcome.decision, Decision::InfoHashAlreadyExists);
+    assert_eq!(outcome.action_result, None);
+    assert_eq!(torrent_file_count(&output_dir), 0);
+    assert!(
+        client
+            .join()
+            .iter()
+            .any(|request| request.contains("/api/v2/torrents/info?offset=0&limit=1000"))
+    );
+    let _download_requests = download.join();
+    let _cleanup = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -840,7 +977,7 @@ fn rss_item(title: &str, guid: &str, link: &str) -> String {
                 <guid>{guid}</guid>
                 <link>{link}</link>
                 <size>7</size>
-                <pubDate>Fri, 01 May 2026 00:00:00 GMT</pubDate>
+                <pubDate>Fri, 01 May 2099 00:00:00 GMT</pubDate>
                 <indexer>ReplacementTracker</indexer>
             </item>
         </channel></rss>"#
@@ -858,6 +995,64 @@ fn torrent_file_count(dir: &std::path::Path) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+fn qbittorrent_inventory_responses(
+    info_hash: &str,
+    torrent_name: &str,
+    file_name: &str,
+    file_size: u64,
+) -> Vec<HttpResponse> {
+    vec![
+        HttpResponse::new("200 OK", &[], "Ok."),
+        HttpResponse::json(&format!(
+            r#"[{{"hash":"{info_hash}","name":"{torrent_name}","save_path":"/downloads","progress":1.0,"state":"uploading"}}]"#
+        )),
+        HttpResponse::json(&format!(r#"[{{"name":"{file_name}","size":{file_size}}}]"#)),
+        HttpResponse::json("[]"),
+    ]
+}
+
+fn client_backed_config(
+    app_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+    torznab_url: &str,
+    client_url: &str,
+) -> RuntimeConfig {
+    raw_config_from_source(&format!(
+        r#"
+        state_dir = "{}"
+        database_path = "{}/sporos.db"
+        data_dirs = ["{}"]
+        output_dir = "{}"
+        use_client_torrents = true
+        include_single_episodes = true
+        action = "save"
+        search_timeout = "1s"
+        snatch_timeout = "1s"
+
+        [[torznab]]
+        url = "{}/api"
+        api_key = "key"
+
+        [[torrent_clients]]
+        kind = "qbittorrent"
+        url = "{}"
+        "#,
+        app_dir.display(),
+        app_dir.display(),
+        data_dir.display(),
+        output_dir.display(),
+        torznab_url,
+        client_url,
+    ))
+    .and_then(|raw| RuntimeConfig::normalize(raw, app_dir))
+    .map(|mut config| {
+        config.delay = 0;
+        config
+    })
+    .expect("config")
 }
 
 fn torrent_bytes(name: &str, length: u64) -> Vec<u8> {

@@ -422,7 +422,7 @@ pub fn run_rss_workflow(
         },
         Label::Rss,
     )?;
-    let excluded = local_info_hashes(&local);
+    let excluded = reverse_workflow_info_hashes(database, config, &local)?;
     let options = search_pipeline_options(config, &blocklist, &excluded, &arr_configs, Label::Rss);
     let injection = injection_options(config, &client_refs);
     let gate = ReverseLookupGate::new();
@@ -511,7 +511,7 @@ pub fn run_announce_match(
         },
         Label::Announce,
     )?;
-    let excluded = local_info_hashes(&local);
+    let excluded = reverse_workflow_info_hashes(database, config, &local)?;
     let options =
         search_pipeline_options(config, &blocklist, &excluded, &arr_configs, Label::Announce);
     let injection = injection_options(config, &client_refs);
@@ -941,6 +941,18 @@ fn local_info_hashes(searchees: &[crate::domain::Searchee<'_>]) -> BTreeSet<Stri
         .filter_map(|searchee| searchee.info_hash.as_ref())
         .map(ToString::to_string)
         .collect()
+}
+
+fn reverse_workflow_info_hashes(
+    database: &Database,
+    config: &RuntimeConfig,
+    searchees: &[crate::domain::Searchee<'_>],
+) -> crate::Result<BTreeSet<String>> {
+    let mut excluded = local_info_hashes(searchees);
+    if config.use_client_torrents {
+        excluded.extend(database.client_info_hashes()?);
+    }
+    Ok(excluded)
 }
 
 fn webhook_targets_and_excluded(

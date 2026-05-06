@@ -1232,6 +1232,16 @@ impl Database {
         })
     }
 
+    /// Load distinct info hashes currently known to configured clients.
+    pub fn client_info_hashes(&self) -> crate::Result<Vec<String>> {
+        self.block_on(async {
+            sqlx::query_scalar("SELECT DISTINCT info_hash FROM client_searchee")
+                .fetch_all(self.pool())
+                .await
+                .map_err(sqlx_error)
+        })
+    }
+
     /// Select one bounded page of likely data-dir reverse lookup rows.
     pub fn reverse_lookup_data_page(
         &self,
