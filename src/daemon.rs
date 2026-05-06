@@ -1226,6 +1226,7 @@ async fn handle_runtime_request(
     };
     let mut handlers = RuntimeHandlers {
         config: &state.config,
+        app_dir: &state.app_dir,
         services: Arc::clone(&state.services),
         metrics: Arc::clone(&state.metrics),
         async_database: &async_database,
@@ -1233,20 +1234,12 @@ async fn handle_runtime_request(
         scheduler_snapshot,
         scheduler_available,
         now_millis: now_millis(),
-        webhook_requests: Vec::new(),
         job_dispatches: Vec::new(),
     };
     let response = handle_trusted_api_request(request, &mut handlers).await?;
-    let webhook_requests = std::mem::take(&mut handlers.webhook_requests);
     let job_dispatches = std::mem::take(&mut handlers.job_dispatches);
     drop(handlers);
     drop(scheduler);
-    submit_webhook_workers(
-        Arc::clone(&state.services),
-        &state.app_dir,
-        &state.config,
-        webhook_requests,
-    );
     let executed_jobs = execute_ran_jobs(
         Arc::clone(&state.services),
         &state.app_dir,
@@ -2513,6 +2506,7 @@ struct DaemonState {
 
 struct RuntimeHandlers<'a> {
     config: &'a RuntimeConfig,
+    app_dir: &'a Path,
     services: Arc<RuntimeServices>,
     metrics: Arc<DaemonMetrics>,
     async_database: &'a AsyncDatabase,
@@ -2520,34 +2514,7 @@ struct RuntimeHandlers<'a> {
     scheduler_snapshot: Option<Vec<ScheduledJob>>,
     scheduler_available: bool,
     now_millis: i64,
-    webhook_requests: Vec<WebhookRequest>,
     job_dispatches: Vec<crate::scheduler::JobCheckResult>,
-}
-
-fn submit_webhook_workers(
-    services: Arc<RuntimeServices>,
-    app_dir: &Path,
-    config: &RuntimeConfig,
-    webhook_requests: Vec<WebhookRequest>,
-) {
-    for request in webhook_requests {
-        let app_dir = PathBuf::from(app_dir);
-        let config = config.clone();
-        let worker_services = Arc::clone(&services);
-        let result = services
-            .queues()
-            .webhooks
-            .try_submit("webhook", move |shutdown| async move {
-                if let Err(error) =
-                    run_webhook_worker(worker_services, app_dir, config, request, shutdown).await
-                {
-                    tracing::error!("webhook background work failed: {error}");
-                }
-            });
-        if let Err(error) = result {
-            tracing::warn!("webhook background work was not queued: {error}");
-        }
-    }
 }
 
 fn announce_work_id(request: &AnnounceRequest) -> String {
@@ -2754,8 +2721,14 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             path = request.path.as_deref().unwrap_or_default(),
             "received webhook request"
         );
-        self.webhook_requests.push(request);
-        Ok(())
+        run_webhook_worker(
+            Arc::clone(&self.services),
+            self.app_dir.to_path_buf(),
+            self.config.clone(),
+            request,
+            self.services.cancellation_token().child_token(),
+        )
+        .await
     }
 
     async fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse> {
@@ -2866,7 +2839,7 @@ mod tests {
     use crate::{
         SporosError,
         api::{ApiMethod, ApiOutcome, ApiRequest, handle_api_request},
-        config::{RawAnnounceQueueConfig, RawConfig, RuntimeConfig, TorrentClientConfig},
+        config::{RawAnnounceQueueConfig, RawConfig, RuntimeConfig},
         domain::{ActionResult, Decision, InjectionResult, SaveResult},
         persistence::{
             AnnounceWorkFinish, AnnounceWorkInsert, AnnounceWorkRecord, AnnounceWorkRetry,
@@ -2955,19 +2928,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_webhook_queues_background_work_without_running_jobs_inline() {
-        let root = temp_path("daemon-webhook-inline");
+    async fn runtime_webhook_runs_work_before_acknowledging() {
+        let root = temp_path("daemon-webhook-before-ack");
+        let release = root.join("Example.Show.S01E01");
         std::fs::create_dir_all(&root).expect("root");
-        let webhook_path = root.join("source.mkv");
+        std::fs::create_dir_all(&release).expect("release");
+        let webhook_path = release.join("Example.Show.S01E01.mkv");
         std::fs::write(&webhook_path, b"data").expect("webhook source");
         let database = Database::open_app_dir(&root).expect("database");
         let config = RuntimeConfig::normalize(
             RawConfig {
-                action: Some("inject".to_owned()),
-                torrent_clients: vec![
-                    TorrentClientConfig::parse("qbittorrent:http://localhost:8080")
-                        .expect("client"),
-                ],
+                data_dirs: vec![release.clone()],
+                include_single_episodes: Some(false),
                 listen_port: Some(None),
                 ..RawConfig::default()
             },
@@ -2978,6 +2950,7 @@ mod tests {
         let async_database = AsyncDatabase::open_app_dir(&root).await.expect("database");
         let mut handlers = super::RuntimeHandlers {
             config: &config,
+            app_dir: &root,
             services: RuntimeServices::start(CancellationToken::new()),
             metrics: Arc::new(super::DaemonMetrics::default()),
             async_database: &async_database,
@@ -2985,7 +2958,6 @@ mod tests {
             scheduler_snapshot: None,
             scheduler_available: true,
             now_millis: 1_000,
-            webhook_requests: Vec::new(),
             job_dispatches: Vec::new(),
         };
 
@@ -3003,22 +2975,10 @@ mod tests {
         .expect("webhook");
 
         assert_eq!(response.status, 204);
-        assert_eq!(handlers.webhook_requests.len(), 1);
-        assert_eq!(
-            handlers
-                .scheduler
-                .as_deref()
-                .expect("scheduler")
-                .jobs()
-                .iter()
-                .find(|job| job.name == JobName::Inject)
-                .map(|job| job.runs),
-            Some(0)
-        );
-        let inject_last_run = database
-            .read_last_run(JobName::Inject.as_str())
-            .expect("last run");
-        assert_eq!(inject_last_run, None);
+        let indexed: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM data", &[])
+            .expect("indexed data");
+        assert_eq!(indexed, 1);
         async_database.close().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -3046,6 +3006,7 @@ mod tests {
         let services = RuntimeServices::start(CancellationToken::new());
         let mut handlers = super::RuntimeHandlers {
             config: &config,
+            app_dir: &root,
             services,
             metrics: Arc::new(super::DaemonMetrics::default()),
             async_database: &async_database,
@@ -3053,7 +3014,6 @@ mod tests {
             scheduler_snapshot: None,
             scheduler_available: true,
             now_millis: 1_000,
-            webhook_requests: Vec::new(),
             job_dispatches: Vec::new(),
         };
 

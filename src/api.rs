@@ -248,7 +248,7 @@ pub trait ApiHandlers {
     }
     /// Durably accept an announce candidate.
     async fn announce(&mut self, request: AnnounceRequest) -> crate::Result<AnnounceAccepted>;
-    /// Start webhook work after the immediate 204 response is selected.
+    /// Run accepted webhook work before acknowledging the request.
     async fn webhook(&mut self, request: WebhookRequest) -> crate::Result<()>;
     /// Run a scheduled job ahead of schedule.
     async fn job(&mut self, request: JobRequest) -> crate::Result<JobResponse>;
