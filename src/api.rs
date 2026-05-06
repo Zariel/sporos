@@ -94,7 +94,7 @@ impl ApiResponse {
 pub struct AnnounceRequest {
     /// Remote release name.
     pub name: String,
-    /// Candidate GUID URL.
+    /// Candidate GUID.
     pub guid: String,
     /// Candidate download URL.
     pub link: String,
@@ -469,11 +469,8 @@ fn modified_millis(metadata: &fs::Metadata) -> Option<u64> {
 fn parse_announce(body: &BTreeMap<String, serde_json::Value>) -> crate::Result<AnnounceRequest> {
     reject_unknown_fields(body, &["name", "guid", "link", "tracker", "cookie"])?;
     let name = required_string(body, "name")?;
-    let guid = required_url(body, "guid")?;
+    let guid = required_string(body, "guid")?;
     let link = required_url(body, "link")?;
-    if guid != link {
-        return Err(api_error("announce guid must equal link"));
-    }
     let tracker = required_string(body, "tracker")?;
     let cookie = optional_string(body, "cookie");
     Ok(AnnounceRequest {
@@ -712,7 +709,7 @@ mod tests {
                 ApiMethod::Post,
                 "/api/announce",
                 headers,
-                r#"{"name":" Release ","guid":"https://idx/t","link":"https://idx/t","tracker":"Tracker"}"#,
+                r#"{"name":" Release ","guid":"stable-guid-123","link":"https://idx/download/123.torrent","tracker":"Tracker"}"#,
             ),
             "secret",
             &mut handlers,
@@ -726,6 +723,35 @@ mod tests {
         assert_eq!(body["status"], "queued");
         assert_eq!(handlers.announces.len(), 1);
         assert_eq!(handlers.announces[0].name, "Release");
+        assert_eq!(handlers.announces[0].guid, "stable-guid-123");
+        assert_eq!(
+            handlers.announces[0].link,
+            "https://idx/download/123.torrent"
+        );
+    }
+
+    #[tokio::test]
+    async fn announce_rejects_invalid_download_link() {
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Api-Key".to_owned(), "secret".to_owned());
+        let mut handlers = TestHandlers::default();
+
+        let response = handle_api_request(
+            ApiRequest::new(
+                ApiMethod::Post,
+                "/api/announce",
+                headers,
+                r#"{"name":"Release","guid":"stable-guid-123","link":"not a url","tracker":"Tracker"}"#,
+            ),
+            "secret",
+            &mut handlers,
+        )
+        .await
+        .expect("announce");
+
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("link must be a URL"));
+        assert!(handlers.announces.is_empty());
     }
 
     #[tokio::test]
