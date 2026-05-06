@@ -4,7 +4,6 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     fs,
-    net::IpAddr,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -378,20 +377,7 @@ fn authorized(request: &ApiRequest, api_key: &str) -> bool {
 }
 
 fn logged_client_addr(request: &ApiRequest) -> Option<Cow<'_, str>> {
-    request
-        .headers
-        .get("x-forwarded-for")
-        .and_then(|value| forwarded_client_addr(value))
-        .map(Cow::Owned)
-        .or_else(|| request.remote_addr.as_deref().map(Cow::Borrowed))
-}
-
-fn forwarded_client_addr(value: &str) -> Option<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .find(|addr| addr.parse::<IpAddr>().is_ok())
-        .map(ToOwned::to_owned)
+    request.remote_addr.as_deref().map(Cow::Borrowed)
 }
 
 fn parse_body(body: &str) -> crate::Result<BTreeMap<String, serde_json::Value>> {
@@ -670,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_logging_prefers_valid_forwarded_client() {
+    fn unauthorized_logging_ignores_untrusted_forwarded_client() {
         let mut request = ApiRequest::new(ApiMethod::Get, "/api/status", BTreeMap::new(), "");
         request.remote_addr = Some("10.0.0.4:50000".to_owned());
         request.headers.insert(
@@ -680,7 +666,7 @@ mod tests {
 
         assert_eq!(
             super::logged_client_addr(&request).as_deref(),
-            Some("203.0.113.9")
+            Some("10.0.0.4:50000")
         );
     }
 

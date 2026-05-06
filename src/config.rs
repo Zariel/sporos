@@ -388,6 +388,8 @@ pub struct RawConfig {
     pub listen_port: Option<Option<u16>>,
     /// Service listener host.
     pub listen_host: Option<IpAddr>,
+    /// Proxy peer IPs allowed to supply forwarded client headers.
+    pub trusted_proxy_ips: Vec<IpAddr>,
     /// RSS cadence in ms.
     #[serde(deserialize_with = "deserialize_optional_duration")]
     pub rss_cadence: Option<u64>,
@@ -495,6 +497,8 @@ pub struct RuntimeConfig {
     pub listen_port: Option<u16>,
     /// Service listener host.
     pub listen_host: IpAddr,
+    /// Proxy peer IPs allowed to supply forwarded client headers.
+    pub trusted_proxy_ips: Vec<IpAddr>,
     /// RSS cadence in ms.
     pub rss_cadence: Option<u64>,
     /// Search cadence in ms.
@@ -593,6 +597,7 @@ impl RuntimeConfig {
             listen_host: raw
                 .listen_host
                 .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            trusted_proxy_ips: raw.trusted_proxy_ips,
             rss_cadence: raw.rss_cadence,
             search_cadence: raw.search_cadence,
             snatch_timeout: raw.snatch_timeout,
@@ -1024,6 +1029,9 @@ pub fn apply_env_overrides_from(
                     config_error(format!("invalid SPOROS__LISTEN_PORT: {error}"))
                 })?));
             }
+            "SPOROS__TRUSTED_PROXY_IPS" => {
+                raw.trusted_proxy_ips = parse_ip_list(&key, &value)?;
+            }
             "SPOROS__RSS_CADENCE" => raw.rss_cadence = Some(parse_duration_millis(&value)?),
             "SPOROS__SEARCH_CADENCE" => raw.search_cadence = Some(parse_duration_millis(&value)?),
             "SPOROS__ANNOUNCE_QUEUE__WORKER_CONCURRENCY" => {
@@ -1057,6 +1065,19 @@ fn parse_env_u32(key: &str, value: &str) -> crate::Result<u32> {
     value
         .parse()
         .map_err(|error| config_error(format!("invalid {key}: {error}")))
+}
+
+fn parse_ip_list(key: &str, value: &str) -> crate::Result<Vec<IpAddr>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse()
+                .map_err(|error| config_error(format!("invalid {key}: {error}")))
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1274,6 +1295,7 @@ mod tests {
             "0.0.0.0".parse::<IpAddr>().expect("host")
         );
         assert_eq!(config.listen_port, Some(9000));
+        assert!(config.trusted_proxy_ips.is_empty());
     }
 
     #[test]
@@ -1483,6 +1505,7 @@ mod tests {
             link_dirs = ["/links"]
             state_dir = "/state"
             database_path = "/state/sporos.db"
+            trusted_proxy_ips = ["10.0.0.4", "127.0.0.1"]
 
             [announce_queue]
             worker_concurrency = 2
@@ -1526,6 +1549,13 @@ mod tests {
         assert_eq!(
             raw.database_path.as_deref(),
             Some(Path::new("/state/sporos.db"))
+        );
+        assert_eq!(
+            raw.trusted_proxy_ips,
+            vec![
+                "10.0.0.4".parse::<IpAddr>().expect("ip"),
+                "127.0.0.1".parse::<IpAddr>().expect("ip"),
+            ]
         );
         assert_eq!(raw.announce_queue.worker_concurrency, Some(2));
         assert_eq!(raw.announce_queue.max_accepted_backlog, Some(200));
@@ -1631,6 +1661,10 @@ mod tests {
                 ),
                 ("SPOROS__LISTEN_HOST".to_owned(), "127.0.0.1".to_owned()),
                 ("SPOROS__LISTEN_PORT".to_owned(), "2222".to_owned()),
+                (
+                    "SPOROS__TRUSTED_PROXY_IPS".to_owned(),
+                    "10.0.0.4, 127.0.0.1".to_owned(),
+                ),
                 ("SPOROS__LOG_FORMAT".to_owned(), "json".to_owned()),
                 ("SPOROS__LOG_LEVEL".to_owned(), "debug".to_owned()),
                 (
@@ -1683,6 +1717,13 @@ mod tests {
         assert_eq!(raw.api_key.as_deref(), Some("env-env-env-env-env-env"));
         assert_eq!(raw.listen_host, Some("127.0.0.1".parse().expect("ip")));
         assert_eq!(raw.listen_port, Some(Some(2222)));
+        assert_eq!(
+            raw.trusted_proxy_ips,
+            vec![
+                "10.0.0.4".parse::<IpAddr>().expect("ip"),
+                "127.0.0.1".parse::<IpAddr>().expect("ip"),
+            ]
+        );
         assert_eq!(raw.log_format.as_deref(), Some("json"));
         assert_eq!(raw.log_level.as_deref(), Some("debug"));
         assert_eq!(raw.injection_category.as_deref(), Some("client-label"));
@@ -1704,6 +1745,7 @@ mod tests {
         for (key, value) in [
             ("SPOROS__LISTEN_HOST", "not an ip"),
             ("SPOROS__LISTEN_PORT", "not a port"),
+            ("SPOROS__TRUSTED_PROXY_IPS", "10.0.0.4, not an ip"),
             ("SPOROS__RSS_CADENCE", "not a duration"),
             ("SPOROS__SEARCH_CADENCE", "not a duration"),
             ("SPOROS__ANNOUNCE_QUEUE__WORKER_CONCURRENCY", "many"),

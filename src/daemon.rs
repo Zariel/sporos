@@ -842,7 +842,11 @@ async fn require_api_auth(
         Ok(api_key) if request_authorized(&headers, &query, &api_key) => next.run(request).await,
         Ok(_) => {
             tracing::warn!(
-                net.peer.addr = %client_addr(&headers, Some(remote_addr)),
+                net.peer.addr = %client_addr(
+                    &headers,
+                    Some(remote_addr),
+                    &state.config.trusted_proxy_ips,
+                ),
                 "unauthorized API request"
             );
             DaemonHttpResponse {
@@ -891,7 +895,11 @@ async fn record_http_request(
     let started = Instant::now();
     let method_label = request.method().as_str().to_owned();
     let route = http_route(request.uri().path());
-    let remote_addr = client_addr(request.headers(), Some(remote_addr));
+    let remote_addr = client_addr(
+        request.headers(),
+        Some(remote_addr),
+        &state.config.trusted_proxy_ips,
+    );
     let response = next.run(request).await;
     let status = response.status().as_u16();
     let latency_ms = started.elapsed().as_millis();
@@ -910,16 +918,23 @@ async fn record_http_request(
     response
 }
 
-fn client_addr(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(forwarded_client_addr)
-        .unwrap_or_else(|| {
-            remote_addr
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|| "unknown".to_owned())
-        })
+fn client_addr(
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    trusted_proxy_ips: &[std::net::IpAddr],
+) -> String {
+    if remote_addr.is_some_and(|addr| trusted_proxy_ips.contains(&addr.ip())) {
+        if let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(forwarded_client_addr)
+        {
+            return forwarded;
+        }
+    }
+    remote_addr
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn forwarded_client_addr(value: &str) -> Option<String> {
@@ -2835,7 +2850,9 @@ async fn run_webhook_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REQUEST_BODY_BYTES, handle_runtime_request, http_route, run_plan};
+    use super::{
+        MAX_REQUEST_BODY_BYTES, client_addr, handle_runtime_request, http_route, run_plan,
+    };
     use crate::{
         SporosError,
         api::{ApiMethod, ApiOutcome, ApiRequest, handle_api_request},
@@ -2850,16 +2867,48 @@ mod tests {
             DaemonPlan, JobCheckResult, JobConfigOverride, JobName, ScheduledJob, Scheduler,
         },
     };
-    use axum::http::header::CONTENT_TYPE;
+    use axum::http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
     use std::{
         borrow::Cow,
         collections::BTreeMap,
+        net::SocketAddr,
         path::Path,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn audit_client_addr_ignores_forwarded_headers_by_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 10.0.0.4"),
+        );
+        let remote_addr: SocketAddr = "10.0.0.4:50000".parse().expect("remote addr");
+
+        assert_eq!(
+            client_addr(&headers, Some(remote_addr), &[]),
+            "10.0.0.4:50000"
+        );
+    }
+
+    #[test]
+    fn audit_client_addr_trusts_forwarded_headers_from_configured_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 10.0.0.4"),
+        );
+        let remote_addr: SocketAddr = "10.0.0.4:50000".parse().expect("remote addr");
+        let trusted = ["10.0.0.4".parse().expect("trusted proxy")];
+
+        assert_eq!(
+            client_addr(&headers, Some(remote_addr), &trusted),
+            "203.0.113.9"
+        );
+    }
 
     #[tokio::test]
     async fn no_port_runs_startup_jobs_without_serving() {
