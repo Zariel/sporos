@@ -932,7 +932,13 @@ impl TorrentClient for RecordingClient {
         _decision: Decision,
         _options: &InjectionOptions,
     ) -> sporos::Result<InjectionResult> {
-        *self.injected.lock().expect("injected lock") += 1;
+        let mut injected =
+            self.injected
+                .lock()
+                .map_err(|error| sporos::SporosError::Operation {
+                    message: Cow::Owned(format!("injected lock poisoned: {error}")),
+                })?;
+        *injected += 1;
         Ok(InjectionResult::Injected)
     }
 

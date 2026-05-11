@@ -160,6 +160,7 @@ async fn run_plan(
                 app_dir,
                 config,
                 Arc::clone(&runtime_services),
+                Arc::clone(&metrics),
                 shutdown.child_token(),
                 now_millis(),
             )
@@ -268,6 +269,7 @@ async fn start_announce_workers(
     app_dir: &Path,
     config: &RuntimeConfig,
     services: Arc<RuntimeServices>,
+    metrics: Arc<DaemonMetrics>,
     shutdown: CancellationToken,
     now: i64,
 ) -> crate::Result<AnnounceWorkerGroup> {
@@ -292,6 +294,7 @@ async fn start_announce_workers(
             app_dir: app_dir.to_owned(),
             config: config.clone(),
             services: Arc::clone(&services),
+            metrics: Arc::clone(&metrics),
             shutdown: worker_shutdown.child_token(),
         };
         handles.push(tokio::spawn(worker.run()));
@@ -308,6 +311,7 @@ struct AnnounceWorker {
     app_dir: PathBuf,
     config: RuntimeConfig,
     services: Arc<RuntimeServices>,
+    metrics: Arc<DaemonMetrics>,
     shutdown: CancellationToken,
 }
 
@@ -337,6 +341,8 @@ impl AnnounceWorker {
             .expire_announce_work(now, self.config.announce_queue.claim_batch_size)
             .await?;
         for work in expired {
+            self.metrics
+                .record_announce_outcome(AnnounceWorkTerminalStatus::Expired);
             tracing::warn!(
                 work_id = work.work_id.as_str(),
                 dedupe_key = work.dedupe_key.as_str(),
@@ -351,6 +357,7 @@ impl AnnounceWorker {
             .release_stale_announce_leases(now, now, self.config.announce_queue.claim_batch_size)
             .await?;
         for work in recovered {
+            self.metrics.record_announce_retry_scheduled();
             tracing::warn!(
                 work_id = work.work_id.as_str(),
                 dedupe_key = work.dedupe_key.as_str(),
@@ -373,6 +380,7 @@ impl AnnounceWorker {
         let Some(work) = claimed.pop() else {
             return Ok(false);
         };
+        self.metrics.record_announce_attempt_started();
         self.process(database, work).await?;
         Ok(true)
     }
@@ -418,6 +426,7 @@ impl AnnounceWorker {
                 log_inactive_announce_lease(&work, "breaker_delay");
                 return Ok(());
             }
+            self.metrics.record_announce_retry_scheduled();
             tracing::warn!(
                 work_id = work.work_id.as_str(),
                 dedupe_key = work.dedupe_key.as_str(),
@@ -462,6 +471,8 @@ impl AnnounceWorker {
                     log_inactive_announce_lease(&work, "succeeded");
                     return Ok(());
                 }
+                self.metrics
+                    .record_announce_outcome(AnnounceWorkTerminalStatus::Succeeded);
                 database
                     .close_endpoint_breaker(
                         announce_breaker_key(&work),
@@ -498,6 +509,7 @@ impl AnnounceWorker {
                     log_inactive_announce_lease(&work, "waiting");
                     return Ok(());
                 }
+                self.metrics.record_announce_retry_scheduled();
                 tracing::info!(
                     work_id = work.work_id.as_str(),
                     dedupe_key = work.dedupe_key.as_str(),
@@ -530,6 +542,7 @@ impl AnnounceWorker {
                     log_inactive_announce_lease(&work, "retrying");
                     return Ok(());
                 }
+                self.metrics.record_announce_retry_scheduled();
                 database
                     .record_endpoint_breaker_failure(&EndpointBreakerFailure {
                         endpoint_key: announce_breaker_key(&work),
@@ -572,6 +585,9 @@ impl AnnounceWorker {
                     log_inactive_announce_lease(&work, "terminal_failed");
                     return Ok(());
                 }
+                self.metrics.record_announce_attempt_exhausted();
+                self.metrics
+                    .record_announce_outcome(AnnounceWorkTerminalStatus::TerminalFailed);
                 tracing::info!(
                     work_id = work.work_id.as_str(),
                     dedupe_key = work.dedupe_key.as_str(),
@@ -599,6 +615,8 @@ impl AnnounceWorker {
                     log_inactive_announce_lease(&work, "expired");
                     return Ok(());
                 }
+                self.metrics
+                    .record_announce_outcome(AnnounceWorkTerminalStatus::Expired);
                 tracing::warn!(
                     work_id = work.work_id.as_str(),
                     dedupe_key = work.dedupe_key.as_str(),
@@ -1472,7 +1490,8 @@ async fn metrics_response(
     );
 
     let database = AsyncDatabase::open(&state.config.database_path).await?;
-    let announce_queue = announce_queue_status(&state.config, &database, now_millis()).await?;
+    let announce_queue =
+        announce_queue_status(&state.config, &database, &state.metrics, now_millis()).await?;
     database.close().await;
     observe_announce_queue_metrics(&registry, &announce_queue)?;
     observe_job_metrics(&registry, &state).await?;
@@ -1586,6 +1605,14 @@ fn observe_announce_queue_metrics(
         "Whether durable announce processing is blocked by an open breaker.",
     ))
     .map_err(metrics_error)?;
+    let enqueues = IntCounterVec::new(
+        Opts::new(
+            "sporos_announce_queue_enqueues_total",
+            "Durable announce enqueue requests by bounded result.",
+        ),
+        &["result"],
+    )
+    .map_err(metrics_error)?;
     let attempts = IntCounterVec::new(
         Opts::new(
             "sporos_announce_queue_attempts_total",
@@ -1627,6 +1654,9 @@ fn observe_announce_queue_metrics(
         .register(Box::new(breaker_open.clone()))
         .map_err(metrics_error)?;
     registry
+        .register(Box::new(enqueues.clone()))
+        .map_err(metrics_error)?;
+    registry
         .register(Box::new(attempts.clone()))
         .map_err(metrics_error)?;
     registry
@@ -1642,6 +1672,15 @@ fn observe_announce_queue_metrics(
     oldest_age.set(queue.oldest_queued_age_seconds.unwrap_or_default());
     retry_delay.set(queue.retry_delay_seconds.unwrap_or_default());
     breaker_open.set(bool_to_i64(queue.breaker_open));
+    for (result, value) in [
+        ("queued", queue.enqueues_queued),
+        ("existing", queue.enqueues_existing),
+        ("rejected", queue.enqueues_rejected),
+    ] {
+        enqueues
+            .with_label_values(&[result])
+            .inc_by(i64_to_u64(value));
+    }
     for result in ANNOUNCE_QUEUE_ATTEMPT_RESULTS {
         let value = match *result {
             "started" => queue.attempts_started,
@@ -1698,6 +1737,19 @@ fn blocking_status(executor: &RuntimeBlockingExecutor) -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+struct AnnounceQueueMetrics {
+    enqueues_queued: i64,
+    enqueues_existing: i64,
+    enqueues_rejected: i64,
+    attempts_started: i64,
+    attempts_retry_scheduled: i64,
+    attempts_exhausted: i64,
+    outcomes_succeeded: i64,
+    outcomes_terminal_failed: i64,
+    outcomes_expired: i64,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct AnnounceQueueStatus {
     ready: bool,
@@ -1707,6 +1759,9 @@ struct AnnounceQueueStatus {
     running: i64,
     oldest_queued_age_seconds: Option<i64>,
     retry_delay_seconds: Option<i64>,
+    enqueues_queued: i64,
+    enqueues_existing: i64,
+    enqueues_rejected: i64,
     attempts_started: i64,
     attempts_retry_scheduled: i64,
     attempts_exhausted: i64,
@@ -1736,6 +1791,9 @@ impl AnnounceQueueStatus {
             running: 0,
             oldest_queued_age_seconds: None,
             retry_delay_seconds: None,
+            enqueues_queued: 0,
+            enqueues_existing: 0,
+            enqueues_rejected: 0,
             attempts_started: 0,
             attempts_retry_scheduled: 0,
             attempts_exhausted: 0,
@@ -1759,6 +1817,7 @@ impl AnnounceQueueStatus {
     fn from_stats(
         config: &RuntimeConfig,
         stats: AnnounceQueueStats,
+        metrics: AnnounceQueueMetrics,
         breaker: EndpointBreakerStats,
         now: i64,
     ) -> Self {
@@ -1785,13 +1844,16 @@ impl AnnounceQueueStatus {
             retry_delay_seconds: stats
                 .next_retry_at
                 .map(|retry_at| retry_at.saturating_sub(now).max(0) / 1_000),
-            attempts_started: stats.total_attempts,
-            attempts_retry_scheduled: stats.retry_scheduled,
-            attempts_exhausted: stats.terminal_failed,
-            outcomes_succeeded: stats.succeeded,
-            outcomes_terminal_failed: stats.terminal_failed,
-            outcomes_expired: stats.expired,
-            expired: stats.expired,
+            enqueues_queued: metrics.enqueues_queued,
+            enqueues_existing: metrics.enqueues_existing,
+            enqueues_rejected: metrics.enqueues_rejected,
+            attempts_started: metrics.attempts_started,
+            attempts_retry_scheduled: metrics.attempts_retry_scheduled,
+            attempts_exhausted: metrics.attempts_exhausted,
+            outcomes_succeeded: metrics.outcomes_succeeded,
+            outcomes_terminal_failed: metrics.outcomes_terminal_failed,
+            outcomes_expired: metrics.outcomes_expired,
+            expired: metrics.outcomes_expired,
             breaker_open,
             breaker_state: if breaker_open {
                 "open"
@@ -1824,6 +1886,11 @@ impl AnnounceQueueStatus {
             "backlog": self.backlog,
             "running": self.running,
             "oldestQueuedAgeSeconds": self.oldest_queued_age_seconds,
+            "enqueues": {
+                "queued": self.enqueues_queued,
+                "existing": self.enqueues_existing,
+                "rejected": self.enqueues_rejected,
+            },
             "attempts": {
                 "started": self.attempts_started,
                 "retryScheduled": self.attempts_retry_scheduled,
@@ -1857,11 +1924,18 @@ impl AnnounceQueueStatus {
 async fn announce_queue_status(
     config: &RuntimeConfig,
     database: &AsyncDatabase,
+    metrics: &DaemonMetrics,
     now: i64,
 ) -> crate::Result<AnnounceQueueStatus> {
     let stats = database.announce_queue_stats(now).await?;
     let breaker = database.endpoint_breaker_stats(now).await?;
-    Ok(AnnounceQueueStatus::from_stats(config, stats, breaker, now))
+    Ok(AnnounceQueueStatus::from_stats(
+        config,
+        stats,
+        metrics.announce_queue_metrics(),
+        breaker,
+        now,
+    ))
 }
 
 async fn observe_job_metrics(registry: &Registry, state: &DaemonState) -> crate::Result<()> {
@@ -2063,7 +2137,8 @@ async fn health_readyz_response(
     let intake_ready = state.config.listen_port.is_some() && runtime_ready;
     let announce_queue = match &database_result {
         Ok(database) => {
-            let status = announce_queue_status(&state.config, database, now_millis()).await;
+            let status =
+                announce_queue_status(&state.config, database, &state.metrics, now_millis()).await;
             match status {
                 Ok(status) => status,
                 Err(error) => {
@@ -2319,7 +2394,6 @@ async fn execute_ran_job(
                 data_rows_removed = cleanup.data_rows_removed,
                 ensemble_rows_removed = cleanup.ensemble_rows_removed,
                 torrent_cache_files_removed = cleanup.torrent_cache_files_removed,
-                announce_work_pruned = cleanup.announce_work_pruned,
                 null_decisions_removed = cleanup.null_decisions_removed,
                 missing_cache_decisions_removed = cleanup.missing_cache_decisions_removed,
                 catastrophic_decision_cleanup_skipped =
@@ -2411,6 +2485,15 @@ struct DaemonMetrics {
     started_at: Instant,
     http_requests: AtomicUsize,
     http_by_route: StdMutex<BTreeMap<HttpMetricKey, HttpMetricValue>>,
+    announce_enqueue_queued: AtomicUsize,
+    announce_enqueue_existing: AtomicUsize,
+    announce_enqueue_rejected: AtomicUsize,
+    announce_attempt_started: AtomicUsize,
+    announce_attempt_retry_scheduled: AtomicUsize,
+    announce_attempt_exhausted: AtomicUsize,
+    announce_outcome_succeeded: AtomicUsize,
+    announce_outcome_terminal_failed: AtomicUsize,
+    announce_outcome_expired: AtomicUsize,
     rss_failures: AtomicUsize,
     search_failures: AtomicUsize,
     update_indexer_caps_failures: AtomicUsize,
@@ -2451,6 +2534,68 @@ impl DaemonMetrics {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn record_announce_enqueue(&self, inserted: bool) {
+        if inserted {
+            self.announce_enqueue_queued.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.announce_enqueue_existing
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_announce_rejected(&self) {
+        self.announce_enqueue_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_announce_attempt_started(&self) {
+        self.announce_attempt_started
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_announce_retry_scheduled(&self) {
+        self.announce_attempt_retry_scheduled
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_announce_attempt_exhausted(&self) {
+        self.announce_attempt_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_announce_outcome(&self, status: AnnounceWorkTerminalStatus) {
+        match status {
+            AnnounceWorkTerminalStatus::Succeeded => &self.announce_outcome_succeeded,
+            AnnounceWorkTerminalStatus::TerminalFailed => &self.announce_outcome_terminal_failed,
+            AnnounceWorkTerminalStatus::Expired => &self.announce_outcome_expired,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn announce_queue_metrics(&self) -> AnnounceQueueMetrics {
+        AnnounceQueueMetrics {
+            enqueues_queued: usize_to_i64(self.announce_enqueue_queued.load(Ordering::Relaxed)),
+            enqueues_existing: usize_to_i64(self.announce_enqueue_existing.load(Ordering::Relaxed)),
+            enqueues_rejected: usize_to_i64(self.announce_enqueue_rejected.load(Ordering::Relaxed)),
+            attempts_started: usize_to_i64(self.announce_attempt_started.load(Ordering::Relaxed)),
+            attempts_retry_scheduled: usize_to_i64(
+                self.announce_attempt_retry_scheduled
+                    .load(Ordering::Relaxed),
+            ),
+            attempts_exhausted: usize_to_i64(
+                self.announce_attempt_exhausted.load(Ordering::Relaxed),
+            ),
+            outcomes_succeeded: usize_to_i64(
+                self.announce_outcome_succeeded.load(Ordering::Relaxed),
+            ),
+            outcomes_terminal_failed: usize_to_i64(
+                self.announce_outcome_terminal_failed
+                    .load(Ordering::Relaxed),
+            ),
+            outcomes_expired: usize_to_i64(self.announce_outcome_expired.load(Ordering::Relaxed)),
+        }
     }
 
     fn record_job_failure(&self, name: JobName) {
@@ -2498,6 +2643,15 @@ impl Default for DaemonMetrics {
             started_at: Instant::now(),
             http_requests: AtomicUsize::new(0),
             http_by_route: StdMutex::new(BTreeMap::new()),
+            announce_enqueue_queued: AtomicUsize::new(0),
+            announce_enqueue_existing: AtomicUsize::new(0),
+            announce_enqueue_rejected: AtomicUsize::new(0),
+            announce_attempt_started: AtomicUsize::new(0),
+            announce_attempt_retry_scheduled: AtomicUsize::new(0),
+            announce_attempt_exhausted: AtomicUsize::new(0),
+            announce_outcome_succeeded: AtomicUsize::new(0),
+            announce_outcome_terminal_failed: AtomicUsize::new(0),
+            announce_outcome_expired: AtomicUsize::new(0),
             rss_failures: AtomicUsize::new(0),
             search_failures: AtomicUsize::new(0),
             update_indexer_caps_failures: AtomicUsize::new(0),
@@ -2555,8 +2709,13 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             .await
             .is_ok_and(|metadata| metadata.is_file());
         let runtime_ready = !self.services.cancellation_token().is_cancelled();
-        let announce_queue =
-            announce_queue_status(self.config, self.async_database, self.now_millis).await?;
+        let announce_queue = announce_queue_status(
+            self.config,
+            self.async_database,
+            &self.metrics,
+            self.now_millis,
+        )
+        .await?;
         let announce_queue_ready = announce_queue.ready();
         let mut jobs = Vec::new();
         let mut recent_service_errors = Vec::new();
@@ -2683,6 +2842,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
                 status = existing.status.as_str(),
                 "deduped announce request to existing work"
             );
+            self.metrics.record_announce_enqueue(false);
             return Ok(AnnounceAccepted {
                 work_id: existing.work_id,
                 status: "existing".to_owned(),
@@ -2708,6 +2868,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
             )
             .await?
         else {
+            self.metrics.record_announce_rejected();
             return Err(daemon_error(ANNOUNCE_QUEUE_FULL_MESSAGE));
         };
         let status = if accepted.inserted {
@@ -2715,6 +2876,7 @@ impl ApiHandlers for RuntimeHandlers<'_> {
         } else {
             "existing"
         };
+        self.metrics.record_announce_enqueue(accepted.inserted);
         tracing::info!(
             work_id = accepted.work.work_id.as_str(),
             dedupe_key = accepted.work.dedupe_key.as_str(),
@@ -3429,7 +3591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn announce_queue_status_and_metrics_use_durable_state() {
+    async fn announce_queue_status_and_metrics_use_active_state() {
         let root = temp_path("daemon-announce-queue-observability");
         std::fs::create_dir_all(&root).expect("root");
         let database = Database::open_app_dir(&root).expect("database");
@@ -3446,11 +3608,14 @@ mod tests {
             .claim_announce_work(now, "worker-a", 60_000, 1)
             .expect("claim running");
         assert_eq!(running.len(), 1);
+        let daemon_metrics = Arc::new(super::DaemonMetrics::default());
+        daemon_metrics.record_announce_attempt_started();
 
         insert_announce_work(&database, "retry", now.saturating_sub(8_000), now + 60_000);
         let retrying = database
             .claim_announce_work(now + 1, "worker-a", 60_000, 1)
             .expect("claim retry");
+        daemon_metrics.record_announce_attempt_started();
         database
             .schedule_announce_retry(&AnnounceWorkRetry {
                 work_id: &retrying[0].work_id,
@@ -3462,6 +3627,7 @@ mod tests {
                 outcome_context: Some("retryable_workflow_error"),
             })
             .expect("schedule retry");
+        daemon_metrics.record_announce_retry_scheduled();
 
         insert_announce_work(
             &database,
@@ -3472,6 +3638,7 @@ mod tests {
         let succeeded = database
             .claim_announce_work(now + 3, "worker-a", 60_000, 1)
             .expect("claim succeeded");
+        daemon_metrics.record_announce_attempt_started();
         database
             .finish_announce_work(&AnnounceWorkFinish {
                 work_id: &succeeded[0].work_id,
@@ -3483,6 +3650,7 @@ mod tests {
                 outcome_context: Some("action_completed"),
             })
             .expect("finish succeeded");
+        daemon_metrics.record_announce_outcome(AnnounceWorkTerminalStatus::Succeeded);
 
         insert_announce_work(
             &database,
@@ -3493,6 +3661,7 @@ mod tests {
         let terminal = database
             .claim_announce_work(now + 5, "worker-a", 60_000, 1)
             .expect("claim terminal");
+        daemon_metrics.record_announce_attempt_started();
         database
             .finish_announce_work(&AnnounceWorkFinish {
                 work_id: &terminal[0].work_id,
@@ -3504,12 +3673,15 @@ mod tests {
                 outcome_context: Some("file_tree_mismatch"),
             })
             .expect("finish terminal");
+        daemon_metrics.record_announce_attempt_exhausted();
+        daemon_metrics.record_announce_outcome(AnnounceWorkTerminalStatus::TerminalFailed);
 
         insert_announce_work(&database, "expired", now.saturating_sub(5_000), now - 1);
         let expired = database
             .expire_announce_work(now + 7, 10)
             .expect("expire work");
         assert_eq!(expired.len(), 1);
+        daemon_metrics.record_announce_outcome(AnnounceWorkTerminalStatus::Expired);
 
         insert_announce_work(
             &database,
@@ -3524,7 +3696,7 @@ mod tests {
             config,
             services: RuntimeServices::start(CancellationToken::new()),
             scheduler: Mutex::new(Scheduler::new(Vec::new())),
-            metrics: Arc::new(super::DaemonMetrics::default()),
+            metrics: Arc::clone(&daemon_metrics),
         });
 
         let status = handle_runtime_request(
@@ -3549,6 +3721,9 @@ mod tests {
                 .as_i64()
                 .is_some_and(|delay| delay > 0 && delay <= 30)
         );
+        assert_eq!(queue["enqueues"]["queued"], 0);
+        assert_eq!(queue["enqueues"]["existing"], 0);
+        assert_eq!(queue["enqueues"]["rejected"], 0);
         assert_eq!(queue["attempts"]["started"], 4);
         assert_eq!(queue["attempts"]["retryScheduled"], 1);
         assert_eq!(queue["attempts"]["exhausted"], 1);
@@ -3556,8 +3731,8 @@ mod tests {
         assert_eq!(queue["outcomes"]["terminalFailed"], 1);
         assert_eq!(queue["outcomes"]["expired"], 1);
         assert_eq!(queue["expiryCount"], 1);
-        assert_eq!(queue["lastError"]["class"], "terminal_decision");
-        assert_eq!(queue["lastError"]["context"], "file_tree_mismatch");
+        assert_eq!(queue["lastError"]["class"], "workflow_error");
+        assert_eq!(queue["lastError"]["context"], "retryable_workflow_error");
 
         let metrics = handle_runtime_request(
             Arc::clone(&state),
@@ -3900,6 +4075,9 @@ mod tests {
                 .backlog,
             1
         );
+        let queue_metrics = state.metrics.announce_queue_metrics();
+        assert_eq!(queue_metrics.enqueues_queued, 1);
+        assert_eq!(queue_metrics.enqueues_rejected, 1);
         state.services.shutdown().await;
         let _cleanup = std::fs::remove_dir_all(root);
     }
@@ -3937,10 +4115,12 @@ mod tests {
         )
         .expect("config");
         let services = RuntimeServices::start(CancellationToken::new());
+        let metrics = Arc::new(super::DaemonMetrics::default());
         let workers = super::start_announce_workers(
             &root,
             &config,
             Arc::clone(&services),
+            Arc::clone(&metrics),
             CancellationToken::new(),
             now,
         )
@@ -3952,6 +4132,9 @@ mod tests {
             loop {
                 let stats = database.announce_queue_stats(10_000).expect("stats");
                 if stats.total_attempts == 1 {
+                    let queue_metrics = metrics.announce_queue_metrics();
+                    assert_eq!(queue_metrics.attempts_started, 1);
+                    assert_eq!(queue_metrics.attempts_retry_scheduled, 1);
                     assert_eq!(stats.backlog, 1);
                     assert_eq!(stats.running, 0);
                     assert_eq!(stats.last_error_class.as_deref(), Some("workflow_error"));
@@ -4035,10 +4218,12 @@ mod tests {
         );
 
         let services = RuntimeServices::start(CancellationToken::new());
+        let worker_metrics = Arc::new(super::DaemonMetrics::default());
         let workers = super::start_announce_workers(
             &root,
             &config,
             Arc::clone(&services),
+            Arc::clone(&worker_metrics),
             CancellationToken::new(),
             now,
         )
@@ -4050,7 +4235,13 @@ mod tests {
                 let stats = restart_database
                     .announce_queue_stats(super::now_millis())
                     .expect("retry stats");
-                if stats.total_attempts == 1 && stats.retry_scheduled == 1 && stats.expired == 1 {
+                let queue_metrics = worker_metrics.announce_queue_metrics();
+                if stats.total_attempts == 1
+                    && stats.retry_scheduled == 1
+                    && queue_metrics.outcomes_expired == 1
+                {
+                    assert_eq!(queue_metrics.attempts_started, 1);
+                    assert_eq!(queue_metrics.attempts_retry_scheduled, 1);
                     assert_eq!(stats.backlog, 1);
                     assert_eq!(stats.running, 0);
                     assert_eq!(stats.last_error_class.as_deref(), Some("workflow_error"));
@@ -4071,7 +4262,7 @@ mod tests {
             config,
             services: Arc::clone(&services),
             scheduler: Mutex::new(Scheduler::new(Vec::new())),
-            metrics: Arc::new(super::DaemonMetrics::default()),
+            metrics: Arc::clone(&worker_metrics),
         });
         let status = handle_runtime_request(
             Arc::clone(&observed_state),
@@ -4150,10 +4341,12 @@ mod tests {
         )
         .expect("config");
         let services = RuntimeServices::start(CancellationToken::new());
+        let metrics = Arc::new(super::DaemonMetrics::default());
         let workers = super::start_announce_workers(
             &root,
             &config,
             Arc::clone(&services),
+            Arc::clone(&metrics),
             CancellationToken::new(),
             now,
         )
@@ -4166,6 +4359,9 @@ mod tests {
                     .announce_queue_stats(super::now_millis())
                     .expect("stats");
                 if stats.total_attempts == 1 {
+                    let queue_metrics = metrics.announce_queue_metrics();
+                    assert_eq!(queue_metrics.attempts_started, 1);
+                    assert_eq!(queue_metrics.attempts_retry_scheduled, 1);
                     assert_eq!(stats.backlog, 1);
                     assert_eq!(stats.running, 0);
                     assert_eq!(
@@ -4194,7 +4390,7 @@ mod tests {
             config,
             services: Arc::clone(&services),
             scheduler: Mutex::new(Scheduler::new(Vec::new())),
-            metrics: Arc::new(super::DaemonMetrics::default()),
+            metrics: Arc::clone(&metrics),
         });
         let status = handle_runtime_request(
             Arc::clone(&state),

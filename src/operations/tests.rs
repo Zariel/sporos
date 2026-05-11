@@ -329,20 +329,6 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
     insert_decision(&database, searchee_id, "null-guid", None, now);
     insert_announce_work(
         &database,
-        "old-terminal",
-        "old-terminal",
-        "succeeded",
-        now - 8 * 86_400_000,
-    );
-    insert_announce_work(
-        &database,
-        "recent-terminal",
-        "recent-terminal",
-        "terminal_failed",
-        now - 86_400_000,
-    );
-    insert_announce_work(
-        &database,
         "old-active",
         "old-active",
         "queued",
@@ -364,7 +350,6 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
     assert_eq!(result.data_rows_removed, 1);
     assert_eq!(result.ensemble_rows_removed, 1);
     assert_eq!(result.torrent_cache_files_removed, 1);
-    assert_eq!(result.announce_work_pruned, 1);
     assert_eq!(result.null_decisions_removed, 1);
     assert_eq!(result.missing_cache_decisions_removed, 2);
     assert!(!result.catastrophic_decision_cleanup_skipped);
@@ -378,7 +363,7 @@ fn cleanup_prunes_cache_null_decisions_and_missing_paths() {
         database
             .query_scalar::<i64>("SELECT COUNT(*) FROM announce_work", &[])
             .expect("announce work count"),
-        2
+        1
     );
     assert_eq!(
         database

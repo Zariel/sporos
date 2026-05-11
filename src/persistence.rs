@@ -656,7 +656,7 @@ impl Database {
         self.block_on(self.inner.schedule_announce_retry(update))
     }
 
-    /// Mark announce work as succeeded, terminally failed, or expired.
+    /// Delete announce work after a terminal transition.
     pub fn finish_announce_work(&self, update: &AnnounceWorkFinish<'_>) -> crate::Result<bool> {
         self.block_on(self.inner.finish_announce_work(update))
     }
@@ -668,18 +668,6 @@ impl Database {
         limit: u32,
     ) -> crate::Result<Vec<AnnounceWorkRecord>> {
         self.block_on(self.inner.expire_announce_work(now, limit))
-    }
-
-    /// Delete terminal announce work older than the retention window.
-    pub fn prune_terminal_announce_work(
-        &self,
-        now: i64,
-        retention_millis: i64,
-    ) -> crate::Result<usize> {
-        self.block_on(
-            self.inner
-                .prune_terminal_announce_work(now, retention_millis),
-        )
     }
 
     /// Return abandoned running work to a retryable state after lease timeout.
@@ -2159,30 +2147,18 @@ impl AsyncDatabase {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Mark announce work as succeeded, terminally failed, or expired.
+    /// Delete announce work after a terminal transition.
     pub async fn finish_announce_work(
         &self,
         update: &AnnounceWorkFinish<'_>,
     ) -> crate::Result<bool> {
         let result = sqlx::query(
-            "UPDATE announce_work
-             SET status = ?3,
-                 updated_at = ?2,
-                 lease_owner = NULL,
-                 lease_expires_at = NULL,
-                 last_error_class = ?4,
-                 last_error_message = ?5,
-                 last_outcome_context = ?6
+            "DELETE FROM announce_work
              WHERE work_id = ?1
                AND status = 'running'
-               AND lease_owner = ?7",
+               AND lease_owner = ?2",
         )
         .bind(update.work_id)
-        .bind(update.now)
-        .bind(update.status.as_str())
-        .bind(update.error_class)
-        .bind(update.error_message)
-        .bind(update.outcome_context)
         .bind(update.lease_owner)
         .execute(self.pool())
         .await
@@ -2200,14 +2176,7 @@ impl AsyncDatabase {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "UPDATE announce_work
-             SET status = 'expired',
-                 updated_at = ?1,
-                 lease_owner = NULL,
-                 lease_expires_at = NULL,
-                 last_error_class = NULL,
-                 last_error_message = NULL,
-                 last_outcome_context = 'ttl_expired'
+            "DELETE FROM announce_work
              WHERE work_id IN (
                  SELECT work_id
                  FROM announce_work
@@ -2217,9 +2186,10 @@ impl AsyncDatabase {
                  LIMIT ?2
              )
              RETURNING work_id, dedupe_key, name, guid, link, tracker, cookie,
-                 status, attempts, created_at, updated_at, next_attempt_at,
-                 expires_at, lease_owner, lease_expires_at, last_error_class,
-                 last_error_message, last_outcome_context",
+                 'expired' AS status, attempts, created_at, ?1 AS updated_at,
+                 next_attempt_at, expires_at, NULL AS lease_owner,
+                 NULL AS lease_expires_at, NULL AS last_error_class,
+                 NULL AS last_error_message, 'ttl_expired' AS last_outcome_context",
         )
         .bind(now)
         .bind(i64::from(limit))
@@ -2227,28 +2197,6 @@ impl AsyncDatabase {
         .await
         .map_err(sqlx_error)?;
         Ok(rows.into_iter().map(announce_work_record).collect())
-    }
-
-    /// Delete terminal announce work older than the retention window.
-    pub async fn prune_terminal_announce_work(
-        &self,
-        now: i64,
-        retention_millis: i64,
-    ) -> crate::Result<usize> {
-        if retention_millis <= 0 {
-            return Ok(0);
-        }
-        let cutoff = now.saturating_sub(retention_millis);
-        let result = sqlx::query(
-            "DELETE FROM announce_work
-             WHERE status IN ('succeeded', 'terminal_failed', 'expired')
-               AND updated_at < ?1",
-        )
-        .bind(cutoff)
-        .execute(self.pool())
-        .await
-        .map_err(sqlx_error)?;
-        rows_affected(result.rows_affected())
     }
 
     /// Return abandoned running work to a retryable state after lease timeout.
@@ -2300,9 +2248,6 @@ impl AsyncDatabase {
             "SELECT
                 COALESCE(SUM(CASE WHEN status IN ('queued', 'retrying') THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status = 'terminal_failed' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(attempts), 0),
                 COALESCE(SUM(CASE WHEN status = 'retrying' THEN 1 ELSE 0 END), 0),
                 MIN(CASE WHEN status IN ('queued', 'retrying') THEN created_at END),
@@ -2327,13 +2272,13 @@ impl AsyncDatabase {
         Ok(AnnounceQueueStats {
             backlog: row.get(0),
             running: row.get(1),
-            succeeded: row.get(2),
-            terminal_failed: row.get(3),
-            expired: row.get(4),
-            total_attempts: row.get(5),
-            retry_scheduled: row.get(6),
-            oldest_queued_at: row.get(7),
-            next_retry_at: row.get(8),
+            succeeded: 0,
+            terminal_failed: 0,
+            expired: 0,
+            total_attempts: row.get(2),
+            retry_scheduled: row.get(3),
+            oldest_queued_at: row.get(4),
+            next_retry_at: row.get(5),
             last_error_class: last_error.as_ref().and_then(|row| row.get(0)),
             last_error_message: last_error.as_ref().and_then(|row| row.get(1)),
             last_outcome_context: last_error.as_ref().and_then(|row| row.get(2)),
@@ -2755,16 +2700,6 @@ pub enum AnnounceWorkTerminalStatus {
     Expired,
 }
 
-impl AnnounceWorkTerminalStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::TerminalFailed => "terminal_failed",
-            Self::Expired => "expired",
-        }
-    }
-}
-
 /// Terminal transition for announce work.
 #[derive(Debug, Clone, Copy)]
 pub struct AnnounceWorkFinish<'a> {
@@ -2791,13 +2726,13 @@ pub struct AnnounceQueueStats {
     pub backlog: i64,
     /// Work currently leased to a worker.
     pub running: i64,
-    /// Succeeded work rows retained for observability.
+    /// Succeeded terminal transitions retained in memory for this process.
     pub succeeded: i64,
-    /// Terminally failed work rows retained for observability.
+    /// Terminal failure transitions retained in memory for this process.
     pub terminal_failed: i64,
-    /// Expired work rows retained for observability.
+    /// Expired transitions retained in memory for this process.
     pub expired: i64,
-    /// Total claimed attempts currently visible in retained rows.
+    /// Total claimed attempts currently visible in active rows.
     pub total_attempts: i64,
     /// Retry rows waiting for their next attempt.
     pub retry_scheduled: i64,
@@ -3070,10 +3005,7 @@ CREATE TABLE IF NOT EXISTS announce_work (
     status TEXT NOT NULL CHECK (status IN (
         'queued',
         'running',
-        'retrying',
-        'succeeded',
-        'terminal_failed',
-        'expired'
+        'retrying'
     )),
     attempts INTEGER NOT NULL CHECK (attempts >= 0),
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -3103,9 +3035,6 @@ ON announce_work(status, lease_expires_at, created_at, work_id)
 WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS idx_announce_work_expiry
 ON announce_work(status, expires_at, created_at, work_id);
-CREATE INDEX IF NOT EXISTS idx_announce_work_terminal_retention
-ON announce_work(status, updated_at, work_id)
-WHERE status IN ('succeeded', 'terminal_failed', 'expired');
 CREATE INDEX IF NOT EXISTS idx_announce_work_status
 ON announce_work(status);
 

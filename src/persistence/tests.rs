@@ -99,7 +99,6 @@ fn initializes_schema_with_wal_and_documented_tables() {
         "idx_announce_work_ready",
         "idx_announce_work_running_lease",
         "idx_announce_work_expiry",
-        "idx_announce_work_terminal_retention",
         "idx_announce_work_status",
     ] {
         assert_index(&database, index);
@@ -184,6 +183,14 @@ fn schema_constraints_reject_invalid_cache_invariants() {
               attempts, created_at, updated_at, next_attempt_at, expires_at)
              VALUES ('work', 'dedupe', 'Name', 'guid', 'link', 'tracker',
               'queued', -1, 10, 10, 10, 20)",
+    );
+    assert_sql_fails(
+        &database,
+        "INSERT INTO announce_work
+             (work_id, dedupe_key, name, guid, link, tracker, status,
+              attempts, created_at, updated_at, next_attempt_at, expires_at)
+             VALUES ('work', 'dedupe', 'Name', 'guid', 'link', 'tracker',
+              'succeeded', 0, 10, 10, 10, 20)",
     );
 
     let _cleanup = fs::remove_dir_all(root);
@@ -389,14 +396,28 @@ fn announce_work_transitions_require_active_lease_owner() {
     assert!(active_finish);
 
     let stats = database.announce_queue_stats(2_400).expect("stats");
-    assert_eq!(stats.succeeded, 1);
+    assert_eq!(stats.succeeded, 0);
     assert_eq!(stats.retry_scheduled, 0);
+    assert!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM announce_work WHERE dedupe_key = 'dedupe'",
+                &[],
+            )
+            .expect("active lookup")
+            == 0
+    );
+    let repeated = database
+        .insert_or_dedupe_announce_work(&announce_insert("work", "dedupe", 2_500, 20_000))
+        .expect("repeat insert");
+    assert!(repeated.inserted);
+    assert_eq!(repeated.work.cookie.as_deref(), Some("uid=1"));
 
     let _cleanup = fs::remove_dir_all(root);
 }
 
 #[test]
-fn announce_work_updates_terminal_expiry_and_stats() {
+fn announce_work_deletes_terminal_and_expired_rows() {
     let root = temp_path("announce-work-stats");
     fs::create_dir_all(&root).expect("temp dir");
     let database = Database::open_app_dir(&root).expect("database");
@@ -466,12 +487,23 @@ fn announce_work_updates_terminal_expiry_and_stats() {
     let stats = database.announce_queue_stats(2_500).expect("stats");
     assert_eq!(stats.backlog, 0);
     assert_eq!(stats.running, 0);
-    assert_eq!(stats.succeeded, 1);
-    assert_eq!(stats.terminal_failed, 1);
-    assert_eq!(stats.expired, 1);
-    assert_eq!(stats.total_attempts, 4);
+    assert_eq!(stats.succeeded, 0);
+    assert_eq!(stats.terminal_failed, 0);
+    assert_eq!(stats.expired, 0);
+    assert_eq!(stats.total_attempts, 0);
     assert_eq!(stats.retry_scheduled, 0);
-    assert_eq!(stats.last_error_class.as_deref(), Some("terminal"));
+    assert_eq!(stats.last_error_class.as_deref(), None);
+
+    for (work_id, dedupe_key) in [
+        ("work-ok", "dedupe-ok"),
+        ("work-fail", "dedupe-fail"),
+        ("work-expire", "dedupe-expire"),
+    ] {
+        let repeated = database
+            .insert_or_dedupe_announce_work(&announce_insert(work_id, dedupe_key, 2_600, 20_000))
+            .expect("repeat insert");
+        assert!(repeated.inserted);
+    }
 
     let _cleanup = fs::remove_dir_all(root);
 }

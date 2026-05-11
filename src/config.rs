@@ -34,7 +34,6 @@ const DEFAULT_ANNOUNCE_QUEUE_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_ANNOUNCE_QUEUE_RETRY_MIN_MILLIS: u64 = 30 * 1_000;
 const DEFAULT_ANNOUNCE_QUEUE_RETRY_MAX_MILLIS: u64 = 30 * 60 * 1_000;
 const DEFAULT_ANNOUNCE_QUEUE_LEASE_MILLIS: u64 = 15 * 60 * 1_000;
-const DEFAULT_ANNOUNCE_QUEUE_TERMINAL_RETENTION_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_ANNOUNCE_QUEUE_CLAIM_BATCH_SIZE: u32 = 1;
 const MAX_ANNOUNCE_QUEUE_WORKERS: u32 = 64;
 
@@ -217,9 +216,6 @@ pub struct RawAnnounceQueueConfig {
     /// Running work lease timeout in ms.
     #[serde(deserialize_with = "deserialize_optional_duration")]
     pub lease_timeout: Option<u64>,
-    /// Terminal work retention in ms.
-    #[serde(deserialize_with = "deserialize_optional_duration")]
-    pub terminal_retention: Option<u64>,
     /// Work rows claimed in one database call.
     pub claim_batch_size: Option<u32>,
 }
@@ -239,8 +235,6 @@ pub struct AnnounceQueueConfig {
     pub retry_delay_max: u64,
     /// Running work lease timeout in ms.
     pub lease_timeout: u64,
-    /// Terminal work retention in ms.
-    pub terminal_retention: u64,
     /// Work rows claimed in one database call.
     pub claim_batch_size: u32,
 }
@@ -264,9 +258,6 @@ impl AnnounceQueueConfig {
             lease_timeout: raw
                 .lease_timeout
                 .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_LEASE_MILLIS),
-            terminal_retention: raw
-                .terminal_retention
-                .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_TERMINAL_RETENTION_MILLIS),
             claim_batch_size: raw
                 .claim_batch_size
                 .unwrap_or(DEFAULT_ANNOUNCE_QUEUE_CLAIM_BATCH_SIZE),
@@ -306,11 +297,6 @@ impl AnnounceQueueConfig {
                 "announce_queue.lease_timeout must be greater than 0",
             ));
         }
-        if self.terminal_retention == 0 {
-            return Err(config_error(
-                "announce_queue.terminal_retention must be greater than 0",
-            ));
-        }
         if self.claim_batch_size == 0 || self.claim_batch_size > self.max_accepted_backlog {
             return Err(config_error(
                 "announce_queue.claim_batch_size must be 1..=max_accepted_backlog",
@@ -329,7 +315,6 @@ impl Default for AnnounceQueueConfig {
             retry_delay_min: DEFAULT_ANNOUNCE_QUEUE_RETRY_MIN_MILLIS,
             retry_delay_max: DEFAULT_ANNOUNCE_QUEUE_RETRY_MAX_MILLIS,
             lease_timeout: DEFAULT_ANNOUNCE_QUEUE_LEASE_MILLIS,
-            terminal_retention: DEFAULT_ANNOUNCE_QUEUE_TERMINAL_RETENTION_MILLIS,
             claim_batch_size: DEFAULT_ANNOUNCE_QUEUE_CLAIM_BATCH_SIZE,
         }
     }
@@ -1054,8 +1039,6 @@ torrent_clients = []
 sonarr = []
 radarr = []
 
-[announce_queue]
-terminal_retention = "7 days"
 "#
 }
 
@@ -1147,9 +1130,6 @@ pub fn apply_env_overrides_from(
             }
             "SPOROS__ANNOUNCE_QUEUE__LEASE_TIMEOUT" => {
                 raw.announce_queue.lease_timeout = Some(parse_duration_millis(&value)?);
-            }
-            "SPOROS__ANNOUNCE_QUEUE__TERMINAL_RETENTION" => {
-                raw.announce_queue.terminal_retention = Some(parse_duration_millis(&value)?);
             }
             "SPOROS__ANNOUNCE_QUEUE__CLAIM_BATCH_SIZE" => {
                 raw.announce_queue.claim_batch_size = Some(parse_env_u32(&key, &value)?);
@@ -1413,7 +1393,6 @@ mod tests {
         assert_eq!(config.announce_queue.retry_delay_min, 30_000);
         assert_eq!(config.announce_queue.retry_delay_max, 1_800_000);
         assert_eq!(config.announce_queue.lease_timeout, 900_000);
-        assert_eq!(config.announce_queue.terminal_retention, 604_800_000);
         assert_eq!(config.announce_queue.claim_batch_size, 1);
     }
 
@@ -1650,7 +1629,6 @@ mod tests {
             retry_delay_min = "45s"
             retry_delay_max = "20 minutes"
             lease_timeout = "5 minutes"
-            terminal_retention = "14 days"
             claim_batch_size = 2
 
             [[torznab]]
@@ -1705,7 +1683,6 @@ mod tests {
         assert_eq!(raw.announce_queue.retry_delay_min, Some(45_000));
         assert_eq!(raw.announce_queue.retry_delay_max, Some(1_200_000));
         assert_eq!(raw.announce_queue.lease_timeout, Some(300_000));
-        assert_eq!(raw.announce_queue.terminal_retention, Some(1_209_600_000));
         assert_eq!(raw.announce_queue.claim_batch_size, Some(2));
         assert_eq!(
             raw.torrent_clients,
@@ -1861,10 +1838,6 @@ mod tests {
                     "2 minutes".to_owned(),
                 ),
                 (
-                    "SPOROS__ANNOUNCE_QUEUE__TERMINAL_RETENTION".to_owned(),
-                    "3 days".to_owned(),
-                ),
-                (
                     "SPOROS__ANNOUNCE_QUEUE__CLAIM_BATCH_SIZE".to_owned(),
                     "4".to_owned(),
                 ),
@@ -1899,7 +1872,6 @@ mod tests {
         assert_eq!(raw.announce_queue.retry_delay_min, Some(10_000));
         assert_eq!(raw.announce_queue.retry_delay_max, Some(300_000));
         assert_eq!(raw.announce_queue.lease_timeout, Some(120_000));
-        assert_eq!(raw.announce_queue.terminal_retention, Some(259_200_000));
         assert_eq!(raw.announce_queue.claim_batch_size, Some(4));
         assert!(raw.torznab.is_empty());
     }
@@ -1915,7 +1887,6 @@ mod tests {
             ("SPOROS__ANNOUNCE_QUEUE__WORKER_CONCURRENCY", "many"),
             ("SPOROS__ANNOUNCE_QUEUE__DEFAULT_TTL", "soon"),
             ("SPOROS__ANNOUNCE_QUEUE__CLAIM_BATCH_SIZE", "several"),
-            ("SPOROS__ANNOUNCE_QUEUE__TERMINAL_RETENTION", "later"),
         ] {
             let mut raw = RawConfig::default();
             let error = apply_env_overrides_from([(key.to_owned(), value.to_owned())], &mut raw)
@@ -1967,13 +1938,6 @@ mod tests {
             RawConfig {
                 announce_queue: super::RawAnnounceQueueConfig {
                     lease_timeout: Some(0),
-                    ..Default::default()
-                },
-                ..RawConfig::default()
-            },
-            RawConfig {
-                announce_queue: super::RawAnnounceQueueConfig {
-                    terminal_retention: Some(0),
                     ..Default::default()
                 },
                 ..RawConfig::default()

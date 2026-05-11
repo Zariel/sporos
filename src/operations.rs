@@ -109,8 +109,6 @@ pub struct CleanupDbResult {
     pub ensemble_rows_removed: usize,
     /// Torrent cache files removed because no recent decision references them.
     pub torrent_cache_files_removed: usize,
-    /// Terminal announce work rows removed after retention.
-    pub announce_work_pruned: usize,
     /// Decision rows with null info hashes removed.
     pub null_decisions_removed: usize,
     /// Decision rows removed because their cache files are missing.
@@ -316,10 +314,6 @@ pub fn cleanup_db_with_clients(
         result.ensemble_rows_removed += prune_missing_ensemble_rows(database)?;
     }
     result.torrent_cache_files_removed = prune_unused_torrent_cache(database, config, now_millis)?;
-    result.announce_work_pruned = database.prune_terminal_announce_work(
-        now_millis,
-        i64::try_from(config.announce_queue.terminal_retention).unwrap_or(i64::MAX),
-    )?;
     result.null_decisions_removed = database.delete_null_decisions()?;
     let decision_cleanup = prune_missing_cache_decisions(database, &config.torrent_cache_dir)?;
     result.missing_cache_decisions_removed = decision_cleanup.removed;
