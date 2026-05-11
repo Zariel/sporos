@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted, not implemented
 
 ## Date
 
@@ -34,6 +34,30 @@ torrent cache, client inventory, and filesystem remain the operational state.
 Announces should be treated as durable, bounded work items that drive matching
 and side effects.
 
+## Current State
+
+As of 2026-05-05, ADR 0002 has established the service foundation this ADR
+needs: `sporos serve`, standard health probes, service status, Prometheus
+metrics, structured logging, bounded in-memory runtime queues, and graceful
+shutdown behavior exist.
+
+The durable announce queue itself has not landed yet:
+
+- `/api/announce` still runs the announce workflow synchronously after request
+  validation and maps the final workflow outcome into the HTTP response;
+- `TorrentNotComplete` still returns `202` as a compatibility signal for the
+  caller to retry later;
+- the daemon computes and logs an announce work id, but does not persist it or
+  return it to the caller;
+- the SQLite schema has no announce work table or repository helpers;
+- `AnnounceQueueStatus::current()` is a disabled placeholder, so queue status,
+  readiness detail, and metrics are not backed by durable state;
+- existing retry helpers and indexer `Retry-After` state provide useful
+  building blocks, but endpoint circuit-breaker state is not implemented.
+
+This ADR should therefore be implemented as a focused service hardening effort
+on top of the existing service runtime, not as another broad runtime rewrite.
+
 ## Decision
 
 Move the project toward a durable announce work queue using an inbox-style
@@ -55,10 +79,10 @@ The target contract for accepted announce work is:
 - retry transient failures until success, terminal failure, or expiry;
 - expose queue state through health, status, logs, and Prometheus metrics.
 
-The synchronous API contract may be kept temporarily for compatibility, but it
-is not the north star for the daemon. Before a `0.1` release, the project should
-choose whether `/api/announce` itself adopts queued semantics or whether a
-separate compatibility path remains.
+The synchronous API contract is not the north star for the daemon. Because
+Sporos has not made a `0.1` release yet, `/api/announce` should adopt queued
+semantics directly for `0.1` rather than adding a separate compatibility
+endpoint first.
 
 ## North Star
 
@@ -194,22 +218,26 @@ Immediate `4xx` responses should remain for invalid requests and auth failures.
 Immediate `5xx` responses should be reserved for cases where the daemon cannot
 durably accept the work, such as database unavailability.
 
-The current synchronous result mapping should be treated as a compatibility
-contract until the project intentionally changes it before release or provides a
-separate endpoint/mode.
+The current synchronous result mapping is pre-release compatibility behavior.
+It should be replaced before `0.1` by the queued response contract for accepted
+work.
 
 ## Incremental Plan
 
-1. Add durable announce work storage and repository helpers.
-2. Add queue state and worker orchestration to the daemon runtime.
-3. Persist valid announces and process them asynchronously behind a feature or
-   compatibility boundary.
-4. Classify workflow outcomes into retryable, waiting, terminal, and succeeded
-   states.
-5. Add TTL, dedupe, bounded concurrency, and backpressure policy.
+1. Add durable announce work storage, repository helpers, and bounded policy
+   configuration.
+2. Change `/api/announce` to persist valid work and return `202 Accepted` with
+   a stable work id.
+3. Add daemon-owned queue workers with claim, lease, restart recovery,
+   cancellation, and bounded concurrency behavior.
+4. Classify announce workflow outcomes into waiting, retryable, terminal,
+   expired, and succeeded states.
+5. Add TTL, dedupe, retry delay, backpressure, and expiry policy.
 6. Integrate endpoint circuit state into retry scheduling.
-7. Expose queue metrics, breaker state, and work outcome counters.
-8. Decide the release API contract for `/api/announce` before `0.1`.
+7. Replace placeholder queue status, readiness detail, and Prometheus metrics
+   with real durable queue state.
+8. Remove the old synchronous announce response mapping once queued semantics
+   are covered by tests.
 
 ## Consequences
 
@@ -254,8 +282,6 @@ restart and would not provide enough debugging state for operators.
 ## Open Questions
 
 - What default TTL should announce work use?
-- Should `/api/announce` switch to queued semantics before `0.1`, or should a
-  separate queued endpoint/mode be introduced first?
 - What is the exact dedupe key when a tracker does not provide a stable info
   hash before torrent download?
 - Which terminal non-match decisions are safe to cache for the full TTL?
