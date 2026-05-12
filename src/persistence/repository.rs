@@ -34,6 +34,35 @@ pub struct AnnounceStatusCount {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct JobStateUpdate<'a> {
+    pub state: JobState,
+    pub last_started_at_ms: Option<i64>,
+    pub last_finished_at_ms: Option<i64>,
+    pub next_run_at_ms: Option<i64>,
+    pub last_error: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JobStatusSnapshot {
+    pub name: JobName,
+    pub state: String,
+    pub last_started_at_ms: Option<i64>,
+    pub last_finished_at_ms: Option<i64>,
+    pub next_run_at_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DependencyHealthSnapshot {
+    pub dependency_type: String,
+    pub dependency_name: DependencyName,
+    pub state: String,
+    pub reason: Option<String>,
+    pub retry_after_ms: Option<i64>,
+    pub checked_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct AnnounceRetryUpdate<'a> {
     pub reason: AnnounceReason,
     pub next_attempt_at_ms: i64,
@@ -333,25 +362,118 @@ impl Repository {
         next_run_at: Option<i64>,
         last_error: Option<&str>,
     ) -> Result<(), DatabaseError> {
+        self.record_job_status(
+            name,
+            JobStateUpdate {
+                state,
+                last_started_at_ms: None,
+                last_finished_at_ms: None,
+                next_run_at_ms: next_run_at,
+                last_error,
+            },
+        )
+        .await
+    }
+
+    pub async fn record_job_status(
+        &self,
+        name: &JobName,
+        update: JobStateUpdate<'_>,
+    ) -> Result<(), DatabaseError> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (name, state, next_run_at, last_error)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO jobs (
+                name,
+                state,
+                last_started_at,
+                last_finished_at,
+                next_run_at,
+                last_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (name) DO UPDATE SET
                 state = excluded.state,
+                last_started_at = COALESCE(excluded.last_started_at, jobs.last_started_at),
+                last_finished_at = COALESCE(excluded.last_finished_at, jobs.last_finished_at),
                 next_run_at = excluded.next_run_at,
                 last_error = excluded.last_error
             "#,
         )
         .bind(name.as_str())
-        .bind(job_state_key(state))
-        .bind(next_run_at)
-        .bind(last_error)
+        .bind(job_state_key(update.state))
+        .bind(update.last_started_at_ms)
+        .bind(update.last_finished_at_ms)
+        .bind(update.next_run_at_ms)
+        .bind(update.last_error)
         .execute(&self.pool)
         .await
-        .map_err(|error| db_error("upsert job state", error))?;
+        .map_err(|error| db_error("record job status", error))?;
 
         Ok(())
+    }
+
+    pub async fn ready_jobs(&self, now_ms: i64, limit: u16) -> Result<Vec<JobName>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT name FROM jobs
+            WHERE state NOT IN ('running', 'disabled')
+              AND (next_run_at IS NULL OR next_run_at <= ?)
+            ORDER BY COALESCE(next_run_at, -9223372036854775808), name
+            LIMIT ?
+            "#,
+        )
+        .bind(now_ms)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read ready jobs", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                JobName::new(row.get::<String, _>("name")).map_err(|error| {
+                    DatabaseError::QueryFailed {
+                        operation: "read ready job name".to_owned(),
+                        message: error.to_string(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    pub async fn job_status_snapshot(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<JobStatusSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT name, state, last_started_at, last_finished_at, next_run_at, last_error
+            FROM jobs
+            ORDER BY name
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read job status snapshot", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(JobStatusSnapshot {
+                    name: JobName::new(row.get::<String, _>("name")).map_err(|error| {
+                        DatabaseError::QueryFailed {
+                            operation: "read job status name".to_owned(),
+                            message: error.to_string(),
+                        }
+                    })?,
+                    state: row.get("state"),
+                    last_started_at_ms: row.get("last_started_at"),
+                    last_finished_at_ms: row.get("last_finished_at"),
+                    next_run_at_ms: row.get("next_run_at"),
+                    last_error: row.get("last_error"),
+                })
+            })
+            .collect()
     }
 
     pub async fn record_dependency_health(
@@ -391,6 +513,41 @@ impl Repository {
         .map_err(|error| db_error("record dependency health", error))?;
 
         Ok(())
+    }
+
+    pub async fn dependency_health_snapshot(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<DependencyHealthSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT dependency_type, dependency_name, state, reason, retry_after, checked_at
+            FROM dependency_health
+            ORDER BY dependency_type, dependency_name
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read dependency health snapshot", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(DependencyHealthSnapshot {
+                    dependency_type: row.get("dependency_type"),
+                    dependency_name: DependencyName::new(row.get::<String, _>("dependency_name"))
+                        .map_err(|error| DatabaseError::QueryFailed {
+                        operation: "read dependency name".to_owned(),
+                        message: error.to_string(),
+                    })?,
+                    state: row.get("state"),
+                    reason: row.get("reason"),
+                    retry_after_ms: row.get("retry_after"),
+                    checked_at_ms: row.get("checked_at"),
+                })
+            })
+            .collect()
     }
 
     pub async fn insert_or_dedupe_announce_work(
@@ -1401,10 +1558,45 @@ mod tests {
         };
 
         repository
-            .upsert_job_state(
+            .record_job_status(
                 &JobName::new("rss").unwrap(),
-                JobState::Waiting,
-                Some(456),
+                JobStateUpdate {
+                    state: JobState::Running,
+                    last_started_at_ms: Some(100),
+                    last_finished_at_ms: None,
+                    next_run_at_ms: Some(456),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        repository
+            .record_job_status(
+                &JobName::new("rss").unwrap(),
+                JobStateUpdate {
+                    state: JobState::Waiting,
+                    last_started_at_ms: None,
+                    last_finished_at_ms: Some(200),
+                    next_run_at_ms: Some(456),
+                    last_error: Some("rate limited"),
+                },
+            )
+            .await
+            .unwrap();
+        repository
+            .upsert_job_state(
+                &JobName::new("cleanup").unwrap(),
+                JobState::Pending,
+                Some(10),
+                None,
+            )
+            .await
+            .unwrap();
+        repository
+            .upsert_job_state(
+                &JobName::new("disabled").unwrap(),
+                JobState::Disabled,
+                Some(1),
                 None,
             )
             .await
@@ -1413,20 +1605,31 @@ mod tests {
             .record_dependency_health("indexer", &dependency_name, &dependency_state, 789)
             .await
             .unwrap();
-
-        let job_state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE name = 'rss'")
-            .fetch_one(repository.pool())
+        repository
+            .record_dependency_health(
+                "client",
+                &DependencyName::new("qbit").unwrap(),
+                &DependencyState::Healthy { checked_at_ms: 900 },
+                900,
+            )
             .await
             .unwrap();
-        let health_state: String = sqlx::query_scalar(
-            "SELECT state FROM dependency_health WHERE dependency_type = 'indexer'",
-        )
-        .fetch_one(repository.pool())
-        .await
-        .unwrap();
 
-        assert_eq!("waiting", job_state);
-        assert_eq!("degraded", health_state);
+        let ready = repository.ready_jobs(10, 10).await.unwrap();
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let health = repository.dependency_health_snapshot(1).await.unwrap();
+
+        assert_eq!(vec![JobName::new("cleanup").unwrap()], ready);
+        assert_eq!(3, jobs.len());
+        let rss = jobs.iter().find(|job| job.name.as_str() == "rss").unwrap();
+        assert_eq!("waiting", rss.state);
+        assert_eq!(Some(100), rss.last_started_at_ms);
+        assert_eq!(Some(200), rss.last_finished_at_ms);
+        assert_eq!(Some(456), rss.next_run_at_ms);
+        assert_eq!(Some("rate limited".to_owned()), rss.last_error);
+        assert_eq!(1, health.len());
+        assert_eq!("client", health[0].dependency_type);
+        assert_eq!("healthy", health[0].state);
     }
 
     #[tokio::test]
