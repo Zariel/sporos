@@ -1,0 +1,254 @@
+pub const BUSY_TIMEOUT_MS: u32 = 5_000;
+
+pub const CONNECTION_PRAGMAS: &[&str] = &[
+    "PRAGMA foreign_keys = ON;",
+    "PRAGMA journal_mode = WAL;",
+    "PRAGMA busy_timeout = 5000;",
+];
+
+pub const INITIAL_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS local_items (
+    id INTEGER PRIMARY KEY,
+    source_type TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    info_hash TEXT,
+    path TEXT,
+    save_path TEXT,
+    total_size INTEGER NOT NULL,
+    mtime_ms INTEGER,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (source_type, source_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_items_info_hash
+    ON local_items (info_hash)
+    WHERE info_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_local_items_media_title
+    ON local_items (media_type, title);
+CREATE INDEX IF NOT EXISTS idx_local_items_updated_at
+    ON local_items (updated_at);
+
+CREATE TABLE IF NOT EXISTS local_files (
+    item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE,
+    relative_path TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime_ms INTEGER,
+    file_index INTEGER NOT NULL,
+    PRIMARY KEY (item_id, file_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_files_item_size
+    ON local_files (item_id, size);
+CREATE INDEX IF NOT EXISTS idx_local_files_size_name
+    ON local_files (size, file_name);
+CREATE INDEX IF NOT EXISTS idx_local_files_relative_path
+    ON local_files (relative_path);
+
+CREATE TABLE IF NOT EXISTS remote_candidates (
+    id INTEGER PRIMARY KEY,
+    indexer_id INTEGER NOT NULL,
+    guid TEXT NOT NULL,
+    download_url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    tracker TEXT NOT NULL,
+    size INTEGER,
+    published_at INTEGER,
+    info_hash TEXT,
+    torrent_cache_path TEXT,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    UNIQUE (indexer_id, guid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_remote_candidates_info_hash
+    ON remote_candidates (info_hash);
+CREATE INDEX IF NOT EXISTS idx_remote_candidates_last_seen_at
+    ON remote_candidates (last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_remote_candidates_title
+    ON remote_candidates (title);
+CREATE INDEX IF NOT EXISTS idx_remote_candidates_published_at
+    ON remote_candidates (published_at);
+
+CREATE TABLE IF NOT EXISTS match_decisions (
+    local_item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE,
+    candidate_id INTEGER NOT NULL REFERENCES remote_candidates(id) ON DELETE CASCADE,
+    decision TEXT NOT NULL,
+    matched_size INTEGER,
+    matched_ratio REAL,
+    reason_code TEXT NOT NULL,
+    assessed_at INTEGER NOT NULL,
+    PRIMARY KEY (local_item_id, candidate_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_match_decisions_decision_assessed_at
+    ON match_decisions (decision, assessed_at);
+CREATE INDEX IF NOT EXISTS idx_match_decisions_candidate_id
+    ON match_decisions (candidate_id);
+
+CREATE TABLE IF NOT EXISTS indexers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL,
+    retry_after INTEGER,
+    last_caps_refresh_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (name),
+    UNIQUE (url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_indexers_enabled_state_retry_after
+    ON indexers (enabled, state, retry_after);
+
+CREATE TABLE IF NOT EXISTS search_history (
+    local_item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE,
+    indexer_id INTEGER NOT NULL REFERENCES indexers(id) ON DELETE CASCADE,
+    first_searched_at INTEGER NOT NULL,
+    last_searched_at INTEGER NOT NULL,
+    PRIMARY KEY (local_item_id, indexer_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_history_indexer_last_searched_at
+    ON search_history (indexer_id, last_searched_at);
+CREATE INDEX IF NOT EXISTS idx_search_history_first_searched_at
+    ON search_history (first_searched_at);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    name TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    last_started_at INTEGER,
+    last_finished_at INTEGER,
+    next_run_at INTEGER,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_next_run_at
+    ON jobs (next_run_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_state
+    ON jobs (state);
+
+CREATE TABLE IF NOT EXISTS dependency_health (
+    dependency_type TEXT NOT NULL,
+    dependency_name TEXT NOT NULL,
+    state TEXT NOT NULL,
+    reason TEXT,
+    retry_after INTEGER,
+    checked_at INTEGER NOT NULL,
+    PRIMARY KEY (dependency_type, dependency_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dependency_health_state_retry_after
+    ON dependency_health (state, retry_after);
+"#;
+
+pub const REQUIRED_TABLES: &[&str] = &[
+    "local_items",
+    "local_files",
+    "remote_candidates",
+    "match_decisions",
+    "indexers",
+    "search_history",
+    "jobs",
+    "dependency_health",
+];
+
+pub fn initial_schema_statements() -> impl Iterator<Item = &'static str> {
+    INITIAL_SCHEMA
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn connection_pragmas_enable_wal_busy_timeout_and_foreign_keys() {
+        assert!(CONNECTION_PRAGMAS.contains(&"PRAGMA foreign_keys = ON;"));
+        assert!(CONNECTION_PRAGMAS.contains(&"PRAGMA journal_mode = WAL;"));
+        assert!(CONNECTION_PRAGMAS.contains(&"PRAGMA busy_timeout = 5000;"));
+        assert_eq!(5_000, BUSY_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn schema_declares_required_tables() {
+        for table in REQUIRED_TABLES {
+            let expected = format!("CREATE TABLE IF NOT EXISTS {table}");
+            assert!(
+                INITIAL_SCHEMA.contains(&expected),
+                "schema should create {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_declares_required_keys_and_indexes() {
+        for fragment in [
+            "UNIQUE (source_type, source_key)",
+            "WHERE info_hash IS NOT NULL",
+            "PRIMARY KEY (item_id, file_index)",
+            "UNIQUE (indexer_id, guid)",
+            "PRIMARY KEY (local_item_id, candidate_id)",
+            "UNIQUE (name)",
+            "UNIQUE (url)",
+            "PRIMARY KEY (local_item_id, indexer_id)",
+            "name TEXT PRIMARY KEY",
+            "PRIMARY KEY (dependency_type, dependency_name)",
+            "idx_local_files_size_name",
+            "idx_jobs_next_run_at",
+            "idx_dependency_health_state_retry_after",
+        ] {
+            assert!(
+                INITIAL_SCHEMA.contains(fragment),
+                "schema should contain `{fragment}`"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_preserves_explicit_ownership_boundaries() {
+        assert!(
+            INITIAL_SCHEMA
+                .contains("item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE")
+        );
+        assert!(INITIAL_SCHEMA.contains(
+            "local_item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE"
+        ));
+        assert!(INITIAL_SCHEMA.contains(
+            "candidate_id INTEGER NOT NULL REFERENCES remote_candidates(id) ON DELETE CASCADE"
+        ));
+        assert!(
+            !INITIAL_SCHEMA.contains("remote_candidates(id) REFERENCES local_items"),
+            "remote candidates must not be owned by local torrent identity"
+        );
+    }
+
+    #[test]
+    fn schema_is_inline_and_sporos_native() {
+        assert!(!Path::new("migrations").exists());
+        assert!(!Path::new("src/migrations").exists());
+        let normalized = INITIAL_SCHEMA.to_ascii_lowercase();
+        assert!(!normalized.contains(&["cross", "-seed"].concat()));
+        assert!(!normalized.contains(&["cross", "seed"].concat()));
+    }
+
+    #[test]
+    fn schema_splits_into_statements_without_empty_entries() {
+        let statements = initial_schema_statements().collect::<Vec<_>>();
+
+        assert!(statements.len() > REQUIRED_TABLES.len());
+        assert!(statements.iter().all(|statement| !statement.is_empty()));
+    }
+}
