@@ -7,8 +7,8 @@ use crate::announce::{
     AnnounceDedupeHash, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
 use crate::domain::{
-    ByteSize, CandidateAssessment, CandidateGuid, DependencyName, DependencyState, InfoHash,
-    JobName, JobState, LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision,
+    ByteSize, CandidateAssessment, CandidateGuid, DependencyName, DependencyState, FileIndex,
+    InfoHash, JobName, JobState, LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision,
     MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
 };
 use crate::errors::DatabaseError;
@@ -60,6 +60,16 @@ pub struct DependencyHealthSnapshot {
     pub reason: Option<String>,
     pub retry_after_ms: Option<i64>,
     pub checked_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LocalFileSnapshot {
+    pub item_id: LocalItemId,
+    pub relative_path: PathBuf,
+    pub file_name: String,
+    pub size: ByteSize,
+    pub mtime_ms: Option<i64>,
+    pub file_index: FileIndex,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -241,7 +251,7 @@ impl Repository {
             .bind(path_to_string(&file.relative_path))
             .bind(file.file_name.as_str())
             .bind(i64_from_u64(file.size.get(), "local file size")?)
-            .bind(None::<i64>)
+            .bind(file.mtime_ms)
             .bind(i64::from(file.file_index.get()))
             .execute(&mut *transaction)
             .await
@@ -254,6 +264,100 @@ impl Repository {
             .map_err(|error| db_error("commit local item transaction", error))?;
 
         Ok(item_id)
+    }
+
+    pub async fn local_files_for_item(
+        &self,
+        item_id: LocalItemId,
+        limit: u16,
+    ) -> Result<Vec<LocalFileSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT item_id, relative_path, file_name, size, mtime_ms, file_index
+            FROM local_files
+            WHERE item_id = ?
+            ORDER BY file_index
+            LIMIT ?
+            "#,
+        )
+        .bind(i64_from_u64(item_id.get(), "local item id")?)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local files by item", error))?;
+
+        rows.into_iter().map(local_file_snapshot_from_row).collect()
+    }
+
+    pub async fn local_files_by_size(
+        &self,
+        size: ByteSize,
+        limit: u16,
+    ) -> Result<Vec<LocalFileSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT item_id, relative_path, file_name, size, mtime_ms, file_index
+            FROM local_files
+            WHERE size = ?
+            ORDER BY item_id, file_index
+            LIMIT ?
+            "#,
+        )
+        .bind(i64_from_u64(size.get(), "local file size")?)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local files by size", error))?;
+
+        rows.into_iter().map(local_file_snapshot_from_row).collect()
+    }
+
+    pub async fn local_files_by_size_and_name(
+        &self,
+        size: ByteSize,
+        file_name: &str,
+        limit: u16,
+    ) -> Result<Vec<LocalFileSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT item_id, relative_path, file_name, size, mtime_ms, file_index
+            FROM local_files
+            WHERE size = ? AND file_name = ?
+            ORDER BY item_id, file_index
+            LIMIT ?
+            "#,
+        )
+        .bind(i64_from_u64(size.get(), "local file size")?)
+        .bind(file_name)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local files by size and name", error))?;
+
+        rows.into_iter().map(local_file_snapshot_from_row).collect()
+    }
+
+    pub async fn local_files_by_relative_path(
+        &self,
+        relative_path: &Path,
+        limit: u16,
+    ) -> Result<Vec<LocalFileSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT item_id, relative_path, file_name, size, mtime_ms, file_index
+            FROM local_files
+            WHERE relative_path = ?
+            ORDER BY item_id, file_index
+            LIMIT ?
+            "#,
+        )
+        .bind(path_to_string(relative_path))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local files by relative path", error))?;
+
+        rows.into_iter().map(local_file_snapshot_from_row).collect()
     }
 
     pub async fn upsert_remote_candidate(
@@ -1269,6 +1373,37 @@ fn remote_id_from_i64(value: i64, field: &'static str) -> Result<RemoteCandidate
         })
 }
 
+fn byte_size_from_i64(value: i64, field: &'static str) -> Result<ByteSize, DatabaseError> {
+    u64::try_from(value)
+        .map(ByteSize::new)
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: format!("read {field}"),
+            message: error.to_string(),
+        })
+}
+
+fn file_index_from_i64(value: i64, field: &'static str) -> Result<FileIndex, DatabaseError> {
+    u32::try_from(value)
+        .map(FileIndex::new)
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: format!("read {field}"),
+            message: error.to_string(),
+        })
+}
+
+fn local_file_snapshot_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<LocalFileSnapshot, DatabaseError> {
+    Ok(LocalFileSnapshot {
+        item_id: id_from_i64(row.get("item_id"), "local file item id")?,
+        relative_path: PathBuf::from(row.get::<String, _>("relative_path")),
+        file_name: row.get("file_name"),
+        size: byte_size_from_i64(row.get("size"), "local file size")?,
+        mtime_ms: row.get("mtime_ms"),
+        file_index: file_index_from_i64(row.get("file_index"), "local file index")?,
+    })
+}
+
 fn remote_candidate_snapshot_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<RemoteCandidateSnapshot, DatabaseError> {
@@ -1404,14 +1539,16 @@ mod tests {
             ByteSize::new(10),
             FileIndex::new(0),
         )
-        .unwrap();
+        .unwrap()
+        .with_mtime_ms(Some(1_700_000_000_001));
         let second_file = LocalFile::new(
             None,
             PathBuf::from("Example/file-b.mkv"),
             ByteSize::new(20),
             FileIndex::new(1),
         )
-        .unwrap();
+        .unwrap()
+        .with_mtime_ms(Some(1_700_000_000_002));
 
         let item_id = repository
             .upsert_local_item_with_files(&item, &[first_file.clone(), second_file])
@@ -1429,6 +1566,130 @@ mod tests {
             .unwrap();
 
         assert_eq!(1, count);
+
+        let files = repository.local_files_for_item(item_id, 10).await.unwrap();
+
+        assert_eq!(1, files.len());
+        assert_eq!(PathBuf::from("Example/file-a.mkv"), files[0].relative_path);
+        assert_eq!("file-a.mkv", files[0].file_name);
+        assert_eq!(ByteSize::new(10), files[0].size);
+        assert_eq!(Some(1_700_000_000_001), files[0].mtime_ms);
+        assert_eq!(FileIndex::new(0), files[0].file_index);
+    }
+
+    #[tokio::test]
+    async fn local_file_queries_find_duplicate_sizes_names_and_paths() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let first_item = test_local_item("Example");
+        let mut second_item = test_local_item("Other");
+        second_item.source = LocalItemSource::Virtual {
+            source_key: SourceKey::new("other-source").unwrap(),
+        };
+        second_item.info_hash = None;
+
+        let first_file = LocalFile::new(
+            None,
+            PathBuf::from("Example/file-a.mkv"),
+            ByteSize::new(10),
+            FileIndex::new(0),
+        )
+        .unwrap()
+        .with_mtime_ms(Some(1_700_000_000_001));
+        let second_file = LocalFile::new(
+            None,
+            PathBuf::from("Other/file-a.mkv"),
+            ByteSize::new(10),
+            FileIndex::new(0),
+        )
+        .unwrap()
+        .with_mtime_ms(Some(1_700_000_000_002));
+        let third_file = LocalFile::new(
+            None,
+            PathBuf::from("Other/file-c.mkv"),
+            ByteSize::new(20),
+            FileIndex::new(1),
+        )
+        .unwrap();
+
+        let first_item_id = repository
+            .upsert_local_item_with_files(&first_item, &[first_file])
+            .await
+            .unwrap();
+        let second_item_id = repository
+            .upsert_local_item_with_files(&second_item, &[second_file, third_file])
+            .await
+            .unwrap();
+
+        let size_matches = repository
+            .local_files_by_size(ByteSize::new(10), 10)
+            .await
+            .unwrap();
+        let name_matches = repository
+            .local_files_by_size_and_name(ByteSize::new(10), "file-a.mkv", 10)
+            .await
+            .unwrap();
+        let path_matches = repository
+            .local_files_by_relative_path(&PathBuf::from("Other/file-a.mkv"), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(2, size_matches.len());
+        assert_eq!(2, name_matches.len());
+        assert_eq!(1, path_matches.len());
+        assert_eq!(second_item_id, path_matches[0].item_id);
+        assert_eq!(
+            PathBuf::from("Other/file-a.mkv"),
+            path_matches[0].relative_path
+        );
+        assert_eq!(Some(1_700_000_000_002), path_matches[0].mtime_ms);
+        assert!(
+            size_matches
+                .iter()
+                .any(|file| file.item_id == first_item_id)
+        );
+        assert!(
+            size_matches
+                .iter()
+                .any(|file| file.item_id == second_item_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn large_local_file_batches_commit_in_one_transaction() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let item = test_local_item("Example");
+        let files = (0..1_024)
+            .map(|index| {
+                LocalFile::new(
+                    None,
+                    PathBuf::from(format!("Example/file-{index:04}.mkv")),
+                    ByteSize::new(u64::from(index) + 1),
+                    FileIndex::new(index),
+                )
+                .unwrap()
+                .with_mtime_ms(Some(1_700_000_000_000 + i64::from(index)))
+            })
+            .collect::<Vec<_>>();
+
+        let item_id = repository
+            .upsert_local_item_with_files(&item, &files)
+            .await
+            .unwrap();
+        let stored = repository
+            .local_files_for_item(item_id, 2_000)
+            .await
+            .unwrap();
+
+        assert_eq!(files.len(), stored.len());
+        assert_eq!(
+            PathBuf::from("Example/file-0000.mkv"),
+            stored[0].relative_path
+        );
+        assert_eq!(
+            PathBuf::from("Example/file-1023.mkv"),
+            stored[1023].relative_path
+        );
+        assert_eq!(Some(1_700_000_001_023), stored[1023].mtime_ms);
     }
 
     #[tokio::test]

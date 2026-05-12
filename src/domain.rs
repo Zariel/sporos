@@ -272,6 +272,7 @@ pub struct LocalFile {
     pub relative_path: PathBuf,
     pub file_name: FileName,
     pub size: ByteSize,
+    pub mtime_ms: Option<i64>,
     pub file_index: FileIndex,
 }
 
@@ -289,8 +290,14 @@ impl LocalFile {
             relative_path,
             file_name,
             size,
+            mtime_ms: None,
             file_index,
         })
+    }
+
+    pub const fn with_mtime_ms(mut self, mtime_ms: Option<i64>) -> Self {
+        self.mtime_ms = mtime_ms;
+        self
     }
 }
 

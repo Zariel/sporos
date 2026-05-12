@@ -415,8 +415,9 @@ impl InventoryScanner {
                 );
                 return None;
             };
+            let mtime_ms = file.mtime_ms;
             match LocalFile::new(None, file.relative_path, file.size, FileIndex::new(index)) {
-                Ok(file) => local_files.push(file),
+                Ok(file) => local_files.push(file.with_mtime_ms(mtime_ms)),
                 Err(error) => {
                     push_domain_failure(report, root, error);
                 }
