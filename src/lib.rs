@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod errors;
+pub mod inventory;
 pub mod persistence;
 pub mod secrets;
 pub mod torrent;

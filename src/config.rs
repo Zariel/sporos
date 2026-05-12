@@ -21,6 +21,7 @@ pub struct SporosConfig {
     pub torrent_clients: BTreeMap<String, TorrentClientConfig>,
     pub indexers: IndexersConfig,
     pub matching: MatchingConfig,
+    pub inventory: InventoryConfig,
     pub scheduling: SchedulingConfig,
     pub announce: AnnounceQueueConfig,
 }
@@ -134,6 +135,20 @@ impl Default for MatchingConfig {
 pub enum MatchingMode {
     Exact,
     Partial,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InventoryConfig {
+    pub media_scan_max_depth: u16,
+}
+
+impl Default for InventoryConfig {
+    fn default() -> Self {
+        Self {
+            media_scan_max_depth: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
@@ -452,6 +467,9 @@ include_single_episodes = false
 include_non_video = false
 season_from_episodes = 1.0
 
+[inventory]
+media_scan_max_depth = 3
+
 [scheduling]
 rss_interval = "30m"
 search_interval = "24h"
@@ -642,6 +660,7 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("sporos config schema"));
         assert!(CONFIG_SCHEMA.contains("[torrent_clients.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[indexers.torznab.<name>]"));
+        assert!(CONFIG_SCHEMA.contains("[inventory]"));
         assert!(!CONFIG_SCHEMA.contains("SPOROS"));
     }
 
