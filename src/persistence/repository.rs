@@ -1079,7 +1079,48 @@ mod tests {
         CandidateGuid, ClientHost, DecisionReason, DisplayName, DownloadUrl, FileIndex, IndexerId,
         ItemTitle, MatchRatio, ReasonText, SourceKey, TrackerName,
     };
+    use crate::persistence::schema::{BUSY_TIMEOUT_MS, REQUIRED_TABLES};
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn file_backed_repository_initializes_schema_and_connection_pragmas() {
+        let root = unique_temp_dir("sqlite-pragmas");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys;")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout;")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode;")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(1, foreign_keys);
+        assert_eq!(i64::from(BUSY_TIMEOUT_MS), busy_timeout);
+        assert_eq!("wal", journal_mode);
+
+        for table in REQUIRED_TABLES {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+            assert_eq!(1, exists, "{table} should be initialized");
+        }
+
+        repository.pool().close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn local_item_upsert_replaces_file_batch_in_transaction() {
@@ -1116,6 +1157,58 @@ mod tests {
             .unwrap();
 
         assert_eq!(1, count);
+    }
+
+    #[tokio::test]
+    async fn failed_local_file_batch_rolls_back_item_and_file_replacement() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut item = test_local_item("Original");
+        let first_file = LocalFile::new(
+            None,
+            PathBuf::from("Example/file-a.mkv"),
+            ByteSize::new(10),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let duplicate_a = LocalFile::new(
+            None,
+            PathBuf::from("Example/duplicate-a.mkv"),
+            ByteSize::new(20),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let duplicate_b = LocalFile::new(
+            None,
+            PathBuf::from("Example/duplicate-b.mkv"),
+            ByteSize::new(30),
+            FileIndex::new(0),
+        )
+        .unwrap();
+
+        let item_id = repository
+            .upsert_local_item_with_files(&item, &[first_file])
+            .await
+            .unwrap();
+        item.title = ItemTitle::new("Should Roll Back").unwrap();
+        let result = repository
+            .upsert_local_item_with_files(&item, &[duplicate_a, duplicate_b])
+            .await;
+
+        let title: String = sqlx::query_scalar("SELECT title FROM local_items WHERE id = ?")
+            .bind(i64_from_u64(item_id.get(), "local item id").unwrap())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let file_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_files WHERE item_id = ?")
+                .bind(i64_from_u64(item_id.get(), "local item id").unwrap())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
+        assert_eq!("Original", title);
+        assert_eq!(1, file_count);
     }
 
     #[tokio::test]
@@ -1163,6 +1256,138 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn match_decision_records_and_reassesses_candidate_for_local_item() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let item_id = repository
+            .upsert_local_item_with_files(&test_local_item("Example"), &[])
+            .await
+            .unwrap();
+        let candidate_id = repository
+            .upsert_remote_candidate(&test_remote_candidate("guid-1", "Example"))
+            .await
+            .unwrap();
+
+        repository
+            .record_match_decision(
+                item_id,
+                candidate_id,
+                CandidateAssessment {
+                    decision: MatchDecision::Exact,
+                    reason: DecisionReason::FileTreeMatched,
+                    matched_size: Some(ByteSize::new(42)),
+                    matched_ratio: Some(MatchRatio::new(1.0).unwrap()),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        repository
+            .record_match_decision(
+                item_id,
+                candidate_id,
+                CandidateAssessment {
+                    decision: MatchDecision::NoMatch,
+                    reason: DecisionReason::NameMismatch,
+                    matched_size: Some(ByteSize::new(1)),
+                    matched_ratio: Some(MatchRatio::new(0.1).unwrap()),
+                },
+                200,
+            )
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT decision, matched_size, reason_code, assessed_at FROM match_decisions",
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+        let decision: String = row.get("decision");
+        let matched_size: i64 = row.get("matched_size");
+        let reason_code: String = row.get("reason_code");
+        let assessed_at: i64 = row.get("assessed_at");
+        let decision_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM match_decisions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(1, decision_count);
+        assert_eq!("no_match", decision);
+        assert_eq!(1, matched_size);
+        assert_eq!("name_mismatch", reason_code);
+        assert_eq!(200, assessed_at);
+    }
+
+    #[tokio::test]
+    async fn delete_cascades_remove_owned_files_and_match_decisions() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let item_id = repository
+            .upsert_local_item_with_files(
+                &test_local_item("Example"),
+                &[LocalFile::new(
+                    None,
+                    PathBuf::from("Example/file-a.mkv"),
+                    ByteSize::new(10),
+                    FileIndex::new(0),
+                )
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        let candidate_id = repository
+            .upsert_remote_candidate(&test_remote_candidate("guid-1", "Example"))
+            .await
+            .unwrap();
+        let assessment = CandidateAssessment {
+            decision: MatchDecision::Exact,
+            reason: DecisionReason::FileTreeMatched,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(1.0).unwrap()),
+        };
+
+        repository
+            .record_match_decision(item_id, candidate_id, assessment, 100)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM local_items WHERE id = ?")
+            .bind(i64_from_u64(item_id.get(), "local item id").unwrap())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+
+        let file_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_files")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let decision_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM match_decisions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(0, file_count);
+        assert_eq!(0, decision_count);
+
+        let next_item_id = repository
+            .upsert_local_item_with_files(&test_local_item("Example 2"), &[])
+            .await
+            .unwrap();
+        repository
+            .record_match_decision(next_item_id, candidate_id, assessment, 200)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM remote_candidates WHERE id = ?")
+            .bind(i64_from_u64(candidate_id.get(), "remote candidate id").unwrap())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+
+        let decision_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM match_decisions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(0, decision_count);
     }
 
     #[tokio::test]
@@ -1400,5 +1625,15 @@ mod tests {
             last_error_class: None,
             last_redacted_message: None,
         }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sporos-repository-test-{label}-{nanos}"));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }
