@@ -148,6 +148,50 @@ CREATE TABLE IF NOT EXISTS dependency_health (
 
 CREATE INDEX IF NOT EXISTS idx_dependency_health_state_retry_after
     ON dependency_health (state, retry_after);
+
+CREATE TABLE IF NOT EXISTS announce_work (
+    id TEXT PRIMARY KEY,
+    dedupe_hash TEXT NOT NULL,
+    received_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    first_attempt_at INTEGER,
+    finished_at INTEGER,
+    tracker TEXT NOT NULL,
+    guid TEXT,
+    info_hash TEXT,
+    title TEXT NOT NULL,
+    category TEXT,
+    size INTEGER,
+    published_at INTEGER,
+    redacted_download_url TEXT,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    next_attempt_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_until INTEGER,
+    last_dependency_kind TEXT,
+    last_dependency_name TEXT,
+    last_error_class TEXT,
+    last_error_message TEXT,
+    last_decision TEXT,
+    last_action_outcome TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_announce_work_active_dedupe
+    ON announce_work (dedupe_hash)
+    WHERE status IN ('queued', 'running', 'waiting', 'retryable');
+CREATE INDEX IF NOT EXISTS idx_announce_work_claimable
+    ON announce_work (status, next_attempt_at)
+    WHERE status IN ('queued', 'retryable');
+CREATE INDEX IF NOT EXISTS idx_announce_work_expires_at
+    ON announce_work (expires_at);
+CREATE INDEX IF NOT EXISTS idx_announce_work_lease_until
+    ON announce_work (lease_until)
+    WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS idx_announce_work_status_reason
+    ON announce_work (status, reason);
 "#;
 
 pub const REQUIRED_TABLES: &[&str] = &[
@@ -159,6 +203,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "search_history",
     "jobs",
     "dependency_health",
+    "announce_work",
 ];
 
 pub fn initial_schema_statements() -> impl Iterator<Item = &'static str> {
@@ -209,6 +254,11 @@ mod tests {
             "idx_local_files_size_name",
             "idx_jobs_next_run_at",
             "idx_dependency_health_state_retry_after",
+            "idx_announce_work_active_dedupe",
+            "idx_announce_work_claimable",
+            "idx_announce_work_expires_at",
+            "idx_announce_work_lease_until",
+            "idx_announce_work_status_reason",
         ] {
             assert!(
                 INITIAL_SCHEMA.contains(fragment),
@@ -242,6 +292,35 @@ mod tests {
         let normalized = INITIAL_SCHEMA.to_ascii_lowercase();
         assert!(!normalized.contains(&["cross", "-seed"].concat()));
         assert!(!normalized.contains(&["cross", "seed"].concat()));
+    }
+
+    #[test]
+    fn announce_work_schema_covers_durable_queue_state() {
+        for fragment in [
+            "id TEXT PRIMARY KEY",
+            "dedupe_hash TEXT NOT NULL",
+            "redacted_download_url TEXT",
+            "status TEXT NOT NULL",
+            "reason TEXT NOT NULL",
+            "attempt_count INTEGER NOT NULL",
+            "next_attempt_at INTEGER NOT NULL",
+            "expires_at INTEGER NOT NULL",
+            "lease_owner TEXT",
+            "lease_until INTEGER",
+            "last_dependency_kind TEXT",
+            "last_error_class TEXT",
+            "last_error_message TEXT",
+            "last_decision TEXT",
+            "last_action_outcome TEXT",
+            "WHERE status IN ('queued', 'running', 'waiting', 'retryable')",
+            "WHERE status IN ('queued', 'retryable')",
+            "WHERE status = 'running'",
+        ] {
+            assert!(
+                INITIAL_SCHEMA.contains(fragment),
+                "announce_work schema should contain `{fragment}`"
+            );
+        }
     }
 
     #[test]
