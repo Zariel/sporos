@@ -70,7 +70,7 @@ mod tests {
         .unwrap();
 
         assert!(output.contains("sporos config ok"));
-        fs::remove_file(config_path).unwrap();
+        remove_temp_config(config_path);
     }
 
     #[test]
@@ -86,7 +86,7 @@ mod tests {
         .unwrap();
 
         assert!(output.contains("sporos serve configuration loaded"));
-        fs::remove_file(config_path).unwrap();
+        remove_temp_config(config_path);
     }
 
     #[test]
@@ -106,8 +106,30 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("sporos-test-{nanos}.toml"));
+        let root = std::env::temp_dir().join(format!("sporos-cli-test-{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let contents = format!(
+            r#"
+            [paths]
+            database = "{}/state/sporos.db"
+            torrent_cache_dir = "{}/cache/torrents"
+            output_dir = "{}/output"
+
+            {contents}
+            "#,
+            root.display(),
+            root.display(),
+            root.display()
+        );
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    fn remove_temp_config(path: PathBuf) {
+        let Some(root) = path.parent() else {
+            return;
+        };
+        fs::remove_dir_all(root).unwrap();
     }
 }
