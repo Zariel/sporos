@@ -5,5 +5,6 @@ pub mod domain;
 pub mod errors;
 pub mod inventory;
 pub mod persistence;
+pub mod runtime;
 pub mod secrets;
 pub mod torrent;

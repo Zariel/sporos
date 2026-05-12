@@ -39,7 +39,7 @@ impl std::error::Error for DomainError {}
 
 type DomainResult<T> = Result<T, DomainError>;
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct NonEmptyText(String);
 
 impl NonEmptyText {
@@ -59,7 +59,7 @@ impl NonEmptyText {
 
 macro_rules! text_newtype {
     ($name:ident, $field:literal) => {
-        #[derive(Debug, Clone, Eq, PartialEq, Hash)]
+        #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
         pub struct $name(NonEmptyText);
 
         impl $name {
