@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, Row, SqlitePool};
@@ -60,6 +60,26 @@ pub struct DependencyHealthSnapshot {
     pub reason: Option<String>,
     pub retry_after_ms: Option<i64>,
     pub checked_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteCandidateSnapshot {
+    pub id: RemoteCandidateId,
+    pub indexer_id: u64,
+    pub guid: CandidateGuid,
+    pub title: String,
+    pub info_hash: Option<InfoHash>,
+    pub torrent_cache_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchDecisionSnapshot {
+    pub candidate_id: RemoteCandidateId,
+    pub decision: String,
+    pub matched_size: Option<i64>,
+    pub matched_ratio: Option<f64>,
+    pub reason_code: String,
+    pub assessed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -353,6 +373,65 @@ impl Repository {
         .map_err(|error| db_error("record match decision", error))?;
 
         Ok(())
+    }
+
+    pub async fn remote_candidates_by_info_hash(
+        &self,
+        info_hash: &InfoHash,
+        limit: u16,
+    ) -> Result<Vec<RemoteCandidateSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, indexer_id, guid, title, info_hash, torrent_cache_path
+            FROM remote_candidates
+            WHERE info_hash = ?
+            ORDER BY last_seen_at DESC, id
+            LIMIT ?
+            "#,
+        )
+        .bind(info_hash.as_str())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup remote candidates by info hash", error))?;
+
+        rows.into_iter()
+            .map(remote_candidate_snapshot_from_row)
+            .collect()
+    }
+
+    pub async fn match_decisions_for_local_item(
+        &self,
+        local_item_id: LocalItemId,
+        limit: u16,
+    ) -> Result<Vec<MatchDecisionSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT candidate_id, decision, matched_size, matched_ratio, reason_code, assessed_at
+            FROM match_decisions
+            WHERE local_item_id = ?
+            ORDER BY assessed_at DESC, candidate_id
+            LIMIT ?
+            "#,
+        )
+        .bind(i64_from_u64(local_item_id.get(), "local item id")?)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read local item match decisions", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(MatchDecisionSnapshot {
+                    candidate_id: remote_id_from_i64(row.get("candidate_id"), "candidate id")?,
+                    decision: row.get("decision"),
+                    matched_size: row.get("matched_size"),
+                    matched_ratio: row.get("matched_ratio"),
+                    reason_code: row.get("reason_code"),
+                    assessed_at_ms: row.get("assessed_at"),
+                })
+            })
+            .collect()
     }
 
     pub async fn upsert_job_state(
@@ -1190,6 +1269,41 @@ fn remote_id_from_i64(value: i64, field: &'static str) -> Result<RemoteCandidate
         })
 }
 
+fn remote_candidate_snapshot_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<RemoteCandidateSnapshot, DatabaseError> {
+    let indexer_id = u64::try_from(row.get::<i64, _>("indexer_id")).map_err(|error| {
+        DatabaseError::QueryFailed {
+            operation: "read candidate indexer id".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let info_hash = row
+        .get::<Option<String>, _>("info_hash")
+        .map(InfoHash::new)
+        .transpose()
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: "read candidate info hash".to_owned(),
+            message: error.to_string(),
+        })?;
+
+    Ok(RemoteCandidateSnapshot {
+        id: remote_id_from_i64(row.get("id"), "remote candidate id")?,
+        indexer_id,
+        guid: CandidateGuid::new(row.get::<String, _>("guid")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read candidate guid".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        title: row.get("title"),
+        info_hash,
+        torrent_cache_path: row
+            .get::<Option<String>, _>("torrent_cache_path")
+            .map(PathBuf::from),
+    })
+}
+
 fn db_error(operation: &'static str, error: sqlx::Error) -> DatabaseError {
     let message = error.to_string();
     if message.contains("database is locked") || message.contains("database is busy") {
@@ -1379,6 +1493,7 @@ mod tests {
             .await
             .unwrap();
         candidate.title = ItemTitle::new("Updated").unwrap();
+        candidate.torrent_cache_path = Some(PathBuf::from("/cache/fedcba.cached.torrent"));
         let second_id = repository
             .upsert_remote_candidate(&candidate)
             .await
@@ -1389,9 +1504,19 @@ mod tests {
             .fetch_one(repository.pool())
             .await
             .unwrap();
+        let info_hash_matches = repository
+            .remote_candidates_by_info_hash(candidate.info_hash.as_ref().unwrap(), 10)
+            .await
+            .unwrap();
 
         assert_eq!(first_id, second_id);
         assert_eq!("Updated", title);
+        assert_eq!(1, info_hash_matches.len());
+        assert_eq!(first_id, info_hash_matches[0].id);
+        assert_eq!(
+            Some(PathBuf::from("/cache/fedcba.cached.torrent")),
+            info_hash_matches[0].torrent_cache_path
+        );
     }
 
     #[tokio::test]
@@ -1471,12 +1596,21 @@ mod tests {
             .fetch_one(repository.pool())
             .await
             .unwrap();
+        let decisions = repository
+            .match_decisions_for_local_item(item_id, 10)
+            .await
+            .unwrap();
 
         assert_eq!(1, decision_count);
         assert_eq!("no_match", decision);
         assert_eq!(1, matched_size);
         assert_eq!("name_mismatch", reason_code);
         assert_eq!(200, assessed_at);
+        assert_eq!(1, decisions.len());
+        assert_eq!(candidate_id, decisions[0].candidate_id);
+        assert_eq!("no_match", decisions[0].decision);
+        assert_eq!(Some(1), decisions[0].matched_size);
+        assert_eq!(Some(0.1), decisions[0].matched_ratio);
     }
 
     #[tokio::test]
