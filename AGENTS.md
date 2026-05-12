@@ -128,14 +128,21 @@ must pass with no warnings.
 
 ## Architecture Overview
 
-Sporos is past the TypeScript-to-Rust rewrite phase. Treat the current Rust
-code, tests, ADRs, and beads issues as the active project contract. Do not use
-old rewrite planning material as a source of truth for CLI flags, TOML config
-semantics, HTTP API behavior, torrent cache and output filenames, matching
-decisions, scheduler behavior, or torrent-client side effects. The Rust-native
-TOML configuration and initial Rust schema are the supported contract; do not
-add alternate configuration loaders or schema compatibility layers unless a
-ticket explicitly changes that contract.
+Sporos is in a phase-one Rust rewrite. During this phase, use
+`docs/internal/10-sporos-rust-rewrite.md` as the controlling architecture guide.
+The other `docs/internal` files are source-analysis research only; use them for
+behavioral context and edge cases where they do not conflict with the Sporos
+rewrite guide.
+
+Treat `docs/internal` as read-only rewrite scaffolding. Do not edit, regenerate,
+stage, or commit files under `docs/internal`; if durable project context is
+needed, move it into Rust code, tests, ADRs, operator docs, beads issues, or
+this file instead. After the rewrite phase, treat the current Rust code, tests,
+ADRs, and beads issues as the active project contract, and do not rely on
+removed internal research docs. The Rust-native TOML configuration and initial
+Rust schema are the supported contract; do not add alternate configuration
+loaders or schema compatibility layers unless a ticket explicitly changes that
+contract.
 
 SQLite schema changes are folded into the inline initial schema until the first
 Rust release. Do not add migration files for unreleased schema changes. After
