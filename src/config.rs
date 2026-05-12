@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::announce::AnnounceQueueConfig;
 use crate::errors::ConfigError;
 
 pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
@@ -18,6 +19,7 @@ pub struct SporosConfig {
     pub indexers: IndexersConfig,
     pub matching: MatchingConfig,
     pub scheduling: SchedulingConfig,
+    pub announce: AnnounceQueueConfig,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
@@ -162,10 +164,21 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SporosConfig, ConfigError> 
 }
 
 pub fn parse_config(contents: &str) -> Result<SporosConfig, ConfigError> {
-    toml::from_str(contents).map_err(|error| ConfigError::InvalidField {
-        field: "config",
-        reason: error.to_string(),
-    })
+    let config: SporosConfig =
+        toml::from_str(contents).map_err(|error| ConfigError::InvalidField {
+            field: "config",
+            reason: error.to_string(),
+        })?;
+
+    config
+        .announce
+        .validate()
+        .map_err(|error| ConfigError::InvalidField {
+            field: "announce",
+            reason: error.to_string(),
+        })?;
+
+    Ok(config)
 }
 
 pub const CONFIG_SCHEMA: &str = r#"sporos config schema
@@ -207,6 +220,19 @@ rss_interval = "30m"
 search_interval = "24h"
 indexer_caps_interval = "24h"
 cleanup_interval = "24h"
+
+[announce]
+max_pending = 1000
+worker_concurrency = 2
+claim_batch_size = 10
+lease_duration_secs = 300
+lease_renewal_secs = 120
+default_ttl_secs = 86400
+retry_initial_delay_secs = 30
+retry_max_delay_secs = 3600
+retry_jitter_ratio = 0.2
+success_retention_secs = 604800
+failure_retention_secs = 1209600
 "#;
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+pub mod announce;
 pub mod cli;
 pub mod config;
 pub mod domain;
