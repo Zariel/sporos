@@ -321,6 +321,7 @@ impl Error for TorrentClientError {}
 pub enum TorrentParseError {
     InvalidBencode { message: String },
     InvalidInfoHash { source: DomainError },
+    InvalidMetafile { source: DomainError },
     MissingInfoDictionary,
     UnsupportedLayout { message: String },
 }
@@ -340,6 +341,9 @@ impl fmt::Display for TorrentParseError {
             Self::InvalidInfoHash { source } => {
                 write!(formatter, "invalid torrent info hash: {source}")
             }
+            Self::InvalidMetafile { source } => {
+                write!(formatter, "invalid torrent metadata: {source}")
+            }
             Self::MissingInfoDictionary => {
                 write!(formatter, "torrent is missing an info dictionary")
             }
@@ -353,7 +357,7 @@ impl fmt::Display for TorrentParseError {
 impl Error for TorrentParseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidInfoHash { source } => Some(source),
+            Self::InvalidInfoHash { source } | Self::InvalidMetafile { source } => Some(source),
             Self::InvalidBencode { .. }
             | Self::MissingInfoDictionary
             | Self::UnsupportedLayout { .. } => None,
