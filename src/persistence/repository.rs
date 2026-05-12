@@ -3,10 +3,13 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, Row, SqlitePool};
 
+use crate::announce::{
+    AnnounceDedupeHash, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
+};
 use crate::domain::{
-    ByteSize, CandidateAssessment, DependencyName, DependencyState, InfoHash, JobName, JobState,
-    LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision, MediaType, RemoteCandidate,
-    RemoteCandidateId,
+    ByteSize, CandidateAssessment, CandidateGuid, DependencyName, DependencyState, InfoHash,
+    JobName, JobState, LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision,
+    MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
 };
 use crate::errors::DatabaseError;
 
@@ -15,6 +18,37 @@ use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
 #[derive(Debug, Clone)]
 pub struct Repository {
     pool: SqlitePool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum AnnounceInsertResult {
+    Inserted { id: AnnounceWorkId },
+    Deduplicated { id: AnnounceWorkId },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceStatusCount {
+    pub status: String,
+    pub reason: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AnnounceRetryUpdate<'a> {
+    pub reason: AnnounceReason,
+    pub next_attempt_at_ms: i64,
+    pub now_ms: i64,
+    pub error_class: &'a str,
+    pub redacted_message: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct LeasedTransition<'a> {
+    status: AnnounceStatus,
+    reason: AnnounceReason,
+    next_attempt_at_ms: Option<i64>,
+    now_ms: i64,
+    dependency: Option<(&'a str, &'a str)>,
 }
 
 impl Repository {
@@ -358,6 +392,515 @@ impl Repository {
 
         Ok(())
     }
+
+    pub async fn insert_or_dedupe_announce_work(
+        &self,
+        work: &AnnounceWorkItem,
+        max_pending: u32,
+    ) -> Result<AnnounceInsertResult, DatabaseError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("begin announce insert transaction", error))?;
+
+        if let Some(id) = select_active_announce_id(&mut transaction, &work.dedupe_hash).await? {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| db_error("commit announce dedupe transaction", error))?;
+            return Ok(AnnounceInsertResult::Deduplicated { id });
+        }
+
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM announce_work WHERE status IN ('queued', 'running', 'waiting', 'retryable')",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| db_error("count active announce work", error))?;
+
+        if active_count >= i64::from(max_pending) {
+            return Err(DatabaseError::Busy {
+                operation: "accept announce work".to_owned(),
+                retry_after_ms: None,
+            });
+        }
+
+        insert_announce_work(&mut transaction, work).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit announce insert transaction", error))?;
+
+        Ok(AnnounceInsertResult::Inserted {
+            id: work.id.clone(),
+        })
+    }
+
+    pub async fn claim_announce_work(
+        &self,
+        owner: &str,
+        now_ms: i64,
+        lease_until_ms: i64,
+        limit: u16,
+    ) -> Result<Vec<AnnounceWorkId>, DatabaseError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("begin announce claim transaction", error))?;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id FROM announce_work
+            WHERE status IN ('queued', 'retryable')
+              AND next_attempt_at <= ?
+              AND expires_at > ?
+            ORDER BY next_attempt_at, received_at
+            LIMIT ?
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|error| db_error("select claimable announce work", error))?;
+
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = AnnounceWorkId::new(row.get::<String, _>("id")).map_err(|error| {
+                DatabaseError::QueryFailed {
+                    operation: "read announce work id".to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+            sqlx::query(
+                r#"
+                UPDATE announce_work
+                SET status = 'running',
+                    reason = 'accepted',
+                    attempt_count = attempt_count + 1,
+                    first_attempt_at = COALESCE(first_attempt_at, ?),
+                    updated_at = ?,
+                    lease_owner = ?,
+                    lease_until = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(now_ms)
+            .bind(now_ms)
+            .bind(owner)
+            .bind(lease_until_ms)
+            .bind(id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| db_error("claim announce work", error))?;
+            claimed.push(id);
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit announce claim transaction", error))?;
+
+        Ok(claimed)
+    }
+
+    pub async fn renew_announce_lease(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        lease_until_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET lease_until = ?, updated_at = ?
+            WHERE id = ? AND lease_owner = ? AND status = 'running'
+            "#,
+        )
+        .bind(lease_until_ms)
+        .bind(now_ms)
+        .bind(id.as_str())
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("renew announce lease", error))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn release_announce_lease(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        reason: AnnounceReason,
+        next_attempt_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        self.transition_leased(
+            id,
+            owner,
+            LeasedTransition {
+                status: AnnounceStatus::Queued,
+                reason,
+                next_attempt_at_ms: Some(next_attempt_at_ms),
+                now_ms,
+                dependency: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn mark_announce_waiting(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        reason: AnnounceReason,
+        next_attempt_at_ms: i64,
+        now_ms: i64,
+        dependency: Option<(&str, &str)>,
+    ) -> Result<bool, DatabaseError> {
+        self.transition_leased(
+            id,
+            owner,
+            LeasedTransition {
+                status: AnnounceStatus::Waiting,
+                reason,
+                next_attempt_at_ms: Some(next_attempt_at_ms),
+                now_ms,
+                dependency,
+            },
+        )
+        .await
+    }
+
+    pub async fn mark_announce_retryable(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        update: AnnounceRetryUpdate<'_>,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'retryable',
+                reason = ?,
+                next_attempt_at = ?,
+                updated_at = ?,
+                lease_owner = NULL,
+                lease_until = NULL,
+                last_error_class = ?,
+                last_error_message = ?
+            WHERE id = ? AND lease_owner = ? AND status = 'running'
+            "#,
+        )
+        .bind(announce_reason_key(update.reason))
+        .bind(update.next_attempt_at_ms)
+        .bind(update.now_ms)
+        .bind(update.error_class)
+        .bind(update.redacted_message)
+        .bind(id.as_str())
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("mark announce retryable", error))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn mark_announce_succeeded(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        reason: AnnounceReason,
+        outcome: &str,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        self.finish_announce(
+            id,
+            owner,
+            AnnounceStatus::Succeeded,
+            reason,
+            Some(outcome),
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn mark_announce_terminal_failed(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        reason: AnnounceReason,
+        redacted_message: &str,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'terminal_failed',
+                reason = ?,
+                updated_at = ?,
+                finished_at = ?,
+                lease_owner = NULL,
+                lease_until = NULL,
+                last_error_message = ?
+            WHERE id = ? AND lease_owner = ? AND status = 'running'
+            "#,
+        )
+        .bind(announce_reason_key(reason))
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(redacted_message)
+        .bind(id.as_str())
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("mark announce terminal failed", error))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn expire_announce_work(&self, now_ms: i64) -> Result<u64, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'expired',
+                reason = 'expired',
+                updated_at = ?,
+                finished_at = ?,
+                lease_owner = NULL,
+                lease_until = NULL
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+              AND expires_at <= ?
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("expire announce work", error))?;
+
+        Ok(result.rows_affected())
+    }
+
+    pub async fn recover_stale_announce_leases(&self, now_ms: i64) -> Result<u64, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'queued',
+                reason = 'dependency_backoff',
+                updated_at = ?,
+                lease_owner = NULL,
+                lease_until = NULL
+            WHERE status = 'running' AND lease_until <= ?
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("recover stale announce leases", error))?;
+
+        Ok(result.rows_affected())
+    }
+
+    pub async fn announce_status_counts(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<AnnounceStatusCount>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT status, reason, COUNT(*) AS count
+            FROM announce_work
+            GROUP BY status, reason
+            ORDER BY count DESC, status, reason
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce status counts", error))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| AnnounceStatusCount {
+                status: row.get("status"),
+                reason: row.get("reason"),
+                count: row.get("count"),
+            })
+            .collect())
+    }
+
+    async fn transition_leased(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        transition: LeasedTransition<'_>,
+    ) -> Result<bool, DatabaseError> {
+        let (dependency_kind, dependency_name) = transition.dependency.unwrap_or(("", ""));
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = ?,
+                reason = ?,
+                next_attempt_at = COALESCE(?, next_attempt_at),
+                updated_at = ?,
+                lease_owner = NULL,
+                lease_until = NULL,
+                last_dependency_kind = NULLIF(?, ''),
+                last_dependency_name = NULLIF(?, '')
+            WHERE id = ? AND lease_owner = ? AND status = 'running'
+            "#,
+        )
+        .bind(announce_status_key(transition.status))
+        .bind(announce_reason_key(transition.reason))
+        .bind(transition.next_attempt_at_ms)
+        .bind(transition.now_ms)
+        .bind(dependency_kind)
+        .bind(dependency_name)
+        .bind(id.as_str())
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("transition leased announce work", error))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn finish_announce(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        status: AnnounceStatus,
+        reason: AnnounceReason,
+        outcome: Option<&str>,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = ?,
+                reason = ?,
+                updated_at = ?,
+                finished_at = ?,
+                lease_owner = NULL,
+                lease_until = NULL,
+                last_action_outcome = ?
+            WHERE id = ? AND lease_owner = ? AND status = 'running'
+            "#,
+        )
+        .bind(announce_status_key(status))
+        .bind(announce_reason_key(reason))
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(outcome)
+        .bind(id.as_str())
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("finish announce work", error))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+}
+
+async fn select_active_announce_id(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    dedupe_hash: &AnnounceDedupeHash,
+) -> Result<Option<AnnounceWorkId>, DatabaseError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id FROM announce_work
+        WHERE dedupe_hash = ?
+          AND status IN ('queued', 'running', 'waiting', 'retryable')
+        ORDER BY received_at
+        LIMIT 1
+        "#,
+    )
+    .bind(dedupe_hash.as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| db_error("select active announce dedupe", error))?;
+
+    row.map(|row| AnnounceWorkId::new(row.get::<String, _>("id")))
+        .transpose()
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: "read announce work id".to_owned(),
+            message: error.to_string(),
+        })
+}
+
+async fn insert_announce_work(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    work: &AnnounceWorkItem,
+) -> Result<(), DatabaseError> {
+    sqlx::query(
+        r#"
+        INSERT INTO announce_work (
+            id,
+            dedupe_hash,
+            received_at,
+            updated_at,
+            first_attempt_at,
+            finished_at,
+            tracker,
+            guid,
+            info_hash,
+            title,
+            size,
+            status,
+            reason,
+            attempt_count,
+            next_attempt_at,
+            expires_at,
+            lease_owner,
+            lease_until,
+            last_dependency_kind,
+            last_dependency_name,
+            last_error_class,
+            last_error_message
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(work.id.as_str())
+    .bind(work.dedupe_hash.as_str())
+    .bind(work.received_at_ms)
+    .bind(work.updated_at_ms)
+    .bind(work.first_attempt_at_ms)
+    .bind(work.finished_at_ms)
+    .bind(work.tracker.as_str())
+    .bind(work.guid.as_ref().map(CandidateGuid::as_str))
+    .bind(work.info_hash.as_ref().map(InfoHash::as_str))
+    .bind(work.title.as_str())
+    .bind(
+        work.size
+            .map(ByteSize::get)
+            .map(|size| i64_from_u64(size, "announce size"))
+            .transpose()?,
+    )
+    .bind(announce_status_key(work.status))
+    .bind(announce_reason_key(work.reason))
+    .bind(i64::from(work.attempt_count))
+    .bind(work.next_attempt_at_ms)
+    .bind(work.expires_at_ms)
+    .bind(work.lease.as_ref().map(|lease| lease.owner.as_str()))
+    .bind(work.lease.as_ref().map(|lease| lease.lease_until_ms))
+    .bind(work.last_dependency_kind.as_ref().map(ReasonText::as_str))
+    .bind(work.last_dependency_name.as_ref().map(ReasonText::as_str))
+    .bind(work.last_error_class.as_ref().map(ReasonText::as_str))
+    .bind(work.last_redacted_message.as_ref().map(ReasonText::as_str))
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("insert announce work", error))?;
+
+    Ok(())
 }
 
 fn local_source(source: &LocalItemSource) -> (String, String) {
@@ -427,6 +970,41 @@ fn dependency_state_row(state: &DependencyState) -> (&'static str, Option<&str>,
     }
 }
 
+fn announce_status_key(status: AnnounceStatus) -> &'static str {
+    match status {
+        AnnounceStatus::Queued => "queued",
+        AnnounceStatus::Running => "running",
+        AnnounceStatus::Waiting => "waiting",
+        AnnounceStatus::Retryable => "retryable",
+        AnnounceStatus::Succeeded => "succeeded",
+        AnnounceStatus::TerminalFailed => "terminal_failed",
+        AnnounceStatus::Expired => "expired",
+    }
+}
+
+fn announce_reason_key(reason: AnnounceReason) -> &'static str {
+    match reason {
+        AnnounceReason::Accepted => "accepted",
+        AnnounceReason::Deduplicated => "deduplicated",
+        AnnounceReason::SourceIncomplete => "source_incomplete",
+        AnnounceReason::InventoryRefreshing => "inventory_refreshing",
+        AnnounceReason::DependencyBackoff => "dependency_backoff",
+        AnnounceReason::CandidateDownloading => "candidate_downloading",
+        AnnounceReason::ClientChecking => "client_checking",
+        AnnounceReason::RetryAfter => "retry_after",
+        AnnounceReason::TransientDependencyFailure => "transient_dependency_failure",
+        AnnounceReason::Saved => "saved",
+        AnnounceReason::Injected => "injected",
+        AnnounceReason::AlreadyExists => "already_exists",
+        AnnounceReason::NoMatchTerminal => "no_match_terminal",
+        AnnounceReason::InvalidRequest => "invalid_request",
+        AnnounceReason::UnsupportedShape => "unsupported_shape",
+        AnnounceReason::UnsafePath => "unsafe_path",
+        AnnounceReason::InvalidTorrentMetadata => "invalid_torrent_metadata",
+        AnnounceReason::Expired => "expired",
+    }
+}
+
 fn i64_from_u64(value: u64, field: &'static str) -> Result<i64, DatabaseError> {
     i64::try_from(value).map_err(|error| DatabaseError::QueryFailed {
         operation: format!("convert {field} to sqlite integer"),
@@ -493,6 +1071,10 @@ impl SnakeCase for str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::announce::{
+        AnnounceDedupeIdentity, AnnounceLease, AnnounceReason, AnnounceStatus, AnnounceWorkId,
+        AnnounceWorkItem,
+    };
     use crate::domain::{
         CandidateGuid, ClientHost, DecisionReason, DisplayName, DownloadUrl, FileIndex, IndexerId,
         ItemTitle, MatchRatio, ReasonText, SourceKey, TrackerName,
@@ -621,6 +1203,138 @@ mod tests {
         assert_eq!("degraded", health_state);
     }
 
+    #[tokio::test]
+    async fn announce_insert_deduplicates_and_enforces_capacity() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let work = test_announce_work("ann_01", "guid-1", 1);
+        let duplicate = test_announce_work("ann_02", "guid-1", 2);
+        let other = test_announce_work("ann_03", "guid-2", 3);
+
+        let inserted = repository
+            .insert_or_dedupe_announce_work(&work, 1)
+            .await
+            .unwrap();
+        let deduped = repository
+            .insert_or_dedupe_announce_work(&duplicate, 1)
+            .await
+            .unwrap();
+        let full = repository.insert_or_dedupe_announce_work(&other, 1).await;
+
+        assert_eq!(
+            AnnounceInsertResult::Inserted {
+                id: AnnounceWorkId::new("ann_01").unwrap()
+            },
+            inserted
+        );
+        assert_eq!(
+            AnnounceInsertResult::Deduplicated {
+                id: AnnounceWorkId::new("ann_01").unwrap()
+            },
+            deduped
+        );
+        assert!(matches!(full, Err(DatabaseError::Busy { .. })));
+    }
+
+    #[tokio::test]
+    async fn announce_claim_lease_retry_and_success_flow() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let work = test_announce_work("ann_10", "guid-10", 1);
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+
+        let claimed = repository
+            .claim_announce_work("worker-1", 10, 100, 5)
+            .await
+            .unwrap();
+        assert_eq!(vec![AnnounceWorkId::new("ann_10").unwrap()], claimed);
+        assert!(
+            repository
+                .renew_announce_lease(&claimed[0], "worker-1", 120, 20)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .mark_announce_retryable(
+                    &claimed[0],
+                    "worker-1",
+                    AnnounceRetryUpdate {
+                        reason: AnnounceReason::RetryAfter,
+                        next_attempt_at_ms: 50,
+                        now_ms: 25,
+                        error_class: "retryable_dependency",
+                        redacted_message: "rate limited",
+                    },
+                )
+                .await
+                .unwrap()
+        );
+
+        let early = repository
+            .claim_announce_work("worker-1", 49, 150, 5)
+            .await
+            .unwrap();
+        let ready = repository
+            .claim_announce_work("worker-1", 50, 150, 5)
+            .await
+            .unwrap();
+        assert!(early.is_empty());
+        assert_eq!(vec![AnnounceWorkId::new("ann_10").unwrap()], ready);
+        assert!(
+            repository
+                .mark_announce_succeeded(
+                    &ready[0],
+                    "worker-1",
+                    AnnounceReason::Injected,
+                    "injected",
+                    60
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn announce_expiry_recovery_and_status_snapshots_work() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut expired = test_announce_work("ann_20", "guid-20", 1);
+        expired.expires_at_ms = 5;
+        let mut running = test_announce_work("ann_21", "guid-21", 1);
+        running.status = AnnounceStatus::Running;
+        running.lease =
+            Some(AnnounceLease::new(ReasonText::new("worker-1").unwrap(), 5, 1).unwrap());
+
+        repository
+            .insert_or_dedupe_announce_work(&expired, 10)
+            .await
+            .unwrap();
+        repository
+            .insert_or_dedupe_announce_work(&running, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(1, repository.expire_announce_work(10).await.unwrap());
+        assert_eq!(
+            1,
+            repository.recover_stale_announce_leases(10).await.unwrap()
+        );
+
+        let stats = repository.announce_status_counts(10).await.unwrap();
+
+        assert!(
+            stats
+                .iter()
+                .any(|count| count.status == "expired" && count.count == 1)
+        );
+        assert!(
+            stats
+                .iter()
+                .any(|count| count.status == "queued" && count.count == 1)
+        );
+    }
+
     fn test_local_item(title: &str) -> LocalItem {
         LocalItem {
             id: None,
@@ -651,6 +1365,40 @@ mod tests {
             published_at_ms: Some(1_700_000_000_000),
             info_hash: Some(InfoHash::new("fedcba9876543210fedcba9876543210fedcba98").unwrap()),
             torrent_cache_path: None,
+        }
+    }
+
+    fn test_announce_work(id: &str, guid: &str, received_at_ms: i64) -> AnnounceWorkItem {
+        let tracker = TrackerName::new("tracker.example").unwrap();
+        let guid = CandidateGuid::new(guid).unwrap();
+        let dedupe_hash = AnnounceDedupeIdentity::Guid {
+            tracker: tracker.clone(),
+            guid: guid.clone(),
+        }
+        .hash();
+
+        AnnounceWorkItem {
+            id: AnnounceWorkId::new(id).unwrap(),
+            status: AnnounceStatus::Queued,
+            reason: AnnounceReason::Accepted,
+            dedupe_hash,
+            title: ItemTitle::new("Example").unwrap(),
+            tracker,
+            guid: Some(guid),
+            info_hash: None,
+            size: Some(ByteSize::new(42)),
+            received_at_ms,
+            updated_at_ms: received_at_ms,
+            first_attempt_at_ms: None,
+            finished_at_ms: None,
+            attempt_count: 0,
+            next_attempt_at_ms: received_at_ms,
+            expires_at_ms: 1_000,
+            lease: None,
+            last_dependency_kind: None,
+            last_dependency_name: None,
+            last_error_class: None,
+            last_redacted_message: None,
         }
     }
 }
