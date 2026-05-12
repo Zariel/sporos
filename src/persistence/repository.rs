@@ -930,6 +930,7 @@ fn media_type_key(media_type: MediaType) -> &'static str {
         MediaType::Video => "video",
         MediaType::Audio => "audio",
         MediaType::Book => "book",
+        MediaType::Archive => "archive",
         MediaType::Unknown => "unknown",
     }
 }

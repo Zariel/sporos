@@ -231,6 +231,7 @@ pub enum MediaType {
     Video,
     Audio,
     Book,
+    Archive,
     Unknown,
 }
 

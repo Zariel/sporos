@@ -2,7 +2,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
+
+use regex::Regex;
 
 use crate::domain::{
     ByteSize, DisplayName, DomainError, FileIndex, ItemTitle, LocalFile, LocalItem,
@@ -62,10 +65,181 @@ impl fmt::Display for InventoryScanFailureKind {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ParsedMediaTitle {
+    pub raw_name: String,
+    pub search_title: String,
+    pub media_type: MediaType,
+    pub season: Option<u16>,
+    pub episode: Option<u16>,
+    pub air_date: Option<AirDate>,
+    pub year: Option<u16>,
+    pub release_group: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct AirDate {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+}
+
+pub fn parse_media_title(name: &str, file_paths: &[PathBuf]) -> ParsedMediaTitle {
+    let release_group = parse_release_group(name);
+    let normalized = normalize_title_input(strip_release_group(name));
+
+    if let Some(episode) = parse_numbered_episode(&normalized) {
+        let title = title_before(&normalized, episode.start);
+        return ParsedMediaTitle {
+            raw_name: name.to_owned(),
+            search_title: format!(
+                "{} S{:02}E{:02}",
+                fallback_title(&title, &normalized),
+                episode.season,
+                episode.episode
+            ),
+            media_type: MediaType::Episode,
+            season: Some(episode.season),
+            episode: Some(episode.episode),
+            air_date: None,
+            year: None,
+            release_group,
+        };
+    }
+
+    if let Some(date) = parse_dated_episode(&normalized) {
+        let title = title_before(&normalized, date.start);
+        return ParsedMediaTitle {
+            raw_name: name.to_owned(),
+            search_title: format!(
+                "{} {:04}-{:02}-{:02}",
+                fallback_title(&title, &normalized),
+                date.date.year,
+                date.date.month,
+                date.date.day
+            ),
+            media_type: MediaType::Episode,
+            season: None,
+            episode: None,
+            air_date: Some(date.date),
+            year: Some(date.date.year),
+            release_group,
+        };
+    }
+
+    if let Some(season) = parse_season_pack(&normalized) {
+        let title = title_before(&normalized, season.start);
+        return ParsedMediaTitle {
+            raw_name: name.to_owned(),
+            search_title: format!(
+                "{} S{:02}",
+                fallback_title(&title, &normalized),
+                season.season
+            ),
+            media_type: MediaType::SeasonPack,
+            season: Some(season.season),
+            episode: None,
+            air_date: None,
+            year: None,
+            release_group,
+        };
+    }
+
+    let media_type = classify_media_type_from_name(name, file_paths);
+    let year = parse_movie_year(&normalized);
+    let anime_episode = parse_anime_episode(&normalized, release_group.as_deref());
+    let search_title = match (media_type, year, anime_episode) {
+        (MediaType::Movie, Some(year), _) => {
+            format!("{} {year}", title_before_year(&normalized, year))
+        }
+        (MediaType::Anime, _, Some(episode)) => {
+            format!(
+                "{} {:02}",
+                title_before(&normalized, episode.start),
+                episode.episode
+            )
+        }
+        _ => strip_trailing_metadata(&normalized),
+    };
+
+    ParsedMediaTitle {
+        raw_name: name.to_owned(),
+        search_title: fallback_title(&search_title, &normalized),
+        media_type,
+        season: None,
+        episode: anime_episode.map(|episode| episode.episode),
+        air_date: None,
+        year,
+        release_group,
+    }
+}
+
+pub fn classify_media_type_from_name(name: &str, file_paths: &[PathBuf]) -> MediaType {
+    let normalized = normalize_title_input(strip_release_group(name));
+    if parse_numbered_episode(&normalized).is_some() || parse_dated_episode(&normalized).is_some() {
+        return MediaType::Episode;
+    }
+    if parse_season_pack(&normalized).is_some() {
+        return MediaType::SeasonPack;
+    }
+
+    let extensions = FileExtensions::from_paths(file_paths);
+    if extensions.has_video {
+        if parse_movie_year(&normalized).is_some() {
+            MediaType::Movie
+        } else if parse_anime_episode(&normalized, parse_release_group(name).as_deref()).is_some() {
+            MediaType::Anime
+        } else {
+            MediaType::Video
+        }
+    } else if extensions.has_video_disc {
+        if parse_movie_year(&normalized).is_some() {
+            MediaType::Movie
+        } else {
+            MediaType::Video
+        }
+    } else if extensions.has_rar && parse_movie_year(&normalized).is_some() {
+        MediaType::Movie
+    } else if extensions.has_audio {
+        MediaType::Audio
+    } else if extensions.has_book {
+        MediaType::Book
+    } else if extensions.has_archive && !extensions.has_rar {
+        MediaType::Archive
+    } else {
+        MediaType::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct ScannedFile {
     relative_path: PathBuf,
     size: ByteSize,
     mtime_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct EpisodeMatch {
+    start: usize,
+    season: u16,
+    episode: u16,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DateMatch {
+    start: usize,
+    date: AirDate,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct SeasonMatch {
+    start: usize,
+    season: u16,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct AnimeEpisode {
+    start: usize,
+    episode: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -210,14 +384,19 @@ impl InventoryScanner {
 
         let total_size = total_size(&files, root, report)?;
         let newest_mtime = files.iter().filter_map(|file| file.mtime_ms).max();
+        let file_paths = files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect::<Vec<_>>();
+        let parsed_title = parse_media_title(display_name, &file_paths);
         let item = LocalItem {
             id: None,
             source: LocalItemSource::DataRoot {
                 path: root.to_path_buf(),
             },
-            title: ItemTitle::new(display_name).ok()?,
+            title: ItemTitle::new(parsed_title.search_title).ok()?,
             display_name: DisplayName::new(display_name).ok()?,
-            media_type: MediaType::Video,
+            media_type: parsed_title.media_type,
             info_hash: None,
             path: Some(root.to_path_buf()),
             save_path: None,
@@ -253,6 +432,305 @@ impl InventoryScanner {
             })
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct FileExtensions {
+    has_video: bool,
+    has_video_disc: bool,
+    has_rar: bool,
+    has_audio: bool,
+    has_book: bool,
+    has_archive: bool,
+}
+
+impl FileExtensions {
+    fn from_paths(file_paths: &[PathBuf]) -> Self {
+        let mut extensions = Self::default();
+        for path in file_paths {
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            match extension.to_ascii_lowercase().as_str() {
+                "mkv" | "mp4" | "avi" | "mov" | "m4v" | "ts" | "wmv" | "flv" | "webm" => {
+                    extensions.has_video = true;
+                }
+                "m2ts" | "ifo" | "vob" | "bup" => {
+                    extensions.has_video_disc = true;
+                }
+                "rar" => {
+                    extensions.has_rar = true;
+                    extensions.has_archive = true;
+                }
+                "zip" | "7z" | "tar" | "gz" => {
+                    extensions.has_archive = true;
+                }
+                "mp3" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wav" => {
+                    extensions.has_audio = true;
+                }
+                "epub" | "mobi" | "azw3" | "pdf" | "cbz" | "cbr" => {
+                    extensions.has_book = true;
+                }
+                _ => {}
+            }
+        }
+        extensions
+    }
+}
+
+fn parse_numbered_episode(value: &str) -> Option<EpisodeMatch> {
+    let captures = episode_regex()
+        .captures(value)
+        .or_else(|| season_space_episode_regex().captures(value))?;
+    Some(EpisodeMatch {
+        start: captures.get(0)?.start(),
+        season: captures.name("season")?.as_str().parse().ok()?,
+        episode: captures.name("episode")?.as_str().parse().ok()?,
+    })
+}
+
+fn parse_dated_episode(value: &str) -> Option<DateMatch> {
+    let captures = dated_episode_regex().captures(value)?;
+    Some(DateMatch {
+        start: captures.get(0)?.start(),
+        date: AirDate {
+            year: captures.name("year")?.as_str().parse().ok()?,
+            month: captures.name("month")?.as_str().parse().ok()?,
+            day: captures.name("day")?.as_str().parse().ok()?,
+        },
+    })
+}
+
+fn parse_season_pack(value: &str) -> Option<SeasonMatch> {
+    let captures = season_regex().captures(value)?;
+    let season = captures
+        .name("season")
+        .or_else(|| captures.name("season_word"))?;
+    Some(SeasonMatch {
+        start: captures.get(0)?.start(),
+        season: season.as_str().parse().ok()?,
+    })
+}
+
+fn parse_movie_year(value: &str) -> Option<u16> {
+    let captures = movie_year_regex().captures(value)?;
+    captures.name("year")?.as_str().parse().ok()
+}
+
+fn parse_anime_episode(value: &str, release_group: Option<&str>) -> Option<AnimeEpisode> {
+    let captures = anime_episode_regex().captures(value)?;
+    let marker = captures.get(0)?;
+    if release_group.is_none() && !value.contains("anime") && !value.contains("sub") {
+        return None;
+    }
+    Some(AnimeEpisode {
+        start: marker.start(),
+        episode: captures.name("episode")?.as_str().parse().ok()?,
+    })
+}
+
+fn parse_release_group(value: &str) -> Option<String> {
+    let captures = bracketed_group_regex()
+        .captures(value)
+        .or_else(|| scene_group_regex().captures(value))?;
+    let group = captures.name("group")?.as_str().trim();
+    if is_bad_group(group) {
+        None
+    } else {
+        Some(group.to_owned())
+    }
+}
+
+fn strip_release_group(value: &str) -> &str {
+    if let Some(captures) = bracketed_group_regex().captures(value) {
+        if let (Some(match_), Some(group)) = (captures.get(0), captures.name("group")) {
+            if match_.start() == 0 && !is_bad_group(group.as_str()) {
+                return value.get(match_.end()..).unwrap_or(value).trim_start();
+            }
+        }
+    }
+
+    if let Some(captures) = scene_group_regex().captures(value) {
+        if let (Some(match_), Some(group)) = (captures.get(0), captures.name("group"))
+            && match_.start() == 0
+            && !is_bad_group(group.as_str())
+        {
+            return value.get(match_.end()..).unwrap_or(value).trim_start();
+        }
+    }
+
+    value
+}
+
+fn is_bad_group(group: &str) -> bool {
+    matches!(
+        group.to_ascii_lowercase().as_str(),
+        "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "av1"
+            | "aac"
+            | "dts"
+            | "truehd"
+            | "1080p"
+            | "2160p"
+            | "720p"
+            | "bluray"
+            | "web-dl"
+            | "webrip"
+    )
+}
+
+fn normalize_title_input(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '.' | '_' | '-' | '[' | ']' | '(' | ')') {
+            normalized.push(' ');
+        } else {
+            normalized.push(character);
+        }
+    }
+    normalized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
+}
+
+fn title_before(value: &str, index: usize) -> String {
+    value
+        .get(..index)
+        .unwrap_or(value)
+        .split_whitespace()
+        .filter(|token| !is_title_metadata_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn title_before_year(value: &str, year: u16) -> String {
+    let year = year.to_string();
+    value
+        .split_whitespace()
+        .take_while(|token| *token != year)
+        .filter(|token| !is_title_metadata_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_trailing_metadata(value: &str) -> String {
+    value
+        .split_whitespace()
+        .take_while(|token| !is_title_metadata_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fallback_title(candidate: &str, fallback: &str) -> String {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        fallback.to_owned()
+    } else {
+        candidate.to_owned()
+    }
+}
+
+fn is_title_metadata_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "480p"
+            | "576p"
+            | "720p"
+            | "1080p"
+            | "2160p"
+            | "4k"
+            | "web"
+            | "webdl"
+            | "web-dl"
+            | "webrip"
+            | "bluray"
+            | "brrip"
+            | "hdtv"
+            | "dvdrip"
+            | "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "av1"
+            | "proper"
+            | "repack"
+            | "extended"
+    )
+}
+
+fn episode_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|\b)S(?P<season>\d{1,2})\s*E(?P<episode>\d{1,3})(?:\s*E\d{1,3})?")
+            .expect("episode regex should compile")
+    })
+}
+
+fn season_space_episode_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|\b)S(?P<season>\d{1,2})\s+(?P<episode>\d{2})(?:\b|$)")
+            .expect("season-space-episode regex should compile")
+    })
+}
+
+fn dated_episode_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?P<year>19\d{2}|20\d{2})\s+(?P<month>1[0-2]|0?[1-9])\s+(?P<day>3[01]|[12]\d|0?[1-9])(?:\b|$)",
+        )
+        .expect("dated episode regex should compile")
+    })
+}
+
+fn season_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|\b)(?:S(?P<season>\d{1,2})|Season\s+(?P<season_word>\d{1,2}))(?:\b|$)",
+        )
+        .expect("season regex should compile")
+    })
+}
+
+fn movie_year_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?:^|\b)(?P<year>19\d{2}|20\d{2})(?:\b|$)")
+            .expect("movie year regex should compile")
+    })
+}
+
+fn anime_episode_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?:^|\b)(?P<episode>\d{2,3})(?:v\d+)?(?:\b|$)")
+            .expect("anime episode regex should compile")
+    })
+}
+
+fn bracketed_group_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"^\[(?P<group>[^\]]{2,32})\]\s*").expect("bracketed group regex should compile")
+    })
+}
+
+fn scene_group_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"^(?P<group>[A-Za-z0-9][A-Za-z0-9._-]{1,31})\s+-\s+")
+            .expect("scene group regex should compile")
+    })
 }
 
 fn collect_video_files(
@@ -483,6 +961,120 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parser_classifies_episode_and_season_precedence() {
+        let episode = parse_media_title("My.Show.S01E01.1080p", &[]);
+        let season_pack = parse_media_title("My.Show.Season.2", &[]);
+        let spaced_episode = parse_media_title("My.Show.S01.02", &[]);
+
+        assert_eq!(MediaType::Episode, episode.media_type);
+        assert_eq!("My Show S01E01", episode.search_title);
+        assert_eq!(Some(1), episode.season);
+        assert_eq!(Some(1), episode.episode);
+        assert_eq!(MediaType::SeasonPack, season_pack.media_type);
+        assert_eq!("My Show S02", season_pack.search_title);
+        assert_eq!(MediaType::Episode, spaced_episode.media_type);
+        assert_eq!("My Show S01E02", spaced_episode.search_title);
+    }
+
+    #[test]
+    fn parser_handles_dated_episodes_and_movie_years() {
+        let dated = parse_media_title("Daily.Show.2024.01.31.720p", &[]);
+        let movie = parse_media_title(
+            "Example.Movie.(2023).1080p",
+            &[PathBuf::from("Example.Movie.2023.mkv")],
+        );
+        let bracketed = parse_media_title(
+            "Another.Movie.[2022].WEB-DL",
+            &[PathBuf::from("Another.Movie.2022.MP4")],
+        );
+
+        assert_eq!(MediaType::Episode, dated.media_type);
+        assert_eq!("Daily Show 2024-01-31", dated.search_title);
+        assert_eq!(
+            Some(AirDate {
+                year: 2024,
+                month: 1,
+                day: 31
+            }),
+            dated.air_date
+        );
+        assert_eq!(MediaType::Movie, movie.media_type);
+        assert_eq!("Example Movie 2023", movie.search_title);
+        assert_eq!(Some(2023), movie.year);
+        assert_eq!(MediaType::Movie, bracketed.media_type);
+        assert_eq!("Another Movie 2022", bracketed.search_title);
+    }
+
+    #[test]
+    fn parser_handles_anime_scene_prefixes_and_bad_groups() {
+        let anime = parse_media_title(
+            "[SubsPlease] Frieren - 03 (1080p)",
+            &[PathBuf::from("Frieren.03.mkv")],
+        );
+        let bad_group = parse_media_title(
+            "x264 - Example.Movie.2020.1080p",
+            &[PathBuf::from("Example.Movie.2020.mkv")],
+        );
+
+        assert_eq!(MediaType::Anime, anime.media_type);
+        assert_eq!(Some("SubsPlease".to_owned()), anime.release_group);
+        assert_eq!("Frieren 03", anime.search_title);
+        assert_eq!(Some(3), anime.episode);
+        assert_eq!(None, bad_group.release_group);
+        assert_eq!("Example Movie 2020", bad_group.search_title);
+    }
+
+    #[test]
+    fn media_type_detection_preserves_rar_fallthrough_and_archive_classification() {
+        assert_eq!(
+            MediaType::Movie,
+            classify_media_type_from_name("Movie.2020", &[PathBuf::from("movie.rar")])
+        );
+        assert_eq!(
+            MediaType::Audio,
+            classify_media_type_from_name(
+                "Album.Release",
+                &[PathBuf::from("album.rar"), PathBuf::from("track.flac")]
+            )
+        );
+        assert_eq!(
+            MediaType::Book,
+            classify_media_type_from_name(
+                "Book.Release",
+                &[PathBuf::from("book.rar"), PathBuf::from("book.epub")]
+            )
+        );
+        assert_eq!(
+            MediaType::Unknown,
+            classify_media_type_from_name("Archive.Release", &[PathBuf::from("archive.rar")])
+        );
+        assert_eq!(
+            MediaType::Archive,
+            classify_media_type_from_name("Archive.Release", &[PathBuf::from("archive.zip")])
+        );
+    }
+
+    #[test]
+    fn media_type_detection_handles_video_disc_uppercase_and_title_regex_wins() {
+        assert_eq!(
+            MediaType::Movie,
+            classify_media_type_from_name("Movie.2021", &[PathBuf::from("BDMV/INDEX.IFO")])
+        );
+        assert_eq!(
+            MediaType::Video,
+            classify_media_type_from_name("Concert.Release", &[PathBuf::from("VIDEO_TS/VTS.VOB")])
+        );
+        assert_eq!(
+            MediaType::Video,
+            classify_media_type_from_name("Generic.Release", &[PathBuf::from("GENERIC.MKV")])
+        );
+        assert_eq!(
+            MediaType::Episode,
+            classify_media_type_from_name("Show.S01E01", &[PathBuf::from("track.mp3")])
+        );
+    }
 
     #[test]
     fn scan_media_dirs_builds_items_and_ignores_noise_dirs() {
