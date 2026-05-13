@@ -62,7 +62,7 @@ impl HttpState {
         *current = readiness;
     }
 
-    fn readiness(&self) -> ReadinessState {
+    pub(crate) fn readiness(&self) -> ReadinessState {
         self.readiness
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
