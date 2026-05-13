@@ -1,3 +1,4 @@
+pub mod announce_worker;
 pub mod app;
 pub mod health;
 pub mod queue;

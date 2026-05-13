@@ -9,6 +9,7 @@ use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshWorker, inventory_refresh_queue,
 };
 use crate::persistence::repository::Repository;
+use crate::runtime::announce_worker::AnnounceWorker;
 use crate::runtime::health::HealthRegistry;
 use crate::runtime::queue::{QueueKind, RuntimeQueueConfig, WorkReceiver, bounded_work_queue};
 use crate::runtime::scheduler::{
@@ -29,6 +30,7 @@ pub struct AppState {
     pub health: HealthRegistry,
     pub http: HttpState,
     pub queues: RuntimeQueues,
+    pub announce_worker: AnnounceWorker,
     pub scheduler: PersistedScheduler,
     pub inventory_refresh: InventoryRefreshWorker,
     pub shutdown: ShutdownController,
@@ -72,6 +74,15 @@ impl AppRuntime {
                 operation: "build scheduler config".to_owned(),
                 message: error.to_string(),
             })?;
+        let announce_worker = AnnounceWorker::new(
+            repository.clone(),
+            "sporos-announce-worker",
+            &config.announce,
+        )
+        .map_err(|error| DatabaseError::Unavailable {
+            operation: "build announce worker".to_owned(),
+            message: error.to_string(),
+        })?;
         let scheduler = PersistedScheduler::new(
             repository.clone(),
             scheduler_queue.clone(),
@@ -99,6 +110,7 @@ impl AppRuntime {
                 health,
                 http,
                 queues,
+                announce_worker,
                 scheduler,
                 inventory_refresh,
                 shutdown,
