@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, Row, Sqlite, SqlitePool, Transaction};
+use tracing::{debug_span, info_span};
 
 use crate::announce::{
     AnnounceDedupeHash, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
@@ -161,6 +162,8 @@ struct LeasedTransition<'a> {
 
 impl Repository {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let _span = info_span!("sqlite.connect", database_path = %path.display());
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true);
@@ -176,6 +179,7 @@ impl Repository {
     }
 
     pub async fn connect_in_memory() -> Result<Self, DatabaseError> {
+        let _span = info_span!("sqlite.connect", database_path = ":memory:");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -236,6 +240,11 @@ impl Repository {
         scope: LocalInventoryScope,
         items: &[LocalItemFileBatch<'_>],
     ) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
+        let _span = info_span!(
+            "inventory.replace",
+            source_type = scope.source_type(),
+            item_count = items.len()
+        );
         let mut transaction = self
             .pool
             .begin()
@@ -370,6 +379,17 @@ impl Repository {
         &self,
         candidate: &RemoteCandidate,
     ) -> Result<RemoteCandidateId, DatabaseError> {
+        let _span = debug_span!(
+            "candidate.upsert",
+            indexer_id = candidate.indexer_id.get(),
+            candidate_guid = %candidate.guid,
+            tracker = %candidate.tracker,
+            info_hash_prefix = candidate
+                .info_hash
+                .as_ref()
+                .map(info_hash_prefix)
+                .unwrap_or_default()
+        );
         let mut transaction = self
             .pool
             .begin()
@@ -445,6 +465,12 @@ impl Repository {
         assessment: CandidateAssessment,
         assessed_at_ms: i64,
     ) -> Result<(), DatabaseError> {
+        let _span = debug_span!(
+            "match_decision.record",
+            local_item_id = local_item_id.get(),
+            candidate_id = candidate_id.get(),
+            decision = match_decision_key(assessment.decision)
+        );
         sqlx::query(
             r#"
             INSERT INTO match_decisions (
@@ -569,6 +595,11 @@ impl Repository {
         name: &JobName,
         update: JobStateUpdate<'_>,
     ) -> Result<(), DatabaseError> {
+        let _span = debug_span!(
+            "job_status.record",
+            job_name = %name,
+            job_state = job_state_key(update.state)
+        );
         sqlx::query(
             r#"
             INSERT INTO jobs (
@@ -673,6 +704,12 @@ impl Repository {
         checked_at_ms: i64,
     ) -> Result<(), DatabaseError> {
         let (state_key, reason, retry_after) = dependency_state_row(state);
+        let _span = debug_span!(
+            "dependency_health.record",
+            dependency_type,
+            dependency_name = %dependency_name,
+            dependency_state = state_key
+        );
         sqlx::query(
             r#"
             INSERT INTO dependency_health (
@@ -744,6 +781,17 @@ impl Repository {
         work: &AnnounceWorkItem,
         max_pending: u32,
     ) -> Result<AnnounceInsertResult, DatabaseError> {
+        let _span = info_span!(
+            "announce.accept",
+            announce_id = %work.id,
+            tracker = %work.tracker,
+            candidate_guid = work.guid.as_ref().map(CandidateGuid::as_str).unwrap_or(""),
+            info_hash_prefix = work
+                .info_hash
+                .as_ref()
+                .map(info_hash_prefix)
+                .unwrap_or_default()
+        );
         let mut transaction = self
             .pool
             .begin()
@@ -790,6 +838,12 @@ impl Repository {
         lease_until_ms: i64,
         limit: u16,
     ) -> Result<Vec<AnnounceWorkId>, DatabaseError> {
+        let _span = debug_span!(
+            "announce.claim",
+            lease_owner = owner,
+            claim_limit = limit,
+            lease_until_ms
+        );
         let mut transaction = self
             .pool
             .begin()
@@ -1641,6 +1695,10 @@ fn db_error(operation: &'static str, error: sqlx::Error) -> DatabaseError {
             message,
         }
     }
+}
+
+fn info_hash_prefix(info_hash: &InfoHash) -> String {
+    info_hash.as_str().chars().take(8).collect()
 }
 
 trait SnakeCase {

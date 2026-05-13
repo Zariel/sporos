@@ -9,6 +9,7 @@ use crate::persistence::repository::{JobStateUpdate, Repository};
 use crate::runtime::queue::{
     BoundedWorkQueue, EnqueueError, QueueKind, WorkReceiver, bounded_work_queue,
 };
+use tracing::{debug_span, info_span};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SchedulerConfig {
@@ -139,12 +140,14 @@ impl PersistedScheduler {
     }
 
     pub async fn tick(&self, now_ms: i64) -> Result<SchedulerTickSummary, SchedulerError> {
+        let _span = info_span!("scheduler.tick", now_ms, claim_limit = self.claim_limit);
         let seeded = self.seed_jobs(now_ms).await?;
         let ready_jobs = self.repository.ready_jobs(now_ms, self.claim_limit).await?;
         let mut enqueued = 0;
         let mut deferred = 0;
 
         for job_name in ready_jobs {
+            let _job_span = debug_span!("scheduler.enqueue_job", job_name = %job_name);
             if !self.jobs.contains_key(&job_name) {
                 continue;
             }

@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tracing::{Instrument, debug_span, info_span};
 
 use crate::announce::{
     AnnounceDedupeIdentity, AnnounceQueueConfig, AnnounceReason, AnnounceStatus, AnnounceWorkId,
@@ -406,10 +407,18 @@ async fn post_announcement(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
+    let span = info_span!(
+        "http.announcement",
+        tracker = %request.tracker,
+        candidate_guid = %request.guid
+    );
     if let Some(acceptor) = state.announce_acceptor.as_ref() {
-        return accept_announcement(acceptor, request).await;
+        return accept_announcement(acceptor, request)
+            .instrument(span)
+            .await;
     }
 
+    let _entered = span.enter();
     let queues = match state.workflow_queues() {
         Ok(queues) => queues,
         Err(error) => return error.into_response(),
@@ -514,6 +523,7 @@ async fn post_search(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
+    let _span = debug_span!("http.search", query = %request.query);
     let queues = match state.workflow_queues() {
         Ok(queues) => queues,
         Err(error) => return error.into_response(),
@@ -530,6 +540,7 @@ async fn post_job_run(State(state): State<HttpState>, Path(job_name): Path<Strin
                 .into_response();
         }
     };
+    let _span = info_span!("http.job_run", job_name = %request.job_name);
     let queues = match state.workflow_queues() {
         Ok(queues) => queues,
         Err(error) => return error.into_response(),

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::config::{ConfigTorrentClientKind, TorrentClientConfig};
 use crate::domain::{ClientHost, DisplayName, TorrentClientKind};
 use crate::errors::TorrentClientError;
+use tracing::debug_span;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TorrentClientOperation {
@@ -135,6 +136,7 @@ impl TorrentClientRegistry {
     pub fn from_config(
         config: &BTreeMap<String, TorrentClientConfig>,
     ) -> Result<Self, TorrentClientError> {
+        let _span = debug_span!("torrent_client.registry", client_count = config.len());
         let mut host_counts = BTreeMap::<String, usize>::new();
         for client in config.values() {
             let host = url_host(&client.url).ok_or_else(|| TorrentClientError::BadResponse {
@@ -147,6 +149,11 @@ impl TorrentClientRegistry {
 
         let mut clients = BTreeMap::new();
         for (name, config) in config {
+            let _client_span = debug_span!(
+                "torrent_client.configure",
+                client_name = name.as_str(),
+                client_kind = ?config.kind
+            );
             let name = DisplayName::new(name).map_err(|error| TorrentClientError::BadResponse {
                 client: name.clone(),
                 message: error.to_string(),

@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use tokio::task;
+use tracing::info_span;
 
 use crate::domain::ClientHost;
 use crate::errors::DatabaseError;
@@ -52,6 +53,10 @@ impl InventoryRefreshWorker {
         &self,
         request: InventoryRefreshRequest,
     ) -> Result<InventoryRefreshSummary, InventoryRefreshError> {
+        let _span = info_span!(
+            "inventory.refresh_data_dirs",
+            media_dir_count = request.media_dirs.len()
+        );
         let scanner = InventoryScanner::new(self.scan_options);
         let scan_report =
             task::spawn_blocking(move || scanner.scan_media_dirs(&request.media_dirs))
@@ -85,6 +90,11 @@ impl InventoryRefreshWorker {
         client_host: ClientHost,
         items: &[ScannedLocalItem],
     ) -> Result<InventoryRefreshSummary, InventoryRefreshError> {
+        let _span = info_span!(
+            "inventory.refresh_client_items",
+            client_host = %client_host,
+            item_count = items.len()
+        );
         let batches = items
             .iter()
             .map(|scanned| LocalItemFileBatch {

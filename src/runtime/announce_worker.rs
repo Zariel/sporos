@@ -1,6 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug_span, info_span};
 
 use crate::announce::{AnnounceQueueConfig, AnnounceReason, AnnounceWorkId};
 use crate::domain::ReasonText;
@@ -101,6 +102,7 @@ impl AnnounceWorker {
         &self,
         now_ms: i64,
     ) -> Result<AnnounceStartupSummary, AnnounceWorkerError> {
+        let _span = info_span!("announce.recover_startup", now_ms);
         let expired = self.repository.expire_announce_work(now_ms).await?;
         let recovered_leases = self
             .repository
@@ -223,6 +225,11 @@ impl AnnounceWorker {
         F: FnMut(AnnounceWorkId) -> Fut,
         Fut: Future<Output = AnnounceWorkOutcome>,
     {
+        let _span = info_span!(
+            "announce.worker_batch",
+            lease_owner = %self.config.owner,
+            claim_batch_size = self.config.claim_batch_size
+        );
         let claimed = self.claim_ready(now_ms).await?;
         let mut summary = AnnounceWorkerSummary {
             claimed: claimed.len(),
@@ -230,6 +237,7 @@ impl AnnounceWorker {
         };
 
         for id in claimed {
+            let _work_span = debug_span!("announce.process", announce_id = %id);
             if shutdown.state().phase != ShutdownPhase::Running {
                 self.release_for_shutdown(&id, now_ms).await?;
                 summary.cancelled += 1;
