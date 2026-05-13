@@ -1,15 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Executor, Row, SqlitePool};
+use sqlx::{Executor, Row, Sqlite, SqlitePool, Transaction};
 
 use crate::announce::{
     AnnounceDedupeHash, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
 use crate::domain::{
-    ByteSize, CandidateAssessment, CandidateGuid, DependencyName, DependencyState, FileIndex,
-    InfoHash, JobName, JobState, LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision,
-    MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
+    ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyName, DependencyState,
+    FileIndex, InfoHash, JobName, JobState, LocalFile, LocalItem, LocalItemId, LocalItemSource,
+    MatchDecision, MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
 };
 use crate::errors::DatabaseError;
 
@@ -31,6 +31,55 @@ pub struct AnnounceStatusCount {
     pub status: String,
     pub reason: String,
     pub count: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LocalItemFileBatch<'a> {
+    pub item: &'a LocalItem,
+    pub files: &'a [LocalFile],
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum LocalInventoryScope {
+    Client { client_host: ClientHost },
+    DataRoot,
+    TorrentCache,
+    Virtual,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct LocalInventoryReplaceSummary {
+    pub upserted: usize,
+    pub pruned: u64,
+}
+
+impl LocalInventoryScope {
+    fn accepts(&self, source_type: &str, source_key: &str) -> bool {
+        match self {
+            Self::Client { client_host } => {
+                source_type == "client" && source_key.starts_with(&format!("{client_host}:"))
+            }
+            Self::DataRoot => source_type == "data_root",
+            Self::TorrentCache => source_type == "torrent_cache",
+            Self::Virtual => source_type == "virtual",
+        }
+    }
+
+    fn source_type(&self) -> &'static str {
+        match self {
+            Self::Client { .. } => "client",
+            Self::DataRoot => "data_root",
+            Self::TorrentCache => "torrent_cache",
+            Self::Virtual => "virtual",
+        }
+    }
+
+    fn source_key_prefix(&self) -> Option<String> {
+        match self {
+            Self::Client { client_host } => Some(format!("{client_host}:")),
+            Self::DataRoot | Self::TorrentCache | Self::Virtual => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -171,92 +220,8 @@ impl Repository {
             .await
             .map_err(|error| db_error("begin local item transaction", error))?;
 
-        let (source_type, source_key) = local_source(&item.source);
-        sqlx::query(
-            r#"
-            INSERT INTO local_items (
-                source_type,
-                source_key,
-                title,
-                display_name,
-                media_type,
-                info_hash,
-                path,
-                save_path,
-                total_size,
-                mtime_ms,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch() * 1000, unixepoch() * 1000)
-            ON CONFLICT (source_type, source_key) DO UPDATE SET
-                title = excluded.title,
-                display_name = excluded.display_name,
-                media_type = excluded.media_type,
-                info_hash = excluded.info_hash,
-                path = excluded.path,
-                save_path = excluded.save_path,
-                total_size = excluded.total_size,
-                mtime_ms = excluded.mtime_ms,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(&source_type)
-        .bind(&source_key)
-        .bind(item.title.as_str())
-        .bind(item.display_name.as_str())
-        .bind(media_type_key(item.media_type))
-        .bind(item.info_hash.as_ref().map(InfoHash::as_str))
-        .bind(item.path.as_ref().map(path_to_string))
-        .bind(item.save_path.as_ref().map(path_to_string))
-        .bind(i64_from_u64(
-            item.total_size.get(),
-            "local item total size",
-        )?)
-        .bind(item.mtime_ms)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| db_error("upsert local item", error))?;
-
-        let row =
-            sqlx::query("SELECT id FROM local_items WHERE source_type = ? AND source_key = ?")
-                .bind(&source_type)
-                .bind(&source_key)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(|error| db_error("select local item id", error))?;
-        let item_id = id_from_i64(row.get::<i64, _>("id"), "local item id")?;
-
-        sqlx::query("DELETE FROM local_files WHERE item_id = ?")
-            .bind(i64_from_u64(item_id.get(), "local item id")?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| db_error("replace local files", error))?;
-
-        for file in files {
-            sqlx::query(
-                r#"
-                INSERT INTO local_files (
-                    item_id,
-                    relative_path,
-                    file_name,
-                    size,
-                    mtime_ms,
-                    file_index
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(i64_from_u64(item_id.get(), "local item id")?)
-            .bind(path_to_string(&file.relative_path))
-            .bind(file.file_name.as_str())
-            .bind(i64_from_u64(file.size.get(), "local file size")?)
-            .bind(file.mtime_ms)
-            .bind(i64::from(file.file_index.get()))
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| db_error("insert local file", error))?;
-        }
+        let item_id =
+            upsert_local_item_with_files_in_transaction(&mut transaction, item, files).await?;
 
         transaction
             .commit()
@@ -264,6 +229,47 @@ impl Repository {
             .map_err(|error| db_error("commit local item transaction", error))?;
 
         Ok(item_id)
+    }
+
+    pub async fn replace_local_inventory(
+        &self,
+        scope: LocalInventoryScope,
+        items: &[LocalItemFileBatch<'_>],
+    ) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("begin local inventory transaction", error))?;
+
+        initialize_retained_keys(&mut transaction).await?;
+
+        for batch in items {
+            let (source_type, source_key) = local_source(&batch.item.source);
+            if !scope.accepts(&source_type, &source_key) {
+                return Err(DatabaseError::QueryFailed {
+                    operation: "validate local inventory refresh scope".to_owned(),
+                    message: format!("item source {source_type}:{source_key} is outside {scope:?}"),
+                });
+            }
+
+            upsert_local_item_with_files_in_transaction(&mut transaction, batch.item, batch.files)
+                .await?;
+            insert_retained_key(&mut transaction, &source_key).await?;
+        }
+
+        let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
+
+        clear_retained_keys(&mut transaction).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit local inventory transaction", error))?;
+
+        Ok(LocalInventoryReplaceSummary {
+            upserted: items.len(),
+            pruned,
+        })
     }
 
     pub async fn local_files_for_item(
@@ -1255,6 +1261,189 @@ fn local_source(source: &LocalItemSource) -> (String, String) {
         LocalItemSource::DataRoot { path } => ("data_root".to_owned(), path_to_string(path)),
         LocalItemSource::Virtual { source_key } => ("virtual".to_owned(), source_key.to_string()),
     }
+}
+
+async fn upsert_local_item_with_files_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    item: &LocalItem,
+    files: &[LocalFile],
+) -> Result<LocalItemId, DatabaseError> {
+    let (source_type, source_key) = local_source(&item.source);
+    sqlx::query(
+        r#"
+        INSERT INTO local_items (
+            source_type,
+            source_key,
+            title,
+            display_name,
+            media_type,
+            info_hash,
+            path,
+            save_path,
+            total_size,
+            mtime_ms,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch() * 1000, unixepoch() * 1000)
+        ON CONFLICT (source_type, source_key) DO UPDATE SET
+            title = excluded.title,
+            display_name = excluded.display_name,
+            media_type = excluded.media_type,
+            info_hash = excluded.info_hash,
+            path = excluded.path,
+            save_path = excluded.save_path,
+            total_size = excluded.total_size,
+            mtime_ms = excluded.mtime_ms,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&source_type)
+    .bind(&source_key)
+    .bind(item.title.as_str())
+    .bind(item.display_name.as_str())
+    .bind(media_type_key(item.media_type))
+    .bind(item.info_hash.as_ref().map(InfoHash::as_str))
+    .bind(item.path.as_ref().map(path_to_string))
+    .bind(item.save_path.as_ref().map(path_to_string))
+    .bind(i64_from_u64(
+        item.total_size.get(),
+        "local item total size",
+    )?)
+    .bind(item.mtime_ms)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("upsert local item", error))?;
+
+    let row = sqlx::query("SELECT id FROM local_items WHERE source_type = ? AND source_key = ?")
+        .bind(&source_type)
+        .bind(&source_key)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|error| db_error("select local item id", error))?;
+    let item_id = id_from_i64(row.get::<i64, _>("id"), "local item id")?;
+
+    sqlx::query("DELETE FROM local_files WHERE item_id = ?")
+        .bind(i64_from_u64(item_id.get(), "local item id")?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| db_error("replace local files", error))?;
+
+    for file in files {
+        sqlx::query(
+            r#"
+            INSERT INTO local_files (
+                item_id,
+                relative_path,
+                file_name,
+                size,
+                mtime_ms,
+                file_index
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(i64_from_u64(item_id.get(), "local item id")?)
+        .bind(path_to_string(&file.relative_path))
+        .bind(file.file_name.as_str())
+        .bind(i64_from_u64(file.size.get(), "local file size")?)
+        .bind(file.mtime_ms)
+        .bind(i64::from(file.file_index.get()))
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| db_error("insert local file", error))?;
+    }
+
+    Ok(item_id)
+}
+
+async fn initialize_retained_keys(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DatabaseError> {
+    sqlx::query(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS retained_local_item_keys (
+            source_key TEXT PRIMARY KEY
+        ) WITHOUT ROWID
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("initialize retained local item keys", error))?;
+
+    clear_retained_keys(transaction).await
+}
+
+async fn insert_retained_key(
+    transaction: &mut Transaction<'_, Sqlite>,
+    source_key: &str,
+) -> Result<(), DatabaseError> {
+    sqlx::query("INSERT OR IGNORE INTO retained_local_item_keys (source_key) VALUES (?)")
+        .bind(source_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| db_error("insert retained local item key", error))?;
+
+    Ok(())
+}
+
+async fn prune_local_items_not_retained(
+    transaction: &mut Transaction<'_, Sqlite>,
+    scope: &LocalInventoryScope,
+) -> Result<u64, DatabaseError> {
+    let result = if let Some(prefix) = scope.source_key_prefix() {
+        sqlx::query(
+            r#"
+            DELETE FROM local_items
+            WHERE source_type = ?
+              AND substr(source_key, 1, ?) = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM retained_local_item_keys retained
+                  WHERE retained.source_key = local_items.source_key
+              )
+            "#,
+        )
+        .bind(scope.source_type())
+        .bind(
+            i64::try_from(prefix.len()).map_err(|error| DatabaseError::QueryFailed {
+                operation: "convert source key prefix length".to_owned(),
+                message: error.to_string(),
+            })?,
+        )
+        .bind(prefix)
+        .execute(&mut **transaction)
+        .await
+    } else {
+        sqlx::query(
+            r#"
+            DELETE FROM local_items
+            WHERE source_type = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM retained_local_item_keys retained
+                  WHERE retained.source_key = local_items.source_key
+              )
+            "#,
+        )
+        .bind(scope.source_type())
+        .execute(&mut **transaction)
+        .await
+    }
+    .map_err(|error| db_error("prune missing local inventory", error))?;
+
+    Ok(result.rows_affected())
+}
+
+async fn clear_retained_keys(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DatabaseError> {
+    sqlx::query("DELETE FROM retained_local_item_keys")
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| db_error("clear retained local item keys", error))?;
+
+    Ok(())
 }
 
 fn path_to_string(path: impl AsRef<Path>) -> String {

@@ -5,6 +5,7 @@ pub mod domain;
 pub mod errors;
 pub mod http;
 pub mod inventory;
+pub mod inventory_refresh;
 pub mod persistence;
 pub mod runtime;
 pub mod secrets;
