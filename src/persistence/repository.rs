@@ -34,6 +34,30 @@ pub struct AnnounceStatusCount {
     pub count: i64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceAttemptCount {
+    pub outcome_class: String,
+    pub attempts: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceDependencyWaitCount {
+    pub dependency_kind: String,
+    pub dependency_name: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceQueueSnapshot {
+    pub active_count: i64,
+    pub oldest_active_age_ms: Option<i64>,
+    pub next_retry_delay_ms: Option<i64>,
+    pub running_leases: i64,
+    pub status_counts: Vec<AnnounceStatusCount>,
+    pub attempt_counts: Vec<AnnounceAttemptCount>,
+    pub dependency_wait_counts: Vec<AnnounceDependencyWaitCount>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LocalItemFileBatch<'a> {
     pub item: &'a LocalItem,
@@ -1135,6 +1159,97 @@ impl Repository {
                 count: row.get("count"),
             })
             .collect())
+    }
+
+    pub async fn announce_queue_snapshot(
+        &self,
+        limit: u16,
+        now_ms: i64,
+    ) -> Result<AnnounceQueueSnapshot, DatabaseError> {
+        let summary = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS active_count,
+                MIN(received_at) AS oldest_received_at,
+                MIN(CASE
+                    WHEN status IN ('queued', 'retryable', 'waiting')
+                    THEN next_attempt_at
+                END) AS next_attempt_at,
+                COALESCE(SUM(CASE
+                    WHEN status = 'running' AND lease_owner IS NOT NULL
+                    THEN 1 ELSE 0
+                END), 0) AS running_leases
+            FROM announce_work
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce queue summary", error))?;
+        let active_count = summary.get("active_count");
+        let oldest_received_at: Option<i64> = summary.get("oldest_received_at");
+        let next_attempt_at: Option<i64> = summary.get("next_attempt_at");
+        let running_leases = summary.get("running_leases");
+        let oldest_active_age_ms =
+            oldest_received_at.map(|received_at| now_ms.saturating_sub(received_at).max(0));
+        let next_retry_delay_ms =
+            next_attempt_at.map(|next_attempt| next_attempt.saturating_sub(now_ms).max(0));
+
+        let attempt_rows = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(last_error_class, last_action_outcome, reason, status) AS outcome_class,
+                SUM(attempt_count) AS attempts
+            FROM announce_work
+            WHERE attempt_count > 0
+            GROUP BY outcome_class
+            ORDER BY attempts DESC, outcome_class
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce attempt counts", error))?;
+        let dependency_rows = sqlx::query(
+            r#"
+            SELECT last_dependency_kind, last_dependency_name, COUNT(*) AS count
+            FROM announce_work
+            WHERE last_dependency_kind IS NOT NULL
+              AND last_dependency_name IS NOT NULL
+              AND status IN ('queued', 'running', 'waiting', 'retryable')
+            GROUP BY last_dependency_kind, last_dependency_name
+            ORDER BY count DESC, last_dependency_kind, last_dependency_name
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce dependency wait counts", error))?;
+
+        Ok(AnnounceQueueSnapshot {
+            active_count,
+            oldest_active_age_ms,
+            next_retry_delay_ms,
+            running_leases,
+            status_counts: self.announce_status_counts(limit).await?,
+            attempt_counts: attempt_rows
+                .into_iter()
+                .map(|row| AnnounceAttemptCount {
+                    outcome_class: row.get("outcome_class"),
+                    attempts: row.get("attempts"),
+                })
+                .collect(),
+            dependency_wait_counts: dependency_rows
+                .into_iter()
+                .map(|row| AnnounceDependencyWaitCount {
+                    dependency_kind: row.get("last_dependency_kind"),
+                    dependency_name: row.get("last_dependency_name"),
+                    count: row.get("count"),
+                })
+                .collect(),
+        })
     }
 
     async fn transition_leased(

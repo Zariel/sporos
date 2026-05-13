@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use crate::persistence::repository::{
-    AnnounceStatusCount, DependencyHealthSnapshot as StoredDependencyHealthSnapshot,
+    AnnounceQueueSnapshot, DependencyHealthSnapshot as StoredDependencyHealthSnapshot,
     JobStatusSnapshot,
 };
 use crate::runtime::health::DependencyHealthSnapshot;
@@ -226,7 +226,8 @@ impl ActionOutcome {
 pub struct MetricsSnapshot {
     pub queues: Vec<QueueStats>,
     pub dependency_health: DependencyHealthSnapshot,
-    pub announce_status_counts: Vec<AnnounceStatusCount>,
+    pub announce_queue: Option<AnnounceQueueSnapshot>,
+    pub announce_worker_capacity: Option<u16>,
     pub jobs: Vec<JobStatusSnapshot>,
     pub stored_dependency_health: Vec<StoredDependencyHealthSnapshot>,
     pub snapshot_errors: Vec<&'static str>,
@@ -240,7 +241,8 @@ impl Default for MetricsSnapshot {
                 entries: Vec::new(),
                 summaries: BTreeMap::new(),
             },
-            announce_status_counts: Vec::new(),
+            announce_queue: None,
+            announce_worker_capacity: None,
             jobs: Vec::new(),
             stored_dependency_health: Vec::new(),
             snapshot_errors: Vec::new(),
@@ -360,7 +362,11 @@ impl MetricsRegistry {
 
         write_queue_metrics(&mut output, &snapshot.queues);
         write_dependency_metrics(&mut output, &snapshot.dependency_health);
-        write_announce_metrics(&mut output, &snapshot.announce_status_counts);
+        write_announce_metrics(
+            &mut output,
+            snapshot.announce_queue.as_ref(),
+            snapshot.announce_worker_capacity,
+        );
         write_job_snapshot_metrics(&mut output, &snapshot.jobs);
         write_stored_dependency_metrics(&mut output, &snapshot.stored_dependency_health);
         write_snapshot_errors(&mut output, &snapshot.snapshot_errors);
@@ -508,6 +514,51 @@ fn write_descriptors(output: &mut String) {
             "Durable announce work by status and reason.",
         ),
         (
+            "sporos_announce_active_work",
+            "gauge",
+            "Active durable announce work.",
+        ),
+        (
+            "sporos_announce_oldest_active_age_seconds",
+            "gauge",
+            "Oldest active announce work age.",
+        ),
+        (
+            "sporos_announce_next_retry_delay_seconds",
+            "gauge",
+            "Next announce retry delay.",
+        ),
+        (
+            "sporos_announce_running_leases",
+            "gauge",
+            "Running announce leases.",
+        ),
+        (
+            "sporos_announce_worker_capacity",
+            "gauge",
+            "Configured announce worker capacity.",
+        ),
+        (
+            "sporos_announce_worker_busy",
+            "gauge",
+            "Busy announce workers inferred from running leases.",
+        ),
+        (
+            "sporos_announce_worker_idle",
+            "gauge",
+            "Idle announce worker capacity.",
+        ),
+        (
+            "sporos_announce_attempts_total",
+            "counter",
+            "Announce attempts by safe outcome class.",
+        ),
+        (
+            "sporos_announce_dependency_wait_count",
+            "gauge",
+            "Announce work waiting on dependency state.",
+        ),
+        (
             "sporos_job_state",
             "gauge",
             "Persisted job state snapshots.",
@@ -574,13 +625,81 @@ fn write_dependency_metrics(output: &mut String, health: &DependencyHealthSnapsh
     }
 }
 
-fn write_announce_metrics(output: &mut String, counts: &[AnnounceStatusCount]) {
-    for count in counts {
+fn write_announce_metrics(
+    output: &mut String,
+    queue: Option<&AnnounceQueueSnapshot>,
+    worker_capacity: Option<u16>,
+) {
+    let Some(queue) = queue else {
+        return;
+    };
+
+    write_metric(
+        output,
+        "sporos_announce_active_work",
+        &[],
+        queue.active_count,
+    );
+    if let Some(age_ms) = queue.oldest_active_age_ms {
+        let value_ms = u64::try_from(age_ms).unwrap_or(0);
+        write_metric_seconds(
+            output,
+            "sporos_announce_oldest_active_age_seconds",
+            &[],
+            value_ms,
+        );
+    }
+    if let Some(delay_ms) = queue.next_retry_delay_ms {
+        let value_ms = u64::try_from(delay_ms).unwrap_or(0);
+        write_metric_seconds(
+            output,
+            "sporos_announce_next_retry_delay_seconds",
+            &[],
+            value_ms,
+        );
+    }
+    write_metric(
+        output,
+        "sporos_announce_running_leases",
+        &[],
+        queue.running_leases,
+    );
+    if let Some(worker_capacity) = worker_capacity {
+        let capacity = i64::from(worker_capacity);
+        let busy = queue.running_leases.min(capacity).max(0);
+        let idle = capacity.saturating_sub(busy);
+        write_metric(output, "sporos_announce_worker_capacity", &[], capacity);
+        write_metric(output, "sporos_announce_worker_busy", &[], busy);
+        write_metric(output, "sporos_announce_worker_idle", &[], idle);
+    }
+
+    for count in &queue.status_counts {
         let labels = vec![
             label("status", &count.status),
             label("reason", &count.reason),
         ];
         write_metric(output, "sporos_announce_work_total", &labels, count.count);
+    }
+    for count in &queue.attempt_counts {
+        let labels = vec![label("outcome_class", &count.outcome_class)];
+        write_metric(
+            output,
+            "sporos_announce_attempts_total",
+            &labels,
+            count.attempts,
+        );
+    }
+    for count in &queue.dependency_wait_counts {
+        let labels = vec![
+            label("dependency_kind", &count.dependency_kind),
+            label("dependency_name", &count.dependency_name),
+        ];
+        write_metric(
+            output,
+            "sporos_announce_dependency_wait_count",
+            &labels,
+            count.count,
+        );
     }
 }
 
@@ -728,6 +847,9 @@ impl PrometheusValue for i64 {
 mod tests {
     use super::*;
     use crate::domain::{DependencyName, JobName};
+    use crate::persistence::repository::{
+        AnnounceAttemptCount, AnnounceDependencyWaitCount, AnnounceStatusCount,
+    };
     use crate::runtime::health::{DependencyKind, DependencySummary};
     use crate::runtime::queue::QueueKind;
 
@@ -762,11 +884,27 @@ mod tests {
                 entries: Vec::new(),
                 summaries,
             },
-            announce_status_counts: vec![AnnounceStatusCount {
-                status: "queued".to_owned(),
-                reason: "accepted".to_owned(),
-                count: 3,
-            }],
+            announce_queue: Some(AnnounceQueueSnapshot {
+                active_count: 3,
+                oldest_active_age_ms: Some(4_000),
+                next_retry_delay_ms: Some(2_000),
+                running_leases: 1,
+                status_counts: vec![AnnounceStatusCount {
+                    status: "queued".to_owned(),
+                    reason: "accepted".to_owned(),
+                    count: 3,
+                }],
+                attempt_counts: vec![AnnounceAttemptCount {
+                    outcome_class: "retryable_dependency".to_owned(),
+                    attempts: 2,
+                }],
+                dependency_wait_counts: vec![AnnounceDependencyWaitCount {
+                    dependency_kind: "indexer".to_owned(),
+                    dependency_name: "torznab".to_owned(),
+                    count: 1,
+                }],
+            }),
+            announce_worker_capacity: Some(2),
             jobs: vec![JobStatusSnapshot {
                 name: JobName::new("rss").unwrap(),
                 state: "succeeded".to_owned(),
@@ -808,6 +946,10 @@ mod tests {
                 "sporos_job_duration_seconds_sum{job=\"rss\",outcome=\"succeeded\"} 3.000"
             )
         );
+        assert!(output.contains("sporos_announce_active_work 3"));
+        assert!(output.contains("sporos_announce_oldest_active_age_seconds 4.000"));
+        assert!(output.contains("sporos_announce_worker_busy 1"));
+        assert!(output.contains("sporos_announce_worker_idle 1"));
         assert!(output.contains("sporos_queue_depth{queue=\"search\"} 1"));
         assert!(output.contains(
             "sporos_dependency_health_state{dependency=\"indexer\",state=\"degraded\"} 1"
@@ -815,6 +957,12 @@ mod tests {
         assert!(
             output.contains("sporos_announce_work_total{status=\"queued\",reason=\"accepted\"} 3")
         );
+        assert!(
+            output.contains(
+                "sporos_announce_attempts_total{outcome_class=\"retryable_dependency\"} 2"
+            )
+        );
+        assert!(output.contains("sporos_announce_dependency_wait_count{dependency_kind=\"indexer\",dependency_name=\"torznab\"} 1"));
         assert!(
             output.contains(
                 "sporos_job_last_duration_seconds{job=\"rss\",state=\"succeeded\"} 1.500"
