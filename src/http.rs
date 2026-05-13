@@ -1,19 +1,27 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::domain::{ByteSize, CandidateGuid, DownloadUrl, ItemTitle, JobName, TrackerName};
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
+use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
 
 #[derive(Debug, Clone)]
 pub struct HttpState {
     readiness: Arc<RwLock<ReadinessState>>,
     health: HealthRegistry,
+    workflow_queues: Option<WorkflowQueues>,
+    api_auth: Option<ApiAuth>,
+    request_timeout: Duration,
 }
 
 impl HttpState {
@@ -21,7 +29,27 @@ impl HttpState {
         Self {
             readiness: Arc::new(RwLock::new(readiness)),
             health,
+            workflow_queues: None,
+            api_auth: None,
+            request_timeout: Duration::from_secs(5),
         }
+    }
+
+    pub fn with_workflow_queues(mut self, workflow_queues: WorkflowQueues) -> Self {
+        self.workflow_queues = Some(workflow_queues);
+        self
+    }
+
+    pub fn with_api_token(mut self, token: impl Into<String>) -> Self {
+        self.api_auth = Some(ApiAuth {
+            bearer_token: Arc::from(token.into()),
+        });
+        self
+    }
+
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
     }
 
     pub fn set_readiness(&self, readiness: ReadinessState) {
@@ -41,6 +69,56 @@ impl HttpState {
 
     fn dependency_health(&self) -> DependencyHealthSnapshot {
         self.health.snapshot()
+    }
+
+    fn workflow_queues(&self) -> Result<&WorkflowQueues, ApiErrorResponse> {
+        self.workflow_queues
+            .as_ref()
+            .ok_or(ApiErrorResponse::service_unavailable(
+                "workflow queues are not running",
+            ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowQueues {
+    pub announcements: BoundedWorkQueue<AnnouncementWorkflowRequest>,
+    pub searches: BoundedWorkQueue<SearchWorkflowRequest>,
+    pub jobs: BoundedWorkQueue<JobRunWorkflowRequest>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnouncementWorkflowRequest {
+    pub title: ItemTitle,
+    pub guid: CandidateGuid,
+    pub download_url: DownloadUrl,
+    pub tracker: TrackerName,
+    pub cookie: Option<String>,
+    pub size: Option<ByteSize>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchWorkflowRequest {
+    pub query: ItemTitle,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JobRunWorkflowRequest {
+    pub job_name: JobName,
+}
+
+#[derive(Debug, Clone)]
+struct ApiAuth {
+    bearer_token: Arc<str>,
+}
+
+impl ApiAuth {
+    fn authorizes(&self, headers: &HeaderMap) -> bool {
+        let expected = format!("Bearer {}", self.bearer_token);
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some(expected.as_str())
     }
 }
 
@@ -100,11 +178,163 @@ struct ReadinessChecks {
     workers_running: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnnouncementRequestDto {
+    name: String,
+    guid: String,
+    download_url: String,
+    tracker: String,
+    cookie: Option<String>,
+    size: Option<u64>,
+}
+
+impl AnnouncementRequestDto {
+    fn try_into_workflow(self) -> Result<AnnouncementWorkflowRequest, ApiErrorResponse> {
+        Ok(AnnouncementWorkflowRequest {
+            title: ItemTitle::new(self.name).map_err(|error| {
+                ApiErrorResponse::unprocessable(format!("invalid name: {error}"))
+            })?,
+            guid: CandidateGuid::new(self.guid).map_err(|error| {
+                ApiErrorResponse::unprocessable(format!("invalid guid: {error}"))
+            })?,
+            download_url: DownloadUrl::new(self.download_url).map_err(|error| {
+                ApiErrorResponse::unprocessable(format!("invalid download_url: {error}"))
+            })?,
+            tracker: TrackerName::new(self.tracker).map_err(|error| {
+                ApiErrorResponse::unprocessable(format!("invalid tracker: {error}"))
+            })?,
+            cookie: self.cookie,
+            size: self.size.map(ByteSize::new),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchRequestDto {
+    query: String,
+}
+
+impl SearchRequestDto {
+    fn try_into_workflow(self) -> Result<SearchWorkflowRequest, ApiErrorResponse> {
+        Ok(SearchWorkflowRequest {
+            query: ItemTitle::new(self.query).map_err(|error| {
+                ApiErrorResponse::unprocessable(format!("invalid query: {error}"))
+            })?,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowAcceptedResponse {
+    status: &'static str,
+    workflow: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WorkflowKind {
+    Announcement,
+    Search,
+    JobRun,
+}
+
+impl WorkflowKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Announcement => "announcement",
+            Self::Search => "search",
+            Self::JobRun => "job_run",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorBody {
+    error: ApiErrorDetail,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorDetail {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ApiErrorResponse {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl ApiErrorResponse {
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: message.into(),
+        }
+    }
+
+    fn unprocessable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_request",
+            message: message.into(),
+        }
+    }
+
+    fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "service_unavailable",
+            message: message.into(),
+        }
+    }
+
+    fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            code: "request_timeout",
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiErrorResponse {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(ApiErrorBody {
+                error: ApiErrorDetail {
+                    code: self.code,
+                    message: self.message,
+                },
+            }),
+        )
+            .into_response()
+    }
+}
+
 pub fn router(state: HttpState) -> Router {
+    let workflow_routes = Router::new()
+        .route("/v1/announcements", post(post_announcement))
+        .route("/v1/searches", post(post_search))
+        .route("/v1/jobs/{job_name}/runs", post(post_job_run))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            timeout_middleware,
+        ));
+
     Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/status", get(status))
+        .merge(workflow_routes)
         .with_state(state)
 }
 
@@ -133,6 +363,103 @@ async fn status(State(state): State<HttpState>) -> impl IntoResponse {
     )
 }
 
+async fn post_announcement(
+    State(state): State<HttpState>,
+    Json(request): Json<AnnouncementRequestDto>,
+) -> Response {
+    let request = match request.try_into_workflow() {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let queues = match state.workflow_queues() {
+        Ok(queues) => queues,
+        Err(error) => return error.into_response(),
+    };
+
+    enqueue_work(
+        queues.announcements.try_enqueue(request),
+        WorkflowKind::Announcement,
+    )
+}
+
+async fn post_search(
+    State(state): State<HttpState>,
+    Json(request): Json<SearchRequestDto>,
+) -> Response {
+    let request = match request.try_into_workflow() {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let queues = match state.workflow_queues() {
+        Ok(queues) => queues,
+        Err(error) => return error.into_response(),
+    };
+
+    enqueue_work(queues.searches.try_enqueue(request), WorkflowKind::Search)
+}
+
+async fn post_job_run(State(state): State<HttpState>, Path(job_name): Path<String>) -> Response {
+    let request = match JobName::new(job_name) {
+        Ok(job_name) => JobRunWorkflowRequest { job_name },
+        Err(error) => {
+            return ApiErrorResponse::unprocessable(format!("invalid job name: {error}"))
+                .into_response();
+        }
+    };
+    let queues = match state.workflow_queues() {
+        Ok(queues) => queues,
+        Err(error) => return error.into_response(),
+    };
+
+    enqueue_work(queues.jobs.try_enqueue(request), WorkflowKind::JobRun)
+}
+
+async fn auth_middleware(
+    State(state): State<HttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if state
+        .api_auth
+        .as_ref()
+        .is_some_and(|auth| !auth.authorizes(request.headers()))
+    {
+        return ApiErrorResponse::unauthorized("missing or invalid bearer token").into_response();
+    }
+
+    next.run(request).await
+}
+
+async fn timeout_middleware(
+    State(state): State<HttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(state.request_timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_elapsed) => ApiErrorResponse::timeout("request timed out").into_response(),
+    }
+}
+
+fn enqueue_work<T>(result: Result<(), EnqueueError<T>>, kind: WorkflowKind) -> Response {
+    match result {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(WorkflowAcceptedResponse {
+                status: "queued",
+                workflow: kind.as_str(),
+            }),
+        )
+            .into_response(),
+        Err(EnqueueError::Full { .. }) => {
+            ApiErrorResponse::service_unavailable("workflow queue is full").into_response()
+        }
+        Err(EnqueueError::Closed { .. }) => {
+            ApiErrorResponse::service_unavailable("workflow queue is closed").into_response()
+        }
+    }
+}
+
 fn readiness_response(state: &HttpState) -> ReadinessResponse {
     let readiness = state.readiness();
     ReadinessResponse {
@@ -159,14 +486,17 @@ fn readiness_response(state: &HttpState) -> ReadinessResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{Request, header};
     use serde_json::Value;
     use tower::ServiceExt;
 
     use crate::domain::{DependencyName, ReasonText};
     use crate::runtime::health::DependencyKind;
+    use crate::runtime::queue::{QueueKind, WorkReceiver, bounded_work_queue};
 
     #[tokio::test]
     async fn livez_does_not_depend_on_external_health() {
@@ -259,5 +589,187 @@ mod tests {
         assert_eq!(StatusCode::OK, status);
         assert_eq!("ok", json["status"]);
         assert_eq!("ready", json["readiness"]["status"]);
+    }
+
+    #[tokio::test]
+    async fn announcement_endpoint_validates_auth_and_enqueues_work() {
+        let (app, mut announcements, _searches, _jobs) = workflow_app(Some("secret"));
+
+        let unauthorized = app
+            .clone()
+            .oneshot(json_post(
+                "/v1/announcements",
+                serde_json::json!({
+                    "name": "Example",
+                    "guid": "guid-1",
+                    "download_url": "https://tracker.example/download?id=1",
+                    "tracker": "tracker.example"
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        let accepted = app
+            .oneshot(json_post(
+                "/v1/announcements",
+                serde_json::json!({
+                    "name": "Example",
+                    "guid": "guid-1",
+                    "download_url": "https://tracker.example/download?id=1",
+                    "tracker": "tracker.example",
+                    "size": 42
+                }),
+                Some("Bearer secret"),
+            ))
+            .await
+            .unwrap();
+        let status = accepted.status();
+        let body = axum::body::to_bytes(accepted.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let queued = announcements.recv().await.unwrap();
+
+        assert_eq!(StatusCode::UNAUTHORIZED, unauthorized.status());
+        assert_eq!(StatusCode::ACCEPTED, status);
+        assert_eq!("queued", json["status"]);
+        assert_eq!("announcement", json["workflow"]);
+        assert_eq!("Example", queued.title.as_str());
+        assert_eq!(Some(42), queued.size.map(ByteSize::get));
+    }
+
+    #[tokio::test]
+    async fn workflow_endpoints_validate_dtos_before_enqueueing() {
+        let (app, _announcements, _searches, _jobs) = workflow_app(None);
+
+        let response = app
+            .oneshot(json_post(
+                "/v1/announcements",
+                serde_json::json!({
+                    "name": "",
+                    "guid": "guid-1",
+                    "download_url": "https://tracker.example/download",
+                    "tracker": "tracker.example"
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::UNPROCESSABLE_ENTITY, response.status());
+    }
+
+    #[tokio::test]
+    async fn search_and_job_run_endpoints_use_bounded_queues() {
+        let (app, _announcements, mut searches, mut jobs) = workflow_app(None);
+
+        let search = app
+            .clone()
+            .oneshot(json_post(
+                "/v1/searches",
+                serde_json::json!({ "query": "Example Movie 2026" }),
+                None,
+            ))
+            .await
+            .unwrap();
+        let job = app
+            .oneshot(json_post("/v1/jobs/rss/runs", serde_json::json!({}), None))
+            .await
+            .unwrap();
+        let search_work = searches.recv().await.unwrap();
+        let job_work = jobs.recv().await.unwrap();
+
+        assert_eq!(StatusCode::ACCEPTED, search.status());
+        assert_eq!("Example Movie 2026", search_work.query.as_str());
+        assert_eq!(StatusCode::ACCEPTED, job.status());
+        assert_eq!("rss", job_work.job_name.as_str());
+    }
+
+    #[tokio::test]
+    async fn workflow_endpoints_report_backpressure() {
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(1));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(1));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(1));
+        announcements
+            .try_enqueue(AnnouncementWorkflowRequest {
+                title: ItemTitle::new("Already Queued").unwrap(),
+                guid: CandidateGuid::new("guid-1").unwrap(),
+                download_url: DownloadUrl::new("https://tracker.example/download").unwrap(),
+                tracker: TrackerName::new("tracker.example").unwrap(),
+                cookie: None,
+                size: None,
+            })
+            .unwrap();
+        let app = router(
+            HttpState::new(ReadinessState::ready(), HealthRegistry::new()).with_workflow_queues(
+                WorkflowQueues {
+                    announcements,
+                    searches,
+                    jobs,
+                },
+            ),
+        );
+
+        let response = app
+            .oneshot(json_post(
+                "/v1/announcements",
+                serde_json::json!({
+                    "name": "Example",
+                    "guid": "guid-2",
+                    "download_url": "https://tracker.example/download?id=2",
+                    "tracker": "tracker.example"
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, response.status());
+    }
+
+    fn workflow_app(
+        token: Option<&str>,
+    ) -> (
+        Router,
+        WorkReceiver<AnnouncementWorkflowRequest>,
+        WorkReceiver<SearchWorkflowRequest>,
+        WorkReceiver<JobRunWorkflowRequest>,
+    ) {
+        let (announcements, announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(4));
+        let (searches, search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let (jobs, job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
+        let mut state = HttpState::new(ReadinessState::ready(), HealthRegistry::new())
+            .with_workflow_queues(WorkflowQueues {
+                announcements,
+                searches,
+                jobs,
+            });
+        if let Some(token) = token {
+            state = state.with_api_token(token);
+        }
+
+        (
+            router(state),
+            announcement_receiver,
+            search_receiver,
+            job_receiver,
+        )
+    }
+
+    fn json_post(path: &str, body: Value, authorization: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(authorization) = authorization {
+            builder = builder.header(header::AUTHORIZATION, authorization);
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn nonzero(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
     }
 }
