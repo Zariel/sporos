@@ -14,7 +14,7 @@ use crate::domain::{
     MatchDecision, MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
 };
 use crate::errors::DatabaseError;
-use crate::indexers::ConfiguredTorznabIndexer;
+use crate::indexers::{ConfiguredTorznabIndexer, TorznabCaps};
 
 use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
 
@@ -934,6 +934,80 @@ impl Repository {
                 })
             })
             .collect()
+    }
+
+    pub async fn record_indexer_caps_success(
+        &self,
+        name: &DependencyName,
+        caps: &TorznabCaps,
+        refreshed_at_ms: i64,
+    ) -> Result<(), DatabaseError> {
+        let caps_json =
+            serde_json::to_string(caps).map_err(|error| DatabaseError::QueryFailed {
+                operation: "serialize indexer caps".to_owned(),
+                message: error.to_string(),
+            })?;
+        sqlx::query(
+            r#"
+            UPDATE indexers
+            SET capabilities_json = ?,
+                state = 'healthy',
+                retry_after = NULL,
+                last_caps_refresh_at = ?,
+                updated_at = ?
+            WHERE name = ?
+            "#,
+        )
+        .bind(caps_json)
+        .bind(refreshed_at_ms)
+        .bind(refreshed_at_ms)
+        .bind(name.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record indexer caps success", error))?;
+        self.record_dependency_health(
+            "indexer",
+            name,
+            &DependencyState::Healthy {
+                checked_at_ms: refreshed_at_ms,
+            },
+            refreshed_at_ms,
+        )
+        .await
+    }
+
+    pub async fn record_indexer_caps_failure(
+        &self,
+        name: &DependencyName,
+        reason: &ReasonText,
+        retry_after_ms: Option<i64>,
+        checked_at_ms: i64,
+    ) -> Result<(), DatabaseError> {
+        sqlx::query(
+            r#"
+            UPDATE indexers
+            SET state = 'degraded',
+                retry_after = ?,
+                updated_at = ?
+            WHERE name = ?
+            "#,
+        )
+        .bind(retry_after_ms)
+        .bind(checked_at_ms)
+        .bind(name.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record indexer caps failure", error))?;
+        self.record_dependency_health(
+            "indexer",
+            name,
+            &DependencyState::Degraded {
+                reason: reason.clone(),
+                retry_after_ms,
+            },
+            checked_at_ms,
+        )
+        .await
     }
 
     pub async fn insert_or_dedupe_announce_work(
@@ -1984,7 +2058,9 @@ mod tests {
         CandidateGuid, ClientHost, DecisionReason, DisplayName, DownloadUrl, FileIndex, IndexerId,
         ItemTitle, MatchRatio, ReasonText, SourceKey, TrackerName,
     };
-    use crate::indexers::{ApiKeySource, ConfiguredTorznabIndexer, SanitizedTorznabUrl};
+    use crate::indexers::{
+        ApiKeySource, ConfiguredTorznabIndexer, SanitizedTorznabUrl, parse_torznab_caps,
+    };
     use crate::persistence::schema::{BUSY_TIMEOUT_MS, REQUIRED_TABLES};
     use std::fs;
     use std::path::PathBuf;
@@ -2329,6 +2405,58 @@ mod tests {
         assert!(main.enabled);
         assert!(!backup.enabled);
         assert!(!format!("{resynced:?}").contains("secret-value"));
+    }
+
+    #[tokio::test]
+    async fn indexer_caps_updates_registry_and_dependency_health() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let indexer = test_indexer(
+            "main",
+            "https://indexer.example/api",
+            ApiKeySource::Env("INDEXER_KEY".to_owned()),
+        );
+        repository
+            .sync_torznab_indexers(&[indexer], 100)
+            .await
+            .unwrap();
+        let name = DependencyName::new("main").unwrap();
+        let caps = parse_torznab_caps(
+            r#"
+            <caps>
+              <searching><search available="yes"/></searching>
+              <categories><category id="5000" name="TV"/></categories>
+            </caps>
+            "#,
+        )
+        .unwrap();
+
+        repository
+            .record_indexer_caps_success(&name, &caps, 200)
+            .await
+            .unwrap();
+        let rows = repository.indexer_registry_snapshot(10).await.unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert_eq!("healthy", rows[0].state);
+        assert_eq!(Some(200), rows[0].last_caps_refresh_at_ms);
+        assert_eq!("healthy", health[0].state);
+
+        repository
+            .record_indexer_caps_failure(
+                &name,
+                &ReasonText::new("bad caps").unwrap(),
+                Some(5_000),
+                300,
+            )
+            .await
+            .unwrap();
+        let rows = repository.indexer_registry_snapshot(10).await.unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert_eq!("degraded", rows[0].state);
+        assert_eq!(Some(5_000), rows[0].retry_after_ms);
+        assert_eq!("degraded", health[0].state);
+        assert_eq!(Some("bad caps".to_owned()), health[0].reason);
     }
 
     #[tokio::test]

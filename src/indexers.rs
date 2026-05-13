@@ -2,8 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
+use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::name::QName;
+use serde::{Deserialize, Serialize};
+
 use crate::config::{IndexersConfig, TorznabIndexerConfig};
-use crate::domain::DependencyName;
+use crate::domain::{DependencyName, MediaType};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConfiguredTorznabIndexer {
@@ -204,6 +209,242 @@ pub fn configured_torznab_by_name(
         .collect())
 }
 
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TorznabCaps {
+    pub search: SearchCaps,
+    pub categories: CategoryCaps,
+    pub limits: TorznabLimits,
+}
+
+impl TorznabCaps {
+    pub fn supports_media_type(&self, media_type: MediaType) -> bool {
+        match media_type {
+            MediaType::Episode | MediaType::SeasonPack => {
+                self.search.tv_search || self.categories.tv || self.categories.xxx
+            }
+            MediaType::Movie => {
+                self.search.movie_search || self.categories.movie || self.categories.xxx
+            }
+            MediaType::Anime | MediaType::Video => {
+                self.search.tv_search
+                    || self.search.movie_search
+                    || self.categories.tv
+                    || self.categories.movie
+                    || self.categories.anime
+                    || self.categories.xxx
+            }
+            MediaType::Audio => self.search.audio_search || self.categories.audio,
+            MediaType::Book => self.categories.book,
+            MediaType::Archive | MediaType::Unknown => self.search.generic_search,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchCaps {
+    pub generic_search: bool,
+    pub tv_search: bool,
+    pub movie_search: bool,
+    pub audio_search: bool,
+    pub supported_id_params: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CategoryCaps {
+    pub movie: bool,
+    pub tv: bool,
+    pub anime: bool,
+    pub xxx: bool,
+    pub audio: bool,
+    pub book: bool,
+    pub additional: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TorznabLimits {
+    pub default: u16,
+    pub max: u16,
+}
+
+impl Default for TorznabLimits {
+    fn default() -> Self {
+        Self {
+            default: 100,
+            max: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TorznabCapsError {
+    InvalidXml { message: String },
+    UnsupportedSearch,
+}
+
+impl fmt::Display for TorznabCapsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidXml { message } => {
+                write!(formatter, "invalid Torznab caps XML: {message}")
+            }
+            Self::UnsupportedSearch => write!(formatter, "Torznab caps do not support search"),
+        }
+    }
+}
+
+impl std::error::Error for TorznabCapsError {}
+
+pub fn parse_torznab_caps(xml: &str) -> Result<TorznabCaps, TorznabCapsError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut caps = TorznabCaps::default();
+    let mut saw_caps = false;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
+                let name = element.name();
+                if name == QName(b"caps") {
+                    saw_caps = true;
+                } else if name == QName(b"limits") {
+                    parse_limits(&reader, &element, &mut caps)?;
+                } else if is_search_element(name) {
+                    parse_search_caps(&reader, &element, &mut caps)?;
+                } else if name == QName(b"category") || name == QName(b"subcat") {
+                    parse_category_caps(&reader, &element, &mut caps)?;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => {
+                return Err(TorznabCapsError::InvalidXml {
+                    message: error.to_string(),
+                });
+            }
+        }
+        buffer.clear();
+    }
+
+    if !saw_caps {
+        return Err(TorznabCapsError::InvalidXml {
+            message: "missing caps root".to_owned(),
+        });
+    }
+    if !caps.search.generic_search && !caps.search.tv_search && !caps.search.movie_search {
+        return Err(TorznabCapsError::UnsupportedSearch);
+    }
+
+    Ok(caps)
+}
+
+fn parse_limits(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    caps: &mut TorznabCaps,
+) -> Result<(), TorznabCapsError> {
+    let default = attribute_value(reader, element, b"default")?
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(100);
+    let max = attribute_value(reader, element, b"max")?
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(100);
+    caps.limits = TorznabLimits { default, max };
+    Ok(())
+}
+
+fn parse_search_caps(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    caps: &mut TorznabCaps,
+) -> Result<(), TorznabCapsError> {
+    let available = attribute_value(reader, element, b"available")?
+        .map(|value| matches!(value.as_str(), "yes" | "true" | "1"))
+        .unwrap_or(false);
+    match element.name() {
+        QName(b"search") => caps.search.generic_search = available,
+        QName(b"tv-search") => caps.search.tv_search = available,
+        QName(b"movie-search") => caps.search.movie_search = available,
+        QName(b"audio-search") => caps.search.audio_search = available,
+        _ => {}
+    }
+    if available {
+        if let Some(params) = attribute_value(reader, element, b"supportedParams")? {
+            for param in params
+                .split(',')
+                .map(str::trim)
+                .filter(|param| !param.is_empty())
+            {
+                caps.search
+                    .supported_id_params
+                    .insert(param.to_ascii_lowercase());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_category_caps(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    caps: &mut TorznabCaps,
+) -> Result<(), TorznabCapsError> {
+    let name = attribute_value(reader, element, b"name")?
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let id = attribute_value(reader, element, b"id")?.and_then(|value| value.parse::<u32>().ok());
+
+    if name.contains("movie") {
+        caps.categories.movie = true;
+    } else if name.contains("tv") || name.contains("television") {
+        caps.categories.tv = true;
+    } else if name.contains("anime") {
+        caps.categories.anime = true;
+    } else if name.contains("xxx") {
+        caps.categories.xxx = true;
+    } else if name.contains("audio") || name.contains("music") {
+        caps.categories.audio = true;
+    } else if name.contains("book") {
+        caps.categories.book = true;
+    } else if id.is_some_and(is_additional_category) {
+        caps.categories.additional = true;
+    }
+
+    Ok(())
+}
+
+fn is_search_element(name: QName<'_>) -> bool {
+    matches!(
+        name,
+        QName(b"search") | QName(b"tv-search") | QName(b"movie-search") | QName(b"audio-search")
+    )
+}
+
+fn is_additional_category(id: u32) -> bool {
+    id < 100_000 && !(8_000..=8_999).contains(&id)
+}
+
+fn attribute_value(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    key: &[u8],
+) -> Result<Option<String>, TorznabCapsError> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| TorznabCapsError::InvalidXml {
+            message: error.to_string(),
+        })?;
+        if attribute.key == QName(key) {
+            let value = attribute
+                .decode_and_unescape_value(reader.decoder())
+                .map_err(|error| TorznabCapsError::InvalidXml {
+                    message: error.to_string(),
+                })?;
+            return Ok(Some(value.into_owned()));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +524,69 @@ mod tests {
             let error = SanitizedTorznabUrl::new(url).unwrap_err();
             assert!(matches!(error, IndexerConfigError::InvalidUrl { .. }));
         }
+    }
+
+    #[test]
+    fn caps_parser_extracts_search_categories_and_limits() {
+        let caps = parse_torznab_caps(
+            r#"
+            <caps>
+              <limits default="50" max="200"/>
+              <searching>
+                <search available="yes" supportedParams="q"/>
+                <tv-search available="yes" supportedParams="q,tvdbid,imdbid"/>
+                <movie-search available="yes" supportedParams="q,imdbid"/>
+              </searching>
+              <categories>
+                <category id="2000" name="Movies"/>
+                <category id="5000" name="TV"/>
+                <category id="5070" name="Anime"/>
+                <category id="3000" name="Audio"/>
+                <category id="7020" name="Books"/>
+                <category id="1010" name="Other"/>
+              </categories>
+            </caps>
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            TorznabLimits {
+                default: 50,
+                max: 200
+            },
+            caps.limits
+        );
+        assert!(caps.search.generic_search);
+        assert!(caps.search.tv_search);
+        assert!(caps.search.supported_id_params.contains("tvdbid"));
+        assert!(caps.categories.movie);
+        assert!(caps.categories.additional);
+        assert!(caps.supports_media_type(MediaType::Episode));
+        assert!(caps.supports_media_type(MediaType::Movie));
+        assert!(caps.supports_media_type(MediaType::Audio));
+    }
+
+    #[test]
+    fn caps_parser_defaults_limits_and_rejects_unsupported_search() {
+        let error = parse_torznab_caps(
+            r#"
+            <caps>
+              <searching>
+                <search available="no"/>
+              </searching>
+            </caps>
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(TorznabCapsError::UnsupportedSearch, error);
+    }
+
+    #[test]
+    fn caps_parser_rejects_bad_xml() {
+        let error = parse_torznab_caps("<caps><").unwrap_err();
+
+        assert!(matches!(error, TorznabCapsError::InvalidXml { .. }));
     }
 }
