@@ -100,8 +100,9 @@ impl AppRuntime {
             scheduler: scheduler_queue,
             inventory_refresh: inventory_queue,
         };
-        let http =
-            HttpState::new(ReadinessState::ready(), health.clone()).with_workflow_queues(workflow);
+        let http = HttpState::new(ReadinessState::ready(), health.clone())
+            .with_workflow_queues(workflow)
+            .with_announce_acceptor(repository.clone(), config.announce.clone());
 
         Ok(Self {
             state: AppState {

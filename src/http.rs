@@ -11,9 +11,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::announce::{
+    AnnounceDedupeIdentity, AnnounceQueueConfig, AnnounceReason, AnnounceStatus, AnnounceWorkId,
+    AnnounceWorkItem,
+};
 use crate::domain::{ByteSize, CandidateGuid, DownloadUrl, ItemTitle, JobName, TrackerName};
+use crate::errors::DatabaseError;
+use crate::persistence::repository::{AnnounceInsertResult, Repository};
+use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
+use crate::secrets::CookieSecret;
 
 const WORKFLOW_BODY_LIMIT_BYTES: usize = 16 * 1024;
 
@@ -22,6 +30,7 @@ pub struct HttpState {
     readiness: Arc<RwLock<ReadinessState>>,
     health: HealthRegistry,
     workflow_queues: Option<WorkflowQueues>,
+    announce_acceptor: Option<AnnounceAcceptor>,
     api_auth: Option<ApiAuth>,
     request_timeout: Duration,
 }
@@ -32,6 +41,7 @@ impl HttpState {
             readiness: Arc::new(RwLock::new(readiness)),
             health,
             workflow_queues: None,
+            announce_acceptor: None,
             api_auth: None,
             request_timeout: Duration::from_secs(5),
         }
@@ -39,6 +49,15 @@ impl HttpState {
 
     pub fn with_workflow_queues(mut self, workflow_queues: WorkflowQueues) -> Self {
         self.workflow_queues = Some(workflow_queues);
+        self
+    }
+
+    pub fn with_announce_acceptor(
+        mut self,
+        repository: Repository,
+        config: AnnounceQueueConfig,
+    ) -> Self {
+        self.announce_acceptor = Some(AnnounceAcceptor { repository, config });
         self
     }
 
@@ -80,6 +99,12 @@ impl HttpState {
                 "workflow queues are not running",
             ))
     }
+}
+
+#[derive(Debug, Clone)]
+struct AnnounceAcceptor {
+    repository: Repository,
+    config: AnnounceQueueConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +259,13 @@ struct WorkflowAcceptedResponse {
     workflow: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct AnnouncementAcceptedResponse {
+    id: String,
+    status: &'static str,
+    deduplicated: bool,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum WorkflowKind {
     Announcement,
@@ -374,6 +406,10 @@ async fn post_announcement(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
+    if let Some(acceptor) = state.announce_acceptor.as_ref() {
+        return accept_announcement(acceptor, request).await;
+    }
+
     let queues = match state.workflow_queues() {
         Ok(queues) => queues,
         Err(error) => return error.into_response(),
@@ -383,6 +419,91 @@ async fn post_announcement(
         queues.announcements.try_enqueue(request),
         WorkflowKind::Announcement,
     )
+}
+
+async fn accept_announcement(
+    acceptor: &AnnounceAcceptor,
+    request: AnnouncementWorkflowRequest,
+) -> Response {
+    let work = match announcement_work_item(request, acceptor.config.default_ttl_secs) {
+        Ok(work) => work,
+        Err(error) => return error.into_response(),
+    };
+
+    match acceptor
+        .repository
+        .insert_or_dedupe_announce_work(&work, acceptor.config.max_pending)
+        .await
+    {
+        Ok(AnnounceInsertResult::Inserted { id }) => announcement_accepted(id, false),
+        Ok(AnnounceInsertResult::Deduplicated { id }) => announcement_accepted(id, true),
+        Err(DatabaseError::Busy { .. }) => {
+            ApiErrorResponse::service_unavailable("announce queue is at durable capacity")
+                .into_response()
+        }
+        Err(error) => ApiErrorResponse::service_unavailable(format!(
+            "cannot durably accept announcement: {error}"
+        ))
+        .into_response(),
+    }
+}
+
+fn announcement_accepted(id: AnnounceWorkId, deduplicated: bool) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(AnnouncementAcceptedResponse {
+            id: id.to_string(),
+            status: "queued",
+            deduplicated,
+        }),
+    )
+        .into_response()
+}
+
+fn announcement_work_item(
+    request: AnnouncementWorkflowRequest,
+    ttl_secs: u64,
+) -> Result<AnnounceWorkItem, ApiErrorResponse> {
+    if let Some(cookie) = request.cookie.as_deref() {
+        CookieSecret::new(cookie)
+            .map_err(|error| ApiErrorResponse::unprocessable(format!("invalid cookie: {error}")))?;
+    }
+    let now_ms = unix_time_ms();
+    let ttl_ms = i64::try_from(ttl_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    let expires_at_ms = now_ms.saturating_add(ttl_ms);
+    let dedupe_hash = AnnounceDedupeIdentity::Guid {
+        tracker: request.tracker.clone(),
+        guid: request.guid.clone(),
+    }
+    .hash();
+    let id_suffix = dedupe_hash.as_str().chars().take(12).collect::<String>();
+    let id = AnnounceWorkId::new(format!("ann_{now_ms}_{id_suffix}")).map_err(|error| {
+        ApiErrorResponse::service_unavailable(format!("cannot create announce work id: {error}"))
+    })?;
+
+    Ok(AnnounceWorkItem {
+        id,
+        status: AnnounceStatus::Queued,
+        reason: AnnounceReason::Accepted,
+        dedupe_hash,
+        title: request.title,
+        tracker: request.tracker,
+        guid: Some(request.guid),
+        info_hash: None,
+        size: request.size,
+        received_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        first_attempt_at_ms: None,
+        finished_at_ms: None,
+        attempt_count: 0,
+        next_attempt_at_ms: now_ms,
+        expires_at_ms,
+        lease: None,
+        last_dependency_kind: None,
+        last_dependency_name: None,
+        last_error_class: None,
+        last_redacted_message: None,
+    })
 }
 
 async fn post_search(
@@ -501,6 +622,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::domain::{DependencyName, ReasonText};
+    use crate::persistence::repository::Repository;
     use crate::runtime::health::DependencyKind;
     use crate::runtime::queue::{QueueKind, WorkReceiver, bounded_work_queue};
 
@@ -598,8 +720,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn announcement_endpoint_validates_auth_and_enqueues_work() {
-        let (app, mut announcements, _searches, _jobs) = workflow_app(Some("secret"));
+    async fn announcement_endpoint_validates_auth_and_persists_work() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let app = announce_app(
+            repository.clone(),
+            Some("secret"),
+            AnnounceQueueConfig::default(),
+        );
 
         let unauthorized = app
             .clone()
@@ -634,14 +761,106 @@ mod tests {
             .await
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        let queued = announcements.recv().await.unwrap();
+        let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM announce_work")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
 
         assert_eq!(StatusCode::UNAUTHORIZED, unauthorized.status());
         assert_eq!(StatusCode::ACCEPTED, status);
         assert_eq!("queued", json["status"]);
-        assert_eq!("announcement", json["workflow"]);
-        assert_eq!("Example", queued.title.as_str());
-        assert_eq!(Some(42), queued.size.map(ByteSize::get));
+        assert_eq!(false, json["deduplicated"]);
+        assert!(json["id"].as_str().is_some_and(|id| id.starts_with("ann_")));
+        assert_eq!(1, stored_count);
+    }
+
+    #[tokio::test]
+    async fn announcement_endpoint_deduplicates_active_work() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let app = announce_app(repository.clone(), None, AnnounceQueueConfig::default());
+        let body = serde_json::json!({
+            "name": "Example",
+            "guid": "guid-1",
+            "download_url": "https://tracker.example/download?id=1",
+            "tracker": "tracker.example",
+            "size": 42
+        });
+
+        let first = app
+            .clone()
+            .oneshot(json_post("/v1/announcements", body.clone(), None))
+            .await
+            .unwrap();
+        let second = app
+            .oneshot(json_post("/v1/announcements", body, None))
+            .await
+            .unwrap();
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_json: Value = serde_json::from_slice(&first_body).unwrap();
+        let second_json: Value = serde_json::from_slice(&second_body).unwrap();
+        let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM announce_work")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(first_json["id"], second_json["id"]);
+        assert_eq!(false, first_json["deduplicated"]);
+        assert_eq!(true, second_json["deduplicated"]);
+        assert_eq!(1, stored_count);
+    }
+
+    #[tokio::test]
+    async fn announcement_endpoint_reports_durable_capacity() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let app = announce_app(
+            repository.clone(),
+            None,
+            AnnounceQueueConfig {
+                max_pending: 1,
+                ..AnnounceQueueConfig::default()
+            },
+        );
+
+        let first = app
+            .clone()
+            .oneshot(json_post(
+                "/v1/announcements",
+                serde_json::json!({
+                    "name": "Example",
+                    "guid": "guid-1",
+                    "download_url": "https://tracker.example/download?id=1",
+                    "tracker": "tracker.example"
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        let rejected = app
+            .oneshot(json_post(
+                "/v1/announcements",
+                serde_json::json!({
+                    "name": "Other",
+                    "guid": "guid-2",
+                    "download_url": "https://tracker.example/download?id=2",
+                    "tracker": "tracker.example"
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM announce_work")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::ACCEPTED, first.status());
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, rejected.status());
+        assert_eq!(1, stored_count);
     }
 
     #[tokio::test]
@@ -697,14 +916,9 @@ mod tests {
             bounded_work_queue(QueueKind::Announcement, nonzero(1));
         let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(1));
         let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(1));
-        announcements
-            .try_enqueue(AnnouncementWorkflowRequest {
-                title: ItemTitle::new("Already Queued").unwrap(),
-                guid: CandidateGuid::new("guid-1").unwrap(),
-                download_url: DownloadUrl::new("https://tracker.example/download").unwrap(),
-                tracker: TrackerName::new("tracker.example").unwrap(),
-                cookie: None,
-                size: None,
+        searches
+            .try_enqueue(SearchWorkflowRequest {
+                query: ItemTitle::new("Already Queued").unwrap(),
             })
             .unwrap();
         let app = router(
@@ -719,13 +933,8 @@ mod tests {
 
         let response = app
             .oneshot(json_post(
-                "/v1/announcements",
-                serde_json::json!({
-                    "name": "Example",
-                    "guid": "guid-2",
-                    "download_url": "https://tracker.example/download?id=2",
-                    "tracker": "tracker.example"
-                }),
+                "/v1/searches",
+                serde_json::json!({ "query": "Example" }),
                 None,
             ))
             .await
@@ -807,6 +1016,29 @@ mod tests {
             search_receiver,
             job_receiver,
         )
+    }
+
+    fn announce_app(
+        repository: Repository,
+        token: Option<&str>,
+        config: AnnounceQueueConfig,
+    ) -> Router {
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(4));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
+        let mut state = HttpState::new(ReadinessState::ready(), HealthRegistry::new())
+            .with_workflow_queues(WorkflowQueues {
+                announcements,
+                searches,
+                jobs,
+            })
+            .with_announce_acceptor(repository, config);
+        if let Some(token) = token {
+            state = state.with_api_token(token);
+        }
+
+        router(state)
     }
 
     fn json_post(path: &str, body: Value, authorization: Option<&str>) -> Request<Body> {
