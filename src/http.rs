@@ -18,6 +18,9 @@ use crate::announce::{
 };
 use crate::domain::{ByteSize, CandidateGuid, DownloadUrl, ItemTitle, JobName, TrackerName};
 use crate::errors::DatabaseError;
+use crate::metrics::{
+    HttpMethod, HttpRoute, MetricsRegistry, MetricsSnapshot, WorkflowMetric, WorkflowOutcome,
+};
 use crate::persistence::repository::{AnnounceInsertResult, Repository};
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
@@ -34,6 +37,7 @@ pub struct HttpState {
     announce_acceptor: Option<AnnounceAcceptor>,
     api_auth: Option<ApiAuth>,
     request_timeout: Duration,
+    metrics: MetricsRegistry,
 }
 
 impl HttpState {
@@ -45,6 +49,7 @@ impl HttpState {
             announce_acceptor: None,
             api_auth: None,
             request_timeout: Duration::from_secs(5),
+            metrics: MetricsRegistry::new(),
         }
     }
 
@@ -71,6 +76,11 @@ impl HttpState {
 
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout;
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: MetricsRegistry) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -113,6 +123,16 @@ pub struct WorkflowQueues {
     pub announcements: BoundedWorkQueue<AnnouncementWorkflowRequest>,
     pub searches: BoundedWorkQueue<SearchWorkflowRequest>,
     pub jobs: BoundedWorkQueue<JobRunWorkflowRequest>,
+}
+
+impl WorkflowQueues {
+    fn stats(&self) -> Vec<crate::runtime::queue::QueueStats> {
+        vec![
+            self.announcements.stats(),
+            self.searches.stats(),
+            self.jobs.stats(),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -282,6 +302,14 @@ impl WorkflowKind {
             Self::JobRun => "job_run",
         }
     }
+
+    const fn metric(self) -> WorkflowMetric {
+        match self {
+            Self::Announcement => WorkflowMetric::Announcement,
+            Self::Search => WorkflowMetric::Search,
+            Self::JobRun => WorkflowMetric::JobRun,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -369,12 +397,16 @@ pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/v1/status", get(status))
         .merge(workflow_routes)
         .with_state(state)
 }
 
-async fn livez() -> impl IntoResponse {
+async fn livez(State(state): State<HttpState>) -> impl IntoResponse {
+    state
+        .metrics
+        .record_http_request(HttpMethod::Get, HttpRoute::Livez, StatusCode::OK.as_u16());
     (StatusCode::OK, Json(LivenessResponse { status: "live" }))
 }
 
@@ -385,11 +417,33 @@ async fn readyz(State(state): State<HttpState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    state
+        .metrics
+        .record_http_request(HttpMethod::Get, HttpRoute::Readyz, status.as_u16());
     (status, Json(readiness))
+}
+
+async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
+    let snapshot = metrics_snapshot(&state).await;
+    let body = state.metrics.render_prometheus(&snapshot);
+    state
+        .metrics
+        .record_http_request(HttpMethod::Get, HttpRoute::Metrics, StatusCode::OK.as_u16());
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
 }
 
 async fn status(State(state): State<HttpState>) -> impl IntoResponse {
     let readiness = readiness_response(&state);
+    state
+        .metrics
+        .record_http_request(HttpMethod::Get, HttpRoute::Status, StatusCode::OK.as_u16());
     (
         StatusCode::OK,
         Json(StatusResponse {
@@ -405,7 +459,17 @@ async fn post_announcement(
 ) -> Response {
     let request = match request.try_into_workflow() {
         Ok(request) => request,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            state
+                .metrics
+                .record_workflow_enqueue(WorkflowMetric::Announcement, WorkflowOutcome::Invalid);
+            state.metrics.record_http_request(
+                HttpMethod::Post,
+                HttpRoute::Announcements,
+                error.status.as_u16(),
+            );
+            return error.into_response();
+        }
     };
     let span = info_span!(
         "http.announcement",
@@ -413,30 +477,58 @@ async fn post_announcement(
         candidate_guid = %request.guid
     );
     if let Some(acceptor) = state.announce_acceptor.as_ref() {
-        return accept_announcement(acceptor, request)
+        let response = accept_announcement(&state.metrics, acceptor, request)
             .instrument(span)
             .await;
+        state.metrics.record_http_request(
+            HttpMethod::Post,
+            HttpRoute::Announcements,
+            response.status().as_u16(),
+        );
+        return response;
     }
 
     let _entered = span.enter();
     let queues = match state.workflow_queues() {
         Ok(queues) => queues,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            state.metrics.record_workflow_enqueue(
+                WorkflowMetric::Announcement,
+                WorkflowOutcome::RejectedClosed,
+            );
+            state.metrics.record_http_request(
+                HttpMethod::Post,
+                HttpRoute::Announcements,
+                error.status.as_u16(),
+            );
+            return error.into_response();
+        }
     };
 
-    enqueue_work(
+    let response = enqueue_work(
+        &state.metrics,
         queues.announcements.try_enqueue(request),
         WorkflowKind::Announcement,
-    )
+    );
+    state.metrics.record_http_request(
+        HttpMethod::Post,
+        HttpRoute::Announcements,
+        response.status().as_u16(),
+    );
+    response
 }
 
 async fn accept_announcement(
+    metrics: &MetricsRegistry,
     acceptor: &AnnounceAcceptor,
     request: AnnouncementWorkflowRequest,
 ) -> Response {
     let work = match announcement_work_item(request, acceptor.config.default_ttl_secs) {
         Ok(work) => work,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            metrics.record_workflow_enqueue(WorkflowMetric::Announcement, WorkflowOutcome::Invalid);
+            return error.into_response();
+        }
     };
 
     match acceptor
@@ -444,16 +536,38 @@ async fn accept_announcement(
         .insert_or_dedupe_announce_work(&work, acceptor.config.max_pending)
         .await
     {
-        Ok(AnnounceInsertResult::Inserted { id }) => announcement_accepted(id, false),
-        Ok(AnnounceInsertResult::Deduplicated { id }) => announcement_accepted(id, true),
+        Ok(AnnounceInsertResult::Inserted { id }) => {
+            metrics.record_workflow_enqueue(
+                WorkflowMetric::Announcement,
+                WorkflowOutcome::DurableAccepted,
+            );
+            announcement_accepted(id, false)
+        }
+        Ok(AnnounceInsertResult::Deduplicated { id }) => {
+            metrics.record_workflow_enqueue(
+                WorkflowMetric::Announcement,
+                WorkflowOutcome::DurableDeduplicated,
+            );
+            announcement_accepted(id, true)
+        }
         Err(DatabaseError::Busy { .. }) => {
+            metrics.record_workflow_enqueue(
+                WorkflowMetric::Announcement,
+                WorkflowOutcome::DurableCapacity,
+            );
             ApiErrorResponse::service_unavailable("announce queue is at durable capacity")
                 .into_response()
         }
-        Err(error) => ApiErrorResponse::service_unavailable(format!(
-            "cannot durably accept announcement: {error}"
-        ))
-        .into_response(),
+        Err(error) => {
+            metrics.record_workflow_enqueue(
+                WorkflowMetric::Announcement,
+                WorkflowOutcome::RejectedClosed,
+            );
+            ApiErrorResponse::service_unavailable(format!(
+                "cannot durably accept announcement: {error}"
+            ))
+            .into_response()
+        }
     }
 }
 
@@ -521,32 +635,90 @@ async fn post_search(
 ) -> Response {
     let request = match request.try_into_workflow() {
         Ok(request) => request,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            state
+                .metrics
+                .record_workflow_enqueue(WorkflowMetric::Search, WorkflowOutcome::Invalid);
+            state.metrics.record_http_request(
+                HttpMethod::Post,
+                HttpRoute::Searches,
+                error.status.as_u16(),
+            );
+            return error.into_response();
+        }
     };
     let _span = debug_span!("http.search", query = %request.query);
     let queues = match state.workflow_queues() {
         Ok(queues) => queues,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            state
+                .metrics
+                .record_workflow_enqueue(WorkflowMetric::Search, WorkflowOutcome::RejectedClosed);
+            state.metrics.record_http_request(
+                HttpMethod::Post,
+                HttpRoute::Searches,
+                error.status.as_u16(),
+            );
+            return error.into_response();
+        }
     };
 
-    enqueue_work(queues.searches.try_enqueue(request), WorkflowKind::Search)
+    let response = enqueue_work(
+        &state.metrics,
+        queues.searches.try_enqueue(request),
+        WorkflowKind::Search,
+    );
+    state.metrics.record_http_request(
+        HttpMethod::Post,
+        HttpRoute::Searches,
+        response.status().as_u16(),
+    );
+    response
 }
 
 async fn post_job_run(State(state): State<HttpState>, Path(job_name): Path<String>) -> Response {
     let request = match JobName::new(job_name) {
         Ok(job_name) => JobRunWorkflowRequest { job_name },
         Err(error) => {
-            return ApiErrorResponse::unprocessable(format!("invalid job name: {error}"))
-                .into_response();
+            state
+                .metrics
+                .record_workflow_enqueue(WorkflowMetric::JobRun, WorkflowOutcome::Invalid);
+            let error = ApiErrorResponse::unprocessable(format!("invalid job name: {error}"));
+            state.metrics.record_http_request(
+                HttpMethod::Post,
+                HttpRoute::JobRuns,
+                error.status.as_u16(),
+            );
+            return error.into_response();
         }
     };
     let _span = info_span!("http.job_run", job_name = %request.job_name);
     let queues = match state.workflow_queues() {
         Ok(queues) => queues,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            state
+                .metrics
+                .record_workflow_enqueue(WorkflowMetric::JobRun, WorkflowOutcome::RejectedClosed);
+            state.metrics.record_http_request(
+                HttpMethod::Post,
+                HttpRoute::JobRuns,
+                error.status.as_u16(),
+            );
+            return error.into_response();
+        }
     };
 
-    enqueue_work(queues.jobs.try_enqueue(request), WorkflowKind::JobRun)
+    let response = enqueue_work(
+        &state.metrics,
+        queues.jobs.try_enqueue(request),
+        WorkflowKind::JobRun,
+    );
+    state.metrics.record_http_request(
+        HttpMethod::Post,
+        HttpRoute::JobRuns,
+        response.status().as_u16(),
+    );
+    response
 }
 
 async fn auth_middleware(
@@ -579,23 +751,63 @@ async fn timeout_middleware(
     }
 }
 
-fn enqueue_work<T>(result: Result<(), EnqueueError<T>>, kind: WorkflowKind) -> Response {
+fn enqueue_work<T>(
+    metrics: &MetricsRegistry,
+    result: Result<(), EnqueueError<T>>,
+    kind: WorkflowKind,
+) -> Response {
     match result {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(WorkflowAcceptedResponse {
-                status: "queued",
-                workflow: kind.as_str(),
-            }),
-        )
-            .into_response(),
+        Ok(()) => {
+            metrics.record_workflow_enqueue(kind.metric(), WorkflowOutcome::Accepted);
+            (
+                StatusCode::ACCEPTED,
+                Json(WorkflowAcceptedResponse {
+                    status: "queued",
+                    workflow: kind.as_str(),
+                }),
+            )
+                .into_response()
+        }
         Err(EnqueueError::Full { .. }) => {
+            metrics.record_workflow_enqueue(kind.metric(), WorkflowOutcome::RejectedFull);
             ApiErrorResponse::service_unavailable("workflow queue is full").into_response()
         }
         Err(EnqueueError::Closed { .. }) => {
+            metrics.record_workflow_enqueue(kind.metric(), WorkflowOutcome::RejectedClosed);
             ApiErrorResponse::service_unavailable("workflow queue is closed").into_response()
         }
     }
+}
+
+async fn metrics_snapshot(state: &HttpState) -> MetricsSnapshot {
+    let queues = state
+        .workflow_queues
+        .as_ref()
+        .map(WorkflowQueues::stats)
+        .unwrap_or_default();
+    let dependency_health = state.dependency_health();
+    let mut snapshot = MetricsSnapshot {
+        queues,
+        dependency_health,
+        ..MetricsSnapshot::default()
+    };
+
+    if let Some(acceptor) = state.announce_acceptor.as_ref() {
+        match acceptor.repository.announce_status_counts(100).await {
+            Ok(counts) => snapshot.announce_status_counts = counts,
+            Err(_error) => snapshot.snapshot_errors.push("announce_work"),
+        }
+        match acceptor.repository.job_status_snapshot(1_000).await {
+            Ok(jobs) => snapshot.jobs = jobs,
+            Err(_error) => snapshot.snapshot_errors.push("jobs"),
+        }
+        match acceptor.repository.dependency_health_snapshot(1_000).await {
+            Ok(health) => snapshot.stored_dependency_health = health,
+            Err(_error) => snapshot.snapshot_errors.push("dependency_health"),
+        }
+    }
+
+    snapshot
 }
 
 fn readiness_response(state: &HttpState) -> ReadinessResponse {
@@ -728,6 +940,48 @@ mod tests {
         assert_eq!(StatusCode::OK, status);
         assert_eq!("ok", json["status"]);
         assert_eq!("ready", json["readiness"]["status"]);
+    }
+
+    #[tokio::test]
+    async fn metrics_route_exports_prometheus_text() {
+        let (app, _announcements, _searches, _jobs) = workflow_app(None);
+        let search = app
+            .clone()
+            .oneshot(json_post(
+                "/v1/searches",
+                serde_json::json!({ "query": "Example Movie 2026" }),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::ACCEPTED, search.status());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        assert_eq!(StatusCode::OK, status);
+        assert!(text.contains("# TYPE sporos_http_requests_total counter"));
+        assert!(text.contains(
+            "sporos_http_requests_total{method=\"POST\",route=\"/v1/searches\",status=\"202\"} 1"
+        ));
+        assert!(
+            text.contains(
+                "sporos_workflow_enqueue_total{workflow=\"search\",outcome=\"accepted\"} 1"
+            )
+        );
+        assert!(text.contains("sporos_queue_depth{queue=\"search\"} 1"));
     }
 
     #[tokio::test]
