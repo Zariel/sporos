@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{ByteSize, CandidateGuid, DownloadUrl, ItemTitle, JobName, TrackerName};
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
+
+const WORKFLOW_BODY_LIMIT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HttpState {
@@ -321,6 +323,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/v1/announcements", post(post_announcement))
         .route("/v1/searches", post(post_search))
         .route("/v1/jobs/{job_name}/runs", post(post_job_run))
+        .layer(DefaultBodyLimit::max(WORKFLOW_BODY_LIMIT_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -435,6 +438,9 @@ async fn timeout_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if state.request_timeout.is_zero() {
+        return ApiErrorResponse::timeout("request timed out").into_response();
+    }
     match tokio::time::timeout(state.request_timeout, next.run(request)).await {
         Ok(response) => response,
         Err(_elapsed) => ApiErrorResponse::timeout("request timed out").into_response(),
@@ -726,6 +732,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, response.status());
+    }
+
+    #[tokio::test]
+    async fn workflow_routes_enforce_bounded_bodies() {
+        let (app, _announcements, _searches, _jobs) = workflow_app(None);
+        let oversized_query = "x".repeat(WORKFLOW_BODY_LIMIT_BYTES + 1);
+
+        let response = app
+            .oneshot(json_post(
+                "/v1/searches",
+                serde_json::json!({ "query": oversized_query }),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::PAYLOAD_TOO_LARGE, response.status());
+    }
+
+    #[tokio::test]
+    async fn workflow_routes_enforce_request_timeout() {
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(4));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
+        let app = router(
+            HttpState::new(ReadinessState::ready(), HealthRegistry::new())
+                .with_workflow_queues(WorkflowQueues {
+                    announcements,
+                    searches,
+                    jobs,
+                })
+                .with_request_timeout(Duration::ZERO),
+        );
+
+        let response = app
+            .oneshot(json_post(
+                "/v1/searches",
+                serde_json::json!({ "query": "Example" }),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::REQUEST_TIMEOUT, response.status());
     }
 
     fn workflow_app(
