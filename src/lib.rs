@@ -1,5 +1,6 @@
 pub mod announce;
 pub mod cli;
+pub mod clients;
 pub mod config;
 pub mod content_filter;
 pub mod domain;

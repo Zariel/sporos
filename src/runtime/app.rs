@@ -1,3 +1,4 @@
+use crate::clients::TorrentClientRegistry;
 use crate::config::SporosConfig;
 use crate::errors::DatabaseError;
 use crate::http::{
@@ -27,6 +28,7 @@ pub struct AppRuntime {
 pub struct AppState {
     pub config: SporosConfig,
     pub repository: Repository,
+    pub clients: TorrentClientRegistry,
     pub health: HealthRegistry,
     pub http: HttpState,
     pub queues: RuntimeQueues,
@@ -64,6 +66,13 @@ impl AppRuntime {
         repository: Repository,
     ) -> Result<Self, DatabaseError> {
         let health = HealthRegistry::new();
+        let clients =
+            TorrentClientRegistry::from_config(&config.torrent_clients).map_err(|error| {
+                DatabaseError::Unavailable {
+                    operation: "build torrent client registry".to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
         let queue_config = RuntimeQueueConfig::default();
         let (workflow, workflow_receivers) = workflow_queues(queue_config);
         let (scheduler_queue, scheduler_receiver) = scheduler_queue(queue_config.indexing_limit);
@@ -108,6 +117,7 @@ impl AppRuntime {
             state: AppState {
                 config,
                 repository,
+                clients,
                 health,
                 http,
                 queues,
