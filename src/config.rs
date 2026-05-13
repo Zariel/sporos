@@ -9,8 +9,10 @@ use toml::Value;
 
 use crate::announce::AnnounceQueueConfig;
 use crate::errors::ConfigError;
+use crate::secrets::{ApiKey, Password};
 
 pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
+const ENV_PREFIX: &str = "SPOROS__";
 static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -66,7 +68,9 @@ pub struct TorrentClientConfig {
     pub kind: ConfigTorrentClientKind,
     pub url: String,
     pub username: Option<String>,
+    pub password: Option<Password>,
     pub password_file: Option<PathBuf>,
+    pub password_env: Option<String>,
     pub default_save_path: PathBuf,
     pub label_field: Option<String>,
 }
@@ -105,7 +109,9 @@ impl Default for IndexerTimeoutsConfig {
 #[serde(deny_unknown_fields)]
 pub struct TorznabIndexerConfig {
     pub url: String,
+    pub api_key: Option<ApiKey>,
     pub api_key_file: Option<PathBuf>,
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -183,15 +189,60 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<SporosConfig, ConfigError> 
         reason: format!("cannot resolve current working directory: {error}"),
     })?;
 
-    parse_startup_config(&contents, cwd)
+    parse_startup_config_with_env(&contents, cwd, std::env::vars())
 }
 
 pub fn parse_config(contents: &str) -> Result<SporosConfig, ConfigError> {
-    let config: SporosConfig =
-        toml::from_str(contents).map_err(|error| ConfigError::InvalidField {
-            field: "config",
-            reason: error.to_string(),
-        })?;
+    parse_config_with_env(contents, std::iter::empty::<(String, String)>())
+}
+
+pub fn parse_config_with_env<I>(contents: &str, env: I) -> Result<SporosConfig, ConfigError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let (config, _raw) = parse_config_value(contents, env)?;
+    Ok(config)
+}
+
+pub fn parse_startup_config(
+    contents: &str,
+    cwd: impl AsRef<Path>,
+) -> Result<SporosConfig, ConfigError> {
+    parse_startup_config_with_env(contents, cwd, std::iter::empty::<(String, String)>())
+}
+
+pub fn parse_startup_config_with_env<I>(
+    contents: &str,
+    cwd: impl AsRef<Path>,
+    env: I,
+) -> Result<SporosConfig, ConfigError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let (mut config, raw) = parse_config_value(contents, env)?;
+    let supplied_paths = SuppliedPaths::from_toml(&raw);
+
+    config.paths.resolve(cwd.as_ref(), supplied_paths)?;
+    config.paths.prepare_local_state()?;
+    config.paths.validate_media_dirs()?;
+
+    Ok(config)
+}
+
+fn parse_config_value<I>(contents: &str, env: I) -> Result<(SporosConfig, Value), ConfigError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let env = env.into_iter().collect::<BTreeMap<_, _>>();
+    let mut raw = parse_raw_config(contents)?;
+    apply_env_overrides(&mut raw, &env)?;
+    let mut config: SporosConfig =
+        raw.clone()
+            .try_into()
+            .map_err(|error: toml::de::Error| ConfigError::InvalidField {
+                field: "config",
+                reason: error.to_string(),
+            })?;
 
     config
         .announce
@@ -200,26 +251,199 @@ pub fn parse_config(contents: &str) -> Result<SporosConfig, ConfigError> {
             field: "announce",
             reason: error.to_string(),
         })?;
+    resolve_secret_env(&mut config, &env)?;
 
-    Ok(config)
+    Ok((config, raw))
 }
 
-pub fn parse_startup_config(
-    contents: &str,
-    cwd: impl AsRef<Path>,
-) -> Result<SporosConfig, ConfigError> {
-    let raw: Value = toml::from_str(contents).map_err(|error| ConfigError::InvalidField {
+fn parse_raw_config(contents: &str) -> Result<Value, ConfigError> {
+    if contents.trim().is_empty() {
+        return Ok(Value::Table(toml::Table::new()));
+    }
+
+    toml::from_str(contents).map_err(|error| ConfigError::InvalidField {
         field: "config",
         reason: error.to_string(),
-    })?;
-    let supplied_paths = SuppliedPaths::from_toml(&raw);
-    let mut config = parse_config(contents)?;
+    })
+}
 
-    config.paths.resolve(cwd.as_ref(), supplied_paths)?;
-    config.paths.prepare_local_state()?;
-    config.paths.validate_media_dirs()?;
+fn apply_env_overrides(raw: &mut Value, env: &BTreeMap<String, String>) -> Result<(), ConfigError> {
+    for (key, value) in env {
+        let Some(suffix) = key.strip_prefix(ENV_PREFIX) else {
+            continue;
+        };
+        let path = env_key_path(key, suffix)?;
+        reject_array_env_path(key, &path)?;
+        let value = parse_env_scalar(key, value)?;
+        insert_env_value(raw, &path, value, key)?;
+    }
 
-    Ok(config)
+    Ok(())
+}
+
+fn env_key_path(key: &str, suffix: &str) -> Result<Vec<String>, ConfigError> {
+    if suffix.is_empty() {
+        return Err(env_error(key, "missing config path after SPOROS__"));
+    }
+
+    suffix
+        .split("__")
+        .map(|segment| env_segment_to_key(key, segment))
+        .collect()
+}
+
+fn env_segment_to_key(key: &str, segment: &str) -> Result<String, ConfigError> {
+    if segment.is_empty() {
+        return Err(env_error(key, "empty path segment"));
+    }
+    if segment.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(env_error(key, "indexed env overrides are not supported"));
+    }
+    if !segment
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(env_error(
+            key,
+            "path segments must be uppercase ASCII, digits, or underscores",
+        ));
+    }
+
+    Ok(segment.to_ascii_lowercase())
+}
+
+fn reject_array_env_path(key: &str, path: &[String]) -> Result<(), ConfigError> {
+    if path == ["paths", "media_dirs"] {
+        return Err(env_error(
+            key,
+            "array config values are not settable through env",
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_env_scalar(key: &str, value: &str) -> Result<Value, ConfigError> {
+    let document = format!("value = {value}");
+    let parsed = toml::from_str::<Value>(&document)
+        .ok()
+        .and_then(|value| value.get("value").cloned())
+        .unwrap_or_else(|| Value::String(value.to_owned()));
+
+    match parsed {
+        Value::Array(_) | Value::Table(_) => {
+            Err(env_error(key, "env overrides must be scalar values"))
+        }
+        value => Ok(value),
+    }
+}
+
+fn insert_env_value(
+    current: &mut Value,
+    path: &[String],
+    value: Value,
+    key: &str,
+) -> Result<(), ConfigError> {
+    let Some((segment, rest)) = path.split_first() else {
+        return Err(env_error(key, "missing config path"));
+    };
+    let Value::Table(table) = current else {
+        return Err(env_error(
+            key,
+            "cannot override inside a scalar config value",
+        ));
+    };
+
+    if rest.is_empty() {
+        if matches!(table.get(segment), Some(Value::Array(_))) {
+            return Err(env_error(
+                key,
+                "array config values are not settable through env",
+            ));
+        }
+        table.insert(segment.clone(), value);
+        return Ok(());
+    }
+
+    let child = table
+        .entry(segment.clone())
+        .or_insert_with(|| Value::Table(toml::Table::new()));
+    if matches!(child, Value::Array(_)) {
+        return Err(env_error(key, "indexed env overrides are not supported"));
+    }
+
+    insert_env_value(child, rest, value, key)
+}
+
+fn resolve_secret_env(
+    config: &mut SporosConfig,
+    env: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (name, client) in &mut config.torrent_clients {
+        if client.password.is_none() {
+            if let Some(env_name) =
+                nonempty_secret_env("torrent_clients.password_env", name, &client.password_env)?
+            {
+                let value = secret_env_value(env, env_name, "torrent_clients.password_env", name)?;
+                client.password = Some(
+                    Password::new(value.clone())
+                        .map_err(|source| ConfigError::InvalidSecret { source })?,
+                );
+            }
+        }
+    }
+    for (name, indexer) in &mut config.indexers.torznab {
+        if indexer.api_key.is_none() {
+            if let Some(env_name) =
+                nonempty_secret_env("indexers.torznab.api_key_env", name, &indexer.api_key_env)?
+            {
+                let value = secret_env_value(env, env_name, "indexers.torznab.api_key_env", name)?;
+                indexer.api_key = Some(
+                    ApiKey::new(value.clone())
+                        .map_err(|source| ConfigError::InvalidSecret { source })?,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn nonempty_secret_env<'a>(
+    field: &'static str,
+    name: &str,
+    value: &'a Option<String>,
+) -> Result<Option<&'a str>, ConfigError> {
+    let Some(value) = value.as_deref() else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{name} references an empty environment variable name"),
+        });
+    }
+
+    Ok(Some(value))
+}
+
+fn secret_env_value<'a>(
+    env: &'a BTreeMap<String, String>,
+    env_name: &str,
+    field: &'static str,
+    config_name: &str,
+) -> Result<&'a String, ConfigError> {
+    env.get(env_name).ok_or_else(|| ConfigError::InvalidField {
+        field,
+        reason: format!("{config_name} references unset environment variable {env_name}"),
+    })
+}
+
+fn env_error(key: &str, reason: impl Into<String>) -> ConfigError {
+    ConfigError::InvalidField {
+        field: "environment",
+        reason: format!("{key}: {}", reason.into()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -448,7 +672,9 @@ bind = "127.0.0.1:2468"
 kind = "qbittorrent|rtorrent"
 url = "http://client.example"
 username = "optional"
+password = "optional local-development secret"
 password_file = "optional path"
+password_env = "optional env var containing password"
 default_save_path = "path"
 label_field = "optional rtorrent custom field"
 
@@ -458,7 +684,17 @@ download = "30s"
 
 [indexers.torznab.<name>]
 url = "https://indexer.example/api"
+api_key = "optional local-development secret"
 api_key_file = "optional path"
+api_key_env = "optional env var containing api key"
+
+[environment overrides]
+SPOROS__SERVER__BIND = "0.0.0.0:2468"
+SPOROS__PATHS__DATABASE = "/data/state/sporos.db"
+SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE = "/var/run/secrets/qbit-password"
+SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY_FILE = "/var/run/secrets/indexer-api-key"
 
 [matching]
 mode = "exact|partial"
@@ -493,7 +729,7 @@ failure_retention_secs = 1209600
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
@@ -530,6 +766,14 @@ mod tests {
         );
         assert_eq!(1, config.torrent_clients.len());
         assert_eq!(1, config.indexers.torznab.len());
+        assert_eq!(
+            Some("/var/run/secrets/qbit-password"),
+            config
+                .torrent_clients
+                .get("qbit_main")
+                .and_then(|client| client.password_file.as_deref())
+                .and_then(Path::to_str)
+        );
     }
 
     #[test]
@@ -661,7 +905,150 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("[torrent_clients.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[indexers.torznab.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[inventory]"));
-        assert!(!CONFIG_SCHEMA.contains("SPOROS"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL"));
+    }
+
+    #[test]
+    fn environment_overrides_scalar_fields_before_typed_parse() {
+        let config = parse_config_with_env(
+            r#"
+            [paths]
+            database = "/data/state/sporos.db"
+
+            [server]
+            bind = "127.0.0.1:2468"
+
+            [matching]
+            fuzzy_size_threshold = 0.02
+            include_non_video = false
+
+            [announce]
+            max_pending = 1000
+            "#,
+            vec![
+                ("SPOROS__SERVER__BIND".to_owned(), "0.0.0.0:9876".to_owned()),
+                (
+                    "SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD".to_owned(),
+                    "0.05".to_owned(),
+                ),
+                (
+                    "SPOROS__MATCHING__INCLUDE_NON_VIDEO".to_owned(),
+                    "true".to_owned(),
+                ),
+                ("SPOROS__ANNOUNCE__MAX_PENDING".to_owned(), "42".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            "0.0.0.0:9876".parse::<SocketAddr>().unwrap(),
+            config.server.bind
+        );
+        assert!((config.matching.fuzzy_size_threshold - 0.05).abs() < f64::EPSILON);
+        assert!(config.matching.include_non_video);
+        assert_eq!(42, config.announce.max_pending);
+    }
+
+    #[test]
+    fn environment_overrides_keyed_table_scalars_and_secrets() {
+        let config = parse_config_with_env(
+            r#"
+            [torrent_clients.qbit_main]
+            kind = "qbittorrent"
+            url = "http://old:8080"
+            default_save_path = "/downloads"
+            password_env = "QBIT_PASSWORD"
+
+            [indexers.torznab.example]
+            url = "https://old.example/api"
+            api_key_env = "INDEXER_API_KEY"
+            "#,
+            vec![
+                (
+                    "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL".to_owned(),
+                    "http://qbittorrent:8080".to_owned(),
+                ),
+                (
+                    "SPOROS__INDEXERS__TORZNAB__EXAMPLE__URL".to_owned(),
+                    "https://indexer.example/api".to_owned(),
+                ),
+                ("QBIT_PASSWORD".to_owned(), "super-secret".to_owned()),
+                ("INDEXER_API_KEY".to_owned(), "api-secret".to_owned()),
+            ],
+        )
+        .unwrap();
+        let client = &config.torrent_clients["qbit_main"];
+        let indexer = &config.indexers.torznab["example"];
+
+        assert_eq!("http://qbittorrent:8080", client.url);
+        assert_eq!(
+            Some("super-secret"),
+            client.password.as_ref().map(Password::expose_secret)
+        );
+        assert_eq!(
+            Some("[REDACTED]".to_owned()),
+            client.password.as_ref().map(ToString::to_string)
+        );
+        assert_eq!("https://indexer.example/api", indexer.url);
+        assert_eq!(
+            Some("api-secret"),
+            indexer.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+    }
+
+    #[test]
+    fn environment_rejects_arrays_and_indexed_paths() {
+        let media_error = parse_config_with_env(
+            "",
+            vec![(
+                "SPOROS__PATHS__MEDIA_DIRS".to_owned(),
+                "[\"/media\"]".to_owned(),
+            )],
+        )
+        .unwrap_err();
+        let indexed_error = parse_config_with_env(
+            "",
+            vec![(
+                "SPOROS__TORRENT_CLIENTS__0__URL".to_owned(),
+                "http://client".to_owned(),
+            )],
+        )
+        .unwrap_err();
+
+        assert!(media_error.to_string().contains("array config values"));
+        assert!(indexed_error.to_string().contains("indexed env overrides"));
+    }
+
+    #[test]
+    fn direct_toml_secret_values_are_redacted() {
+        let config = parse_config(
+            r#"
+            [torrent_clients.qbit_main]
+            kind = "qbittorrent"
+            url = "http://qbittorrent:8080"
+            password = "dev-secret"
+            default_save_path = "/downloads"
+
+            [indexers.torznab.example]
+            url = "https://indexer.example/api"
+            api_key = "api-secret"
+            "#,
+        )
+        .unwrap();
+        let client = &config.torrent_clients["qbit_main"];
+        let indexer = &config.indexers.torznab["example"];
+
+        assert_eq!(
+            Some("dev-secret"),
+            client.password.as_ref().map(Password::expose_secret)
+        );
+        assert!(!format!("{client:?}").contains("dev-secret"));
+        assert_eq!(
+            Some("api-secret"),
+            indexer.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert!(!format!("{indexer:?}").contains("api-secret"));
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

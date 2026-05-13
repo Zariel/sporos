@@ -1,5 +1,7 @@
 use std::fmt;
 
+use serde::Deserialize;
+
 const REDACTED: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -102,6 +104,16 @@ macro_rules! secret_newtype {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str(REDACTED)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
             }
         }
     };
