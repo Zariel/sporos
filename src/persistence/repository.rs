@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -13,6 +14,7 @@ use crate::domain::{
     MatchDecision, MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
 };
 use crate::errors::DatabaseError;
+use crate::indexers::ConfiguredTorznabIndexer;
 
 use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
 
@@ -134,6 +136,18 @@ pub struct DependencyHealthSnapshot {
     pub reason: Option<String>,
     pub retry_after_ms: Option<i64>,
     pub checked_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IndexerRegistryRow {
+    pub id: u64,
+    pub name: DependencyName,
+    pub url: String,
+    pub api_key_source: String,
+    pub enabled: bool,
+    pub state: String,
+    pub retry_after_ms: Option<i64>,
+    pub last_caps_refresh_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -795,6 +809,128 @@ impl Repository {
                     reason: row.get("reason"),
                     retry_after_ms: row.get("retry_after"),
                     checked_at_ms: row.get("checked_at"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn sync_torznab_indexers(
+        &self,
+        configured: &[ConfiguredTorznabIndexer],
+        now_ms: i64,
+    ) -> Result<Vec<IndexerRegistryRow>, DatabaseError> {
+        let _span = info_span!("indexers.sync", configured_count = configured.len());
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("begin indexer sync transaction", error))?;
+        let configured_names = configured
+            .iter()
+            .map(|indexer| indexer.name.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+
+        for indexer in configured {
+            sqlx::query(
+                r#"
+                INSERT INTO indexers (
+                    name,
+                    url,
+                    api_key_source,
+                    enabled,
+                    capabilities_json,
+                    state,
+                    retry_after,
+                    last_caps_refresh_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, '{}', 'unknown', NULL, NULL, ?, ?)
+                ON CONFLICT (name) DO UPDATE SET
+                    url = excluded.url,
+                    api_key_source = excluded.api_key_source,
+                    enabled = excluded.enabled,
+                    state = CASE
+                        WHEN indexers.state = 'unknown_error' THEN 'unknown'
+                        ELSE indexers.state
+                    END,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(indexer.name.as_str())
+            .bind(indexer.url.as_str())
+            .bind(indexer.api_key_source.storage_value())
+            .bind(if indexer.enabled { 1_i64 } else { 0_i64 })
+            .bind(now_ms)
+            .bind(now_ms)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| db_error("upsert configured indexer", error))?;
+        }
+
+        let existing_rows = sqlx::query("SELECT name FROM indexers")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|error| db_error("read existing indexer names", error))?;
+        for row in existing_rows {
+            let name: String = row.get("name");
+            if !configured_names.contains(&name) {
+                sqlx::query("UPDATE indexers SET enabled = 0, updated_at = ? WHERE name = ?")
+                    .bind(now_ms)
+                    .bind(name)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| db_error("disable unconfigured indexer", error))?;
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit indexer sync transaction", error))?;
+
+        self.indexer_registry_snapshot(1_000).await
+    }
+
+    pub async fn indexer_registry_snapshot(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<IndexerRegistryRow>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, url, api_key_source, enabled, state, retry_after, last_caps_refresh_at
+            FROM indexers
+            ORDER BY name
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read indexer registry snapshot", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let id = u64::try_from(row.get::<i64, _>("id")).map_err(|error| {
+                    DatabaseError::QueryFailed {
+                        operation: "read indexer id".to_owned(),
+                        message: error.to_string(),
+                    }
+                })?;
+                Ok(IndexerRegistryRow {
+                    id,
+                    name: DependencyName::new(row.get::<String, _>("name")).map_err(|error| {
+                        DatabaseError::QueryFailed {
+                            operation: "read indexer name".to_owned(),
+                            message: error.to_string(),
+                        }
+                    })?,
+                    url: row.get("url"),
+                    api_key_source: row.get("api_key_source"),
+                    enabled: row.get::<i64, _>("enabled") != 0,
+                    state: row.get("state"),
+                    retry_after_ms: row.get("retry_after"),
+                    last_caps_refresh_at_ms: row.get("last_caps_refresh_at"),
                 })
             })
             .collect()
@@ -1848,6 +1984,7 @@ mod tests {
         CandidateGuid, ClientHost, DecisionReason, DisplayName, DownloadUrl, FileIndex, IndexerId,
         ItemTitle, MatchRatio, ReasonText, SourceKey, TrackerName,
     };
+    use crate::indexers::{ApiKeySource, ConfiguredTorznabIndexer, SanitizedTorznabUrl};
     use crate::persistence::schema::{BUSY_TIMEOUT_MS, REQUIRED_TABLES};
     use std::fs;
     use std::path::PathBuf;
@@ -2140,6 +2277,58 @@ mod tests {
             Some(PathBuf::from("/cache/fedcba.cached.torrent")),
             info_hash_matches[0].torrent_cache_path
         );
+    }
+
+    #[tokio::test]
+    async fn sync_torznab_indexers_upserts_and_disables_removed_rows() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let first = test_indexer(
+            "main",
+            "https://indexer.example/api",
+            ApiKeySource::Env("INDEXER_KEY".to_owned()),
+        );
+        let second = test_indexer(
+            "backup",
+            "https://backup.example/api",
+            ApiKeySource::File("/run/secrets/backup".to_owned()),
+        );
+
+        let synced = repository
+            .sync_torznab_indexers(&[first.clone(), second.clone()], 100)
+            .await
+            .unwrap();
+        let main = synced
+            .iter()
+            .find(|indexer| indexer.name.as_str() == "main")
+            .unwrap();
+        assert_eq!("https://indexer.example/api", main.url);
+        assert_eq!("env:INDEXER_KEY", main.api_key_source);
+        assert!(main.enabled);
+        assert_eq!("unknown", main.state);
+
+        let updated = test_indexer(
+            "main",
+            "https://indexer.example/prowlarr/api",
+            ApiKeySource::Direct,
+        );
+        let resynced = repository
+            .sync_torznab_indexers(&[updated], 200)
+            .await
+            .unwrap();
+        let main = resynced
+            .iter()
+            .find(|indexer| indexer.name.as_str() == "main")
+            .unwrap();
+        let backup = resynced
+            .iter()
+            .find(|indexer| indexer.name.as_str() == "backup")
+            .unwrap();
+
+        assert_eq!("https://indexer.example/prowlarr/api", main.url);
+        assert_eq!("direct", main.api_key_source);
+        assert!(main.enabled);
+        assert!(!backup.enabled);
+        assert!(!format!("{resynced:?}").contains("secret-value"));
     }
 
     #[tokio::test]
@@ -2551,6 +2740,19 @@ mod tests {
             published_at_ms: Some(1_700_000_000_000),
             info_hash: Some(InfoHash::new("fedcba9876543210fedcba9876543210fedcba98").unwrap()),
             torrent_cache_path: None,
+        }
+    }
+
+    fn test_indexer(
+        name: &str,
+        url: &str,
+        api_key_source: ApiKeySource,
+    ) -> ConfiguredTorznabIndexer {
+        ConfiguredTorznabIndexer {
+            name: DependencyName::new(name).unwrap(),
+            url: SanitizedTorznabUrl::new(url).unwrap(),
+            api_key_source,
+            enabled: true,
         }
     }
 

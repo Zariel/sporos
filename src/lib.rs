@@ -6,6 +6,7 @@ pub mod content_filter;
 pub mod domain;
 pub mod errors;
 pub mod http;
+pub mod indexers;
 pub mod inventory;
 pub mod inventory_refresh;
 pub mod matching;

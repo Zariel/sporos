@@ -5,6 +5,7 @@ use crate::http::{
     AnnouncementWorkflowRequest, HttpState, JobRunWorkflowRequest, ReadinessState,
     SearchWorkflowRequest, WorkflowQueues,
 };
+use crate::indexers::TorznabRegistry;
 use crate::inventory::InventoryScanOptions;
 use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshWorker, inventory_refresh_queue,
@@ -58,14 +59,26 @@ pub struct RuntimeReceivers {
 impl AppRuntime {
     pub async fn build(config: SporosConfig) -> Result<Self, DatabaseError> {
         let repository = Repository::connect(&config.paths.database).await?;
-        Self::from_repository(config, repository)
+        Self::from_repository(config, repository).await
     }
 
-    pub fn from_repository(
+    pub async fn from_repository(
         config: SporosConfig,
         repository: Repository,
     ) -> Result<Self, DatabaseError> {
         let health = HealthRegistry::new();
+        let indexers = TorznabRegistry::from_config(&config.indexers).map_err(|error| {
+            DatabaseError::Unavailable {
+                operation: "build Torznab indexer registry".to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        repository
+            .sync_torznab_indexers(
+                indexers.indexers(),
+                crate::runtime::announce_worker::unix_time_ms(),
+            )
+            .await?;
         let clients =
             TorrentClientRegistry::from_config(&config.torrent_clients).map_err(|error| {
                 DatabaseError::Unavailable {
@@ -169,15 +182,32 @@ fn workflow_queues(queue_config: RuntimeQueueConfig) -> (WorkflowQueues, Workflo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TorznabIndexerConfig;
 
     #[tokio::test]
     async fn runtime_composes_services_from_config_and_repository() {
-        let config = SporosConfig::default();
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: "https://indexer.example/api?apikey=secret".to_owned(),
+                api_key: None,
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
         let repository = Repository::connect_in_memory().await.unwrap();
 
-        let runtime = AppRuntime::from_repository(config, repository).unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let indexers = repository.indexer_registry_snapshot(10).await.unwrap();
 
         assert!(runtime.state.http.clone().readiness().is_ready());
+        assert_eq!(1, indexers.len());
+        assert_eq!("main", indexers[0].name.as_str());
+        assert_eq!("https://indexer.example/api", indexers[0].url);
+        assert_eq!("url_query", indexers[0].api_key_source);
         assert_eq!(0, runtime.state.queues.workflow.announcements.stats().depth);
         assert_eq!(0, runtime.state.queues.scheduler.stats().depth);
         assert_eq!(0, runtime.state.queues.inventory_refresh.stats().depth);
@@ -191,7 +221,9 @@ mod tests {
     async fn runtime_exposes_receivers_for_owned_workers() {
         let config = SporosConfig::default();
         let repository = Repository::connect_in_memory().await.unwrap();
-        let mut runtime = AppRuntime::from_repository(config, repository).unwrap();
+        let mut runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
 
         runtime
             .state
