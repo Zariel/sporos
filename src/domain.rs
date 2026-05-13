@@ -346,6 +346,7 @@ pub struct TorrentMetafile {
     pub name: DisplayName,
     pub files: Vec<TorrentFile>,
     pub total_size: ByteSize,
+    pub piece_length: Option<ByteSize>,
 }
 
 impl TorrentMetafile {
@@ -353,6 +354,15 @@ impl TorrentMetafile {
         info_hash: InfoHash,
         name: DisplayName,
         files: Vec<TorrentFile>,
+    ) -> DomainResult<Self> {
+        Self::new_with_piece_length(info_hash, name, files, None)
+    }
+
+    pub fn new_with_piece_length(
+        info_hash: InfoHash,
+        name: DisplayName,
+        files: Vec<TorrentFile>,
+        piece_length: Option<ByteSize>,
     ) -> DomainResult<Self> {
         if files.is_empty() {
             return Err(DomainError::EmptyFiles);
@@ -365,6 +375,7 @@ impl TorrentMetafile {
             name,
             files,
             total_size,
+            piece_length,
         })
     }
 }

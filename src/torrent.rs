@@ -36,11 +36,12 @@ pub fn parse_metafile(bytes: &[u8]) -> Result<ParsedMetafile, TorrentParseError>
     }
 
     let info_hash = info_hash(&info_raw)?;
-    let (name, files) = parse_info(&info_raw)?;
-    let metafile = TorrentMetafile::new(
+    let (name, files, piece_length) = parse_info(&info_raw)?;
+    let metafile = TorrentMetafile::new_with_piece_length(
         info_hash,
         DisplayName::new(name).map_err(|source| TorrentParseError::InvalidMetafile { source })?,
         files,
+        piece_length,
     )
     .map_err(|source| TorrentParseError::InvalidMetafile { source })?;
     let tracker_hosts = tracker_hosts(&tracker_urls)?;
@@ -94,7 +95,9 @@ fn parse_announce_list(
     Ok(())
 }
 
-fn parse_info(bytes: &[u8]) -> Result<(String, Vec<TorrentFile>), TorrentParseError> {
+fn parse_info(
+    bytes: &[u8],
+) -> Result<(String, Vec<TorrentFile>, Option<ByteSize>), TorrentParseError> {
     let mut decoder = Decoder::new(bytes).with_max_depth(16);
     let info = decoder
         .next_object()
@@ -108,11 +111,19 @@ fn parse_info(bytes: &[u8]) -> Result<(String, Vec<TorrentFile>), TorrentParseEr
     let mut name = None;
     let mut single_file_length = None;
     let mut multi_file_entries = None;
+    let mut piece_length = None;
 
     while let Some((key, value)) = info.next_pair().map_err(bencode_error)? {
         match key {
             b"name" => name = Some(bytes_to_string(bytes_object(value)?)?),
             b"length" => single_file_length = Some(parse_u64(integer_object(value)?)?),
+            b"piece length" => {
+                let length = parse_u64(integer_object(value)?)?;
+                if length == 0 {
+                    return Err(unsupported_layout("torrent piece length must be non-zero"));
+                }
+                piece_length = Some(ByteSize::new(length));
+            }
             b"files" => multi_file_entries = Some(parse_files(list_object(value)?)?),
             _ => {}
         }
@@ -135,7 +146,7 @@ fn parse_info(bytes: &[u8]) -> Result<(String, Vec<TorrentFile>), TorrentParseEr
     };
 
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok((name, files))
+    Ok((name, files, piece_length))
 }
 
 fn parse_files(mut files: ListDecoder<'_, '_>) -> Result<Vec<TorrentFile>, TorrentParseError> {
@@ -363,8 +374,8 @@ mod tests {
     #[test]
     fn parses_single_file_torrent_and_hashes_info_dictionary() {
         let first =
-            b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name9:movie.mkvee";
-        let second = b"d8:announce34:https://other.example:443/announce4:infod6:lengthi12e4:name9:movie.mkvee";
+            b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi4eee";
+        let second = b"d8:announce34:https://other.example:443/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi4eee";
 
         let first = parse_metafile(first).unwrap();
         let second = parse_metafile(second).unwrap();
@@ -372,6 +383,7 @@ mod tests {
         assert_eq!(first.metafile.info_hash, second.metafile.info_hash);
         assert_eq!("movie.mkv", first.metafile.name.as_str());
         assert_eq!(12, first.metafile.total_size.get());
+        assert_eq!(Some(ByteSize::new(4)), first.metafile.piece_length);
         assert_eq!(
             PathBuf::from("movie.mkv"),
             first.metafile.files[0].relative_path
