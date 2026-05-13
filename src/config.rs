@@ -900,6 +900,67 @@ mod tests {
     }
 
     #[test]
+    fn startup_config_env_overrides_resolve_container_style_paths() {
+        let cwd = unique_temp_dir("env-container");
+        let database = cwd.join("data/state/sporos.db");
+        let torrent_cache_dir = cwd.join("data/cache/torrents");
+        let output_dir = cwd.join("data/output");
+
+        let config = parse_startup_config_with_env(
+            "",
+            &cwd,
+            vec![
+                (
+                    "SPOROS__PATHS__DATABASE".to_owned(),
+                    database.display().to_string(),
+                ),
+                (
+                    "SPOROS__PATHS__TORRENT_CACHE_DIR".to_owned(),
+                    torrent_cache_dir.display().to_string(),
+                ),
+                (
+                    "SPOROS__PATHS__OUTPUT_DIR".to_owned(),
+                    output_dir.display().to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            database
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join("sporos.db"),
+            config.paths.database
+        );
+        assert!(config.paths.torrent_cache_dir.is_dir());
+        assert!(config.paths.output_dir.is_dir());
+
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn startup_config_rejects_relative_env_paths() {
+        let cwd = unique_temp_dir("relative-env");
+        let error = parse_startup_config_with_env(
+            "",
+            &cwd,
+            vec![(
+                "SPOROS__PATHS__DATABASE".to_owned(),
+                "state/sporos.db".to_owned(),
+            )],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("paths.database"));
+        assert!(error.to_string().contains("must be absolute"));
+
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
     fn schema_documents_sporos_native_surface() {
         assert!(CONFIG_SCHEMA.contains("sporos config schema"));
         assert!(CONFIG_SCHEMA.contains("[torrent_clients.<name>]"));
