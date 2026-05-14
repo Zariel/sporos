@@ -21,6 +21,7 @@ pub struct AnnounceWorkerConfig {
     pub claim_batch_size: u16,
     pub lease_duration: Duration,
     pub lease_renewal: Duration,
+    pub dependency_recovery_probe_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -89,6 +90,9 @@ impl AnnounceWorker {
             claim_batch_size: queue_config.claim_batch_size,
             lease_duration: Duration::from_secs(queue_config.lease_duration_secs),
             lease_renewal: Duration::from_secs(queue_config.lease_renewal_secs),
+            dependency_recovery_probe_interval: Duration::from_secs(
+                queue_config.retry_initial_delay_secs,
+            ),
         };
 
         Ok(Self { repository, config })
@@ -120,6 +124,14 @@ impl AnnounceWorker {
         now_ms: i64,
     ) -> Result<Vec<AnnounceWorkId>, AnnounceWorkerError> {
         let lease_until_ms = now_ms.saturating_add(duration_ms(self.config.lease_duration));
+        let reconcile_limit = self.config.claim_batch_size.saturating_mul(4).max(1);
+        self.repository
+            .schedule_announce_dependency_backoff(
+                now_ms,
+                duration_ms(self.config.dependency_recovery_probe_interval),
+                reconcile_limit,
+            )
+            .await?;
         self.repository
             .claim_announce_work(
                 self.config.owner.as_str(),
@@ -317,7 +329,9 @@ mod tests {
 
     use super::*;
     use crate::announce::{AnnounceDedupeIdentity, AnnounceStatus, AnnounceWorkItem};
-    use crate::domain::{ByteSize, CandidateGuid, ItemTitle, TrackerName};
+    use crate::domain::{
+        ByteSize, CandidateGuid, DependencyName, DependencyState, ItemTitle, TrackerName,
+    };
     use crate::persistence::repository::AnnounceInsertResult;
     use crate::runtime::shutdown::shutdown_channel;
 
@@ -403,6 +417,56 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(10_015, lease_until);
+    }
+
+    #[tokio::test]
+    async fn worker_honors_dependency_retry_after_before_claiming() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_35", "guid-35", 1).await;
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+        let claimed = worker.claim_ready(10).await.unwrap();
+
+        assert!(
+            worker
+                .complete(
+                    &claimed[0],
+                    AnnounceWorkOutcome::Waiting {
+                        reason: AnnounceReason::DependencyBackoff,
+                        next_attempt_at_ms: 20,
+                        dependency: Some(("indexer".to_owned(), "main".to_owned())),
+                    },
+                    10,
+                )
+                .await
+                .unwrap()
+        );
+        repository
+            .record_dependency_health(
+                "indexer",
+                &DependencyName::new("main").unwrap(),
+                &DependencyState::Unavailable {
+                    reason: ReasonText::new("rate limited").unwrap(),
+                    retry_after_ms: Some(100),
+                },
+                50,
+            )
+            .await
+            .unwrap();
+
+        let early = worker.claim_ready(50).await.unwrap();
+        let ready = worker.claim_ready(100).await.unwrap();
+
+        assert!(early.is_empty());
+        assert_eq!(vec![AnnounceWorkId::new("ann_35").unwrap()], ready);
+        assert_eq!(
+            vec![(
+                "running".to_owned(),
+                "accepted".to_owned(),
+                Some("indexer".to_owned()),
+                Some("main".to_owned())
+            )],
+            dependency_rows(&repository).await
+        );
     }
 
     #[tokio::test]
@@ -513,6 +577,27 @@ mod tests {
             .into_iter()
             .map(|row| (row.get("status"), row.get("reason")))
             .collect()
+    }
+
+    async fn dependency_rows(
+        repository: &Repository,
+    ) -> Vec<(String, String, Option<String>, Option<String>)> {
+        sqlx::query(
+            "SELECT status, reason, last_dependency_kind, last_dependency_name FROM announce_work ORDER BY id",
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("status"),
+                row.get("reason"),
+                row.get("last_dependency_kind"),
+                row.get("last_dependency_name"),
+            )
+        })
+        .collect()
     }
 
     async fn leased_count(repository: &Repository) -> i64 {

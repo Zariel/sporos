@@ -206,6 +206,26 @@ struct LeasedTransition<'a> {
     dependency: Option<(&'a str, &'a str)>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AnnounceDependencyScheduleRow {
+    id: AnnounceWorkId,
+    status: String,
+    next_attempt_at_ms: i64,
+    dependency_state: Option<String>,
+    retry_after_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AnnounceDependencyScheduleAction {
+    None,
+    Wait {
+        reason: AnnounceReason,
+        next_attempt_at_ms: i64,
+    },
+    Probe,
+    ClearDependency,
+}
+
 impl Repository {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
@@ -1265,6 +1285,65 @@ impl Repository {
         Ok(claimed)
     }
 
+    pub async fn schedule_announce_dependency_backoff(
+        &self,
+        now_ms: i64,
+        recovery_probe_interval_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                work.id,
+                work.status,
+                work.next_attempt_at,
+                health.state AS dependency_state,
+                health.retry_after
+            FROM announce_work work
+            LEFT JOIN dependency_health health
+              ON health.dependency_type = work.last_dependency_kind
+             AND health.dependency_name = work.last_dependency_name
+            WHERE work.status IN ('queued', 'retryable', 'waiting')
+              AND work.expires_at > ?
+              AND work.last_dependency_kind IS NOT NULL
+              AND work.last_dependency_name IS NOT NULL
+            ORDER BY work.next_attempt_at, work.received_at
+            LIMIT ?
+            "#,
+        )
+        .bind(now_ms)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce dependency waits", error))?;
+
+        let mut updated = 0_u64;
+        for row in rows {
+            let row = AnnounceDependencyScheduleRow {
+                id: AnnounceWorkId::new(row.get::<String, _>("id")).map_err(|error| {
+                    DatabaseError::QueryFailed {
+                        operation: "read announce work id".to_owned(),
+                        message: error.to_string(),
+                    }
+                })?,
+                status: row.get("status"),
+                next_attempt_at_ms: row.get("next_attempt_at"),
+                dependency_state: row.get("dependency_state"),
+                retry_after_ms: row.get("retry_after"),
+            };
+            let action = announce_dependency_schedule_action(
+                &row,
+                now_ms,
+                recovery_probe_interval_ms.max(1),
+            );
+            updated += self
+                .apply_announce_dependency_schedule(&row.id, action, now_ms)
+                .await?;
+        }
+
+        Ok(updated)
+    }
+
     pub async fn renew_announce_lease(
         &self,
         id: &AnnounceWorkId,
@@ -1622,6 +1701,76 @@ impl Repository {
         Ok(result.rows_affected() == 1)
     }
 
+    async fn apply_announce_dependency_schedule(
+        &self,
+        id: &AnnounceWorkId,
+        action: AnnounceDependencyScheduleAction,
+        now_ms: i64,
+    ) -> Result<u64, DatabaseError> {
+        let result = match action {
+            AnnounceDependencyScheduleAction::None => return Ok(0),
+            AnnounceDependencyScheduleAction::Wait {
+                reason,
+                next_attempt_at_ms,
+            } => sqlx::query(
+                r#"
+                    UPDATE announce_work
+                    SET status = 'waiting',
+                        reason = ?,
+                        next_attempt_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status IN ('queued', 'retryable', 'waiting')
+                    "#,
+            )
+            .bind(announce_reason_key(reason))
+            .bind(next_attempt_at_ms)
+            .bind(now_ms)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| db_error("wait announce dependency", error))?,
+            AnnounceDependencyScheduleAction::Probe => sqlx::query(
+                r#"
+                    UPDATE announce_work
+                    SET status = 'queued',
+                        reason = 'dependency_backoff',
+                        next_attempt_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status = 'waiting'
+                    "#,
+            )
+            .bind(now_ms)
+            .bind(now_ms)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| db_error("probe announce dependency", error))?,
+            AnnounceDependencyScheduleAction::ClearDependency => sqlx::query(
+                r#"
+                    UPDATE announce_work
+                    SET status = 'queued',
+                        reason = 'dependency_backoff',
+                        next_attempt_at = ?,
+                        updated_at = ?,
+                        last_dependency_kind = NULL,
+                        last_dependency_name = NULL
+                    WHERE id = ?
+                      AND status = 'waiting'
+                    "#,
+            )
+            .bind(now_ms)
+            .bind(now_ms)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| db_error("clear announce dependency", error))?,
+        };
+
+        Ok(result.rows_affected())
+    }
+
     async fn finish_announce(
         &self,
         id: &AnnounceWorkId,
@@ -1888,6 +2037,48 @@ async fn insert_retained_key(
         .map_err(|error| db_error("insert retained local item key", error))?;
 
     Ok(())
+}
+
+fn announce_dependency_schedule_action(
+    row: &AnnounceDependencyScheduleRow,
+    now_ms: i64,
+    recovery_probe_interval_ms: i64,
+) -> AnnounceDependencyScheduleAction {
+    match row.dependency_state.as_deref() {
+        Some("degraded" | "unavailable") => {
+            if let Some(retry_after_ms) = row.retry_after_ms {
+                if retry_after_ms > now_ms {
+                    return AnnounceDependencyScheduleAction::Wait {
+                        reason: AnnounceReason::RetryAfter,
+                        next_attempt_at_ms: retry_after_ms.max(row.next_attempt_at_ms),
+                    };
+                }
+            }
+
+            if row.status == "waiting" {
+                if row.next_attempt_at_ms <= now_ms {
+                    AnnounceDependencyScheduleAction::Probe
+                } else {
+                    AnnounceDependencyScheduleAction::None
+                }
+            } else {
+                AnnounceDependencyScheduleAction::Wait {
+                    reason: AnnounceReason::DependencyBackoff,
+                    next_attempt_at_ms: row
+                        .next_attempt_at_ms
+                        .max(now_ms.saturating_add(recovery_probe_interval_ms)),
+                }
+            }
+        }
+        Some("healthy" | "unknown") | None => {
+            if row.status == "waiting" {
+                AnnounceDependencyScheduleAction::ClearDependency
+            } else {
+                AnnounceDependencyScheduleAction::None
+            }
+        }
+        Some(_) => AnnounceDependencyScheduleAction::None,
+    }
 }
 
 async fn prune_local_items_not_retained(
