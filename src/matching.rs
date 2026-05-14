@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::domain::{
-    ByteSize, LocalFile, LocalItem, LocalItemSource, MediaType, TorrentFile, TorrentMetafile,
+    ByteSize, IndexerId, LocalFile, LocalItem, LocalItemSource, MediaType, TorrentFile,
+    TorrentMetafile,
 };
 use crate::indexers::TorznabCaps;
 
@@ -62,6 +63,75 @@ pub struct FileTreeAssessment {
     pub decision: FileTreeDecision,
     pub matched_size: ByteSize,
     pub matched_ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SearchCadenceConfig {
+    pub recent_search_cooldown_ms: Option<u64>,
+    pub first_search_window_ms: Option<u64>,
+}
+
+impl Default for SearchCadenceConfig {
+    fn default() -> Self {
+        Self {
+            recent_search_cooldown_ms: Some(3 * 24 * 60 * 60 * 1_000),
+            first_search_window_ms: Some(7 * 24 * 60 * 60 * 1_000),
+        }
+    }
+}
+
+impl SearchCadenceConfig {
+    pub fn from_seconds(
+        recent_search_cooldown_secs: Option<u64>,
+        first_search_window_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            recent_search_cooldown_ms: recent_search_cooldown_secs
+                .map(|seconds| seconds.saturating_mul(1_000)),
+            first_search_window_ms: first_search_window_secs
+                .map(|seconds| seconds.saturating_mul(1_000)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SearchCadenceIndexer<'a> {
+    pub indexer_id: IndexerId,
+    pub enabled: bool,
+    pub caps: &'a TorznabCaps,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SearchHistoryEntry {
+    pub indexer_id: IndexerId,
+    pub first_searched_at_ms: i64,
+    pub last_searched_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SearchCadenceDecision {
+    Searchable(SearchCadenceSearchReason),
+    Skipped(SearchCadenceSkipReason),
+}
+
+impl SearchCadenceDecision {
+    pub const fn is_searchable(self) -> bool {
+        matches!(self, Self::Searchable(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SearchCadenceSearchReason {
+    MissingCompatibleIndexerHistory,
+    VirtualSourceChanged,
+    CadenceDue,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SearchCadenceSkipReason {
+    NoCompatibleIndexers,
+    RecentlySearched,
+    FirstSearchWindowExpired,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -192,6 +262,78 @@ pub fn plan_torznab_search(
         query,
         limit: caps.limits.max,
     })
+}
+
+pub fn evaluate_search_cadence(
+    item: &LocalItem,
+    indexers: &[SearchCadenceIndexer<'_>],
+    history: &[SearchHistoryEntry],
+    now_ms: i64,
+    config: SearchCadenceConfig,
+) -> SearchCadenceDecision {
+    let compatible_indexers = indexers
+        .iter()
+        .filter(|indexer| indexer.enabled && indexer.caps.supports_media_type(item.media_type));
+
+    let mut earliest_first = None;
+    let mut earliest_last = None;
+    let history_by_indexer = history
+        .iter()
+        .map(|entry| (entry.indexer_id, entry))
+        .collect::<HashMap<_, _>>();
+
+    let mut compatible_count = 0_usize;
+    for indexer in compatible_indexers {
+        compatible_count += 1;
+        let Some(entry) = history_by_indexer.get(&indexer.indexer_id) else {
+            return SearchCadenceDecision::Searchable(
+                SearchCadenceSearchReason::MissingCompatibleIndexerHistory,
+            );
+        };
+        earliest_first = Some(min_timestamp(earliest_first, entry.first_searched_at_ms));
+        earliest_last = Some(min_timestamp(earliest_last, entry.last_searched_at_ms));
+    }
+
+    if compatible_count == 0 {
+        return SearchCadenceDecision::Skipped(SearchCadenceSkipReason::NoCompatibleIndexers);
+    }
+
+    let Some(earliest_first) = earliest_first else {
+        return SearchCadenceDecision::Searchable(
+            SearchCadenceSearchReason::MissingCompatibleIndexerHistory,
+        );
+    };
+    let Some(earliest_last) = earliest_last else {
+        return SearchCadenceDecision::Searchable(
+            SearchCadenceSearchReason::MissingCompatibleIndexerHistory,
+        );
+    };
+
+    if matches!(item.source, LocalItemSource::Virtual { .. })
+        && item
+            .mtime_ms
+            .is_some_and(|newest_source_mtime| newest_source_mtime > earliest_last)
+    {
+        return SearchCadenceDecision::Searchable(SearchCadenceSearchReason::VirtualSourceChanged);
+    }
+
+    if let Some(cooldown_ms) = config.recent_search_cooldown_ms {
+        let cutoff = timestamp_cutoff(now_ms, cooldown_ms);
+        if earliest_last > cutoff {
+            return SearchCadenceDecision::Skipped(SearchCadenceSkipReason::RecentlySearched);
+        }
+    }
+
+    if let Some(window_ms) = config.first_search_window_ms {
+        let cutoff = timestamp_cutoff(now_ms, window_ms);
+        if earliest_first < cutoff {
+            return SearchCadenceDecision::Skipped(
+                SearchCadenceSkipReason::FirstSearchWindowExpired,
+            );
+        }
+    }
+
+    SearchCadenceDecision::Searchable(SearchCadenceSearchReason::CadenceDue)
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -370,6 +512,14 @@ fn normalize_search_key(value: &str) -> String {
         })
         .trim_matches('.')
         .to_owned()
+}
+
+fn min_timestamp(current: Option<i64>, candidate: i64) -> i64 {
+    current.map_or(candidate, |current| current.min(candidate))
+}
+
+fn timestamp_cutoff(now_ms: i64, duration_ms: u64) -> i64 {
+    now_ms.saturating_sub(i64::try_from(duration_ms).unwrap_or(i64::MAX))
 }
 
 pub fn assess_file_tree(
@@ -784,6 +934,119 @@ mod tests {
     }
 
     #[test]
+    fn cadence_filters_use_earliest_compatible_history() {
+        let item = search_item("Example Movie", MediaType::Movie);
+        let caps = all_caps();
+        let unsupported = no_movie_caps();
+        let indexers = vec![
+            cadence_indexer(1, true, &caps),
+            cadence_indexer(2, true, &caps),
+            cadence_indexer(3, false, &caps),
+            cadence_indexer(4, true, &unsupported),
+        ];
+
+        let due = evaluate_search_cadence(
+            &item,
+            &indexers,
+            &[
+                history(1, 900, 900),
+                history(2, 900, 700),
+                history(3, 1, 1),
+                history(4, 1, 1),
+            ],
+            1_000,
+            SearchCadenceConfig {
+                recent_search_cooldown_ms: Some(200),
+                first_search_window_ms: None,
+            },
+        );
+        let recent = evaluate_search_cadence(
+            &item,
+            &indexers,
+            &[history(1, 900, 900), history(2, 900, 850)],
+            1_000,
+            SearchCadenceConfig {
+                recent_search_cooldown_ms: Some(200),
+                first_search_window_ms: None,
+            },
+        );
+        let old = evaluate_search_cadence(
+            &item,
+            &indexers[..2],
+            &[history(1, 600, 600), history(2, 100, 600)],
+            1_000,
+            SearchCadenceConfig {
+                recent_search_cooldown_ms: None,
+                first_search_window_ms: Some(500),
+            },
+        );
+
+        assert_eq!(
+            SearchCadenceDecision::Searchable(SearchCadenceSearchReason::CadenceDue),
+            due
+        );
+        assert_eq!(
+            SearchCadenceDecision::Skipped(SearchCadenceSkipReason::RecentlySearched),
+            recent
+        );
+        assert_eq!(
+            SearchCadenceDecision::Skipped(SearchCadenceSkipReason::FirstSearchWindowExpired),
+            old
+        );
+    }
+
+    #[test]
+    fn cadence_new_indexer_and_virtual_changes_make_items_searchable() {
+        let item = search_item("Example Movie", MediaType::Movie);
+        let virtual_item = virtual_item();
+        let caps = all_caps();
+        let indexers = vec![
+            cadence_indexer(1, true, &caps),
+            cadence_indexer(2, true, &caps),
+        ];
+        let config = SearchCadenceConfig {
+            recent_search_cooldown_ms: Some(1_000),
+            first_search_window_ms: Some(500),
+        };
+
+        let missing_history =
+            evaluate_search_cadence(&item, &indexers, &[history(1, 1, 1)], 1_000, config);
+        let changed_virtual = evaluate_search_cadence(
+            &virtual_item,
+            &indexers,
+            &[history(1, 900, 900), history(2, 900, 850)],
+            1_000,
+            config,
+        );
+
+        assert_eq!(
+            SearchCadenceDecision::Searchable(
+                SearchCadenceSearchReason::MissingCompatibleIndexerHistory
+            ),
+            missing_history
+        );
+        assert_eq!(
+            SearchCadenceDecision::Searchable(SearchCadenceSearchReason::VirtualSourceChanged),
+            changed_virtual
+        );
+    }
+
+    #[test]
+    fn cadence_skips_without_enabled_compatible_indexers() {
+        let item = search_item("Example Movie", MediaType::Movie);
+        let caps = no_movie_caps();
+        let indexers = vec![cadence_indexer(1, true, &caps)];
+
+        let decision =
+            evaluate_search_cadence(&item, &indexers, &[], 1_000, SearchCadenceConfig::default());
+
+        assert_eq!(
+            SearchCadenceDecision::Skipped(SearchCadenceSkipReason::NoCompatibleIndexers),
+            decision
+        );
+    }
+
+    #[test]
     fn exact_match_requires_paths_and_sizes_for_real_items() {
         let local_item = data_root_item();
         let local_files = vec![local_file("Example/a.mkv", 10, 0)];
@@ -1017,6 +1280,45 @@ mod tests {
                 default: 100,
                 max: 200,
             },
+        }
+    }
+
+    fn no_movie_caps() -> TorznabCaps {
+        TorznabCaps {
+            search: SearchCaps {
+                generic_search: true,
+                tv_search: true,
+                ..SearchCaps::default()
+            },
+            categories: CategoryCaps {
+                tv: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits::default(),
+        }
+    }
+
+    fn cadence_indexer<'a>(
+        indexer_id: u64,
+        enabled: bool,
+        caps: &'a TorznabCaps,
+    ) -> SearchCadenceIndexer<'a> {
+        SearchCadenceIndexer {
+            indexer_id: IndexerId::new(indexer_id).unwrap(),
+            enabled,
+            caps,
+        }
+    }
+
+    fn history(
+        indexer_id: u64,
+        first_searched_at_ms: i64,
+        last_searched_at_ms: i64,
+    ) -> SearchHistoryEntry {
+        SearchHistoryEntry {
+            indexer_id: IndexerId::new(indexer_id).unwrap(),
+            first_searched_at_ms,
+            last_searched_at_ms,
         }
     }
 

@@ -122,6 +122,8 @@ pub struct MatchingConfig {
     pub include_single_episodes: bool,
     pub include_non_video: bool,
     pub season_from_episodes: f64,
+    pub recent_search_cooldown_secs: Option<u64>,
+    pub first_search_window_secs: Option<u64>,
 }
 
 impl Default for MatchingConfig {
@@ -132,6 +134,8 @@ impl Default for MatchingConfig {
             include_single_episodes: false,
             include_non_video: false,
             season_from_episodes: 1.0,
+            recent_search_cooldown_secs: Some(3 * 24 * 60 * 60),
+            first_search_window_secs: Some(7 * 24 * 60 * 60),
         }
     }
 }
@@ -702,6 +706,8 @@ fuzzy_size_threshold = 0.02
 include_single_episodes = false
 include_non_video = false
 season_from_episodes = 1.0
+recent_search_cooldown_secs = 259200
+first_search_window_secs = 604800
 
 [inventory]
 media_scan_max_depth = 3
@@ -983,6 +989,7 @@ mod tests {
             [matching]
             fuzzy_size_threshold = 0.02
             include_non_video = false
+            recent_search_cooldown_secs = 259200
 
             [announce]
             max_pending = 1000
@@ -997,6 +1004,10 @@ mod tests {
                     "SPOROS__MATCHING__INCLUDE_NON_VIDEO".to_owned(),
                     "true".to_owned(),
                 ),
+                (
+                    "SPOROS__MATCHING__RECENT_SEARCH_COOLDOWN_SECS".to_owned(),
+                    "86400".to_owned(),
+                ),
                 ("SPOROS__ANNOUNCE__MAX_PENDING".to_owned(), "42".to_owned()),
             ],
         )
@@ -1008,6 +1019,7 @@ mod tests {
         );
         assert!((config.matching.fuzzy_size_threshold - 0.05).abs() < f64::EPSILON);
         assert!(config.matching.include_non_video);
+        assert_eq!(Some(86_400), config.matching.recent_search_cooldown_secs);
         assert_eq!(42, config.announce.max_pending);
     }
 

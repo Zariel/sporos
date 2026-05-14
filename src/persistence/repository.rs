@@ -10,8 +10,8 @@ use crate::announce::{
 };
 use crate::domain::{
     ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyName, DependencyState,
-    FileIndex, InfoHash, JobName, JobState, LocalFile, LocalItem, LocalItemId, LocalItemSource,
-    MatchDecision, MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
+    FileIndex, IndexerId, InfoHash, JobName, JobState, LocalFile, LocalItem, LocalItemId,
+    LocalItemSource, MatchDecision, MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
 };
 use crate::errors::DatabaseError;
 use crate::indexers::{ConfiguredTorznabIndexer, TorznabCaps};
@@ -148,6 +148,14 @@ pub struct IndexerRegistryRow {
     pub state: String,
     pub retry_after_ms: Option<i64>,
     pub last_caps_refresh_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SearchHistoryRow {
+    pub local_item_id: LocalItemId,
+    pub indexer_id: IndexerId,
+    pub first_searched_at_ms: i64,
+    pub last_searched_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -974,6 +982,76 @@ impl Repository {
             refreshed_at_ms,
         )
         .await
+    }
+
+    pub async fn search_history_for_item(
+        &self,
+        local_item_id: LocalItemId,
+        limit: u16,
+    ) -> Result<Vec<SearchHistoryRow>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT local_item_id, indexer_id, first_searched_at, last_searched_at
+            FROM search_history
+            WHERE local_item_id = ?
+            ORDER BY indexer_id
+            LIMIT ?
+            "#,
+        )
+        .bind(i64_from_u64(local_item_id.get(), "local item id")?)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read search history for item", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(SearchHistoryRow {
+                    local_item_id: id_from_i64(row.get("local_item_id"), "search history item id")?,
+                    indexer_id: indexer_id_from_i64(
+                        row.get("indexer_id"),
+                        "search history indexer id",
+                    )?,
+                    first_searched_at_ms: row.get("first_searched_at"),
+                    last_searched_at_ms: row.get("last_searched_at"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn record_search_history(
+        &self,
+        local_item_id: LocalItemId,
+        indexer_id: IndexerId,
+        searched_at_ms: i64,
+        rate_limited: bool,
+    ) -> Result<(), DatabaseError> {
+        if rate_limited {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO search_history (
+                local_item_id,
+                indexer_id,
+                first_searched_at,
+                last_searched_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (local_item_id, indexer_id) DO UPDATE SET
+                last_searched_at = excluded.last_searched_at
+            "#,
+        )
+        .bind(i64_from_u64(local_item_id.get(), "local item id")?)
+        .bind(i64_from_u64(indexer_id.get(), "indexer id")?)
+        .bind(searched_at_ms)
+        .bind(searched_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record search history", error))?;
+
+        Ok(())
     }
 
     pub async fn record_indexer_caps_failure(
@@ -1931,6 +2009,16 @@ fn id_from_i64(value: i64, field: &'static str) -> Result<LocalItemId, DatabaseE
         })
 }
 
+fn indexer_id_from_i64(value: i64, field: &'static str) -> Result<IndexerId, DatabaseError> {
+    u64::try_from(value)
+        .ok()
+        .and_then(|value| IndexerId::new(value).ok())
+        .ok_or_else(|| DatabaseError::QueryFailed {
+            operation: format!("read {field}"),
+            message: format!("invalid positive id {value}"),
+        })
+}
+
 fn remote_id_from_i64(value: i64, field: &'static str) -> Result<RemoteCandidateId, DatabaseError> {
     u64::try_from(value)
         .ok()
@@ -2457,6 +2545,56 @@ mod tests {
         assert_eq!(Some(5_000), rows[0].retry_after_ms);
         assert_eq!("degraded", health[0].state);
         assert_eq!(Some("bad caps".to_owned()), health[0].reason);
+    }
+
+    #[tokio::test]
+    async fn search_history_updates_only_for_non_rate_limited_searches() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let item_id = repository
+            .upsert_local_item_with_files(&test_local_item("Example"), &[])
+            .await
+            .unwrap();
+        repository
+            .sync_torznab_indexers(
+                &[test_indexer(
+                    "main",
+                    "https://indexer.example/api",
+                    ApiKeySource::Direct,
+                )],
+                100,
+            )
+            .await
+            .unwrap();
+        let indexer_id =
+            IndexerId::new(repository.indexer_registry_snapshot(10).await.unwrap()[0].id).unwrap();
+
+        repository
+            .record_search_history(item_id, indexer_id, 200, false)
+            .await
+            .unwrap();
+        repository
+            .record_search_history(item_id, indexer_id, 300, false)
+            .await
+            .unwrap();
+        repository
+            .record_search_history(item_id, indexer_id, 400, true)
+            .await
+            .unwrap();
+
+        let history = repository
+            .search_history_for_item(item_id, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vec![SearchHistoryRow {
+                local_item_id: item_id,
+                indexer_id,
+                first_searched_at_ms: 200,
+                last_searched_at_ms: 300,
+            }],
+            history
+        );
     }
 
     #[tokio::test]
