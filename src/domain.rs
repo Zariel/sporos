@@ -392,13 +392,23 @@ pub enum MatchDecision {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum DecisionReason {
     AlreadyExists,
+    BlockedRelease,
     CandidateInvalid,
     FileTreeMatched,
+    FuzzySizeMismatch,
+    InfoHashAlreadyExists,
+    MissingDownloadLink,
     NameMismatch,
     PartialOverlap,
     PolicyRejected,
+    ProperRepackMismatch,
+    ReleaseGroupMismatch,
+    ResolutionMismatch,
+    SameInfoHash,
+    SingleEpisodeForSeasonPack,
     SizeMatched,
     SourceIncomplete,
+    SourceMismatch,
     UnsupportedLayout,
 }
 

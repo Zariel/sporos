@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -6,10 +7,14 @@ use regex::Regex;
 
 use crate::content_filter::{BlocklistRule, CandidateBlocklistSubject};
 use crate::domain::{
-    ByteSize, IndexerId, InfoHash, LocalFile, LocalItem, LocalItemSource, MediaType,
-    RemoteCandidate, TorrentFile, TorrentMetafile,
+    ByteSize, CandidateAssessment, DecisionReason, IndexerId, InfoHash, LocalFile, LocalItem,
+    LocalItemSource, MatchDecision, MatchRatio, MediaType, RemoteCandidate, RemoteCandidateId,
+    TorrentFile, TorrentMetafile,
 };
+use crate::errors::DatabaseError;
 use crate::indexers::TorznabCaps;
+use crate::persistence::repository::Repository;
+use crate::torrent::parse_metafile;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FileTreeMatchMode {
@@ -67,6 +72,60 @@ pub struct FileTreeAssessment {
     pub decision: FileTreeDecision,
     pub matched_size: ByteSize,
     pub matched_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateAssessmentConfig {
+    pub precheck: CandidatePrecheckConfig,
+    pub file_tree: FileTreeMatchConfig,
+}
+
+impl Default for CandidateAssessmentConfig {
+    fn default() -> Self {
+        Self {
+            precheck: CandidatePrecheckConfig::default(),
+            file_tree: FileTreeMatchConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PersistedCandidateAssessment {
+    Assessed {
+        candidate_id: RemoteCandidateId,
+        assessment: CandidateAssessment,
+        cache_status: CandidateCacheStatus,
+    },
+    Rejected {
+        candidate_id: RemoteCandidateId,
+        assessment: CandidateAssessment,
+        cache_status: CandidateCacheStatus,
+    },
+    NeedsTorrentDownload {
+        candidate_id: RemoteCandidateId,
+        cache_status: CandidateCacheStatus,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CandidateCacheStatus {
+    NotAvailable,
+    Reused,
+    Unreadable,
+    Invalid,
+    UnsafeInfoHashMismatch,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CandidateAssessmentError {
+    MissingLocalItemId,
+    Database { source: DatabaseError },
+}
+
+impl From<DatabaseError> for CandidateAssessmentError {
+    fn from(source: DatabaseError) -> Self {
+        Self::Database { source }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,6 +293,105 @@ pub fn precheck_candidate(
     }
 
     CandidatePrecheckDecision::Accepted
+}
+
+pub async fn assess_and_persist_candidate(
+    repository: &Repository,
+    local_item: &LocalItem,
+    local_files: &[LocalFile],
+    candidate: &RemoteCandidate,
+    owned_info_hashes: &[InfoHash],
+    assessed_at_ms: i64,
+    config: &CandidateAssessmentConfig,
+) -> Result<PersistedCandidateAssessment, CandidateAssessmentError> {
+    let local_item_id = local_item
+        .id
+        .ok_or(CandidateAssessmentError::MissingLocalItemId)?;
+    let mut candidate_id = repository.upsert_remote_candidate(candidate).await?;
+
+    if let CandidatePrecheckDecision::Rejected(reason) = precheck_candidate(
+        local_item,
+        CandidatePrecheckInput::from_remote_candidate(candidate),
+        owned_info_hashes,
+        &config.precheck,
+    ) {
+        let assessment = rejected_assessment(reason);
+        repository
+            .record_match_decision(local_item_id, candidate_id, assessment, assessed_at_ms)
+            .await?;
+        return Ok(PersistedCandidateAssessment::Rejected {
+            candidate_id,
+            assessment,
+            cache_status: CandidateCacheStatus::NotAvailable,
+        });
+    }
+
+    let Some(cache_path) = candidate.torrent_cache_path.as_deref() else {
+        return Ok(PersistedCandidateAssessment::NeedsTorrentDownload {
+            candidate_id,
+            cache_status: CandidateCacheStatus::NotAvailable,
+        });
+    };
+    let cached = match cached_metafile(cache_path).await {
+        CachedMetafile::Parsed(metafile) => metafile,
+        CachedMetafile::Unreadable => {
+            return Ok(PersistedCandidateAssessment::NeedsTorrentDownload {
+                candidate_id,
+                cache_status: CandidateCacheStatus::Unreadable,
+            });
+        }
+        CachedMetafile::Invalid => {
+            return Ok(PersistedCandidateAssessment::NeedsTorrentDownload {
+                candidate_id,
+                cache_status: CandidateCacheStatus::Invalid,
+            });
+        }
+    };
+
+    if candidate
+        .info_hash
+        .as_ref()
+        .is_some_and(|info_hash| info_hash != &cached.info_hash)
+    {
+        return Ok(PersistedCandidateAssessment::NeedsTorrentDownload {
+            candidate_id,
+            cache_status: CandidateCacheStatus::UnsafeInfoHashMismatch,
+        });
+    }
+
+    let mut cached_candidate = candidate.clone();
+    cached_candidate.info_hash = Some(cached.info_hash.clone());
+    candidate_id = repository
+        .upsert_remote_candidate(&cached_candidate)
+        .await?;
+
+    if let CandidatePrecheckDecision::Rejected(reason) = precheck_candidate(
+        local_item,
+        CandidatePrecheckInput::from_remote_candidate(&cached_candidate),
+        owned_info_hashes,
+        &config.precheck,
+    ) {
+        let assessment = rejected_assessment(reason);
+        repository
+            .record_match_decision(local_item_id, candidate_id, assessment, assessed_at_ms)
+            .await?;
+        return Ok(PersistedCandidateAssessment::Rejected {
+            candidate_id,
+            assessment,
+            cache_status: CandidateCacheStatus::Reused,
+        });
+    }
+
+    let file_tree = assess_file_tree(local_item, local_files, &cached, config.file_tree);
+    let assessment = file_tree_assessment(file_tree);
+    repository
+        .record_match_decision(local_item_id, candidate_id, assessment, assessed_at_ms)
+        .await?;
+    Ok(PersistedCandidateAssessment::Assessed {
+        candidate_id,
+        assessment,
+        cache_status: CandidateCacheStatus::Reused,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -667,6 +825,76 @@ fn parse_digits(value: &str, start: usize, max_len: usize) -> Option<(u16, usize
         .parse()
         .ok()
         .map(|number| (number, end))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum CachedMetafile {
+    Parsed(TorrentMetafile),
+    Unreadable,
+    Invalid,
+}
+
+async fn cached_metafile(path: &Path) -> CachedMetafile {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || read_cached_metafile(&path))
+        .await
+        .unwrap_or(CachedMetafile::Unreadable)
+}
+
+fn read_cached_metafile(path: &Path) -> CachedMetafile {
+    let Ok(bytes) = fs::read(path) else {
+        return CachedMetafile::Unreadable;
+    };
+    parse_metafile(&bytes)
+        .map(|parsed| CachedMetafile::Parsed(parsed.metafile))
+        .unwrap_or(CachedMetafile::Invalid)
+}
+
+fn rejected_assessment(reason: CandidatePrecheckReason) -> CandidateAssessment {
+    CandidateAssessment {
+        decision: MatchDecision::Rejected,
+        reason: precheck_reason(reason),
+        matched_size: None,
+        matched_ratio: None,
+    }
+}
+
+fn precheck_reason(reason: CandidatePrecheckReason) -> DecisionReason {
+    match reason {
+        CandidatePrecheckReason::ReleaseGroupMismatch => DecisionReason::ReleaseGroupMismatch,
+        CandidatePrecheckReason::ResolutionMismatch => DecisionReason::ResolutionMismatch,
+        CandidatePrecheckReason::SourceMismatch => DecisionReason::SourceMismatch,
+        CandidatePrecheckReason::ProperRepackMismatch => DecisionReason::ProperRepackMismatch,
+        CandidatePrecheckReason::FuzzySizeMismatch => DecisionReason::FuzzySizeMismatch,
+        CandidatePrecheckReason::MissingDownloadLink => DecisionReason::MissingDownloadLink,
+        CandidatePrecheckReason::SameInfoHash => DecisionReason::SameInfoHash,
+        CandidatePrecheckReason::InfoHashAlreadyExists => DecisionReason::InfoHashAlreadyExists,
+        CandidatePrecheckReason::BlockedRelease { .. } => DecisionReason::BlockedRelease,
+        CandidatePrecheckReason::SingleEpisodeForSeasonPack => {
+            DecisionReason::SingleEpisodeForSeasonPack
+        }
+    }
+}
+
+fn file_tree_assessment(file_tree: FileTreeAssessment) -> CandidateAssessment {
+    let (decision, reason) = match file_tree.decision {
+        FileTreeDecision::Match => (MatchDecision::Exact, DecisionReason::FileTreeMatched),
+        FileTreeDecision::MatchSizeOnly => (MatchDecision::SizeOnly, DecisionReason::SizeMatched),
+        FileTreeDecision::MatchPartial => (MatchDecision::Partial, DecisionReason::PartialOverlap),
+        FileTreeDecision::SizeMismatch | FileTreeDecision::PartialSizeMismatch => {
+            (MatchDecision::NoMatch, DecisionReason::SourceIncomplete)
+        }
+        FileTreeDecision::FileTreeMismatch => {
+            (MatchDecision::NoMatch, DecisionReason::NameMismatch)
+        }
+    };
+
+    CandidateAssessment {
+        decision,
+        reason,
+        matched_size: Some(file_tree.matched_size),
+        matched_ratio: MatchRatio::new(file_tree.matched_ratio).ok(),
+    }
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -1156,13 +1384,17 @@ fn assessment(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::domain::{
-        DisplayName, FileIndex, InfoHash, ItemTitle, LocalItem, MediaType, SourceKey,
+        CandidateGuid, DisplayName, DownloadUrl, FileIndex, InfoHash, ItemTitle, LocalItem,
+        MediaType, SourceKey, TrackerName,
     };
     use crate::indexers::{CategoryCaps, SearchCaps, TorznabLimits};
+    use crate::persistence::repository::Repository;
 
     #[test]
     fn query_grouping_deduplicates_titles_and_keeps_distinct_ids() {
@@ -1663,6 +1895,229 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn assessment_persists_cached_file_tree_decisions_and_candidate_hash() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("matching-cache-assessed");
+        let torrent_bytes = test_torrent_bytes();
+        let parsed = parse_metafile(torrent_bytes).unwrap().metafile;
+        let cache_path = write_cache_file(&cache_dir, "candidate.cached.torrent", torrent_bytes);
+        let mut local = search_item("movie.mkv", MediaType::Movie);
+        local.total_size = ByteSize::new(10);
+        local.id = Some(
+            repository
+                .upsert_local_item_with_files(&local, &[])
+                .await
+                .unwrap(),
+        );
+        let local_files = vec![local_file("movie.mkv", 10, 0)];
+        let candidate = remote_candidate("guid-cached", "movie.mkv", Some(cache_path));
+
+        let outcome = assess_and_persist_candidate(
+            &repository,
+            &local,
+            &local_files,
+            &candidate,
+            &[],
+            123,
+            &CandidateAssessmentConfig::default(),
+        )
+        .await
+        .unwrap();
+        let matches = repository
+            .remote_candidates_by_info_hash(&parsed.info_hash, 10)
+            .await
+            .unwrap();
+        let decisions = repository
+            .match_decisions_for_local_item(local.id.unwrap(), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            PersistedCandidateAssessment::Assessed {
+                candidate_id: matches[0].id,
+                assessment: CandidateAssessment {
+                    decision: MatchDecision::Exact,
+                    reason: DecisionReason::FileTreeMatched,
+                    matched_size: Some(ByteSize::new(10)),
+                    matched_ratio: Some(MatchRatio::new(1.0).unwrap()),
+                },
+                cache_status: CandidateCacheStatus::Reused,
+            },
+            outcome
+        );
+        assert_eq!(Some(parsed.info_hash), matches[0].info_hash);
+        assert_eq!(1, decisions.len());
+        assert_eq!("exact", decisions[0].decision);
+        assert_eq!("file_tree_matched", decisions[0].reason_code);
+        assert_eq!(123, decisions[0].assessed_at_ms);
+    }
+
+    #[tokio::test]
+    async fn assessment_records_precheck_rejections_with_specific_reason_codes() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let local_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let mut local = search_item("Movie.2026.1080p.WEB-DL-GRP", MediaType::Movie);
+        local.info_hash = Some(local_hash.clone());
+        local.id = Some(
+            repository
+                .upsert_local_item_with_files(&local, &[])
+                .await
+                .unwrap(),
+        );
+        let mut candidate = remote_candidate("guid-same", "Movie.2026.1080p.WEB-DL-GRP", None);
+        candidate.info_hash = Some(local_hash);
+
+        let outcome = assess_and_persist_candidate(
+            &repository,
+            &local,
+            &[],
+            &candidate,
+            &[],
+            456,
+            &CandidateAssessmentConfig::default(),
+        )
+        .await
+        .unwrap();
+        let decisions = repository
+            .match_decisions_for_local_item(local.id.unwrap(), 10)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PersistedCandidateAssessment::Rejected {
+                assessment: CandidateAssessment {
+                    decision: MatchDecision::Rejected,
+                    reason: DecisionReason::SameInfoHash,
+                    ..
+                },
+                cache_status: CandidateCacheStatus::NotAvailable,
+                ..
+            }
+        ));
+        assert_eq!("same_info_hash", decisions[0].reason_code);
+        assert_eq!(456, decisions[0].assessed_at_ms);
+    }
+
+    #[tokio::test]
+    async fn assessment_rechecks_hash_gates_after_reusing_cached_torrent() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("matching-cache-owned");
+        let torrent_bytes = test_torrent_bytes();
+        let parsed = parse_metafile(torrent_bytes).unwrap().metafile;
+        let cache_path = write_cache_file(&cache_dir, "candidate.cached.torrent", torrent_bytes);
+        let mut local = search_item("movie.mkv", MediaType::Movie);
+        local.id = Some(
+            repository
+                .upsert_local_item_with_files(&local, &[])
+                .await
+                .unwrap(),
+        );
+        let candidate = remote_candidate("guid-owned", "movie.mkv", Some(cache_path));
+
+        let outcome = assess_and_persist_candidate(
+            &repository,
+            &local,
+            &[],
+            &candidate,
+            std::slice::from_ref(&parsed.info_hash),
+            789,
+            &CandidateAssessmentConfig::default(),
+        )
+        .await
+        .unwrap();
+        let decisions = repository
+            .match_decisions_for_local_item(local.id.unwrap(), 10)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PersistedCandidateAssessment::Rejected {
+                assessment: CandidateAssessment {
+                    decision: MatchDecision::Rejected,
+                    reason: DecisionReason::InfoHashAlreadyExists,
+                    ..
+                },
+                cache_status: CandidateCacheStatus::Reused,
+                ..
+            }
+        ));
+        assert_eq!("info_hash_already_exists", decisions[0].reason_code);
+    }
+
+    #[tokio::test]
+    async fn assessment_does_not_reuse_invalid_or_mismatched_cached_torrents() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("matching-cache-invalid");
+        let invalid_path = write_cache_file(&cache_dir, "invalid.cached.torrent", b"not bencode");
+        let valid_path = write_cache_file(&cache_dir, "valid.cached.torrent", test_torrent_bytes());
+        let mut local = search_item("movie.mkv", MediaType::Movie);
+        local.id = Some(
+            repository
+                .upsert_local_item_with_files(&local, &[])
+                .await
+                .unwrap(),
+        );
+        let invalid_candidate = remote_candidate("guid-invalid", "movie.mkv", Some(invalid_path));
+        let mut mismatched_candidate =
+            remote_candidate("guid-mismatch", "movie.mkv", Some(valid_path));
+        mismatched_candidate.info_hash =
+            Some(InfoHash::new("ffffffffffffffffffffffffffffffffffffffff").unwrap());
+
+        let invalid = assess_and_persist_candidate(
+            &repository,
+            &local,
+            &[],
+            &invalid_candidate,
+            &[],
+            1,
+            &CandidateAssessmentConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mismatched = assess_and_persist_candidate(
+            &repository,
+            &local,
+            &[],
+            &mismatched_candidate,
+            &[],
+            2,
+            &CandidateAssessmentConfig::default(),
+        )
+        .await
+        .unwrap();
+        let decisions = repository
+            .match_decisions_for_local_item(local.id.unwrap(), 10)
+            .await
+            .unwrap();
+        let preserved = repository
+            .remote_candidates_by_info_hash(mismatched_candidate.info_hash.as_ref().unwrap(), 10)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            invalid,
+            PersistedCandidateAssessment::NeedsTorrentDownload {
+                cache_status: CandidateCacheStatus::Invalid,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mismatched,
+            PersistedCandidateAssessment::NeedsTorrentDownload {
+                cache_status: CandidateCacheStatus::UnsafeInfoHashMismatch,
+                ..
+            }
+        ));
+        assert!(decisions.is_empty());
+        assert_eq!(
+            Some(mismatched_candidate.info_hash.unwrap()),
+            preserved[0].info_hash
+        );
+    }
+
     #[test]
     fn exact_match_requires_paths_and_sizes_for_real_items() {
         let local_item = data_root_item();
@@ -2032,6 +2487,42 @@ mod tests {
             size: Some(ByteSize::new(10)),
             info_hash: None,
         }
+    }
+
+    fn remote_candidate(guid: &str, title: &str, cache_path: Option<PathBuf>) -> RemoteCandidate {
+        RemoteCandidate {
+            id: None,
+            indexer_id: IndexerId::new(1).unwrap(),
+            guid: CandidateGuid::new(guid).unwrap(),
+            download_url: DownloadUrl::new("https://indexer.example/download/1").unwrap(),
+            title: ItemTitle::new(title).unwrap(),
+            tracker: TrackerName::new("tracker.example").unwrap(),
+            size: Some(ByteSize::new(10)),
+            published_at_ms: None,
+            info_hash: None,
+            torrent_cache_path: cache_path,
+        }
+    }
+
+    fn test_torrent_bytes() -> &'static [u8] {
+        b"d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkvee"
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("sporos-{label}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_cache_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, bytes).unwrap();
+        path
     }
 
     fn rejected_reason(decision: CandidatePrecheckDecision) -> CandidatePrecheckReason {
