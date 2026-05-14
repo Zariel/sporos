@@ -495,6 +495,70 @@ impl CandidateDownloadPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct IndexerBackoffPolicy {
+    pub base_delay_ms: i64,
+    pub max_delay_ms: i64,
+    pub jitter_ms: i64,
+    pub recovery_probe_interval_ms: i64,
+}
+
+impl Default for IndexerBackoffPolicy {
+    fn default() -> Self {
+        Self {
+            base_delay_ms: 10 * 60 * 1_000,
+            max_delay_ms: 60 * 60 * 1_000,
+            jitter_ms: 30_000,
+            recovery_probe_interval_ms: 5 * 60 * 1_000,
+        }
+    }
+}
+
+impl IndexerBackoffPolicy {
+    pub fn retry_after_deadline(
+        self,
+        now_ms: i64,
+        consecutive_failures: u16,
+        retry_after_ms: Option<i64>,
+    ) -> i64 {
+        if let Some(retry_after_ms) = retry_after_ms {
+            return if retry_after_ms > now_ms {
+                retry_after_ms
+            } else {
+                now_ms.saturating_add(retry_after_ms)
+            };
+        }
+
+        now_ms.saturating_add(self.exponential_delay_ms(consecutive_failures))
+    }
+
+    pub fn should_probe(
+        self,
+        now_ms: i64,
+        retry_after_ms: Option<i64>,
+        last_probe_ms: Option<i64>,
+    ) -> bool {
+        if retry_after_ms.is_some_and(|retry_after| retry_after > now_ms) {
+            return last_probe_ms.is_none_or(|last_probe| {
+                now_ms.saturating_sub(last_probe) >= self.recovery_probe_interval_ms
+            });
+        }
+        true
+    }
+
+    fn exponential_delay_ms(self, consecutive_failures: u16) -> i64 {
+        let shift = u32::from(consecutive_failures.min(6));
+        let multiplier = 1_i64.checked_shl(shift).unwrap_or(i64::MAX);
+        let delay = self.base_delay_ms.saturating_mul(multiplier);
+        let jitter = if self.jitter_ms <= 0 {
+            0
+        } else {
+            (i64::from(consecutive_failures).saturating_mul(97)) % self.jitter_ms
+        };
+        delay.saturating_add(jitter).min(self.max_delay_ms)
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CandidateDownloadError {
     RateLimited {
@@ -1453,6 +1517,23 @@ mod tests {
         assert!(!CandidateDownloadPolicy::default().should_attempt(3));
 
         remove_temp_dir(&cache_dir);
+    }
+
+    #[test]
+    fn indexer_backoff_uses_retry_after_exponential_delay_and_recovery_probes() {
+        let policy = IndexerBackoffPolicy {
+            base_delay_ms: 1_000,
+            max_delay_ms: 10_000,
+            jitter_ms: 100,
+            recovery_probe_interval_ms: 500,
+        };
+
+        assert_eq!(1_500, policy.retry_after_deadline(1_000, 3, Some(500)));
+        assert_eq!(6_000, policy.retry_after_deadline(1_000, 3, Some(6_000)));
+        assert_eq!(9_000 + 91, policy.retry_after_deadline(1_000, 3, None));
+        assert!(!policy.should_probe(1_100, Some(2_000), Some(800)));
+        assert!(policy.should_probe(1_400, Some(2_000), Some(800)));
+        assert!(policy.should_probe(2_100, Some(2_000), Some(2_000)));
     }
 
     #[test]

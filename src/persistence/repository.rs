@@ -1088,6 +1088,51 @@ impl Repository {
         .await
     }
 
+    pub async fn record_indexer_request_backoff(
+        &self,
+        name: &DependencyName,
+        reason: &ReasonText,
+        retry_after_ms: i64,
+        checked_at_ms: i64,
+        unavailable: bool,
+    ) -> Result<(), DatabaseError> {
+        let state = if unavailable {
+            "unavailable"
+        } else {
+            "degraded"
+        };
+        sqlx::query(
+            r#"
+            UPDATE indexers
+            SET state = ?,
+                retry_after = ?,
+                updated_at = ?
+            WHERE name = ?
+            "#,
+        )
+        .bind(state)
+        .bind(retry_after_ms)
+        .bind(checked_at_ms)
+        .bind(name.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record indexer request backoff", error))?;
+
+        let dependency_state = if unavailable {
+            DependencyState::Unavailable {
+                reason: reason.clone(),
+                retry_after_ms: Some(retry_after_ms),
+            }
+        } else {
+            DependencyState::Degraded {
+                reason: reason.clone(),
+                retry_after_ms: Some(retry_after_ms),
+            }
+        };
+        self.record_dependency_health("indexer", name, &dependency_state, checked_at_ms)
+            .await
+    }
+
     pub async fn insert_or_dedupe_announce_work(
         &self,
         work: &AnnounceWorkItem,
@@ -2545,6 +2590,58 @@ mod tests {
         assert_eq!(Some(5_000), rows[0].retry_after_ms);
         assert_eq!("degraded", health[0].state);
         assert_eq!(Some("bad caps".to_owned()), health[0].reason);
+    }
+
+    #[tokio::test]
+    async fn indexer_request_backoff_updates_retry_and_health_state() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let indexer = test_indexer(
+            "main",
+            "https://indexer.example/api",
+            ApiKeySource::Env("INDEXER_KEY".to_owned()),
+        );
+        repository
+            .sync_torznab_indexers(&[indexer], 100)
+            .await
+            .unwrap();
+        let name = DependencyName::new("main").unwrap();
+
+        repository
+            .record_indexer_request_backoff(
+                &name,
+                &ReasonText::new("rate limited").unwrap(),
+                10_000,
+                200,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let rows = repository.indexer_registry_snapshot(10).await.unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert_eq!("degraded", rows[0].state);
+        assert_eq!(Some(10_000), rows[0].retry_after_ms);
+        assert_eq!("degraded", health[0].state);
+
+        repository
+            .record_indexer_request_backoff(
+                &name,
+                &ReasonText::new("network unavailable").unwrap(),
+                20_000,
+                300,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let rows = repository.indexer_registry_snapshot(10).await.unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert_eq!("unavailable", rows[0].state);
+        assert_eq!(Some(20_000), rows[0].retry_after_ms);
+        assert_eq!("unavailable", health[0].state);
+        assert_eq!(Some("network unavailable".to_owned()), health[0].reason);
     }
 
     #[tokio::test]
