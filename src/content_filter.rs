@@ -91,6 +91,14 @@ pub struct ContentFilterSubject<'a> {
     pub context: ContentFilterContext,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateBlocklistSubject<'a> {
+    pub display_name: &'a str,
+    pub tracker_hosts: &'a [&'a str],
+    pub info_hash: Option<&'a InfoHash>,
+    pub size: Option<ByteSize>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContentMetadata<'a> {
     pub tags: &'a [&'a str],
@@ -151,6 +159,22 @@ pub fn filter_content(
 }
 
 impl BlocklistRule {
+    pub fn matches_candidate(&self, subject: CandidateBlocklistSubject<'_>) -> bool {
+        match self {
+            Self::NameSubstring(value) => subject.display_name.contains(value),
+            Self::NameRegex(pattern) => Regex::new(pattern)
+                .map(|regex| regex.is_match(subject.display_name))
+                .unwrap_or(false),
+            Self::TrackerHost(value) => {
+                subject.tracker_hosts.iter().any(|tracker| tracker == value)
+            }
+            Self::InfoHash(value) => subject.info_hash == Some(value),
+            Self::SizeBelow(value) => subject.size.is_some_and(|size| size.get() < value.get()),
+            Self::SizeAbove(value) => subject.size.is_some_and(|size| size.get() > value.get()),
+            Self::FolderSubstring(_) | Self::Tag(_) => false,
+        }
+    }
+
     fn matches(&self, subject: &ContentFilterSubject<'_>) -> bool {
         match self {
             Self::NameSubstring(value) => subject.item.display_name.as_str().contains(value),
@@ -362,6 +386,37 @@ mod tests {
             );
 
             assert_eq!(ContentFilterDecision::Accepted, decision);
+        }
+    }
+
+    #[test]
+    fn candidate_blocklist_rules_use_available_metadata() {
+        let hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let subject = CandidateBlocklistSubject {
+            display_name: "Blocked.Release",
+            tracker_hosts: &["tracker.example"],
+            info_hash: Some(&hash),
+            size: Some(ByteSize::new(50)),
+        };
+
+        for rule in [
+            BlocklistRule::NameSubstring("Blocked".to_owned()),
+            BlocklistRule::NameRegex("Blocked[.]Release".to_owned()),
+            BlocklistRule::TrackerHost("tracker.example".to_owned()),
+            BlocklistRule::InfoHash(hash.clone()),
+            BlocklistRule::SizeBelow(ByteSize::new(100)),
+            BlocklistRule::SizeAbove(ByteSize::new(10)),
+        ] {
+            assert!(rule.matches_candidate(subject));
+        }
+
+        for rule in [
+            BlocklistRule::FolderSubstring("blocked".to_owned()),
+            BlocklistRule::Tag("bad".to_owned()),
+            BlocklistRule::SizeBelow(ByteSize::new(50)),
+            BlocklistRule::SizeAbove(ByteSize::new(50)),
+        ] {
+            assert!(!rule.matches_candidate(subject));
         }
     }
 

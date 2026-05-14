@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
+use regex::Regex;
+
+use crate::content_filter::{BlocklistRule, CandidateBlocklistSubject};
 use crate::domain::{
-    ByteSize, IndexerId, LocalFile, LocalItem, LocalItemSource, MediaType, TorrentFile,
-    TorrentMetafile,
+    ByteSize, IndexerId, InfoHash, LocalFile, LocalItem, LocalItemSource, MediaType,
+    RemoteCandidate, TorrentFile, TorrentMetafile,
 };
 use crate::indexers::TorznabCaps;
 
@@ -63,6 +67,173 @@ pub struct FileTreeAssessment {
     pub decision: FileTreeDecision,
     pub matched_size: ByteSize,
     pub matched_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidatePrecheckConfig {
+    pub fuzzy_size_threshold: f64,
+    pub season_from_episodes: f64,
+    pub include_single_episodes: bool,
+    pub blocklist: Vec<BlocklistRule>,
+}
+
+impl Default for CandidatePrecheckConfig {
+    fn default() -> Self {
+        Self {
+            fuzzy_size_threshold: FileTreeMatchConfig::default().fuzzy_size_threshold,
+            season_from_episodes: FileTreeMatchConfig::default().season_from_episodes,
+            include_single_episodes: false,
+            blocklist: Vec::new(),
+        }
+    }
+}
+
+impl From<FileTreeMatchConfig> for CandidatePrecheckConfig {
+    fn from(config: FileTreeMatchConfig) -> Self {
+        Self {
+            fuzzy_size_threshold: config.fuzzy_size_threshold,
+            season_from_episodes: config.season_from_episodes,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CandidatePrecheckInput<'a> {
+    pub title: &'a str,
+    pub download_url: Option<&'a str>,
+    pub tracker: Option<&'a str>,
+    pub size: Option<ByteSize>,
+    pub info_hash: Option<&'a InfoHash>,
+}
+
+impl<'a> CandidatePrecheckInput<'a> {
+    pub fn from_remote_candidate(candidate: &'a RemoteCandidate) -> Self {
+        Self {
+            title: candidate.title.as_str(),
+            download_url: Some(candidate.download_url.as_str()),
+            tracker: Some(candidate.tracker.as_str()),
+            size: candidate.size,
+            info_hash: candidate.info_hash.as_ref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CandidatePrecheckDecision {
+    Accepted,
+    Rejected(CandidatePrecheckReason),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CandidatePrecheckReason {
+    ReleaseGroupMismatch,
+    ResolutionMismatch,
+    SourceMismatch,
+    ProperRepackMismatch,
+    FuzzySizeMismatch,
+    MissingDownloadLink,
+    SameInfoHash,
+    InfoHashAlreadyExists,
+    BlockedRelease { rule: BlocklistRule },
+    SingleEpisodeForSeasonPack,
+}
+
+impl CandidatePrecheckReason {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReleaseGroupMismatch => "RELEASE_GROUP_MISMATCH",
+            Self::ResolutionMismatch => "RESOLUTION_MISMATCH",
+            Self::SourceMismatch => "SOURCE_MISMATCH",
+            Self::ProperRepackMismatch => "PROPER_REPACK_MISMATCH",
+            Self::FuzzySizeMismatch => "FUZZY_SIZE_MISMATCH",
+            Self::MissingDownloadLink => "MISSING_DOWNLOAD_LINK",
+            Self::SameInfoHash => "SAME_INFO_HASH",
+            Self::InfoHashAlreadyExists => "INFO_HASH_ALREADY_EXISTS",
+            Self::BlockedRelease { .. } => "BLOCKED_RELEASE",
+            Self::SingleEpisodeForSeasonPack => "FILE_TREE_MISMATCH",
+        }
+    }
+}
+
+pub fn precheck_candidate(
+    local_item: &LocalItem,
+    candidate: CandidatePrecheckInput<'_>,
+    owned_info_hashes: &[InfoHash],
+    config: &CandidatePrecheckConfig,
+) -> CandidatePrecheckDecision {
+    let local_metadata = ParsedReleaseMetadata::from_title(local_item.display_name.as_str());
+    let candidate_metadata = ParsedReleaseMetadata::from_title(candidate.title);
+
+    if comparable_mismatch(
+        local_metadata.release_group.as_deref(),
+        candidate_metadata.release_group.as_deref(),
+    ) {
+        return reject(CandidatePrecheckReason::ReleaseGroupMismatch);
+    }
+
+    if comparable_mismatch(local_metadata.resolution, candidate_metadata.resolution) {
+        return reject(CandidatePrecheckReason::ResolutionMismatch);
+    }
+
+    if comparable_mismatch(local_metadata.source, candidate_metadata.source) {
+        return reject(CandidatePrecheckReason::SourceMismatch);
+    }
+
+    if local_metadata.has_proper_repack != candidate_metadata.has_proper_repack {
+        return reject(CandidatePrecheckReason::ProperRepackMismatch);
+    }
+
+    if candidate
+        .size
+        .is_some_and(|size| !candidate_size_in_bounds(local_item, size, config))
+    {
+        return reject(CandidatePrecheckReason::FuzzySizeMismatch);
+    }
+
+    if !candidate
+        .download_url
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        return reject(CandidatePrecheckReason::MissingDownloadLink);
+    }
+
+    if local_item
+        .info_hash
+        .as_ref()
+        .is_some_and(|local_hash| candidate.info_hash == Some(local_hash))
+    {
+        return reject(CandidatePrecheckReason::SameInfoHash);
+    }
+
+    if let Some(candidate_hash) = candidate.info_hash
+        && owned_info_hashes
+            .iter()
+            .any(|owned_hash| owned_hash == candidate_hash)
+    {
+        return reject(CandidatePrecheckReason::InfoHashAlreadyExists);
+    }
+
+    let tracker_hosts = candidate.tracker.into_iter().collect::<Vec<_>>();
+    if let Some(rule) = config.blocklist.iter().find(|rule| {
+        rule.matches_candidate(CandidateBlocklistSubject {
+            display_name: candidate.title,
+            tracker_hosts: &tracker_hosts,
+            info_hash: candidate.info_hash,
+            size: candidate.size,
+        })
+    }) {
+        return reject(CandidatePrecheckReason::BlockedRelease { rule: rule.clone() });
+    }
+
+    if !config.include_single_episodes
+        && local_item.media_type == MediaType::SeasonPack
+        && parse_episode_metadata(candidate.title).episode.is_some()
+    {
+        return reject(CandidatePrecheckReason::SingleEpisodeForSeasonPack);
+    }
+
+    CandidatePrecheckDecision::Accepted
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -496,6 +667,198 @@ fn parse_digits(value: &str, start: usize, max_len: usize) -> Option<(u16, usize
         .parse()
         .ok()
         .map(|number| (number, end))
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct ParsedReleaseMetadata {
+    release_group: Option<String>,
+    resolution: Option<ReleaseResolution>,
+    source: Option<ReleaseSource>,
+    has_proper_repack: bool,
+}
+
+impl ParsedReleaseMetadata {
+    fn from_title(title: &str) -> Self {
+        Self {
+            release_group: parse_release_group(title),
+            resolution: parse_release_resolution(title),
+            source: parse_release_source(title),
+            has_proper_repack: has_proper_repack(title),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReleaseResolution {
+    P720,
+    P1080,
+    P2160,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReleaseSource {
+    WebDl,
+    WebRip,
+    Bluray,
+    Hdtv,
+    Dvd,
+    Remux,
+}
+
+fn comparable_mismatch<T: PartialEq>(left: Option<T>, right: Option<T>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left != right)
+}
+
+fn candidate_size_in_bounds(
+    local_item: &LocalItem,
+    candidate_size: ByteSize,
+    config: &CandidatePrecheckConfig,
+) -> bool {
+    let length = local_item.total_size.get() as f64;
+    let factor = fuzzy_size_factor(local_item, config);
+    let lower = length - factor * length;
+    let upper = length + factor * length;
+    let candidate_size = candidate_size.get() as f64;
+    candidate_size >= lower && candidate_size <= upper
+}
+
+fn fuzzy_size_factor(local_item: &LocalItem, config: &CandidatePrecheckConfig) -> f64 {
+    if matches!(local_item.source, LocalItemSource::Virtual { .. }) {
+        1.0 - config.season_from_episodes
+    } else {
+        config.fuzzy_size_threshold
+    }
+    .clamp(0.0, 1.0)
+}
+
+fn reject(reason: CandidatePrecheckReason) -> CandidatePrecheckDecision {
+    CandidatePrecheckDecision::Rejected(reason)
+}
+
+fn parse_release_group(title: &str) -> Option<String> {
+    bracketed_group_regex()
+        .captures(title)
+        .or_else(|| leading_group_regex().captures(title))
+        .or_else(|| trailing_group_regex().captures(title))
+        .and_then(|captures| captures.name("group"))
+        .map(|group| group.as_str().trim())
+        .filter(|group| !is_bad_release_group(group))
+        .map(|group| group.to_ascii_lowercase())
+}
+
+fn parse_release_resolution(title: &str) -> Option<ReleaseResolution> {
+    release_resolution_regex()
+        .captures(title)
+        .and_then(|captures| captures.name("resolution"))
+        .and_then(
+            |resolution| match resolution.as_str().to_ascii_lowercase().as_str() {
+                "720p" => Some(ReleaseResolution::P720),
+                "1080p" => Some(ReleaseResolution::P1080),
+                "2160p" => Some(ReleaseResolution::P2160),
+                _ => None,
+            },
+        )
+}
+
+fn parse_release_source(title: &str) -> Option<ReleaseSource> {
+    release_source_regex()
+        .captures(title)
+        .and_then(|captures| captures.name("source"))
+        .map(|source| normalize_release_token(source.as_str()))
+        .and_then(|source| match source.as_str() {
+            "webdl" => Some(ReleaseSource::WebDl),
+            "webrip" => Some(ReleaseSource::WebRip),
+            "bluray" | "bdrip" | "brrip" => Some(ReleaseSource::Bluray),
+            "hdtv" => Some(ReleaseSource::Hdtv),
+            "dvdrip" => Some(ReleaseSource::Dvd),
+            "remux" => Some(ReleaseSource::Remux),
+            _ => None,
+        })
+}
+
+fn has_proper_repack(title: &str) -> bool {
+    proper_repack_regex().is_match(title)
+}
+
+fn normalize_release_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_bad_release_group(group: &str) -> bool {
+    matches!(
+        normalize_release_token(group).as_str(),
+        "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "av1"
+            | "aac"
+            | "dts"
+            | "truehd"
+            | "720p"
+            | "1080p"
+            | "2160p"
+            | "bluray"
+            | "webdl"
+            | "webrip"
+            | "dl"
+            | "rip"
+            | "ray"
+    )
+}
+
+fn bracketed_group_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"^\[(?P<group>[^\]]{2,32})\]\s*").expect("group regex should compile")
+    })
+}
+
+fn leading_group_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"^(?P<group>[A-Za-z0-9][A-Za-z0-9._-]{1,31})\s+-\s+")
+            .expect("leading group regex should compile")
+    })
+}
+
+fn trailing_group_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"-(?P<group>[A-Za-z0-9][A-Za-z0-9._]{1,31})$")
+            .expect("trailing group regex should compile")
+    })
+}
+
+fn release_resolution_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[ ._\-\[\]()])(?P<resolution>2160p|1080p|720p)(?:$|[ ._\-\[\]()])")
+            .expect("resolution regex should compile")
+    })
+}
+
+fn release_source_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|[ ._\-\[\]()])(?P<source>web[ ._-]?dl|web[ ._-]?rip|blu[ ._-]?ray|bdrip|brrip|hdtv|dvd[ ._-]?rip|remux)(?:$|[ ._\-\[\]()])",
+        )
+        .expect("source regex should compile")
+    })
+}
+
+fn proper_repack_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[ ._\-\[\]()])(?:proper|repack)(?:$|[ ._\-\[\]()])")
+            .expect("proper/repack regex should compile")
+    })
 }
 
 fn normalize_search_key(value: &str) -> String {
@@ -1074,6 +1437,233 @@ mod tests {
     }
 
     #[test]
+    fn candidate_precheck_runs_metadata_gates_in_documented_order() {
+        let mut local = search_item("[GRP] Show.S01E01.1080p.WEB-DL", MediaType::Episode);
+        local.total_size = ByteSize::new(100);
+        let candidate = CandidatePrecheckInput {
+            title: "Show.S01E01.720p.HDTV-OTHER",
+            size: Some(ByteSize::new(10_000)),
+            download_url: None,
+            ..candidate_input("Show.S01E01.720p.HDTV-OTHER")
+        };
+
+        let decision =
+            precheck_candidate(&local, candidate, &[], &CandidatePrecheckConfig::default());
+
+        assert_eq!(
+            CandidatePrecheckDecision::Rejected(CandidatePrecheckReason::ReleaseGroupMismatch),
+            decision
+        );
+        assert_eq!("RELEASE_GROUP_MISMATCH", rejected_reason(decision).as_str());
+    }
+
+    #[test]
+    fn candidate_precheck_rejects_resolution_source_and_proper_mismatches() {
+        let local = search_item("Show.S01E01.1080p.WEB-DL-GRP", MediaType::Episode);
+
+        assert_eq!(
+            CandidatePrecheckReason::ResolutionMismatch,
+            rejected_reason(precheck_candidate(
+                &local,
+                candidate_input("Show.S01E01.720p.WEB-DL-GRP"),
+                &[],
+                &CandidatePrecheckConfig::default(),
+            ))
+        );
+        assert_eq!(
+            CandidatePrecheckReason::SourceMismatch,
+            rejected_reason(precheck_candidate(
+                &local,
+                candidate_input("Show.S01E01.1080p.HDTV-GRP"),
+                &[],
+                &CandidatePrecheckConfig::default(),
+            ))
+        );
+        assert_eq!(
+            CandidatePrecheckReason::ProperRepackMismatch,
+            rejected_reason(precheck_candidate(
+                &local,
+                candidate_input("Show.S01E01.1080p.WEB-DL.REPACK-GRP"),
+                &[],
+                &CandidatePrecheckConfig::default(),
+            ))
+        );
+    }
+
+    #[test]
+    fn candidate_precheck_applies_fuzzy_size_boundaries() {
+        let mut local = search_item("Movie.2026.1080p.WEB-DL-GRP", MediaType::Movie);
+        local.total_size = ByteSize::new(100);
+        let config = CandidatePrecheckConfig {
+            fuzzy_size_threshold: 0.2,
+            ..CandidatePrecheckConfig::default()
+        };
+
+        for accepted_size in [80, 100, 120] {
+            assert_eq!(
+                CandidatePrecheckDecision::Accepted,
+                precheck_candidate(
+                    &local,
+                    CandidatePrecheckInput {
+                        size: Some(ByteSize::new(accepted_size)),
+                        ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
+                    },
+                    &[],
+                    &config,
+                )
+            );
+        }
+
+        for rejected_size in [79, 121] {
+            assert_eq!(
+                CandidatePrecheckReason::FuzzySizeMismatch,
+                rejected_reason(precheck_candidate(
+                    &local,
+                    CandidatePrecheckInput {
+                        size: Some(ByteSize::new(rejected_size)),
+                        ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
+                    },
+                    &[],
+                    &config,
+                ))
+            );
+        }
+
+        let mut virtual_pack = virtual_item();
+        virtual_pack.total_size = ByteSize::new(100);
+        let virtual_config = CandidatePrecheckConfig {
+            season_from_episodes: 0.75,
+            ..CandidatePrecheckConfig::default()
+        };
+
+        assert_eq!(
+            CandidatePrecheckDecision::Accepted,
+            precheck_candidate(
+                &virtual_pack,
+                CandidatePrecheckInput {
+                    size: Some(ByteSize::new(75)),
+                    ..candidate_input("Show.S01.1080p.WEB-DL-GRP")
+                },
+                &[],
+                &virtual_config,
+            )
+        );
+        assert_eq!(
+            CandidatePrecheckReason::FuzzySizeMismatch,
+            rejected_reason(precheck_candidate(
+                &virtual_pack,
+                CandidatePrecheckInput {
+                    size: Some(ByteSize::new(74)),
+                    ..candidate_input("Show.S01.1080p.WEB-DL-GRP")
+                },
+                &[],
+                &virtual_config,
+            ))
+        );
+    }
+
+    #[test]
+    fn candidate_precheck_rejects_missing_download_links() {
+        let local = search_item("Movie.2026.1080p.WEB-DL-GRP", MediaType::Movie);
+
+        for download_url in [None, Some("   ")] {
+            assert_eq!(
+                CandidatePrecheckReason::MissingDownloadLink,
+                rejected_reason(precheck_candidate(
+                    &local,
+                    CandidatePrecheckInput {
+                        download_url,
+                        ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
+                    },
+                    &[],
+                    &CandidatePrecheckConfig::default(),
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_precheck_rejects_same_and_owned_info_hashes() {
+        let same_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let owned_hash = InfoHash::new("ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let mut local = search_item("Movie.2026.1080p.WEB-DL-GRP", MediaType::Movie);
+        local.info_hash = Some(same_hash.clone());
+
+        assert_eq!(
+            CandidatePrecheckReason::SameInfoHash,
+            rejected_reason(precheck_candidate(
+                &local,
+                CandidatePrecheckInput {
+                    info_hash: Some(&same_hash),
+                    ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
+                },
+                &[owned_hash.clone()],
+                &CandidatePrecheckConfig::default(),
+            ))
+        );
+        assert_eq!(
+            CandidatePrecheckReason::InfoHashAlreadyExists,
+            rejected_reason(precheck_candidate(
+                &local,
+                CandidatePrecheckInput {
+                    info_hash: Some(&owned_hash),
+                    ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
+                },
+                &[owned_hash.clone()],
+                &CandidatePrecheckConfig::default(),
+            ))
+        );
+    }
+
+    #[test]
+    fn candidate_precheck_rejects_blocklisted_candidates() {
+        let local = search_item("Movie.2026.1080p.WEB-DL-GRP", MediaType::Movie);
+        let rule = BlocklistRule::TrackerHost("tracker.example".to_owned());
+        let config = CandidatePrecheckConfig {
+            blocklist: vec![rule.clone()],
+            ..CandidatePrecheckConfig::default()
+        };
+
+        assert_eq!(
+            CandidatePrecheckReason::BlockedRelease { rule },
+            rejected_reason(precheck_candidate(
+                &local,
+                candidate_input("Movie.2026.1080p.WEB-DL-GRP"),
+                &[],
+                &config,
+            ))
+        );
+    }
+
+    #[test]
+    fn candidate_precheck_rejects_single_episodes_for_season_pack() {
+        let local = search_item("Show.S01", MediaType::SeasonPack);
+        let candidate = candidate_input("Show.S01E01.1080p.WEB-DL-GRP");
+
+        assert_eq!(
+            CandidatePrecheckReason::SingleEpisodeForSeasonPack,
+            rejected_reason(precheck_candidate(
+                &local,
+                candidate,
+                &[],
+                &CandidatePrecheckConfig::default(),
+            ))
+        );
+        assert_eq!(
+            CandidatePrecheckDecision::Accepted,
+            precheck_candidate(
+                &local,
+                candidate,
+                &[],
+                &CandidatePrecheckConfig {
+                    include_single_episodes: true,
+                    ..CandidatePrecheckConfig::default()
+                },
+            )
+        );
+    }
+
+    #[test]
     fn exact_match_requires_paths_and_sizes_for_real_items() {
         let local_item = data_root_item();
         let local_files = vec![local_file("Example/a.mkv", 10, 0)];
@@ -1431,6 +2021,23 @@ mod tests {
             save_path: None,
             total_size: ByteSize::new(10),
             mtime_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    fn candidate_input(title: &str) -> CandidatePrecheckInput<'_> {
+        CandidatePrecheckInput {
+            title,
+            download_url: Some("https://indexer.example/download/1"),
+            tracker: Some("tracker.example"),
+            size: Some(ByteSize::new(10)),
+            info_hash: None,
+        }
+    }
+
+    fn rejected_reason(decision: CandidatePrecheckDecision) -> CandidatePrecheckReason {
+        match decision {
+            CandidatePrecheckDecision::Rejected(reason) => reason,
+            CandidatePrecheckDecision::Accepted => panic!("candidate precheck accepted"),
         }
     }
 
