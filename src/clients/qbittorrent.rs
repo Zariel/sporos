@@ -589,6 +589,12 @@ mod tests {
             "Example",
             torrents[0].display_name("qbit").unwrap().as_str()
         );
+        assert_eq!(Some(PathBuf::from("/downloads")), torrents[0].save_path);
+        assert!(
+            torrents
+                .iter()
+                .any(|torrent| torrent.info_hash("qbit").unwrap().as_str() == SHA1)
+        );
         assert!(torrents[0].is_complete());
     }
 
@@ -674,6 +680,41 @@ mod tests {
         assert!(seen.contains("/api/v2/app/version|SID=expired"));
         assert!(seen.contains("/api/v2/auth/login|"));
         assert!(seen.contains("/api/v2/torrents/start|SID=renewed"));
+    }
+
+    #[tokio::test]
+    async fn client_posts_recheck_pause_and_v4_resume_endpoints() {
+        let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen_requests = seen.clone();
+        let endpoint = spawn_qbit_server(move |request| {
+            let seen = seen_requests.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                seen.lock().unwrap().push(path.clone());
+                match path.as_str() {
+                    "/api/v2/auth/login" => {
+                        response_with_cookie(AxumStatusCode::OK, "Ok.", "SID=ok")
+                    }
+                    "/api/v2/app/version" => (AxumStatusCode::OK, "4.6.0").into_response(),
+                    "/api/v2/torrents/recheck"
+                    | "/api/v2/torrents/pause"
+                    | "/api/v2/torrents/resume" => (AxumStatusCode::OK, "").into_response(),
+                    _ => (AxumStatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+        let hash = InfoHash::new(SHA1).unwrap();
+
+        client.recheck(&hash).await.unwrap();
+        client.pause(&hash).await.unwrap();
+        client.resume(&hash).await.unwrap();
+
+        let seen = seen.lock().unwrap().join("\n");
+        assert!(seen.contains("/api/v2/torrents/recheck"));
+        assert!(seen.contains("/api/v2/torrents/pause"));
+        assert!(seen.contains("/api/v2/torrents/resume"));
     }
 
     #[tokio::test]

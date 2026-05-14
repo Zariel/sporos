@@ -780,6 +780,7 @@ mod tests {
         assert_eq!(PathBuf::from("/downloads"), downloads[0].directory);
         assert_eq!(0, downloads[0].left_bytes.get());
         assert!(downloads[0].complete);
+        assert!(downloads.iter().any(|download| download.info_hash == hash));
         assert_eq!(Some("sporos".to_owned()), downloads[0].label);
     }
 
@@ -851,6 +852,28 @@ mod tests {
 
         assert_eq!(1, inventory.len());
         assert_eq!("Example", inventory[0].name.as_str());
+    }
+
+    #[tokio::test]
+    async fn client_posts_label_recheck_pause_and_resume_methods() {
+        let endpoint = spawn_rtorrent_server(|request| async move {
+            let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            for method in ["d.custom1.set", "d.check_hash", "d.pause", "d.resume"] {
+                if body.contains(&format!("<methodName>{method}</methodName>")) {
+                    return (AxumStatusCode::OK, xml_response("<i8>0</i8>"));
+                }
+            }
+            (AxumStatusCode::BAD_REQUEST, body)
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+        let hash = InfoHash::new(SHA1).unwrap();
+
+        client.set_label(&hash).await.unwrap();
+        client.recheck(&hash).await.unwrap();
+        client.pause(&hash).await.unwrap();
+        client.resume(&hash).await.unwrap();
     }
 
     fn row(value: XmlRpcValue) -> XmlRpcValue {
