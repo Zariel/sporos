@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crate::config::{ConfigTorrentClientKind, TorrentClientConfig};
 use crate::domain::{ClientHost, DisplayName, TorrentClientKind};
@@ -111,6 +112,8 @@ pub struct TorrentClientDescriptor {
     pub kind: TorrentClientKind,
     pub host: ClientHost,
     pub url: String,
+    pub default_save_path: PathBuf,
+    pub readonly: bool,
     pub capabilities: TorrentClientCapabilities,
 }
 
@@ -127,6 +130,10 @@ impl TorrentClientDescriptor {
             client: self.name.as_str().to_owned(),
             capability: operation.as_str().to_owned(),
         })
+    }
+
+    pub const fn can_inject(&self) -> bool {
+        !self.readonly && self.capabilities.can_inject
     }
 }
 
@@ -173,6 +180,8 @@ impl TorrentClientRegistry {
                 kind,
                 host,
                 url: config.url.clone(),
+                default_save_path: config.default_save_path.clone(),
+                readonly: false,
                 capabilities: TorrentClientCapabilities::for_kind(kind),
             };
             clients.insert(name, descriptor);
@@ -195,6 +204,22 @@ impl TorrentClientRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
+    }
+
+    pub fn select_injection_client(
+        &self,
+        preferred_host: Option<&ClientHost>,
+    ) -> Option<&TorrentClientDescriptor> {
+        if let Some(preferred_host) = preferred_host
+            && let Some(client) = self
+                .clients
+                .values()
+                .find(|client| &client.host == preferred_host && client.can_inject())
+        {
+            return Some(client);
+        }
+
+        self.clients.values().find(|client| client.can_inject())
     }
 }
 
@@ -276,12 +301,19 @@ mod tests {
 
         assert_eq!(2, registry.len());
         assert_eq!(TorrentClientKind::Qbittorrent, qbit.kind);
+        assert_eq!(PathBuf::from("/downloads"), qbit.default_save_path);
+        assert!(!qbit.readonly);
+        assert!(qbit.can_inject());
         assert!(qbit.capabilities.supports(TorrentClientOperation::SetTags));
         assert!(
             qbit.capabilities
                 .supports(TorrentClientOperation::SetCategory)
         );
         assert_eq!(TorrentClientKind::Rtorrent, rtorrent.kind);
+        assert_eq!(
+            PathBuf::from("/downloads/archive"),
+            rtorrent.default_save_path
+        );
         assert!(
             rtorrent
                 .capabilities
@@ -301,6 +333,8 @@ mod tests {
             kind: TorrentClientKind::Rtorrent,
             host: ClientHost::new("rtorrent:5000").unwrap(),
             url: "http://rtorrent:5000/RPC2".to_owned(),
+            default_save_path: PathBuf::from("/downloads"),
+            readonly: false,
             capabilities: TorrentClientCapabilities::for_kind(TorrentClientKind::Rtorrent),
         };
 
@@ -341,6 +375,31 @@ mod tests {
 
         assert_eq!("box.local/qbit", first.host.as_str());
         assert_eq!("box.local/rtorrent", second.host.as_str());
+    }
+
+    #[test]
+    fn injection_selection_prefers_matching_writable_host_then_name_order() {
+        let mut config = BTreeMap::new();
+        config.insert(
+            "z_rtorrent".to_owned(),
+            client_config(
+                ConfigTorrentClientKind::Rtorrent,
+                "http://rtorrent:5000/RPC2",
+            ),
+        );
+        config.insert(
+            "a_qbit".to_owned(),
+            client_config(ConfigTorrentClientKind::Qbittorrent, "http://qbit:8080"),
+        );
+        let registry = TorrentClientRegistry::from_config(&config).unwrap();
+
+        let preferred = registry
+            .select_injection_client(Some(&ClientHost::new("rtorrent:5000").unwrap()))
+            .unwrap();
+        let fallback = registry.select_injection_client(None).unwrap();
+
+        assert_eq!("z_rtorrent", preferred.name.as_str());
+        assert_eq!("a_qbit", fallback.name.as_str());
     }
 
     #[test]

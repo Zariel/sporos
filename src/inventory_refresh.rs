@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use tokio::task;
 use tracing::info_span;
 
-use crate::domain::ClientHost;
+use crate::domain::{
+    ByteSize, ClientHost, DisplayName, InfoHash, ItemTitle, LocalFile, LocalItem, LocalItemSource,
+    MediaType, SourceKey, TorrentFile,
+};
 use crate::errors::DatabaseError;
 use crate::inventory::{
     InventoryScanFailure, InventoryScanOptions, InventoryScanner, ScannedLocalItem,
@@ -29,8 +32,59 @@ pub struct InventoryRefreshSummary {
     pub scan_failures: Vec<InventoryScanFailure>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ClientInventoryItem {
+    pub client_host: ClientHost,
+    pub info_hash: InfoHash,
+    pub display_name: DisplayName,
+    pub media_type: MediaType,
+    pub save_path: PathBuf,
+    pub files: Vec<TorrentFile>,
+}
+
+impl ClientInventoryItem {
+    pub fn into_scanned(self) -> Result<ScannedLocalItem, InventoryRefreshError> {
+        let total_size = ByteSize::new(self.files.iter().map(|file| file.size.get()).sum());
+        let files = self
+            .files
+            .into_iter()
+            .map(|file| LocalFile::new(None, file.relative_path, file.size, file.file_index))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| InventoryRefreshError::InvalidClientInventory {
+                message: error.to_string(),
+            })?;
+        Ok(ScannedLocalItem {
+            item: LocalItem {
+                id: None,
+                source: LocalItemSource::Client {
+                    client_host: self.client_host,
+                    source_key: SourceKey::new(self.info_hash.as_str()).map_err(|error| {
+                        InventoryRefreshError::InvalidClientInventory {
+                            message: error.to_string(),
+                        }
+                    })?,
+                },
+                title: ItemTitle::new(self.display_name.as_str()).map_err(|error| {
+                    InventoryRefreshError::InvalidClientInventory {
+                        message: error.to_string(),
+                    }
+                })?,
+                display_name: self.display_name,
+                media_type: self.media_type,
+                info_hash: Some(self.info_hash),
+                path: None,
+                save_path: Some(self.save_path),
+                total_size,
+                mtime_ms: None,
+            },
+            files,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum InventoryRefreshError {
+    InvalidClientInventory { message: String },
     ScanWorkerFailed { message: String },
     Database { source: DatabaseError },
 }
@@ -146,6 +200,9 @@ impl From<DatabaseError> for InventoryRefreshError {
 impl fmt::Display for InventoryRefreshError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidClientInventory { message } => {
+                write!(formatter, "invalid client inventory: {message}")
+            }
             Self::ScanWorkerFailed { message } => {
                 write!(formatter, "inventory scan worker failed: {message}")
             }
@@ -157,6 +214,7 @@ impl fmt::Display for InventoryRefreshError {
 impl Error for InventoryRefreshError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidClientInventory { .. } => None,
             Self::ScanWorkerFailed { .. } => None,
             Self::Database { source } => Some(source),
         }
@@ -341,6 +399,54 @@ mod tests {
         assert_eq!(1, summary.pruned_items);
         assert_eq!(2, client_count);
         assert_eq!(1, qbit_a_count);
+    }
+
+    #[tokio::test]
+    async fn client_inventory_items_materialize_scanned_batches() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let client_host = ClientHost::new("qbit.local").unwrap();
+        let inventory = ClientInventoryItem {
+            client_host: client_host.clone(),
+            info_hash: InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            display_name: DisplayName::new("Example").unwrap(),
+            media_type: MediaType::Movie,
+            save_path: PathBuf::from("/downloads"),
+            files: vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("Example/file.mkv"),
+                    ByteSize::new(42),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+            ],
+        };
+        let scanned = inventory.into_scanned().unwrap();
+
+        let summary = worker
+            .refresh_client_items(client_host, &[scanned])
+            .await
+            .unwrap();
+
+        let row =
+            sqlx::query("SELECT source_type, source_key, save_path, total_size FROM local_items")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let source_type: String = row.get("source_type");
+        let source_key: String = row.get("source_key");
+        let save_path: String = row.get("save_path");
+        let total_size: i64 = row.get("total_size");
+
+        assert_eq!(1, summary.persisted_items);
+        assert_eq!("client", source_type);
+        assert_eq!(
+            "qbit.local:0123456789abcdef0123456789abcdef01234567",
+            source_key
+        );
+        assert_eq!("/downloads", save_path);
+        assert_eq!(42, total_size);
     }
 
     fn write_file(path: &std::path::Path, bytes: usize) {
