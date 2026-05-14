@@ -1,14 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, UNIX_EPOCH};
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
+use reqwest::StatusCode;
+use reqwest::header::RETRY_AFTER;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{IndexersConfig, TorznabIndexerConfig};
-use crate::domain::{DependencyName, MediaType};
+use crate::domain::{
+    ByteSize, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash, ItemTitle,
+    MediaType, RemoteCandidate, TrackerName,
+};
+use crate::matching::{TorznabSearchPlan, TorznabSearchType};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConfiguredTorznabIndexer {
@@ -109,6 +116,485 @@ impl fmt::Display for IndexerConfigError {
 }
 
 impl std::error::Error for IndexerConfigError {}
+
+#[derive(Debug, Clone)]
+pub struct TorznabHttpClient {
+    client: reqwest::Client,
+    timeout: Duration,
+}
+
+impl TorznabHttpClient {
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            timeout,
+        }
+    }
+
+    pub async fn search(
+        &self,
+        endpoint: &TorznabEndpoint,
+        media_type: MediaType,
+        plan: &TorznabSearchPlan,
+        now_ms: i64,
+    ) -> Result<Vec<RemoteCandidate>, TorznabRequestError> {
+        if endpoint
+            .retry_after_ms
+            .is_some_and(|retry_after| retry_after > now_ms)
+        {
+            return Err(TorznabRequestError::Backoff {
+                retry_after_ms: endpoint.retry_after_ms,
+            });
+        }
+        if !endpoint.caps.supports_media_type(media_type) {
+            return Ok(Vec::new());
+        }
+
+        let limit = plan.limit.min(endpoint.caps.limits.max);
+        let response = self
+            .request(endpoint, |params| {
+                params.push(("t".to_owned(), plan.query.search_type.as_str().to_owned()));
+                if let Some(q) = plan.query.q.as_deref() {
+                    params.push(("q".to_owned(), q.to_owned()));
+                }
+                if let Some(season) = plan.query.season {
+                    params.push(("season".to_owned(), season.to_string()));
+                }
+                if let Some(episode) = plan.query.episode {
+                    params.push(("ep".to_owned(), episode.to_string()));
+                }
+                if let Some(imdb_id) = plan.query.ids.imdb_id.as_deref() {
+                    params.push(("imdbid".to_owned(), imdb_id.to_owned()));
+                }
+                if let Some(tvdb_id) = plan.query.ids.tvdb_id.as_deref() {
+                    params.push(("tvdbid".to_owned(), tvdb_id.to_owned()));
+                }
+                if let Some(tmdb_id) = plan.query.ids.tmdb_id.as_deref() {
+                    params.push(("tmdbid".to_owned(), tmdb_id.to_owned()));
+                }
+                params.push(("limit".to_owned(), limit.to_string()));
+            })
+            .await?;
+
+        parse_torznab_rss(&response, endpoint)
+    }
+
+    pub async fn rss(
+        &self,
+        endpoint: &TorznabEndpoint,
+        options: RssPageOptions<'_>,
+        now_ms: i64,
+    ) -> Result<RssPageResult, TorznabRequestError> {
+        if endpoint
+            .retry_after_ms
+            .is_some_and(|retry_after| retry_after > now_ms)
+        {
+            return Err(TorznabRequestError::Backoff {
+                retry_after_ms: endpoint.retry_after_ms,
+            });
+        }
+
+        let mut candidates = Vec::new();
+        let mut new_last_seen_guid = None;
+        for page in 0..options.max_pages {
+            let limit = options.page_size.min(endpoint.caps.limits.max);
+            let offset = u32::from(limit) * u32::from(page);
+            let response = self
+                .request(endpoint, |params| {
+                    params.push((
+                        "t".to_owned(),
+                        TorznabSearchType::Search.as_str().to_owned(),
+                    ));
+                    params.push(("limit".to_owned(), limit.to_string()));
+                    params.push(("offset".to_owned(), offset.to_string()));
+                })
+                .await?;
+            let page_candidates = parse_torznab_rss(&response, endpoint)?;
+            if page == 0 {
+                new_last_seen_guid = page_candidates
+                    .first()
+                    .map(|candidate| candidate.guid.as_str().to_owned());
+            }
+            if page_candidates.is_empty() {
+                break;
+            }
+
+            let mut should_stop = false;
+            for candidate in page_candidates {
+                if options
+                    .last_seen_guid
+                    .is_some_and(|guid| guid == candidate.guid.as_str())
+                {
+                    should_stop = true;
+                    break;
+                }
+                if options.max_age_ms.is_some_and(|max_age_ms| {
+                    candidate
+                        .published_at_ms
+                        .is_some_and(|published| now_ms.saturating_sub(published) > max_age_ms)
+                }) {
+                    should_stop = true;
+                    break;
+                }
+                candidates.push(candidate);
+                if candidates.len() >= usize::from(options.max_candidates) {
+                    should_stop = true;
+                    break;
+                }
+            }
+            if should_stop {
+                break;
+            }
+        }
+
+        Ok(RssPageResult {
+            candidates,
+            new_last_seen_guid,
+        })
+    }
+
+    async fn request<F>(
+        &self,
+        endpoint: &TorznabEndpoint,
+        build_params: F,
+    ) -> Result<String, TorznabRequestError>
+    where
+        F: FnOnce(&mut Vec<(String, String)>),
+    {
+        let mut params = Vec::new();
+        build_params(&mut params);
+        if let Some(api_key) = endpoint.api_key.as_deref() {
+            params.push(("apikey".to_owned(), api_key.to_owned()));
+        }
+
+        let response = self
+            .client
+            .get(endpoint.url.as_str())
+            .query(&params)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(TorznabRequestError::from_reqwest)?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after_ms = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_ms);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err(TorznabRequestError::RateLimited { retry_after_ms });
+            }
+            return Err(TorznabRequestError::HttpStatus {
+                status: status.as_u16(),
+                retry_after_ms,
+            });
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(TorznabRequestError::from_reqwest)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TorznabEndpoint {
+    pub indexer_id: IndexerId,
+    pub name: DependencyName,
+    pub url: SanitizedTorznabUrl,
+    pub api_key: Option<String>,
+    pub caps: TorznabCaps,
+    pub retry_after_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RssPageOptions<'a> {
+    pub last_seen_guid: Option<&'a str>,
+    pub max_age_ms: Option<i64>,
+    pub max_pages: u16,
+    pub max_candidates: u16,
+    pub page_size: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RssPageResult {
+    pub candidates: Vec<RemoteCandidate>,
+    pub new_last_seen_guid: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TorznabRequestError {
+    Backoff {
+        retry_after_ms: Option<i64>,
+    },
+    RateLimited {
+        retry_after_ms: Option<i64>,
+    },
+    HttpStatus {
+        status: u16,
+        retry_after_ms: Option<i64>,
+    },
+    Timeout,
+    Request {
+        message: String,
+    },
+    InvalidXml {
+        message: String,
+    },
+    InvalidCandidate {
+        message: String,
+    },
+}
+
+impl TorznabRequestError {
+    fn from_reqwest(error: reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else {
+            Self::Request {
+                message: error.to_string(),
+            }
+        }
+    }
+}
+
+impl fmt::Display for TorznabRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backoff { .. } => formatter.write_str("indexer is in backoff"),
+            Self::RateLimited { .. } => formatter.write_str("indexer returned a rate limit"),
+            Self::HttpStatus { status, .. } => {
+                write!(formatter, "indexer returned HTTP status {status}")
+            }
+            Self::Timeout => formatter.write_str("indexer request timed out"),
+            Self::Request { message } => write!(formatter, "indexer request failed: {message}"),
+            Self::InvalidXml { message } => write!(formatter, "invalid Torznab RSS: {message}"),
+            Self::InvalidCandidate { message } => {
+                write!(formatter, "invalid Torznab candidate: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TorznabRequestError {}
+
+pub fn parse_torznab_rss(
+    xml: &str,
+    endpoint: &TorznabEndpoint,
+) -> Result<Vec<RemoteCandidate>, TorznabRequestError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut candidates = Vec::new();
+    let mut saw_rss = false;
+    let mut item = None;
+    let mut text_field = None;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element)) => {
+                if element.name() == QName(b"rss") {
+                    saw_rss = true;
+                } else if element.name() == QName(b"item") {
+                    item = Some(RssItemBuilder::default());
+                } else if item.is_some() {
+                    text_field = rss_text_field(element.name());
+                }
+            }
+            Ok(Event::Empty(element)) => {
+                if let Some(builder) = item.as_mut() {
+                    if element.name() == QName(b"enclosure") {
+                        if let Some(url) = rss_attribute_value(&reader, &element, b"url")? {
+                            builder.enclosure_url = Some(url);
+                        }
+                        if let Some(length) = rss_attribute_value(&reader, &element, b"length")? {
+                            builder.size = length.parse().ok();
+                        }
+                    } else if element.name() == QName(b"torznab:attr")
+                        || element.name() == QName(b"attr")
+                    {
+                        let name = rss_attribute_value(&reader, &element, b"name")?
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        let value = rss_attribute_value(&reader, &element, b"value")?;
+                        builder.apply_torznab_attr(&name, value.as_deref());
+                    }
+                }
+            }
+            Ok(Event::Text(text)) => {
+                if let (Some(builder), Some(field)) = (item.as_mut(), text_field) {
+                    let value = reader
+                        .decoder()
+                        .decode(text.as_ref())
+                        .map_err(|error| TorznabRequestError::InvalidXml {
+                            message: error.to_string(),
+                        })?
+                        .into_owned();
+                    builder.apply_text(field, value);
+                }
+            }
+            Ok(Event::End(element)) => {
+                if element.name() == QName(b"item") {
+                    let Some(builder) = item.take() else {
+                        return Err(TorznabRequestError::InvalidXml {
+                            message: "item end without item start".to_owned(),
+                        });
+                    };
+                    candidates.push(builder.into_candidate(endpoint)?);
+                }
+                text_field = None;
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => {
+                return Err(TorznabRequestError::InvalidXml {
+                    message: error.to_string(),
+                });
+            }
+        }
+        buffer.clear();
+    }
+
+    if !saw_rss {
+        return Err(TorznabRequestError::InvalidXml {
+            message: "missing rss root".to_owned(),
+        });
+    }
+
+    Ok(candidates)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RssTextField {
+    Title,
+    Guid,
+    Link,
+    PubDate,
+    Size,
+}
+
+#[derive(Debug, Default)]
+struct RssItemBuilder {
+    title: Option<String>,
+    guid: Option<String>,
+    link: Option<String>,
+    enclosure_url: Option<String>,
+    size: Option<u64>,
+    published_at_ms: Option<i64>,
+    info_hash: Option<String>,
+}
+
+impl RssItemBuilder {
+    fn apply_text(&mut self, field: RssTextField, value: String) {
+        match field {
+            RssTextField::Title => self.title = Some(value),
+            RssTextField::Guid => self.guid = Some(value),
+            RssTextField::Link => self.link = Some(value),
+            RssTextField::PubDate => self.published_at_ms = parse_http_date_ms(&value),
+            RssTextField::Size => self.size = value.parse().ok(),
+        }
+    }
+
+    fn apply_torznab_attr(&mut self, name: &str, value: Option<&str>) {
+        match (name, value) {
+            ("size", Some(value)) => self.size = value.parse().ok(),
+            ("infohash", Some(value)) => self.info_hash = Some(value.to_owned()),
+            ("magneturl", Some(value)) if self.link.is_none() => self.link = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+
+    fn into_candidate(
+        self,
+        endpoint: &TorznabEndpoint,
+    ) -> Result<RemoteCandidate, TorznabRequestError> {
+        let guid = self.guid.or_else(|| self.link.clone()).ok_or_else(|| {
+            TorznabRequestError::InvalidCandidate {
+                message: "candidate missing guid".to_owned(),
+            }
+        })?;
+        let download_url = self.link.or(self.enclosure_url).ok_or_else(|| {
+            TorznabRequestError::InvalidCandidate {
+                message: "candidate missing download URL".to_owned(),
+            }
+        })?;
+        let title = self
+            .title
+            .ok_or_else(|| TorznabRequestError::InvalidCandidate {
+                message: "candidate missing title".to_owned(),
+            })?;
+
+        Ok(RemoteCandidate {
+            id: None,
+            indexer_id: endpoint.indexer_id,
+            guid: CandidateGuid::new(guid).map_err(candidate_error)?,
+            download_url: DownloadUrl::new(download_url).map_err(candidate_error)?,
+            title: ItemTitle::new(title).map_err(candidate_error)?,
+            tracker: TrackerName::new(endpoint.name.as_str().to_owned())
+                .map_err(candidate_error)?,
+            size: self.size.map(ByteSize::new),
+            published_at_ms: self.published_at_ms,
+            info_hash: self.info_hash.and_then(|value| InfoHash::new(value).ok()),
+            torrent_cache_path: None,
+        })
+    }
+}
+
+fn rss_text_field(name: QName<'_>) -> Option<RssTextField> {
+    match name.as_ref() {
+        b"title" => Some(RssTextField::Title),
+        b"guid" => Some(RssTextField::Guid),
+        b"link" => Some(RssTextField::Link),
+        b"pubDate" => Some(RssTextField::PubDate),
+        b"size" => Some(RssTextField::Size),
+        _ => None,
+    }
+}
+
+fn rss_attribute_value(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    key: &[u8],
+) -> Result<Option<String>, TorznabRequestError> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| TorznabRequestError::InvalidXml {
+            message: error.to_string(),
+        })?;
+        if attribute.key == QName(key) {
+            let value = attribute
+                .decode_and_unescape_value(reader.decoder())
+                .map_err(|error| TorznabRequestError::InvalidXml {
+                    message: error.to_string(),
+                })?;
+            return Ok(Some(value.into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn candidate_error(error: impl std::error::Error) -> TorznabRequestError {
+    TorznabRequestError::InvalidCandidate {
+        message: error.to_string(),
+    }
+}
+
+fn parse_retry_after_ms(value: &str) -> Option<i64> {
+    value
+        .parse::<i64>()
+        .ok()
+        .map(|seconds| seconds.saturating_mul(1_000))
+        .or_else(|| parse_http_date_ms(value))
+}
+
+fn parse_http_date_ms(value: &str) -> Option<i64> {
+    let duration = httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?;
+    i64::try_from(duration.as_millis()).ok()
+}
 
 fn configured_torznab_indexer(
     name: &str,
@@ -449,7 +935,13 @@ fn attribute_value(
 mod tests {
     use super::*;
     use crate::config::{IndexerTimeoutsConfig, IndexersConfig};
+    use crate::matching::{SearchIds, TorznabSearchPlan, TorznabSearchQuery};
     use crate::secrets::ApiKey;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as AxumStatusCode};
+    use axum::routing::get;
+    use tokio::net::TcpListener;
 
     #[test]
     fn registry_sanitizes_urls_and_tracks_secret_sources() {
@@ -526,6 +1018,137 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn search_client_sends_query_and_parses_rss_candidates() {
+        let endpoint = test_endpoint(
+            spawn_torznab_server(|request| async move {
+                let query = request.uri().query().unwrap_or_default();
+                if !query.contains("t=tvsearch")
+                    || !query.contains("tvdbid=42")
+                    || !query.contains("apikey=secret")
+                    || !query.contains("limit=50")
+                {
+                    return (AxumStatusCode::BAD_REQUEST, "bad query".to_owned());
+                }
+                (
+                    AxumStatusCode::OK,
+                    search_rss("candidate-1", "Example S01E01"),
+                )
+            })
+            .await,
+        );
+        let client = TorznabHttpClient::new(Duration::from_secs(5));
+        let plan = TorznabSearchPlan {
+            query: TorznabSearchQuery {
+                search_type: TorznabSearchType::TvSearch,
+                q: None,
+                season: Some(1),
+                episode: Some(1),
+                ids: SearchIds {
+                    tvdb_id: Some("42".to_owned()),
+                    ..SearchIds::default()
+                },
+            },
+            limit: 200,
+        };
+
+        let candidates = client
+            .search(&endpoint, MediaType::Episode, &plan, 1_700_000_000_000)
+            .await
+            .unwrap();
+
+        assert_eq!(1, candidates.len());
+        assert_eq!("candidate-1", candidates[0].guid.as_str());
+        assert_eq!("Example S01E01", candidates[0].title.as_str());
+        assert_eq!(Some(ByteSize::new(1234)), candidates[0].size);
+        assert_eq!(
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            candidates[0].info_hash.as_ref().map(InfoHash::as_str)
+        );
+    }
+
+    #[tokio::test]
+    async fn search_client_maps_rate_limits_and_malformed_rss() {
+        let rate_limited = test_endpoint(
+            spawn_torznab_server(|_request| async move {
+                (AxumStatusCode::TOO_MANY_REQUESTS, "limited".to_owned())
+            })
+            .await,
+        );
+        let malformed = test_endpoint(
+            spawn_torznab_server(
+                |_request| async move { (AxumStatusCode::OK, "not rss".to_owned()) },
+            )
+            .await,
+        );
+        let client = TorznabHttpClient::new(Duration::from_secs(5));
+        let plan = generic_plan();
+
+        let limited = client
+            .search(&rate_limited, MediaType::Movie, &plan, 1_700_000_000_000)
+            .await
+            .unwrap_err();
+        let invalid = client
+            .search(&malformed, MediaType::Movie, &plan, 1_700_000_000_000)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(limited, TorznabRequestError::RateLimited { .. }));
+        assert!(matches!(invalid, TorznabRequestError::InvalidXml { .. }));
+    }
+
+    #[tokio::test]
+    async fn rss_client_stops_on_seen_guid_and_candidate_limit() {
+        let endpoint = test_endpoint(
+            spawn_torznab_server(|request| async move {
+                let query = request.uri().query().unwrap_or_default();
+                if query.contains("offset=0") {
+                    (
+                        AxumStatusCode::OK,
+                        rss_items(&["newest", "seen", "ignored"]),
+                    )
+                } else {
+                    (AxumStatusCode::OK, rss_items(&["later"]))
+                }
+            })
+            .await,
+        );
+        let client = TorznabHttpClient::new(Duration::from_secs(5));
+
+        let seen = client
+            .rss(
+                &endpoint,
+                RssPageOptions {
+                    last_seen_guid: Some("seen"),
+                    max_age_ms: None,
+                    max_pages: 5,
+                    max_candidates: 10,
+                    page_size: 50,
+                },
+                1_700_000_000_000,
+            )
+            .await
+            .unwrap();
+        let limited = client
+            .rss(
+                &endpoint,
+                RssPageOptions {
+                    last_seen_guid: None,
+                    max_age_ms: None,
+                    max_pages: 5,
+                    max_candidates: 1,
+                    page_size: 50,
+                },
+                1_700_000_000_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(Some("newest".to_owned()), seen.new_last_seen_guid);
+        assert_eq!(vec!["newest"], candidate_guids(&seen.candidates));
+        assert_eq!(vec!["newest"], candidate_guids(&limited.candidates));
+    }
+
     #[test]
     fn caps_parser_extracts_search_categories_and_limits() {
         let caps = parse_torznab_caps(
@@ -588,5 +1211,111 @@ mod tests {
         let error = parse_torznab_caps("<caps><").unwrap_err();
 
         assert!(matches!(error, TorznabCapsError::InvalidXml { .. }));
+    }
+
+    async fn spawn_torznab_server<F, Fut>(handler: F) -> String
+    where
+        F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: std::future::Future<Output = (AxumStatusCode, String)> + Send + 'static,
+    {
+        let app = Router::new().route("/api", get(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    fn test_endpoint(url: String) -> TorznabEndpoint {
+        TorznabEndpoint {
+            indexer_id: IndexerId::new(1).unwrap(),
+            name: DependencyName::new("main").unwrap(),
+            url: SanitizedTorznabUrl::new(url).unwrap(),
+            api_key: Some("secret".to_owned()),
+            caps: test_caps(),
+            retry_after_ms: None,
+        }
+    }
+
+    fn test_caps() -> TorznabCaps {
+        TorznabCaps {
+            search: SearchCaps {
+                generic_search: true,
+                tv_search: true,
+                movie_search: true,
+                supported_id_params: ["tvdbid".to_owned()].into_iter().collect(),
+                ..SearchCaps::default()
+            },
+            categories: CategoryCaps {
+                tv: true,
+                movie: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits {
+                default: 50,
+                max: 50,
+            },
+        }
+    }
+
+    fn generic_plan() -> TorznabSearchPlan {
+        TorznabSearchPlan {
+            query: TorznabSearchQuery {
+                search_type: TorznabSearchType::Search,
+                q: Some("Example".to_owned()),
+                season: None,
+                episode: None,
+                ids: SearchIds::default(),
+            },
+            limit: 50,
+        }
+    }
+
+    fn search_rss(guid: &str, title: &str) -> String {
+        format!(
+            r#"
+            <rss>
+              <channel>
+                <item>
+                  <title>{title}</title>
+                  <guid>{guid}</guid>
+                  <link>https://indexer.example/download/{guid}</link>
+                  <pubDate>Thu, 01 Jan 1970 00:00:01 GMT</pubDate>
+                  <torznab:attr name="size" value="1234"/>
+                  <torznab:attr name="infohash" value="0123456789abcdef0123456789abcdef01234567"/>
+                </item>
+              </channel>
+            </rss>
+            "#
+        )
+    }
+
+    fn rss_items(guids: &[&str]) -> String {
+        let mut items = String::new();
+        for guid in guids {
+            items.push_str(&search_item(guid));
+        }
+        format!("<rss><channel>{items}</channel></rss>")
+    }
+
+    fn search_item(guid: &str) -> String {
+        format!(
+            r#"
+            <item>
+              <title>{guid}</title>
+              <guid>{guid}</guid>
+              <link>https://indexer.example/download/{guid}</link>
+              <pubDate>Thu, 01 Jan 1970 00:00:01 GMT</pubDate>
+            </item>
+            "#
+        )
+    }
+
+    fn candidate_guids(candidates: &[RemoteCandidate]) -> Vec<&str> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.guid.as_str())
+            .collect()
     }
 }
