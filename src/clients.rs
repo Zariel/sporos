@@ -5,6 +5,7 @@ use crate::domain::{ClientHost, DisplayName, TorrentClientKind};
 use crate::errors::TorrentClientError;
 use tracing::debug_span;
 
+pub mod qbittorrent;
 pub mod rtorrent;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
