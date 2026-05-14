@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -7,15 +8,17 @@ use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
 use reqwest::StatusCode;
-use reqwest::header::RETRY_AFTER;
+use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{IndexersConfig, TorznabIndexerConfig};
 use crate::domain::{
     ByteSize, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash, ItemTitle,
-    MediaType, RemoteCandidate, TrackerName,
+    MediaType, RemoteCandidate, TorrentMetafile, TrackerName,
 };
 use crate::matching::{TorznabSearchPlan, TorznabSearchType};
+use crate::persistence::torrent_cache::cached_torrent_path;
+use crate::torrent::parse_metafile;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConfiguredTorznabIndexer {
@@ -380,6 +383,182 @@ impl fmt::Display for TorznabRequestError {
 
 impl std::error::Error for TorznabRequestError {}
 
+#[derive(Debug, Clone)]
+pub struct CandidateDownloadClient {
+    client: reqwest::Client,
+    timeout: Duration,
+}
+
+impl CandidateDownloadClient {
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            timeout,
+        }
+    }
+
+    pub async fn download_and_cache(
+        &self,
+        candidate: &RemoteCandidate,
+        cache_dir: &Path,
+        cookie: Option<&str>,
+    ) -> Result<CachedCandidateTorrent, CandidateDownloadError> {
+        if candidate.download_url.as_str().starts_with("magnet:") {
+            return Err(CandidateDownloadError::MagnetLink);
+        }
+
+        let mut request = self
+            .client
+            .get(candidate.download_url.as_str())
+            .header(USER_AGENT, concat!("Sporos/", env!("CARGO_PKG_VERSION")))
+            .timeout(self.timeout);
+        if let Some(cookie) = cookie {
+            request = request.header(COOKIE, cookie);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(CandidateDownloadError::from_reqwest)?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after_ms = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_ms);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err(CandidateDownloadError::RateLimited { retry_after_ms });
+            }
+            return Err(CandidateDownloadError::HttpStatus {
+                status: status.as_u16(),
+                retry_after_ms,
+            });
+        }
+        if response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|content_type| content_type.contains("application/rss+xml"))
+        {
+            return Err(CandidateDownloadError::InvalidContents {
+                message: "download returned RSS XML".to_owned(),
+            });
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(CandidateDownloadError::from_reqwest)?;
+        let parsed =
+            parse_metafile(&bytes).map_err(|error| CandidateDownloadError::InvalidContents {
+                message: error.to_string(),
+            })?;
+        let cache_path = cached_torrent_path(cache_dir, &parsed.metafile.info_hash);
+        write_cached_torrent(&cache_path, &bytes)?;
+
+        let mut updated_candidate = candidate.clone();
+        updated_candidate.info_hash = Some(parsed.metafile.info_hash.clone());
+        updated_candidate.torrent_cache_path = Some(cache_path.clone());
+
+        Ok(CachedCandidateTorrent {
+            candidate: updated_candidate,
+            metafile: parsed.metafile,
+            tracker_hosts: parsed.tracker_hosts,
+            cache_path,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CachedCandidateTorrent {
+    pub candidate: RemoteCandidate,
+    pub metafile: TorrentMetafile,
+    pub tracker_hosts: Vec<TrackerName>,
+    pub cache_path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CandidateDownloadPolicy {
+    pub max_failures: u16,
+}
+
+impl Default for CandidateDownloadPolicy {
+    fn default() -> Self {
+        Self { max_failures: 3 }
+    }
+}
+
+impl CandidateDownloadPolicy {
+    pub const fn should_attempt(self, prior_failures: u16) -> bool {
+        prior_failures < self.max_failures
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CandidateDownloadError {
+    RateLimited {
+        retry_after_ms: Option<i64>,
+    },
+    HttpStatus {
+        status: u16,
+        retry_after_ms: Option<i64>,
+    },
+    MagnetLink,
+    Timeout,
+    Request {
+        message: String,
+    },
+    InvalidContents {
+        message: String,
+    },
+    CacheWrite {
+        path: std::path::PathBuf,
+        message: String,
+    },
+}
+
+impl CandidateDownloadError {
+    fn from_reqwest(error: reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else {
+            Self::Request {
+                message: error.to_string(),
+            }
+        }
+    }
+}
+
+impl fmt::Display for CandidateDownloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RateLimited { .. } => formatter.write_str("candidate download was rate limited"),
+            Self::HttpStatus { status, .. } => {
+                write!(
+                    formatter,
+                    "candidate download returned HTTP status {status}"
+                )
+            }
+            Self::MagnetLink => formatter.write_str("candidate download is a magnet link"),
+            Self::Timeout => formatter.write_str("candidate download timed out"),
+            Self::Request { message } => write!(formatter, "candidate download failed: {message}"),
+            Self::InvalidContents { message } => {
+                write!(formatter, "invalid candidate torrent contents: {message}")
+            }
+            Self::CacheWrite { path, message } => {
+                write!(
+                    formatter,
+                    "write cached torrent {}: {message}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CandidateDownloadError {}
+
 pub fn parse_torznab_rss(
     xml: &str,
     endpoint: &TorznabEndpoint,
@@ -594,6 +773,29 @@ fn parse_http_date_ms(value: &str) -> Option<i64> {
         .duration_since(UNIX_EPOCH)
         .ok()?;
     i64::try_from(duration.as_millis()).ok()
+}
+
+fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownloadError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CandidateDownloadError::CacheWrite {
+            path: path.to_path_buf(),
+            message: "cache path has no parent directory".to_owned(),
+        })?;
+    fs::create_dir_all(parent).map_err(|error| CandidateDownloadError::CacheWrite {
+        path: parent.to_path_buf(),
+        message: error.to_string(),
+    })?;
+
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, bytes).map_err(|error| CandidateDownloadError::CacheWrite {
+        path: temporary.clone(),
+        message: error.to_string(),
+    })?;
+    fs::rename(&temporary, path).map_err(|error| CandidateDownloadError::CacheWrite {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })
 }
 
 fn configured_torznab_indexer(
@@ -1149,6 +1351,110 @@ mod tests {
         assert_eq!(vec!["newest"], candidate_guids(&limited.candidates));
     }
 
+    #[tokio::test]
+    async fn candidate_download_caches_valid_torrents_atomically() {
+        let url = spawn_torznab_server(|request| async move {
+            let cookie = request
+                .headers()
+                .get(COOKIE)
+                .and_then(|value| value.to_str().ok());
+            let agent = request
+                .headers()
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if cookie != Some("sid=secret") || !agent.starts_with("Sporos/") {
+                return (AxumStatusCode::BAD_REQUEST, "bad headers".to_owned());
+            }
+            (
+                AxumStatusCode::OK,
+                String::from_utf8(test_torrent_bytes()).unwrap(),
+            )
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-cache");
+        let candidate = test_candidate(&url);
+        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+
+        let cached = client
+            .download_and_cache(&candidate, &cache_dir, Some("sid=secret"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cached.metafile.info_hash,
+            cached.candidate.info_hash.clone().unwrap()
+        );
+        assert_eq!(
+            Some(cached.cache_path.clone()),
+            cached.candidate.torrent_cache_path
+        );
+        assert_eq!(test_torrent_bytes(), fs::read(&cached.cache_path).unwrap());
+
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_maps_terminal_and_retryable_failures() {
+        let rate_limited = test_candidate(
+            &spawn_torznab_server(|_request| async move {
+                (AxumStatusCode::TOO_MANY_REQUESTS, "limited".to_owned())
+            })
+            .await,
+        );
+        let invalid = test_candidate(
+            &spawn_torznab_server(|_request| async move {
+                (AxumStatusCode::OK, "not bencode".to_owned())
+            })
+            .await,
+        );
+        let rss = test_candidate(
+            &spawn_torznab_server(|_request| async move {
+                (
+                    AxumStatusCode::OK,
+                    "<rss><channel></channel></rss>".to_owned(),
+                )
+            })
+            .await,
+        );
+        let magnet = test_candidate("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567");
+        let cache_dir = unique_temp_dir("candidate-failures");
+        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+
+        assert!(matches!(
+            client
+                .download_and_cache(&rate_limited, &cache_dir, None)
+                .await
+                .unwrap_err(),
+            CandidateDownloadError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            client
+                .download_and_cache(&invalid, &cache_dir, None)
+                .await
+                .unwrap_err(),
+            CandidateDownloadError::InvalidContents { .. }
+        ));
+        assert!(matches!(
+            client
+                .download_and_cache(&rss, &cache_dir, None)
+                .await
+                .unwrap_err(),
+            CandidateDownloadError::InvalidContents { .. }
+        ));
+        assert!(matches!(
+            client
+                .download_and_cache(&magnet, &cache_dir, None)
+                .await
+                .unwrap_err(),
+            CandidateDownloadError::MagnetLink
+        ));
+        assert!(CandidateDownloadPolicy::default().should_attempt(2));
+        assert!(!CandidateDownloadPolicy::default().should_attempt(3));
+
+        remove_temp_dir(&cache_dir);
+    }
+
     #[test]
     fn caps_parser_extracts_search_categories_and_limits() {
         let caps = parse_torznab_caps(
@@ -1317,5 +1623,40 @@ mod tests {
             .iter()
             .map(|candidate| candidate.guid.as_str())
             .collect()
+    }
+
+    fn test_candidate(url: &str) -> RemoteCandidate {
+        RemoteCandidate {
+            id: None,
+            indexer_id: IndexerId::new(1).unwrap(),
+            guid: CandidateGuid::new(format!("guid-{url}")).unwrap(),
+            download_url: DownloadUrl::new(url).unwrap(),
+            title: ItemTitle::new("Example").unwrap(),
+            tracker: TrackerName::new("main").unwrap(),
+            size: None,
+            published_at_ms: None,
+            info_hash: None,
+            torrent_cache_path: None,
+        }
+    }
+
+    fn test_torrent_bytes() -> Vec<u8> {
+        b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi4eee".to_vec()
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("sporos-{label}-{unique}"))
+    }
+
+    fn remove_temp_dir(path: &Path) {
+        match fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove temp dir {}: {error}", path.display()),
+        }
     }
 }
