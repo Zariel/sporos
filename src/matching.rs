@@ -273,7 +273,7 @@ pub fn evaluate_search_cadence(
 ) -> SearchCadenceDecision {
     let compatible_indexers = indexers
         .iter()
-        .filter(|indexer| indexer.enabled && indexer.caps.supports_media_type(item.media_type));
+        .filter(|indexer| indexer.enabled && cadence_can_search(item, indexer.caps));
 
     let mut earliest_first = None;
     let mut earliest_last = None;
@@ -334,6 +334,11 @@ pub fn evaluate_search_cadence(
     }
 
     SearchCadenceDecision::Searchable(SearchCadenceSearchReason::CadenceDue)
+}
+
+fn cadence_can_search(item: &LocalItem, caps: &TorznabCaps) -> bool {
+    caps.supports_media_type(item.media_type)
+        && plan_torznab_search(item, &SearchIds::default(), caps).is_some()
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -1035,6 +1040,28 @@ mod tests {
     fn cadence_skips_without_enabled_compatible_indexers() {
         let item = search_item("Example Movie", MediaType::Movie);
         let caps = no_movie_caps();
+        let indexers = vec![cadence_indexer(1, true, &caps)];
+
+        let decision =
+            evaluate_search_cadence(&item, &indexers, &[], 1_000, SearchCadenceConfig::default());
+
+        assert_eq!(
+            SearchCadenceDecision::Skipped(SearchCadenceSkipReason::NoCompatibleIndexers),
+            decision
+        );
+    }
+
+    #[test]
+    fn cadence_skips_indexers_without_searchable_caps() {
+        let item = search_item("Example Movie", MediaType::Movie);
+        let caps = TorznabCaps {
+            search: SearchCaps::default(),
+            categories: CategoryCaps {
+                movie: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits::default(),
+        };
         let indexers = vec![cadence_indexer(1, true, &caps)];
 
         let decision =

@@ -1040,7 +1040,8 @@ impl Repository {
             )
             VALUES (?, ?, ?, ?)
             ON CONFLICT (local_item_id, indexer_id) DO UPDATE SET
-                last_searched_at = excluded.last_searched_at
+                first_searched_at = MIN(search_history.first_searched_at, excluded.first_searched_at),
+                last_searched_at = MAX(search_history.last_searched_at, excluded.last_searched_at)
             "#,
         )
         .bind(i64_from_u64(local_item_id.get(), "local item id")?)
@@ -2674,6 +2675,10 @@ mod tests {
             .await
             .unwrap();
         repository
+            .record_search_history(item_id, indexer_id, 150, false)
+            .await
+            .unwrap();
+        repository
             .record_search_history(item_id, indexer_id, 400, true)
             .await
             .unwrap();
@@ -2687,7 +2692,7 @@ mod tests {
             vec![SearchHistoryRow {
                 local_item_id: item_id,
                 indexer_id,
-                first_searched_at_ms: 200,
+                first_searched_at_ms: 150,
                 last_searched_at_ms: 300,
             }],
             history

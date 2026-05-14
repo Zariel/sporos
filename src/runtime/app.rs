@@ -183,6 +183,7 @@ fn workflow_queues(queue_config: RuntimeQueueConfig) -> (WorkflowQueues, Workflo
 mod tests {
     use super::*;
     use crate::config::TorznabIndexerConfig;
+    use crate::secrets::ApiKey;
 
     #[tokio::test]
     async fn runtime_composes_services_from_config_and_repository() {
@@ -190,8 +191,8 @@ mod tests {
         config.indexers.torznab.insert(
             "main".to_owned(),
             TorznabIndexerConfig {
-                url: "https://indexer.example/api?apikey=secret".to_owned(),
-                api_key: None,
+                url: "https://indexer.example/api".to_owned(),
+                api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
                 api_key_env: None,
             },
@@ -207,7 +208,7 @@ mod tests {
         assert_eq!(1, indexers.len());
         assert_eq!("main", indexers[0].name.as_str());
         assert_eq!("https://indexer.example/api", indexers[0].url);
-        assert_eq!("url_query", indexers[0].api_key_source);
+        assert_eq!("direct", indexers[0].api_key_source);
         assert_eq!(0, runtime.state.queues.workflow.announcements.stats().depth);
         assert_eq!(0, runtime.state.queues.scheduler.stats().depth);
         assert_eq!(0, runtime.state.queues.inventory_refresh.stats().depth);

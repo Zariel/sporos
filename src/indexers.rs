@@ -5,7 +5,8 @@ use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use quick_xml::Reader;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::escape::{resolve_predefined_entity, unescape};
+use quick_xml::events::{BytesCData, BytesRef, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
@@ -97,6 +98,21 @@ impl ApiKeySource {
             Self::Env(name) => format!("env:{name}"),
             Self::UrlQuery => "url_query".to_owned(),
             Self::Missing => "missing".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RetryAfter {
+    DelayMs(i64),
+    DeadlineMs(i64),
+}
+
+impl RetryAfter {
+    pub fn deadline_ms(self, now_ms: i64) -> i64 {
+        match self {
+            Self::DelayMs(delay_ms) => now_ms.saturating_add(delay_ms.max(0)),
+            Self::DeadlineMs(deadline_ms) => deadline_ms.max(now_ms),
         }
     }
 }
@@ -280,17 +296,17 @@ impl TorznabHttpClient {
             .map_err(TorznabRequestError::from_reqwest)?;
         let status = response.status();
         if !status.is_success() {
-            let retry_after_ms = response
+            let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
-                .and_then(parse_retry_after_ms);
+                .and_then(parse_retry_after);
             if status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(TorznabRequestError::RateLimited { retry_after_ms });
+                return Err(TorznabRequestError::RateLimited { retry_after });
             }
             return Err(TorznabRequestError::HttpStatus {
                 status: status.as_u16(),
-                retry_after_ms,
+                retry_after,
             });
         }
 
@@ -333,11 +349,11 @@ pub enum TorznabRequestError {
         retry_after_ms: Option<i64>,
     },
     RateLimited {
-        retry_after_ms: Option<i64>,
+        retry_after: Option<RetryAfter>,
     },
     HttpStatus {
         status: u16,
-        retry_after_ms: Option<i64>,
+        retry_after: Option<RetryAfter>,
     },
     Timeout,
     Request {
@@ -422,17 +438,17 @@ impl CandidateDownloadClient {
             .map_err(CandidateDownloadError::from_reqwest)?;
         let status = response.status();
         if !status.is_success() {
-            let retry_after_ms = response
+            let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
-                .and_then(parse_retry_after_ms);
+                .and_then(parse_retry_after);
             if status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(CandidateDownloadError::RateLimited { retry_after_ms });
+                return Err(CandidateDownloadError::RateLimited { retry_after });
             }
             return Err(CandidateDownloadError::HttpStatus {
                 status: status.as_u16(),
-                retry_after_ms,
+                retry_after,
             });
         }
         if response
@@ -519,14 +535,10 @@ impl IndexerBackoffPolicy {
         self,
         now_ms: i64,
         consecutive_failures: u16,
-        retry_after_ms: Option<i64>,
+        retry_after: Option<RetryAfter>,
     ) -> i64 {
-        if let Some(retry_after_ms) = retry_after_ms {
-            return if retry_after_ms > now_ms {
-                retry_after_ms
-            } else {
-                now_ms.saturating_add(retry_after_ms)
-            };
+        if let Some(retry_after) = retry_after {
+            return retry_after.deadline_ms(now_ms);
         }
 
         now_ms.saturating_add(self.exponential_delay_ms(consecutive_failures))
@@ -537,8 +549,12 @@ impl IndexerBackoffPolicy {
         now_ms: i64,
         retry_after_ms: Option<i64>,
         last_probe_ms: Option<i64>,
+        explicit_retry_after: bool,
     ) -> bool {
         if retry_after_ms.is_some_and(|retry_after| retry_after > now_ms) {
+            if explicit_retry_after {
+                return false;
+            }
             return last_probe_ms.is_none_or(|last_probe| {
                 now_ms.saturating_sub(last_probe) >= self.recovery_probe_interval_ms
             });
@@ -562,11 +578,11 @@ impl IndexerBackoffPolicy {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CandidateDownloadError {
     RateLimited {
-        retry_after_ms: Option<i64>,
+        retry_after: Option<RetryAfter>,
     },
     HttpStatus {
         status: u16,
-        retry_after_ms: Option<i64>,
+        retry_after: Option<RetryAfter>,
     },
     MagnetLink,
     Timeout,
@@ -668,14 +684,20 @@ pub fn parse_torznab_rss(
             }
             Ok(Event::Text(text)) => {
                 if let (Some(builder), Some(field)) = (item.as_mut(), text_field) {
-                    let value = reader
-                        .decoder()
-                        .decode(text.as_ref())
-                        .map_err(|error| TorznabRequestError::InvalidXml {
-                            message: error.to_string(),
-                        })?
-                        .into_owned();
-                    builder.apply_text(field, value);
+                    let value = rss_text_value(&text)?;
+                    builder.append_text(field, value);
+                }
+            }
+            Ok(Event::CData(cdata)) => {
+                if let (Some(builder), Some(field)) = (item.as_mut(), text_field) {
+                    let value = rss_cdata_value(&cdata)?;
+                    builder.append_text(field, value);
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if let (Some(builder), Some(field)) = (item.as_mut(), text_field) {
+                    let value = rss_reference_value(&reference)?;
+                    builder.append_text(field, value);
                 }
             }
             Ok(Event::End(element)) => {
@@ -725,18 +747,29 @@ struct RssItemBuilder {
     link: Option<String>,
     enclosure_url: Option<String>,
     size: Option<u64>,
+    size_text: Option<String>,
     published_at_ms: Option<i64>,
+    pub_date_text: Option<String>,
     info_hash: Option<String>,
 }
 
 impl RssItemBuilder {
-    fn apply_text(&mut self, field: RssTextField, value: String) {
+    fn append_text(&mut self, field: RssTextField, value: String) {
         match field {
-            RssTextField::Title => self.title = Some(value),
-            RssTextField::Guid => self.guid = Some(value),
-            RssTextField::Link => self.link = Some(value),
-            RssTextField::PubDate => self.published_at_ms = parse_http_date_ms(&value),
-            RssTextField::Size => self.size = value.parse().ok(),
+            RssTextField::Title => append_text(&mut self.title, value),
+            RssTextField::Guid => append_text(&mut self.guid, value),
+            RssTextField::Link => append_text(&mut self.link, value),
+            RssTextField::PubDate => {
+                append_text(&mut self.pub_date_text, value);
+                self.published_at_ms = self.pub_date_text.as_deref().and_then(parse_http_date_ms);
+            }
+            RssTextField::Size => {
+                append_text(&mut self.size_text, value);
+                self.size = self
+                    .size_text
+                    .as_deref()
+                    .and_then(|value| value.parse().ok());
+            }
         }
     }
 
@@ -785,6 +818,14 @@ impl RssItemBuilder {
     }
 }
 
+fn append_text(target: &mut Option<String>, value: String) {
+    if let Some(existing) = target {
+        existing.push_str(&value);
+    } else {
+        *target = Some(value);
+    }
+}
+
 fn rss_text_field(name: QName<'_>) -> Option<RssTextField> {
     match name.as_ref() {
         b"title" => Some(RssTextField::Title),
@@ -817,18 +858,61 @@ fn rss_attribute_value(
     Ok(None)
 }
 
+fn rss_text_value(text: &BytesText<'_>) -> Result<String, TorznabRequestError> {
+    let decoded = text
+        .xml10_content()
+        .map_err(|error| TorznabRequestError::InvalidXml {
+            message: error.to_string(),
+        })?;
+    let value = unescape(&decoded).map_err(|error| TorznabRequestError::InvalidXml {
+        message: error.to_string(),
+    })?;
+    Ok(value.into_owned())
+}
+
+fn rss_cdata_value(cdata: &BytesCData<'_>) -> Result<String, TorznabRequestError> {
+    cdata
+        .xml10_content()
+        .map(|value| value.into_owned())
+        .map_err(|error| TorznabRequestError::InvalidXml {
+            message: error.to_string(),
+        })
+}
+
+fn rss_reference_value(reference: &BytesRef<'_>) -> Result<String, TorznabRequestError> {
+    if let Some(character) =
+        reference
+            .resolve_char_ref()
+            .map_err(|error| TorznabRequestError::InvalidXml {
+                message: error.to_string(),
+            })?
+    {
+        return Ok(character.to_string());
+    }
+    let name = reference
+        .decode()
+        .map_err(|error| TorznabRequestError::InvalidXml {
+            message: error.to_string(),
+        })?;
+    resolve_predefined_entity(&name)
+        .map(str::to_owned)
+        .ok_or_else(|| TorznabRequestError::InvalidXml {
+            message: format!("unknown XML entity `{name}`"),
+        })
+}
+
 fn candidate_error(error: impl std::error::Error) -> TorznabRequestError {
     TorznabRequestError::InvalidCandidate {
         message: error.to_string(),
     }
 }
 
-fn parse_retry_after_ms(value: &str) -> Option<i64> {
+fn parse_retry_after(value: &str) -> Option<RetryAfter> {
     value
         .parse::<i64>()
         .ok()
-        .map(|seconds| seconds.saturating_mul(1_000))
-        .or_else(|| parse_http_date_ms(value))
+        .map(|seconds| RetryAfter::DelayMs(seconds.saturating_mul(1_000)))
+        .or_else(|| parse_http_date_ms(value).map(RetryAfter::DeadlineMs))
 }
 
 fn parse_http_date_ms(value: &str) -> Option<i64> {
@@ -866,6 +950,12 @@ fn configured_torznab_indexer(
     name: &str,
     config: &TorznabIndexerConfig,
 ) -> Result<ConfiguredTorznabIndexer, IndexerConfigError> {
+    if url_has_apikey_query(&config.url) {
+        return Err(IndexerConfigError::InvalidUrl {
+            message: "URL query apikey is not supported; use api_key, api_key_file, or api_key_env"
+                .to_owned(),
+        });
+    }
     let name =
         DependencyName::new(name.to_owned()).map_err(|error| IndexerConfigError::InvalidName {
             message: error.to_string(),
@@ -885,8 +975,6 @@ fn api_key_source(config: &TorznabIndexerConfig) -> ApiKeySource {
         ApiKeySource::File(display_path(path))
     } else if let Some(name) = &config.api_key_env {
         ApiKeySource::Env(name.clone())
-    } else if url_has_apikey_query(&config.url) {
-        ApiKeySource::UrlQuery
     } else {
         ApiKeySource::Missing
     }
@@ -1206,6 +1294,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode as AxumStatusCode};
+    use axum::response::IntoResponse;
     use axum::routing::get;
     use tokio::net::TcpListener;
 
@@ -1215,10 +1304,10 @@ mod tests {
         torznab.insert(
             "main".to_owned(),
             TorznabIndexerConfig {
-                url: "https://indexer.example//Case/api?apikey=secret&t=caps#fragment".to_owned(),
+                url: "https://indexer.example//Case/api?t=caps#fragment".to_owned(),
                 api_key: None,
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env: Some("MAIN_INDEXER_KEY".to_owned()),
             },
         );
         torznab.insert(
@@ -1244,8 +1333,33 @@ mod tests {
             .find(|indexer| indexer.name.as_str() == "main")
             .unwrap();
         assert_eq!("https://indexer.example//Case/api", main.url.as_str());
-        assert_eq!(ApiKeySource::UrlQuery, main.api_key_source);
+        assert_eq!(
+            ApiKeySource::Env("MAIN_INDEXER_KEY".to_owned()),
+            main.api_key_source
+        );
         assert!(!format!("{registry:?}").contains("secret"));
+    }
+
+    #[test]
+    fn registry_rejects_url_query_api_keys() {
+        let mut torznab = BTreeMap::new();
+        torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: "https://indexer.example/api?apikey=secret".to_owned(),
+                api_key: None,
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let config = IndexersConfig {
+            default_timeouts: IndexerTimeoutsConfig::default(),
+            torznab,
+        };
+
+        let error = TorznabRegistry::from_config(&config).unwrap_err();
+
+        assert!(matches!(error, IndexerConfigError::InvalidUrl { .. }));
     }
 
     #[test]
@@ -1255,7 +1369,7 @@ mod tests {
             torznab.insert(
                 name.to_owned(),
                 TorznabIndexerConfig {
-                    url: "https://indexer.example/api?apikey=secret".to_owned(),
+                    url: "https://indexer.example/api?t=caps".to_owned(),
                     api_key: None,
                     api_key_file: None,
                     api_key_env: None,
@@ -1415,6 +1529,33 @@ mod tests {
         assert_eq!(vec!["newest"], candidate_guids(&limited.candidates));
     }
 
+    #[test]
+    fn rss_parser_unescapes_text_and_accepts_cdata() {
+        let endpoint = test_endpoint("https://indexer.example/api".to_owned());
+        let candidates = parse_torznab_rss(
+            r#"
+            <rss>
+              <channel>
+                <item>
+                  <title><![CDATA[Example & Friends]]></title>
+                  <guid>candidate-1</guid>
+                  <link>https://indexer.example/download?id=1&amp;passkey=secret</link>
+                </item>
+              </channel>
+            </rss>
+            "#,
+            &endpoint,
+        )
+        .unwrap();
+
+        assert_eq!("candidate-1", candidates[0].guid.as_str());
+        assert_eq!("Example & Friends", candidates[0].title.as_str());
+        assert_eq!(
+            "https://indexer.example/download?id=1&passkey=secret",
+            candidates[0].download_url.as_str()
+        );
+    }
+
     #[tokio::test]
     async fn candidate_download_caches_valid_torrents_atomically() {
         let url = spawn_torznab_server(|request| async move {
@@ -1476,6 +1617,7 @@ mod tests {
             &spawn_torznab_server(|_request| async move {
                 (
                     AxumStatusCode::OK,
+                    [("content-type", "application/rss+xml")],
                     "<rss><channel></channel></rss>".to_owned(),
                 )
             })
@@ -1528,12 +1670,32 @@ mod tests {
             recovery_probe_interval_ms: 500,
         };
 
-        assert_eq!(1_500, policy.retry_after_deadline(1_000, 3, Some(500)));
-        assert_eq!(6_000, policy.retry_after_deadline(1_000, 3, Some(6_000)));
+        assert_eq!(
+            1_500,
+            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DelayMs(500)))
+        );
+        assert_eq!(
+            6_000,
+            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DeadlineMs(6_000)))
+        );
+        assert_eq!(
+            1_000,
+            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DeadlineMs(500)))
+        );
         assert_eq!(9_000 + 91, policy.retry_after_deadline(1_000, 3, None));
-        assert!(!policy.should_probe(1_100, Some(2_000), Some(800)));
-        assert!(policy.should_probe(1_400, Some(2_000), Some(800)));
-        assert!(policy.should_probe(2_100, Some(2_000), Some(2_000)));
+        assert!(!policy.should_probe(1_100, Some(2_000), Some(800), false));
+        assert!(policy.should_probe(1_400, Some(2_000), Some(800), false));
+        assert!(!policy.should_probe(1_400, Some(2_000), Some(800), true));
+        assert!(policy.should_probe(2_100, Some(2_000), Some(2_000), true));
+    }
+
+    #[test]
+    fn retry_after_parser_preserves_header_semantics() {
+        assert_eq!(Some(RetryAfter::DelayMs(5_000)), parse_retry_after("5"));
+        assert_eq!(
+            Some(RetryAfter::DeadlineMs(5_000)),
+            parse_retry_after("Thu, 01 Jan 1970 00:00:05 GMT")
+        );
     }
 
     #[test]
@@ -1600,10 +1762,11 @@ mod tests {
         assert!(matches!(error, TorznabCapsError::InvalidXml { .. }));
     }
 
-    async fn spawn_torznab_server<F, Fut>(handler: F) -> String
+    async fn spawn_torznab_server<F, Fut, R>(handler: F) -> String
     where
         F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
-        Fut: std::future::Future<Output = (AxumStatusCode, String)> + Send + 'static,
+        Fut: std::future::Future<Output = R> + Send + 'static,
+        R: IntoResponse + Send + 'static,
     {
         let app = Router::new().route("/api", get(handler));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
