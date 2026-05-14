@@ -7,6 +7,7 @@ description = "Torrent automation service"
 license = "MIT"
 
 [dependencies]
+base64 = "0.22.1"
 bendy = { version = "0.6.1", default-features = true }
 axum = { version = "0.8.7", default-features = false, features = ["json", "tokio", "http1"] }
 clap = { version = "4.6.1", default-features = true, features = ["derive"] }

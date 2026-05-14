@@ -1,0 +1,897 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use quick_xml::Reader;
+use quick_xml::escape::{escape, resolve_predefined_entity, unescape};
+use quick_xml::events::{BytesCData, BytesRef, BytesText, Event};
+use quick_xml::name::QName;
+use reqwest::StatusCode;
+use reqwest::header::CONTENT_TYPE;
+
+use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
+use crate::errors::TorrentClientError;
+
+const RTORRENT_LABEL: &str = "sporos";
+const INVENTORY_METHODS: &[&str] = &[
+    "d.name",
+    "d.directory",
+    "d.left_bytes",
+    "d.hashing",
+    "d.complete",
+    "d.is_multi_file",
+    "d.is_active",
+    "d.custom1",
+];
+
+#[derive(Debug, Clone)]
+pub struct RtorrentClient {
+    client_name: String,
+    endpoint: String,
+    timeout: Duration,
+    client: reqwest::Client,
+}
+
+impl RtorrentClient {
+    pub fn new(
+        client_name: impl Into<String>,
+        endpoint: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            client_name: client_name.into(),
+            endpoint: endpoint.into(),
+            timeout,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub async fn validate(&self) -> Result<(), TorrentClientError> {
+        self.call("download_list", Vec::new()).await.map(|_| ())
+    }
+
+    pub async fn list_inventory(&self) -> Result<Vec<RtorrentDownload>, TorrentClientError> {
+        let hashes = self.download_hashes().await?;
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let response = self
+            .call("system.multicall", vec![inventory_multicall_param(&hashes)])
+            .await?;
+        parse_inventory_response(&self.client_name, &hashes, &response)
+    }
+
+    pub async fn fetch_files(
+        &self,
+        info_hash: &InfoHash,
+    ) -> Result<Vec<TorrentFile>, TorrentClientError> {
+        let response = self
+            .call(
+                "f.multicall",
+                vec![
+                    XmlRpcValue::String(info_hash.as_str().to_owned()),
+                    XmlRpcValue::String(String::new()),
+                    XmlRpcValue::String("f.path=".to_owned()),
+                    XmlRpcValue::String("f.size_bytes=".to_owned()),
+                ],
+            )
+            .await?;
+        parse_files_response(&self.client_name, &response)
+    }
+
+    pub async fn fetch_trackers(
+        &self,
+        info_hash: &InfoHash,
+    ) -> Result<Vec<RtorrentTracker>, TorrentClientError> {
+        let response = self
+            .call(
+                "t.multicall",
+                vec![
+                    XmlRpcValue::String(info_hash.as_str().to_owned()),
+                    XmlRpcValue::String(String::new()),
+                    XmlRpcValue::String("t.url=".to_owned()),
+                    XmlRpcValue::String("t.group=".to_owned()),
+                ],
+            )
+            .await?;
+        parse_trackers_response(&self.client_name, &response)
+    }
+
+    pub async fn inject(
+        &self,
+        torrent_bytes: &[u8],
+        start: bool,
+    ) -> Result<(), TorrentClientError> {
+        let method = if start { "load.raw_start" } else { "load.raw" };
+        self.call(method, injection_params(torrent_bytes))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn set_label(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
+        self.call(
+            "d.custom1.set",
+            vec![
+                XmlRpcValue::String(info_hash.as_str().to_owned()),
+                XmlRpcValue::String(RTORRENT_LABEL.to_owned()),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn recheck(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
+        self.call(
+            "d.check_hash",
+            vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn resume(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
+        self.call(
+            "d.resume",
+            vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn pause(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
+        self.call(
+            "d.pause",
+            vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn download_hashes(&self) -> Result<Vec<InfoHash>, TorrentClientError> {
+        let response = self.call("download_list", Vec::new()).await?;
+        let values = response.as_array(&self.client_name, "download_list result")?;
+        values
+            .iter()
+            .map(|value| {
+                InfoHash::new(value.as_string(&self.client_name, "download hash")?).map_err(
+                    |error| TorrentClientError::BadResponse {
+                        client: self.client_name.clone(),
+                        message: error.to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    async fn call(
+        &self,
+        method: &str,
+        params: Vec<XmlRpcValue>,
+    ) -> Result<XmlRpcValue, TorrentClientError> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .timeout(self.timeout)
+            .header(CONTENT_TYPE, "text/xml")
+            .body(build_method_call(method, &params))
+            .send()
+            .await
+            .map_err(|error| unavailable(&self.client_name, error.to_string()))?;
+
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(TorrentClientError::Unauthorized {
+                client: self.client_name.clone(),
+            });
+        }
+        if !response.status().is_success() {
+            return Err(unavailable(
+                &self.client_name,
+                format!("HTTP {}", response.status()),
+            ));
+        }
+
+        let body = response
+            .text()
+            .await
+            .map_err(|error| unavailable(&self.client_name, error.to_string()))?;
+        parse_method_response(&self.client_name, &body)
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RtorrentDownload {
+    pub info_hash: InfoHash,
+    pub name: DisplayName,
+    pub directory: PathBuf,
+    pub left_bytes: ByteSize,
+    pub hashing: bool,
+    pub complete: bool,
+    pub is_multi_file: bool,
+    pub is_active: bool,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RtorrentTracker {
+    pub url: String,
+    pub group: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum XmlRpcValue {
+    String(String),
+    Int(i64),
+    Bool(bool),
+    Base64(Vec<u8>),
+    Array(Vec<XmlRpcValue>),
+    Struct(BTreeMap<String, XmlRpcValue>),
+    Nil,
+}
+
+impl XmlRpcValue {
+    fn as_array<'a>(
+        &'a self,
+        client: &str,
+        field: &str,
+    ) -> Result<&'a [XmlRpcValue], TorrentClientError> {
+        match self {
+            Self::Array(values) => Ok(values),
+            _ => Err(bad_response(client, format!("{field} is not an array"))),
+        }
+    }
+
+    fn as_string<'a>(&'a self, client: &str, field: &str) -> Result<&'a str, TorrentClientError> {
+        match self {
+            Self::String(value) => Ok(value),
+            _ => Err(bad_response(client, format!("{field} is not a string"))),
+        }
+    }
+
+    fn as_i64(&self, client: &str, field: &str) -> Result<i64, TorrentClientError> {
+        match self {
+            Self::Int(value) => Ok(*value),
+            Self::Bool(value) => Ok(i64::from(*value)),
+            _ => Err(bad_response(client, format!("{field} is not an integer"))),
+        }
+    }
+
+    fn as_bool(&self, client: &str, field: &str) -> Result<bool, TorrentClientError> {
+        Ok(self.as_i64(client, field)? != 0)
+    }
+}
+
+pub fn build_method_call(method: &str, params: &[XmlRpcValue]) -> String {
+    let mut xml = String::from(r#"<?xml version="1.0"?><methodCall><methodName>"#);
+    xml.push_str(&escape(method));
+    xml.push_str("</methodName><params>");
+    for param in params {
+        xml.push_str("<param>");
+        push_value(&mut xml, param);
+        xml.push_str("</param>");
+    }
+    xml.push_str("</params></methodCall>");
+    xml
+}
+
+pub fn build_inventory_multicall(hashes: &[InfoHash]) -> String {
+    build_method_call("system.multicall", &[inventory_multicall_param(hashes)])
+}
+
+pub fn build_injection_call(torrent_bytes: &[u8], start: bool) -> String {
+    let method = if start { "load.raw_start" } else { "load.raw" };
+    build_method_call(method, &injection_params(torrent_bytes))
+}
+
+pub fn parse_method_response(client: &str, xml: &str) -> Result<XmlRpcValue, TorrentClientError> {
+    let mut reader = Reader::from_str(xml);
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) if start.name() == QName(b"value") => {
+                return parse_value(&mut reader);
+            }
+            Ok(Event::Start(start)) if start.name() == QName(b"fault") => {
+                let fault = parse_fault(&mut reader)?;
+                return Err(fault_error(client, &fault));
+            }
+            Ok(Event::Eof) => return Err(bad_response(client, "missing XML-RPC value")),
+            Ok(_) => {}
+            Err(error) => return Err(bad_response(client, error.to_string())),
+        }
+    }
+}
+
+pub fn parse_inventory_response(
+    client: &str,
+    hashes: &[InfoHash],
+    response: &XmlRpcValue,
+) -> Result<Vec<RtorrentDownload>, TorrentClientError> {
+    let values = response.as_array(client, "system.multicall result")?;
+    let expected = hashes.len().saturating_mul(INVENTORY_METHODS.len());
+    if values.len() != expected {
+        return Err(bad_response(
+            client,
+            format!("expected {expected} inventory values, got {}", values.len()),
+        ));
+    }
+
+    let mut downloads = Vec::with_capacity(hashes.len());
+    for (hash_index, info_hash) in hashes.iter().enumerate() {
+        let offset = hash_index.saturating_mul(INVENTORY_METHODS.len());
+        let fields = multicall_fields(client, values, offset, INVENTORY_METHODS.len())?;
+        downloads.push(RtorrentDownload {
+            info_hash: info_hash.clone(),
+            name: DisplayName::new(fields[0].as_string(client, "d.name")?)
+                .map_err(|error| bad_response(client, error.to_string()))?,
+            directory: PathBuf::from(fields[1].as_string(client, "d.directory")?),
+            left_bytes: ByteSize::new(nonnegative_u64(
+                client,
+                fields[2].as_i64(client, "d.left_bytes")?,
+            )?),
+            hashing: fields[3].as_bool(client, "d.hashing")?,
+            complete: fields[4].as_bool(client, "d.complete")?,
+            is_multi_file: fields[5].as_bool(client, "d.is_multi_file")?,
+            is_active: fields[6].as_bool(client, "d.is_active")?,
+            label: nonempty_string(fields[7].as_string(client, "d.custom1")?),
+        });
+    }
+    Ok(downloads)
+}
+
+pub fn parse_files_response(
+    client: &str,
+    response: &XmlRpcValue,
+) -> Result<Vec<TorrentFile>, TorrentClientError> {
+    let rows = response.as_array(client, "f.multicall result")?;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let fields = row.as_array(client, "f.multicall row")?;
+            if fields.len() < 2 {
+                return Err(bad_response(
+                    client,
+                    "f.multicall row has fewer than two fields",
+                ));
+            }
+            TorrentFile::new(
+                PathBuf::from(fields[0].as_string(client, "f.path")?),
+                ByteSize::new(nonnegative_u64(
+                    client,
+                    fields[1].as_i64(client, "f.size_bytes")?,
+                )?),
+                FileIndex::new(
+                    u32::try_from(index)
+                        .map_err(|error| bad_response(client, error.to_string()))?,
+                ),
+            )
+            .map_err(|error| bad_response(client, error.to_string()))
+        })
+        .collect()
+}
+
+pub fn parse_trackers_response(
+    client: &str,
+    response: &XmlRpcValue,
+) -> Result<Vec<RtorrentTracker>, TorrentClientError> {
+    let rows = response.as_array(client, "t.multicall result")?;
+    rows.iter()
+        .map(|row| {
+            let fields = row.as_array(client, "t.multicall row")?;
+            if fields.len() < 2 {
+                return Err(bad_response(
+                    client,
+                    "t.multicall row has fewer than two fields",
+                ));
+            }
+            Ok(RtorrentTracker {
+                url: fields[0].as_string(client, "t.url")?.to_owned(),
+                group: fields[1].as_string(client, "t.group")?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn inventory_multicall_param(hashes: &[InfoHash]) -> XmlRpcValue {
+    XmlRpcValue::Array(
+        hashes
+            .iter()
+            .flat_map(|hash| {
+                INVENTORY_METHODS.iter().map(|method| {
+                    let mut call = BTreeMap::new();
+                    call.insert(
+                        "methodName".to_owned(),
+                        XmlRpcValue::String((*method).to_owned()),
+                    );
+                    call.insert(
+                        "params".to_owned(),
+                        XmlRpcValue::Array(vec![XmlRpcValue::String(hash.as_str().to_owned())]),
+                    );
+                    XmlRpcValue::Struct(call)
+                })
+            })
+            .collect(),
+    )
+}
+
+fn injection_params(torrent_bytes: &[u8]) -> Vec<XmlRpcValue> {
+    vec![
+        XmlRpcValue::Base64(torrent_bytes.to_vec()),
+        XmlRpcValue::String(format!("d.custom1.set={RTORRENT_LABEL}")),
+    ]
+}
+
+fn push_value(xml: &mut String, value: &XmlRpcValue) {
+    xml.push_str("<value>");
+    match value {
+        XmlRpcValue::String(value) => {
+            xml.push_str("<string>");
+            xml.push_str(&escape(value));
+            xml.push_str("</string>");
+        }
+        XmlRpcValue::Int(value) => {
+            xml.push_str("<i8>");
+            xml.push_str(&value.to_string());
+            xml.push_str("</i8>");
+        }
+        XmlRpcValue::Bool(value) => {
+            xml.push_str("<boolean>");
+            xml.push_str(if *value { "1" } else { "0" });
+            xml.push_str("</boolean>");
+        }
+        XmlRpcValue::Base64(value) => {
+            xml.push_str("<base64>");
+            xml.push_str(&BASE64.encode(value));
+            xml.push_str("</base64>");
+        }
+        XmlRpcValue::Array(values) => {
+            xml.push_str("<array><data>");
+            for value in values {
+                push_value(xml, value);
+            }
+            xml.push_str("</data></array>");
+        }
+        XmlRpcValue::Struct(fields) => {
+            xml.push_str("<struct>");
+            for (name, value) in fields {
+                xml.push_str("<member><name>");
+                xml.push_str(&escape(name));
+                xml.push_str("</name>");
+                push_value(xml, value);
+                xml.push_str("</member>");
+            }
+            xml.push_str("</struct>");
+        }
+        XmlRpcValue::Nil => xml.push_str("<nil/>"),
+    }
+    xml.push_str("</value>");
+}
+
+fn parse_fault(reader: &mut Reader<&[u8]>) -> Result<XmlRpcValue, TorrentClientError> {
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) if start.name() == QName(b"value") => {
+                return parse_value(reader);
+            }
+            Ok(Event::End(end)) if end.name() == QName(b"fault") => {
+                return Ok(XmlRpcValue::String("unknown XML-RPC fault".to_owned()));
+            }
+            Ok(Event::Eof) => return Err(bad_response("rtorrent", "unterminated XML-RPC fault")),
+            Ok(_) => {}
+            Err(error) => return Err(bad_response("rtorrent", error.to_string())),
+        }
+    }
+}
+
+fn parse_value(reader: &mut Reader<&[u8]>) -> Result<XmlRpcValue, TorrentClientError> {
+    let mut text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) if start.name() == QName(b"string") => {
+                return Ok(XmlRpcValue::String(read_text_until(
+                    reader,
+                    QName(b"string"),
+                )?));
+            }
+            Ok(Event::Start(start)) if matches!(start.name().as_ref(), b"int" | b"i4" | b"i8") => {
+                let end = start.name();
+                let value = read_text_until(reader, end)?;
+                return value
+                    .parse::<i64>()
+                    .map(XmlRpcValue::Int)
+                    .map_err(|error| bad_response("rtorrent", error.to_string()));
+            }
+            Ok(Event::Start(start)) if start.name() == QName(b"boolean") => {
+                let value = read_text_until(reader, QName(b"boolean"))?;
+                return match value.as_str() {
+                    "0" => Ok(XmlRpcValue::Bool(false)),
+                    "1" => Ok(XmlRpcValue::Bool(true)),
+                    _ => Err(bad_response(
+                        "rtorrent",
+                        format!("invalid boolean `{value}`"),
+                    )),
+                };
+            }
+            Ok(Event::Start(start)) if start.name() == QName(b"base64") => {
+                let value = read_text_until(reader, QName(b"base64"))?;
+                return BASE64
+                    .decode(value.trim())
+                    .map(XmlRpcValue::Base64)
+                    .map_err(|error| bad_response("rtorrent", error.to_string()));
+            }
+            Ok(Event::Start(start)) if start.name() == QName(b"array") => {
+                return parse_array(reader);
+            }
+            Ok(Event::Start(start)) if start.name() == QName(b"struct") => {
+                return parse_struct(reader);
+            }
+            Ok(Event::Empty(start)) if start.name() == QName(b"nil") => {
+                return Ok(XmlRpcValue::Nil);
+            }
+            Ok(Event::Text(value)) => text.push_str(&xml_text_value(&value)?),
+            Ok(Event::CData(value)) => text.push_str(&xml_cdata_value(&value)?),
+            Ok(Event::GeneralRef(value)) => text.push_str(&xml_reference_value(&value)?),
+            Ok(Event::End(end)) if end.name() == QName(b"value") => {
+                return Ok(XmlRpcValue::String(text));
+            }
+            Ok(Event::Eof) => return Err(bad_response("rtorrent", "unterminated XML-RPC value")),
+            Ok(_) => {}
+            Err(error) => return Err(bad_response("rtorrent", error.to_string())),
+        }
+    }
+}
+
+fn parse_array(reader: &mut Reader<&[u8]>) -> Result<XmlRpcValue, TorrentClientError> {
+    let mut values = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) if start.name() == QName(b"value") => {
+                values.push(parse_value(reader)?);
+            }
+            Ok(Event::End(end)) if end.name() == QName(b"array") => {
+                return Ok(XmlRpcValue::Array(values));
+            }
+            Ok(Event::Eof) => return Err(bad_response("rtorrent", "unterminated XML-RPC array")),
+            Ok(_) => {}
+            Err(error) => return Err(bad_response("rtorrent", error.to_string())),
+        }
+    }
+}
+
+fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlRpcValue, TorrentClientError> {
+    let mut fields = BTreeMap::new();
+    let mut name = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) if start.name() == QName(b"name") => {
+                name = Some(read_text_until(reader, QName(b"name"))?);
+            }
+            Ok(Event::Start(start)) if start.name() == QName(b"value") => {
+                let field = name
+                    .take()
+                    .ok_or_else(|| bad_response("rtorrent", "XML-RPC struct value without name"))?;
+                fields.insert(field, parse_value(reader)?);
+            }
+            Ok(Event::End(end)) if end.name() == QName(b"struct") => {
+                return Ok(XmlRpcValue::Struct(fields));
+            }
+            Ok(Event::Eof) => return Err(bad_response("rtorrent", "unterminated XML-RPC struct")),
+            Ok(_) => {}
+            Err(error) => return Err(bad_response("rtorrent", error.to_string())),
+        }
+    }
+}
+
+fn read_text_until(
+    reader: &mut Reader<&[u8]>,
+    end: QName<'_>,
+) -> Result<String, TorrentClientError> {
+    let mut value = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Text(text)) => value.push_str(&xml_text_value(&text)?),
+            Ok(Event::CData(cdata)) => value.push_str(&xml_cdata_value(&cdata)?),
+            Ok(Event::GeneralRef(reference)) => value.push_str(&xml_reference_value(&reference)?),
+            Ok(Event::End(name)) if name.name() == end => return Ok(value),
+            Ok(Event::Eof) => return Err(bad_response("rtorrent", "unterminated XML-RPC text")),
+            Ok(_) => {}
+            Err(error) => return Err(bad_response("rtorrent", error.to_string())),
+        }
+    }
+}
+
+fn xml_text_value(text: &BytesText<'_>) -> Result<String, TorrentClientError> {
+    let decoded = text
+        .xml10_content()
+        .map_err(|error| bad_response("rtorrent", error.to_string()))?;
+    let value = unescape(&decoded).map_err(|error| bad_response("rtorrent", error.to_string()))?;
+    Ok(value.into_owned())
+}
+
+fn xml_cdata_value(cdata: &BytesCData<'_>) -> Result<String, TorrentClientError> {
+    cdata
+        .xml10_content()
+        .map(|value| value.into_owned())
+        .map_err(|error| bad_response("rtorrent", error.to_string()))
+}
+
+fn xml_reference_value(reference: &BytesRef<'_>) -> Result<String, TorrentClientError> {
+    if let Some(character) = reference
+        .resolve_char_ref()
+        .map_err(|error| bad_response("rtorrent", error.to_string()))?
+    {
+        return Ok(character.to_string());
+    }
+    let name = reference
+        .decode()
+        .map_err(|error| bad_response("rtorrent", error.to_string()))?;
+    resolve_predefined_entity(&name)
+        .map(str::to_owned)
+        .ok_or_else(|| bad_response("rtorrent", format!("unknown XML entity `{name}`")))
+}
+
+fn multicall_fields<'a>(
+    client: &str,
+    values: &'a [XmlRpcValue],
+    offset: usize,
+    count: usize,
+) -> Result<Vec<&'a XmlRpcValue>, TorrentClientError> {
+    let mut fields = Vec::with_capacity(count);
+    for index in offset..offset.saturating_add(count) {
+        let row = values
+            .get(index)
+            .ok_or_else(|| bad_response(client, "missing system.multicall row"))?;
+        let row_values = row.as_array(client, "system.multicall row")?;
+        let value = row_values
+            .first()
+            .ok_or_else(|| bad_response(client, "empty system.multicall row"))?;
+        fields.push(value);
+    }
+    Ok(fields)
+}
+
+fn nonnegative_u64(client: &str, value: i64) -> Result<u64, TorrentClientError> {
+    u64::try_from(value).map_err(|error| bad_response(client, error.to_string()))
+}
+
+fn nonempty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn fault_error(client: &str, fault: &XmlRpcValue) -> TorrentClientError {
+    let message = match fault {
+        XmlRpcValue::Struct(fields) => fields
+            .get("faultString")
+            .and_then(|value| match value {
+                XmlRpcValue::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{fault:?}")),
+        _ => format!("{fault:?}"),
+    };
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("method") && (lower.contains("not found") || lower.contains("unknown")) {
+        TorrentClientError::UnsupportedCapability {
+            client: client.to_owned(),
+            capability: message,
+        }
+    } else {
+        bad_response(client, message)
+    }
+}
+
+fn unavailable(client: &str, message: String) -> TorrentClientError {
+    TorrentClientError::Unavailable {
+        client: client.to_owned(),
+        retry_after_ms: None,
+        message,
+    }
+}
+
+fn bad_response(client: &str, message: impl Into<String>) -> TorrentClientError {
+    TorrentClientError::BadResponse {
+        client: client.to_owned(),
+        message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode as AxumStatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn inventory_multicall_payload_contains_rtorrent_fields() {
+        let hash = InfoHash::new(SHA1).unwrap();
+        let xml = build_inventory_multicall(&[hash]);
+
+        assert!(xml.contains("<methodName>system.multicall</methodName>"));
+        assert!(xml.contains("<name>methodName</name><value><string>d.name</string></value>"));
+        assert!(xml.contains("<string>d.custom1</string>"));
+        assert!(xml.contains(SHA1));
+    }
+
+    #[test]
+    fn injection_payload_uses_raw_methods_and_sets_label() {
+        let stopped = build_injection_call(b"torrent", false);
+        let started = build_injection_call(b"torrent", true);
+
+        assert!(stopped.contains("<methodName>load.raw</methodName>"));
+        assert!(started.contains("<methodName>load.raw_start</methodName>"));
+        assert!(stopped.contains("<base64>dG9ycmVudA==</base64>"));
+        assert!(stopped.contains("<string>d.custom1.set=sporos</string>"));
+    }
+
+    #[test]
+    fn response_parser_decodes_xmlrpc_values_and_entities() {
+        let value = parse_method_response(
+            "rtorrent",
+            r#"
+            <methodResponse><params><param><value><array><data>
+              <value><string>Show &amp; Tell</string></value>
+              <value><i8>42</i8></value>
+              <value><boolean>1</boolean></value>
+            </data></array></value></param></params></methodResponse>
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            XmlRpcValue::Array(vec![
+                XmlRpcValue::String("Show & Tell".to_owned()),
+                XmlRpcValue::Int(42),
+                XmlRpcValue::Bool(true),
+            ]),
+            value
+        );
+    }
+
+    #[test]
+    fn inventory_response_maps_download_metadata() {
+        let hash = InfoHash::new(SHA1).unwrap();
+        let rows = XmlRpcValue::Array(vec![
+            row(XmlRpcValue::String("Example".to_owned())),
+            row(XmlRpcValue::String("/downloads".to_owned())),
+            row(XmlRpcValue::Int(0)),
+            row(XmlRpcValue::Int(0)),
+            row(XmlRpcValue::Int(1)),
+            row(XmlRpcValue::Int(1)),
+            row(XmlRpcValue::Int(0)),
+            row(XmlRpcValue::String("sporos".to_owned())),
+        ]);
+
+        let downloads = parse_inventory_response("rtorrent", &[hash.clone()], &rows).unwrap();
+
+        assert_eq!(hash, downloads[0].info_hash);
+        assert_eq!("Example", downloads[0].name.as_str());
+        assert_eq!(PathBuf::from("/downloads"), downloads[0].directory);
+        assert_eq!(0, downloads[0].left_bytes.get());
+        assert!(downloads[0].complete);
+        assert_eq!(Some("sporos".to_owned()), downloads[0].label);
+    }
+
+    #[test]
+    fn file_and_tracker_responses_map_typed_rows() {
+        let files = parse_files_response(
+            "rtorrent",
+            &XmlRpcValue::Array(vec![XmlRpcValue::Array(vec![
+                XmlRpcValue::String("Show/Episode.mkv".to_owned()),
+                XmlRpcValue::Int(123),
+            ])]),
+        )
+        .unwrap();
+        let trackers = parse_trackers_response(
+            "rtorrent",
+            &XmlRpcValue::Array(vec![XmlRpcValue::Array(vec![
+                XmlRpcValue::String("https://tracker.example/announce".to_owned()),
+                XmlRpcValue::String("tracker.example".to_owned()),
+            ])]),
+        )
+        .unwrap();
+
+        assert_eq!(PathBuf::from("Show/Episode.mkv"), files[0].relative_path);
+        assert_eq!(123, files[0].size.get());
+        assert_eq!("https://tracker.example/announce", trackers[0].url);
+        assert_eq!("tracker.example", trackers[0].group);
+    }
+
+    #[test]
+    fn xmlrpc_fault_maps_missing_methods_to_unsupported_capability() {
+        let error = parse_method_response(
+            "rtorrent",
+            r#"
+            <methodResponse><fault><value><struct>
+              <member><name>faultString</name><value><string>Method not found: d.tags</string></value></member>
+            </struct></value></fault></methodResponse>
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TorrentClientError::UnsupportedCapability { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_posts_xmlrpc_payloads_and_parses_inventory() {
+        let endpoint = spawn_rtorrent_server(|request| async move {
+            let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            if body.contains("<methodName>download_list</methodName>") {
+                return (
+                    AxumStatusCode::OK,
+                    xml_response(r#"<array><data><value><string>0123456789abcdef0123456789abcdef01234567</string></value></data></array>"#),
+                );
+            }
+            if body.contains("<methodName>system.multicall</methodName>")
+                && body.contains("d.custom1")
+            {
+                return (AxumStatusCode::OK, inventory_xml_response());
+            }
+            (AxumStatusCode::BAD_REQUEST, body)
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        let inventory = client.list_inventory().await.unwrap();
+
+        assert_eq!(1, inventory.len());
+        assert_eq!("Example", inventory[0].name.as_str());
+    }
+
+    fn row(value: XmlRpcValue) -> XmlRpcValue {
+        XmlRpcValue::Array(vec![value])
+    }
+
+    fn xml_response(value: &str) -> String {
+        format!(
+            "<methodResponse><params><param><value>{value}</value></param></params></methodResponse>"
+        )
+    }
+
+    fn inventory_xml_response() -> String {
+        xml_response(
+            r#"<array><data>
+              <value><array><data><value><string>Example</string></value></data></array></value>
+              <value><array><data><value><string>/downloads</string></value></data></array></value>
+              <value><array><data><value><i8>0</i8></value></data></array></value>
+              <value><array><data><value><i8>0</i8></value></data></array></value>
+              <value><array><data><value><i8>1</i8></value></data></array></value>
+              <value><array><data><value><i8>1</i8></value></data></array></value>
+              <value><array><data><value><i8>0</i8></value></data></array></value>
+              <value><array><data><value><string>sporos</string></value></data></array></value>
+            </data></array>"#,
+        )
+    }
+
+    async fn spawn_rtorrent_server<F, Fut, R>(handler: F) -> String
+    where
+        F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: IntoResponse + Send + 'static,
+    {
+        let app = Router::new().route("/RPC2", post(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{address}/RPC2")
+    }
+}
