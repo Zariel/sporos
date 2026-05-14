@@ -1,9 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::domain::{
-    ByteSize, LocalFile, LocalItem, LocalItemSource, TorrentFile, TorrentMetafile,
+    ByteSize, LocalFile, LocalItem, LocalItemSource, MediaType, TorrentFile, TorrentMetafile,
 };
+use crate::indexers::TorznabCaps;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FileTreeMatchMode {
@@ -61,6 +62,314 @@ pub struct FileTreeAssessment {
     pub decision: FileTreeDecision,
     pub matched_size: ByteSize,
     pub matched_ratio: f64,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct SearchIds {
+    pub imdb_id: Option<String>,
+    pub tvdb_id: Option<String>,
+    pub tmdb_id: Option<String>,
+}
+
+impl SearchIds {
+    pub fn is_empty(&self) -> bool {
+        self.imdb_id.is_none() && self.tvdb_id.is_none() && self.tmdb_id.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchPlanningItem<'a> {
+    pub item: &'a LocalItem,
+    pub ids: SearchIds,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchGroup<'a> {
+    pub cache_key: SearchCacheKey,
+    pub items: Vec<SearchPlanningItem<'a>>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SearchCacheKey {
+    value: String,
+}
+
+impl SearchCacheKey {
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TorznabSearchPlan {
+    pub query: TorznabSearchQuery,
+    pub limit: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TorznabSearchQuery {
+    pub search_type: TorznabSearchType,
+    pub q: Option<String>,
+    pub season: Option<u16>,
+    pub episode: Option<u16>,
+    pub ids: SearchIds,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TorznabSearchType {
+    Search,
+    TvSearch,
+    MovieSearch,
+}
+
+impl TorznabSearchType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::TvSearch => "tvsearch",
+            Self::MovieSearch => "movie",
+        }
+    }
+}
+
+pub fn group_search_items<'a>(items: Vec<SearchPlanningItem<'a>>) -> Vec<SearchGroup<'a>> {
+    let mut groups = BTreeMap::<SearchCacheKey, Vec<SearchPlanningItem<'a>>>::new();
+    for item in items {
+        groups
+            .entry(search_cache_key(item.item, &item.ids))
+            .or_default()
+            .push(item);
+    }
+
+    groups
+        .into_iter()
+        .map(|(cache_key, items)| SearchGroup { cache_key, items })
+        .collect()
+}
+
+pub fn search_cache_key(item: &LocalItem, ids: &SearchIds) -> SearchCacheKey {
+    let title = normalize_search_key(item.title.as_str());
+    let metadata = parsed_search_metadata(item);
+    let mut value = match (metadata.season, metadata.episode) {
+        (Some(season), Some(episode)) => format!("{title}.s{season:02}.e{episode:02}"),
+        (Some(season), None) => format!("{title}.s{season:02}"),
+        _ => title,
+    };
+    if let Some(imdb_id) = ids.imdb_id.as_deref() {
+        value.push_str("|imdb:");
+        value.push_str(&normalize_search_key(imdb_id));
+    }
+    if let Some(tvdb_id) = ids.tvdb_id.as_deref() {
+        value.push_str("|tvdb:");
+        value.push_str(&normalize_search_key(tvdb_id));
+    }
+    if let Some(tmdb_id) = ids.tmdb_id.as_deref() {
+        value.push_str("|tmdb:");
+        value.push_str(&normalize_search_key(tmdb_id));
+    }
+    SearchCacheKey { value }
+}
+
+pub fn plan_torznab_search(
+    item: &LocalItem,
+    ids: &SearchIds,
+    caps: &TorznabCaps,
+) -> Option<TorznabSearchPlan> {
+    if !caps.supports_media_type(item.media_type) {
+        return None;
+    }
+    let metadata = parsed_search_metadata(item);
+    let query = match item.media_type {
+        MediaType::Episode | MediaType::SeasonPack => tv_query(item, ids, caps, metadata),
+        MediaType::Movie => movie_query(item, ids, caps),
+        MediaType::Anime | MediaType::Video | MediaType::Audio | MediaType::Book => {
+            generic_query(item, ids, caps)
+        }
+        MediaType::Archive | MediaType::Unknown => generic_query(item, ids, caps),
+    }?;
+
+    Some(TorznabSearchPlan {
+        query,
+        limit: caps.limits.max,
+    })
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct ParsedSearchMetadata {
+    season: Option<u16>,
+    episode: Option<u16>,
+}
+
+fn tv_query(
+    item: &LocalItem,
+    ids: &SearchIds,
+    caps: &TorznabCaps,
+    metadata: ParsedSearchMetadata,
+) -> Option<TorznabSearchQuery> {
+    if caps.search.tv_search {
+        let ids = supported_ids(ids, caps, &["tvdbid", "imdbid"]);
+        return Some(TorznabSearchQuery {
+            search_type: TorznabSearchType::TvSearch,
+            q: if ids.is_empty() {
+                Some(item.title.as_str().to_owned())
+            } else {
+                None
+            },
+            season: metadata.season,
+            episode: metadata.episode,
+            ids,
+        });
+    }
+    generic_query(item, ids, caps)
+}
+
+fn movie_query(
+    item: &LocalItem,
+    ids: &SearchIds,
+    caps: &TorznabCaps,
+) -> Option<TorznabSearchQuery> {
+    if caps.search.movie_search {
+        let ids = supported_ids(ids, caps, &["imdbid", "tmdbid"]);
+        return Some(TorznabSearchQuery {
+            search_type: TorznabSearchType::MovieSearch,
+            q: if ids.is_empty() {
+                Some(item.title.as_str().to_owned())
+            } else {
+                None
+            },
+            season: None,
+            episode: None,
+            ids,
+        });
+    }
+    generic_query(item, ids, caps)
+}
+
+fn generic_query(
+    item: &LocalItem,
+    ids: &SearchIds,
+    caps: &TorznabCaps,
+) -> Option<TorznabSearchQuery> {
+    if !caps.search.generic_search {
+        return None;
+    }
+    Some(TorznabSearchQuery {
+        search_type: TorznabSearchType::Search,
+        q: Some(item.title.as_str().to_owned()),
+        season: None,
+        episode: None,
+        ids: supported_ids(ids, caps, &["imdbid", "tvdbid", "tmdbid"]),
+    })
+}
+
+fn supported_ids(ids: &SearchIds, caps: &TorznabCaps, priority: &[&str]) -> SearchIds {
+    let mut supported = SearchIds::default();
+    for key in priority {
+        if !caps.search.supported_id_params.contains(*key) {
+            continue;
+        }
+        match *key {
+            "imdbid" => supported.imdb_id = ids.imdb_id.clone(),
+            "tvdbid" => supported.tvdb_id = ids.tvdb_id.clone(),
+            "tmdbid" => supported.tmdb_id = ids.tmdb_id.clone(),
+            _ => {}
+        }
+        if !supported.is_empty() {
+            return supported;
+        }
+    }
+    supported
+}
+
+fn parsed_search_metadata(item: &LocalItem) -> ParsedSearchMetadata {
+    let title = item.title.as_str();
+    match item.media_type {
+        MediaType::Episode => parse_episode_metadata(title),
+        MediaType::SeasonPack => parse_season_metadata(title),
+        _ => ParsedSearchMetadata::default(),
+    }
+}
+
+fn parse_episode_metadata(title: &str) -> ParsedSearchMetadata {
+    let lower = title.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes.get(index) != Some(&b's') {
+            continue;
+        }
+        let season_start = index + 1;
+        let Some((season, after_season)) = parse_digits(&lower, season_start, 2) else {
+            continue;
+        };
+        if bytes.get(after_season) != Some(&b'e') {
+            continue;
+        }
+        let Some((episode, _after_episode)) = parse_digits(&lower, after_season + 1, 3) else {
+            continue;
+        };
+        return ParsedSearchMetadata {
+            season: Some(season),
+            episode: Some(episode),
+        };
+    }
+    ParsedSearchMetadata::default()
+}
+
+fn parse_season_metadata(title: &str) -> ParsedSearchMetadata {
+    let lower = title.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes.get(index) != Some(&b's') {
+            continue;
+        }
+        let Some((season, _after_season)) = parse_digits(&lower, index + 1, 2) else {
+            continue;
+        };
+        return ParsedSearchMetadata {
+            season: Some(season),
+            episode: None,
+        };
+    }
+    ParsedSearchMetadata::default()
+}
+
+fn parse_digits(value: &str, start: usize, max_len: usize) -> Option<(u16, usize)> {
+    let mut end = start;
+    for byte in value.as_bytes().iter().skip(start).take(max_len) {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    value
+        .get(start..end)?
+        .parse()
+        .ok()
+        .map(|number| (number, end))
+}
+
+fn normalize_search_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '.'
+            }
+        })
+        .fold(String::new(), |mut normalized, character| {
+            if character == '.' && normalized.ends_with('.') {
+                return normalized;
+            }
+            normalized.push(character);
+            normalized
+        })
+        .trim_matches('.')
+        .to_owned()
 }
 
 pub fn assess_file_tree(
@@ -332,7 +641,147 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::domain::{DisplayName, FileIndex, InfoHash, ItemTitle, LocalItem, SourceKey};
+    use crate::domain::{
+        DisplayName, FileIndex, InfoHash, ItemTitle, LocalItem, MediaType, SourceKey,
+    };
+    use crate::indexers::{CategoryCaps, SearchCaps, TorznabLimits};
+
+    #[test]
+    fn query_grouping_deduplicates_titles_and_keeps_distinct_ids() {
+        let movie = search_item("Example Movie 2026", MediaType::Movie);
+        let same_movie = search_item("Example.Movie.2026", MediaType::Movie);
+        let different_id_movie = search_item("Example Movie 2026", MediaType::Movie);
+
+        let groups = group_search_items(vec![
+            SearchPlanningItem {
+                item: &movie,
+                ids: SearchIds {
+                    imdb_id: Some("tt123".to_owned()),
+                    ..SearchIds::default()
+                },
+            },
+            SearchPlanningItem {
+                item: &same_movie,
+                ids: SearchIds {
+                    imdb_id: Some("tt123".to_owned()),
+                    ..SearchIds::default()
+                },
+            },
+            SearchPlanningItem {
+                item: &different_id_movie,
+                ids: SearchIds {
+                    imdb_id: Some("tt999".to_owned()),
+                    ..SearchIds::default()
+                },
+            },
+        ]);
+
+        assert_eq!(2, groups.len());
+        assert_eq!(2, groups[0].items.len());
+        assert_ne!(groups[0].cache_key, groups[1].cache_key);
+        assert!(groups[0].cache_key.as_str().contains("imdb:tt123"));
+        assert!(groups[1].cache_key.as_str().contains("imdb:tt999"));
+    }
+
+    #[test]
+    fn query_planning_covers_common_media_types_and_ids() {
+        let caps = all_caps();
+        let episode = search_item("My Show S01E02", MediaType::Episode);
+        let pack = search_item("My Show S01", MediaType::SeasonPack);
+        let movie = search_item("Example Movie 2026", MediaType::Movie);
+        let anime = search_item("Anime Show 03", MediaType::Anime);
+        let book = search_item("Great Book", MediaType::Book);
+        let video = search_item("Generic Video", MediaType::Video);
+
+        let episode_plan = plan_torznab_search(
+            &episode,
+            &SearchIds {
+                tvdb_id: Some("777".to_owned()),
+                ..SearchIds::default()
+            },
+            &caps,
+        )
+        .unwrap();
+        let pack_plan = plan_torznab_search(&pack, &SearchIds::default(), &caps).unwrap();
+        let movie_plan = plan_torznab_search(
+            &movie,
+            &SearchIds {
+                imdb_id: Some("tt123".to_owned()),
+                ..SearchIds::default()
+            },
+            &caps,
+        )
+        .unwrap();
+        let anime_plan = plan_torznab_search(&anime, &SearchIds::default(), &caps).unwrap();
+        let book_plan = plan_torznab_search(&book, &SearchIds::default(), &caps).unwrap();
+        let video_plan = plan_torznab_search(&video, &SearchIds::default(), &caps).unwrap();
+
+        assert_eq!(TorznabSearchType::TvSearch, episode_plan.query.search_type);
+        assert_eq!("tvsearch", episode_plan.query.search_type.as_str());
+        assert_eq!(Some(1), episode_plan.query.season);
+        assert_eq!(Some(2), episode_plan.query.episode);
+        assert_eq!(Some("777"), episode_plan.query.ids.tvdb_id.as_deref());
+        assert_eq!(Some(1), pack_plan.query.season);
+        assert_eq!(TorznabSearchType::MovieSearch, movie_plan.query.search_type);
+        assert_eq!(Some("tt123"), movie_plan.query.ids.imdb_id.as_deref());
+        assert_eq!(TorznabSearchType::Search, anime_plan.query.search_type);
+        assert_eq!(Some("Anime Show 03"), anime_plan.query.q.as_deref());
+        assert_eq!(TorznabSearchType::Search, book_plan.query.search_type);
+        assert_eq!(TorznabSearchType::Search, video_plan.query.search_type);
+        assert_eq!(200, episode_plan.limit);
+    }
+
+    #[test]
+    fn query_planning_respects_media_support_and_id_fallback() {
+        let movie = search_item("Example Movie 2026", MediaType::Movie);
+        let episode = search_item("My Show S01E02", MediaType::Episode);
+        let movie_only_caps = TorznabCaps {
+            search: SearchCaps {
+                generic_search: true,
+                movie_search: true,
+                supported_id_params: ["imdbid".to_owned()].into_iter().collect(),
+                ..SearchCaps::default()
+            },
+            categories: CategoryCaps {
+                movie: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits {
+                default: 50,
+                max: 50,
+            },
+        };
+        let generic_caps = TorznabCaps {
+            search: SearchCaps {
+                generic_search: true,
+                supported_id_params: ["imdbid".to_owned()].into_iter().collect(),
+                ..SearchCaps::default()
+            },
+            categories: CategoryCaps {
+                tv: true,
+                movie: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits::default(),
+        };
+
+        assert!(plan_torznab_search(&episode, &SearchIds::default(), &movie_only_caps).is_none());
+        let fallback = plan_torznab_search(
+            &movie,
+            &SearchIds {
+                imdb_id: Some("tt123".to_owned()),
+                tmdb_id: Some("999".to_owned()),
+                ..SearchIds::default()
+            },
+            &generic_caps,
+        )
+        .unwrap();
+
+        assert_eq!(TorznabSearchType::Search, fallback.query.search_type);
+        assert_eq!(Some("Example Movie 2026"), fallback.query.q.as_deref());
+        assert_eq!(Some("tt123"), fallback.query.ids.imdb_id.as_deref());
+        assert_eq!(None, fallback.query.ids.tmdb_id);
+    }
 
     #[test]
     fn exact_match_requires_paths_and_sizes_for_real_items() {
@@ -524,6 +973,50 @@ mod tests {
             save_path: None,
             total_size: ByteSize::new(10),
             mtime_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    fn search_item(title: &str, media_type: MediaType) -> LocalItem {
+        LocalItem {
+            id: None,
+            source: LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/example"),
+            },
+            title: ItemTitle::new(title).unwrap(),
+            display_name: DisplayName::new(title).unwrap(),
+            media_type,
+            info_hash: None,
+            path: Some(PathBuf::from("/media/example")),
+            save_path: None,
+            total_size: ByteSize::new(10),
+            mtime_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    fn all_caps() -> TorznabCaps {
+        TorznabCaps {
+            search: SearchCaps {
+                generic_search: true,
+                tv_search: true,
+                movie_search: true,
+                audio_search: true,
+                supported_id_params: ["imdbid".to_owned(), "tvdbid".to_owned()]
+                    .into_iter()
+                    .collect(),
+            },
+            categories: CategoryCaps {
+                movie: true,
+                tv: true,
+                anime: true,
+                xxx: false,
+                audio: true,
+                book: true,
+                additional: true,
+            },
+            limits: TorznabLimits {
+                default: 100,
+                max: 200,
+            },
         }
     }
 
