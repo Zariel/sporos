@@ -338,6 +338,34 @@ mod tests {
     }
 
     #[test]
+    fn blocklist_name_and_size_rules_use_strict_boundaries() {
+        let item = local_item("Blocked.Release", MediaType::Movie).with_size(50);
+        let files = vec![local_file("movie.mkv", 50)];
+
+        for rule in [
+            BlocklistRule::NameSubstring("blocked".to_owned()),
+            BlocklistRule::SizeBelow(ByteSize::new(50)),
+            BlocklistRule::SizeAbove(ByteSize::new(50)),
+        ] {
+            let decision = filter_content(
+                subject(
+                    &item.0,
+                    &files,
+                    ContentMetadata::default(),
+                    ContentFilterContext::Search,
+                ),
+                &ContentFilterConfig {
+                    blocklist: vec![rule],
+                    include_non_videos: true,
+                    ..ContentFilterConfig::default()
+                },
+            );
+
+            assert_eq!(ContentFilterDecision::Accepted, decision);
+        }
+    }
+
+    #[test]
     fn empty_tag_blocklist_matches_absent_tags() {
         let item = local_item("Untagged", MediaType::Movie);
         let decision = filter_content(

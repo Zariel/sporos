@@ -457,7 +457,7 @@ mod tests {
         torznab.insert(
             "main".to_owned(),
             TorznabIndexerConfig {
-                url: "https://indexer.example/api?apikey=secret&t=caps".to_owned(),
+                url: "https://indexer.example//Case/api?apikey=secret&t=caps#fragment".to_owned(),
                 api_key: None,
                 api_key_file: None,
                 api_key_env: None,
@@ -485,7 +485,7 @@ mod tests {
             .iter()
             .find(|indexer| indexer.name.as_str() == "main")
             .unwrap();
-        assert_eq!("https://indexer.example/api", main.url.as_str());
+        assert_eq!("https://indexer.example//Case/api", main.url.as_str());
         assert_eq!(ApiKeySource::UrlQuery, main.api_key_source);
         assert!(!format!("{registry:?}").contains("secret"));
     }

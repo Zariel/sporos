@@ -966,6 +966,9 @@ mod tests {
     #[test]
     fn parser_classifies_episode_and_season_precedence() {
         let episode = parse_media_title("My.Show.S01E01.1080p", &[]);
+        let multi_episode = parse_media_title("My.Show.S01E01E02.1080p", &[]);
+        let episode_with_season_text = parse_media_title("My.Show.S01E01.Season.1", &[]);
+        let short_season_pack = parse_media_title("My.Show.S01", &[]);
         let season_pack = parse_media_title("My.Show.Season.2", &[]);
         let spaced_episode = parse_media_title("My.Show.S01.02", &[]);
 
@@ -973,6 +976,12 @@ mod tests {
         assert_eq!("My Show S01E01", episode.search_title);
         assert_eq!(Some(1), episode.season);
         assert_eq!(Some(1), episode.episode);
+        assert_eq!(MediaType::Episode, multi_episode.media_type);
+        assert_eq!("My Show S01E01", multi_episode.search_title);
+        assert_eq!(MediaType::Episode, episode_with_season_text.media_type);
+        assert_eq!("My Show S01E01", episode_with_season_text.search_title);
+        assert_eq!(MediaType::SeasonPack, short_season_pack.media_type);
+        assert_eq!("My Show S01", short_season_pack.search_title);
         assert_eq!(MediaType::SeasonPack, season_pack.media_type);
         assert_eq!("My Show S02", season_pack.search_title);
         assert_eq!(MediaType::Episode, spaced_episode.media_type);
@@ -990,6 +999,10 @@ mod tests {
             "Another.Movie.[2022].WEB-DL",
             &[PathBuf::from("Another.Movie.2022.MP4")],
         );
+        let year_only = parse_media_title(
+            "Example.Show.2024.1080p",
+            &[PathBuf::from("Example.Show.2024.mkv")],
+        );
 
         assert_eq!(MediaType::Episode, dated.media_type);
         assert_eq!("Daily Show 2024-01-31", dated.search_title);
@@ -1006,6 +1019,8 @@ mod tests {
         assert_eq!(Some(2023), movie.year);
         assert_eq!(MediaType::Movie, bracketed.media_type);
         assert_eq!("Another Movie 2022", bracketed.search_title);
+        assert_eq!(MediaType::Movie, year_only.media_type);
+        assert_eq!(None, year_only.episode);
     }
 
     #[test]
@@ -1041,6 +1056,17 @@ mod tests {
             )
         );
         assert_eq!(
+            MediaType::Audio,
+            classify_media_type_from_name(
+                "Mixed.Release",
+                &[
+                    PathBuf::from("mixed.rar"),
+                    PathBuf::from("track.flac"),
+                    PathBuf::from("book.epub")
+                ]
+            )
+        );
+        assert_eq!(
             MediaType::Book,
             classify_media_type_from_name(
                 "Book.Release",
@@ -1065,7 +1091,22 @@ mod tests {
         );
         assert_eq!(
             MediaType::Video,
+            classify_media_type_from_name("Disc.Release", &[PathBuf::from("BDMV/STREAM.M2TS")])
+        );
+        assert_eq!(
+            MediaType::Video,
+            classify_media_type_from_name("Disc.Release", &[PathBuf::from("BDMV/BACKUP.BUP")])
+        );
+        assert_eq!(
+            MediaType::Video,
             classify_media_type_from_name("Concert.Release", &[PathBuf::from("VIDEO_TS/VTS.VOB")])
+        );
+        assert_eq!(
+            MediaType::Movie,
+            classify_media_type_from_name(
+                "Movie.2021",
+                &[PathBuf::from("cover.mp3"), PathBuf::from("movie.mkv")]
+            )
         );
         assert_eq!(
             MediaType::Video,

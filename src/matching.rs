@@ -1104,6 +1104,14 @@ mod tests {
         let local_files = vec![local_file("Local/a.mkv", 10, 0)];
         let size_only_candidate = torrent(vec![torrent_file("Other/a.mkv", 10, 0)], None);
         let size_mismatch_candidate = torrent(vec![torrent_file("Other/a.mkv", 20, 0)], None);
+        let candidate_with_extra_file = torrent(
+            vec![
+                torrent_file("Local/a.mkv", 10, 0),
+                torrent_file("Local/b.mkv", 10, 1),
+            ],
+            None,
+        );
+        let candidate_subset = torrent(vec![torrent_file("Local/a.mkv", 10, 0)], None);
 
         let tree_result = assess_file_tree(
             &local_item,
@@ -1117,9 +1125,29 @@ mod tests {
             &size_mismatch_candidate,
             FileTreeMatchConfig::default(),
         );
+        let extra_candidate_result = assess_file_tree(
+            &local_item,
+            &local_files,
+            &candidate_with_extra_file,
+            FileTreeMatchConfig::default(),
+        );
+        let extra_local_result = assess_file_tree(
+            &local_item,
+            &[
+                local_file("Local/a.mkv", 10, 0),
+                local_file("Local/b.mkv", 10, 1),
+            ],
+            &candidate_subset,
+            FileTreeMatchConfig::default(),
+        );
 
         assert_eq!(FileTreeDecision::FileTreeMismatch, tree_result.decision);
         assert_eq!(FileTreeDecision::SizeMismatch, size_result.decision);
+        assert_eq!(
+            FileTreeDecision::SizeMismatch,
+            extra_candidate_result.decision
+        );
+        assert_eq!(FileTreeDecision::Match, extra_local_result.decision);
     }
 
     #[test]
@@ -1193,6 +1221,46 @@ mod tests {
         assert_eq!(FileTreeDecision::MatchPartial, result.decision);
         assert_eq!(ByteSize::new(80), result.matched_size);
         assert_float_eq(0.8, result.matched_ratio);
+    }
+
+    #[test]
+    fn partial_mode_respects_fuzzy_size_boundary() {
+        let local_item = data_root_item();
+        let config = FileTreeMatchConfig {
+            mode: FileTreeMatchMode::Partial,
+            fuzzy_size_threshold: 0.2,
+            season_from_episodes: 1.0,
+        };
+        let accepted_candidate = torrent(
+            vec![
+                torrent_file("Candidate/a.mkv", 80, 0),
+                torrent_file("Candidate/b.mkv", 20, 1),
+            ],
+            Some(ByteSize::new(20)),
+        );
+        let rejected_candidate = torrent(
+            vec![
+                torrent_file("Candidate/a.mkv", 79, 0),
+                torrent_file("Candidate/b.mkv", 21, 1),
+            ],
+            Some(ByteSize::new(20)),
+        );
+
+        let accepted = assess_file_tree(
+            &local_item,
+            &[local_file("Local/a.mkv", 80, 0)],
+            &accepted_candidate,
+            config,
+        );
+        let rejected = assess_file_tree(
+            &local_item,
+            &[local_file("Local/a.mkv", 79, 0)],
+            &rejected_candidate,
+            config,
+        );
+
+        assert_eq!(FileTreeDecision::MatchPartial, accepted.decision);
+        assert_eq!(FileTreeDecision::PartialSizeMismatch, rejected.decision);
     }
 
     #[test]
