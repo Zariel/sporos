@@ -286,8 +286,39 @@ lines wrapped at 72 characters or less. Do not include literal `\n` sequences in
 commit messages.
 
 ### Release tags
-When creating a tag, include a very brief changelog in the tag annotation using
-one concise line per notable change item. Keep the annotation focused on the
-externally meaningful behavior change, not implementation details. Do not list
-docs, refactors, config renames, or internal plumbing unless they are
-themselves the notable user-facing change.
+Before creating a tag for a completed epic, first run a code review covering
+all code changed since the last tag. Use multiple subagents in parallel, with
+each subagent focused on a different risk area. Fix the review feedback that is
+accepted, run the required quality gates, and commit those fixes before creating
+the tag.
+
+Use this prompt template for each review subagent, replacing the focus area:
+
+```text
+Review the changes for completed epic <epic-id> from <last-tag> to HEAD.
+
+Focus area: <focus-area>.
+
+Inspect the git diff, relevant tests, and nearby code. Take a code-review
+stance: prioritize bugs, behavioral regressions, missing tests, performance or
+memory risks, security problems, operational risks, and release blockers. Do
+not edit files.
+
+Return findings ordered by severity. For each finding include file and line,
+the concrete risk, why it matters for this focus area, and the smallest
+reasonable fix or test. If there are no findings, say so and note any residual
+risk or coverage gap.
+```
+
+Run at least these focus areas before tagging:
+
+- Domain behavior, API contracts, and user-visible compatibility.
+- Persistence, schema/data safety, and large-inventory performance.
+- Async runtime, bounded concurrency, retry behavior, and shutdown safety.
+- Tests, observability, security/redaction, and operator/release readiness.
+
+When creating the tag after review fixes are committed, include a very brief
+changelog in the tag annotation using one concise line per notable change item.
+Keep the annotation focused on the externally meaningful behavior change, not
+implementation details. Do not list docs, refactors, config renames, or
+internal plumbing unless they are themselves the notable user-facing change.
