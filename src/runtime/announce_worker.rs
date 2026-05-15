@@ -4,9 +4,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug_span, info_span};
 
 use crate::announce::{AnnounceQueueConfig, AnnounceReason, AnnounceWorkId};
-use crate::domain::ReasonText;
-use crate::errors::DatabaseError;
+use crate::domain::{DecisionReason, InjectionOutcome, MatchDecision, ReasonText};
+use crate::errors::{ClassifyFailure, DatabaseError, FailureClass, WorkerError};
+use crate::matching::{PersistedCandidateAssessment, ReverseLookupOutcome};
 use crate::persistence::repository::{AnnounceRetryUpdate, Repository};
+use crate::runtime::injection_worker::InjectionWorkResult;
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 
 #[derive(Debug, Clone)]
@@ -65,10 +67,288 @@ pub enum AnnounceWorkOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AnnounceOutcomeConfig {
+    pub source_wait_ms: i64,
+    pub candidate_download_wait_ms: i64,
+    pub retry_delay_ms: i64,
+}
+
+impl Default for AnnounceOutcomeConfig {
+    fn default() -> Self {
+        Self {
+            source_wait_ms: 5 * 60 * 1_000,
+            candidate_download_wait_ms: 30 * 1_000,
+            retry_delay_ms: 60 * 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum AnnounceWorkflowResult {
+    Saved,
+    Injected,
+    AlreadyExists,
+    SourceIncomplete {
+        dependency: Option<(String, String)>,
+    },
+    CandidateDownloading,
+    DependencyBackoff {
+        dependency_kind: String,
+        dependency_name: String,
+        retry_after_ms: Option<i64>,
+    },
+    NoMatch,
+    RetryableDependency {
+        retry_after_ms: Option<i64>,
+        error_class: String,
+        redacted_message: String,
+    },
+    TerminalFailure {
+        reason: AnnounceReason,
+        redacted_message: String,
+    },
+    Expired,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AnnounceWorkerError {
     InvalidConfig { message: String },
     Database { source: DatabaseError },
+}
+
+pub fn classify_announce_result(
+    result: AnnounceWorkflowResult,
+    now_ms: i64,
+    config: AnnounceOutcomeConfig,
+) -> AnnounceWorkOutcome {
+    match result {
+        AnnounceWorkflowResult::Saved => AnnounceWorkOutcome::Succeeded {
+            reason: AnnounceReason::Saved,
+            outcome: "saved".to_owned(),
+        },
+        AnnounceWorkflowResult::Injected => AnnounceWorkOutcome::Succeeded {
+            reason: AnnounceReason::Injected,
+            outcome: "injected".to_owned(),
+        },
+        AnnounceWorkflowResult::AlreadyExists => AnnounceWorkOutcome::Succeeded {
+            reason: AnnounceReason::AlreadyExists,
+            outcome: "already_exists".to_owned(),
+        },
+        AnnounceWorkflowResult::SourceIncomplete { dependency } => AnnounceWorkOutcome::Waiting {
+            reason: AnnounceReason::SourceIncomplete,
+            next_attempt_at_ms: now_ms.saturating_add(config.source_wait_ms.max(1)),
+            dependency,
+        },
+        AnnounceWorkflowResult::CandidateDownloading => AnnounceWorkOutcome::Waiting {
+            reason: AnnounceReason::CandidateDownloading,
+            next_attempt_at_ms: now_ms.saturating_add(config.candidate_download_wait_ms.max(1)),
+            dependency: None,
+        },
+        AnnounceWorkflowResult::DependencyBackoff {
+            dependency_kind,
+            dependency_name,
+            retry_after_ms,
+        } => AnnounceWorkOutcome::Waiting {
+            reason: retry_after_ms.map_or(AnnounceReason::DependencyBackoff, |_| {
+                AnnounceReason::RetryAfter
+            }),
+            next_attempt_at_ms: retry_after_ms
+                .filter(|retry_after| *retry_after > now_ms)
+                .unwrap_or_else(|| now_ms.saturating_add(config.retry_delay_ms.max(1))),
+            dependency: Some((dependency_kind, dependency_name)),
+        },
+        AnnounceWorkflowResult::NoMatch => AnnounceWorkOutcome::Waiting {
+            reason: AnnounceReason::InventoryRefreshing,
+            next_attempt_at_ms: now_ms.saturating_add(config.source_wait_ms.max(1)),
+            dependency: None,
+        },
+        AnnounceWorkflowResult::RetryableDependency {
+            retry_after_ms,
+            error_class,
+            redacted_message,
+        } => AnnounceWorkOutcome::Retryable {
+            reason: retry_after_ms.map_or(AnnounceReason::TransientDependencyFailure, |_| {
+                AnnounceReason::RetryAfter
+            }),
+            next_attempt_at_ms: retry_after_ms
+                .filter(|retry_after| *retry_after > now_ms)
+                .unwrap_or_else(|| now_ms.saturating_add(config.retry_delay_ms.max(1))),
+            error_class,
+            redacted_message,
+        },
+        AnnounceWorkflowResult::TerminalFailure {
+            reason,
+            redacted_message,
+        } => AnnounceWorkOutcome::TerminalFailed {
+            reason,
+            redacted_message,
+        },
+        AnnounceWorkflowResult::Expired => AnnounceWorkOutcome::TerminalFailed {
+            reason: AnnounceReason::Expired,
+            redacted_message: "announce work expired".to_owned(),
+        },
+    }
+}
+
+pub fn classify_injection_result(
+    result: &InjectionWorkResult,
+    now_ms: i64,
+    config: AnnounceOutcomeConfig,
+) -> AnnounceWorkOutcome {
+    let workflow = match result.outcome {
+        InjectionOutcome::Injected => AnnounceWorkflowResult::Injected,
+        InjectionOutcome::Saved => AnnounceWorkflowResult::Saved,
+        InjectionOutcome::AlreadyExists => AnnounceWorkflowResult::AlreadyExists,
+        InjectionOutcome::SourceIncomplete => AnnounceWorkflowResult::SourceIncomplete {
+            dependency: result
+                .target_client
+                .as_ref()
+                .map(|name| ("client".to_owned(), name.as_str().to_owned())),
+        },
+        InjectionOutcome::Failed => AnnounceWorkflowResult::RetryableDependency {
+            retry_after_ms: None,
+            error_class: "torrent_client".to_owned(),
+            redacted_message: "torrent client injection failed".to_owned(),
+        },
+    };
+    classify_announce_result(workflow, now_ms, config)
+}
+
+pub fn classify_reverse_lookup_outcome(
+    outcome: &ReverseLookupOutcome,
+    now_ms: i64,
+    config: AnnounceOutcomeConfig,
+) -> AnnounceWorkOutcome {
+    let workflow = match outcome {
+        ReverseLookupOutcome::AlreadyPresent { .. } => AnnounceWorkflowResult::AlreadyExists,
+        ReverseLookupOutcome::NeedsTorrentDownload { .. } => {
+            AnnounceWorkflowResult::CandidateDownloading
+        }
+        ReverseLookupOutcome::NoCandidates => AnnounceWorkflowResult::NoMatch,
+        ReverseLookupOutcome::BestFailure { assessment, .. } => {
+            classify_assessment_failure(assessment)
+        }
+        ReverseLookupOutcome::Matched { assessment, .. } => classify_matched_assessment(assessment),
+    };
+    classify_announce_result(workflow, now_ms, config)
+}
+
+pub fn classify_worker_error(
+    error: &WorkerError,
+    now_ms: i64,
+    config: AnnounceOutcomeConfig,
+) -> AnnounceWorkOutcome {
+    let workflow = match error.failure_class() {
+        FailureClass::RetryableDependency => AnnounceWorkflowResult::RetryableDependency {
+            retry_after_ms: error.retry_after_ms(),
+            error_class: "retryable_dependency".to_owned(),
+            redacted_message: error.to_string(),
+        },
+        FailureClass::BadRemoteData => AnnounceWorkflowResult::TerminalFailure {
+            reason: AnnounceReason::InvalidTorrentMetadata,
+            redacted_message: error.to_string(),
+        },
+        FailureClass::UserActionRequired => AnnounceWorkflowResult::TerminalFailure {
+            reason: AnnounceReason::UnsupportedShape,
+            redacted_message: error.to_string(),
+        },
+        FailureClass::FatalLocal => AnnounceWorkflowResult::TerminalFailure {
+            reason: AnnounceReason::InvalidRequest,
+            redacted_message: error.to_string(),
+        },
+    };
+    classify_announce_result(workflow, now_ms, config)
+}
+
+fn classify_matched_assessment(
+    assessment: &PersistedCandidateAssessment,
+) -> AnnounceWorkflowResult {
+    let Some(assessment) = persisted_assessment(assessment) else {
+        return AnnounceWorkflowResult::CandidateDownloading;
+    };
+    if matches!(
+        assessment.decision,
+        MatchDecision::Exact | MatchDecision::SizeOnly | MatchDecision::Partial
+    ) {
+        AnnounceWorkflowResult::Saved
+    } else {
+        classify_decision_failure(assessment)
+    }
+}
+
+fn classify_assessment_failure(
+    assessment: &PersistedCandidateAssessment,
+) -> AnnounceWorkflowResult {
+    let Some(assessment) = persisted_assessment(assessment) else {
+        return AnnounceWorkflowResult::CandidateDownloading;
+    };
+    classify_decision_failure(assessment)
+}
+
+fn classify_decision_failure(
+    assessment: &crate::domain::CandidateAssessment,
+) -> AnnounceWorkflowResult {
+    match assessment.reason {
+        DecisionReason::AlreadyExists
+        | DecisionReason::SameInfoHash
+        | DecisionReason::InfoHashAlreadyExists => AnnounceWorkflowResult::AlreadyExists,
+        DecisionReason::SourceIncomplete => {
+            AnnounceWorkflowResult::SourceIncomplete { dependency: None }
+        }
+        DecisionReason::BlockedRelease
+        | DecisionReason::ReleaseGroupMismatch
+        | DecisionReason::ResolutionMismatch
+        | DecisionReason::SourceMismatch
+        | DecisionReason::ProperRepackMismatch
+        | DecisionReason::FuzzySizeMismatch
+        | DecisionReason::MissingDownloadLink
+        | DecisionReason::SingleEpisodeForSeasonPack
+        | DecisionReason::CandidateInvalid
+        | DecisionReason::PolicyRejected
+        | DecisionReason::UnsupportedLayout => AnnounceWorkflowResult::TerminalFailure {
+            reason: terminal_reason_for_decision(assessment.reason),
+            redacted_message: format!("candidate rejected: {:?}", assessment.reason),
+        },
+        DecisionReason::FileTreeMatched
+        | DecisionReason::SizeMatched
+        | DecisionReason::PartialOverlap => AnnounceWorkflowResult::Saved,
+        DecisionReason::NameMismatch => AnnounceWorkflowResult::NoMatch,
+    }
+}
+
+fn persisted_assessment(
+    assessment: &PersistedCandidateAssessment,
+) -> Option<&crate::domain::CandidateAssessment> {
+    match assessment {
+        PersistedCandidateAssessment::Assessed { assessment, .. }
+        | PersistedCandidateAssessment::Rejected { assessment, .. } => Some(assessment),
+        PersistedCandidateAssessment::NeedsTorrentDownload { .. } => None,
+    }
+}
+
+fn terminal_reason_for_decision(reason: DecisionReason) -> AnnounceReason {
+    match reason {
+        DecisionReason::BlockedRelease => AnnounceReason::InvalidRequest,
+        DecisionReason::MissingDownloadLink => AnnounceReason::InvalidRequest,
+        DecisionReason::AlreadyExists
+        | DecisionReason::SameInfoHash
+        | DecisionReason::InfoHashAlreadyExists => AnnounceReason::AlreadyExists,
+        DecisionReason::FileTreeMatched
+        | DecisionReason::SizeMatched
+        | DecisionReason::PartialOverlap
+        | DecisionReason::SourceIncomplete
+        | DecisionReason::NameMismatch => AnnounceReason::NoMatchTerminal,
+        DecisionReason::ReleaseGroupMismatch
+        | DecisionReason::ResolutionMismatch
+        | DecisionReason::SourceMismatch
+        | DecisionReason::ProperRepackMismatch
+        | DecisionReason::FuzzySizeMismatch
+        | DecisionReason::SingleEpisodeForSeasonPack
+        | DecisionReason::CandidateInvalid
+        | DecisionReason::PolicyRejected
+        | DecisionReason::UnsupportedLayout => AnnounceReason::NoMatchTerminal,
+    }
 }
 
 impl AnnounceWorker {
@@ -333,8 +613,11 @@ mod tests {
     use super::*;
     use crate::announce::{AnnounceDedupeIdentity, AnnounceStatus, AnnounceWorkItem};
     use crate::domain::{
-        ByteSize, CandidateGuid, DependencyName, DependencyState, ItemTitle, TrackerName,
+        ByteSize, CandidateAssessment, CandidateGuid, DependencyName, DependencyState,
+        InjectionOutcome, ItemTitle, LocalItem, LocalItemSource, MatchDecision, MatchRatio,
+        MediaType, SourceKey, TrackerName,
     };
+    use crate::matching::{CandidateCacheStatus, PersistedCandidateAssessment};
     use crate::persistence::repository::AnnounceInsertResult;
     use crate::runtime::shutdown::shutdown_channel;
 
@@ -501,6 +784,132 @@ mod tests {
         assert_eq!(vec![AnnounceWorkId::new("ann_37").unwrap()], ready);
     }
 
+    #[test]
+    fn classifier_maps_workflow_results_to_queue_transitions() {
+        let config = AnnounceOutcomeConfig {
+            source_wait_ms: 10,
+            candidate_download_wait_ms: 20,
+            retry_delay_ms: 30,
+        };
+
+        assert_eq!(
+            AnnounceWorkOutcome::Succeeded {
+                reason: AnnounceReason::Injected,
+                outcome: "injected".to_owned(),
+            },
+            classify_announce_result(AnnounceWorkflowResult::Injected, 100, config)
+        );
+        assert_eq!(
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::SourceIncomplete,
+                next_attempt_at_ms: 110,
+                dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
+            },
+            classify_announce_result(
+                AnnounceWorkflowResult::SourceIncomplete {
+                    dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
+                },
+                100,
+                config,
+            )
+        );
+        assert_eq!(
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::RetryAfter,
+                next_attempt_at_ms: 500,
+                dependency: Some(("indexer".to_owned(), "main".to_owned())),
+            },
+            classify_announce_result(
+                AnnounceWorkflowResult::DependencyBackoff {
+                    dependency_kind: "indexer".to_owned(),
+                    dependency_name: "main".to_owned(),
+                    retry_after_ms: Some(500),
+                },
+                100,
+                config,
+            )
+        );
+        assert_eq!(
+            AnnounceWorkOutcome::Retryable {
+                reason: AnnounceReason::TransientDependencyFailure,
+                next_attempt_at_ms: 130,
+                error_class: "indexer".to_owned(),
+                redacted_message: "timeout".to_owned(),
+            },
+            classify_announce_result(
+                AnnounceWorkflowResult::RetryableDependency {
+                    retry_after_ms: None,
+                    error_class: "indexer".to_owned(),
+                    redacted_message: "timeout".to_owned(),
+                },
+                100,
+                config,
+            )
+        );
+        assert_eq!(
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::InventoryRefreshing,
+                next_attempt_at_ms: 110,
+                dependency: None,
+            },
+            classify_announce_result(AnnounceWorkflowResult::NoMatch, 100, config)
+        );
+    }
+
+    #[test]
+    fn classifier_maps_reverse_lookup_and_injection_results() {
+        let config = AnnounceOutcomeConfig {
+            source_wait_ms: 10,
+            candidate_download_wait_ms: 20,
+            retry_delay_ms: 30,
+        };
+        let local_item = classified_local_item();
+        let source_incomplete = ReverseLookupOutcome::BestFailure {
+            local_item: local_item.clone(),
+            assessment: persisted_assessment(
+                MatchDecision::NoMatch,
+                DecisionReason::SourceIncomplete,
+            ),
+        };
+        let rejected = ReverseLookupOutcome::BestFailure {
+            local_item: local_item.clone(),
+            assessment: persisted_assessment(
+                MatchDecision::Rejected,
+                DecisionReason::BlockedRelease,
+            ),
+        };
+        let injection = crate::runtime::injection_worker::InjectionWorkResult {
+            outcome: InjectionOutcome::SourceIncomplete,
+            target_client: Some(DependencyName::new("qbit.local").unwrap()),
+            saved_for_retry: true,
+            linked_files: 0,
+        };
+
+        assert_eq!(
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::SourceIncomplete,
+                next_attempt_at_ms: 110,
+                dependency: None,
+            },
+            classify_reverse_lookup_outcome(&source_incomplete, 100, config)
+        );
+        assert_eq!(
+            AnnounceWorkOutcome::TerminalFailed {
+                reason: AnnounceReason::InvalidRequest,
+                redacted_message: "candidate rejected: BlockedRelease".to_owned(),
+            },
+            classify_reverse_lookup_outcome(&rejected, 100, config)
+        );
+        assert_eq!(
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::SourceIncomplete,
+                next_attempt_at_ms: 110,
+                dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
+            },
+            classify_injection_result(&injection, 100, config)
+        );
+    }
+
     #[tokio::test]
     async fn worker_shutdown_releases_claimed_work() {
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -598,6 +1007,39 @@ mod tests {
             last_dependency_name: None,
             last_error_class: None,
             last_redacted_message: None,
+        }
+    }
+
+    fn classified_local_item() -> LocalItem {
+        LocalItem {
+            id: None,
+            source: LocalItemSource::Virtual {
+                source_key: SourceKey::new("example").unwrap(),
+            },
+            title: ItemTitle::new("Example").unwrap(),
+            display_name: crate::domain::DisplayName::new("Example").unwrap(),
+            media_type: MediaType::Movie,
+            info_hash: None,
+            path: None,
+            save_path: None,
+            total_size: ByteSize::new(10),
+            mtime_ms: None,
+        }
+    }
+
+    fn persisted_assessment(
+        decision: MatchDecision,
+        reason: DecisionReason,
+    ) -> PersistedCandidateAssessment {
+        PersistedCandidateAssessment::Rejected {
+            candidate_id: crate::domain::RemoteCandidateId::new(1).unwrap(),
+            assessment: CandidateAssessment {
+                decision,
+                reason,
+                matched_size: Some(ByteSize::new(5)),
+                matched_ratio: MatchRatio::new(0.5).ok(),
+            },
+            cache_status: CandidateCacheStatus::Reused,
         }
     }
 
