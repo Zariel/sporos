@@ -2,13 +2,14 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::task;
-use tracing::info_span;
+use tracing::{info_span, warn};
 
 use crate::domain::{
-    ClientHost, DisplayName, InfoHash, ItemTitle, LocalFile, LocalItem, LocalItemSource, MediaType,
-    SourceKey, TorrentFile, checked_file_total,
+    ClientHost, DependencyName, DependencyState, DisplayName, InfoHash, ItemTitle, LocalFile,
+    LocalItem, LocalItemSource, MediaType, ReasonText, SourceKey, TorrentFile, checked_file_total,
 };
 use crate::errors::DatabaseError;
 use crate::inventory::{
@@ -18,7 +19,12 @@ use crate::persistence::repository::{
     LocalInventoryReplaceSummary, LocalInventoryScope, LocalItemFileBatch, Repository,
 };
 use crate::runtime::announce_worker::unix_time_ms;
+use crate::runtime::health::DependencyKind;
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
+
+const INVENTORY_REFRESH_DEPENDENCY: &str = "inventory-refresh";
+const INVENTORY_REFRESH_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const INVENTORY_REFRESH_RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InventoryRefreshRequest {
@@ -198,11 +204,94 @@ pub async fn run_inventory_refresh_worker(
     mut receiver: WorkReceiver<InventoryRefreshRequest>,
 ) {
     while let Some(request) = receiver.recv().await {
-        if let Err(error) = worker.refresh_data_dirs(request).await {
-            drop(error);
-        }
+        run_inventory_refresh_with_retry(&worker, request).await;
         receiver.mark_completed();
     }
+}
+
+async fn run_inventory_refresh_with_retry(
+    worker: &InventoryRefreshWorker,
+    request: InventoryRefreshRequest,
+) {
+    let mut delay = INVENTORY_REFRESH_RETRY_INITIAL;
+    loop {
+        match worker.refresh_data_dirs(request.clone()).await {
+            Ok(summary) if summary.scan_failures.is_empty() => {
+                record_inventory_refresh_health(worker, None, None).await;
+                return;
+            }
+            Ok(summary) => {
+                let reason = scan_failure_reason(&summary.scan_failures);
+                warn!(reason, "inventory refresh reported scan failures");
+                record_inventory_refresh_health(worker, Some(reason), None).await;
+                return;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                warn!(error = %reason, "inventory refresh failed; retrying");
+                record_inventory_refresh_health(worker, Some(reason), Some(delay)).await;
+            }
+        }
+
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2).min(INVENTORY_REFRESH_RETRY_MAX);
+    }
+}
+
+async fn record_inventory_refresh_health(
+    worker: &InventoryRefreshWorker,
+    reason: Option<String>,
+    retry_after: Option<Duration>,
+) {
+    let Ok(name) = DependencyName::new(INVENTORY_REFRESH_DEPENDENCY) else {
+        return;
+    };
+    let checked_at_ms = unix_time_ms();
+    let state = if let Some(reason) = reason {
+        let Ok(reason) = ReasonText::new(reason) else {
+            return;
+        };
+        DependencyState::Degraded {
+            reason,
+            retry_after_ms: retry_after
+                .map(duration_ms)
+                .map(|delay| checked_at_ms.saturating_add(delay)),
+        }
+    } else {
+        DependencyState::Healthy { checked_at_ms }
+    };
+    let _ = worker
+        .repository
+        .record_dependency_health(
+            DependencyKind::LocalState.as_str(),
+            &name,
+            &state,
+            checked_at_ms,
+        )
+        .await;
+}
+
+fn scan_failure_reason(failures: &[InventoryScanFailure]) -> String {
+    match failures {
+        [] => "inventory refresh failed".to_owned(),
+        [failure] => format!(
+            "scan {} failed for {}: {}",
+            failure.kind,
+            failure.path.display(),
+            failure.message
+        ),
+        [first, ..] => format!(
+            "{} scan failures; first {} failed for {}: {}",
+            failures.len(),
+            first.kind,
+            first.path.display(),
+            first.message
+        ),
+    }
+}
+
+fn duration_ms(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
 impl From<DatabaseError> for InventoryRefreshError {
@@ -390,6 +479,92 @@ mod tests {
         assert_eq!(1, local_count);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inventory_refresh_worker_records_partial_failures_and_continues() {
+        let missing = unique_temp_dir("queue-partial-missing");
+        fs::remove_dir_all(&missing).unwrap();
+        let root = unique_temp_dir("queue-partial-next");
+        let release = root.join("Queued.2026.1080p");
+        fs::create_dir_all(&release).unwrap();
+        write_file(&release.join("queued.mkv"), 10);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let (queue, receiver) = inventory_refresh_queue(NonZeroUsize::new(2).unwrap());
+
+        queue
+            .try_enqueue(InventoryRefreshRequest {
+                media_dirs: vec![missing],
+            })
+            .unwrap();
+        queue
+            .try_enqueue(InventoryRefreshRequest {
+                media_dirs: vec![root.clone()],
+            })
+            .unwrap();
+        drop(queue);
+        run_inventory_refresh_worker(worker, receiver).await;
+
+        let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let health = inventory_refresh_health(&repository).await.unwrap();
+
+        assert_eq!(1, local_count);
+        assert_eq!("healthy", health.state);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inventory_refresh_worker_retries_database_failures_before_completing() {
+        let root = unique_temp_dir("queue-retry-db");
+        let release = root.join("Recovered.2026.1080p");
+        fs::create_dir_all(&release).unwrap();
+        write_file(&release.join("recovered.mkv"), 10);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository.pool().close().await;
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let (queue, receiver) = inventory_refresh_queue(NonZeroUsize::new(1).unwrap());
+
+        queue
+            .try_enqueue(InventoryRefreshRequest {
+                media_dirs: vec![root.clone()],
+            })
+            .unwrap();
+        let handle = tokio::spawn(run_inventory_refresh_worker(worker, receiver));
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        assert_eq!(0, queue.stats().completed);
+        handle.abort();
+        let _ = handle.await;
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inventory_refresh_error_health_uses_current_backoff() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+
+        record_inventory_refresh_health(
+            &worker,
+            Some("database unavailable".to_owned()),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
+
+        let health = inventory_refresh_health(&repository).await.unwrap();
+        let delay = health.retry_after_ms.unwrap() - health.checked_at_ms;
+
+        assert_eq!("degraded", health.state);
+        assert!((2_000..=2_100).contains(&delay), "delay was {delay}");
     }
 
     #[tokio::test]
@@ -713,6 +888,20 @@ mod tests {
 
     fn write_file(path: &std::path::Path, bytes: usize) {
         fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
+    async fn inventory_refresh_health(
+        repository: &Repository,
+    ) -> Option<crate::persistence::repository::DependencyHealthSnapshot> {
+        repository
+            .dependency_health_snapshot(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|health| {
+                health.dependency_type == DependencyKind::LocalState.as_str()
+                    && health.dependency_name.as_str() == INVENTORY_REFRESH_DEPENDENCY
+            })
     }
 
     fn client_item(
