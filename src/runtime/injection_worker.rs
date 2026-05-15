@@ -2,6 +2,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 
@@ -12,8 +13,9 @@ use crate::actions::{
 };
 use crate::clients::TorrentClientDescriptor;
 use crate::domain::{
-    CandidateAssessment, DependencyName, DependencyState, InfoHash, InjectionOutcome, LocalFile,
-    LocalItem, MatchDecision, ReasonText, RemoteCandidate, RemoteCandidateId, TorrentMetafile,
+    ByteSize, CandidateAssessment, DependencyName, DependencyState, InfoHash, InjectionOutcome,
+    LocalFile, LocalItem, MatchDecision, ReasonText, RemoteCandidate, RemoteCandidateId,
+    TorrentMetafile,
 };
 use crate::errors::{ClassifyFailure, DatabaseError, FailureClass, TorrentClientError};
 use crate::persistence::repository::Repository;
@@ -27,6 +29,8 @@ pub trait InjectionClient: Send + Sync {
     fn has_torrent<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool>;
     fn inject<'a>(&'a self, request: ClientInjectionRequest<'a>) -> ClientResultFuture<'a, ()>;
     fn recheck<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()>;
+    fn is_checking<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool>;
+    fn remaining_bytes<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ByteSize>;
     fn resume<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()>;
 }
 
@@ -52,6 +56,7 @@ pub struct InjectionRequest {
     pub link_dirs: Vec<PathBuf>,
     pub link_type: Option<LinkType>,
     pub flat_linking: bool,
+    pub recheck: RecheckResumeConfig,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -70,6 +75,41 @@ pub enum InjectionWorkerError {
     Save(SaveTorrentError),
     Link(LinkActionError),
     Client(TorrentClientError),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecheckResumeConfig {
+    pub skip_recheck: bool,
+    pub auto_resume_max_download: ByteSize,
+    pub ignore_non_relevant_files_to_resume: bool,
+    pub poll_interval_ms: u64,
+    pub max_resume_wait_ms: u64,
+}
+
+impl Default for RecheckResumeConfig {
+    fn default() -> Self {
+        Self {
+            skip_recheck: true,
+            auto_resume_max_download: ByteSize::new(0),
+            ignore_non_relevant_files_to_resume: false,
+            poll_interval_ms: 5_000,
+            max_resume_wait_ms: 60 * 60 * 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecheckResumePlan {
+    pub should_recheck: bool,
+    pub max_remaining_bytes: ByteSize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ResumeLoopOutcome {
+    NotRequired,
+    Resumed,
+    WaitingForCompletion,
+    StillChecking,
 }
 
 impl From<DatabaseError> for InjectionWorkerError {
@@ -171,7 +211,9 @@ impl InjectionWorker {
             unreachable!("source incomplete handled above");
         };
 
-        let pause_for_recheck = should_recheck(&request.assessment);
+        let recheck_plan =
+            recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
+        let pause_for_recheck = recheck_plan.should_recheck;
         let inject_result = {
             let _guard = self.mutation_lock.lock().await;
             target
@@ -188,7 +230,10 @@ impl InjectionWorker {
             Ok(()) => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
-                if pause_for_recheck {
+                if recheck_plan.should_recheck {
+                    let _ = self
+                        .run_recheck_resume(target.as_ref(), &request, recheck_plan)
+                        .await?;
                     self.save_for_retry(&request)?;
                 }
                 Ok(InjectionWorkResult {
@@ -357,6 +402,38 @@ impl InjectionWorker {
             .record_dependency_health("client", &name, &state, checked_at_ms)
             .await
     }
+
+    async fn run_recheck_resume(
+        &self,
+        client: &dyn InjectionClient,
+        request: &InjectionRequest,
+        plan: RecheckResumePlan,
+    ) -> Result<ResumeLoopOutcome, InjectionWorkerError> {
+        if !plan.should_recheck {
+            return Ok(ResumeLoopOutcome::NotRequired);
+        }
+        client.recheck(&request.metafile.info_hash).await?;
+        let max_polls = max_resume_polls(request.recheck);
+        for _ in 0..max_polls {
+            if client.is_checking(&request.metafile.info_hash).await? {
+                sleep_between_resume_polls(request.recheck).await;
+                continue;
+            }
+            let remaining = client.remaining_bytes(&request.metafile.info_hash).await?;
+            if can_resume_with_remaining(
+                &request.metafile,
+                &request.assessment,
+                request.recheck,
+                plan,
+                remaining,
+            ) {
+                client.resume(&request.metafile.info_hash).await?;
+                return Ok(ResumeLoopOutcome::Resumed);
+            }
+            return Ok(ResumeLoopOutcome::WaitingForCompletion);
+        }
+        Ok(ResumeLoopOutcome::StillChecking)
+    }
 }
 
 enum LinkPreparation {
@@ -381,8 +458,106 @@ fn source_root(item: &LocalItem) -> Option<&Path> {
     item.save_path.as_deref().or(item.path.as_deref())
 }
 
-fn should_recheck(assessment: &CandidateAssessment) -> bool {
-    assessment.decision == MatchDecision::Partial
+pub fn recheck_resume_plan(
+    metafile: &TorrentMetafile,
+    assessment: &CandidateAssessment,
+    config: RecheckResumeConfig,
+) -> RecheckResumePlan {
+    let partial = assessment.decision == MatchDecision::Partial;
+    let video_disc = has_video_disc_files(metafile);
+    let should_recheck = !config.skip_recheck || partial || video_disc;
+    let max_remaining_bytes = if partial && !video_disc {
+        config.auto_resume_max_download
+    } else {
+        ByteSize::new(0)
+    };
+
+    RecheckResumePlan {
+        should_recheck,
+        max_remaining_bytes,
+    }
+}
+
+pub fn can_resume_with_remaining(
+    metafile: &TorrentMetafile,
+    assessment: &CandidateAssessment,
+    config: RecheckResumeConfig,
+    plan: RecheckResumePlan,
+    remaining: ByteSize,
+) -> bool {
+    if remaining.get() <= plan.max_remaining_bytes.get() {
+        return true;
+    }
+    if !config.ignore_non_relevant_files_to_resume
+        || assessment.decision != MatchDecision::Partial
+        || has_video_disc_files(metafile)
+        || remaining.get() > 200 * 1024 * 1024
+    {
+        return false;
+    }
+
+    let piece_slack = metafile
+        .piece_length
+        .unwrap_or(ByteSize::new(0))
+        .get()
+        .saturating_mul(2);
+    remaining.get()
+        <= irrelevant_file_bytes(metafile)
+            .get()
+            .saturating_add(piece_slack)
+}
+
+fn has_video_disc_files(metafile: &TorrentMetafile) -> bool {
+    metafile.files.iter().any(|file| {
+        file.relative_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "m2ts" | "ifo" | "vob" | "bup"
+                )
+            })
+    })
+}
+
+fn irrelevant_file_bytes(metafile: &TorrentMetafile) -> ByteSize {
+    ByteSize::new(
+        metafile
+            .files
+            .iter()
+            .filter(|file| is_irrelevant_file(&file.relative_path))
+            .map(|file| file.size.get())
+            .sum(),
+    )
+}
+
+fn is_irrelevant_file(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().to_ascii_lowercase();
+    let has_keyword = ["sample", "trailer", "extras", "bonus"]
+        .iter()
+        .any(|keyword| normalized.contains(keyword));
+    let has_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "nfo" | "srr" | "srt" | "txt" | "ass"
+            )
+        });
+    has_keyword || has_extension
+}
+
+fn max_resume_polls(config: RecheckResumeConfig) -> u64 {
+    let interval = config.poll_interval_ms.max(1);
+    config.max_resume_wait_ms.div_ceil(interval).max(1)
+}
+
+async fn sleep_between_resume_polls(config: RecheckResumeConfig) {
+    if config.poll_interval_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
+    }
 }
 
 fn dependency_name(
@@ -501,6 +676,11 @@ mod tests {
             matched_size: Some(ByteSize::new(5)),
             matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
         };
+        request.recheck = RecheckResumeConfig {
+            auto_resume_max_download: ByteSize::new(10),
+            poll_interval_ms: 0,
+            ..RecheckResumeConfig::default()
+        };
         let worker =
             InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
 
@@ -509,8 +689,110 @@ mod tests {
         assert_eq!(InjectionOutcome::Injected, result.outcome);
         assert!(result.saved_for_retry);
         assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.resume_calls.load(Ordering::SeqCst));
         assert_eq!(1, saved_torrent_count(&root.join("output")));
         assert_eq!(Some(true), target.last_pause_for_recheck());
+    }
+
+    #[test]
+    fn recheck_policy_covers_skip_partial_and_video_disc_rules() {
+        let exact = CandidateAssessment {
+            decision: MatchDecision::Exact,
+            reason: crate::domain::DecisionReason::FileTreeMatched,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(1.0).unwrap()),
+        };
+        let partial = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(5)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        let normal = metafile();
+        let disc = metafile_with_files(&[("BDMV/STREAM/00001.m2ts", 10)]);
+
+        assert!(
+            !recheck_resume_plan(&normal, &exact, RecheckResumeConfig::default()).should_recheck
+        );
+        assert!(
+            recheck_resume_plan(
+                &normal,
+                &exact,
+                RecheckResumeConfig {
+                    skip_recheck: false,
+                    ..RecheckResumeConfig::default()
+                }
+            )
+            .should_recheck
+        );
+        assert!(
+            recheck_resume_plan(&normal, &partial, RecheckResumeConfig::default()).should_recheck
+        );
+        assert!(recheck_resume_plan(&disc, &exact, RecheckResumeConfig::default()).should_recheck);
+        assert_eq!(
+            ByteSize::new(0),
+            recheck_resume_plan(
+                &disc,
+                &partial,
+                RecheckResumeConfig {
+                    auto_resume_max_download: ByteSize::new(10),
+                    ..RecheckResumeConfig::default()
+                },
+            )
+            .max_remaining_bytes
+        );
+    }
+
+    #[test]
+    fn resume_policy_allows_irrelevant_file_slack_for_partial_matches() {
+        let metafile = TorrentMetafile::new_with_piece_length(
+            InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            DisplayName::new("movie").unwrap(),
+            vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("movie.mkv"),
+                    ByteSize::new(100),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("extras/sample.nfo"),
+                    ByteSize::new(20),
+                    FileIndex::new(1),
+                )
+                .unwrap(),
+            ],
+            Some(ByteSize::new(5)),
+        )
+        .unwrap();
+        let assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(100)),
+            matched_ratio: Some(MatchRatio::new(0.8).unwrap()),
+        };
+        let config = RecheckResumeConfig {
+            auto_resume_max_download: ByteSize::new(0),
+            ignore_non_relevant_files_to_resume: true,
+            ..RecheckResumeConfig::default()
+        };
+        let plan = recheck_resume_plan(&metafile, &assessment, config);
+
+        assert!(can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(30)
+        ));
+        assert!(!can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(31)
+        ));
     }
 
     struct FakeClient {
@@ -519,6 +801,8 @@ mod tests {
         inject_error: bool,
         inject_calls: AtomicUsize,
         has_calls: AtomicUsize,
+        recheck_calls: AtomicUsize,
+        resume_calls: AtomicUsize,
         last_pause_for_recheck: StdMutex<Option<bool>>,
     }
 
@@ -530,6 +814,8 @@ mod tests {
                 inject_error: false,
                 inject_calls: AtomicUsize::new(0),
                 has_calls: AtomicUsize::new(0),
+                recheck_calls: AtomicUsize::new(0),
+                resume_calls: AtomicUsize::new(0),
                 last_pause_for_recheck: StdMutex::new(None),
             }
         }
@@ -578,10 +864,23 @@ mod tests {
         }
 
         fn recheck<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()> {
+            self.recheck_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(()) })
         }
 
+        fn is_checking<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
+            Box::pin(async move { Ok(false) })
+        }
+
+        fn remaining_bytes<'a>(
+            &'a self,
+            _info_hash: &'a InfoHash,
+        ) -> ClientResultFuture<'a, ByteSize> {
+            Box::pin(async move { Ok(ByteSize::new(0)) })
+        }
+
         fn resume<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()> {
+            self.resume_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(()) })
         }
     }
@@ -628,6 +927,7 @@ mod tests {
             link_dirs: Vec::new(),
             link_type: None,
             flat_linking: false,
+            recheck: RecheckResumeConfig::default(),
         }
     }
 
@@ -673,17 +973,25 @@ mod tests {
     }
 
     fn metafile() -> TorrentMetafile {
+        metafile_with_files(&[("movie.mkv", 10)])
+    }
+
+    fn metafile_with_files(files: &[(&str, u64)]) -> TorrentMetafile {
         TorrentMetafile::new(
             InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
             DisplayName::new("movie.mkv").unwrap(),
-            vec![
-                crate::domain::TorrentFile::new(
-                    PathBuf::from("movie.mkv"),
-                    ByteSize::new(10),
-                    FileIndex::new(0),
-                )
-                .unwrap(),
-            ],
+            files
+                .iter()
+                .enumerate()
+                .map(|(index, (path, size))| {
+                    crate::domain::TorrentFile::new(
+                        PathBuf::from(path),
+                        ByteSize::new(*size),
+                        FileIndex::new(u32::try_from(index).unwrap()),
+                    )
+                    .unwrap()
+                })
+                .collect(),
         )
         .unwrap()
     }
