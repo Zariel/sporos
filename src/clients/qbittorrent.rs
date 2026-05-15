@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
 use crate::errors::TorrentClientError;
+use crate::secrets::sanitize_url_for_logging;
 
 const SPOROS_TAG: &str = "sporos";
 const MIN_QBIT_VERSION: QbitVersion = QbitVersion {
@@ -20,7 +21,6 @@ const MIN_QBIT_VERSION: QbitVersion = QbitVersion {
 const QBIT_INVENTORY_PAGE_SIZE: usize = 500;
 const QBIT_RESPONSE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Debug)]
 pub struct QbittorrentClient {
     client_name: String,
     base_url: String,
@@ -30,6 +30,22 @@ pub struct QbittorrentClient {
     client: reqwest::Client,
     cookie: Mutex<Option<String>>,
     version: Mutex<Option<QbitVersion>>,
+}
+
+impl fmt::Debug for QbittorrentClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QbittorrentClient")
+            .field("client_name", &self.client_name)
+            .field("base_url", &sanitize_url_for_logging(&self.base_url))
+            .field("username", &redacted_option(self.username.as_ref()))
+            .field("password", &redacted_option(self.password.as_ref()))
+            .field("timeout", &self.timeout)
+            .field("client", &"[REDACTED]")
+            .field("cookie", &"[REDACTED]")
+            .field("version", &"[cached]")
+            .finish()
+    }
 }
 
 impl QbittorrentClient {
@@ -373,6 +389,10 @@ impl QbittorrentClient {
     }
 }
 
+fn redacted_option(value: Option<&String>) -> Option<&'static str> {
+    value.map(|_| "[REDACTED]")
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum QbitContentLayout {
     Original,
@@ -619,6 +639,28 @@ mod tests {
     use super::*;
 
     const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn client_debug_redacts_credentials_urls_and_session_state() {
+        let client = QbittorrentClient::new(
+            "qbit",
+            "https://url-user:url-pass@example.invalid/rpc?apikey=url-secret&ok=1#fragment",
+            Some("login-user".to_owned()),
+            Some("login-pass".to_owned()),
+            Duration::from_secs(1),
+        );
+
+        let debug = format!("{client:?}");
+
+        assert!(debug.contains("QbittorrentClient"));
+        assert!(debug.contains("ok=1"));
+        assert!(!debug.contains("url-user"));
+        assert!(!debug.contains("url-pass"));
+        assert!(!debug.contains("url-secret"));
+        assert!(!debug.contains("fragment"));
+        assert!(!debug.contains("login-user"));
+        assert!(!debug.contains("login-pass"));
+    }
 
     #[test]
     fn version_parsing_selects_v4_and_v5_control_endpoints() {

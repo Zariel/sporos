@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use reqwest::header::CONTENT_TYPE;
 
 use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
 use crate::errors::TorrentClientError;
+use crate::secrets::sanitize_url_for_logging;
 
 const RTORRENT_LABEL: &str = "sporos";
 const RTORRENT_RESPONSE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -28,12 +30,24 @@ const INVENTORY_METHODS: &[&str] = &[
 ];
 const RTORRENT_INVENTORY_CHUNK_SIZE: usize = 256;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RtorrentClient {
     client_name: String,
     endpoint: String,
     timeout: Duration,
     client: reqwest::Client,
+}
+
+impl fmt::Debug for RtorrentClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RtorrentClient")
+            .field("client_name", &self.client_name)
+            .field("endpoint", &sanitize_url_for_logging(&self.endpoint))
+            .field("timeout", &self.timeout)
+            .field("client", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl RtorrentClient {
@@ -771,6 +785,24 @@ mod tests {
     use super::*;
 
     const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn client_debug_redacts_secret_bearing_endpoint() {
+        let client = RtorrentClient::new(
+            "rtorrent",
+            "https://url-user:url-pass@example.invalid/RPC2?token=url-secret&ok=1#fragment",
+            Duration::from_secs(1),
+        );
+
+        let debug = format!("{client:?}");
+
+        assert!(debug.contains("RtorrentClient"));
+        assert!(debug.contains("ok=1"));
+        assert!(!debug.contains("url-user"));
+        assert!(!debug.contains("url-pass"));
+        assert!(!debug.contains("url-secret"));
+        assert!(!debug.contains("fragment"));
+    }
 
     #[test]
     fn inventory_multicall_payload_contains_rtorrent_fields() {
