@@ -110,6 +110,20 @@ Before ending a work session:
 5. Check `git status --short` and report any remaining uncommitted changes.
 6. Do not push source or Dolt remotes unless the user explicitly asked for it.
 
+### Context Handoffs
+
+Before a long pause, context compaction, or ending a session with unfinished
+work, persist task state in bd instead of relying on chat history. Update the
+active bead with current status, quality gates run, latest commit if any,
+remaining uncommitted files, blockers, and the next concrete step.
+
+Use `bd update <id> --append-notes "..." --json` for task-specific handoff
+state. If the work is complete and committed, close the bead instead. If
+follow-up work remains, create linked beads with
+`--deps discovered-from:<current-id>`.
+
+Do not create markdown TODO files, scratch trackers, or chat-only handoff notes.
+
 <!-- END BEADS INTEGRATION -->
 
 
