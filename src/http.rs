@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{Instrument, debug_span, info_span};
 
 use crate::announce::{
-    AnnounceDedupeIdentity, AnnounceQueueConfig, AnnounceReason, AnnounceStatus, AnnounceWorkId,
-    AnnounceWorkItem,
+    AnnounceDedupeIdentity, AnnounceFetchMaterial, AnnounceQueueConfig, AnnounceReason,
+    AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
 use crate::domain::{ByteSize, CandidateGuid, DownloadUrl, ItemTitle, JobName, TrackerName};
 use crate::errors::DatabaseError;
@@ -610,10 +610,14 @@ fn announcement_work_item(
     request: AnnouncementWorkflowRequest,
     ttl_secs: u64,
 ) -> Result<AnnounceWorkItem, ApiErrorResponse> {
-    if let Some(cookie) = request.cookie.as_deref() {
-        CookieSecret::new(cookie)
-            .map_err(|error| ApiErrorResponse::unprocessable(format!("invalid cookie: {error}")))?;
-    }
+    let cookie = request
+        .cookie
+        .map(CookieSecret::new)
+        .transpose()
+        .map_err(|error| ApiErrorResponse::unprocessable(format!("invalid cookie: {error}")))?;
+    let fetch = AnnounceFetchMaterial::new(&request.download_url, cookie).map_err(|error| {
+        ApiErrorResponse::unprocessable(format!("invalid fetch material: {error}"))
+    })?;
     let now_ms = unix_time_ms();
     let ttl_ms = i64::try_from(ttl_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
     let expires_at_ms = now_ms.saturating_add(ttl_ms);
@@ -637,6 +641,7 @@ fn announcement_work_item(
         guid: Some(request.guid),
         info_hash: None,
         size: request.size,
+        fetch: Some(fetch),
         received_at_ms: now_ms,
         updated_at_ms: now_ms,
         first_attempt_at_ms: None,
@@ -1112,8 +1117,9 @@ mod tests {
                 serde_json::json!({
                     "name": "Example",
                     "guid": "guid-1",
-                    "download_url": "https://tracker.example/download?id=1",
+                    "download_url": "https://tracker.example/download?id=1&passkey=secret",
                     "tracker": "tracker.example",
+                    "cookie": "sid=secret-cookie",
                     "size": 42
                 }),
                 Some("Bearer secret"),
@@ -1129,6 +1135,12 @@ mod tests {
             .fetch_one(repository.pool())
             .await
             .unwrap();
+        let id = AnnounceWorkId::new(json["id"].as_str().unwrap_or_default()).unwrap();
+        let fetch = repository
+            .announce_fetch_material(&id)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(StatusCode::UNAUTHORIZED, unauthorized.status());
         assert_eq!(StatusCode::ACCEPTED, status);
@@ -1136,6 +1148,12 @@ mod tests {
         assert_eq!(false, json["deduplicated"]);
         assert!(json["id"].as_str().is_some_and(|id| id.starts_with("ann_")));
         assert_eq!(1, stored_count);
+        assert_eq!(
+            "https://tracker.example/download?id=1&passkey=secret",
+            fetch.expose_download_url()
+        );
+        assert_eq!("sid=secret-cookie", fetch.cookie().unwrap().expose_secret());
+        assert!(!fetch.redacted_download_url().as_str().contains("secret"));
     }
 
     #[tokio::test]

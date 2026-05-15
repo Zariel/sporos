@@ -6,16 +6,18 @@ use sqlx::{Executor, Row, Sqlite, SqlitePool, Transaction};
 use tracing::{debug_span, info_span};
 
 use crate::announce::{
-    AnnounceDedupeHash, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
+    AnnounceDedupeHash, AnnounceFetchMaterial, AnnounceReason, AnnounceStatus, AnnounceWorkId,
+    AnnounceWorkItem,
 };
 use crate::domain::{
     ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyName, DependencyState,
-    DisplayName, FileIndex, IndexerId, InfoHash, ItemTitle, JobName, JobState, LocalFile,
-    LocalItem, LocalItemId, LocalItemSource, MatchDecision, MediaType, ReasonText, RemoteCandidate,
-    RemoteCandidateId, SourceKey,
+    DisplayName, DownloadUrl, FileIndex, IndexerId, InfoHash, ItemTitle, JobName, JobState,
+    LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision, MediaType, ReasonText,
+    RemoteCandidate, RemoteCandidateId, SourceKey,
 };
 use crate::errors::DatabaseError;
 use crate::indexers::{ConfiguredTorznabIndexer, TorznabCaps};
+use crate::secrets::CookieSecret;
 
 use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
 
@@ -1397,6 +1399,50 @@ impl Repository {
         Ok(claimed)
     }
 
+    pub async fn announce_fetch_material(
+        &self,
+        id: &AnnounceWorkId,
+    ) -> Result<Option<AnnounceFetchMaterial>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT download_url, cookie FROM announce_work
+            WHERE id = ?
+            "#,
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce fetch material", error))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let Some(download_url) = row.get::<Option<String>, _>("download_url") else {
+            return Ok(None);
+        };
+        let download_url =
+            DownloadUrl::new(download_url).map_err(|error| DatabaseError::QueryFailed {
+                operation: "read announce download url".to_owned(),
+                message: error.to_string(),
+            })?;
+        let cookie = row
+            .get::<Option<String>, _>("cookie")
+            .map(CookieSecret::new)
+            .transpose()
+            .map_err(|error| DatabaseError::QueryFailed {
+                operation: "read announce cookie".to_owned(),
+                message: error.to_string(),
+            })?;
+        let material = AnnounceFetchMaterial::new(&download_url, cookie).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read announce fetch material".to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+
+        Ok(Some(material))
+    }
+
     pub async fn schedule_announce_dependency_backoff(
         &self,
         now_ms: i64,
@@ -2176,6 +2222,9 @@ async fn insert_announce_work(
             info_hash,
             title,
             size,
+            download_url,
+            redacted_download_url,
+            cookie,
             status,
             reason,
             attempt_count,
@@ -2188,7 +2237,7 @@ async fn insert_announce_work(
             last_error_class,
             last_error_message
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(work.id.as_str())
@@ -2206,6 +2255,22 @@ async fn insert_announce_work(
             .map(ByteSize::get)
             .map(|size| i64_from_u64(size, "announce size"))
             .transpose()?,
+    )
+    .bind(
+        work.fetch
+            .as_ref()
+            .map(AnnounceFetchMaterial::expose_download_url),
+    )
+    .bind(
+        work.fetch
+            .as_ref()
+            .map(|fetch| fetch.redacted_download_url().as_str()),
+    )
+    .bind(
+        work.fetch
+            .as_ref()
+            .and_then(AnnounceFetchMaterial::cookie)
+            .map(CookieSecret::expose_secret),
     )
     .bind(announce_status_key(work.status))
     .bind(announce_reason_key(work.reason))
@@ -3656,6 +3721,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_insert_persists_fetch_material() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut work = test_announce_work("ann_fetch", "guid-fetch", 1);
+        let download_url =
+            DownloadUrl::new("https://tracker.example/download?id=1&apikey=secret").unwrap();
+        work.fetch = Some(
+            AnnounceFetchMaterial::new(
+                &download_url,
+                Some(CookieSecret::new("sid=secret-cookie").unwrap()),
+            )
+            .unwrap(),
+        );
+
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        let stored = repository
+            .announce_fetch_material(&work.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let redacted: String =
+            sqlx::query_scalar("SELECT redacted_download_url FROM announce_work WHERE id = ?")
+                .bind(work.id.as_str())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(download_url.as_str(), stored.expose_download_url());
+        assert_eq!(
+            "sid=secret-cookie",
+            stored.cookie().unwrap().expose_secret()
+        );
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("secret"));
+    }
+
+    #[tokio::test]
     async fn concurrent_announce_claims_do_not_steal_leases() {
         let root = unique_temp_dir("announce-atomic-claim");
         let database = root.join("sporos.db");
@@ -3973,6 +4077,7 @@ mod tests {
             guid: Some(guid),
             info_hash: None,
             size: Some(ByteSize::new(42)),
+            fetch: None,
             received_at_ms,
             updated_at_ms: received_at_ms,
             first_attempt_at_ms: None,

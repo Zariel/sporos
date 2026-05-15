@@ -1070,6 +1070,7 @@ mod tests {
             guid: Some(guid),
             info_hash: None,
             size: Some(ByteSize::new(42)),
+            fetch: None,
             received_at_ms,
             updated_at_ms: received_at_ms,
             first_attempt_at_ms: None,
