@@ -5,15 +5,18 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::content_filter::{BlocklistRule, CandidateBlocklistSubject};
+use crate::content_filter::{
+    BlocklistRule, CandidateBlocklistSubject, ContentFilterConfig, ContentFilterContext,
+    ContentFilterDecision, ContentFilterSubject, ContentMetadata, filter_content,
+};
 use crate::domain::{
     ByteSize, CandidateAssessment, DecisionReason, IndexerId, InfoHash, LocalFile, LocalItem,
-    LocalItemSource, MatchDecision, MatchRatio, MediaType, RemoteCandidate, RemoteCandidateId,
-    TorrentFile, TorrentMetafile,
+    LocalItemId, LocalItemSource, MatchDecision, MatchRatio, MediaType, RemoteCandidate,
+    RemoteCandidateId, TorrentFile, TorrentMetafile,
 };
 use crate::errors::DatabaseError;
 use crate::indexers::TorznabCaps;
-use crate::persistence::repository::Repository;
+use crate::persistence::repository::{LocalFileSnapshot, Repository};
 use crate::torrent::parse_metafile;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -78,6 +81,81 @@ pub struct FileTreeAssessment {
 pub struct CandidateAssessmentConfig {
     pub precheck: CandidatePrecheckConfig,
     pub file_tree: FileTreeMatchConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReverseLookupConfig {
+    pub max_local_candidates: u16,
+    pub max_files_per_item: u16,
+    pub levenshtein_divisor: usize,
+    pub content_filter: ContentFilterConfig,
+    pub assessment: CandidateAssessmentConfig,
+}
+
+impl Default for ReverseLookupConfig {
+    fn default() -> Self {
+        Self {
+            max_local_candidates: 64,
+            max_files_per_item: 2_000,
+            levenshtein_divisor: 3,
+            content_filter: ContentFilterConfig::default(),
+            assessment: CandidateAssessmentConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReverseLookupCandidate {
+    pub local_item: LocalItem,
+    pub local_files: Vec<LocalFile>,
+    pub source: ReverseLookupSource,
+    pub distance: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ReverseLookupSource {
+    InfoHash,
+    ParsedKey,
+    FuzzyTitle,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReverseLookupOutcome {
+    Matched {
+        local_item: LocalItem,
+        assessment: PersistedCandidateAssessment,
+    },
+    AlreadyPresent {
+        local_item: LocalItem,
+        assessment: PersistedCandidateAssessment,
+    },
+    NeedsTorrentDownload {
+        local_item: LocalItem,
+        candidate_id: RemoteCandidateId,
+    },
+    BestFailure {
+        local_item: LocalItem,
+        assessment: PersistedCandidateAssessment,
+    },
+    NoCandidates,
+}
+
+#[derive(Debug)]
+pub enum ReverseLookupError {
+    Database { source: DatabaseError },
+    Assessment { source: CandidateAssessmentError },
+}
+
+impl From<DatabaseError> for ReverseLookupError {
+    fn from(source: DatabaseError) -> Self {
+        Self::Database { source }
+    }
+}
+
+impl From<CandidateAssessmentError> for ReverseLookupError {
+    fn from(source: CandidateAssessmentError) -> Self {
+        Self::Assessment { source }
+    }
 }
 
 impl Default for CandidateAssessmentConfig {
@@ -392,6 +470,521 @@ pub async fn assess_and_persist_candidate(
         assessment,
         cache_status: CandidateCacheStatus::Reused,
     })
+}
+
+pub async fn reverse_lookup_candidates(
+    repository: &Repository,
+    candidate: &RemoteCandidate,
+    context: ContentFilterContext,
+    config: &ReverseLookupConfig,
+) -> Result<Vec<ReverseLookupCandidate>, ReverseLookupError> {
+    let mut lookup = Vec::new();
+    let mut seen = HashSet::<LocalItemId>::new();
+
+    if let Some(info_hash) = candidate.info_hash.as_ref() {
+        let items = repository
+            .local_items_by_info_hash(info_hash, config.max_local_candidates)
+            .await?;
+        add_lookup_items(
+            repository,
+            items,
+            ReverseLookupSource::InfoHash,
+            0,
+            context,
+            config,
+            &mut seen,
+            &mut lookup,
+        )
+        .await?;
+    }
+
+    let key = ReverseLookupKey::from_title(candidate.title.as_str());
+    for media_type in key.media_types() {
+        let items = if let Some(title_token) = key.primary_title_token() {
+            repository
+                .local_items_by_media_type_and_title_token(
+                    media_type,
+                    title_token,
+                    config.max_local_candidates,
+                )
+                .await?
+        } else {
+            repository
+                .local_items_by_media_type(media_type, config.max_local_candidates)
+                .await?
+        };
+        for item in items {
+            let Some(score) = reverse_lookup_score(&item, &key, config) else {
+                continue;
+            };
+            add_lookup_items(
+                repository,
+                vec![item],
+                score.source,
+                score.distance,
+                context,
+                config,
+                &mut seen,
+                &mut lookup,
+            )
+            .await?;
+        }
+    }
+
+    lookup.sort_by(reverse_lookup_order);
+    Ok(dedupe_reverse_lookup(lookup))
+}
+
+pub async fn reverse_lookup_and_assess_candidate(
+    repository: &Repository,
+    candidate: &RemoteCandidate,
+    owned_info_hashes: &[InfoHash],
+    assessed_at_ms: i64,
+    context: ContentFilterContext,
+    config: &ReverseLookupConfig,
+) -> Result<ReverseLookupOutcome, ReverseLookupError> {
+    let matches = reverse_lookup_candidates(repository, candidate, context, config).await?;
+    let mut best_failure = None;
+
+    for lookup in matches {
+        let assessment = assess_and_persist_candidate(
+            repository,
+            &lookup.local_item,
+            &lookup.local_files,
+            candidate,
+            owned_info_hashes,
+            assessed_at_ms,
+            &config.assessment,
+        )
+        .await?;
+
+        if assessment_needs_torrent_download(&assessment) {
+            let PersistedCandidateAssessment::NeedsTorrentDownload { candidate_id, .. } =
+                assessment
+            else {
+                unreachable!("checked needs torrent download");
+            };
+            return Ok(ReverseLookupOutcome::NeedsTorrentDownload {
+                local_item: lookup.local_item,
+                candidate_id,
+            });
+        }
+
+        if assessment_is_already_present(&assessment) {
+            return Ok(ReverseLookupOutcome::AlreadyPresent {
+                local_item: lookup.local_item,
+                assessment,
+            });
+        }
+
+        if assessment_is_actionable(&assessment) {
+            return Ok(ReverseLookupOutcome::Matched {
+                local_item: lookup.local_item,
+                assessment,
+            });
+        }
+
+        best_failure = better_failure(best_failure, lookup.local_item, assessment);
+    }
+
+    Ok(best_failure.map_or(
+        ReverseLookupOutcome::NoCandidates,
+        |(local_item, assessment)| ReverseLookupOutcome::BestFailure {
+            local_item,
+            assessment,
+        },
+    ))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ReverseLookupKey {
+    title_keys: Vec<String>,
+    metadata: ParsedSearchMetadata,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ReverseLookupScore {
+    source: ReverseLookupSource,
+    distance: usize,
+}
+
+impl ReverseLookupKey {
+    fn from_title(title: &str) -> Self {
+        let stripped = strip_wrapped_metadata(title);
+        let mut title_keys = vec![normalize_lookup_title(title)];
+        let stripped_key = normalize_lookup_title(&stripped);
+        if !stripped_key.is_empty() && !title_keys.contains(&stripped_key) {
+            title_keys.push(stripped_key);
+        }
+
+        Self {
+            title_keys,
+            metadata: parsed_candidate_metadata(title),
+        }
+    }
+
+    fn media_types(&self) -> Vec<MediaType> {
+        if self.metadata.episode.is_some() {
+            return vec![MediaType::Episode];
+        }
+        if self.metadata.season.is_some() {
+            return vec![MediaType::SeasonPack];
+        }
+        vec![MediaType::Movie, MediaType::Video, MediaType::Anime]
+    }
+
+    fn primary_title_token(&self) -> Option<&str> {
+        self.title_keys
+            .iter()
+            .flat_map(|key| key.split_whitespace())
+            .find(|token| token.len() >= 3 && !episode_or_season_token(token))
+    }
+}
+
+async fn add_lookup_items(
+    repository: &Repository,
+    items: Vec<LocalItem>,
+    source: ReverseLookupSource,
+    distance: usize,
+    context: ContentFilterContext,
+    config: &ReverseLookupConfig,
+    seen: &mut HashSet<LocalItemId>,
+    lookup: &mut Vec<ReverseLookupCandidate>,
+) -> Result<(), ReverseLookupError> {
+    for item in items {
+        let Some(item_id) = item.id else {
+            continue;
+        };
+        if !seen.insert(item_id) {
+            continue;
+        }
+        let files = local_files(repository, item_id, config.max_files_per_item).await?;
+        if !matches!(
+            filter_content(
+                ContentFilterSubject {
+                    item: &item,
+                    files: &files,
+                    metadata: ContentMetadata::default(),
+                    context,
+                },
+                &config.content_filter,
+            ),
+            ContentFilterDecision::Accepted
+        ) {
+            continue;
+        }
+        lookup.push(ReverseLookupCandidate {
+            local_item: item,
+            local_files: files,
+            source,
+            distance,
+        });
+    }
+
+    Ok(())
+}
+
+async fn local_files(
+    repository: &Repository,
+    item_id: LocalItemId,
+    limit: u16,
+) -> Result<Vec<LocalFile>, ReverseLookupError> {
+    repository
+        .local_files_for_item(item_id, limit)
+        .await?
+        .into_iter()
+        .map(local_file_from_snapshot)
+        .collect()
+}
+
+fn local_file_from_snapshot(snapshot: LocalFileSnapshot) -> Result<LocalFile, ReverseLookupError> {
+    LocalFile::new(
+        Some(snapshot.item_id),
+        snapshot.relative_path,
+        snapshot.size,
+        snapshot.file_index,
+    )
+    .map(|file| file.with_mtime_ms(snapshot.mtime_ms))
+    .map_err(|error| ReverseLookupError::Database {
+        source: DatabaseError::QueryFailed {
+            operation: "read local file snapshot".to_owned(),
+            message: error.to_string(),
+        },
+    })
+}
+
+fn reverse_lookup_score(
+    item: &LocalItem,
+    key: &ReverseLookupKey,
+    config: &ReverseLookupConfig,
+) -> Option<ReverseLookupScore> {
+    let local_metadata = parsed_search_metadata(item);
+    if key.metadata.season.is_some()
+        && local_metadata.season.is_some()
+        && key.metadata.season != local_metadata.season
+    {
+        return None;
+    }
+    if key.metadata.episode.is_some()
+        && local_metadata.episode.is_some()
+        && key.metadata.episode != local_metadata.episode
+    {
+        return None;
+    }
+
+    let local_key = normalize_lookup_title(item.title.as_str());
+    if local_key.is_empty() {
+        return None;
+    }
+    key.title_keys
+        .iter()
+        .filter(|candidate_key| !candidate_key.is_empty())
+        .map(|candidate_key| {
+            let distance = levenshtein(candidate_key, &local_key);
+            let max_distance =
+                candidate_key.len().max(local_key.len()) / config.levenshtein_divisor.max(1);
+            (candidate_key, distance, max_distance)
+        })
+        .filter(|(_, distance, max_distance)| distance <= max_distance)
+        .min_by_key(|(_, distance, _)| *distance)
+        .map(|(_, distance, _)| ReverseLookupScore {
+            source: if key.metadata.season.is_some() || key.metadata.episode.is_some() {
+                ReverseLookupSource::ParsedKey
+            } else {
+                ReverseLookupSource::FuzzyTitle
+            },
+            distance,
+        })
+}
+
+fn reverse_lookup_order(
+    left: &ReverseLookupCandidate,
+    right: &ReverseLookupCandidate,
+) -> std::cmp::Ordering {
+    source_rank(&left.local_item)
+        .cmp(&source_rank(&right.local_item))
+        .then_with(|| left.source.cmp(&right.source))
+        .then_with(|| left.distance.cmp(&right.distance))
+        .then_with(|| right.local_files.len().cmp(&left.local_files.len()))
+        .then_with(|| {
+            left.local_item
+                .display_name
+                .as_str()
+                .cmp(right.local_item.display_name.as_str())
+        })
+}
+
+fn source_rank(item: &LocalItem) -> u8 {
+    match item.source {
+        LocalItemSource::Client { .. } => 0,
+        LocalItemSource::TorrentCache { .. } => 1,
+        LocalItemSource::DataRoot { .. } => 2,
+        LocalItemSource::Virtual { .. } => 3,
+    }
+}
+
+fn dedupe_reverse_lookup(candidates: Vec<ReverseLookupCandidate>) -> Vec<ReverseLookupCandidate> {
+    let mut seen = HashSet::<String>::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(reverse_lookup_signature(candidate)))
+        .collect()
+}
+
+fn reverse_lookup_signature(candidate: &ReverseLookupCandidate) -> String {
+    let mut sizes = candidate
+        .local_files
+        .iter()
+        .map(|file| file.size.get())
+        .collect::<Vec<_>>();
+    sizes.sort_unstable();
+    let client = match &candidate.local_item.source {
+        LocalItemSource::Client { client_host, .. } => client_host.as_str(),
+        _ => "",
+    };
+    format!(
+        "{}|{}|{}|{}|{:?}",
+        normalize_lookup_title(candidate.local_item.title.as_str()),
+        candidate.local_item.total_size.get(),
+        candidate.local_files.len(),
+        client,
+        sizes
+    )
+}
+
+fn parsed_candidate_metadata(title: &str) -> ParsedSearchMetadata {
+    let episode = parse_episode_metadata(title);
+    if episode.episode.is_some() {
+        episode
+    } else {
+        parse_season_metadata(title)
+    }
+}
+
+fn strip_wrapped_metadata(title: &str) -> String {
+    wrapped_metadata_regex()
+        .replace_all(title, " ")
+        .trim()
+        .to_owned()
+}
+
+fn normalize_lookup_title(value: &str) -> String {
+    let stripped = strip_wrapped_metadata(value);
+    stripped
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| !is_lookup_noise_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_lookup_noise_token(token: &str) -> bool {
+    matches!(
+        token,
+        "480p"
+            | "576p"
+            | "720p"
+            | "1080p"
+            | "2160p"
+            | "web"
+            | "webdl"
+            | "webrip"
+            | "bluray"
+            | "bdrip"
+            | "brrip"
+            | "hdtv"
+            | "dvdrip"
+            | "remux"
+            | "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "av1"
+            | "aac"
+            | "dts"
+            | "proper"
+            | "repack"
+    )
+}
+
+fn episode_or_season_token(token: &str) -> bool {
+    episode_token_regex().is_match(token) || season_token_regex().is_match(token)
+}
+
+fn episode_token_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"^s\d{1,2}e\d{1,3}$").expect("episode token regex"))
+}
+
+fn season_token_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"^s\d{1,2}$").expect("season token regex"))
+}
+
+fn wrapped_metadata_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"[\[(][^\])]+[\])]").expect("metadata regex should compile"))
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    if left == right {
+        return 0;
+    }
+    if left.is_empty() {
+        return right.len();
+    }
+    if right.is_empty() {
+        return left.len();
+    }
+
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_char != *right_char);
+            let insertion = current[right_index] + 1;
+            let deletion = previous[right_index + 1] + 1;
+            current[right_index + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right_chars.len()]
+}
+
+fn assessment_needs_torrent_download(assessment: &PersistedCandidateAssessment) -> bool {
+    matches!(
+        assessment,
+        PersistedCandidateAssessment::NeedsTorrentDownload { .. }
+    )
+}
+
+fn assessment_is_already_present(assessment: &PersistedCandidateAssessment) -> bool {
+    matches!(
+        assessment,
+        PersistedCandidateAssessment::Rejected {
+            assessment: CandidateAssessment {
+                reason: DecisionReason::SameInfoHash | DecisionReason::InfoHashAlreadyExists,
+                ..
+            },
+            ..
+        }
+    )
+}
+
+fn assessment_is_actionable(assessment: &PersistedCandidateAssessment) -> bool {
+    matches!(
+        assessment,
+        PersistedCandidateAssessment::Assessed {
+            assessment: CandidateAssessment {
+                decision: MatchDecision::Exact | MatchDecision::SizeOnly | MatchDecision::Partial,
+                ..
+            },
+            ..
+        }
+    )
+}
+
+fn better_failure(
+    current: Option<(LocalItem, PersistedCandidateAssessment)>,
+    local_item: LocalItem,
+    assessment: PersistedCandidateAssessment,
+) -> Option<(LocalItem, PersistedCandidateAssessment)> {
+    let Some((current_item, current_assessment)) = current else {
+        return Some((local_item, assessment));
+    };
+    if assessment_failure_rank(&assessment) < assessment_failure_rank(&current_assessment) {
+        Some((local_item, assessment))
+    } else {
+        Some((current_item, current_assessment))
+    }
+}
+
+fn assessment_failure_rank(assessment: &PersistedCandidateAssessment) -> (u8, u64) {
+    match assessment {
+        PersistedCandidateAssessment::Assessed { assessment, .. }
+        | PersistedCandidateAssessment::Rejected { assessment, .. } => {
+            let ratio = assessment
+                .matched_ratio
+                .map(|ratio| (ratio.get() * 1_000_000.0) as u64)
+                .unwrap_or(0);
+            (decision_failure_rank(assessment.decision), u64::MAX - ratio)
+        }
+        PersistedCandidateAssessment::NeedsTorrentDownload { .. } => (0, 0),
+    }
+}
+
+fn decision_failure_rank(decision: MatchDecision) -> u8 {
+    match decision {
+        MatchDecision::Exact | MatchDecision::SizeOnly | MatchDecision::Partial => 0,
+        MatchDecision::NoMatch => 1,
+        MatchDecision::Rejected => 2,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1390,8 +1983,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        CandidateGuid, DisplayName, DownloadUrl, FileIndex, InfoHash, ItemTitle, LocalItem,
-        MediaType, SourceKey, TrackerName,
+        CandidateGuid, ClientHost, DisplayName, DownloadUrl, FileIndex, InfoHash, ItemTitle,
+        LocalItem, MediaType, SourceKey, TrackerName,
     };
     use crate::indexers::{CategoryCaps, SearchCaps, TorznabLimits};
     use crate::persistence::repository::Repository;
@@ -2118,6 +2711,130 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reverse_lookup_uses_parsed_keys_filters_dedupes_and_sorts() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let client = local_item(
+            LocalItemSource::Client {
+                client_host: ClientHost::new("qbit.local").unwrap(),
+                source_key: SourceKey::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            },
+            "Example Show S01E02",
+            MediaType::Episode,
+            20,
+        );
+        let data = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/example-show-s01e02"),
+            },
+            "Example Show S01E02",
+            MediaType::Episode,
+            20,
+        );
+        let duplicate_data = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/example-show-s01e02-copy"),
+            },
+            "Example Show S01E02",
+            MediaType::Episode,
+            20,
+        );
+        let blocked = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/blocked-show-s01e02"),
+            },
+            "Blocked Show S01E02",
+            MediaType::Episode,
+            20,
+        );
+        let files = vec![
+            local_file("Example.Show.S01E02/a.mkv", 10, 0),
+            local_file("Example.Show.S01E02/b.mkv", 10, 1),
+        ];
+        insert_local(&repository, &client, &files).await;
+        insert_local(&repository, &data, &files).await;
+        insert_local(&repository, &duplicate_data, &files).await;
+        insert_local(&repository, &blocked, &files).await;
+        let mut config = ReverseLookupConfig::default();
+        config.content_filter.include_single_episodes = true;
+        config.content_filter.blocklist = vec![BlocklistRule::NameSubstring("Blocked".to_owned())];
+        let candidate =
+            remote_candidate("guid-reverse", "Example.Show.S01E02.1080p.WEB-DL-GRP", None);
+
+        let matches = reverse_lookup_candidates(
+            &repository,
+            &candidate,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(2, matches.len());
+        assert!(matches[0].distance <= matches[1].distance);
+        assert!(matches!(
+            matches[0].local_item.source,
+            LocalItemSource::Client { .. }
+        ));
+        assert!(
+            matches
+                .iter()
+                .all(|found| !found.local_item.display_name.as_str().contains("Blocked"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_stops_on_already_present_hash() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let mut local = data_root_item();
+        local.info_hash = Some(info_hash.clone());
+        insert_local(&repository, &local, &[local_file("movie.mkv", 10, 0)]).await;
+        let mut candidate = remote_candidate("guid-same", "Example", None);
+        candidate.info_hash = Some(info_hash);
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &ReverseLookupConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReverseLookupOutcome::AlreadyPresent { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_returns_best_failure_after_cached_assessment() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("reverse-cache");
+        let cache_path = write_cache_file(&cache_dir, "candidate.torrent", test_torrent_bytes());
+        let local = data_root_item();
+        insert_local(&repository, &local, &[local_file("movie.mkv", 8, 0)]).await;
+        let candidate = remote_candidate("guid-failure", "Example", Some(cache_path));
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &ReverseLookupConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, ReverseLookupOutcome::BestFailure { .. }));
+
+        fs::remove_dir_all(cache_dir).unwrap();
+    }
+
     #[test]
     fn exact_match_requires_paths_and_sizes_for_real_items() {
         let local_item = data_root_item();
@@ -2394,6 +3111,37 @@ mod tests {
             total_size: ByteSize::new(10),
             mtime_ms: Some(1_700_000_000_000),
         }
+    }
+
+    fn local_item(
+        source: LocalItemSource,
+        title: &str,
+        media_type: MediaType,
+        total_size: u64,
+    ) -> LocalItem {
+        LocalItem {
+            id: None,
+            source,
+            title: ItemTitle::new(title).unwrap(),
+            display_name: DisplayName::new(title).unwrap(),
+            media_type,
+            info_hash: None,
+            path: Some(PathBuf::from("/media/example")),
+            save_path: None,
+            total_size: ByteSize::new(total_size),
+            mtime_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    async fn insert_local(
+        repository: &Repository,
+        item: &LocalItem,
+        files: &[LocalFile],
+    ) -> crate::domain::LocalItemId {
+        repository
+            .upsert_local_item_with_files(item, files)
+            .await
+            .unwrap()
     }
 
     fn all_caps() -> TorznabCaps {

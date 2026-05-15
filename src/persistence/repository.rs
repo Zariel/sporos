@@ -10,8 +10,9 @@ use crate::announce::{
 };
 use crate::domain::{
     ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyName, DependencyState,
-    FileIndex, IndexerId, InfoHash, JobName, JobState, LocalFile, LocalItem, LocalItemId,
-    LocalItemSource, MatchDecision, MediaType, ReasonText, RemoteCandidate, RemoteCandidateId,
+    DisplayName, FileIndex, IndexerId, InfoHash, ItemTitle, JobName, JobState, LocalFile,
+    LocalItem, LocalItemId, LocalItemSource, MatchDecision, MediaType, ReasonText, RemoteCandidate,
+    RemoteCandidateId, SourceKey,
 };
 use crate::errors::DatabaseError;
 use crate::indexers::{ConfiguredTorznabIndexer, TorznabCaps};
@@ -345,6 +346,81 @@ impl Repository {
             upserted: items.len(),
             pruned,
         })
+    }
+
+    pub async fn local_items_by_info_hash(
+        &self,
+        info_hash: &InfoHash,
+        limit: u16,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_type, source_key, title, display_name, media_type,
+                   info_hash, path, save_path, total_size, mtime_ms
+            FROM local_items
+            WHERE info_hash = ?
+            ORDER BY source_type, source_key
+            LIMIT ?
+            "#,
+        )
+        .bind(info_hash.as_str())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local items by info hash", error))?;
+
+        rows.into_iter().map(local_item_from_row).collect()
+    }
+
+    pub async fn local_items_by_media_type(
+        &self,
+        media_type: MediaType,
+        limit: u16,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_type, source_key, title, display_name, media_type,
+                   info_hash, path, save_path, total_size, mtime_ms
+            FROM local_items
+            WHERE media_type = ?
+            ORDER BY title, source_type, source_key
+            LIMIT ?
+            "#,
+        )
+        .bind(media_type_key(media_type))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local items by media type", error))?;
+
+        rows.into_iter().map(local_item_from_row).collect()
+    }
+
+    pub async fn local_items_by_media_type_and_title_token(
+        &self,
+        media_type: MediaType,
+        title_token: &str,
+        limit: u16,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_type, source_key, title, display_name, media_type,
+                   info_hash, path, save_path, total_size, mtime_ms
+            FROM local_items
+            WHERE media_type = ?
+              AND title LIKE '%' || ? || '%'
+            ORDER BY title, source_type, source_key
+            LIMIT ?
+            "#,
+        )
+        .bind(media_type_key(media_type))
+        .bind(title_token)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local items by media type and title", error))?;
+
+        rows.into_iter().map(local_item_from_row).collect()
     }
 
     pub async fn local_files_for_item(
@@ -2520,6 +2596,107 @@ fn local_file_snapshot_from_row(
         mtime_ms: row.get("mtime_ms"),
         file_index: file_index_from_i64(row.get("file_index"), "local file index")?,
     })
+}
+
+fn local_item_from_row(row: sqlx::sqlite::SqliteRow) -> Result<LocalItem, DatabaseError> {
+    let id = id_from_i64(row.get("id"), "local item id")?;
+    let source_type: String = row.get("source_type");
+    let source_key: String = row.get("source_key");
+    let info_hash = row
+        .get::<Option<String>, _>("info_hash")
+        .map(InfoHash::new)
+        .transpose()
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: "read local item info hash".to_owned(),
+            message: error.to_string(),
+        })?;
+
+    Ok(LocalItem {
+        id: Some(id),
+        source: local_item_source_from_row(&source_type, &source_key)?,
+        title: ItemTitle::new(row.get::<String, _>("title")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read local item title".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        display_name: DisplayName::new(row.get::<String, _>("display_name")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read local item display name".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        media_type: media_type_from_key(row.get::<String, _>("media_type").as_str())?,
+        info_hash,
+        path: row.get::<Option<String>, _>("path").map(PathBuf::from),
+        save_path: row.get::<Option<String>, _>("save_path").map(PathBuf::from),
+        total_size: byte_size_from_i64(row.get("total_size"), "local item total size")?,
+        mtime_ms: row.get("mtime_ms"),
+    })
+}
+
+fn local_item_source_from_row(
+    source_type: &str,
+    source_key: &str,
+) -> Result<LocalItemSource, DatabaseError> {
+    match source_type {
+        "client" => {
+            let Some((client_host, source_key)) = source_key.split_once(':') else {
+                return Err(DatabaseError::QueryFailed {
+                    operation: "read local item client source".to_owned(),
+                    message: "client source key is missing host separator".to_owned(),
+                });
+            };
+            Ok(LocalItemSource::Client {
+                client_host: ClientHost::new(client_host).map_err(|error| {
+                    DatabaseError::QueryFailed {
+                        operation: "read local item client host".to_owned(),
+                        message: error.to_string(),
+                    }
+                })?,
+                source_key: SourceKey::new(source_key).map_err(|error| {
+                    DatabaseError::QueryFailed {
+                        operation: "read local item source key".to_owned(),
+                        message: error.to_string(),
+                    }
+                })?,
+            })
+        }
+        "torrent_cache" => Ok(LocalItemSource::TorrentCache {
+            path: PathBuf::from(source_key),
+        }),
+        "data_root" => Ok(LocalItemSource::DataRoot {
+            path: PathBuf::from(source_key),
+        }),
+        "virtual" => Ok(LocalItemSource::Virtual {
+            source_key: SourceKey::new(source_key).map_err(|error| DatabaseError::QueryFailed {
+                operation: "read virtual item source key".to_owned(),
+                message: error.to_string(),
+            })?,
+        }),
+        _ => Err(DatabaseError::QueryFailed {
+            operation: "read local item source type".to_owned(),
+            message: format!("unsupported local item source type {source_type}"),
+        }),
+    }
+}
+
+fn media_type_from_key(value: &str) -> Result<MediaType, DatabaseError> {
+    match value {
+        "episode" => Ok(MediaType::Episode),
+        "season_pack" => Ok(MediaType::SeasonPack),
+        "movie" => Ok(MediaType::Movie),
+        "anime" => Ok(MediaType::Anime),
+        "video" => Ok(MediaType::Video),
+        "audio" => Ok(MediaType::Audio),
+        "book" => Ok(MediaType::Book),
+        "archive" => Ok(MediaType::Archive),
+        "unknown" => Ok(MediaType::Unknown),
+        _ => Err(DatabaseError::QueryFailed {
+            operation: "read local item media type".to_owned(),
+            message: format!("unsupported media type {value}"),
+        }),
+    }
 }
 
 fn remote_candidate_snapshot_from_row(
