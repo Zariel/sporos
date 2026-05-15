@@ -699,6 +699,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_resumes_durable_work_after_repository_restart() {
+        let root = unique_temp_dir("announce-restart");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+        insert_work(&repository, "ann_22", "guid-22", 1).await;
+        repository
+            .claim_announce_work("old-worker", 2, 3, 1)
+            .await
+            .unwrap();
+        drop(repository);
+
+        let restarted = Repository::connect(&database).await.unwrap();
+        let worker = AnnounceWorker::new(restarted.clone(), "worker-1", &test_config()).unwrap();
+
+        let startup = worker.recover_startup(4).await.unwrap();
+        let claimed = worker.claim_ready(4).await.unwrap();
+        assert!(
+            worker
+                .complete(
+                    &claimed[0],
+                    AnnounceWorkOutcome::Succeeded {
+                        reason: AnnounceReason::Saved,
+                        outcome: "saved".to_owned(),
+                    },
+                    5,
+                )
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            AnnounceStartupSummary {
+                expired: 0,
+                recovered_leases: 1,
+            },
+            startup
+        );
+        assert_eq!(vec![AnnounceWorkId::new("ann_22").unwrap()], claimed);
+        assert_eq!(
+            vec![("succeeded".to_owned(), "saved".to_owned())],
+            status_rows(&restarted).await
+        );
+
+        drop(worker);
+        drop(restarted);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn worker_renews_active_leases() {
         let repository = Repository::connect_in_memory().await.unwrap();
         insert_work(&repository, "ann_30", "guid-30", 1).await;
@@ -1105,5 +1154,15 @@ mod tests {
             .fetch_one(repository.pool())
             .await
             .unwrap()
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("sporos-announce-test-{label}-{nanos}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 }
