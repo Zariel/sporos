@@ -119,24 +119,20 @@ impl InventoryRefreshWorker {
                 .map_err(|error| InventoryRefreshError::ScanWorkerFailed {
                     message: error.to_string(),
                 })?;
-        let batches = scan_report
-            .items
-            .iter()
-            .map(|scanned| LocalItemFileBatch {
-                item: &scanned.item,
-                files: &scanned.files,
-            })
-            .collect::<Vec<_>>();
+        let scanned_items = scan_report.items.len();
         let LocalInventoryReplaceSummary { upserted, pruned } = self
             .repository
-            .replace_local_inventory(LocalInventoryScope::DataRoot, &batches)
+            .replace_local_inventory_stream(
+                LocalInventoryScope::DataRoot,
+                scan_report.items.iter().map(local_item_file_batch),
+            )
             .await?;
         self.repository
             .wake_announce_inventory_refresh(unix_time_ms(), 1_000)
             .await?;
 
         Ok(InventoryRefreshSummary {
-            scanned_items: scan_report.items.len(),
+            scanned_items,
             persisted_items: upserted,
             pruned_items: pruned,
             scan_failures: scan_report.failures,
@@ -153,20 +149,13 @@ impl InventoryRefreshWorker {
             client_host = %client_host,
             item_count = items.len()
         );
-        let batches = items
-            .iter()
-            .map(|scanned| LocalItemFileBatch {
-                item: &scanned.item,
-                files: &scanned.files,
-            })
-            .collect::<Vec<_>>();
         let LocalInventoryReplaceSummary { upserted, pruned } = self
             .repository
-            .replace_local_inventory(
+            .replace_local_inventory_stream(
                 LocalInventoryScope::Client {
                     client_host: client_host.clone(),
                 },
-                &batches,
+                items.iter().map(local_item_file_batch),
             )
             .await?;
         self.repository
@@ -179,6 +168,13 @@ impl InventoryRefreshWorker {
             pruned_items: pruned,
             scan_failures: Vec::new(),
         })
+    }
+}
+
+fn local_item_file_batch(scanned: &ScannedLocalItem) -> LocalItemFileBatch<'_> {
+    LocalItemFileBatch {
+        item: &scanned.item,
+        files: &scanned.files,
     }
 }
 
@@ -438,7 +434,7 @@ mod tests {
                 .await
                 .unwrap();
         let qbit_a_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM local_items WHERE source_type = 'client' AND source_key LIKE 'qbit-a.local:%'",
+            "SELECT COUNT(*) FROM local_items WHERE source_type = 'client' AND source_key LIKE '12:qbit-a.local:%'",
         )
         .fetch_one(repository.pool())
         .await
@@ -544,11 +540,139 @@ mod tests {
         assert_eq!(1, summary.persisted_items);
         assert_eq!("client", source_type);
         assert_eq!(
-            "qbit.local:0123456789abcdef0123456789abcdef01234567",
+            "10:qbit.local:0123456789abcdef0123456789abcdef01234567",
             source_key
         );
         assert_eq!("/downloads", save_path);
         assert_eq!(42, total_size);
+    }
+
+    #[tokio::test]
+    async fn refresh_client_items_keeps_colon_host_scopes_distinct() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let host_base = ClientHost::new("rtorrent").unwrap();
+        let host_port = ClientHost::new("rtorrent:5000").unwrap();
+        let base_item = client_item(
+            host_base.clone(),
+            "0123456789abcdef0123456789abcdef01234567",
+            "Base",
+            "Base/file-a.mkv",
+            10,
+        );
+        let port_item = client_item(
+            host_port.clone(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Port",
+            "Port/file-b.mkv",
+            20,
+        );
+
+        worker
+            .refresh_client_items(host_base.clone(), &[base_item.clone()])
+            .await
+            .unwrap();
+        worker
+            .refresh_client_items(host_port, &[port_item])
+            .await
+            .unwrap();
+        let summary = worker.refresh_client_items(host_base, &[]).await.unwrap();
+
+        let rows = repository
+            .local_items_by_media_type(MediaType::Movie, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.pruned_items);
+        assert_eq!(1, rows.len());
+        match &rows[0].source {
+            LocalItemSource::Client { client_host, .. } => {
+                assert_eq!("rtorrent:5000", client_host.as_str());
+            }
+            source => panic!("expected client source, got {source:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_client_items_normalizes_and_prunes_legacy_client_keys() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        insert_legacy_client_item(
+            &repository,
+            "qbit.local:0123456789abcdef0123456789abcdef01234567",
+            "Legacy Qbit",
+        )
+        .await;
+        insert_legacy_client_item(
+            &repository,
+            "rtorrent:5000:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Legacy Port",
+        )
+        .await;
+
+        let summary = worker
+            .refresh_client_items(ClientHost::new("qbit.local").unwrap(), &[])
+            .await
+            .unwrap();
+        let rows = repository
+            .local_items_by_media_type(MediaType::Movie, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.pruned_items);
+        assert_eq!(1, rows.len());
+        match &rows[0].source {
+            LocalItemSource::Client { client_host, .. } => {
+                assert_eq!("rtorrent:5000", client_host.as_str());
+            }
+            source => panic!("expected client source, got {source:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_client_items_persists_large_inventory_with_pruning() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let client_host = ClientHost::new("qbit-large.local").unwrap();
+        let items = (0..1_500)
+            .map(|index| {
+                client_item(
+                    client_host.clone(),
+                    &format!("{:040x}", index + 1),
+                    &format!("Large {index}"),
+                    &format!("Large/file-{index:04}.mkv"),
+                    index as u64 + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let first_summary = worker
+            .refresh_client_items(client_host.clone(), &items)
+            .await
+            .unwrap();
+        let second_summary = worker
+            .refresh_client_items(client_host, &items[..1_024])
+            .await
+            .unwrap();
+
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let file_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_files")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(1_500, first_summary.persisted_items);
+        assert_eq!(0, first_summary.pruned_items);
+        assert_eq!(1_024, second_summary.persisted_items);
+        assert_eq!(476, second_summary.pruned_items);
+        assert_eq!(1_024, item_count);
+        assert_eq!(1_024, file_count);
     }
 
     fn write_file(path: &std::path::Path, bytes: usize) {
@@ -650,6 +774,30 @@ mod tests {
         .bind(dependency_kind)
         .bind(dependency_name)
         .bind(id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn insert_legacy_client_item(repository: &Repository, source_key: &str, title: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO local_items (
+                source_type,
+                source_key,
+                title,
+                display_name,
+                media_type,
+                total_size,
+                created_at,
+                updated_at
+            )
+            VALUES ('client', ?, ?, ?, 'movie', 1, 1, 1)
+            "#,
+        )
+        .bind(source_key)
+        .bind(title)
+        .bind(title)
         .execute(repository.pool())
         .await
         .unwrap();

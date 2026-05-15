@@ -87,7 +87,8 @@ impl LocalInventoryScope {
     fn accepts(&self, source_type: &str, source_key: &str) -> bool {
         match self {
             Self::Client { client_host } => {
-                source_type == "client" && source_key.starts_with(&format!("{client_host}:"))
+                source_type == "client"
+                    && source_key.starts_with(&client_source_key_prefix(client_host))
             }
             Self::DataRoot => source_type == "data_root",
             Self::TorrentCache => source_type == "torrent_cache",
@@ -106,7 +107,7 @@ impl LocalInventoryScope {
 
     fn source_key_prefix(&self) -> Option<String> {
         match self {
-            Self::Client { client_host } => Some(format!("{client_host}:")),
+            Self::Client { client_host } => Some(client_source_key_prefix(client_host)),
             Self::DataRoot | Self::TorrentCache | Self::Virtual => None,
         }
     }
@@ -309,19 +310,32 @@ impl Repository {
         scope: LocalInventoryScope,
         items: &[LocalItemFileBatch<'_>],
     ) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
-        let _span = info_span!(
-            "inventory.replace",
-            source_type = scope.source_type(),
-            item_count = items.len()
-        );
+        self.replace_local_inventory_stream(scope, items.iter().copied())
+            .await
+    }
+
+    pub async fn replace_local_inventory_stream<'a, I>(
+        &self,
+        scope: LocalInventoryScope,
+        items: I,
+    ) -> Result<LocalInventoryReplaceSummary, DatabaseError>
+    where
+        I: IntoIterator<Item = LocalItemFileBatch<'a>> + Send,
+        I::IntoIter: Send,
+    {
+        let _span = info_span!("inventory.replace", source_type = scope.source_type());
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(|error| db_error("begin local inventory transaction", error))?;
 
+        if let LocalInventoryScope::Client { client_host } = &scope {
+            normalize_client_source_keys(&mut transaction, client_host).await?;
+        }
         initialize_retained_keys(&mut transaction).await?;
 
+        let mut upserted = 0usize;
         for batch in items {
             let (source_type, source_key) = local_source(&batch.item.source);
             if !scope.accepts(&source_type, &source_key) {
@@ -334,6 +348,7 @@ impl Repository {
             upsert_local_item_with_files_in_transaction(&mut transaction, batch.item, batch.files)
                 .await?;
             insert_retained_key(&mut transaction, &source_key).await?;
+            upserted = upserted.saturating_add(1);
         }
 
         let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
@@ -344,10 +359,7 @@ impl Repository {
             .await
             .map_err(|error| db_error("commit local inventory transaction", error))?;
 
-        Ok(LocalInventoryReplaceSummary {
-            upserted: items.len(),
-            pruned,
-        })
+        Ok(LocalInventoryReplaceSummary { upserted, pruned })
     }
 
     pub async fn local_items_by_info_hash(
@@ -2295,7 +2307,10 @@ fn local_source(source: &LocalItemSource) -> (String, String) {
         LocalItemSource::Client {
             client_host,
             source_key,
-        } => ("client".to_owned(), format!("{client_host}:{source_key}")),
+        } => (
+            "client".to_owned(),
+            client_source_key(client_host, source_key),
+        ),
         LocalItemSource::TorrentCache { path } => {
             ("torrent_cache".to_owned(), path_to_string(path))
         }
@@ -2479,7 +2494,7 @@ async fn prune_local_items_not_retained(
             r#"
             DELETE FROM local_items
             WHERE source_type = ?
-              AND substr(source_key, 1, ?) = ?
+              AND instr(source_key, ?) = 1
               AND NOT EXISTS (
                   SELECT 1
                   FROM retained_local_item_keys retained
@@ -2488,12 +2503,6 @@ async fn prune_local_items_not_retained(
             "#,
         )
         .bind(scope.source_type())
-        .bind(
-            i64::try_from(prefix.len()).map_err(|error| DatabaseError::QueryFailed {
-                operation: "convert source key prefix length".to_owned(),
-                message: error.to_string(),
-            })?,
-        )
         .bind(prefix)
         .execute(&mut **transaction)
         .await
@@ -2516,6 +2525,72 @@ async fn prune_local_items_not_retained(
     .map_err(|error| db_error("prune missing local inventory", error))?;
 
     Ok(result.rows_affected())
+}
+
+async fn normalize_client_source_keys(
+    transaction: &mut Transaction<'_, Sqlite>,
+    client_host: &ClientHost,
+) -> Result<(), DatabaseError> {
+    let encoded_prefix = client_source_key_prefix(client_host);
+    let rows = sqlx::query(
+        r#"
+        SELECT id, source_key
+        FROM local_items
+        WHERE source_type = 'client'
+        "#,
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| db_error("read client inventory source keys", error))?;
+
+    for row in rows {
+        let id: i64 = row.get("id");
+        let old_source_key: String = row.get("source_key");
+        if old_source_key.starts_with(&encoded_prefix) {
+            continue;
+        }
+        let Some((row_client_host, row_source_key)) = parse_client_source_key(&old_source_key)
+        else {
+            continue;
+        };
+        if row_client_host != client_host.as_str() {
+            continue;
+        }
+
+        let row_source_key =
+            SourceKey::new(row_source_key).map_err(|error| DatabaseError::QueryFailed {
+                operation: "normalize client inventory source key".to_owned(),
+                message: error.to_string(),
+            })?;
+        let new_source_key = client_source_key(client_host, &row_source_key);
+        if new_source_key == old_source_key {
+            continue;
+        }
+
+        let existing_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM local_items WHERE source_type = 'client' AND source_key = ?",
+        )
+        .bind(&new_source_key)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|error| db_error("read normalized client inventory source key", error))?;
+        if matches!(existing_id, Some(existing_id) if existing_id != id) {
+            sqlx::query("DELETE FROM local_items WHERE id = ?")
+                .bind(id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|error| db_error("delete duplicate legacy client inventory", error))?;
+        } else {
+            sqlx::query("UPDATE local_items SET source_key = ? WHERE id = ?")
+                .bind(new_source_key)
+                .bind(id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|error| db_error("normalize legacy client inventory source key", error))?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn clear_retained_keys(
@@ -2729,7 +2804,7 @@ fn local_item_source_from_row(
 ) -> Result<LocalItemSource, DatabaseError> {
     match source_type {
         "client" => {
-            let Some((client_host, source_key)) = source_key.split_once(':') else {
+            let Some((client_host, source_key)) = parse_client_source_key(source_key) else {
                 return Err(DatabaseError::QueryFailed {
                     operation: "read local item client source".to_owned(),
                     message: "client source key is missing host separator".to_owned(),
@@ -2767,6 +2842,34 @@ fn local_item_source_from_row(
             message: format!("unsupported local item source type {source_type}"),
         }),
     }
+}
+
+fn client_source_key(client_host: &ClientHost, source_key: &SourceKey) -> String {
+    format!(
+        "{}:{}:{}",
+        client_host.as_str().len(),
+        client_host.as_str(),
+        source_key.as_str()
+    )
+}
+
+fn client_source_key_prefix(client_host: &ClientHost) -> String {
+    format!("{}:{}:", client_host.as_str().len(), client_host.as_str())
+}
+
+fn parse_client_source_key(source_key: &str) -> Option<(&str, &str)> {
+    if let Some((host_len, rest)) = source_key.split_once(':')
+        && let Ok(host_len) = host_len.parse::<usize>()
+        && let Some(client_host) = rest.get(..host_len)
+        && let Some(after_host) = rest.get(host_len..)
+        && let Some(source_key) = after_host.strip_prefix(':')
+        && !client_host.is_empty()
+        && !source_key.is_empty()
+    {
+        return Some((client_host, source_key));
+    }
+
+    source_key.rsplit_once(':')
 }
 
 fn media_type_from_key(value: &str) -> Result<MediaType, DatabaseError> {
