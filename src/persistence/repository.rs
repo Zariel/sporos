@@ -393,6 +393,41 @@ impl Repository {
         rows.into_iter().map(local_item_from_row).collect()
     }
 
+    pub async fn local_items_by_info_hash_and_media_types(
+        &self,
+        info_hash: &InfoHash,
+        media_types: &[MediaType],
+        limit: u16,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
+        if media_types.is_empty() {
+            return self.local_items_by_info_hash(info_hash, limit).await;
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT id, source_type, source_key, title, display_name, media_type,
+                   info_hash, path, save_path, total_size, mtime_ms
+            FROM local_items
+            WHERE info_hash =
+            "#,
+        );
+        query.push_bind(info_hash.as_str());
+        query.push(" AND media_type IN (");
+        let mut separated = query.separated(", ");
+        for media_type in media_types {
+            separated.push_bind(media_type_key(*media_type));
+        }
+        separated.push_unseparated(") ORDER BY source_type, source_key LIMIT ");
+        query.push_bind(i64::from(limit));
+
+        let rows =
+            query.build().fetch_all(&self.pool).await.map_err(|error| {
+                db_error("lookup local items by info hash and media type", error)
+            })?;
+
+        rows.into_iter().map(local_item_from_row).collect()
+    }
+
     pub async fn local_items_by_media_type(
         &self,
         media_type: MediaType,

@@ -498,13 +498,27 @@ pub async fn reverse_lookup_candidates(
     context: ContentFilterContext,
     config: &ReverseLookupConfig,
 ) -> Result<Vec<ReverseLookupCandidate>, ReverseLookupError> {
+    reverse_lookup_candidates_for_media_types(repository, candidate, context, config, &[]).await
+}
+
+pub async fn reverse_lookup_candidates_for_media_types(
+    repository: &Repository,
+    candidate: &RemoteCandidate,
+    context: ContentFilterContext,
+    config: &ReverseLookupConfig,
+    media_types: &[MediaType],
+) -> Result<Vec<ReverseLookupCandidate>, ReverseLookupError> {
     let mut lookup = Vec::new();
     let mut seen = HashSet::<LocalItemId>::new();
     let mut accepted_signature_indexes = HashMap::<String, usize>::new();
 
     if let Some(info_hash) = candidate.info_hash.as_ref() {
         let items = repository
-            .local_items_by_info_hash(info_hash, config.max_local_candidates)
+            .local_items_by_info_hash_and_media_types(
+                info_hash,
+                media_types,
+                config.max_local_candidates,
+            )
             .await?;
         add_lookup_items(
             repository,
@@ -521,7 +535,14 @@ pub async fn reverse_lookup_candidates(
     }
 
     let key = ReverseLookupKey::from_title(candidate.title.as_str());
-    for media_type in key.media_types() {
+    let default_media_types;
+    let media_types = if media_types.is_empty() {
+        default_media_types = key.media_types();
+        default_media_types.as_slice()
+    } else {
+        media_types
+    };
+    for media_type in media_types.iter().copied() {
         let scored = scored_lookup_items(repository, media_type, &key, config).await?;
         let target_len = accepted_signature_indexes
             .len()

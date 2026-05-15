@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS local_items (
 CREATE INDEX IF NOT EXISTS idx_local_items_info_hash
     ON local_items (info_hash)
     WHERE info_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_local_items_info_hash_media_type
+    ON local_items (info_hash, media_type)
+    WHERE info_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_local_items_media_title
     ON local_items (media_type, title);
 CREATE INDEX IF NOT EXISTS idx_local_items_updated_at
