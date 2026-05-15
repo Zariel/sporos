@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::config::{CONFIG_SCHEMA, DEFAULT_CONFIG_PATH, load_config};
+use crate::runtime::daemon;
 
 #[derive(Debug, Parser)]
 #[command(name = "sporos", about = "Sporos torrent automation service")]
@@ -31,11 +32,14 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
     match cli.command {
         Command::Serve { config } => {
             let loaded = load_config(&config).map_err(|error| error.to_string())?;
-            Ok(format!(
-                "sporos serve configuration loaded from {} for {} torrent client(s)",
-                config.display(),
-                loaded.torrent_clients.len()
-            ))
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime
+                .block_on(daemon::serve(loaded))
+                .map_err(|error| error.to_string())?;
+            Ok(String::new())
         }
         Command::CheckConfig { config } => {
             load_config(&config).map_err(|error| error.to_string())?;
@@ -108,22 +112,6 @@ mod tests {
 
         assert!(error.contains("unknown field"));
         assert!(error.contains("base_dir"));
-        remove_temp_config(config_path);
-    }
-
-    #[test]
-    fn serve_loads_config_without_daemonizing() {
-        let config_path = write_temp_config("");
-
-        let output = run([
-            OsString::from("sporos"),
-            OsString::from("serve"),
-            OsString::from("--config"),
-            config_path.clone().into_os_string(),
-        ])
-        .unwrap();
-
-        assert!(output.contains("sporos serve configuration loaded"));
         remove_temp_config(config_path);
     }
 
