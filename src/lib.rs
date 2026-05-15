@@ -12,6 +12,7 @@ pub mod inventory;
 pub mod inventory_refresh;
 pub mod matching;
 pub mod metrics;
+pub mod notifications;
 pub mod persistence;
 pub mod runtime;
 pub mod secrets;

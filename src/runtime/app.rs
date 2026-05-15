@@ -10,6 +10,7 @@ use crate::inventory::InventoryScanOptions;
 use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshWorker, inventory_refresh_queue,
 };
+use crate::notifications::{NotificationJob, notification_queue};
 use crate::persistence::repository::Repository;
 use crate::runtime::announce_worker::AnnounceWorker;
 use crate::runtime::health::HealthRegistry;
@@ -45,6 +46,7 @@ pub struct RuntimeQueues {
     pub workflow: WorkflowQueues,
     pub scheduler: crate::runtime::queue::BoundedWorkQueue<ScheduledJobRun>,
     pub inventory_refresh: crate::runtime::queue::BoundedWorkQueue<InventoryRefreshRequest>,
+    pub notifications: crate::runtime::queue::BoundedWorkQueue<NotificationJob>,
 }
 
 #[derive(Debug)]
@@ -54,6 +56,7 @@ pub struct RuntimeReceivers {
     pub jobs: WorkReceiver<JobRunWorkflowRequest>,
     pub scheduler: WorkReceiver<ScheduledJobRun>,
     pub inventory_refresh: WorkReceiver<InventoryRefreshRequest>,
+    pub notifications: WorkReceiver<NotificationJob>,
 }
 
 impl AppRuntime {
@@ -91,6 +94,8 @@ impl AppRuntime {
         let (scheduler_queue, scheduler_receiver) = scheduler_queue(queue_config.indexing_limit);
         let (inventory_queue, inventory_receiver) =
             inventory_refresh_queue(queue_config.indexing_limit);
+        let (notification_queue, notification_receiver) =
+            notification_queue(queue_config.notification_limit);
         let scheduler_config = SchedulerConfig::from_scheduling_config(&config.scheduling)
             .map_err(|error| DatabaseError::Unavailable {
                 operation: "build scheduler config".to_owned(),
@@ -121,6 +126,7 @@ impl AppRuntime {
             workflow: workflow.clone(),
             scheduler: scheduler_queue,
             inventory_refresh: inventory_queue,
+            notifications: notification_queue,
         };
         let http = HttpState::new(ReadinessState::ready(), health.clone())
             .with_workflow_queues(workflow)
@@ -146,6 +152,7 @@ impl AppRuntime {
                 jobs: workflow_receivers.jobs,
                 scheduler: scheduler_receiver,
                 inventory_refresh: inventory_receiver,
+                notifications: notification_receiver,
             },
         })
     }
@@ -212,6 +219,7 @@ mod tests {
         assert_eq!(0, runtime.state.queues.workflow.announcements.stats().depth);
         assert_eq!(0, runtime.state.queues.scheduler.stats().depth);
         assert_eq!(0, runtime.state.queues.inventory_refresh.stats().depth);
+        assert_eq!(0, runtime.state.queues.notifications.stats().depth);
         assert_eq!(
             crate::runtime::shutdown::ShutdownPhase::Running,
             runtime.state.shutdown.state().phase
