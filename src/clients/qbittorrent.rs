@@ -18,6 +18,7 @@ const MIN_QBIT_VERSION: QbitVersion = QbitVersion {
     patch: 1,
 };
 const QBIT_INVENTORY_PAGE_SIZE: usize = 500;
+const QBIT_RESPONSE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct QbittorrentClient {
@@ -287,10 +288,7 @@ impl QbittorrentClient {
                 request
             })
             .await?;
-        response
-            .text()
-            .await
-            .map_err(|error| unavailable(&self.client_name, error.to_string()))
+        read_client_text(response, &self.client_name, QBIT_RESPONSE_MAX_BYTES).await
     }
 
     async fn post_form(
@@ -547,6 +545,55 @@ fn success_response(
     }
 }
 
+async fn read_client_text(
+    mut response: reqwest::Response,
+    client: &str,
+    limit: u64,
+) -> Result<String, TorrentClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(TorrentClientError::BadResponse {
+            client: client.to_owned(),
+            message: format!("response exceeded {limit} bytes"),
+        });
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default(),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| unavailable(client, error.to_string()))?
+    {
+        if !append_limited_body_chunk(&mut body, &chunk, limit) {
+            return Err(TorrentClientError::BadResponse {
+                client: client.to_owned(),
+                message: format!("response exceeded {limit} bytes"),
+            });
+        }
+    }
+
+    String::from_utf8(body).map_err(|error| TorrentClientError::BadResponse {
+        client: client.to_owned(),
+        message: error.to_string(),
+    })
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], limit: u64) -> bool {
+    let next_len = body.len().saturating_add(chunk.len());
+    if u64::try_from(next_len).unwrap_or(u64::MAX) > limit {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
+}
+
 fn unavailable(client: &str, message: String) -> TorrentClientError {
     TorrentClientError::Unavailable {
         client: client.to_owned(),
@@ -558,11 +605,13 @@ fn unavailable(client: &str, message: String) -> TorrentClientError {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdTcpListener;
     use std::sync::{Arc, Mutex as StdMutex};
 
     use axum::Router;
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode as AxumStatusCode};
+    use axum::http::{HeaderValue, Request, StatusCode as AxumStatusCode, header::CONTENT_LENGTH};
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use tokio::net::TcpListener;
@@ -697,6 +746,58 @@ mod tests {
         assert!(seen.contains("/api/v2/app/version|SID=expired"));
         assert!(seen.contains("/api/v2/auth/login|"));
         assert!(seen.contains("/api/v2/torrents/start|SID=renewed"));
+    }
+
+    #[tokio::test]
+    async fn client_rejects_oversized_text_responses() {
+        let endpoint = spawn_qbit_server(|request| async move {
+            let path = request.uri().path().to_owned();
+            match path.as_str() {
+                "/api/v2/auth/login" => response_with_cookie(AxumStatusCode::OK, "Ok.", "SID=ok"),
+                "/api/v2/app/version" => oversized_response(QBIT_RESPONSE_MAX_BYTES + 1),
+                _ => (AxumStatusCode::NOT_FOUND, path).into_response(),
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+
+        let error = client.version().await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TorrentClientError::BadResponse { ref message, .. }
+                    if message.contains("response exceeded")
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_rejects_chunked_oversized_text_responses() {
+        let endpoint = spawn_chunked_response_server(QBIT_RESPONSE_MAX_BYTES + 1);
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+        *client.cookie.lock().await = Some("SID=ok".to_owned());
+
+        let error = client.version().await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TorrentClientError::BadResponse { ref message, .. }
+                    if message.contains("response exceeded")
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn client_reader_rejects_oversized_chunks_without_content_length() {
+        let mut body = Vec::new();
+
+        assert!(append_limited_body_chunk(&mut body, b"12345678", 8));
+        assert!(!append_limited_body_chunk(&mut body, b"9", 8));
+        assert_eq!(b"12345678", body.as_slice());
     }
 
     #[tokio::test]
@@ -863,6 +964,49 @@ mod tests {
             .headers_mut()
             .insert(SET_COOKIE, cookie.parse().unwrap());
         response
+    }
+
+    fn oversized_response(length: u64) -> Response {
+        let body = vec![b'x'; usize::try_from(length).unwrap()];
+        (
+            AxumStatusCode::OK,
+            [(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&length.to_string()).unwrap(),
+            )],
+            body,
+        )
+            .into_response()
+    }
+
+    fn spawn_chunked_response_server(length: u64) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            write_chunked_body(&mut stream, length);
+        });
+        format!("http://{address}")
+    }
+
+    fn write_chunked_body(stream: &mut std::net::TcpStream, length: u64) {
+        let chunk = vec![b'x'; 8192];
+        let mut remaining = length;
+        while remaining > 0 {
+            let size = usize::try_from(remaining.min(chunk.len() as u64)).unwrap();
+            write!(stream, "{size:x}\r\n").unwrap();
+            stream.write_all(&chunk[..size]).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            remaining -= u64::try_from(size).unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").unwrap();
     }
 
     fn query_param(query: &str, name: &str) -> usize {

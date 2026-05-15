@@ -15,6 +15,7 @@ use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
 use crate::errors::TorrentClientError;
 
 const RTORRENT_LABEL: &str = "sporos";
+const RTORRENT_RESPONSE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const INVENTORY_METHODS: &[&str] = &[
     "d.name",
     "d.directory",
@@ -203,10 +204,8 @@ impl RtorrentClient {
             ));
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|error| unavailable(&self.client_name, error.to_string()))?;
+        let body =
+            read_client_text(response, &self.client_name, RTORRENT_RESPONSE_MAX_BYTES).await?;
         parse_method_response(&self.client_name, &body)
     }
 }
@@ -701,6 +700,45 @@ fn fault_error(client: &str, fault: &XmlRpcValue) -> TorrentClientError {
     }
 }
 
+async fn read_client_text(
+    mut response: reqwest::Response,
+    client: &str,
+    limit: u64,
+) -> Result<String, TorrentClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(bad_response(
+            client,
+            format!("response exceeded {limit} bytes"),
+        ));
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default(),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| unavailable(client, error.to_string()))?
+    {
+        let next_len = body.len().saturating_add(chunk.len());
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > limit {
+            return Err(bad_response(
+                client,
+                format!("response exceeded {limit} bytes"),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|error| bad_response(client, error.to_string()))
+}
+
 fn unavailable(client: &str, message: String) -> TorrentClientError {
     TorrentClientError::Unavailable {
         client: client.to_owned(),
@@ -719,12 +757,14 @@ fn bad_response(client: &str, message: impl Into<String>) -> TorrentClientError 
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdTcpListener;
     use std::sync::{Arc, Mutex as StdMutex};
 
     use axum::Router;
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode as AxumStatusCode};
-    use axum::response::IntoResponse;
+    use axum::http::{HeaderValue, Request, StatusCode as AxumStatusCode, header::CONTENT_LENGTH};
+    use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use tokio::net::TcpListener;
 
@@ -930,6 +970,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_rejects_oversized_xmlrpc_response() {
+        let endpoint = spawn_rtorrent_server(|_request| async move {
+            oversized_response(RTORRENT_RESPONSE_MAX_BYTES + 1)
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        let error = client.validate().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            TorrentClientError::BadResponse { message, .. }
+                if message.contains("response exceeded")
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_rejects_chunked_oversized_xmlrpc_response() {
+        let endpoint = spawn_chunked_response_server("/RPC2", RTORRENT_RESPONSE_MAX_BYTES + 1);
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        let error = client.validate().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            TorrentClientError::BadResponse { message, .. }
+                if message.contains("response exceeded")
+        ));
+    }
+
+    #[tokio::test]
     async fn client_chunks_large_inventory_multicalls() {
         let seen_chunks = Arc::new(StdMutex::new(Vec::<usize>::new()));
         let seen_requests = seen_chunks.clone();
@@ -999,6 +1070,49 @@ mod tests {
         format!(
             "<methodResponse><params><param><value>{value}</value></param></params></methodResponse>"
         )
+    }
+
+    fn oversized_response(length: u64) -> Response {
+        let body = vec![b'x'; usize::try_from(length).unwrap()];
+        (
+            AxumStatusCode::OK,
+            [(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&length.to_string()).unwrap(),
+            )],
+            body,
+        )
+            .into_response()
+    }
+
+    fn spawn_chunked_response_server(path: &str, length: u64) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            write_chunked_body(&mut stream, length);
+        });
+        format!("http://{address}{path}")
+    }
+
+    fn write_chunked_body(stream: &mut std::net::TcpStream, length: u64) {
+        let chunk = vec![b'x'; 8192];
+        let mut remaining = length;
+        while remaining > 0 {
+            let size = usize::try_from(remaining.min(chunk.len() as u64)).unwrap();
+            write!(stream, "{size:x}\r\n").unwrap();
+            stream.write_all(&chunk[..size]).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            remaining -= u64::try_from(size).unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").unwrap();
     }
 
     fn inventory_xml_response() -> String {

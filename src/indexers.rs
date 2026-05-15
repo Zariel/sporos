@@ -25,6 +25,9 @@ use crate::torrent::parse_metafile;
 
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+const TORZNAB_RSS_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const CANDIDATE_TORRENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConfiguredTorznabIndexer {
     pub name: DependencyName,
@@ -314,10 +317,7 @@ impl TorznabHttpClient {
             });
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(TorznabRequestError::from_reqwest)?;
+        let bytes = read_torznab_response(response, TORZNAB_RSS_MAX_BYTES).await?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
@@ -369,6 +369,9 @@ pub enum TorznabRequestError {
     InvalidCandidate {
         message: String,
     },
+    ResponseTooLarge {
+        limit: u64,
+    },
 }
 
 impl TorznabRequestError {
@@ -396,6 +399,9 @@ impl fmt::Display for TorznabRequestError {
             Self::InvalidXml { message } => write!(formatter, "invalid Torznab RSS: {message}"),
             Self::InvalidCandidate { message } => {
                 write!(formatter, "invalid Torznab candidate: {message}")
+            }
+            Self::ResponseTooLarge { limit } => {
+                write!(formatter, "indexer response exceeded {limit} bytes")
             }
         }
     }
@@ -466,10 +472,7 @@ impl CandidateDownloadClient {
             });
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(CandidateDownloadError::from_reqwest)?;
+        let bytes = read_candidate_response(response, CANDIDATE_TORRENT_MAX_BYTES).await?;
         let parsed =
             parse_metafile(&bytes).map_err(|error| CandidateDownloadError::InvalidContents {
                 message: error.to_string(),
@@ -596,6 +599,9 @@ pub enum CandidateDownloadError {
     InvalidContents {
         message: String,
     },
+    ResponseTooLarge {
+        limit: u64,
+    },
     CacheWrite {
         path: std::path::PathBuf,
         message: String,
@@ -629,6 +635,12 @@ impl fmt::Display for CandidateDownloadError {
             Self::Request { message } => write!(formatter, "candidate download failed: {message}"),
             Self::InvalidContents { message } => {
                 write!(formatter, "invalid candidate torrent contents: {message}")
+            }
+            Self::ResponseTooLarge { limit } => {
+                write!(
+                    formatter,
+                    "candidate download response exceeded {limit} bytes"
+                )
             }
             Self::CacheWrite { path, message } => {
                 write!(
@@ -917,6 +929,73 @@ fn parse_retry_after(value: &str) -> Option<RetryAfter> {
         .ok()
         .map(|seconds| RetryAfter::DelayMs(seconds.saturating_mul(1_000)))
         .or_else(|| parse_http_date_ms(value).map(RetryAfter::DeadlineMs))
+}
+
+async fn read_torznab_response(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<Vec<u8>, TorznabRequestError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(TorznabRequestError::ResponseTooLarge { limit });
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default(),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(TorznabRequestError::from_reqwest)?
+    {
+        if !append_limited_body_chunk(&mut body, &chunk, limit) {
+            return Err(TorznabRequestError::ResponseTooLarge { limit });
+        }
+    }
+    Ok(body)
+}
+
+async fn read_candidate_response(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<Vec<u8>, CandidateDownloadError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(CandidateDownloadError::ResponseTooLarge { limit });
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default(),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(CandidateDownloadError::from_reqwest)?
+    {
+        if !append_limited_body_chunk(&mut body, &chunk, limit) {
+            return Err(CandidateDownloadError::ResponseTooLarge { limit });
+        }
+    }
+    Ok(body)
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], limit: u64) -> bool {
+    let next_len = body.len().saturating_add(chunk.len());
+    if u64::try_from(next_len).unwrap_or(u64::MAX) > limit {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
 }
 
 fn parse_http_date_ms(value: &str) -> Option<i64> {
@@ -1351,13 +1430,16 @@ fn attribute_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdTcpListener;
+
     use crate::config::{IndexerTimeoutsConfig, IndexersConfig};
     use crate::matching::{SearchIds, TorznabSearchPlan, TorznabSearchQuery};
     use crate::secrets::ApiKey;
     use axum::Router;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode as AxumStatusCode};
-    use axum::response::IntoResponse;
+    use axum::http::{HeaderValue, Request, StatusCode as AxumStatusCode, header::CONTENT_LENGTH};
+    use axum::response::{IntoResponse, Response};
     use axum::routing::get;
     use tokio::net::TcpListener;
 
@@ -1538,6 +1620,67 @@ mod tests {
 
         assert!(matches!(limited, TorznabRequestError::RateLimited { .. }));
         assert!(matches!(invalid, TorznabRequestError::InvalidXml { .. }));
+    }
+
+    #[tokio::test]
+    async fn search_client_rejects_oversized_rss_response() {
+        let endpoint = test_endpoint(
+            spawn_torznab_server(|_request| async move {
+                oversized_response(TORZNAB_RSS_MAX_BYTES.saturating_add(1))
+            })
+            .await,
+        );
+        let client = TorznabHttpClient::new(Duration::from_secs(5));
+        let plan = generic_plan();
+
+        let error = client
+            .search(&endpoint, MediaType::Movie, &plan, 1_700_000_000_000)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TorznabRequestError::ResponseTooLarge {
+                    limit: TORZNAB_RSS_MAX_BYTES
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_client_rejects_chunked_oversized_rss_response() {
+        let endpoint = test_endpoint(spawn_chunked_response_server(
+            "/api",
+            TORZNAB_RSS_MAX_BYTES.saturating_add(1),
+        ));
+        let client = TorznabHttpClient::new(Duration::from_secs(5));
+        let plan = generic_plan();
+
+        let error = client
+            .search(&endpoint, MediaType::Movie, &plan, 1_700_000_000_000)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TorznabRequestError::ResponseTooLarge {
+                    limit: TORZNAB_RSS_MAX_BYTES
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn response_reader_rejects_oversized_chunks_without_content_length() {
+        let mut body = Vec::new();
+
+        assert!(append_limited_body_chunk(&mut body, b"12345678", 8));
+        assert!(!append_limited_body_chunk(&mut body, b"9", 8));
+        assert_eq!(b"12345678", body.as_slice());
     }
 
     #[tokio::test]
@@ -1800,6 +1943,57 @@ mod tests {
         remove_temp_dir(&cache_dir);
     }
 
+    #[tokio::test]
+    async fn candidate_download_rejects_oversized_torrent_response() {
+        let url = spawn_torznab_server(|_request| async move {
+            oversized_response(CANDIDATE_TORRENT_MAX_BYTES.saturating_add(1))
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-oversized");
+        let candidate = test_candidate(&url);
+        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+
+        let error = client
+            .download_and_cache(&candidate, &cache_dir, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CandidateDownloadError::ResponseTooLarge {
+                limit: CANDIDATE_TORRENT_MAX_BYTES
+            }
+        ));
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_rejects_chunked_oversized_torrent_response() {
+        let url = spawn_chunked_response_server(
+            "/download",
+            CANDIDATE_TORRENT_MAX_BYTES.saturating_add(1),
+        );
+        let cache_dir = unique_temp_dir("candidate-chunked-oversized");
+        let candidate = test_candidate(&url);
+        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+
+        let error = client
+            .download_and_cache(&candidate, &cache_dir, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CandidateDownloadError::ResponseTooLarge {
+                    limit: CANDIDATE_TORRENT_MAX_BYTES
+                }
+            ),
+            "got {error:?}"
+        );
+        remove_temp_dir(&cache_dir);
+    }
+
     #[test]
     fn indexer_backoff_uses_retry_after_exponential_delay_and_recovery_probes() {
         let policy = IndexerBackoffPolicy {
@@ -2045,5 +2239,48 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => panic!("remove temp dir {}: {error}", path.display()),
         }
+    }
+
+    fn oversized_response(length: u64) -> Response {
+        let body = vec![b'x'; usize::try_from(length).unwrap()];
+        (
+            AxumStatusCode::OK,
+            [(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&length.to_string()).unwrap(),
+            )],
+            body,
+        )
+            .into_response()
+    }
+
+    fn spawn_chunked_response_server(path: &str, length: u64) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            write_chunked_body(&mut stream, length);
+        });
+        format!("http://{address}{path}")
+    }
+
+    fn write_chunked_body(stream: &mut std::net::TcpStream, length: u64) {
+        let chunk = vec![b'x'; 8192];
+        let mut remaining = length;
+        while remaining > 0 {
+            let size = usize::try_from(remaining.min(chunk.len() as u64)).unwrap();
+            write!(stream, "{size:x}\r\n").unwrap();
+            stream.write_all(&chunk[..size]).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            remaining -= u64::try_from(size).unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").unwrap();
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -19,6 +20,8 @@ use crate::errors::DatabaseError;
 use crate::indexers::TorznabCaps;
 use crate::persistence::repository::{LocalFilePage, LocalFileSnapshot, Repository};
 use crate::torrent::parse_metafile;
+
+const CACHED_TORRENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FileTreeMatchMode {
@@ -1463,12 +1466,39 @@ async fn cached_metafile(path: &Path) -> CachedMetafile {
 }
 
 fn read_cached_metafile(path: &Path) -> CachedMetafile {
-    let Ok(bytes) = fs::read(path) else {
+    let Ok(bytes) = read_bounded_cached_torrent(path) else {
         return CachedMetafile::Unreadable;
     };
     parse_metafile(&bytes)
         .map(|parsed| CachedMetafile::Parsed(parsed.metafile))
         .unwrap_or(CachedMetafile::Invalid)
+}
+
+fn read_bounded_cached_torrent(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > CACHED_TORRENT_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cached torrent exceeds size limit",
+        ));
+    }
+
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(usize::MAX)
+            .min(usize::try_from(CACHED_TORRENT_MAX_BYTES).unwrap_or(usize::MAX)),
+    );
+    file.by_ref()
+        .take(CACHED_TORRENT_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CACHED_TORRENT_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cached torrent exceeds size limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn rejected_assessment(reason: CandidatePrecheckReason) -> CandidateAssessment {
@@ -2751,6 +2781,48 @@ mod tests {
             Some(mismatched_candidate.info_hash.unwrap()),
             preserved[0].info_hash
         );
+    }
+
+    #[tokio::test]
+    async fn assessment_does_not_buffer_oversized_cached_torrents() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("matching-cache-oversized");
+        let cache_path = cache_dir.join("oversized.cached.torrent");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::File::create(&cache_path)
+            .unwrap()
+            .set_len(CACHED_TORRENT_MAX_BYTES + 1)
+            .unwrap();
+        let mut local = search_item("movie.mkv", MediaType::Movie);
+        local.id = Some(
+            repository
+                .upsert_local_item_with_files(&local, &[])
+                .await
+                .unwrap(),
+        );
+        let candidate = remote_candidate("guid-oversized", "movie.mkv", Some(cache_path));
+
+        let outcome = assess_and_persist_candidate(
+            &repository,
+            &local,
+            &[],
+            false,
+            &candidate,
+            &[],
+            2,
+            &CandidateAssessmentConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PersistedCandidateAssessment::NeedsTorrentDownload {
+                cache_status: CandidateCacheStatus::Unreadable,
+                ..
+            }
+        ));
+        fs::remove_dir_all(cache_dir).unwrap();
     }
 
     #[tokio::test]
