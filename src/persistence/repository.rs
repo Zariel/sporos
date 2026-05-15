@@ -1342,7 +1342,7 @@ impl Repository {
                     message: error.to_string(),
                 }
             })?;
-            sqlx::query(
+            let was_claimed = sqlx::query(
                 r#"
                 UPDATE announce_work
                 SET status = 'running',
@@ -1353,6 +1353,9 @@ impl Repository {
                     lease_owner = ?,
                     lease_until = ?
                 WHERE id = ?
+                  AND status IN ('queued', 'retryable')
+                  AND next_attempt_at <= ?
+                  AND expires_at > ?
                 "#,
             )
             .bind(now_ms)
@@ -1360,10 +1363,30 @@ impl Repository {
             .bind(owner)
             .bind(lease_until_ms)
             .bind(id.as_str())
+            .bind(now_ms)
+            .bind(now_ms)
             .execute(&mut *transaction)
             .await
-            .map_err(|error| db_error("claim announce work", error))?;
-            claimed.push(id);
+            .map_err(|error| db_error("claim announce work", error))
+            .and_then(|result| {
+                if result.rows_affected() == 1 {
+                    Ok(true)
+                } else if result.rows_affected() == 0 {
+                    Ok(false)
+                } else {
+                    Err(DatabaseError::QueryFailed {
+                        operation: "claim announce work".to_owned(),
+                        message: format!(
+                            "expected to claim at most one row for {}, claimed {}",
+                            id.as_str(),
+                            result.rows_affected()
+                        ),
+                    })
+                }
+            })?;
+            if was_claimed {
+                claimed.push(id);
+            }
         }
 
         transaction
@@ -3630,6 +3653,49 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_announce_claims_do_not_steal_leases() {
+        let root = unique_temp_dir("announce-atomic-claim");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+        repository
+            .insert_or_dedupe_announce_work(&test_announce_work("ann_atomic", "guid-atomic", 1), 10)
+            .await
+            .unwrap();
+
+        let first_repository = repository.clone();
+        let second_repository = repository.clone();
+        let (first, second) = tokio::join!(
+            first_repository.claim_announce_work("worker-1", 10, 100, 1),
+            second_repository.claim_announce_work("worker-2", 10, 100, 1)
+        );
+        let first = claimed_or_busy_empty(first);
+        let second = claimed_or_busy_empty(second);
+        let total_claims = first.len() + second.len();
+        let owner: String =
+            sqlx::query_scalar("SELECT lease_owner FROM announce_work WHERE id = 'ann_atomic'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(1, total_claims);
+        assert!(
+            (first.is_empty() && owner == "worker-2") || (second.is_empty() && owner == "worker-1")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn claimed_or_busy_empty(
+        result: Result<Vec<AnnounceWorkId>, DatabaseError>,
+    ) -> Vec<AnnounceWorkId> {
+        match result {
+            Ok(claimed) => claimed,
+            Err(DatabaseError::Busy { .. }) => Vec::new(),
+            Err(error) => panic!("unexpected claim error: {error}"),
+        }
     }
 
     #[tokio::test]
