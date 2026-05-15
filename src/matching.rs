@@ -7,7 +7,8 @@ use regex::Regex;
 
 use crate::content_filter::{
     BlocklistRule, CandidateBlocklistSubject, ContentFilterConfig, ContentFilterContext,
-    ContentFilterDecision, ContentFilterSubject, ContentMetadata, filter_content,
+    ContentFilterDecision, ContentFilterSubject, ContentMetadata,
+    filter_content_with_file_completeness,
 };
 use crate::domain::{
     ByteSize, CandidateAssessment, DecisionReason, IndexerId, InfoHash, LocalFile, LocalItem,
@@ -16,7 +17,7 @@ use crate::domain::{
 };
 use crate::errors::DatabaseError;
 use crate::indexers::TorznabCaps;
-use crate::persistence::repository::{LocalFileSnapshot, Repository};
+use crate::persistence::repository::{LocalFilePage, LocalFileSnapshot, Repository};
 use crate::torrent::parse_metafile;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -108,6 +109,7 @@ impl Default for ReverseLookupConfig {
 pub struct ReverseLookupCandidate {
     pub local_item: LocalItem,
     pub local_files: Vec<LocalFile>,
+    pub local_files_truncated: bool,
     pub source: ReverseLookupSource,
     pub distance: usize,
 }
@@ -377,6 +379,7 @@ pub async fn assess_and_persist_candidate(
     repository: &Repository,
     local_item: &LocalItem,
     local_files: &[LocalFile],
+    local_files_truncated: bool,
     candidate: &RemoteCandidate,
     owned_info_hashes: &[InfoHash],
     assessed_at_ms: i64,
@@ -454,6 +457,18 @@ pub async fn assess_and_persist_candidate(
             .record_match_decision(local_item_id, candidate_id, assessment, assessed_at_ms)
             .await?;
         return Ok(PersistedCandidateAssessment::Rejected {
+            candidate_id,
+            assessment,
+            cache_status: CandidateCacheStatus::Reused,
+        });
+    }
+
+    if local_files_truncated {
+        let assessment = truncated_local_files_assessment();
+        repository
+            .record_match_decision(local_item_id, candidate_id, assessment, assessed_at_ms)
+            .await?;
+        return Ok(PersistedCandidateAssessment::Assessed {
             candidate_id,
             assessment,
             cache_status: CandidateCacheStatus::Reused,
@@ -551,6 +566,7 @@ pub async fn reverse_lookup_and_assess_candidate(
             repository,
             &lookup.local_item,
             &lookup.local_files,
+            lookup.local_files_truncated,
             candidate,
             owned_info_hashes,
             assessed_at_ms,
@@ -659,23 +675,23 @@ async fn add_lookup_items(
             continue;
         }
         let files = local_files(repository, item_id, config.max_files_per_item).await?;
-        if !matches!(
-            filter_content(
-                ContentFilterSubject {
-                    item: &item,
-                    files: &files,
-                    metadata: ContentMetadata::default(),
-                    context,
-                },
-                &config.content_filter,
-            ),
-            ContentFilterDecision::Accepted
-        ) {
+        let filter_decision = filter_content_with_file_completeness(
+            ContentFilterSubject {
+                item: &item,
+                files: &files.files,
+                metadata: ContentMetadata::default(),
+                context,
+            },
+            &config.content_filter,
+            !files.truncated,
+        );
+        if !matches!(filter_decision, ContentFilterDecision::Accepted) {
             continue;
         }
         lookup.push(ReverseLookupCandidate {
             local_item: item,
-            local_files: files,
+            local_files: files.files,
+            local_files_truncated: files.truncated,
             source,
             distance,
         });
@@ -688,13 +704,25 @@ async fn local_files(
     repository: &Repository,
     item_id: LocalItemId,
     limit: u16,
-) -> Result<Vec<LocalFile>, ReverseLookupError> {
-    repository
-        .local_files_for_item(item_id, limit)
-        .await?
+) -> Result<LocalFiles, ReverseLookupError> {
+    let page = repository.local_files_for_item_page(item_id, limit).await?;
+    local_files_from_page(page)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct LocalFiles {
+    files: Vec<LocalFile>,
+    truncated: bool,
+}
+
+fn local_files_from_page(page: LocalFilePage) -> Result<LocalFiles, ReverseLookupError> {
+    let truncated = page.truncated;
+    let files = page
+        .files
         .into_iter()
         .map(local_file_from_snapshot)
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(LocalFiles { files, truncated })
 }
 
 fn local_file_from_snapshot(snapshot: LocalFileSnapshot) -> Result<LocalFile, ReverseLookupError> {
@@ -1466,6 +1494,15 @@ fn precheck_reason(reason: CandidatePrecheckReason) -> DecisionReason {
         CandidatePrecheckReason::SingleEpisodeForSeasonPack => {
             DecisionReason::SingleEpisodeForSeasonPack
         }
+    }
+}
+
+fn truncated_local_files_assessment() -> CandidateAssessment {
+    CandidateAssessment {
+        decision: MatchDecision::NoMatch,
+        reason: DecisionReason::SourceIncomplete,
+        matched_size: None,
+        matched_ratio: None,
     }
 }
 
@@ -2510,6 +2547,7 @@ mod tests {
             &repository,
             &local,
             &local_files,
+            false,
             &candidate,
             &[],
             123,
@@ -2565,6 +2603,7 @@ mod tests {
             &repository,
             &local,
             &[],
+            false,
             &candidate,
             &[],
             456,
@@ -2613,6 +2652,7 @@ mod tests {
             &repository,
             &local,
             &[],
+            false,
             &candidate,
             std::slice::from_ref(&parsed.info_hash),
             789,
@@ -2663,6 +2703,7 @@ mod tests {
             &repository,
             &local,
             &[],
+            false,
             &invalid_candidate,
             &[],
             1,
@@ -2674,6 +2715,7 @@ mod tests {
             &repository,
             &local,
             &[],
+            false,
             &mismatched_candidate,
             &[],
             2,
@@ -2833,6 +2875,142 @@ mod tests {
         assert!(matches!(outcome, ReverseLookupOutcome::BestFailure { .. }));
 
         fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_rejects_truncated_local_file_tree() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("reverse-truncated");
+        let cache_path = write_cache_file(&cache_dir, "candidate.torrent", test_torrent_bytes());
+        let local = data_root_item();
+        insert_local(
+            &repository,
+            &local,
+            &[
+                local_file("movie.mkv", 10, 0),
+                local_file("unseen-extra.mkv", 10, 1),
+            ],
+        )
+        .await;
+        let candidate = remote_candidate("guid-truncated", "Example", Some(cache_path));
+        let mut config = ReverseLookupConfig::default();
+        config.max_files_per_item = 1;
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReverseLookupOutcome::BestFailure {
+                assessment: PersistedCandidateAssessment::Assessed {
+                    assessment: CandidateAssessment {
+                        decision: MatchDecision::NoMatch,
+                        reason: DecisionReason::SourceIncomplete,
+                        matched_size: None,
+                        matched_ratio: None,
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
+
+        fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_does_not_filter_truncated_file_slice() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("reverse-truncated-filter");
+        let cache_path = write_cache_file(&cache_dir, "candidate.torrent", test_torrent_bytes());
+        let local = data_root_item();
+        insert_local(
+            &repository,
+            &local,
+            &[
+                local_file("sample.nfo", 10, 0),
+                local_file("movie.mkv", 10, 1),
+            ],
+        )
+        .await;
+        let candidate = remote_candidate("guid-truncated-filter", "Example", Some(cache_path));
+        let mut config = ReverseLookupConfig::default();
+        config.max_files_per_item = 1;
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReverseLookupOutcome::BestFailure {
+                assessment: PersistedCandidateAssessment::Assessed {
+                    assessment: CandidateAssessment {
+                        decision: MatchDecision::NoMatch,
+                        reason: DecisionReason::SourceIncomplete,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
+
+        fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_still_filters_truncated_blocklisted_items() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let local = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/blocked-example"),
+            },
+            "Blocked Example",
+            MediaType::Movie,
+            20,
+        );
+        insert_local(
+            &repository,
+            &local,
+            &[
+                local_file("sample.nfo", 10, 0),
+                local_file("movie.mkv", 10, 1),
+            ],
+        )
+        .await;
+        let candidate = remote_candidate("guid-blocked-truncated", "Blocked Example", None);
+        let mut config = ReverseLookupConfig::default();
+        config.max_files_per_item = 1;
+        config.content_filter.blocklist = vec![BlocklistRule::NameSubstring("Blocked".to_owned())];
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ReverseLookupOutcome::NoCandidates, outcome);
     }
 
     #[test]

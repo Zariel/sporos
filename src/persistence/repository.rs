@@ -173,6 +173,12 @@ pub struct LocalFileSnapshot {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LocalFilePage {
+    pub files: Vec<LocalFileSnapshot>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RemoteCandidateSnapshot {
     pub id: RemoteCandidateId,
     pub indexer_id: u64,
@@ -442,6 +448,14 @@ impl Repository {
         item_id: LocalItemId,
         limit: u16,
     ) -> Result<Vec<LocalFileSnapshot>, DatabaseError> {
+        Ok(self.local_files_for_item_page(item_id, limit).await?.files)
+    }
+
+    pub async fn local_files_for_item_page(
+        &self,
+        item_id: LocalItemId,
+        limit: u16,
+    ) -> Result<LocalFilePage, DatabaseError> {
         let rows = sqlx::query(
             r#"
             SELECT item_id, relative_path, file_name, size, mtime_ms, file_index
@@ -452,12 +466,21 @@ impl Repository {
             "#,
         )
         .bind(i64_from_u64(item_id.get(), "local item id")?)
-        .bind(i64::from(limit))
+        .bind(i64::from(limit) + 1)
         .fetch_all(&self.pool)
         .await
         .map_err(|error| db_error("lookup local files by item", error))?;
 
-        rows.into_iter().map(local_file_snapshot_from_row).collect()
+        let mut files = rows
+            .into_iter()
+            .map(local_file_snapshot_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let truncated = files.len() > usize::from(limit);
+        if truncated {
+            files.truncate(usize::from(limit));
+        }
+
+        Ok(LocalFilePage { files, truncated })
     }
 
     pub async fn local_files_by_size(
@@ -3183,6 +3206,46 @@ mod tests {
             stored[1023].relative_path
         );
         assert_eq!(Some(1_700_000_001_023), stored[1023].mtime_ms);
+    }
+
+    #[tokio::test]
+    async fn local_files_for_item_page_reports_truncation() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let item = test_local_item("Example");
+        let files = [
+            LocalFile::new(
+                None,
+                PathBuf::from("Example/file-a.mkv"),
+                ByteSize::new(10),
+                FileIndex::new(0),
+            )
+            .unwrap(),
+            LocalFile::new(
+                None,
+                PathBuf::from("Example/file-b.mkv"),
+                ByteSize::new(20),
+                FileIndex::new(1),
+            )
+            .unwrap(),
+        ];
+        let item_id = repository
+            .upsert_local_item_with_files(&item, &files)
+            .await
+            .unwrap();
+
+        let limited = repository
+            .local_files_for_item_page(item_id, 1)
+            .await
+            .unwrap();
+        let complete = repository
+            .local_files_for_item_page(item_id, 2)
+            .await
+            .unwrap();
+
+        assert!(limited.truncated);
+        assert_eq!(1, limited.files.len());
+        assert!(!complete.truncated);
+        assert_eq!(2, complete.files.len());
     }
 
     #[tokio::test]

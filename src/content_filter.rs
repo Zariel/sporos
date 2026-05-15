@@ -111,6 +111,14 @@ pub fn filter_content(
     subject: ContentFilterSubject<'_>,
     config: &ContentFilterConfig,
 ) -> ContentFilterDecision {
+    filter_content_with_file_completeness(subject, config, true)
+}
+
+pub fn filter_content_with_file_completeness(
+    subject: ContentFilterSubject<'_>,
+    config: &ContentFilterConfig,
+    files_complete: bool,
+) -> ContentFilterDecision {
     if let Some(rule) = config.blocklist.iter().find(|rule| rule.matches(&subject)) {
         return ContentFilterDecision::Rejected(ContentFilterReason::BlockedRelease {
             rule: rule.clone(),
@@ -121,7 +129,10 @@ pub fn filter_content(
         return ContentFilterDecision::Accepted;
     }
 
-    if !config.allow_season_pack_episodes && is_data_dir_single_file_in_season_pack(&subject) {
+    if files_complete
+        && !config.allow_season_pack_episodes
+        && is_data_dir_single_file_in_season_pack(&subject)
+    {
         return ContentFilterDecision::Rejected(ContentFilterReason::DataDirSeasonPackEpisode);
     }
 
@@ -132,7 +143,10 @@ pub fn filter_content(
         return ContentFilterDecision::Rejected(ContentFilterReason::SingleEpisode);
     }
 
-    if !config.include_non_videos && non_video_ratio_exceeds(subject.files, config) {
+    if files_complete
+        && !config.include_non_videos
+        && non_video_ratio_exceeds(subject.files, config)
+    {
         return ContentFilterDecision::Rejected(ContentFilterReason::NonVideoRatio);
     }
 
@@ -140,11 +154,11 @@ pub fn filter_content(
         return ContentFilterDecision::Rejected(ContentFilterReason::ExistingExternalSeed);
     }
 
-    if is_arr_root(&subject) {
+    if files_complete && is_arr_root(&subject) {
         return ContentFilterDecision::Rejected(ContentFilterReason::ArrRoot);
     }
 
-    if !config.allow_season_specials && is_season_special(subject.files) {
+    if files_complete && !config.allow_season_specials && is_season_special(subject.files) {
         return ContentFilterDecision::Rejected(ContentFilterReason::SeasonSpecial);
     }
 
