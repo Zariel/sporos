@@ -17,7 +17,7 @@ use crate::domain::{
 };
 use crate::errors::DatabaseError;
 use crate::indexers::{ConfiguredTorznabIndexer, TorznabCaps};
-use crate::secrets::CookieSecret;
+use crate::secrets::{CookieSecret, sanitize_url_for_logging};
 
 use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
 
@@ -183,6 +183,7 @@ pub struct RemoteCandidateSnapshot {
     pub id: RemoteCandidateId,
     pub indexer_id: u64,
     pub guid: CandidateGuid,
+    pub redacted_download_url: String,
     pub title: String,
     pub info_hash: Option<InfoHash>,
     pub torrent_cache_path: Option<std::path::PathBuf>,
@@ -580,7 +581,7 @@ impl Repository {
             INSERT INTO remote_candidates (
                 indexer_id,
                 guid,
-                download_url,
+                redacted_download_url,
                 title,
                 tracker,
                 size,
@@ -592,7 +593,7 @@ impl Repository {
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch() * 1000, unixepoch() * 1000)
             ON CONFLICT (indexer_id, guid) DO UPDATE SET
-                download_url = excluded.download_url,
+                redacted_download_url = excluded.redacted_download_url,
                 title = excluded.title,
                 tracker = excluded.tracker,
                 size = excluded.size,
@@ -604,7 +605,7 @@ impl Repository {
         )
         .bind(i64_from_u64(candidate.indexer_id.get(), "indexer id")?)
         .bind(candidate.guid.as_str())
-        .bind(candidate.download_url.as_str())
+        .bind(sanitize_url_for_logging(candidate.download_url.as_str()).to_string())
         .bind(candidate.title.as_str())
         .bind(candidate.tracker.as_str())
         .bind(
@@ -697,7 +698,7 @@ impl Repository {
     ) -> Result<Vec<RemoteCandidateSnapshot>, DatabaseError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, indexer_id, guid, title, info_hash, torrent_cache_path
+            SELECT id, indexer_id, guid, redacted_download_url, title, info_hash, torrent_cache_path
             FROM remote_candidates
             WHERE info_hash = ?
             ORDER BY last_seen_at DESC, id
@@ -2940,6 +2941,7 @@ fn remote_candidate_snapshot_from_row(
                 message: error.to_string(),
             }
         })?,
+        redacted_download_url: row.get("redacted_download_url"),
         title: row.get("title"),
         info_hash,
         torrent_cache_path: row
@@ -3304,6 +3306,9 @@ mod tests {
     async fn remote_candidate_upsert_uses_indexer_guid_natural_key() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let mut candidate = test_remote_candidate("guid-1", "Original");
+        candidate.download_url =
+            DownloadUrl::new("https://user:password@indexer.example/download?id=1&passkey=secret")
+                .unwrap();
 
         let first_id = repository
             .upsert_remote_candidate(&candidate)
@@ -3316,11 +3321,14 @@ mod tests {
             .await
             .unwrap();
 
-        let title: String = sqlx::query_scalar("SELECT title FROM remote_candidates WHERE id = ?")
-            .bind(i64_from_u64(first_id.get(), "remote candidate id").unwrap())
-            .fetch_one(repository.pool())
-            .await
-            .unwrap();
+        let row =
+            sqlx::query("SELECT title, redacted_download_url FROM remote_candidates WHERE id = ?")
+                .bind(i64_from_u64(first_id.get(), "remote candidate id").unwrap())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let title: String = row.get("title");
+        let redacted_download_url: String = row.get("redacted_download_url");
         let info_hash_matches = repository
             .remote_candidates_by_info_hash(candidate.info_hash.as_ref().unwrap(), 10)
             .await
@@ -3328,8 +3336,18 @@ mod tests {
 
         assert_eq!(first_id, second_id);
         assert_eq!("Updated", title);
+        assert_eq!(
+            "https://[REDACTED]@indexer.example/download?id=1&passkey=[REDACTED]",
+            redacted_download_url
+        );
+        assert!(!redacted_download_url.contains("secret"));
+        assert!(!redacted_download_url.contains("password"));
         assert_eq!(1, info_hash_matches.len());
         assert_eq!(first_id, info_hash_matches[0].id);
+        assert_eq!(
+            redacted_download_url,
+            info_hash_matches[0].redacted_download_url
+        );
         assert_eq!(
             Some(PathBuf::from("/cache/fedcba.cached.torrent")),
             info_hash_matches[0].torrent_cache_path
