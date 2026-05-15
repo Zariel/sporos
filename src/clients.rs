@@ -320,6 +320,11 @@ mod tests {
                 .supports(TorrentClientOperation::SetLabel)
         );
         assert!(
+            rtorrent
+                .capabilities
+                .supports(TorrentClientOperation::SetSavePath)
+        );
+        assert!(
             !rtorrent
                 .capabilities
                 .supports(TorrentClientOperation::SetTags)

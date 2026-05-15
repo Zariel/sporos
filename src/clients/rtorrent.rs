@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -112,10 +112,11 @@ impl RtorrentClient {
     pub async fn inject(
         &self,
         torrent_bytes: &[u8],
+        save_path: Option<&Path>,
         start: bool,
     ) -> Result<(), TorrentClientError> {
         let method = if start { "load.raw_start" } else { "load.raw" };
-        self.call(method, injection_params(torrent_bytes))
+        self.call(method, injection_params(torrent_bytes, save_path))
             .await
             .map(|_| ())
     }
@@ -289,9 +290,9 @@ pub fn build_inventory_multicall(hashes: &[InfoHash]) -> String {
     build_method_call("system.multicall", &[inventory_multicall_param(hashes)])
 }
 
-pub fn build_injection_call(torrent_bytes: &[u8], start: bool) -> String {
+pub fn build_injection_call(torrent_bytes: &[u8], save_path: Option<&Path>, start: bool) -> String {
     let method = if start { "load.raw_start" } else { "load.raw" };
-    build_method_call(method, &injection_params(torrent_bytes))
+    build_method_call(method, &injection_params(torrent_bytes, save_path))
 }
 
 pub fn parse_method_response(client: &str, xml: &str) -> Result<XmlRpcValue, TorrentClientError> {
@@ -425,11 +426,19 @@ fn inventory_multicall_param(hashes: &[InfoHash]) -> XmlRpcValue {
     )
 }
 
-fn injection_params(torrent_bytes: &[u8]) -> Vec<XmlRpcValue> {
-    vec![
+fn injection_params(torrent_bytes: &[u8], save_path: Option<&Path>) -> Vec<XmlRpcValue> {
+    let mut params = vec![
+        XmlRpcValue::String(String::new()),
         XmlRpcValue::Base64(torrent_bytes.to_vec()),
         XmlRpcValue::String(format!("d.custom1.set={RTORRENT_LABEL}")),
-    ]
+    ];
+    if let Some(save_path) = save_path {
+        params.push(XmlRpcValue::String(format!(
+            "d.directory.set={}",
+            save_path.display()
+        )));
+    }
+    params
 }
 
 fn push_value(xml: &mut String, value: &XmlRpcValue) {
@@ -736,13 +745,69 @@ mod tests {
 
     #[test]
     fn injection_payload_uses_raw_methods_and_sets_label() {
-        let stopped = build_injection_call(b"torrent", false);
-        let started = build_injection_call(b"torrent", true);
+        let save_path = PathBuf::from("/downloads/prepared");
+        let stopped = build_injection_call(b"torrent", Some(&save_path), false);
+        let started = build_injection_call(b"torrent", Some(&save_path), true);
 
         assert!(stopped.contains("<methodName>load.raw</methodName>"));
         assert!(started.contains("<methodName>load.raw_start</methodName>"));
-        assert!(stopped.contains("<base64>dG9ycmVudA==</base64>"));
-        assert!(stopped.contains("<string>d.custom1.set=sporos</string>"));
+        assert_xml_order(
+            &stopped,
+            &[
+                "<string></string>",
+                "<base64>dG9ycmVudA==</base64>",
+                "<string>d.custom1.set=sporos</string>",
+                "<string>d.directory.set=/downloads/prepared</string>",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn client_injects_with_requested_save_path() {
+        let endpoint = spawn_rtorrent_server(|request| async move {
+            let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            if body.contains("<methodName>load.raw_start</methodName>")
+                && xml_contains_order(
+                    &body,
+                    &[
+                        "<string></string>",
+                        "<base64>dG9ycmVudA==</base64>",
+                        "<string>d.custom1.set=sporos</string>",
+                        "<string>d.directory.set=/downloads/prepared</string>",
+                    ],
+                )
+            {
+                return (AxumStatusCode::OK, xml_response("<i8>0</i8>"));
+            }
+            (AxumStatusCode::BAD_REQUEST, body)
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+        let save_path = PathBuf::from("/downloads/prepared");
+
+        client
+            .inject(b"torrent", Some(&save_path), true)
+            .await
+            .unwrap();
+    }
+
+    fn assert_xml_order(xml: &str, needles: &[&str]) {
+        assert!(
+            xml_contains_order(xml, needles),
+            "expected XML to contain {needles:?} in order, got {xml}"
+        );
+    }
+
+    fn xml_contains_order(xml: &str, needles: &[&str]) -> bool {
+        let mut cursor = 0;
+        for needle in needles {
+            let Some(index) = xml[cursor..].find(needle) else {
+                return false;
+            };
+            cursor += index + needle.len();
+        }
+        true
     }
 
     #[test]
