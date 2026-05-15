@@ -674,6 +674,10 @@ pub fn parse_torznab_rss(
                     saw_rss = true;
                 } else if element.name() == QName(b"item") {
                     item = Some(RssItemBuilder::default());
+                } else if let Some(builder) = item.as_mut()
+                    && element.name() == QName(b"enclosure")
+                {
+                    apply_enclosure_attributes(&reader, &element, builder)?;
                 } else if item.is_some() {
                     text_field = rss_text_field(element.name());
                 }
@@ -681,12 +685,7 @@ pub fn parse_torznab_rss(
             Ok(Event::Empty(element)) => {
                 if let Some(builder) = item.as_mut() {
                     if element.name() == QName(b"enclosure") {
-                        if let Some(url) = rss_attribute_value(&reader, &element, b"url")? {
-                            builder.enclosure_url = Some(url);
-                        }
-                        if let Some(length) = rss_attribute_value(&reader, &element, b"length")? {
-                            builder.size = length.parse().ok();
-                        }
+                        apply_enclosure_attributes(&reader, &element, builder)?;
                     } else if element.name() == QName(b"torznab:attr")
                         || element.name() == QName(b"attr")
                     {
@@ -802,12 +801,13 @@ impl RssItemBuilder {
         self,
         endpoint: &TorznabEndpoint,
     ) -> Result<RemoteCandidate, TorznabRequestError> {
-        let guid = self.guid.or_else(|| self.link.clone()).ok_or_else(|| {
+        let link = self.link;
+        let guid = self.guid.or_else(|| link.clone()).ok_or_else(|| {
             TorznabRequestError::InvalidCandidate {
                 message: "candidate missing guid".to_owned(),
             }
         })?;
-        let download_url = self.link.or(self.enclosure_url).ok_or_else(|| {
+        let download_url = preferred_download_url(self.enclosure_url, link).ok_or_else(|| {
             TorznabRequestError::InvalidCandidate {
                 message: "candidate missing download URL".to_owned(),
             }
@@ -832,6 +832,26 @@ impl RssItemBuilder {
             torrent_cache_path: None,
         })
     }
+}
+
+fn apply_enclosure_attributes(
+    reader: &Reader<&[u8]>,
+    element: &BytesStart<'_>,
+    builder: &mut RssItemBuilder,
+) -> Result<(), TorznabRequestError> {
+    if let Some(url) = rss_attribute_value(reader, element, b"url")? {
+        builder.enclosure_url = Some(url);
+    }
+    if let Some(length) = rss_attribute_value(reader, element, b"length")? {
+        builder.size = length.parse().ok();
+    }
+    Ok(())
+}
+
+fn preferred_download_url(enclosure_url: Option<String>, link: Option<String>) -> Option<String> {
+    enclosure_url
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| link.filter(|url| !url.trim().is_empty()))
 }
 
 fn append_text(target: &mut Option<String>, value: String) {
@@ -1758,6 +1778,87 @@ mod tests {
         assert_eq!("Example & Friends", candidates[0].title.as_str());
         assert_eq!(
             "https://indexer.example/download?id=1&passkey=secret",
+            candidates[0].download_url.as_str()
+        );
+    }
+
+    #[test]
+    fn rss_parser_prefers_enclosure_downloads_over_details_links() {
+        let endpoint = test_endpoint("https://indexer.example/api".to_owned());
+        let candidates = parse_torznab_rss(
+            r#"
+            <rss>
+              <channel>
+                <item>
+                  <title>Example S01E01</title>
+                  <guid>candidate-1</guid>
+                  <link>https://indexer.example/details?id=1</link>
+                  <enclosure url="https://indexer.example/download?id=1&amp;torrent=1" length="4321" type="application/x-bittorrent"/>
+                </item>
+              </channel>
+            </rss>
+            "#,
+            &endpoint,
+        )
+        .unwrap();
+
+        assert_eq!("candidate-1", candidates[0].guid.as_str());
+        assert_eq!("Example S01E01", candidates[0].title.as_str());
+        assert_eq!(
+            "https://indexer.example/download?id=1&torrent=1",
+            candidates[0].download_url.as_str()
+        );
+        assert_eq!(Some(ByteSize::new(4321)), candidates[0].size);
+    }
+
+    #[test]
+    fn rss_parser_reads_non_self_closing_enclosure_downloads() {
+        let endpoint = test_endpoint("https://indexer.example/api".to_owned());
+        let candidates = parse_torznab_rss(
+            r#"
+            <rss>
+              <channel>
+                <item>
+                  <title>Example S01E01</title>
+                  <guid>candidate-1</guid>
+                  <link>https://indexer.example/details?id=1</link>
+                  <enclosure url="https://indexer.example/download?id=1" length="4321"></enclosure>
+                </item>
+              </channel>
+            </rss>
+            "#,
+            &endpoint,
+        )
+        .unwrap();
+
+        assert_eq!(
+            "https://indexer.example/download?id=1",
+            candidates[0].download_url.as_str()
+        );
+        assert_eq!(Some(ByteSize::new(4321)), candidates[0].size);
+    }
+
+    #[test]
+    fn rss_parser_falls_back_to_link_without_enclosure() {
+        let endpoint = test_endpoint("https://indexer.example/api".to_owned());
+        let candidates = parse_torznab_rss(
+            r#"
+            <rss>
+              <channel>
+                <item>
+                  <title>Example S01E02</title>
+                  <guid>candidate-2</guid>
+                  <link>https://indexer.example/download?id=2</link>
+                </item>
+              </channel>
+            </rss>
+            "#,
+            &endpoint,
+        )
+        .unwrap();
+
+        assert_eq!(
+            "https://indexer.example/download?id=2",
             candidates[0].download_url.as_str()
         );
     }
