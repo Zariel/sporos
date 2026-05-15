@@ -7,6 +7,7 @@ pub enum DomainError {
     EmptyField { field: &'static str },
     InvalidInfoHash { value: String },
     InvalidPath { field: &'static str, value: PathBuf },
+    SizeOverflow { field: &'static str },
     InvalidRatio,
     EmptyFiles,
 }
@@ -25,6 +26,7 @@ impl fmt::Display for DomainError {
                     value.display()
                 )
             }
+            Self::SizeOverflow { field } => write!(formatter, "{field} size total overflowed"),
             Self::InvalidRatio => {
                 write!(formatter, "match ratio must be finite and between 0 and 1")
             }
@@ -342,11 +344,11 @@ impl TorrentFile {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct TorrentMetafile {
-    pub info_hash: InfoHash,
-    pub name: DisplayName,
-    pub files: Vec<TorrentFile>,
-    pub total_size: ByteSize,
-    pub piece_length: Option<ByteSize>,
+    info_hash: InfoHash,
+    name: DisplayName,
+    files: Vec<TorrentFile>,
+    total_size: ByteSize,
+    piece_length: Option<ByteSize>,
 }
 
 impl TorrentMetafile {
@@ -368,7 +370,8 @@ impl TorrentMetafile {
             return Err(DomainError::EmptyFiles);
         }
 
-        let total_size = ByteSize::new(files.iter().map(|file| file.size.get()).sum());
+        let total_size =
+            checked_file_total(files.iter().map(|file| file.size), "torrent metafile total")?;
 
         Ok(Self {
             info_hash,
@@ -378,6 +381,54 @@ impl TorrentMetafile {
             piece_length,
         })
     }
+
+    pub fn info_hash(&self) -> &InfoHash {
+        &self.info_hash
+    }
+
+    pub fn name(&self) -> &DisplayName {
+        &self.name
+    }
+
+    pub fn files(&self) -> &[TorrentFile] {
+        &self.files
+    }
+
+    pub fn total_size(&self) -> ByteSize {
+        self.total_size
+    }
+
+    pub fn piece_length(&self) -> Option<ByteSize> {
+        self.piece_length
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked_for_test(
+        info_hash: InfoHash,
+        name: DisplayName,
+        files: Vec<TorrentFile>,
+        total_size: ByteSize,
+        piece_length: Option<ByteSize>,
+    ) -> Self {
+        Self {
+            info_hash,
+            name,
+            files,
+            total_size,
+            piece_length,
+        }
+    }
+}
+
+pub fn checked_file_total(
+    sizes: impl IntoIterator<Item = ByteSize>,
+    field: &'static str,
+) -> DomainResult<ByteSize> {
+    sizes
+        .into_iter()
+        .try_fold(0u64, |total, size| total.checked_add(size.get()))
+        .map(ByteSize::new)
+        .ok_or(DomainError::SizeOverflow { field })
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -618,10 +669,37 @@ mod tests {
 
         let metafile = TorrentMetafile::new(hash.clone(), name.clone(), vec![file]).unwrap();
 
-        assert_eq!(20, metafile.total_size.get());
+        assert_eq!(20, metafile.total_size().get());
         assert_eq!(
             Err(DomainError::EmptyFiles),
             TorrentMetafile::new(hash, name, Vec::new())
+        );
+    }
+
+    #[test]
+    fn torrent_metafile_rejects_total_size_overflow() {
+        let hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let name = DisplayName::new("Example").unwrap();
+        let files = vec![
+            TorrentFile::new(
+                PathBuf::from("first.bin"),
+                ByteSize::new(u64::MAX),
+                FileIndex::new(0),
+            )
+            .unwrap(),
+            TorrentFile::new(
+                PathBuf::from("second.bin"),
+                ByteSize::new(1),
+                FileIndex::new(1),
+            )
+            .unwrap(),
+        ];
+
+        assert_eq!(
+            Err(DomainError::SizeOverflow {
+                field: "torrent metafile total"
+            }),
+            TorrentMetafile::new(hash, name, files)
         );
     }
 

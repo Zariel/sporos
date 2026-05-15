@@ -15,7 +15,7 @@ use crate::clients::TorrentClientDescriptor;
 use crate::domain::{
     ByteSize, CandidateAssessment, DependencyName, DependencyState, InfoHash, InjectionOutcome,
     LocalFile, LocalItem, MatchDecision, ReasonText, RemoteCandidate, RemoteCandidateId,
-    TorrentMetafile,
+    TorrentMetafile, checked_file_total,
 };
 use crate::errors::{ClassifyFailure, DatabaseError, FailureClass, TorrentClientError};
 use crate::persistence::repository::Repository;
@@ -174,7 +174,7 @@ impl InjectionWorker {
             .ok_or(InjectionWorkerError::NoWritableClient)?;
         let target_name = dependency_name(target.descriptor())?;
         let existing = self
-            .find_existing_client(&request.metafile.info_hash, target.descriptor())
+            .find_existing_client(request.metafile.info_hash(), target.descriptor())
             .await?;
         if let Some(existing_client) = existing {
             self.record_client_health(
@@ -216,13 +216,13 @@ impl InjectionWorker {
         let pause_for_recheck = recheck_plan.should_recheck;
         let mutation_result = {
             let _guard = self.mutation_lock.lock().await;
-            if target.has_torrent(&request.metafile.info_hash).await? {
+            if target.has_torrent(request.metafile.info_hash()).await? {
                 InjectionMutationResult::AlreadyExists
             } else {
                 InjectionMutationResult::Injected(
                     target
                         .inject(ClientInjectionRequest {
-                            info_hash: &request.metafile.info_hash,
+                            info_hash: request.metafile.info_hash(),
                             torrent_bytes: &request.torrent_bytes,
                             save_path: save_path.as_deref(),
                             pause_for_recheck,
@@ -357,7 +357,7 @@ impl InjectionWorker {
         let outcome = match link_metafile_files(
             source_root,
             &request.local_files,
-            &request.metafile.files,
+            request.metafile.files(),
             request.assessment.decision,
             &destination_dir,
             LinkFilesOptions::new(link_type),
@@ -439,15 +439,15 @@ impl InjectionWorker {
         }
         {
             let _guard = self.mutation_lock.lock().await;
-            client.recheck(&request.metafile.info_hash).await?;
+            client.recheck(request.metafile.info_hash()).await?;
         }
         let max_polls = max_resume_polls(request.recheck);
         for _ in 0..max_polls {
-            if client.is_checking(&request.metafile.info_hash).await? {
+            if client.is_checking(request.metafile.info_hash()).await? {
                 sleep_between_resume_polls(request.recheck).await;
                 continue;
             }
-            let remaining = client.remaining_bytes(&request.metafile.info_hash).await?;
+            let remaining = client.remaining_bytes(request.metafile.info_hash()).await?;
             if can_resume_with_remaining(
                 &request.metafile,
                 &request.assessment,
@@ -456,7 +456,7 @@ impl InjectionWorker {
                 remaining,
             ) {
                 let _guard = self.mutation_lock.lock().await;
-                client.resume(&request.metafile.info_hash).await?;
+                client.resume(request.metafile.info_hash()).await?;
                 return Ok(ResumeLoopOutcome::Resumed);
             }
             return Ok(ResumeLoopOutcome::WaitingForCompletion);
@@ -530,19 +530,25 @@ pub fn can_resume_with_remaining(
         return false;
     }
 
-    let piece_slack = metafile
-        .piece_length
+    let Some(piece_slack) = metafile
+        .piece_length()
         .unwrap_or(ByteSize::new(0))
         .get()
-        .saturating_mul(2);
-    remaining.get()
-        <= irrelevant_file_bytes(metafile)
-            .get()
-            .saturating_add(piece_slack)
+        .checked_mul(2)
+    else {
+        return false;
+    };
+    let Some(irrelevant_file_bytes) = irrelevant_file_bytes(metafile) else {
+        return false;
+    };
+    let Some(allowed_slack) = irrelevant_file_bytes.get().checked_add(piece_slack) else {
+        return false;
+    };
+    remaining.get() <= allowed_slack
 }
 
 fn has_video_disc_files(metafile: &TorrentMetafile) -> bool {
-    metafile.files.iter().any(|file| {
+    metafile.files().iter().any(|file| {
         file.relative_path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -555,15 +561,16 @@ fn has_video_disc_files(metafile: &TorrentMetafile) -> bool {
     })
 }
 
-fn irrelevant_file_bytes(metafile: &TorrentMetafile) -> ByteSize {
-    ByteSize::new(
+fn irrelevant_file_bytes(metafile: &TorrentMetafile) -> Option<ByteSize> {
+    checked_file_total(
         metafile
-            .files
+            .files()
             .iter()
             .filter(|file| is_irrelevant_file(&file.relative_path))
-            .map(|file| file.size.get())
-            .sum(),
+            .map(|file| file.size),
+        "irrelevant file total",
     )
+    .ok()
 }
 
 fn is_irrelevant_file(path: &Path) -> bool {
@@ -854,6 +861,98 @@ mod tests {
             config,
             plan,
             ByteSize::new(31)
+        ));
+    }
+
+    #[test]
+    fn resume_policy_handles_irrelevant_file_overflow_as_not_resumable() {
+        let metafile = TorrentMetafile::new_unchecked_for_test(
+            InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            DisplayName::new("movie").unwrap(),
+            vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("movie.mkv"),
+                    ByteSize::new(10),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("extras/first.nfo"),
+                    ByteSize::new(u64::MAX),
+                    FileIndex::new(1),
+                )
+                .unwrap(),
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("extras/second.nfo"),
+                    ByteSize::new(1),
+                    FileIndex::new(2),
+                )
+                .unwrap(),
+            ],
+            ByteSize::new(10),
+            Some(ByteSize::new(5)),
+        );
+        let assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        let config = RecheckResumeConfig {
+            ignore_non_relevant_files_to_resume: true,
+            ..RecheckResumeConfig::default()
+        };
+        let plan = recheck_resume_plan(&metafile, &assessment, config);
+
+        assert!(!can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(30)
+        ));
+    }
+
+    #[test]
+    fn resume_policy_handles_piece_slack_overflow_as_not_resumable() {
+        let metafile = TorrentMetafile::new_unchecked_for_test(
+            InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            DisplayName::new("movie").unwrap(),
+            vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("movie.mkv"),
+                    ByteSize::new(10),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("extras/sample.nfo"),
+                    ByteSize::new(1),
+                    FileIndex::new(1),
+                )
+                .unwrap(),
+            ],
+            ByteSize::new(11),
+            Some(ByteSize::new(u64::MAX)),
+        );
+        let assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        let config = RecheckResumeConfig {
+            ignore_non_relevant_files_to_resume: true,
+            ..RecheckResumeConfig::default()
+        };
+        let plan = recheck_resume_plan(&metafile, &assessment, config);
+
+        assert!(!can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(30)
         ));
     }
 

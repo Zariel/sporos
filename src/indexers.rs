@@ -470,11 +470,11 @@ impl CandidateDownloadClient {
             parse_metafile(&bytes).map_err(|error| CandidateDownloadError::InvalidContents {
                 message: error.to_string(),
             })?;
-        let cache_path = cached_torrent_path(cache_dir, &parsed.metafile.info_hash);
+        let cache_path = cached_torrent_path(cache_dir, parsed.metafile.info_hash());
         write_cached_torrent(&cache_path, &bytes)?;
 
         let mut updated_candidate = candidate.clone();
-        updated_candidate.info_hash = Some(parsed.metafile.info_hash.clone());
+        updated_candidate.info_hash = Some(parsed.metafile.info_hash().clone());
         updated_candidate.torrent_cache_path = Some(cache_path.clone());
 
         Ok(CachedCandidateTorrent {
@@ -1587,8 +1587,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            cached.metafile.info_hash,
-            cached.candidate.info_hash.clone().unwrap()
+            cached.metafile.info_hash(),
+            &cached.candidate.info_hash.clone().unwrap()
         );
         assert_eq!(
             Some(cached.cache_path.clone()),

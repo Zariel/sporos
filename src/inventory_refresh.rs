@@ -7,8 +7,8 @@ use tokio::task;
 use tracing::info_span;
 
 use crate::domain::{
-    ByteSize, ClientHost, DisplayName, InfoHash, ItemTitle, LocalFile, LocalItem, LocalItemSource,
-    MediaType, SourceKey, TorrentFile,
+    ClientHost, DisplayName, InfoHash, ItemTitle, LocalFile, LocalItem, LocalItemSource, MediaType,
+    SourceKey, TorrentFile, checked_file_total,
 };
 use crate::errors::DatabaseError;
 use crate::inventory::{
@@ -45,7 +45,13 @@ pub struct ClientInventoryItem {
 
 impl ClientInventoryItem {
     pub fn into_scanned(self) -> Result<ScannedLocalItem, InventoryRefreshError> {
-        let total_size = ByteSize::new(self.files.iter().map(|file| file.size.get()).sum());
+        let total_size = checked_file_total(
+            self.files.iter().map(|file| file.size),
+            "client inventory total",
+        )
+        .map_err(|error| InventoryRefreshError::InvalidClientInventory {
+            message: error.to_string(),
+        })?;
         let files = self
             .files
             .into_iter()
@@ -545,6 +551,36 @@ mod tests {
         );
         assert_eq!("/downloads", save_path);
         assert_eq!(42, total_size);
+    }
+
+    #[test]
+    fn client_inventory_rejects_total_size_overflow() {
+        let inventory = ClientInventoryItem {
+            client_host: ClientHost::new("qbit.local").unwrap(),
+            info_hash: InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            display_name: DisplayName::new("Example").unwrap(),
+            media_type: MediaType::Movie,
+            save_path: PathBuf::from("/downloads"),
+            files: vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("first.bin"),
+                    ByteSize::new(u64::MAX),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("second.bin"),
+                    ByteSize::new(1),
+                    FileIndex::new(1),
+                )
+                .unwrap(),
+            ],
+        };
+
+        let error = inventory.into_scanned().unwrap_err();
+
+        assert!(error.to_string().contains("client inventory total"));
+        assert!(error.to_string().contains("overflow"));
     }
 
     #[tokio::test]

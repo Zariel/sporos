@@ -432,7 +432,7 @@ pub async fn assess_and_persist_candidate(
     if candidate
         .info_hash
         .as_ref()
-        .is_some_and(|info_hash| info_hash != &cached.info_hash)
+        .is_some_and(|info_hash| info_hash != cached.info_hash())
     {
         return Ok(PersistedCandidateAssessment::NeedsTorrentDownload {
             candidate_id,
@@ -441,7 +441,7 @@ pub async fn assess_and_persist_candidate(
     }
 
     let mut cached_candidate = candidate.clone();
-    cached_candidate.info_hash = Some(cached.info_hash.clone());
+    cached_candidate.info_hash = Some(cached.info_hash().clone());
     candidate_id = repository
         .upsert_remote_candidate(&cached_candidate)
         .await?;
@@ -1755,30 +1755,30 @@ pub fn assess_file_tree(
     config: FileTreeMatchConfig,
 ) -> FileTreeAssessment {
     let virtual_item = matches!(local_item.source, LocalItemSource::Virtual { .. });
-    let exact = exact_tree_matches(local_files, &candidate.files, virtual_item);
+    let exact = exact_tree_matches(local_files, candidate.files(), virtual_item);
     if exact {
         return assessment(
             FileTreeDecision::Match,
-            candidate.total_size,
-            full_ratio(candidate.total_size),
+            candidate.total_size(),
+            full_ratio(candidate.total_size()),
         );
     }
 
-    let size_pairing = pair_by_size_prefer_name(local_files, &candidate.files);
-    let size_only = size_pairing.matched_files == candidate.files.len();
+    let size_pairing = pair_by_size_prefer_name(local_files, candidate.files());
+    let size_only = size_pairing.matched_files == candidate.files().len();
     match config.mode {
         FileTreeMatchMode::Strict => {
             if size_only {
                 assessment(
                     FileTreeDecision::FileTreeMismatch,
                     size_pairing.matched_size,
-                    ratio(size_pairing.matched_size, candidate.total_size),
+                    ratio(size_pairing.matched_size, candidate.total_size()),
                 )
             } else {
                 assessment(
                     FileTreeDecision::SizeMismatch,
                     size_pairing.matched_size,
-                    ratio(size_pairing.matched_size, candidate.total_size),
+                    ratio(size_pairing.matched_size, candidate.total_size()),
                 )
             }
         }
@@ -1787,13 +1787,13 @@ pub fn assess_file_tree(
                 assessment(
                     FileTreeDecision::MatchSizeOnly,
                     size_pairing.matched_size,
-                    full_ratio(candidate.total_size),
+                    full_ratio(candidate.total_size()),
                 )
             } else {
                 assessment(
                     FileTreeDecision::SizeMismatch,
                     size_pairing.matched_size,
-                    ratio(size_pairing.matched_size, candidate.total_size),
+                    ratio(size_pairing.matched_size, candidate.total_size()),
                 )
             }
         }
@@ -1820,13 +1820,13 @@ fn partial_assessment(
         return assessment(
             FileTreeDecision::MatchSizeOnly,
             size_pairing.matched_size,
-            full_ratio(candidate.total_size),
+            full_ratio(candidate.total_size()),
         );
     }
 
     let min_ratio = min_size_ratio(local_item, config);
-    let size_gate = partial_size_gate(local_files, &candidate.files);
-    let size_gate_ratio = ratio(size_gate, candidate.total_size);
+    let size_gate = partial_size_gate(local_files, candidate.files());
+    let size_gate_ratio = ratio(size_gate, candidate.total_size());
     if size_gate_ratio < min_ratio {
         return assessment(
             FileTreeDecision::PartialSizeMismatch,
@@ -1908,7 +1908,7 @@ fn pair_by_size_prefer_name(
 ) -> SizePairing {
     let mut used = vec![false; local_files.len()];
     let mut matched_files = 0;
-    let mut matched_size = 0;
+    let mut matched_size = 0u64;
     let mut candidates = candidate_files.iter().collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         left.relative_path
@@ -1937,7 +1937,7 @@ fn pair_by_size_prefer_name(
         if let Some(slot) = selected.and_then(|index| used.get_mut(index)) {
             *slot = true;
             matched_files += 1;
-            matched_size += candidate.size.get();
+            matched_size = matched_size.saturating_add(candidate.size.get());
         }
     }
 
@@ -1961,17 +1961,17 @@ fn partial_size_gate(local_files: &[LocalFile], candidate_files: &[TorrentFile])
             .iter()
             .filter(|file| local_sizes.contains(&file.size.get()))
             .map(|file| file.size.get())
-            .sum(),
+            .fold(0u64, u64::saturating_add),
     )
 }
 
 fn piece_ratio(matched_size: ByteSize, candidate: &TorrentMetafile) -> f64 {
     let piece_length = candidate
-        .piece_length
-        .unwrap_or(candidate.total_size)
+        .piece_length()
+        .unwrap_or(candidate.total_size())
         .get()
         .max(1);
-    let total_pieces = candidate.total_size.get().div_ceil(piece_length);
+    let total_pieces = candidate.total_size().get().div_ceil(piece_length);
     if total_pieces == 0 {
         return 1.0;
     }
@@ -2556,7 +2556,7 @@ mod tests {
         .await
         .unwrap();
         let matches = repository
-            .remote_candidates_by_info_hash(&parsed.info_hash, 10)
+            .remote_candidates_by_info_hash(parsed.info_hash(), 10)
             .await
             .unwrap();
         let decisions = repository
@@ -2577,7 +2577,7 @@ mod tests {
             },
             outcome
         );
-        assert_eq!(Some(parsed.info_hash), matches[0].info_hash);
+        assert_eq!(Some(parsed.info_hash().clone()), matches[0].info_hash);
         assert_eq!(1, decisions.len());
         assert_eq!("exact", decisions[0].decision);
         assert_eq!("file_tree_matched", decisions[0].reason_code);
@@ -2654,7 +2654,7 @@ mod tests {
             &[],
             false,
             &candidate,
-            std::slice::from_ref(&parsed.info_hash),
+            std::slice::from_ref(parsed.info_hash()),
             789,
             &CandidateAssessmentConfig::default(),
         )
@@ -3034,6 +3034,28 @@ mod tests {
         assert!(result.decision.is_actionable());
         assert_eq!(ByteSize::new(10), result.matched_size);
         assert_float_eq(1.0, result.matched_ratio);
+    }
+
+    #[test]
+    fn overflowing_candidate_cannot_be_constructed_for_matching() {
+        let files = vec![
+            torrent_file("Candidate/first.bin", u64::MAX, 0),
+            torrent_file("Candidate/second.bin", 1, 1),
+        ];
+
+        let result = TorrentMetafile::new_with_piece_length(
+            InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            DisplayName::new("Candidate").unwrap(),
+            files,
+            Some(ByteSize::new(4)),
+        );
+
+        assert!(matches!(
+            result,
+            Err(crate::domain::DomainError::SizeOverflow {
+                field: "torrent metafile total"
+            })
+        ));
     }
 
     #[test]

@@ -380,13 +380,13 @@ mod tests {
         let first = parse_metafile(first).unwrap();
         let second = parse_metafile(second).unwrap();
 
-        assert_eq!(first.metafile.info_hash, second.metafile.info_hash);
-        assert_eq!("movie.mkv", first.metafile.name.as_str());
-        assert_eq!(12, first.metafile.total_size.get());
-        assert_eq!(Some(ByteSize::new(4)), first.metafile.piece_length);
+        assert_eq!(first.metafile.info_hash(), second.metafile.info_hash());
+        assert_eq!("movie.mkv", first.metafile.name().as_str());
+        assert_eq!(12, first.metafile.total_size().get());
+        assert_eq!(Some(ByteSize::new(4)), first.metafile.piece_length());
         assert_eq!(
             PathBuf::from("movie.mkv"),
-            first.metafile.files[0].relative_path
+            first.metafile.files()[0].relative_path
         );
         assert_eq!(vec!["tracker.example"], tracker_strings(&first));
         assert_eq!(vec!["other.example"], tracker_strings(&second));
@@ -398,17 +398,17 @@ mod tests {
 
         let parsed = parse_metafile(torrent).unwrap();
 
-        assert_eq!(12, parsed.metafile.total_size.get());
+        assert_eq!(12, parsed.metafile.total_size().get());
         assert_eq!(
             PathBuf::from("a.mkv"),
-            parsed.metafile.files[0].relative_path
+            parsed.metafile.files()[0].relative_path
         );
         assert_eq!(
             PathBuf::from("z.mkv"),
-            parsed.metafile.files[1].relative_path
+            parsed.metafile.files()[1].relative_path
         );
-        assert_eq!(1, parsed.metafile.files[0].file_index.get());
-        assert_eq!(0, parsed.metafile.files[1].file_index.get());
+        assert_eq!(1, parsed.metafile.files()[0].file_index.get());
+        assert_eq!(0, parsed.metafile.files()[1].file_index.get());
         assert_eq!(
             vec!["tracker-a.example", "tracker-b.example"],
             tracker_strings(&parsed)

@@ -289,7 +289,7 @@ pub fn candidate_output_metadata(
         media_type,
         tracker: candidate.tracker.as_str().to_owned(),
         name: candidate.title.as_str().to_owned(),
-        info_hash: metafile.info_hash.clone(),
+        info_hash: metafile.info_hash().clone(),
         cached: false,
     }
 }
@@ -1172,7 +1172,7 @@ mod tests {
         assert_eq!(MediaType::Movie, metadata.media_type);
         assert_eq!("tracker.example", metadata.tracker);
         assert_eq!("Candidate Title", metadata.name);
-        assert_eq!(metafile.info_hash, metadata.info_hash);
+        assert_eq!(metafile.info_hash(), &metadata.info_hash);
         assert!(!metadata.cached);
     }
 
