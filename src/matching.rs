@@ -3453,7 +3453,7 @@ mod tests {
     }
 
     fn test_torrent_bytes() -> &'static [u8] {
-        b"d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkvee"
+        b"d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

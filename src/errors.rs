@@ -352,6 +352,7 @@ pub enum TorrentParseError {
     InvalidInfoHash { source: DomainError },
     InvalidMetafile { source: DomainError },
     MissingInfoDictionary,
+    MissingMetainfoField { field: &'static str },
     UnsupportedLayout { message: String },
 }
 
@@ -376,6 +377,9 @@ impl fmt::Display for TorrentParseError {
             Self::MissingInfoDictionary => {
                 write!(formatter, "torrent is missing an info dictionary")
             }
+            Self::MissingMetainfoField { field } => {
+                write!(formatter, "torrent info dictionary is missing {field}")
+            }
             Self::UnsupportedLayout { message } => {
                 write!(formatter, "unsupported torrent layout: {message}")
             }
@@ -389,6 +393,7 @@ impl Error for TorrentParseError {
             Self::InvalidInfoHash { source } | Self::InvalidMetafile { source } => Some(source),
             Self::InvalidBencode { .. }
             | Self::MissingInfoDictionary
+            | Self::MissingMetainfoField { .. }
             | Self::UnsupportedLayout { .. } => None,
         }
     }

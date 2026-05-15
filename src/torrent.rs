@@ -7,6 +7,7 @@ use sha1::{Digest, Sha1};
 
 use crate::domain::{
     ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile, TorrentMetafile, TrackerName,
+    checked_file_total,
 };
 use crate::errors::TorrentParseError;
 
@@ -41,7 +42,7 @@ pub fn parse_metafile(bytes: &[u8]) -> Result<ParsedMetafile, TorrentParseError>
         info_hash,
         DisplayName::new(name).map_err(|source| TorrentParseError::InvalidMetafile { source })?,
         files,
-        piece_length,
+        Some(piece_length),
     )
     .map_err(|source| TorrentParseError::InvalidMetafile { source })?;
     let tracker_hosts = tracker_hosts(&tracker_urls)?;
@@ -95,9 +96,7 @@ fn parse_announce_list(
     Ok(())
 }
 
-fn parse_info(
-    bytes: &[u8],
-) -> Result<(String, Vec<TorrentFile>, Option<ByteSize>), TorrentParseError> {
+fn parse_info(bytes: &[u8]) -> Result<(String, Vec<TorrentFile>, ByteSize), TorrentParseError> {
     let mut decoder = Decoder::new(bytes).with_max_depth(16);
     let info = decoder
         .next_object()
@@ -112,6 +111,7 @@ fn parse_info(
     let mut single_file_length = None;
     let mut multi_file_entries = None;
     let mut piece_length = None;
+    let mut pieces = None;
 
     while let Some((key, value)) = info.next_pair().map_err(bencode_error)? {
         match key {
@@ -124,12 +124,17 @@ fn parse_info(
                 }
                 piece_length = Some(ByteSize::new(length));
             }
+            b"pieces" => pieces = Some(parse_pieces(bytes_object(value)?)?),
             b"files" => multi_file_entries = Some(parse_files(list_object(value)?)?),
             _ => {}
         }
     }
 
-    let name = name.ok_or_else(|| unsupported_layout("torrent info dictionary is missing name"))?;
+    let name = name.ok_or(TorrentParseError::MissingMetainfoField { field: "name" })?;
+    let piece_length = piece_length.ok_or(TorrentParseError::MissingMetainfoField {
+        field: "piece length",
+    })?;
+    let piece_count = pieces.ok_or(TorrentParseError::MissingMetainfoField { field: "pieces" })?;
     let mut files = if let Some(files) = multi_file_entries {
         files
     } else {
@@ -146,7 +151,38 @@ fn parse_info(
     };
 
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    validate_piece_count(piece_count, piece_length, &files)?;
     Ok((name, files, piece_length))
+}
+
+fn parse_pieces(pieces: &[u8]) -> Result<usize, TorrentParseError> {
+    if pieces.len() % 20 != 0 {
+        return Err(unsupported_layout(
+            "torrent pieces field must contain 20-byte SHA-1 hashes",
+        ));
+    }
+
+    Ok(pieces.len() / 20)
+}
+
+fn validate_piece_count(
+    piece_count: usize,
+    piece_length: ByteSize,
+    files: &[TorrentFile],
+) -> Result<(), TorrentParseError> {
+    let total_size =
+        checked_file_total(files.iter().map(|file| file.size), "torrent metafile total")
+            .map_err(|source| TorrentParseError::InvalidMetafile { source })?;
+    let expected = total_size.get().div_ceil(piece_length.get());
+    let actual = u64::try_from(piece_count)
+        .map_err(|_| unsupported_layout("torrent pieces field contains too many SHA-1 hashes"))?;
+    if actual != expected {
+        return Err(unsupported_layout(
+            "torrent pieces field does not match total size and piece length",
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_files(mut files: ListDecoder<'_, '_>) -> Result<Vec<TorrentFile>, TorrentParseError> {
@@ -374,8 +410,8 @@ mod tests {
     #[test]
     fn parses_single_file_torrent_and_hashes_info_dictionary() {
         let first =
-            b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi4eee";
-        let second = b"d8:announce34:https://other.example:443/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi4eee";
+            b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi12e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let second = b"d8:announce34:https://other.example:443/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi12e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
 
         let first = parse_metafile(first).unwrap();
         let second = parse_metafile(second).unwrap();
@@ -383,7 +419,7 @@ mod tests {
         assert_eq!(first.metafile.info_hash(), second.metafile.info_hash());
         assert_eq!("movie.mkv", first.metafile.name().as_str());
         assert_eq!(12, first.metafile.total_size().get());
-        assert_eq!(Some(ByteSize::new(4)), first.metafile.piece_length());
+        assert_eq!(Some(ByteSize::new(12)), first.metafile.piece_length());
         assert_eq!(
             PathBuf::from("movie.mkv"),
             first.metafile.files()[0].relative_path
@@ -394,7 +430,7 @@ mod tests {
 
     #[test]
     fn parses_multi_file_torrent_with_sorted_normalized_files_and_tracker_hosts() {
-        let torrent = b"d13:announce-listll34:https://tracker-b.example/announceel28:udp://tracker-a.example:6969ee4:infod5:filesld6:lengthi5e4:pathl5:z.mkveed6:lengthi7e4:pathl5:a.mkveee4:name7:Exampleee";
+        let torrent = b"d13:announce-listll34:https://tracker-b.example/announceel28:udp://tracker-a.example:6969ee4:infod5:filesld6:lengthi5e4:pathl5:z.mkveed6:lengthi7e4:pathl5:a.mkveee4:name7:Example12:piece lengthi12e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
 
         let parsed = parse_metafile(torrent).unwrap();
 
@@ -417,11 +453,57 @@ mod tests {
 
     #[test]
     fn rejects_empty_and_unsafe_path_segments() {
-        let empty = b"d4:infod5:filesld6:lengthi1e4:pathl0:eee4:name4:bad eee";
-        let parent = b"d4:infod5:filesld6:lengthi1e4:pathl2:..8:file.mkveee4:name4:bad eee";
+        let empty = b"d4:infod5:filesld6:lengthi1e4:pathl0:eee4:name4:bad 12:piece lengthi4e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let parent = b"d4:infod5:filesld6:lengthi1e4:pathl2:..8:file.mkveee4:name4:bad 12:piece lengthi4e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
 
         parse_metafile(empty).unwrap_err();
         parse_metafile(parent).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_incomplete_metainfo() {
+        let missing_piece_length =
+            b"d4:infod6:lengthi12e4:name9:movie.mkv6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let missing_pieces = b"d4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi4eee";
+
+        assert!(matches!(
+            parse_metafile(missing_piece_length),
+            Err(TorrentParseError::MissingMetainfoField {
+                field: "piece length"
+            })
+        ));
+        assert!(matches!(
+            parse_metafile(missing_pieces),
+            Err(TorrentParseError::MissingMetainfoField { field: "pieces" })
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_pieces() {
+        let torrent =
+            b"d4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi4e6:pieces19:aaaaaaaaaaaaaaaaaaaee";
+
+        assert!(matches!(
+            parse_metafile(torrent),
+            Err(TorrentParseError::UnsupportedLayout { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_piece_count_mismatches() {
+        let too_few =
+            b"d4:infod6:lengthi21e4:name9:movie.mkv12:piece lengthi10e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let too_many =
+            b"d4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces40:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaee";
+
+        assert!(matches!(
+            parse_metafile(too_few),
+            Err(TorrentParseError::UnsupportedLayout { .. })
+        ));
+        assert!(matches!(
+            parse_metafile(too_many),
+            Err(TorrentParseError::UnsupportedLayout { .. })
+        ));
     }
 
     #[test]

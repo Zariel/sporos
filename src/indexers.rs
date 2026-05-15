@@ -1885,7 +1885,7 @@ mod tests {
     }
 
     fn test_torrent_bytes() -> Vec<u8> {
-        b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi4eee".to_vec()
+        b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi12e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec()
     }
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
