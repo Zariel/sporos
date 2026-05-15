@@ -22,6 +22,8 @@ use crate::persistence::repository::{LocalFilePage, LocalFileSnapshot, Repositor
 use crate::torrent::parse_metafile;
 
 const CACHED_TORRENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const REVERSE_LOOKUP_SCAN_PAGE_MULTIPLIER: u16 = 16;
+const REVERSE_LOOKUP_MAX_TITLE_TOKEN_PROBES: usize = 4;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FileTreeMatchMode {
@@ -498,6 +500,7 @@ pub async fn reverse_lookup_candidates(
 ) -> Result<Vec<ReverseLookupCandidate>, ReverseLookupError> {
     let mut lookup = Vec::new();
     let mut seen = HashSet::<LocalItemId>::new();
+    let mut accepted_signature_indexes = HashMap::<String, usize>::new();
 
     if let Some(info_hash) = candidate.info_hash.as_ref() {
         let items = repository
@@ -511,6 +514,7 @@ pub async fn reverse_lookup_candidates(
             context,
             config,
             &mut seen,
+            &mut accepted_signature_indexes,
             &mut lookup,
         )
         .await?;
@@ -518,31 +522,23 @@ pub async fn reverse_lookup_candidates(
 
     let key = ReverseLookupKey::from_title(candidate.title.as_str());
     for media_type in key.media_types() {
-        let items = if let Some(title_token) = key.primary_title_token() {
-            repository
-                .local_items_by_media_type_and_title_token(
-                    media_type,
-                    title_token,
-                    config.max_local_candidates,
-                )
-                .await?
-        } else {
-            repository
-                .local_items_by_media_type(media_type, config.max_local_candidates)
-                .await?
-        };
-        for item in items {
-            let Some(score) = reverse_lookup_score(&item, &key, config) else {
-                continue;
-            };
+        let scored = scored_lookup_items(repository, media_type, &key, config).await?;
+        let target_len = accepted_signature_indexes
+            .len()
+            .saturating_add(usize::from(config.max_local_candidates));
+        for scored_item in scored {
+            if accepted_signature_indexes.len() >= target_len {
+                break;
+            }
             add_lookup_items(
                 repository,
-                vec![item],
-                score.source,
-                score.distance,
+                vec![scored_item.item],
+                scored_item.source,
+                scored_item.distance,
                 context,
                 config,
                 &mut seen,
+                &mut accepted_signature_indexes,
                 &mut lookup,
             )
             .await?;
@@ -551,6 +547,13 @@ pub async fn reverse_lookup_candidates(
 
     lookup.sort_by(reverse_lookup_order);
     Ok(dedupe_reverse_lookup(lookup))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ScoredLookupItem {
+    item: LocalItem,
+    source: ReverseLookupSource,
+    distance: usize,
 }
 
 pub async fn reverse_lookup_and_assess_candidate(
@@ -652,12 +655,160 @@ impl ReverseLookupKey {
         vec![MediaType::Movie, MediaType::Video, MediaType::Anime]
     }
 
-    fn primary_title_token(&self) -> Option<&str> {
-        self.title_keys
+    fn title_tokens(&self) -> Vec<&str> {
+        let mut tokens = Vec::new();
+        for token in self
+            .title_keys
             .iter()
             .flat_map(|key| key.split_whitespace())
-            .find(|token| token.len() >= 3 && !episode_or_season_token(token))
+            .filter(|token| token.len() >= 3 && !episode_or_season_token(token))
+        {
+            if !tokens.contains(&token) {
+                tokens.push(token);
+            }
+        }
+        tokens.sort_by(|left, right| right.len().cmp(&left.len()));
+        tokens
     }
+
+    fn primary_title_key(&self) -> &str {
+        self.title_keys.first().map(String::as_str).unwrap_or("")
+    }
+}
+
+async fn scored_lookup_items(
+    repository: &Repository,
+    media_type: MediaType,
+    key: &ReverseLookupKey,
+    config: &ReverseLookupConfig,
+) -> Result<Vec<ScoredLookupItem>, ReverseLookupError> {
+    let page_size = config.max_local_candidates.max(1);
+    let scan_limit = page_size.saturating_mul(REVERSE_LOOKUP_SCAN_PAGE_MULTIPLIER);
+    let mut scored = Vec::new();
+    let mut seen = HashSet::<LocalItemId>::new();
+    let title_tokens = key.title_tokens();
+
+    if title_tokens.is_empty() {
+        score_lookup_pages(
+            repository,
+            media_type,
+            key,
+            config,
+            page_size,
+            scan_limit,
+            LookupPageFilter::MediaType,
+            &mut seen,
+            &mut scored,
+        )
+        .await?;
+    } else {
+        score_lookup_pages(
+            repository,
+            media_type,
+            key,
+            config,
+            page_size,
+            scan_limit,
+            LookupPageFilter::AllTitleTokens(&title_tokens, key.primary_title_key()),
+            &mut seen,
+            &mut scored,
+        )
+        .await?;
+        for title_token in title_tokens
+            .iter()
+            .copied()
+            .take(REVERSE_LOOKUP_MAX_TITLE_TOKEN_PROBES)
+        {
+            score_lookup_pages(
+                repository,
+                media_type,
+                key,
+                config,
+                page_size,
+                scan_limit,
+                LookupPageFilter::TitleToken(title_token),
+                &mut seen,
+                &mut scored,
+            )
+            .await?;
+        }
+    }
+
+    scored.sort_by(scored_lookup_order);
+    Ok(scored)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LookupPageFilter<'a> {
+    MediaType,
+    AllTitleTokens(&'a [&'a str], &'a str),
+    TitleToken(&'a str),
+}
+
+async fn score_lookup_pages(
+    repository: &Repository,
+    media_type: MediaType,
+    key: &ReverseLookupKey,
+    config: &ReverseLookupConfig,
+    page_size: u16,
+    scan_limit: u16,
+    filter: LookupPageFilter<'_>,
+    seen: &mut HashSet<LocalItemId>,
+    scored: &mut Vec<ScoredLookupItem>,
+) -> Result<(), ReverseLookupError> {
+    let mut offset = 0_u32;
+
+    while offset < u32::from(scan_limit) {
+        let remaining = u32::from(scan_limit).saturating_sub(offset);
+        let limit = u16::try_from(remaining.min(u32::from(page_size))).unwrap_or(page_size);
+        let items = match filter {
+            LookupPageFilter::MediaType => {
+                repository
+                    .local_items_by_media_type_page(media_type, limit, offset)
+                    .await?
+            }
+            LookupPageFilter::AllTitleTokens(title_tokens, preferred_title) => {
+                repository
+                    .local_items_by_media_type_and_title_tokens_page(
+                        media_type,
+                        title_tokens,
+                        preferred_title,
+                        limit,
+                        offset,
+                    )
+                    .await?
+            }
+            LookupPageFilter::TitleToken(title_token) => {
+                repository
+                    .local_items_by_media_type_and_title_token_page(
+                        media_type,
+                        title_token,
+                        limit,
+                        offset,
+                    )
+                    .await?
+            }
+        };
+        let page_len = items.len();
+        for item in items {
+            if item.id.is_some_and(|id| !seen.insert(id)) {
+                continue;
+            }
+            if let Some(score) = reverse_lookup_score(&item, key, config) {
+                scored.push(ScoredLookupItem {
+                    item,
+                    source: score.source,
+                    distance: score.distance,
+                });
+            }
+        }
+        if page_len < usize::from(limit) {
+            break;
+        }
+        offset = offset.saturating_add(u32::from(limit));
+    }
+
+    Ok(())
 }
 
 async fn add_lookup_items(
@@ -668,6 +819,7 @@ async fn add_lookup_items(
     context: ContentFilterContext,
     config: &ReverseLookupConfig,
     seen: &mut HashSet<LocalItemId>,
+    accepted_signature_indexes: &mut HashMap<String, usize>,
     lookup: &mut Vec<ReverseLookupCandidate>,
 ) -> Result<(), ReverseLookupError> {
     for item in items {
@@ -691,13 +843,22 @@ async fn add_lookup_items(
         if !matches!(filter_decision, ContentFilterDecision::Accepted) {
             continue;
         }
-        lookup.push(ReverseLookupCandidate {
+        let candidate = ReverseLookupCandidate {
             local_item: item,
             local_files: files.files,
             local_files_truncated: files.truncated,
             source,
             distance,
-        });
+        };
+        let signature = reverse_lookup_signature(&candidate);
+        if let Some(index) = accepted_signature_indexes.get(&signature).copied() {
+            if reverse_lookup_order(&candidate, &lookup[index]).is_lt() {
+                lookup[index] = candidate;
+            }
+            continue;
+        }
+        accepted_signature_indexes.insert(signature, lookup.len());
+        lookup.push(candidate);
     }
 
     Ok(())
@@ -802,6 +963,19 @@ fn reverse_lookup_order(
                 .display_name
                 .as_str()
                 .cmp(right.local_item.display_name.as_str())
+        })
+}
+
+fn scored_lookup_order(left: &ScoredLookupItem, right: &ScoredLookupItem) -> std::cmp::Ordering {
+    source_rank(&left.item)
+        .cmp(&source_rank(&right.item))
+        .then_with(|| left.source.cmp(&right.source))
+        .then_with(|| left.distance.cmp(&right.distance))
+        .then_with(|| {
+            left.item
+                .display_name
+                .as_str()
+                .cmp(right.item.display_name.as_str())
         })
 }
 
@@ -3014,6 +3188,238 @@ mod tests {
                 .iter()
                 .all(|found| !found.local_item.display_name.as_str().contains("Blocked"))
         );
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_pages_common_token_candidates() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let files = vec![local_file("Common.Target.Movie/movie.mkv", 10, 0)];
+        let config = ReverseLookupConfig {
+            max_local_candidates: 4,
+            ..ReverseLookupConfig::default()
+        };
+        let distractor_count =
+            usize::from(config.max_local_candidates * REVERSE_LOOKUP_SCAN_PAGE_MULTIPLIER) + 4;
+        for index in 0..distractor_count {
+            let distractor = local_item(
+                LocalItemSource::DataRoot {
+                    path: PathBuf::from(format!("/media/a-common-noise-{index:02}")),
+                },
+                &format!("A Common Noise {index:02}"),
+                MediaType::Movie,
+                10,
+            );
+            insert_local(&repository, &distractor, &files).await;
+        }
+        let target = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/common-target-movie"),
+            },
+            "Common Target Movie",
+            MediaType::Movie,
+            10,
+        );
+        insert_local(&repository, &target, &files).await;
+        let candidate = remote_candidate("guid-common", "Common Target Movie", None);
+
+        let matches = reverse_lookup_candidates(
+            &repository,
+            &candidate,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(1, matches.len());
+        assert_eq!("Common Target Movie", matches[0].local_item.title.as_str());
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_backfills_after_blocklisted_candidates() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let files = vec![local_file("Example.Movie/movie.mkv", 10, 0)];
+        let mut blocked = local_item(
+            LocalItemSource::Client {
+                client_host: ClientHost::new("qbit.local").unwrap(),
+                source_key: SourceKey::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            },
+            "Example Movie",
+            MediaType::Movie,
+            10,
+        );
+        blocked.path = Some(PathBuf::from("/blocked/example/movie.mkv"));
+        let valid = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/example-movie"),
+            },
+            "Example Movie",
+            MediaType::Movie,
+            10,
+        );
+        insert_local(&repository, &blocked, &files).await;
+        insert_local(&repository, &valid, &files).await;
+        let candidate = remote_candidate("guid-backfill", "Example Movie", None);
+        let mut config = ReverseLookupConfig {
+            max_local_candidates: 1,
+            ..ReverseLookupConfig::default()
+        };
+        config.content_filter.blocklist =
+            vec![BlocklistRule::FolderSubstring("/blocked".to_owned())];
+
+        let matches = reverse_lookup_candidates(
+            &repository,
+            &candidate,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(1, matches.len());
+        assert!(matches!(
+            matches[0].local_item.source,
+            LocalItemSource::DataRoot { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_probes_all_title_tokens_before_common_token_pages() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let files = vec![local_file("Common.Title/movie.mkv", 10, 0)];
+        let config = ReverseLookupConfig {
+            max_local_candidates: 4,
+            ..ReverseLookupConfig::default()
+        };
+        let distractor_count =
+            usize::from(config.max_local_candidates * REVERSE_LOOKUP_SCAN_PAGE_MULTIPLIER) + 4;
+        for index in 0..distractor_count {
+            let distractor = local_item(
+                LocalItemSource::DataRoot {
+                    path: PathBuf::from(format!("/media/a-common-title-{index:03}")),
+                },
+                "Common Movie Target",
+                MediaType::Movie,
+                10,
+            );
+            insert_local(&repository, &distractor, &files).await;
+        }
+        let target = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/common-target-zoo"),
+            },
+            "Common Target Movie",
+            MediaType::Movie,
+            10,
+        );
+        insert_local(&repository, &target, &files).await;
+        let candidate = remote_candidate("guid-all-tokens", "Common Target Movie", None);
+
+        let matches = reverse_lookup_candidates(
+            &repository,
+            &candidate,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches
+                .iter()
+                .any(|found| found.local_item.title.as_str() == "Common Target Movie")
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_backfills_after_duplicate_candidates() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let files = vec![local_file("Example.Movie/movie.mkv", 10, 0)];
+        for path in ["/media/example-movie-a", "/media/example-movie-b"] {
+            let duplicate = local_item(
+                LocalItemSource::DataRoot {
+                    path: PathBuf::from(path),
+                },
+                "Example Movie",
+                MediaType::Movie,
+                10,
+            );
+            insert_local(&repository, &duplicate, &files).await;
+        }
+        let unique = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/example-movies"),
+            },
+            "Example Movies",
+            MediaType::Movie,
+            10,
+        );
+        insert_local(&repository, &unique, &files).await;
+        let candidate = remote_candidate("guid-dedupe-backfill", "Example Movie", None);
+        let config = ReverseLookupConfig {
+            max_local_candidates: 2,
+            ..ReverseLookupConfig::default()
+        };
+
+        let matches = reverse_lookup_candidates(
+            &repository,
+            &candidate,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(2, matches.len());
+        assert!(
+            matches
+                .iter()
+                .any(|found| found.local_item.title.as_str() == "Example Movies")
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_keeps_best_duplicate_info_hash_candidate() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let files = vec![local_file("Example/movie.mkv", 10, 0)];
+        let mut data = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/example"),
+            },
+            "Example",
+            MediaType::Movie,
+            10,
+        );
+        data.info_hash = Some(info_hash.clone());
+        let mut cache = local_item(
+            LocalItemSource::TorrentCache {
+                path: PathBuf::from("/cache/example.torrent"),
+            },
+            "Example",
+            MediaType::Movie,
+            10,
+        );
+        cache.info_hash = Some(info_hash.clone());
+        insert_local(&repository, &data, &files).await;
+        insert_local(&repository, &cache, &files).await;
+        let mut candidate = remote_candidate("guid-best-duplicate", "Example", None);
+        candidate.info_hash = Some(info_hash);
+
+        let matches = reverse_lookup_candidates(
+            &repository,
+            &candidate,
+            ContentFilterContext::ReverseLookup,
+            &ReverseLookupConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(1, matches.len());
+        assert!(matches!(
+            matches[0].local_item.source,
+            LocalItemSource::TorrentCache { .. }
+        ));
     }
 
     #[tokio::test]

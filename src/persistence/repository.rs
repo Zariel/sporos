@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Executor, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tracing::{debug_span, info_span};
 
 use crate::announce::{
@@ -398,6 +398,16 @@ impl Repository {
         media_type: MediaType,
         limit: u16,
     ) -> Result<Vec<LocalItem>, DatabaseError> {
+        self.local_items_by_media_type_page(media_type, limit, 0)
+            .await
+    }
+
+    pub async fn local_items_by_media_type_page(
+        &self,
+        media_type: MediaType,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
         let rows = sqlx::query(
             r#"
             SELECT id, source_type, source_key, title, display_name, media_type,
@@ -406,10 +416,12 @@ impl Repository {
             WHERE media_type = ?
             ORDER BY title, source_type, source_key
             LIMIT ?
+            OFFSET ?
             "#,
         )
         .bind(media_type_key(media_type))
         .bind(i64::from(limit))
+        .bind(i64::from(offset))
         .fetch_all(&self.pool)
         .await
         .map_err(|error| db_error("lookup local items by media type", error))?;
@@ -423,6 +435,17 @@ impl Repository {
         title_token: &str,
         limit: u16,
     ) -> Result<Vec<LocalItem>, DatabaseError> {
+        self.local_items_by_media_type_and_title_token_page(media_type, title_token, limit, 0)
+            .await
+    }
+
+    pub async fn local_items_by_media_type_and_title_token_page(
+        &self,
+        media_type: MediaType,
+        title_token: &str,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
         let rows = sqlx::query(
             r#"
             SELECT id, source_type, source_key, title, display_name, media_type,
@@ -432,14 +455,56 @@ impl Repository {
               AND title LIKE '%' || ? || '%'
             ORDER BY title, source_type, source_key
             LIMIT ?
+            OFFSET ?
             "#,
         )
         .bind(media_type_key(media_type))
         .bind(title_token)
         .bind(i64::from(limit))
+        .bind(i64::from(offset))
         .fetch_all(&self.pool)
         .await
         .map_err(|error| db_error("lookup local items by media type and title", error))?;
+
+        rows.into_iter().map(local_item_from_row).collect()
+    }
+
+    pub async fn local_items_by_media_type_and_title_tokens_page(
+        &self,
+        media_type: MediaType,
+        title_tokens: &[&str],
+        preferred_title: &str,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT id, source_type, source_key, title, display_name, media_type,
+                   info_hash, path, save_path, total_size, mtime_ms
+            FROM local_items
+            WHERE media_type =
+            "#,
+        );
+        query.push_bind(media_type_key(media_type));
+        for title_token in title_tokens {
+            query
+                .push(" AND title LIKE '%' || ")
+                .push_bind(*title_token)
+                .push(" || '%'");
+        }
+        query
+            .push(" ORDER BY CASE WHEN lower(title) = ")
+            .push_bind(preferred_title)
+            .push(" OR lower(display_name) = ")
+            .push_bind(preferred_title)
+            .push(" THEN 0 ELSE 1 END, length(title), title, source_type, source_key LIMIT ")
+            .push_bind(i64::from(limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(offset));
+
+        let rows = query.build().fetch_all(&self.pool).await.map_err(|error| {
+            db_error("lookup local items by media type and title tokens", error)
+        })?;
 
         rows.into_iter().map(local_item_from_row).collect()
     }
