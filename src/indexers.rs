@@ -13,6 +13,7 @@ use quick_xml::name::QName;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::config::{IndexersConfig, TorznabIndexerConfig};
 use crate::domain::{
@@ -722,7 +723,17 @@ pub fn parse_torznab_rss(
                             message: "item end without item start".to_owned(),
                         });
                     };
-                    candidates.push(builder.into_candidate(endpoint)?);
+                    match builder.into_candidate(endpoint) {
+                        Ok(candidate) => candidates.push(candidate),
+                        Err(TorznabRequestError::InvalidCandidate { message }) => {
+                            warn!(
+                                indexer = %endpoint.name,
+                                error = %message,
+                                "skipping malformed Torznab RSS item"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 text_field = None;
             }
@@ -1904,6 +1915,60 @@ mod tests {
             "https://indexer.example/download?id=2",
             candidates[0].download_url.as_str()
         );
+    }
+
+    #[test]
+    fn rss_parser_skips_malformed_items_without_losing_valid_candidates() {
+        let endpoint = test_endpoint("https://indexer.example/api".to_owned());
+        let candidates = parse_torznab_rss(
+            r#"
+            <rss>
+              <channel>
+                <item>
+                  <title>Missing download</title>
+                  <guid>bad-1</guid>
+                </item>
+                <item>
+                  <guid>bad-2</guid>
+                  <link>https://indexer.example/download?id=bad-2</link>
+                </item>
+                <item>
+                  <title>Example S01E03</title>
+                  <guid>candidate-3</guid>
+                  <link>https://indexer.example/download?id=3</link>
+                </item>
+              </channel>
+            </rss>
+            "#,
+            &endpoint,
+        )
+        .unwrap();
+
+        assert_eq!(1, candidates.len());
+        assert_eq!("candidate-3", candidates[0].guid.as_str());
+        assert_eq!("Example S01E03", candidates[0].title.as_str());
+    }
+
+    #[test]
+    fn rss_parser_preserves_hard_failures_for_malformed_documents() {
+        let endpoint = test_endpoint("https://indexer.example/api".to_owned());
+        let error = parse_torznab_rss(
+            r#"
+            <rss>
+              <channel>
+                <item>
+                  <title>&unknown;</title>
+                  <guid>candidate-1</guid>
+                  <link>https://indexer.example/download?id=1</link>
+                </item>
+              </channel>
+            </rss>
+            "#,
+            &endpoint,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, TorznabRequestError::InvalidXml { .. }));
     }
 
     #[tokio::test]
