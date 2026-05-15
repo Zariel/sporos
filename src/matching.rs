@@ -1104,6 +1104,7 @@ impl SearchIds {
 pub struct SearchPlanningItem<'a> {
     pub item: &'a LocalItem,
     pub ids: SearchIds,
+    pub search_type: TorznabSearchType,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1143,6 +1144,7 @@ pub enum TorznabSearchType {
     Search,
     TvSearch,
     MovieSearch,
+    AudioSearch,
 }
 
 impl TorznabSearchType {
@@ -1151,6 +1153,7 @@ impl TorznabSearchType {
             Self::Search => "search",
             Self::TvSearch => "tvsearch",
             Self::MovieSearch => "movie",
+            Self::AudioSearch => "music",
         }
     }
 }
@@ -1159,7 +1162,7 @@ pub fn group_search_items<'a>(items: Vec<SearchPlanningItem<'a>>) -> Vec<SearchG
     let mut groups = BTreeMap::<SearchCacheKey, Vec<SearchPlanningItem<'a>>>::new();
     for item in items {
         groups
-            .entry(search_cache_key(item.item, &item.ids))
+            .entry(search_cache_key(item.item, &item.ids, item.search_type))
             .or_default()
             .push(item);
     }
@@ -1170,14 +1173,20 @@ pub fn group_search_items<'a>(items: Vec<SearchPlanningItem<'a>>) -> Vec<SearchG
         .collect()
 }
 
-pub fn search_cache_key(item: &LocalItem, ids: &SearchIds) -> SearchCacheKey {
+pub fn search_cache_key(
+    item: &LocalItem,
+    ids: &SearchIds,
+    search_type: TorznabSearchType,
+) -> SearchCacheKey {
     let title = normalize_search_key(item.title.as_str());
     let metadata = parsed_search_metadata(item);
-    let mut value = match (metadata.season, metadata.episode) {
+    let mut value = search_type.as_str().to_owned();
+    value.push('|');
+    value.push_str(&match (metadata.season, metadata.episode) {
         (Some(season), Some(episode)) => format!("{title}.s{season:02}.e{episode:02}"),
         (Some(season), None) => format!("{title}.s{season:02}"),
         _ => title,
-    };
+    });
     if let Some(imdb_id) = ids.imdb_id.as_deref() {
         value.push_str("|imdb:");
         value.push_str(&normalize_search_key(imdb_id));
@@ -1205,9 +1214,8 @@ pub fn plan_torznab_search(
     let query = match item.media_type {
         MediaType::Episode | MediaType::SeasonPack => tv_query(item, ids, caps, metadata),
         MediaType::Movie => movie_query(item, ids, caps),
-        MediaType::Anime | MediaType::Video | MediaType::Audio | MediaType::Book => {
-            generic_query(item, ids, caps)
-        }
+        MediaType::Audio => audio_query(item, ids, caps),
+        MediaType::Anime | MediaType::Video | MediaType::Book => generic_query(item, ids, caps),
         MediaType::Archive | MediaType::Unknown => generic_query(item, ids, caps),
     }?;
 
@@ -1340,6 +1348,23 @@ fn movie_query(
             season: None,
             episode: None,
             ids,
+        });
+    }
+    generic_query(item, ids, caps)
+}
+
+fn audio_query(
+    item: &LocalItem,
+    ids: &SearchIds,
+    caps: &TorznabCaps,
+) -> Option<TorznabSearchQuery> {
+    if caps.search.audio_search {
+        return Some(TorznabSearchQuery {
+            search_type: TorznabSearchType::AudioSearch,
+            q: Some(item.title.as_str().to_owned()),
+            season: None,
+            episode: None,
+            ids: supported_ids(ids, caps, &["imdbid", "tvdbid", "tmdbid"]),
         });
     }
     generic_query(item, ids, caps)
@@ -2065,6 +2090,7 @@ mod tests {
         let groups = group_search_items(vec![
             SearchPlanningItem {
                 item: &movie,
+                search_type: TorznabSearchType::MovieSearch,
                 ids: SearchIds {
                     imdb_id: Some("tt123".to_owned()),
                     ..SearchIds::default()
@@ -2072,6 +2098,7 @@ mod tests {
             },
             SearchPlanningItem {
                 item: &same_movie,
+                search_type: TorznabSearchType::MovieSearch,
                 ids: SearchIds {
                     imdb_id: Some("tt123".to_owned()),
                     ..SearchIds::default()
@@ -2079,6 +2106,7 @@ mod tests {
             },
             SearchPlanningItem {
                 item: &different_id_movie,
+                search_type: TorznabSearchType::MovieSearch,
                 ids: SearchIds {
                     imdb_id: Some("tt999".to_owned()),
                     ..SearchIds::default()
@@ -2089,8 +2117,41 @@ mod tests {
         assert_eq!(2, groups.len());
         assert_eq!(2, groups[0].items.len());
         assert_ne!(groups[0].cache_key, groups[1].cache_key);
+        assert!(groups[0].cache_key.as_str().starts_with("movie|"));
         assert!(groups[0].cache_key.as_str().contains("imdb:tt123"));
         assert!(groups[1].cache_key.as_str().contains("imdb:tt999"));
+    }
+
+    #[test]
+    fn query_grouping_keeps_search_types_distinct() {
+        let audio = search_item("Example Album", MediaType::Audio);
+        let generic = search_item("Example Album", MediaType::Video);
+
+        let groups = group_search_items(vec![
+            SearchPlanningItem {
+                item: &audio,
+                ids: SearchIds::default(),
+                search_type: TorznabSearchType::AudioSearch,
+            },
+            SearchPlanningItem {
+                item: &generic,
+                ids: SearchIds::default(),
+                search_type: TorznabSearchType::Search,
+            },
+        ]);
+
+        assert_eq!(2, groups.len());
+        assert_ne!(groups[0].cache_key, groups[1].cache_key);
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.cache_key.as_str() == "music|example.album")
+        );
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.cache_key.as_str() == "search|example.album")
+        );
     }
 
     #[test]
@@ -2100,6 +2161,7 @@ mod tests {
         let pack = search_item("My Show S01", MediaType::SeasonPack);
         let movie = search_item("Example Movie 2026", MediaType::Movie);
         let anime = search_item("Anime Show 03", MediaType::Anime);
+        let audio = search_item("Example Album", MediaType::Audio);
         let book = search_item("Great Book", MediaType::Book);
         let video = search_item("Generic Video", MediaType::Video);
 
@@ -2123,6 +2185,7 @@ mod tests {
         )
         .unwrap();
         let anime_plan = plan_torznab_search(&anime, &SearchIds::default(), &caps).unwrap();
+        let audio_plan = plan_torznab_search(&audio, &SearchIds::default(), &caps).unwrap();
         let book_plan = plan_torznab_search(&book, &SearchIds::default(), &caps).unwrap();
         let video_plan = plan_torznab_search(&video, &SearchIds::default(), &caps).unwrap();
 
@@ -2136,6 +2199,8 @@ mod tests {
         assert_eq!(Some("tt123"), movie_plan.query.ids.imdb_id.as_deref());
         assert_eq!(TorznabSearchType::Search, anime_plan.query.search_type);
         assert_eq!(Some("Anime Show 03"), anime_plan.query.q.as_deref());
+        assert_eq!(TorznabSearchType::AudioSearch, audio_plan.query.search_type);
+        assert_eq!("music", audio_plan.query.search_type.as_str());
         assert_eq!(TorznabSearchType::Search, book_plan.query.search_type);
         assert_eq!(TorznabSearchType::Search, video_plan.query.search_type);
         assert_eq!(200, episode_plan.limit);
@@ -2145,6 +2210,7 @@ mod tests {
     fn query_planning_respects_media_support_and_id_fallback() {
         let movie = search_item("Example Movie 2026", MediaType::Movie);
         let episode = search_item("My Show S01E02", MediaType::Episode);
+        let audio = search_item("Example Album", MediaType::Audio);
         let movie_only_caps = TorznabCaps {
             search: SearchCaps {
                 generic_search: true,
@@ -2174,8 +2240,24 @@ mod tests {
             },
             limits: TorznabLimits::default(),
         };
+        let audio_only_caps = TorznabCaps {
+            search: SearchCaps {
+                audio_search: true,
+                ..SearchCaps::default()
+            },
+            categories: CategoryCaps {
+                audio: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits {
+                default: 50,
+                max: 50,
+            },
+        };
 
         assert!(plan_torznab_search(&episode, &SearchIds::default(), &movie_only_caps).is_none());
+        let audio_only =
+            plan_torznab_search(&audio, &SearchIds::default(), &audio_only_caps).unwrap();
         let fallback = plan_torznab_search(
             &movie,
             &SearchIds {
@@ -2187,10 +2269,47 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(TorznabSearchType::AudioSearch, audio_only.query.search_type);
+        assert_eq!(Some("Example Album"), audio_only.query.q.as_deref());
         assert_eq!(TorznabSearchType::Search, fallback.query.search_type);
         assert_eq!(Some("Example Movie 2026"), fallback.query.q.as_deref());
         assert_eq!(Some("tt123"), fallback.query.ids.imdb_id.as_deref());
         assert_eq!(None, fallback.query.ids.tmdb_id);
+    }
+
+    #[test]
+    fn cadence_treats_audio_only_indexers_as_compatible() {
+        let audio = search_item("Example Album", MediaType::Audio);
+        let caps = TorznabCaps {
+            search: SearchCaps {
+                audio_search: true,
+                ..SearchCaps::default()
+            },
+            categories: CategoryCaps {
+                audio: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits::default(),
+        };
+        let indexers = vec![cadence_indexer(1, true, &caps)];
+
+        let missing_history = evaluate_search_cadence(
+            &audio,
+            &indexers,
+            &[],
+            1_000,
+            SearchCadenceConfig {
+                recent_search_cooldown_ms: Some(200),
+                first_search_window_ms: None,
+            },
+        );
+
+        assert_eq!(
+            SearchCadenceDecision::Searchable(
+                SearchCadenceSearchReason::MissingCompatibleIndexerHistory
+            ),
+            missing_history
+        );
     }
 
     #[test]

@@ -1333,7 +1333,11 @@ pub fn parse_torznab_caps(xml: &str) -> Result<TorznabCaps, TorznabCapsError> {
             message: "missing caps root".to_owned(),
         });
     }
-    if !caps.search.generic_search && !caps.search.tv_search && !caps.search.movie_search {
+    if !caps.search.generic_search
+        && !caps.search.tv_search
+        && !caps.search.movie_search
+        && !caps.search.audio_search
+    {
         return Err(TorznabCapsError::UnsupportedSearch);
     }
 
@@ -1610,6 +1614,45 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef01234567"),
             candidates[0].info_hash.as_ref().map(InfoHash::as_str)
         );
+    }
+
+    #[tokio::test]
+    async fn search_client_sends_audio_queries_as_music() {
+        let endpoint = test_endpoint(
+            spawn_torznab_server(|request| async move {
+                let query = request.uri().query().unwrap_or_default();
+                if !query.contains("t=music")
+                    || !query.contains("q=Example")
+                    || !query.contains("apikey=secret")
+                {
+                    return (AxumStatusCode::BAD_REQUEST, "bad query".to_owned());
+                }
+                (
+                    AxumStatusCode::OK,
+                    search_rss("candidate-1", "Example Album"),
+                )
+            })
+            .await,
+        );
+        let client = TorznabHttpClient::new(Duration::from_secs(5));
+        let plan = TorznabSearchPlan {
+            query: TorznabSearchQuery {
+                search_type: TorznabSearchType::AudioSearch,
+                q: Some("Example".to_owned()),
+                season: None,
+                episode: None,
+                ids: SearchIds::default(),
+            },
+            limit: 50,
+        };
+
+        let candidates = client
+            .search(&endpoint, MediaType::Audio, &plan, 1_700_000_000_000)
+            .await
+            .unwrap();
+
+        assert_eq!(1, candidates.len());
+        assert_eq!("candidate-1", candidates[0].guid.as_str());
     }
 
     #[tokio::test]
@@ -2142,6 +2185,7 @@ mod tests {
                 <search available="yes" supportedParams="q"/>
                 <tv-search available="yes" supportedParams="q,tvdbid,imdbid"/>
                 <movie-search available="yes" supportedParams="q,imdbid"/>
+                <audio-search available="yes" supportedParams="q,imdbid"/>
               </searching>
               <categories>
                 <category id="2000" name="Movies"/>
@@ -2165,6 +2209,7 @@ mod tests {
         );
         assert!(caps.search.generic_search);
         assert!(caps.search.tv_search);
+        assert!(caps.search.audio_search);
         assert!(caps.search.supported_id_params.contains("tvdbid"));
         assert!(caps.categories.movie);
         assert!(caps.categories.additional);
@@ -2175,6 +2220,19 @@ mod tests {
 
     #[test]
     fn caps_parser_defaults_limits_and_rejects_unsupported_search() {
+        let audio_only = parse_torznab_caps(
+            r#"
+            <caps>
+              <searching>
+                <audio-search available="yes" supportedParams="q"/>
+              </searching>
+              <categories>
+                <category id="3000" name="Audio"/>
+              </categories>
+            </caps>
+            "#,
+        )
+        .unwrap();
         let error = parse_torznab_caps(
             r#"
             <caps>
@@ -2186,6 +2244,8 @@ mod tests {
         )
         .unwrap_err();
 
+        assert!(audio_only.search.audio_search);
+        assert!(audio_only.supports_media_type(MediaType::Audio));
         assert_eq!(TorznabCapsError::UnsupportedSearch, error);
     }
 
@@ -2228,12 +2288,14 @@ mod tests {
                 generic_search: true,
                 tv_search: true,
                 movie_search: true,
+                audio_search: true,
                 supported_id_params: ["tvdbid".to_owned()].into_iter().collect(),
                 ..SearchCaps::default()
             },
             categories: CategoryCaps {
                 tv: true,
                 movie: true,
+                audio: true,
                 ..CategoryCaps::default()
             },
             limits: TorznabLimits {
