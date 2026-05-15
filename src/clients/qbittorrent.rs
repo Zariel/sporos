@@ -17,6 +17,7 @@ const MIN_QBIT_VERSION: QbitVersion = QbitVersion {
     minor: 3,
     patch: 1,
 };
+const QBIT_INVENTORY_PAGE_SIZE: usize = 500;
 
 #[derive(Debug)]
 pub struct QbittorrentClient {
@@ -80,11 +81,27 @@ impl QbittorrentClient {
     }
 
     pub async fn list_inventory(&self) -> Result<Vec<QbitTorrent>, TorrentClientError> {
-        let text = self.get_text("/api/v2/torrents/info").await?;
-        serde_json::from_str(&text).map_err(|error| TorrentClientError::BadResponse {
-            client: self.client_name.clone(),
-            message: error.to_string(),
-        })
+        let mut torrents = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let text = self
+                .get_text(&format!(
+                    "/api/v2/torrents/info?sort=hash&limit={QBIT_INVENTORY_PAGE_SIZE}&offset={offset}"
+                ))
+                .await?;
+            let page: Vec<QbitTorrent> =
+                serde_json::from_str(&text).map_err(|error| TorrentClientError::BadResponse {
+                    client: self.client_name.clone(),
+                    message: error.to_string(),
+                })?;
+            let page_len = page.len();
+            torrents.extend(page);
+            if page_len < QBIT_INVENTORY_PAGE_SIZE {
+                break;
+            }
+            offset = offset.saturating_add(QBIT_INVENTORY_PAGE_SIZE);
+        }
+        Ok(torrents)
     }
 
     pub async fn fetch_files(
@@ -792,6 +809,50 @@ mod tests {
         assert_eq!("https://tracker.example/announce", trackers[0].url);
     }
 
+    #[tokio::test]
+    async fn client_pages_large_inventory_requests() {
+        let seen_queries = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen_requests = seen_queries.clone();
+        let endpoint = spawn_qbit_server(move |request| {
+            let seen_queries = seen_requests.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                match path.as_str() {
+                    "/api/v2/auth/login" => {
+                        response_with_cookie(AxumStatusCode::OK, "Ok.", "SID=ok")
+                    }
+                    "/api/v2/torrents/info" => {
+                        let query = request.uri().query().unwrap_or_default().to_owned();
+                        seen_queries.lock().unwrap().push(query.clone());
+                        let limit = query_param(&query, "limit");
+                        let offset = query_param(&query, "offset");
+                        assert_eq!(QBIT_INVENTORY_PAGE_SIZE, limit);
+
+                        let total = QBIT_INVENTORY_PAGE_SIZE + 1;
+                        let count = total.saturating_sub(offset).min(limit);
+                        (AxumStatusCode::OK, qbit_inventory_response(offset, count)).into_response()
+                    }
+                    _ => (AxumStatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+
+        let inventory = client.list_inventory().await.unwrap();
+
+        assert_eq!(QBIT_INVENTORY_PAGE_SIZE + 1, inventory.len());
+        assert_eq!(
+            vec![
+                format!("sort=hash&limit={QBIT_INVENTORY_PAGE_SIZE}&offset=0"),
+                format!(
+                    "sort=hash&limit={QBIT_INVENTORY_PAGE_SIZE}&offset={QBIT_INVENTORY_PAGE_SIZE}"
+                ),
+            ],
+            *seen_queries.lock().unwrap()
+        );
+    }
+
     fn response_with_cookie(
         status: AxumStatusCode,
         body: &'static str,
@@ -802,6 +863,29 @@ mod tests {
             .headers_mut()
             .insert(SET_COOKIE, cookie.parse().unwrap());
         response
+    }
+
+    fn query_param(query: &str, name: &str) -> usize {
+        query
+            .split('&')
+            .filter_map(|part| part.split_once('='))
+            .find_map(|(key, value)| (key == name).then(|| value.parse().unwrap()))
+            .unwrap()
+    }
+
+    fn qbit_inventory_response(start: usize, count: usize) -> String {
+        let mut body = String::from("[");
+        for index in 0..count {
+            if index > 0 {
+                body.push(',');
+            }
+            let id = start + index + 1;
+            body.push_str(&format!(
+                r#"{{"hash":"{id:040x}","name":"Example {id}","amount_left":0,"progress":1.0}}"#
+            ));
+        }
+        body.push(']');
+        body
     }
 
     async fn spawn_qbit_server<F, Fut, R>(handler: F) -> String

@@ -25,6 +25,7 @@ const INVENTORY_METHODS: &[&str] = &[
     "d.is_active",
     "d.custom1",
 ];
+const RTORRENT_INVENTORY_CHUNK_SIZE: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct RtorrentClient {
@@ -58,10 +59,18 @@ impl RtorrentClient {
             return Ok(Vec::new());
         }
 
-        let response = self
-            .call("system.multicall", vec![inventory_multicall_param(&hashes)])
-            .await?;
-        parse_inventory_response(&self.client_name, &hashes, &response)
+        let mut downloads = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(RTORRENT_INVENTORY_CHUNK_SIZE) {
+            let response = self
+                .call("system.multicall", vec![inventory_multicall_param(chunk)])
+                .await?;
+            downloads.extend(parse_inventory_response(
+                &self.client_name,
+                chunk,
+                &response,
+            )?);
+        }
+        Ok(downloads)
     }
 
     pub async fn fetch_files(
@@ -701,6 +710,7 @@ fn bad_response(client: &str, message: impl Into<String>) -> TorrentClientError 
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use axum::Router;
     use axum::body::{Body, to_bytes};
@@ -855,6 +865,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_chunks_large_inventory_multicalls() {
+        let seen_chunks = Arc::new(StdMutex::new(Vec::<usize>::new()));
+        let seen_requests = seen_chunks.clone();
+        let endpoint = spawn_rtorrent_server(move |request| {
+            let seen_chunks = seen_requests.clone();
+            async move {
+                let body = to_bytes(request.into_body(), 5_000_000).await.unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                if body.contains("<methodName>download_list</methodName>") {
+                    return (
+                        AxumStatusCode::OK,
+                        xml_response(&download_list_xml(RTORRENT_INVENTORY_CHUNK_SIZE + 1)),
+                    );
+                }
+                if body.contains("<methodName>system.multicall</methodName>")
+                    && body.contains("d.custom1")
+                {
+                    let chunk_size = body.matches("<string>d.name</string>").count();
+                    seen_chunks.lock().unwrap().push(chunk_size);
+                    return (
+                        AxumStatusCode::OK,
+                        xml_response(&inventory_rows_xml(chunk_size)),
+                    );
+                }
+                (AxumStatusCode::BAD_REQUEST, body)
+            }
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        let inventory = client.list_inventory().await.unwrap();
+
+        assert_eq!(RTORRENT_INVENTORY_CHUNK_SIZE + 1, inventory.len());
+        assert_eq!(
+            vec![RTORRENT_INVENTORY_CHUNK_SIZE, 1],
+            *seen_chunks.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn client_posts_label_recheck_pause_and_resume_methods() {
         let endpoint = spawn_rtorrent_server(|request| async move {
             let body = to_bytes(request.into_body(), 65_536).await.unwrap();
@@ -899,6 +949,41 @@ mod tests {
               <value><array><data><value><string>sporos</string></value></data></array></value>
             </data></array>"#,
         )
+    }
+
+    fn download_list_xml(count: usize) -> String {
+        let mut body = String::from("<array><data>");
+        for index in 0..count {
+            body.push_str(&format!(
+                r#"<value><string>{:040x}</string></value>"#,
+                index + 1
+            ));
+        }
+        body.push_str("</data></array>");
+        body
+    }
+
+    fn inventory_rows_xml(count: usize) -> String {
+        let mut body = String::from("<array><data>");
+        for index in 0..count {
+            let name = format!("Example {}", index + 1);
+            for value in [
+                format!("<string>{name}</string>"),
+                "<string>/downloads</string>".to_owned(),
+                "<i8>0</i8>".to_owned(),
+                "<i8>0</i8>".to_owned(),
+                "<i8>1</i8>".to_owned(),
+                "<i8>1</i8>".to_owned(),
+                "<i8>0</i8>".to_owned(),
+                "<string>sporos</string>".to_owned(),
+            ] {
+                body.push_str("<value><array><data><value>");
+                body.push_str(&value);
+                body.push_str("</value></data></array></value>");
+            }
+        }
+        body.push_str("</data></array>");
+        body
     }
 
     async fn spawn_rtorrent_server<F, Fut, R>(handler: F) -> String
