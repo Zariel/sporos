@@ -17,6 +17,7 @@ use crate::inventory::{
 use crate::persistence::repository::{
     LocalInventoryReplaceSummary, LocalInventoryScope, LocalItemFileBatch, Repository,
 };
+use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -130,6 +131,9 @@ impl InventoryRefreshWorker {
             .repository
             .replace_local_inventory(LocalInventoryScope::DataRoot, &batches)
             .await?;
+        self.repository
+            .wake_announce_inventory_refresh(unix_time_ms(), 1_000)
+            .await?;
 
         Ok(InventoryRefreshSummary {
             scanned_items: scan_report.items.len(),
@@ -158,7 +162,15 @@ impl InventoryRefreshWorker {
             .collect::<Vec<_>>();
         let LocalInventoryReplaceSummary { upserted, pruned } = self
             .repository
-            .replace_local_inventory(LocalInventoryScope::Client { client_host }, &batches)
+            .replace_local_inventory(
+                LocalInventoryScope::Client {
+                    client_host: client_host.clone(),
+                },
+                &batches,
+            )
+            .await?;
+        self.repository
+            .wake_announce_client_source_completion(&client_host, unix_time_ms(), 1_000)
             .await?;
 
         Ok(InventoryRefreshSummary {
@@ -230,10 +242,14 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
-    use crate::domain::{
-        ByteSize, ClientHost, DisplayName, FileIndex, InfoHash, ItemTitle, LocalFile, LocalItem,
-        LocalItemSource, MediaType, SourceKey,
+    use crate::announce::{
+        AnnounceDedupeIdentity, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
     };
+    use crate::domain::{
+        ByteSize, CandidateGuid, ClientHost, DisplayName, FileIndex, InfoHash, ItemTitle,
+        LocalFile, LocalItem, LocalItemSource, MediaType, SourceKey, TrackerName,
+    };
+    use crate::persistence::repository::AnnounceInsertResult;
 
     #[tokio::test]
     async fn refresh_data_dirs_persists_startup_scan() {
@@ -309,6 +325,38 @@ mod tests {
         assert_eq!(1, local_count);
         assert_eq!("Second.2026.1080p", display_name);
         assert_eq!(20, total_size);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_wakes_source_incomplete_announcements() {
+        let root = unique_temp_dir("announce-wake");
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        insert_waiting_announce(
+            &repository,
+            "ann_inventory",
+            "guid-inventory",
+            AnnounceReason::SourceIncomplete,
+            None,
+        )
+        .await;
+
+        worker
+            .refresh_data_dirs(InventoryRefreshRequest {
+                media_dirs: vec![root.clone()],
+            })
+            .await
+            .unwrap();
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM announce_work WHERE id = 'ann_inventory'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!("queued", status);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -402,6 +450,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_client_items_wakes_matching_client_waits() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let client_host = ClientHost::new("qbit.local").unwrap();
+        insert_waiting_announce(
+            &repository,
+            "ann_client",
+            "guid-client",
+            AnnounceReason::ClientChecking,
+            Some(("client", "qbit.local")),
+        )
+        .await;
+        insert_waiting_announce(
+            &repository,
+            "ann_other",
+            "guid-other",
+            AnnounceReason::ClientChecking,
+            Some(("client", "other.local")),
+        )
+        .await;
+
+        worker
+            .refresh_client_items(
+                client_host.clone(),
+                &[client_item(
+                    client_host,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "First",
+                    "First/file-a.mkv",
+                    10,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let rows = sqlx::query("SELECT id, status FROM announce_work ORDER BY id")
+            .fetch_all(repository.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<String, _>("id"), row.get::<String, _>("status")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            vec![
+                ("ann_client".to_owned(), "queued".to_owned()),
+                ("ann_other".to_owned(), "waiting".to_owned())
+            ],
+            rows
+        );
+    }
+
+    #[tokio::test]
     async fn client_inventory_items_materialize_scanned_batches() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
@@ -485,6 +587,78 @@ mod tests {
                 )
                 .unwrap(),
             ],
+        }
+    }
+
+    async fn insert_waiting_announce(
+        repository: &Repository,
+        id: &str,
+        guid: &str,
+        reason: AnnounceReason,
+        dependency: Option<(&str, &str)>,
+    ) {
+        let now_ms = unix_time_ms();
+        let tracker = TrackerName::new("tracker.example").unwrap();
+        let guid = CandidateGuid::new(guid).unwrap();
+        let work = AnnounceWorkItem {
+            id: AnnounceWorkId::new(id).unwrap(),
+            status: AnnounceStatus::Queued,
+            reason: AnnounceReason::Accepted,
+            dedupe_hash: AnnounceDedupeIdentity::Guid {
+                tracker: tracker.clone(),
+                guid: guid.clone(),
+            }
+            .hash(),
+            title: ItemTitle::new("Example").unwrap(),
+            tracker,
+            guid: Some(guid),
+            info_hash: None,
+            size: Some(ByteSize::new(42)),
+            received_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            first_attempt_at_ms: None,
+            finished_at_ms: None,
+            attempt_count: 0,
+            next_attempt_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(120_000),
+            lease: None,
+            last_dependency_kind: None,
+            last_dependency_name: None,
+            last_error_class: None,
+            last_redacted_message: None,
+        };
+        let result = repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        assert_eq!(AnnounceInsertResult::Inserted { id: work.id }, result);
+        let (dependency_kind, dependency_name) = dependency.unwrap_or(("", ""));
+        sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'waiting',
+                reason = ?,
+                next_attempt_at = ?,
+                last_dependency_kind = NULLIF(?, ''),
+                last_dependency_name = NULLIF(?, '')
+            WHERE id = ?
+            "#,
+        )
+        .bind(announce_reason_key(reason))
+        .bind(now_ms.saturating_add(60_000))
+        .bind(dependency_kind)
+        .bind(dependency_name)
+        .bind(id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    }
+
+    fn announce_reason_key(reason: AnnounceReason) -> &'static str {
+        match reason {
+            AnnounceReason::SourceIncomplete => "source_incomplete",
+            AnnounceReason::ClientChecking => "client_checking",
+            _ => unreachable!("unsupported inventory refresh wake test reason"),
         }
     }
 

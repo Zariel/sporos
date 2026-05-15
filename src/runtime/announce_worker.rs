@@ -133,6 +133,9 @@ impl AnnounceWorker {
             )
             .await?;
         self.repository
+            .wake_due_waiting_announce_work(now_ms, reconcile_limit)
+            .await?;
+        self.repository
             .claim_announce_work(
                 self.config.owner.as_str(),
                 now_ms,
@@ -467,6 +470,35 @@ mod tests {
             )],
             dependency_rows(&repository).await
         );
+    }
+
+    #[tokio::test]
+    async fn worker_wakes_due_waiting_work_before_claiming() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_37", "guid-37", 1).await;
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+        let claimed = worker.claim_ready(10).await.unwrap();
+
+        assert!(
+            worker
+                .complete(
+                    &claimed[0],
+                    AnnounceWorkOutcome::Waiting {
+                        reason: AnnounceReason::SourceIncomplete,
+                        next_attempt_at_ms: 20,
+                        dependency: None,
+                    },
+                    10,
+                )
+                .await
+                .unwrap()
+        );
+
+        let early = worker.claim_ready(19).await.unwrap();
+        let ready = worker.claim_ready(20).await.unwrap();
+
+        assert!(early.is_empty());
+        assert_eq!(vec![AnnounceWorkId::new("ann_37").unwrap()], ready);
     }
 
     #[tokio::test]

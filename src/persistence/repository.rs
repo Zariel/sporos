@@ -804,6 +804,19 @@ impl Repository {
         .await
         .map_err(|error| db_error("record dependency health", error))?;
 
+        if matches!(
+            state,
+            DependencyState::Healthy { .. } | DependencyState::Unknown
+        ) {
+            self.wake_announce_dependency_recovery(
+                dependency_type,
+                dependency_name,
+                checked_at_ms,
+                1_000,
+            )
+            .await?;
+        }
+
         Ok(())
     }
 
@@ -1342,6 +1355,218 @@ impl Repository {
         }
 
         Ok(updated)
+    }
+
+    pub async fn wake_announce_inventory_refresh(
+        &self,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let _span = debug_span!("announce.wake_inventory_refresh", limit);
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'queued',
+                next_attempt_at = ?,
+                updated_at = ?
+            WHERE id IN (
+                SELECT id FROM announce_work
+                WHERE status = 'waiting'
+                  AND expires_at > ?
+                  AND reason IN ('source_incomplete', 'inventory_refreshing')
+                  AND last_dependency_kind IS NULL
+                  AND last_dependency_name IS NULL
+                ORDER BY next_attempt_at, received_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("wake inventory announce work", error))?;
+
+        Ok(result.rows_affected())
+    }
+
+    pub async fn wake_announce_client_source_completion(
+        &self,
+        client_host: &ClientHost,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let _span = debug_span!(
+            "announce.wake_client_source_completion",
+            client_host = %client_host,
+            limit
+        );
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'queued',
+                next_attempt_at = ?,
+                updated_at = ?,
+                last_dependency_kind = NULL,
+                last_dependency_name = NULL
+            WHERE id IN (
+                SELECT id FROM announce_work
+                WHERE status = 'waiting'
+                  AND expires_at > ?
+                  AND reason IN ('source_incomplete', 'client_checking')
+                  AND (
+                      last_dependency_kind IS NULL
+                      OR (
+                          last_dependency_kind = 'client'
+                          AND last_dependency_name = ?
+                      )
+                  )
+                ORDER BY next_attempt_at, received_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(client_host.as_str())
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("wake client source announce work", error))?;
+
+        Ok(result.rows_affected())
+    }
+
+    pub async fn wake_announce_dependency_recovery(
+        &self,
+        dependency_type: &str,
+        dependency_name: &DependencyName,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let _span = debug_span!(
+            "announce.wake_dependency_recovery",
+            dependency_type,
+            dependency_name = %dependency_name,
+            limit
+        );
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'queued',
+                next_attempt_at = ?,
+                updated_at = ?,
+                last_dependency_kind = NULL,
+                last_dependency_name = NULL
+            WHERE id IN (
+                SELECT id FROM announce_work
+                WHERE status = 'waiting'
+                  AND expires_at > ?
+                  AND last_dependency_kind = ?
+                  AND last_dependency_name = ?
+                ORDER BY next_attempt_at, received_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(dependency_type)
+        .bind(dependency_name.as_str())
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("wake dependency announce work", error))?;
+
+        Ok(result.rows_affected())
+    }
+
+    pub async fn wake_announce_candidate_cache_completion(
+        &self,
+        info_hash: Option<&InfoHash>,
+        guid: Option<&CandidateGuid>,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let _span = debug_span!(
+            "announce.wake_candidate_cache_completion",
+            info_hash_prefix = info_hash.map(info_hash_prefix).unwrap_or_default(),
+            candidate_guid = guid.map(CandidateGuid::as_str).unwrap_or(""),
+            limit
+        );
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'queued',
+                next_attempt_at = ?,
+                updated_at = ?,
+                last_dependency_kind = NULL,
+                last_dependency_name = NULL
+            WHERE id IN (
+                SELECT id FROM announce_work
+                WHERE status = 'waiting'
+                  AND expires_at > ?
+                  AND reason = 'candidate_downloading'
+                  AND (? IS NULL OR info_hash = ?)
+                  AND (? IS NULL OR guid = ?)
+                ORDER BY next_attempt_at, received_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(info_hash.map(InfoHash::as_str))
+        .bind(info_hash.map(InfoHash::as_str))
+        .bind(guid.map(CandidateGuid::as_str))
+        .bind(guid.map(CandidateGuid::as_str))
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("wake candidate cache announce work", error))?;
+
+        Ok(result.rows_affected())
+    }
+
+    pub async fn wake_due_waiting_announce_work(
+        &self,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let _span = debug_span!("announce.wake_due_waiting", limit);
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'queued',
+                next_attempt_at = ?,
+                updated_at = ?
+            WHERE id IN (
+                SELECT id FROM announce_work
+                WHERE status = 'waiting'
+                  AND next_attempt_at <= ?
+                  AND expires_at > ?
+                  AND last_dependency_kind IS NULL
+                  AND last_dependency_name IS NULL
+                ORDER BY next_attempt_at, received_at
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("wake due waiting announce work", error))?;
+
+        Ok(result.rows_affected())
     }
 
     pub async fn renew_announce_lease(
@@ -3269,6 +3494,177 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn announce_wakeups_make_matching_waits_claimable() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (id, guid) in [
+            ("ann_30", "guid-inventory"),
+            ("ann_31", "guid-refreshing"),
+            ("ann_32", "guid-client"),
+            ("ann_33", "guid-dependency"),
+            ("ann_34", "guid-cache"),
+            ("ann_35", "guid-scheduled"),
+            ("ann_36", "guid-other-client"),
+        ] {
+            repository
+                .insert_or_dedupe_announce_work(&test_announce_work(id, guid, 1), 10)
+                .await
+                .unwrap();
+        }
+        set_announce_waiting(
+            &repository,
+            "ann_30",
+            AnnounceReason::SourceIncomplete,
+            500,
+            None,
+        )
+        .await;
+        set_announce_waiting(
+            &repository,
+            "ann_31",
+            AnnounceReason::InventoryRefreshing,
+            500,
+            None,
+        )
+        .await;
+        set_announce_waiting(
+            &repository,
+            "ann_32",
+            AnnounceReason::ClientChecking,
+            500,
+            Some(("client", "qbit.local")),
+        )
+        .await;
+        set_announce_waiting(
+            &repository,
+            "ann_33",
+            AnnounceReason::DependencyBackoff,
+            500,
+            Some(("indexer", "main")),
+        )
+        .await;
+        set_announce_waiting(
+            &repository,
+            "ann_34",
+            AnnounceReason::CandidateDownloading,
+            500,
+            Some(("candidate", "guid-cache")),
+        )
+        .await;
+        set_announce_waiting(&repository, "ann_35", AnnounceReason::RetryAfter, 50, None).await;
+        set_announce_waiting(
+            &repository,
+            "ann_36",
+            AnnounceReason::ClientChecking,
+            500,
+            Some(("client", "other.local")),
+        )
+        .await;
+
+        assert_eq!(
+            2,
+            repository
+                .wake_announce_inventory_refresh(100, 10)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            1,
+            repository
+                .wake_announce_client_source_completion(
+                    &ClientHost::new("qbit.local").unwrap(),
+                    101,
+                    10
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            1,
+            repository
+                .wake_announce_dependency_recovery(
+                    "indexer",
+                    &DependencyName::new("main").unwrap(),
+                    102,
+                    10
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            1,
+            repository
+                .wake_announce_candidate_cache_completion(
+                    None,
+                    Some(&CandidateGuid::new("guid-cache").unwrap()),
+                    103,
+                    10
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            1,
+            repository
+                .wake_due_waiting_announce_work(104, 10)
+                .await
+                .unwrap()
+        );
+
+        let claimed = repository
+            .claim_announce_work("worker-1", 104, 200, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vec![
+                AnnounceWorkId::new("ann_30").unwrap(),
+                AnnounceWorkId::new("ann_31").unwrap(),
+                AnnounceWorkId::new("ann_32").unwrap(),
+                AnnounceWorkId::new("ann_33").unwrap(),
+                AnnounceWorkId::new("ann_34").unwrap(),
+                AnnounceWorkId::new("ann_35").unwrap(),
+            ],
+            claimed
+        );
+        assert_eq!(
+            Some(("waiting".to_owned(), "client_checking".to_owned())),
+            announce_status_reason(&repository, "ann_36").await
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_dependency_record_wakes_matching_waits() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .insert_or_dedupe_announce_work(&test_announce_work("ann_40", "guid-40", 1), 10)
+            .await
+            .unwrap();
+        set_announce_waiting(
+            &repository,
+            "ann_40",
+            AnnounceReason::DependencyBackoff,
+            500,
+            Some(("indexer", "main")),
+        )
+        .await;
+
+        repository
+            .record_dependency_health(
+                "indexer",
+                &DependencyName::new("main").unwrap(),
+                &DependencyState::Healthy { checked_at_ms: 100 },
+                100,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Some(("queued".to_owned(), "dependency_backoff".to_owned())),
+            announce_status_reason(&repository, "ann_40").await
+        );
+    }
+
     fn test_local_item(title: &str) -> LocalItem {
         LocalItem {
             id: None,
@@ -3347,6 +3743,45 @@ mod tests {
             last_error_class: None,
             last_redacted_message: None,
         }
+    }
+
+    async fn set_announce_waiting(
+        repository: &Repository,
+        id: &str,
+        reason: AnnounceReason,
+        next_attempt_at_ms: i64,
+        dependency: Option<(&str, &str)>,
+    ) {
+        let (dependency_kind, dependency_name) = dependency.unwrap_or(("", ""));
+        sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'waiting',
+                reason = ?,
+                next_attempt_at = ?,
+                expires_at = 1_000,
+                last_dependency_kind = NULLIF(?, ''),
+                last_dependency_name = NULLIF(?, '')
+            WHERE id = ?
+            "#,
+        )
+        .bind(announce_reason_key(reason))
+        .bind(next_attempt_at_ms)
+        .bind(dependency_kind)
+        .bind(dependency_name)
+        .bind(id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn announce_status_reason(repository: &Repository, id: &str) -> Option<(String, String)> {
+        sqlx::query("SELECT status, reason FROM announce_work WHERE id = ?")
+            .bind(id)
+            .fetch_optional(repository.pool())
+            .await
+            .unwrap()
+            .map(|row| (row.get("status"), row.get("reason")))
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
