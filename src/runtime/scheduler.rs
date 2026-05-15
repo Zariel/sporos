@@ -288,7 +288,7 @@ pub fn scheduler_queue(
     bounded_work_queue(QueueKind::Indexing, capacity)
 }
 
-fn parse_interval_ms(value: &str) -> Result<i64, SchedulerError> {
+pub(crate) fn parse_interval_ms(value: &str) -> Result<i64, SchedulerError> {
     let trimmed = value.trim();
     let split_at = trimmed
         .find(|character: char| !character.is_ascii_digit())
@@ -451,6 +451,12 @@ mod tests {
 
         assert_eq!(4, config.jobs.len());
         assert_eq!(1_800_000, config.jobs[0].interval_ms);
+        assert!(
+            config
+                .jobs
+                .iter()
+                .all(|job| job.name.as_str() != "saved_retry")
+        );
         ScheduledJob::new("bad", "0s").unwrap_err();
         ScheduledJob::new("bad", "1w").unwrap_err();
     }

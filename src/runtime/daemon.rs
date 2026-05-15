@@ -13,6 +13,7 @@ use crate::metrics::MetricsRegistry;
 use crate::notifications::{NotificationWorker, run_notification_worker};
 use crate::runtime::announce_worker::{AnnounceWorkerError, unix_time_ms};
 use crate::runtime::app::{AppRuntime, RuntimeReceivers};
+use crate::runtime::injection_worker::{InjectionWorker, SavedTorrentRetryConfig};
 use crate::runtime::scheduler::PersistedScheduler;
 use crate::runtime::shutdown::ShutdownSignal;
 
@@ -86,6 +87,15 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<JoinHandle<()
         NotificationWorker::new(runtime.state.health.clone(), MetricsRegistry::new()),
         notifications,
     )));
+    handles.push(tokio::spawn(run_saved_retry_loop(
+        runtime.state.injection_worker.clone(),
+        SavedTorrentRetryConfig {
+            directories: vec![runtime.state.config.paths.output_dir.clone()],
+            ..SavedTorrentRetryConfig::default()
+        },
+        runtime.state.saved_retry_interval,
+        runtime.state.shutdown_signal.clone(),
+    )));
     handles.push(tokio::spawn(hold_receiver_open(
         announcements,
         runtime.state.shutdown_signal.clone(),
@@ -120,6 +130,50 @@ async fn run_scheduler_loop(scheduler: PersistedScheduler, mut shutdown: Shutdow
                 break;
             }
             () = tokio::time::sleep(SCHEDULER_TICK_INTERVAL) => {}
+        }
+    }
+}
+
+async fn run_saved_retry_loop(
+    worker: InjectionWorker,
+    config: SavedTorrentRetryConfig,
+    interval: Duration,
+    mut shutdown: ShutdownSignal,
+) {
+    loop {
+        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
+            break;
+        }
+
+        let mut run_config = config.clone();
+        run_config.assessed_at_ms = unix_time_ms();
+        tokio::select! {
+            result = worker.retry_saved_torrents(run_config) => {
+                match result {
+                    Ok(summary) => {
+                        tracing::info!(
+                            scanned = summary.scanned,
+                            attempted = summary.attempted,
+                            injected = summary.injected,
+                            failed = summary.failed,
+                            kept = summary.kept,
+                            deleted = summary.deleted,
+                            "saved torrent retry completed"
+                        );
+                    }
+                    Err(error) => warn!(error = ?error, "saved torrent retry failed"),
+                }
+            }
+            _state = shutdown.cancelled() => {
+                break;
+            }
+        }
+
+        tokio::select! {
+            _state = shutdown.cancelled() => {
+                break;
+            }
+            () = tokio::time::sleep(interval) => {}
         }
     }
 }

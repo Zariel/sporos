@@ -173,6 +173,7 @@ pub struct SchedulingConfig {
     pub rss_interval: String,
     pub search_interval: String,
     pub indexer_caps_interval: String,
+    pub saved_retry_interval: String,
     pub cleanup_interval: String,
 }
 
@@ -182,6 +183,7 @@ impl Default for SchedulingConfig {
             rss_interval: "30m".to_owned(),
             search_interval: "24h".to_owned(),
             indexer_caps_interval: "24h".to_owned(),
+            saved_retry_interval: "30m".to_owned(),
             cleanup_interval: "24h".to_owned(),
         }
     }
@@ -797,6 +799,7 @@ media_scan_max_depth = 3
 rss_interval = "30m"
 search_interval = "24h"
 indexer_caps_interval = "24h"
+saved_retry_interval = "30m"
 cleanup_interval = "24h"
 
 [announce]

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Read;
@@ -223,6 +224,15 @@ pub struct InjectionWorker {
     mutation_lock: Arc<Mutex<()>>,
 }
 
+impl fmt::Debug for InjectionWorker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InjectionWorker")
+            .field("client_count", &self.clients.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl InjectionWorker {
     pub fn new(repository: Repository, clients: Vec<Arc<dyn InjectionClient>>) -> Self {
         Self {
@@ -230,6 +240,10 @@ impl InjectionWorker {
             clients,
             mutation_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
     }
 
     pub async fn process(
