@@ -415,6 +415,10 @@ impl AnnounceWorker {
     ) -> Result<Vec<AnnounceWorkId>, AnnounceWorkerError> {
         let lease_until_ms = now_ms.saturating_add(duration_ms(self.config.lease_duration));
         let reconcile_limit = self.config.claim_batch_size.saturating_mul(4).max(1);
+        self.repository.expire_announce_work(now_ms).await?;
+        self.repository
+            .recover_stale_announce_leases(now_ms)
+            .await?;
         self.repository
             .schedule_announce_dependency_backoff(
                 now_ms,
@@ -544,22 +548,43 @@ impl AnnounceWorker {
         for id in claimed {
             let _work_span = debug_span!("announce.process", announce_id = %id);
             if shutdown.state().phase != ShutdownPhase::Running {
-                self.release_for_shutdown(&id, now_ms).await?;
+                self.release_for_shutdown(&id, unix_time_ms()).await?;
                 summary.cancelled += 1;
                 continue;
             }
+            if !self.renew_lease(&id, unix_time_ms()).await? {
+                summary.released += 1;
+                continue;
+            }
 
-            tokio::select! {
-                outcome = process(id.clone()) => {
-                    if self.complete(&id, outcome, now_ms).await? {
-                        summary.completed += 1;
-                    } else {
-                        summary.released += 1;
+            let processing = process(id.clone());
+            tokio::pin!(processing);
+            let renewal = tokio::time::sleep(self.config.lease_renewal);
+            tokio::pin!(renewal);
+
+            loop {
+                tokio::select! {
+                    outcome = &mut processing => {
+                        if self.complete(&id, outcome, unix_time_ms()).await? {
+                            summary.completed += 1;
+                        } else {
+                            summary.released += 1;
+                        }
+                        break;
                     }
-                }
-                _state = shutdown.cancelled() => {
-                    self.release_for_shutdown(&id, now_ms).await?;
-                    summary.cancelled += 1;
+                    () = &mut renewal => {
+                        if self.renew_lease(&id, unix_time_ms()).await? {
+                            renewal.as_mut().reset(tokio::time::Instant::now() + self.config.lease_renewal);
+                        } else {
+                            summary.released += 1;
+                            break;
+                        }
+                    }
+                    _state = shutdown.cancelled() => {
+                        self.release_for_shutdown(&id, unix_time_ms()).await?;
+                        summary.cancelled += 1;
+                        break;
+                    }
                 }
             }
         }
@@ -762,6 +787,170 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(10_015, lease_until);
+    }
+
+    #[tokio::test]
+    async fn worker_recovers_expired_running_work_during_claims() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_31", "guid-31", 1).await;
+        let first = repository
+            .claim_announce_work("old-worker", 2, 20, 1)
+            .await
+            .unwrap();
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+
+        let early = worker.claim_ready(19).await.unwrap();
+        let recovered = worker.claim_ready(20).await.unwrap();
+
+        assert_eq!(vec![AnnounceWorkId::new("ann_31").unwrap()], first);
+        assert!(early.is_empty());
+        assert_eq!(vec![AnnounceWorkId::new("ann_31").unwrap()], recovered);
+
+        let attempt_count: i64 =
+            sqlx::query_scalar("SELECT attempt_count FROM announce_work WHERE id = 'ann_31'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!(2, attempt_count);
+    }
+
+    #[tokio::test]
+    async fn worker_expires_ttl_dead_running_work_before_recovery() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_32", "guid-32", 1).await;
+        repository
+            .claim_announce_work("old-worker", 2, 20, 1)
+            .await
+            .unwrap();
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+
+        let claimed = worker.claim_ready(200).await.unwrap();
+
+        assert!(claimed.is_empty());
+        assert_eq!(
+            vec![("expired".to_owned(), "expired".to_owned())],
+            status_rows(&repository).await
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_renews_long_running_batch_work() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_33", "guid-33", 1).await;
+        let ttl_expires_at = unix_time_ms().saturating_add(60_000);
+        sqlx::query("UPDATE announce_work SET expires_at = ? WHERE id = 'ann_33'")
+            .bind(ttl_expires_at)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let config = AnnounceQueueConfig {
+            claim_batch_size: 1,
+            lease_duration_secs: 2,
+            lease_renewal_secs: 1,
+            ..test_config()
+        };
+        let first_worker = AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        let second_worker = AnnounceWorker::new(repository.clone(), "worker-2", &config).unwrap();
+        let (_controller, signal) = shutdown_channel();
+
+        let handle = tokio::spawn(async move {
+            first_worker
+                .run_batch(10, signal, |_id| async move {
+                    tokio::time::sleep(Duration::from_millis(2_500)).await;
+                    AnnounceWorkOutcome::Succeeded {
+                        reason: AnnounceReason::Saved,
+                        outcome: "saved".to_owned(),
+                    }
+                })
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let duplicate = second_worker.claim_ready(unix_time_ms()).await.unwrap();
+        let summary = handle.await.unwrap();
+
+        assert!(duplicate.is_empty());
+        assert_eq!(
+            AnnounceWorkerSummary {
+                claimed: 1,
+                completed: 1,
+                released: 0,
+                cancelled: 0
+            },
+            summary
+        );
+        assert_eq!(
+            vec![("succeeded".to_owned(), "saved".to_owned())],
+            status_rows(&repository).await
+        );
+        let row =
+            sqlx::query("SELECT updated_at, finished_at FROM announce_work WHERE id = 'ann_33'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let updated_at: i64 = row.get("updated_at");
+        let finished_at: i64 = row.get("finished_at");
+        assert!(finished_at >= updated_at);
+    }
+
+    #[tokio::test]
+    async fn worker_skips_claimed_work_lost_before_processing() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_34", "guid-34", 1).await;
+        insert_work(&repository, "ann_35", "guid-35", 2).await;
+        sqlx::query(
+            "UPDATE announce_work SET expires_at = 10_000 WHERE id IN ('ann_34', 'ann_35')",
+        )
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        let config = AnnounceQueueConfig {
+            claim_batch_size: 2,
+            lease_duration_secs: 2,
+            lease_renewal_secs: 1,
+            ..test_config()
+        };
+        let first_worker = AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        let second_worker = AnnounceWorker::new(repository.clone(), "worker-2", &config).unwrap();
+        let (_controller, signal) = shutdown_channel();
+        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let processed_by_first = processed.clone();
+
+        let handle = tokio::spawn(async move {
+            first_worker
+                .run_batch(10, signal, move |id| {
+                    let processed = processed_by_first.clone();
+                    async move {
+                        processed.lock().unwrap().push(id.as_str().to_owned());
+                        if id.as_str() == "ann_34" {
+                            tokio::time::sleep(Duration::from_millis(2_500)).await;
+                        }
+                        AnnounceWorkOutcome::Succeeded {
+                            reason: AnnounceReason::Saved,
+                            outcome: "saved".to_owned(),
+                        }
+                    }
+                })
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let reclaimed = second_worker.claim_ready(2_020).await.unwrap();
+        let summary = handle.await.unwrap();
+
+        assert_eq!(vec![AnnounceWorkId::new("ann_35").unwrap()], reclaimed);
+        assert_eq!(
+            AnnounceWorkerSummary {
+                claimed: 2,
+                completed: 1,
+                released: 1,
+                cancelled: 0
+            },
+            summary
+        );
+        assert_eq!(vec!["ann_34".to_owned()], *processed.lock().unwrap());
     }
 
     #[tokio::test]
