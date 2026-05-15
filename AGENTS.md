@@ -303,78 +303,33 @@ or `git commit -m`. The helper lowercases the title, checks title length, wraps
 the body, and calls `git commit`.
 
 ### Review cadence
-Do not wait until release tagging to review substantial code. Before the final
-commit for any bead that changes production Rust code, launch at least one
-review subagent to inspect the task diff. Fix accepted feedback, run the
-required quality gates, and include the fixes in the task commit before closing
-the bead.
+Do not defer review to epic completion. Before the final commit for any bead
+that changes production Rust code, launch at least one review subagent to
+inspect the task diff. Fix accepted feedback, run the required quality gates,
+and include the fixes in the task commit before closing the bead.
 
 Small docs-only, test-only, formatting-only, or purely mechanical changes may
 use self-review plus the required quality gates instead of a subagent review.
 
-### Reasoning budget guidance
-Use default reasoning for small, mechanical, low-risk implementation tasks.
+Use high reasoning for normal production Rust changes. Use xhigh reasoning for
+planning, design, behavior-defining documentation, and review of high-risk
+changes. Do not compensate for under-reasoned implementation solely by adding
+more reviewers; run design-heavy implementation or planning at high or xhigh
+before review.
 
-Use high reasoning for normal production code changes, especially Rust changes
-that affect behavior, error handling, public interfaces, async code, matching,
-filesystem access, persistence, or performance-sensitive paths.
+Use multiple review subagents for high-risk beads. High-risk areas include
+persistence/schema/migrations/data compatibility, matching or injection
+selection logic, public API or user-visible behavior, async runtime and retry
+safety, side-effect idempotency, security and secret redaction, filesystem or
+path safety, destructive operations, and large-inventory performance or memory
+use.
 
-Use xhigh reasoning for planning, design, documentation that defines behavior,
-and review of high-risk changes.
+For high-risk beads, prefer one high-reasoning correctness review and one xhigh
+focused review for the highest-risk area. For very high-risk beads, add xhigh
+planning before implementation and a high-reasoning test/regression coverage
+review. Choose concrete, non-overlapping focus areas; two focused reviewers are
+usually better than several broad reviewers with duplicate coverage.
 
-Do not compensate for an under-reasoned implementation solely by adding more
-reviewers. If the task requires design judgment, run the implementation or
-planning step at high or xhigh before review.
-
-### High-risk beads
-Use multiple review subagents before closing a high-risk bead. High-risk beads
-include changes touching:
-
-- persistence, schema, migrations, or data compatibility
-- matching, injection, or behavioral selection logic
-- public API behavior or user-visible compatibility
-- async runtime behavior, cancellation, concurrency, or retry safety
-- side-effect safety or idempotency
-- security, secret handling, or redaction
-- filesystem safety, path handling, or destructive operations
-- large-inventory performance, memory use, or scaling behavior
-
-For high-risk beads, prefer:
-
-- one general correctness review at high reasoning
-- one focused risk review at xhigh reasoning for the highest-risk area
-- optional additional high-reasoning reviews for independent lenses such as
-  tests, performance, API compatibility, or security
-
-For very high-risk beads, prefer:
-
-- xhigh planning before implementation
-- high reasoning for implementation
-- one xhigh correctness/design-fit review
-- one xhigh focused risk review
-- one high test/regression coverage review
-
-Avoid launching many overlapping reviewers with vague scopes. Two focused
-reviewers are usually better than several broad reviewers with duplicate
-coverage.
-
-### Review focus areas
-Choose concrete, non-overlapping focus areas for review subagents.
-
-Useful focus areas include:
-
-- correctness and behavioral regressions
-- async runtime, cancellation, concurrency, and retry safety
-- persistence, schema compatibility, and migration safety
-- filesystem safety, path handling, and destructive operations
-- security, secret redaction, and untrusted input handling
-- public API compatibility and user-visible behavior
-- performance, memory use, and large-inventory scaling
-- test coverage and missing regression cases
-- operational safety, observability, and failure modes
-- maintainability risks that could affect future changes
-
-### Task-review prompt
 Use this task-review prompt:
 
 ```text
@@ -406,82 +361,6 @@ Return findings ordered by severity. For each finding include:
 If there are no findings, say so and note any residual risk or coverage gap.
 ```
 
-### Suggested review patterns
-For a low-risk bead:
-
-```text
-implementation: default or high
-review: self-review plus required quality gates
-```
-
-For a normal production-code bead:
-
-```text
-implementation: high
-review:
-  - high: correctness and behavioral regressions
-```
-
-For a high-risk bead:
-
-```text
-planning: xhigh if the approach is not already obvious
-implementation: high
-review:
-  - high: correctness and behavioral regressions
-  - xhigh: <highest-risk focused lens>
-```
-
-For a very high-risk bead:
-
-```text
-planning: xhigh
-implementation: high
-review:
-  - xhigh: correctness and design fit
-  - xhigh: <highest-risk focused lens>
-  - high: test coverage and missing regression cases
-```
-
-### Review quality gates
 After accepting review feedback, run the required quality gates for the touched
 area before committing. If a review finding is intentionally rejected, record
 the reason in the bead notes or commit message so the decision is auditable.
-
-### Release tags
-Before creating a tag for a completed epic, first run a code review covering
-all code changed since the last tag. Use multiple subagents in parallel, with
-each subagent focused on a different risk area. Fix the review feedback that is
-accepted, run the required quality gates, and commit those fixes before creating
-the tag.
-
-Use this prompt template for each review subagent, replacing the focus area:
-
-```text
-Review the changes for completed epic <epic-id> from <last-tag> to HEAD.
-
-Focus area: <focus-area>.
-
-Inspect the git diff, relevant tests, and nearby code. Take a code-review
-stance: prioritize bugs, behavioral regressions, missing tests, performance or
-memory risks, security problems, operational risks, and release blockers. Do
-not edit files.
-
-Return findings ordered by severity. For each finding include file and line,
-the concrete risk, why it matters for this focus area, and the smallest
-reasonable fix or test. If there are no findings, say so and note any residual
-risk or coverage gap.
-```
-
-Run at least these focus areas before tagging:
-
-- Domain behavior, API contracts, and user-visible compatibility.
-- Persistence, schema/data safety, and large-inventory performance.
-- Async runtime, bounded concurrency, retry behavior, and shutdown safety.
-- Tests, observability, security/redaction, and operator/release readiness.
-
-When creating the tag after review fixes are committed, include a very brief
-changelog in the tag annotation using one concise line per notable change item.
-Keep the annotation focused on the externally meaningful behavior change, not
-implementation details. Do not list docs, refactors, config renames, or
-internal plumbing unless they are themselves the notable user-facing change.
