@@ -62,11 +62,12 @@ Dependency order matters. For `bd dep add A B`, `A` depends on `B`; `B` blocks
 
 1. **Check ready work**: `bd ready --json` shows unblocked work.
 2. **Claim your task**: `bd update <id> --claim --json`.
-3. **Work on it**: implement, test, document.
+3. **Work on it**: implement, test, review, document.
 4. **Discover new work**: create a linked issue with
    `--deps discovered-from:<current-id>`.
-5. **Complete**: run required quality gates, close the bead, then commit only
-   the changed files for that ticket using the Git rules below.
+5. **Complete**: run required quality gates, commit only the changed files for
+   the ticket, then close the bead. Do not leave a completed ticket open after
+   its fix has been committed.
 
 ### Important Rules
 
@@ -102,10 +103,10 @@ Dependency order matters. For `bd dep add A B`, `A` depends on `B`; `B` blocks
 Before ending a work session:
 
 1. File bd issues for remaining follow-up work.
-2. Run quality gates if code changed.
-3. Close completed beads and update in-progress beads.
-4. Stage only the files changed for the completed ticket and commit them using
-   the commit format in the Git section.
+2. Run required quality gates for code changes.
+3. Stage only the files changed for the completed ticket and commit them.
+4. Close every bead whose accepted work is committed. Do not close beads for
+   uncommitted work, failing gates, or partial fixes; update those beads instead.
 5. Check `git status --short` and report any remaining uncommitted changes.
 6. Do not push source or Dolt remotes unless the user explicitly asked for it.
 
@@ -267,35 +268,32 @@ client host, job name, and request label when safe, but never log secrets.
 Tests should cover both success and failure behavior. Add regression tests for
 compatibility bugs, property tests for parsers or filename round trips where
 useful, and integration tests with fake services for network/client contracts.
+
 When fixing a bug, add a regression test first and confirm it fails for the
 intended reason before changing production code. The acceptance criterion is
 fixing the code under test so that regression test passes, not weakening or
 rewriting the test around the bug. If a direct failing test is impractical,
 record why and add the closest focused regression coverage.
+
 Destructors must not perform fallible or blocking production cleanup; provide an
 explicit close, flush, or shutdown method that returns `Result` when teardown can
 fail.
 
 ### Git
-Only commit touched files, and commit logical changes rather than the whole
-workspace. Commit titles must be lower case, no longer than 50 characters, and
-formatted as `area: title`. The title after the area must complete the sentence
-"when this change is merged it will ..."; for example,
-`persistence: fix unique key violation`.
+Commit logical changes, not the whole workspace. Stage only files that belong
+to the completed ticket and leave unrelated user or agent changes untouched.
 
-Commit bodies must use concise prose and give reviewers enough context. Avoid
-lists unless the change genuinely needs them. When committing non-interactively,
-pass the full commit message directly on stdin with `git commit -F-`. The
-message must contain the title on the first line, a blank second line, and body
-lines wrapped at 72 characters or less. Do not include literal `\n` sequences in
-commit messages.
+Use `git commit-wrapped "area: title" "body..."` for non-interactive commits.
+Pass the body as plain text without manual line splitting, `printf`, heredocs,
+or `git commit -m`. The helper lowercases the title, checks title length, wraps
+the body, and calls `git commit`.
 
 ### Review cadence
-Do not wait until release tagging to review substantial code. Before closing any
-bead that changes production Rust code, launch at least one review subagent to
-inspect the task diff before committing or closing the bead. Fix accepted
-feedback, run the required quality gates, and include the fixes in the task
-commit.
+Do not wait until release tagging to review substantial code. Before the final
+commit for any bead that changes production Rust code, launch at least one
+review subagent to inspect the task diff. Fix accepted feedback, run the
+required quality gates, and include the fixes in the task commit before closing
+the bead.
 
 Use multiple review subagents before closing a high-risk bead. High-risk beads
 include changes touching persistence or schema, matching, injection, public API
