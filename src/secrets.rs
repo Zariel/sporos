@@ -120,6 +120,7 @@ macro_rules! secret_newtype {
 }
 
 secret_newtype!(ApiKey, "api_key");
+secret_newtype!(ApiToken, "api_token");
 secret_newtype!(CookieSecret, "cookie");
 secret_newtype!(NotificationToken, "notification_token");
 secret_newtype!(Passkey, "passkey");

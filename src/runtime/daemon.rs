@@ -5,8 +5,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::config::SporosConfig;
-use crate::errors::DatabaseError;
+use crate::config::{SporosConfig, validate_server_auth};
+use crate::errors::{ConfigError, DatabaseError};
 use crate::http::router;
 use crate::inventory_refresh::run_inventory_refresh_worker;
 use crate::metrics::MetricsRegistry;
@@ -20,6 +20,7 @@ const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum DaemonError {
+    Config { source: ConfigError },
     BuildRuntime { source: DatabaseError },
     Bind { message: String },
     Serve { message: String },
@@ -27,6 +28,7 @@ pub enum DaemonError {
 }
 
 pub async fn serve(config: SporosConfig) -> Result<(), DaemonError> {
+    validate_server_auth(&config).map_err(|source| DaemonError::Config { source })?;
     let bind = config.server.bind;
     let runtime = AppRuntime::build(config)
         .await
@@ -135,6 +137,7 @@ async fn hold_receiver_open<T>(
 impl fmt::Display for DaemonError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config { source } => write!(formatter, "{source}"),
             Self::BuildRuntime { source } => write!(formatter, "{source}"),
             Self::Bind { message } | Self::Serve { message } => formatter.write_str(message),
             Self::AnnounceStartup { source } => write!(formatter, "{source}"),
@@ -145,6 +148,7 @@ impl fmt::Display for DaemonError {
 impl std::error::Error for DaemonError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Config { source } => Some(source),
             Self::BuildRuntime { source } => Some(source),
             Self::AnnounceStartup { source } => Some(source),
             Self::Bind { .. } | Self::Serve { .. } => None,
@@ -175,6 +179,17 @@ mod tests {
 
         handle.abort();
         assert_eq!(200, response);
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_external_bind_without_api_token() {
+        let mut config = SporosConfig::default();
+        config.server.bind = "0.0.0.0:0".parse().unwrap();
+
+        let error = serve(config).await.unwrap_err();
+
+        assert!(matches!(error, DaemonError::Config { .. }));
+        assert!(error.to_string().contains("server.api_token"));
     }
 
     async fn wait_for_livez(address: std::net::SocketAddr) -> u16 {

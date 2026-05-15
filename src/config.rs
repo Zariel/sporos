@@ -9,7 +9,7 @@ use toml::Value;
 
 use crate::announce::AnnounceQueueConfig;
 use crate::errors::ConfigError;
-use crate::secrets::{ApiKey, Password};
+use crate::secrets::{ApiKey, ApiToken, Password};
 
 pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
 const ENV_PREFIX: &str = "SPOROS__";
@@ -48,16 +48,22 @@ impl Default for PathsConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind: SocketAddr,
+    pub api_token: Option<ApiToken>,
+    pub api_token_file: Option<PathBuf>,
+    pub api_token_env: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: SocketAddr::from(([127, 0, 0, 1], 2468)),
+            api_token: None,
+            api_token_file: None,
+            api_token_env: None,
         }
     }
 }
@@ -230,6 +236,7 @@ where
     config.paths.prepare_local_state()?;
     config.paths.validate_media_dirs()?;
     resolve_secret_files(&mut config)?;
+    validate_server_auth(&config)?;
 
     Ok(config)
 }
@@ -384,6 +391,19 @@ fn resolve_secret_env(
     config: &mut SporosConfig,
     env: &BTreeMap<String, String>,
 ) -> Result<(), ConfigError> {
+    if config.server.api_token.is_none() {
+        if let Some(env_name) = nonempty_secret_env(
+            "server.api_token_env",
+            "server",
+            &config.server.api_token_env,
+        )? {
+            let value = secret_env_value(env, env_name, "server.api_token_env", "server")?;
+            config.server.api_token = Some(
+                ApiToken::new(value.clone())
+                    .map_err(|source| ConfigError::InvalidSecret { source })?,
+            );
+        }
+    }
     for (name, client) in &mut config.torrent_clients {
         if client.password.is_none() {
             if let Some(env_name) =
@@ -415,6 +435,13 @@ fn resolve_secret_env(
 }
 
 fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
+    if config.server.api_token.is_none() {
+        if let Some(path) = &config.server.api_token_file {
+            let value = secret_file_value("server.api_token_file", "server", path)?;
+            config.server.api_token =
+                Some(ApiToken::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
+        }
+    }
     for (name, client) in &mut config.torrent_clients {
         if client.password.is_none() {
             if let Some(path) = &client.password_file {
@@ -437,6 +464,20 @@ fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+pub(crate) fn validate_server_auth(config: &SporosConfig) -> Result<(), ConfigError> {
+    if config.server.bind.ip().is_loopback() || config.server.api_token.is_some() {
+        return Ok(());
+    }
+
+    Err(ConfigError::InvalidField {
+        field: "server.api_token",
+        reason: format!(
+            "non-loopback bind {} requires api_token, api_token_file, or api_token_env",
+            config.server.bind
+        ),
+    })
 }
 
 fn secret_file_value(field: &'static str, name: &str, path: &Path) -> Result<String, ConfigError> {
@@ -707,6 +748,9 @@ media_dirs = ["path", "..."]
 
 [server]
 bind = "127.0.0.1:2468"
+api_token = "optional local-development bearer token"
+api_token_file = "optional path"
+api_token_env = "optional env var containing bearer token"
 
 [torrent_clients.<name>]
 kind = "qbittorrent|rtorrent"
@@ -730,6 +774,7 @@ api_key_env = "optional env var containing api key"
 
 [environment overrides]
 SPOROS__SERVER__BIND = "0.0.0.0:2468"
+SPOROS__SERVER__API_TOKEN_FILE = "/var/run/secrets/sporos-api-token"
 SPOROS__PATHS__DATABASE = "/data/state/sporos.db"
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
@@ -1003,10 +1048,38 @@ mod tests {
     }
 
     #[test]
+    fn startup_config_rejects_external_bind_without_api_token() {
+        let cwd = unique_temp_dir("external-bind");
+        let contents = format!(
+            r#"
+            [paths]
+            database = "{}/state/sporos.db"
+            torrent_cache_dir = "{}/cache/torrents"
+            output_dir = "{}/output"
+
+            [server]
+            bind = "0.0.0.0:2468"
+            "#,
+            cwd.display(),
+            cwd.display(),
+            cwd.display()
+        );
+
+        let error = parse_startup_config(&contents, &cwd).unwrap_err();
+
+        assert!(error.to_string().contains("server.api_token"));
+        assert!(error.to_string().contains("non-loopback bind"));
+
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
     fn startup_config_loads_secret_file_values() {
         let cwd = unique_temp_dir("secret-files");
+        let api_token_file = cwd.join("api-token");
         let password_file = cwd.join("qbit-password");
         let api_key_file = cwd.join("indexer-api-key");
+        fs::write(&api_token_file, "server-secret\n").unwrap();
         fs::write(&password_file, "super-secret\n").unwrap();
         fs::write(&api_key_file, "api-secret\r\n").unwrap();
         let contents = format!(
@@ -1015,6 +1088,10 @@ mod tests {
             database = "{}/state/sporos.db"
             torrent_cache_dir = "{}/cache/torrents"
             output_dir = "{}/output"
+
+            [server]
+            bind = "0.0.0.0:2468"
+            api_token_file = "{}"
 
             [torrent_clients.qbit_main]
             kind = "qbittorrent"
@@ -1029,6 +1106,7 @@ mod tests {
             cwd.display(),
             cwd.display(),
             cwd.display(),
+            api_token_file.display(),
             password_file.display(),
             api_key_file.display()
         );
@@ -1042,9 +1120,18 @@ mod tests {
             client.password.as_ref().map(Password::expose_secret)
         );
         assert_eq!(
+            Some("server-secret"),
+            config
+                .server
+                .api_token
+                .as_ref()
+                .map(ApiToken::expose_secret)
+        );
+        assert_eq!(
             Some("api-secret"),
             indexer.api_key.as_ref().map(ApiKey::expose_secret)
         );
+        assert!(!format!("{:?}", config.server).contains("server-secret"));
         assert!(!format!("{client:?}").contains("super-secret"));
         assert!(!format!("{indexer:?}").contains("api-secret"));
 
@@ -1101,6 +1188,7 @@ mod tests {
 
             [server]
             bind = "127.0.0.1:2468"
+            api_token_env = "SPOROS_API_TOKEN"
 
             [matching]
             fuzzy_size_threshold = 0.02
@@ -1125,6 +1213,7 @@ mod tests {
                     "86400".to_owned(),
                 ),
                 ("SPOROS__ANNOUNCE__MAX_PENDING".to_owned(), "42".to_owned()),
+                ("SPOROS_API_TOKEN".to_owned(), "api-token".to_owned()),
             ],
         )
         .unwrap();
@@ -1137,6 +1226,14 @@ mod tests {
         assert!(config.matching.include_non_video);
         assert_eq!(Some(86_400), config.matching.recent_search_cooldown_secs);
         assert_eq!(42, config.announce.max_pending);
+        assert_eq!(
+            Some("api-token"),
+            config
+                .server
+                .api_token
+                .as_ref()
+                .map(ApiToken::expose_secret)
+        );
     }
 
     #[test]

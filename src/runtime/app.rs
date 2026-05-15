@@ -128,9 +128,12 @@ impl AppRuntime {
             inventory_refresh: inventory_queue,
             notifications: notification_queue,
         };
-        let http = HttpState::new(ReadinessState::ready(), health.clone())
+        let mut http = HttpState::new(ReadinessState::ready(), health.clone())
             .with_workflow_queues(workflow)
             .with_announce_acceptor(repository.clone(), config.announce.clone());
+        if let Some(api_token) = config.server.api_token.as_ref() {
+            http = http.with_api_token(api_token.expose_secret());
+        }
 
         Ok(Self {
             state: AppState {
@@ -190,7 +193,11 @@ fn workflow_queues(queue_config: RuntimeQueueConfig) -> (WorkflowQueues, Workflo
 mod tests {
     use super::*;
     use crate::config::TorznabIndexerConfig;
-    use crate::secrets::ApiKey;
+    use crate::http::router;
+    use crate::secrets::{ApiKey, ApiToken};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn runtime_composes_services_from_config_and_repository() {
@@ -245,5 +252,37 @@ mod tests {
         let received = runtime.receivers.inventory_refresh.recv().await.unwrap();
 
         assert!(received.media_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_composes_configured_api_auth() {
+        let mut config = SporosConfig::default();
+        config.server.api_token = Some(ApiToken::new("secret-token").unwrap());
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        assert!(!format!("{:?}", runtime.state.http).contains("secret-token"));
+        let app = router(runtime.state.http.clone());
+
+        let unauthorized = app.clone().oneshot(search_request(None)).await.unwrap();
+        let accepted = app
+            .oneshot(search_request(Some("Bearer secret-token")))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::UNAUTHORIZED, unauthorized.status());
+        assert_eq!(StatusCode::ACCEPTED, accepted.status());
+    }
+
+    fn search_request(auth: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/searches")
+            .header("content-type", "application/json");
+        if let Some(auth) = auth {
+            builder = builder.header("authorization", auth);
+        }
+        builder.body(Body::from(r#"{"query":"Example"}"#)).unwrap()
     }
 }

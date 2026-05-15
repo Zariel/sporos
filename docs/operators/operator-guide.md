@@ -43,6 +43,7 @@ media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
 bind = "0.0.0.0:2468"
+api_token_file = "/var/run/secrets/sporos-api-token"
 
 [torrent_clients.qbit_main]
 kind = "qbittorrent"
@@ -126,6 +127,11 @@ shell value should be interpreted as a TOML string.
 
 ## Secrets
 
+HTTP workflow authentication uses `server.api_token`, `server.api_token_file`,
+or `server.api_token_env`. A non-loopback bind requires one of these token
+sources. Callers must send it as `Authorization: Bearer <token>` when using
+mutating workflow endpoints.
+
 Torrent client passwords support `password`, `password_file`, and
 `password_env`. Torznab indexer keys support `api_key`, `api_key_file`, and
 `api_key_env`.
@@ -164,7 +170,8 @@ The service exposes:
 - `POST /v1/announcements`: accepts validated announcements as durable queued
   work when the announce queue is running.
 
-Workflow endpoints require bearer auth when an API token is configured.
+Workflow endpoints require bearer auth when an API token is configured. Startup
+rejects externally reachable binds without a configured token.
 
 ## Readiness And Degraded Dependencies
 

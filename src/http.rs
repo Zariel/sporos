@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -155,9 +156,18 @@ pub struct JobRunWorkflowRequest {
     pub job_name: JobName,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ApiAuth {
     bearer_token: Arc<str>,
+}
+
+impl fmt::Debug for ApiAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiAuth")
+            .field("bearer_token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ApiAuth {
