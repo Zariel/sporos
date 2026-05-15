@@ -285,6 +285,38 @@ message must contain the title on the first line, a blank second line, and body
 lines wrapped at 72 characters or less. Do not include literal `\n` sequences in
 commit messages.
 
+### Review cadence
+Do not wait until release tagging to review substantial code. Before closing any
+bead that changes production Rust code, launch at least one review subagent to
+inspect the task diff before committing or closing the bead. Fix accepted
+feedback, run the required quality gates, and include the fixes in the task
+commit.
+
+Use multiple review subagents before closing a high-risk bead. High-risk beads
+include changes touching persistence or schema, matching, injection, public API
+behavior, async runtime or concurrency, retry and side-effect safety, security
+or secret redaction, filesystem safety, or large-inventory performance.
+
+Small docs-only, test-only, formatting-only, or purely mechanical changes may
+use self-review plus the required quality gates instead of a subagent review.
+
+Use this task-review prompt:
+
+```text
+Review the changes for bead <bead-id> in the current working tree.
+
+Focus area: <focus-area>.
+
+Inspect the diff, relevant tests, and nearby code. Take a code-review stance:
+prioritize correctness bugs, behavioral regressions, missing tests, performance
+or memory risks, security problems, operational risks, and maintainability
+issues that could affect this task. Do not edit files.
+
+Return findings ordered by severity. For each finding include file and line,
+the concrete risk, why it matters, and the smallest reasonable fix or test. If
+there are no findings, say so and note any residual risk or coverage gap.
+```
+
 ### Release tags
 Before creating a tag for a completed epic, first run a code review covering
 all code changed since the last tag. Use multiple subagents in parallel, with
