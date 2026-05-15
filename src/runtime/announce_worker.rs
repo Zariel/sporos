@@ -206,10 +206,20 @@ pub fn classify_injection_result(
                 .as_ref()
                 .map(|name| ("client".to_owned(), name.as_str().to_owned())),
         },
+        InjectionOutcome::Failed if result.saved_for_retry => {
+            AnnounceWorkflowResult::DependencyBackoff {
+                dependency_kind: "client".to_owned(),
+                dependency_name: result
+                    .target_client
+                    .as_ref()
+                    .map_or_else(|| "unknown".to_owned(), ToString::to_string),
+                retry_after_ms: None,
+            }
+        }
         InjectionOutcome::Failed => AnnounceWorkflowResult::RetryableDependency {
             retry_after_ms: None,
             error_class: "torrent_client".to_owned(),
-            redacted_message: "torrent client injection failed".to_owned(),
+            redacted_message: "torrent client injection failed before side effects".to_owned(),
         },
     };
     classify_announce_result(workflow, now_ms, config)
@@ -907,6 +917,22 @@ mod tests {
                 dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
             },
             classify_injection_result(&injection, 100, config)
+        );
+
+        let ambiguous_failure = crate::runtime::injection_worker::InjectionWorkResult {
+            outcome: InjectionOutcome::Failed,
+            target_client: Some(DependencyName::new("qbit.local").unwrap()),
+            saved_for_retry: true,
+            linked_files: 1,
+        };
+
+        assert_eq!(
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::DependencyBackoff,
+                next_attempt_at_ms: 130,
+                dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
+            },
+            classify_injection_result(&ambiguous_failure, 100, config)
         );
     }
 

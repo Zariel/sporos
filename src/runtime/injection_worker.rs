@@ -214,20 +214,45 @@ impl InjectionWorker {
         let recheck_plan =
             recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
         let pause_for_recheck = recheck_plan.should_recheck;
-        let inject_result = {
+        let mutation_result = {
             let _guard = self.mutation_lock.lock().await;
-            target
-                .inject(ClientInjectionRequest {
-                    info_hash: &request.metafile.info_hash,
-                    torrent_bytes: &request.torrent_bytes,
-                    save_path: save_path.as_deref(),
-                    pause_for_recheck,
-                })
-                .await
+            if target.has_torrent(&request.metafile.info_hash).await? {
+                InjectionMutationResult::AlreadyExists
+            } else {
+                InjectionMutationResult::Injected(
+                    target
+                        .inject(ClientInjectionRequest {
+                            info_hash: &request.metafile.info_hash,
+                            torrent_bytes: &request.torrent_bytes,
+                            save_path: save_path.as_deref(),
+                            pause_for_recheck,
+                        })
+                        .await,
+                )
+            }
         };
 
-        match inject_result {
-            Ok(()) => {
+        match mutation_result {
+            InjectionMutationResult::AlreadyExists => {
+                self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
+                    .await?;
+                if linked_files > 0 {
+                    let recheck_plan = RecheckResumePlan {
+                        should_recheck: true,
+                        ..recheck_plan
+                    };
+                    let _ = self
+                        .run_recheck_resume(target.as_ref(), &request, recheck_plan)
+                        .await?;
+                }
+                Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::AlreadyExists,
+                    target_client: Some(target_name),
+                    saved_for_retry: false,
+                    linked_files,
+                })
+            }
+            InjectionMutationResult::Injected(Ok(())) => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
                 if recheck_plan.should_recheck {
@@ -243,7 +268,7 @@ impl InjectionWorker {
                     linked_files,
                 })
             }
-            Err(error) => {
+            InjectionMutationResult::Injected(Err(error)) => {
                 let _ = cleanup_created_roots(&created_roots);
                 self.save_for_retry(&request)?;
                 self.record_client_health(
@@ -412,7 +437,10 @@ impl InjectionWorker {
         if !plan.should_recheck {
             return Ok(ResumeLoopOutcome::NotRequired);
         }
-        client.recheck(&request.metafile.info_hash).await?;
+        {
+            let _guard = self.mutation_lock.lock().await;
+            client.recheck(&request.metafile.info_hash).await?;
+        }
         let max_polls = max_resume_polls(request.recheck);
         for _ in 0..max_polls {
             if client.is_checking(&request.metafile.info_hash).await? {
@@ -427,6 +455,7 @@ impl InjectionWorker {
                 plan,
                 remaining,
             ) {
+                let _guard = self.mutation_lock.lock().await;
                 client.resume(&request.metafile.info_hash).await?;
                 return Ok(ResumeLoopOutcome::Resumed);
             }
@@ -443,6 +472,11 @@ enum LinkPreparation {
         linked_files: usize,
     },
     SourceIncomplete,
+}
+
+enum InjectionMutationResult {
+    AlreadyExists,
+    Injected(Result<(), TorrentClientError>),
 }
 
 pub fn injection_queue(
@@ -661,6 +695,34 @@ mod tests {
         assert!(!root.join("links/tracker.example/movie.mkv").exists());
         assert_eq!(1, saved_torrent_count(&root.join("output")));
         assert_eq!("degraded", health[0].state);
+    }
+
+    #[tokio::test]
+    async fn worker_rechecks_target_after_linking_before_injecting() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-target-exists");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")).with_existing(true));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("links")];
+        request.recheck = RecheckResumeConfig {
+            poll_interval_ms: 0,
+            ..RecheckResumeConfig::default()
+        };
+        fs::create_dir_all(&request.link_dirs[0]).unwrap();
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::AlreadyExists, result.outcome);
+        assert_eq!(1, result.linked_files);
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.resume_calls.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
