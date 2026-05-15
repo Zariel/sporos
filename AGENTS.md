@@ -267,6 +267,11 @@ client host, job name, and request label when safe, but never log secrets.
 Tests should cover both success and failure behavior. Add regression tests for
 compatibility bugs, property tests for parsers or filename round trips where
 useful, and integration tests with fake services for network/client contracts.
+When fixing a bug, add a regression test first and confirm it fails for the
+intended reason before changing production code. The acceptance criterion is
+fixing the code under test so that regression test passes, not weakening or
+rewriting the test around the bug. If a direct failing test is impractical,
+record why and add the closest focused regression coverage.
 Destructors must not perform fallible or blocking production cleanup; provide an
 explicit close, flush, or shutdown method that returns `Result` when teardown can
 fail.
