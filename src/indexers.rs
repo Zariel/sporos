@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quick_xml::Reader;
 use quick_xml::escape::{resolve_predefined_entity, unescape};
@@ -20,6 +22,8 @@ use crate::domain::{
 use crate::matching::{TorznabSearchPlan, TorznabSearchType};
 use crate::persistence::torrent_cache::cached_torrent_path;
 use crate::torrent::parse_metafile;
+
+static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConfiguredTorznabIndexer {
@@ -935,15 +939,74 @@ fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownlo
         message: error.to_string(),
     })?;
 
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).map_err(|error| CandidateDownloadError::CacheWrite {
-        path: temporary.clone(),
-        message: error.to_string(),
-    })?;
-    fs::rename(&temporary, path).map_err(|error| CandidateDownloadError::CacheWrite {
+    let (mut temporary_file, temporary) = create_cache_temp_file(path)?;
+    if let Err(error) = temporary_file.write_all(bytes) {
+        let _ = fs::remove_file(&temporary);
+        return Err(CandidateDownloadError::CacheWrite {
+            path: temporary,
+            message: error.to_string(),
+        });
+    }
+    drop(temporary_file);
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_file() => {
+            let _ = fs::remove_file(&temporary);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(CandidateDownloadError::CacheWrite {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })
+        }
+    }
+}
+
+fn create_cache_temp_file(
+    path: &Path,
+) -> Result<(File, std::path::PathBuf), CandidateDownloadError> {
+    for _ in 0..128 {
+        let temporary = unique_cache_temp_path(path);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((file, temporary)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(CandidateDownloadError::CacheWrite {
+                    path: temporary,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+
+    Err(CandidateDownloadError::CacheWrite {
         path: path.to_path_buf(),
-        message: error.to_string(),
+        message: "failed to create a unique temporary cache file".to_owned(),
     })
+}
+
+fn unique_cache_temp_path(path: &Path) -> std::path::PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let sequence = CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("candidate.torrent");
+    let temp_name = format!(
+        ".{file_name}.{}.{}.{}.tmp",
+        std::process::id(),
+        unique,
+        sequence
+    );
+    path.with_file_name(temp_name)
 }
 
 fn configured_torznab_indexer(
@@ -1600,6 +1663,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_download_isolates_concurrent_cache_temp_writes() {
+        let url = spawn_torznab_server(|_request| async move {
+            (
+                AxumStatusCode::OK,
+                String::from_utf8(test_torrent_bytes()).unwrap(),
+            )
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-cache-concurrent");
+        let candidate = test_candidate(&url);
+        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+
+        let downloads = tokio::join!(
+            client.download_and_cache(&candidate, &cache_dir, None),
+            client.download_and_cache(&candidate, &cache_dir, None),
+            client.download_and_cache(&candidate, &cache_dir, None),
+            client.download_and_cache(&candidate, &cache_dir, None)
+        );
+        let cached = [
+            downloads.0.unwrap(),
+            downloads.1.unwrap(),
+            downloads.2.unwrap(),
+            downloads.3.unwrap(),
+        ];
+
+        for item in &cached {
+            assert_eq!(test_torrent_bytes(), fs::read(&item.cache_path).unwrap());
+        }
+        assert!(fs::read_dir(&cache_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[test]
+    fn cache_writer_isolates_parallel_distinct_temp_writes() {
+        let cache_dir = unique_temp_dir("cache-writer-concurrent");
+        let cache_path = cache_dir.join("candidate.torrent");
+        let first = test_torrent_bytes();
+        let second = alternate_test_torrent_bytes();
+        let mut handles = Vec::new();
+
+        for index in 0..32 {
+            let cache_path = cache_path.clone();
+            let bytes = if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            handles.push(std::thread::spawn(move || {
+                write_cached_torrent(&cache_path, &bytes).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let final_bytes = fs::read(&cache_path).unwrap();
+        assert!(final_bytes == first || final_bytes == second);
+        assert!(fs::read_dir(&cache_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
     async fn candidate_download_maps_terminal_and_retryable_failures() {
         let rate_limited = test_candidate(
             &spawn_torznab_server(|_request| async move {
@@ -1886,6 +2025,10 @@ mod tests {
 
     fn test_torrent_bytes() -> Vec<u8> {
         b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi12e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec()
+    }
+
+    fn alternate_test_torrent_bytes() -> Vec<u8> {
+        b"d8:announce34:https://other.example:443/announce4:infod6:lengthi12e4:name9:movie.mkv12:piece lengthi12e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec()
     }
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
