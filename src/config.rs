@@ -229,6 +229,7 @@ where
     config.paths.resolve(cwd.as_ref(), supplied_paths)?;
     config.paths.prepare_local_state()?;
     config.paths.validate_media_dirs()?;
+    resolve_secret_files(&mut config)?;
 
     Ok(config)
 }
@@ -411,6 +412,41 @@ fn resolve_secret_env(
     }
 
     Ok(())
+}
+
+fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
+    for (name, client) in &mut config.torrent_clients {
+        if client.password.is_none() {
+            if let Some(path) = &client.password_file {
+                let value = secret_file_value("torrent_clients.password_file", name, path)?;
+                client.password = Some(
+                    Password::new(value).map_err(|source| ConfigError::InvalidSecret { source })?,
+                );
+            }
+        }
+    }
+    for (name, indexer) in &mut config.indexers.torznab {
+        if indexer.api_key.is_none() {
+            if let Some(path) = &indexer.api_key_file {
+                let value = secret_file_value("indexers.torznab.api_key_file", name, path)?;
+                indexer.api_key = Some(
+                    ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn secret_file_value(field: &'static str, name: &str, path: &Path) -> Result<String, ConfigError> {
+    let value = fs::read_to_string(path).map_err(|error| ConfigError::UnreadableSecretFile {
+        field,
+        path: path.to_path_buf(),
+        message: format!("{name}: {error}"),
+    })?;
+
+    Ok(value.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 fn nonempty_secret_env<'a>(
@@ -962,6 +998,86 @@ mod tests {
 
         assert!(error.to_string().contains("paths.database"));
         assert!(error.to_string().contains("must be absolute"));
+
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn startup_config_loads_secret_file_values() {
+        let cwd = unique_temp_dir("secret-files");
+        let password_file = cwd.join("qbit-password");
+        let api_key_file = cwd.join("indexer-api-key");
+        fs::write(&password_file, "super-secret\n").unwrap();
+        fs::write(&api_key_file, "api-secret\r\n").unwrap();
+        let contents = format!(
+            r#"
+            [paths]
+            database = "{}/state/sporos.db"
+            torrent_cache_dir = "{}/cache/torrents"
+            output_dir = "{}/output"
+
+            [torrent_clients.qbit_main]
+            kind = "qbittorrent"
+            url = "http://qbittorrent:8080"
+            password_file = "{}"
+            default_save_path = "/downloads"
+
+            [indexers.torznab.example]
+            url = "https://indexer.example/api"
+            api_key_file = "{}"
+            "#,
+            cwd.display(),
+            cwd.display(),
+            cwd.display(),
+            password_file.display(),
+            api_key_file.display()
+        );
+
+        let config = parse_startup_config(&contents, &cwd).unwrap();
+        let client = &config.torrent_clients["qbit_main"];
+        let indexer = &config.indexers.torznab["example"];
+
+        assert_eq!(
+            Some("super-secret"),
+            client.password.as_ref().map(Password::expose_secret)
+        );
+        assert_eq!(
+            Some("api-secret"),
+            indexer.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert!(!format!("{client:?}").contains("super-secret"));
+        assert!(!format!("{indexer:?}").contains("api-secret"));
+
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn startup_config_rejects_unreadable_secret_files() {
+        let cwd = unique_temp_dir("missing-secret");
+        let missing_file = cwd.join("missing-password");
+        let contents = format!(
+            r#"
+            [paths]
+            database = "{}/state/sporos.db"
+            torrent_cache_dir = "{}/cache/torrents"
+            output_dir = "{}/output"
+
+            [torrent_clients.qbit_main]
+            kind = "qbittorrent"
+            url = "http://qbittorrent:8080"
+            password_file = "{}"
+            default_save_path = "/downloads"
+            "#,
+            cwd.display(),
+            cwd.display(),
+            cwd.display(),
+            missing_file.display()
+        );
+
+        let error = parse_startup_config(&contents, &cwd).unwrap_err();
+
+        assert!(error.to_string().contains("torrent_clients.password_file"));
+        assert!(error.to_string().contains("missing-password"));
 
         fs::remove_dir_all(cwd).unwrap();
     }

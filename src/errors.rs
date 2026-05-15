@@ -46,11 +46,28 @@ pub trait ClassifyFailure {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ConfigError {
-    MissingField { field: &'static str },
-    InvalidField { field: &'static str, reason: String },
-    InvalidDomain { source: DomainError },
-    InvalidSecret { source: SecretFieldError },
-    UnreadableFile { path: PathBuf, message: String },
+    MissingField {
+        field: &'static str,
+    },
+    InvalidField {
+        field: &'static str,
+        reason: String,
+    },
+    InvalidDomain {
+        source: DomainError,
+    },
+    InvalidSecret {
+        source: SecretFieldError,
+    },
+    UnreadableFile {
+        path: PathBuf,
+        message: String,
+    },
+    UnreadableSecretFile {
+        field: &'static str,
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl ClassifyFailure for ConfigError {
@@ -75,6 +92,17 @@ impl fmt::Display for ConfigError {
                     path.display()
                 )
             }
+            Self::UnreadableSecretFile {
+                field,
+                path,
+                message,
+            } => {
+                write!(
+                    formatter,
+                    "cannot read secret file for {field} {}: {message}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -84,9 +112,10 @@ impl Error for ConfigError {
         match self {
             Self::InvalidDomain { source } => Some(source),
             Self::InvalidSecret { source } => Some(source),
-            Self::MissingField { .. } | Self::InvalidField { .. } | Self::UnreadableFile { .. } => {
-                None
-            }
+            Self::MissingField { .. }
+            | Self::InvalidField { .. }
+            | Self::UnreadableFile { .. }
+            | Self::UnreadableSecretFile { .. } => None,
         }
     }
 }
