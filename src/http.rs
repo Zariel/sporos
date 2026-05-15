@@ -328,7 +328,6 @@ struct AnnouncementAcceptedResponse {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum WorkflowKind {
-    Announcement,
     Search,
     JobRun,
 }
@@ -336,7 +335,6 @@ enum WorkflowKind {
 impl WorkflowKind {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Announcement => "announcement",
             Self::Search => "search",
             Self::JobRun => "job_run",
         }
@@ -344,7 +342,6 @@ impl WorkflowKind {
 
     const fn metric(self) -> WorkflowMetric {
         match self {
-            Self::Announcement => WorkflowMetric::Announcement,
             Self::Search => WorkflowMetric::Search,
             Self::JobRun => WorkflowMetric::JobRun,
         }
@@ -531,33 +528,17 @@ async fn post_announcement(
     }
 
     let _entered = span.enter();
-    let queues = match state.workflow_queues() {
-        Ok(queues) => queues,
-        Err(error) => {
-            state.metrics.record_workflow_enqueue(
-                WorkflowMetric::Announcement,
-                WorkflowOutcome::RejectedClosed,
-            );
-            state.metrics.record_http_request(
-                HttpMethod::Post,
-                HttpRoute::Announcements,
-                error.status.as_u16(),
-            );
-            return error.into_response();
-        }
-    };
-
-    let response = enqueue_work(
-        &state.metrics,
-        queues.announcements.try_enqueue(request),
-        WorkflowKind::Announcement,
+    state.metrics.record_workflow_enqueue(
+        WorkflowMetric::Announcement,
+        WorkflowOutcome::RejectedClosed,
     );
+    let error = ApiErrorResponse::service_unavailable("durable announce queue is not running");
     state.metrics.record_http_request(
         HttpMethod::Post,
         HttpRoute::Announcements,
-        response.status().as_u16(),
+        error.status.as_u16(),
     );
-    response
+    error.into_response()
 }
 
 async fn accept_announcement(
@@ -1244,6 +1225,46 @@ mod tests {
         assert_eq!(StatusCode::ACCEPTED, first.status());
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, rejected.status());
         assert_eq!(1, stored_count);
+    }
+
+    #[tokio::test]
+    async fn announcement_endpoint_requires_durable_acceptor() {
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(4));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
+        let app = router(
+            HttpState::new(ReadinessState::ready(), HealthRegistry::new()).with_workflow_queues(
+                WorkflowQueues {
+                    announcements: announcements.clone(),
+                    searches,
+                    jobs,
+                },
+            ),
+        );
+
+        let response = app
+            .oneshot(json_post(
+                "/v1/announcements",
+                serde_json::json!({
+                    "name": "Example",
+                    "guid": "guid-1",
+                    "download_url": "https://tracker.example/download?id=1",
+                    "tracker": "tracker.example"
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!("service_unavailable", json["error"]["code"]);
+        assert_eq!(0, announcements.stats().depth);
     }
 
     #[tokio::test]
