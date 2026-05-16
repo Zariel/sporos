@@ -191,6 +191,15 @@ pub struct SearchHistoryRow {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IndexerSearchCapsRow {
+    pub indexer_id: IndexerId,
+    pub name: DependencyName,
+    pub enabled: bool,
+    pub retry_after_ms: Option<i64>,
+    pub caps: TorznabCaps,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LocalFileSnapshot {
     pub item_id: LocalItemId,
     pub relative_path: PathBuf,
@@ -1349,6 +1358,49 @@ impl Repository {
                     )?,
                     first_searched_at_ms: row.get("first_searched_at"),
                     last_searched_at_ms: row.get("last_searched_at"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn indexer_search_caps_snapshot(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<IndexerSearchCapsRow>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, enabled, retry_after, capabilities_json
+            FROM indexers
+            WHERE capabilities_json IS NOT NULL
+            ORDER BY name
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read indexer search caps snapshot", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let caps_json: String = row.get("capabilities_json");
+                let caps = serde_json::from_str::<TorznabCaps>(&caps_json).map_err(|error| {
+                    DatabaseError::QueryFailed {
+                        operation: "deserialize indexer caps".to_owned(),
+                        message: error.to_string(),
+                    }
+                })?;
+                Ok(IndexerSearchCapsRow {
+                    indexer_id: indexer_id_from_i64(row.get("id"), "indexer search caps id")?,
+                    name: DependencyName::new(row.get::<String, _>("name")).map_err(|error| {
+                        DatabaseError::QueryFailed {
+                            operation: "read indexer search caps name".to_owned(),
+                            message: error.to_string(),
+                        }
+                    })?,
+                    enabled: row.get::<i64, _>("enabled") != 0,
+                    retry_after_ms: row.get("retry_after"),
+                    caps,
                 })
             })
             .collect()
@@ -5129,6 +5181,7 @@ mod tests {
         ConfiguredTorznabIndexer {
             name: DependencyName::new(name).unwrap(),
             url: SanitizedTorznabUrl::new(url).unwrap(),
+            api_key: None,
             api_key_source,
             enabled: true,
         }

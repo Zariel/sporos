@@ -5,18 +5,24 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
+use crate::arr::{ArrEndpoint, ArrRegistry};
 use crate::clients::qbittorrent::QbitTorrent;
 use crate::clients::qbittorrent::{QbitAddTorrent, QbitContentLayout, QbittorrentClient};
 use crate::clients::rtorrent::{RtorrentClient, RtorrentDownload};
 use crate::clients::{TorrentClientDescriptor, TorrentClientRegistry};
 use crate::config::{ConfigTorrentClientKind, SporosConfig, TorrentClientConfig};
-use crate::domain::{ByteSize, DisplayName, InfoHash, MediaType, TorrentFile};
+use crate::domain::{
+    ByteSize, DependencyName, DisplayName, IndexerId, InfoHash, ItemTitle, LocalItem,
+    LocalItemSource, MediaType, ReasonText, SourceKey, TorrentFile,
+};
 use crate::errors::{DatabaseError, TorrentClientError};
 use crate::http::{
     AnnouncementWorkflowRequest, HttpState, JobRunWorkflowRequest, ReadinessState,
     SearchWorkflowRequest, WorkflowQueues,
 };
-use crate::indexers::TorznabRegistry;
+use crate::indexers::{
+    ConfiguredTorznabIndexer, TorznabEndpoint, TorznabHttpClient, TorznabRegistry,
+};
 use crate::inventory::InventoryScanOptions;
 use crate::inventory_refresh::{
     ClientInventoryItem, ClientInventoryMessage, InventoryRefreshError, InventoryRefreshRequest,
@@ -34,6 +40,10 @@ use crate::runtime::injection_worker::{
 use crate::runtime::queue::{QueueKind, RuntimeQueueConfig, WorkReceiver, bounded_work_queue};
 use crate::runtime::scheduler::{
     PersistedScheduler, ScheduledJobRun, SchedulerConfig, parse_interval_ms, scheduler_queue,
+};
+use crate::runtime::search::{
+    RuntimeSearchPlanner, RuntimeTorznabSearchPlan, plan_runtime_torznab_search,
+    seed_arr_endpoint_backoff,
 };
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, shutdown_channel,
@@ -60,6 +70,9 @@ pub struct AppState {
     pub scheduler: PersistedScheduler,
     pub inventory_refresh: InventoryRefreshWorker,
     pub injection_worker: InjectionWorker,
+    pub search_planner: RuntimeSearchPlanner,
+    pub torznab_indexers: BTreeMap<DependencyName, ConfiguredTorznabIndexer>,
+    pub torznab_client: TorznabHttpClient,
     pub saved_retry_interval: Duration,
     pub shutdown: ShutdownController,
     pub shutdown_signal: ShutdownSignal,
@@ -76,6 +89,81 @@ impl AppState {
             )
             .await
     }
+
+    pub async fn plan_search_workflow(
+        &self,
+        request: SearchWorkflowRequest,
+        now_ms: i64,
+    ) -> Result<SearchWorkflowPlanSummary, DatabaseError> {
+        let item = search_workflow_item(request.query)?;
+        let ids = self
+            .search_planner
+            .lookup_ids_for_item(&item, now_ms)
+            .await?;
+        let indexers = self.repository.indexer_search_caps_snapshot(1_000).await?;
+        let mut plans = Vec::new();
+        let mut candidate_count = 0_usize;
+
+        for indexer in indexers
+            .into_iter()
+            .filter(|indexer| indexer.enabled)
+            .filter(|indexer| {
+                indexer
+                    .retry_after_ms
+                    .is_none_or(|retry_after| retry_after <= now_ms)
+            })
+        {
+            let Some(plan) = plan_runtime_torznab_search(&item, &ids, &indexer.caps) else {
+                continue;
+            };
+            plans.push(IndexerSearchPlan {
+                indexer_id: indexer.indexer_id,
+                indexer_name: indexer.name.clone(),
+                plan: plan.clone(),
+            });
+            let Some(configured) = self.torznab_indexers.get(&indexer.name) else {
+                continue;
+            };
+            let endpoint = TorznabEndpoint {
+                indexer_id: indexer.indexer_id,
+                name: indexer.name,
+                url: configured.url.clone(),
+                api_key: configured
+                    .api_key
+                    .as_ref()
+                    .map(|api_key| api_key.expose_secret().to_owned()),
+                caps: indexer.caps,
+                retry_after_ms: indexer.retry_after_ms,
+            };
+            let candidates = self
+                .torznab_client
+                .search(&endpoint, item.media_type, &plan.plan, now_ms)
+                .await
+                .map_err(|error| DatabaseError::Unavailable {
+                    operation: "execute Torznab search workflow".to_owned(),
+                    message: error.to_string(),
+                })?;
+            candidate_count = candidate_count.saturating_add(candidates.len());
+        }
+
+        Ok(SearchWorkflowPlanSummary {
+            plans,
+            candidate_count,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchWorkflowPlanSummary {
+    pub plans: Vec<IndexerSearchPlan>,
+    pub candidate_count: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IndexerSearchPlan {
+    pub indexer_id: IndexerId,
+    pub indexer_name: DependencyName,
+    pub plan: RuntimeTorznabSearchPlan,
 }
 
 #[derive(Debug, Clone)]
@@ -114,12 +202,22 @@ impl AppRuntime {
                 message: error.to_string(),
             }
         })?;
+        let torznab_indexers = indexers
+            .indexers()
+            .iter()
+            .cloned()
+            .map(|indexer| (indexer.name.clone(), indexer))
+            .collect::<BTreeMap<_, _>>();
+        let now_ms = crate::runtime::announce_worker::unix_time_ms();
         repository
-            .sync_torznab_indexers(
-                indexers.indexers(),
-                crate::runtime::announce_worker::unix_time_ms(),
-            )
+            .sync_torznab_indexers(indexers.indexers(), now_ms)
             .await?;
+        let arr = ArrRegistry::from_config(&config.indexers.arr).map_err(|error| {
+            DatabaseError::Unavailable {
+                operation: "build Arr registry".to_owned(),
+                message: error.to_string(),
+            }
+        })?;
         let clients =
             TorrentClientRegistry::from_config(&config.torrent_clients).map_err(|error| {
                 DatabaseError::Unavailable {
@@ -173,6 +271,20 @@ impl AppRuntime {
             },
         );
         let injection_worker = InjectionWorker::new(repository.clone(), injection_clients);
+        let mut arr_endpoints = arr
+            .instances()
+            .iter()
+            .map(ArrEndpoint::from_configured)
+            .collect::<Vec<_>>();
+        let persisted_health = repository.dependency_health_snapshot(1_000).await?;
+        seed_runtime_health(&health, &persisted_health);
+        seed_arr_endpoint_backoff(&mut arr_endpoints, &persisted_health, now_ms);
+        let search_planner = RuntimeSearchPlanner::new(
+            repository.clone(),
+            health.clone(),
+            arr_endpoints,
+            Duration::from_secs(30),
+        );
         let (shutdown, shutdown_signal) = shutdown_channel();
         let queues = RuntimeQueues {
             workflow: workflow.clone(),
@@ -200,6 +312,9 @@ impl AppRuntime {
                 scheduler,
                 inventory_refresh,
                 injection_worker,
+                search_planner,
+                torznab_indexers,
+                torznab_client: TorznabHttpClient::new(Duration::from_secs(120)),
                 saved_retry_interval,
                 shutdown,
                 shutdown_signal,
@@ -214,6 +329,126 @@ impl AppRuntime {
             },
         })
     }
+}
+
+fn search_workflow_item(title: ItemTitle) -> Result<LocalItem, DatabaseError> {
+    let source_key = SourceKey::new(format!("search:{}", title.as_str())).map_err(|error| {
+        DatabaseError::QueryFailed {
+            operation: "build search workflow source key".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let display_name =
+        DisplayName::new(title.as_str()).map_err(|error| DatabaseError::QueryFailed {
+            operation: "build search workflow display name".to_owned(),
+            message: error.to_string(),
+        })?;
+
+    let media_type = infer_search_media_type(title.as_str());
+
+    Ok(LocalItem {
+        id: None,
+        source: LocalItemSource::Virtual { source_key },
+        title,
+        display_name,
+        media_type,
+        info_hash: None,
+        path: None,
+        save_path: None,
+        total_size: ByteSize::new(1),
+        mtime_ms: None,
+    })
+}
+
+fn infer_search_media_type(title: &str) -> MediaType {
+    let mut has_season = false;
+    for token in title.split(['.', '_', ' ', '-']) {
+        let lower = token.to_ascii_lowercase();
+        if looks_like_episode_token(&lower) {
+            return MediaType::Episode;
+        }
+        if looks_like_season_token(&lower) {
+            has_season = true;
+        }
+    }
+    if has_season {
+        MediaType::SeasonPack
+    } else {
+        MediaType::Movie
+    }
+}
+
+fn looks_like_episode_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    if chars.next() != Some('s') {
+        return false;
+    }
+    let mut saw_season_digit = false;
+    for character in chars.by_ref() {
+        if character == 'e' {
+            return saw_season_digit
+                && chars.next().is_some_and(|next| next.is_ascii_digit())
+                && chars.all(|remaining| remaining.is_ascii_digit());
+        }
+        if !character.is_ascii_digit() {
+            return false;
+        }
+        saw_season_digit = true;
+    }
+    false
+}
+
+fn looks_like_season_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    chars.next() == Some('s')
+        && chars
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+        && chars.all(|character| character.is_ascii_digit())
+}
+
+fn seed_runtime_health(
+    health: &HealthRegistry,
+    rows: &[crate::persistence::repository::DependencyHealthSnapshot],
+) {
+    for row in rows {
+        let kind = match row.dependency_type.as_str() {
+            "arr" => crate::runtime::health::DependencyKind::Arr,
+            "indexer" => crate::runtime::health::DependencyKind::Indexer,
+            _ => continue,
+        };
+        match row.state.as_str() {
+            "healthy" => health.set_healthy(kind, row.dependency_name.clone(), row.checked_at_ms),
+            "degraded" => {
+                if let Some(reason) = health_reason(row.reason.as_deref(), "dependency degraded") {
+                    health.set_degraded(
+                        kind,
+                        row.dependency_name.clone(),
+                        reason,
+                        row.retry_after_ms,
+                    );
+                }
+            }
+            "unavailable" => {
+                if let Some(reason) = health_reason(row.reason.as_deref(), "dependency unavailable")
+                {
+                    health.set_unavailable(
+                        kind,
+                        row.dependency_name.clone(),
+                        reason,
+                        row.retry_after_ms,
+                    );
+                }
+            }
+            _ => health.set_unknown(kind, row.dependency_name.clone()),
+        }
+    }
+}
+
+fn health_reason(value: Option<&str>, fallback: &'static str) -> Option<ReasonText> {
+    value
+        .and_then(|reason| ReasonText::new(reason).ok())
+        .or_else(|| ReasonText::new(fallback).ok())
 }
 
 enum RuntimeInjectionClientInner {
@@ -651,15 +886,19 @@ fn workflow_queues(queue_config: RuntimeQueueConfig) -> (WorkflowQueues, Workflo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::future::{Future, pending};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::clients::TorrentClientCapabilities;
-    use crate::config::TorznabIndexerConfig;
-    use crate::domain::{ClientHost, TorrentClientKind};
+    use crate::config::{ArrInstanceConfig, TorznabIndexerConfig};
+    use crate::domain::{
+        ClientHost, DependencyName, DependencyState, ItemTitle, ReasonText, TorrentClientKind,
+    };
     use crate::http::router;
+    use crate::indexers::{CategoryCaps, SearchCaps, TorznabCaps, TorznabLimits};
     use crate::metrics::ExternalOutcome;
     use crate::secrets::{ApiKey, ApiToken};
     use axum::body::{Body, to_bytes};
@@ -718,6 +957,213 @@ mod tests {
             crate::runtime::shutdown::ShutdownPhase::Running,
             runtime.state.shutdown.state().phase
         );
+    }
+
+    #[tokio::test]
+    async fn search_workflow_planning_uses_arr_ids() {
+        let torznab_queries = Arc::new(Mutex::new(Vec::new()));
+        let torznab_url = spawn_runtime_torznab_search_server(Arc::clone(&torznab_queries)).await;
+        let arr_url = spawn_runtime_arr_parse_server(
+            Arc::new(AtomicUsize::new(0)),
+            StatusCode::OK,
+            r#"{"movie":{"tmdbId":99}}"#,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: torznab_url,
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        config.indexers.arr.radarr.insert(
+            "main".to_owned(),
+            ArrInstanceConfig {
+                url: arr_url,
+                api_key: Some(ApiKey::new("arr-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(&DependencyName::new("main").unwrap(), &movie_caps(), 100)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.plans.len());
+        assert_eq!(
+            Some("99"),
+            summary.plans[0].plan.plan.query.ids.tmdb_id.as_deref()
+        );
+        assert_eq!(None, summary.plans[0].plan.plan.query.q);
+        assert!(summary.plans[0].plan.cache_key.as_str().contains("tmdb:99"));
+        assert_eq!(1, summary.candidate_count);
+        let queries = torznab_queries.lock().unwrap();
+        assert_eq!(1, queries.len());
+        assert!(queries[0].contains("tmdbid=99"));
+        assert!(!queries[0].contains("q=Example"));
+    }
+
+    #[tokio::test]
+    async fn runtime_restores_arr_backoff_before_search_planning() {
+        let torznab_queries = Arc::new(Mutex::new(Vec::new()));
+        let torznab_url = spawn_runtime_torznab_search_server(Arc::clone(&torznab_queries)).await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let arr_url = spawn_runtime_arr_parse_server(
+            Arc::clone(&requests),
+            StatusCode::OK,
+            r#"{"movie":{"tmdbId":99}}"#,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: torznab_url,
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        config.indexers.arr.radarr.insert(
+            "main".to_owned(),
+            ArrInstanceConfig {
+                url: arr_url,
+                api_key: Some(ApiKey::new("arr-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .record_dependency_health(
+                "arr",
+                &DependencyName::new("radarr-main").unwrap(),
+                &DependencyState::Degraded {
+                    reason: ReasonText::new("rate limited").unwrap(),
+                    retry_after_ms: Some(i64::MAX / 2),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(&DependencyName::new("main").unwrap(), &movie_caps(), 100)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(0, requests.load(Ordering::SeqCst));
+        assert_eq!(1, summary.plans.len());
+        assert_eq!(
+            Some("Example.Movie.1080p"),
+            summary.plans[0].plan.plan.query.q.as_deref()
+        );
+        assert!(summary.plans[0].plan.plan.query.ids.is_empty());
+        assert_eq!(1, summary.candidate_count);
+        let health = runtime.state.health.snapshot();
+        assert_eq!(
+            Some(&crate::runtime::health::DependencySummary::Degraded),
+            health
+                .summaries
+                .get(&crate::runtime::health::DependencyKind::Arr)
+        );
+        let queries = torznab_queries.lock().unwrap();
+        assert_eq!(1, queries.len());
+        assert!(queries[0].contains("q=Example"));
+    }
+
+    #[tokio::test]
+    async fn search_workflow_planning_uses_sonarr_episode_ids() {
+        let torznab_queries = Arc::new(Mutex::new(Vec::new()));
+        let torznab_url = spawn_runtime_torznab_search_server(Arc::clone(&torznab_queries)).await;
+        let arr_url = spawn_runtime_arr_parse_server(
+            Arc::new(AtomicUsize::new(0)),
+            StatusCode::OK,
+            r#"{"series":{"tvdbId":42}}"#,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: torznab_url,
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        config.indexers.arr.sonarr.insert(
+            "main".to_owned(),
+            ArrInstanceConfig {
+                url: arr_url,
+                api_key: Some(ApiKey::new("arr-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(&DependencyName::new("main").unwrap(), &tv_caps(), 100)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Show.S01E02.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.plans.len());
+        assert_eq!(
+            Some("42"),
+            summary.plans[0].plan.plan.query.ids.tvdb_id.as_deref()
+        );
+        assert_eq!(Some(1), summary.plans[0].plan.plan.query.season);
+        assert_eq!(Some(2), summary.plans[0].plan.plan.query.episode);
+        let queries = torznab_queries.lock().unwrap();
+        assert_eq!(1, queries.len());
+        assert!(queries[0].contains("tvdbid=42"));
+        assert!(queries[0].contains("t=tvsearch"));
     }
 
     #[tokio::test]
@@ -1363,6 +1809,99 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}")
+    }
+
+    async fn spawn_runtime_arr_parse_server(
+        requests: Arc<AtomicUsize>,
+        status: StatusCode,
+        body: &'static str,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/api/v3/parse",
+            get(move |_request: Request<Body>| {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    (status, body)
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    async fn spawn_runtime_torznab_search_server(queries: Arc<Mutex<Vec<String>>>) -> String {
+        let app = axum::Router::new().route(
+            "/api",
+            get(move |request: Request<Body>| {
+                let queries = Arc::clone(&queries);
+                async move {
+                    queries
+                        .lock()
+                        .unwrap()
+                        .push(request.uri().query().unwrap_or_default().to_owned());
+                    (StatusCode::OK, search_rss("candidate-1", "Example"))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    fn movie_caps() -> TorznabCaps {
+        TorznabCaps {
+            search: SearchCaps {
+                movie_search: true,
+                supported_id_params: BTreeSet::from(["tmdbid".to_owned()]),
+                ..SearchCaps::default()
+            },
+            categories: CategoryCaps {
+                movie: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits::default(),
+        }
+    }
+
+    fn tv_caps() -> TorznabCaps {
+        TorznabCaps {
+            search: SearchCaps {
+                tv_search: true,
+                supported_id_params: BTreeSet::from(["tvdbid".to_owned()]),
+                ..SearchCaps::default()
+            },
+            categories: CategoryCaps {
+                tv: true,
+                ..CategoryCaps::default()
+            },
+            limits: TorznabLimits::default(),
+        }
+    }
+
+    fn search_rss(guid: &str, title: &str) -> String {
+        format!(
+            r#"
+            <rss>
+              <channel>
+                <item>
+                  <title>{title}</title>
+                  <guid>{guid}</guid>
+                  <link>https://indexer.example/download/{guid}</link>
+                  <torznab:attr name="size" value="1234"/>
+                  <torznab:attr name="infohash" value="0123456789abcdef0123456789abcdef01234567"/>
+                </item>
+              </channel>
+            </rss>
+            "#
+        )
     }
 
     fn response_with_cookie(

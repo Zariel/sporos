@@ -5,4 +5,5 @@ pub mod health;
 pub mod injection_worker;
 pub mod queue;
 pub mod scheduler;
+pub mod search;
 pub mod shutdown;

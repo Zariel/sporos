@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod announce;
+pub mod arr;
 pub mod cli;
 pub mod clients;
 pub mod config;

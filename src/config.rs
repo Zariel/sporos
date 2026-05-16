@@ -93,6 +93,7 @@ pub enum ConfigTorrentClientKind {
 pub struct IndexersConfig {
     pub default_timeouts: IndexerTimeoutsConfig,
     pub torznab: BTreeMap<String, TorznabIndexerConfig>,
+    pub arr: ArrServicesConfig,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
@@ -114,6 +115,22 @@ impl Default for IndexerTimeoutsConfig {
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TorznabIndexerConfig {
+    pub url: String,
+    pub api_key: Option<ApiKey>,
+    pub api_key_file: Option<PathBuf>,
+    pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArrServicesConfig {
+    pub sonarr: BTreeMap<String, ArrInstanceConfig>,
+    pub radarr: BTreeMap<String, ArrInstanceConfig>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrInstanceConfig {
     pub url: String,
     pub api_key: Option<ApiKey>,
     pub api_key_file: Option<PathBuf>,
@@ -432,6 +449,16 @@ fn resolve_secret_env(
             }
         }
     }
+    resolve_arr_secret_env(
+        "indexers.arr.sonarr.api_key_env",
+        &mut config.indexers.arr.sonarr,
+        env,
+    )?;
+    resolve_arr_secret_env(
+        "indexers.arr.radarr.api_key_env",
+        &mut config.indexers.arr.radarr,
+        env,
+    )?;
 
     Ok(())
 }
@@ -462,6 +489,51 @@ fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
                     ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?,
                 );
             }
+        }
+    }
+    resolve_arr_secret_files(
+        "indexers.arr.sonarr.api_key_file",
+        &mut config.indexers.arr.sonarr,
+    )?;
+    resolve_arr_secret_files(
+        "indexers.arr.radarr.api_key_file",
+        &mut config.indexers.arr.radarr,
+    )?;
+
+    Ok(())
+}
+
+fn resolve_arr_secret_env(
+    field: &'static str,
+    instances: &mut BTreeMap<String, ArrInstanceConfig>,
+    env: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (name, instance) in instances {
+        if instance.api_key.is_none()
+            && let Some(env_name) = nonempty_secret_env(field, name, &instance.api_key_env)?
+        {
+            let value = secret_env_value(env, env_name, field, name)?;
+            instance.api_key = Some(
+                ApiKey::new(value.clone())
+                    .map_err(|source| ConfigError::InvalidSecret { source })?,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_arr_secret_files(
+    field: &'static str,
+    instances: &mut BTreeMap<String, ArrInstanceConfig>,
+) -> Result<(), ConfigError> {
+    for (name, instance) in instances {
+        if instance.api_key.is_none()
+            && let Some(path) = &instance.api_key_file
+        {
+            let value = secret_file_value(field, name, path)?;
+            instance.api_key =
+                Some(ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
         }
     }
 
@@ -774,6 +846,18 @@ api_key = "optional local-development secret"
 api_key_file = "optional path"
 api_key_env = "optional env var containing api key"
 
+[indexers.arr.sonarr.<name>]
+url = "http://sonarr:8989"
+api_key = "optional local-development secret"
+api_key_file = "optional path"
+api_key_env = "optional env var containing api key"
+
+[indexers.arr.radarr.<name>]
+url = "http://radarr:7878"
+api_key = "optional local-development secret"
+api_key_file = "optional path"
+api_key_env = "optional env var containing api key"
+
 [environment overrides]
 SPOROS__SERVER__BIND = "0.0.0.0:2468"
 SPOROS__SERVER__API_TOKEN_FILE = "/var/run/secrets/sporos-api-token"
@@ -782,6 +866,7 @@ SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE = "/var/run/secrets/qbit-password"
 SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY_FILE = "/var/run/secrets/indexer-api-key"
+SPOROS__INDEXERS__ARR__SONARR__MAIN__API_KEY_FILE = "/var/run/secrets/sonarr-api-key"
 
 [matching]
 mode = "exact|partial"
@@ -1082,9 +1167,11 @@ mod tests {
         let api_token_file = cwd.join("api-token");
         let password_file = cwd.join("qbit-password");
         let api_key_file = cwd.join("indexer-api-key");
+        let sonarr_api_key_file = cwd.join("sonarr-api-key");
         fs::write(&api_token_file, "server-secret\n").unwrap();
         fs::write(&password_file, "super-secret\n").unwrap();
         fs::write(&api_key_file, "api-secret\r\n").unwrap();
+        fs::write(&sonarr_api_key_file, "sonarr-secret\n").unwrap();
         let contents = format!(
             r#"
             [paths]
@@ -1105,18 +1192,24 @@ mod tests {
             [indexers.torznab.example]
             url = "https://indexer.example/api"
             api_key_file = "{}"
+
+            [indexers.arr.sonarr.main]
+            url = "http://sonarr:8989"
+            api_key_file = "{}"
             "#,
             cwd.display(),
             cwd.display(),
             cwd.display(),
             api_token_file.display(),
             password_file.display(),
-            api_key_file.display()
+            api_key_file.display(),
+            sonarr_api_key_file.display()
         );
 
         let config = parse_startup_config(&contents, &cwd).unwrap();
         let client = &config.torrent_clients["qbit_main"];
         let indexer = &config.indexers.torznab["example"];
+        let sonarr = &config.indexers.arr.sonarr["main"];
 
         assert_eq!(
             Some("super-secret"),
@@ -1134,9 +1227,14 @@ mod tests {
             Some("api-secret"),
             indexer.api_key.as_ref().map(ApiKey::expose_secret)
         );
+        assert_eq!(
+            Some("sonarr-secret"),
+            sonarr.api_key.as_ref().map(ApiKey::expose_secret)
+        );
         assert!(!format!("{:?}", config.server).contains("server-secret"));
         assert!(!format!("{client:?}").contains("super-secret"));
         assert!(!format!("{indexer:?}").contains("api-secret"));
+        assert!(!format!("{sonarr:?}").contains("sonarr-secret"));
 
         fs::remove_dir_all(cwd).unwrap();
     }
@@ -1252,6 +1350,10 @@ mod tests {
             [indexers.torznab.example]
             url = "https://old.example/api"
             api_key_env = "INDEXER_API_KEY"
+
+            [indexers.arr.radarr.main]
+            url = "http://old-radarr:7878"
+            api_key_env = "RADARR_API_KEY"
             "#,
             vec![
                 (
@@ -1262,13 +1364,19 @@ mod tests {
                     "SPOROS__INDEXERS__TORZNAB__EXAMPLE__URL".to_owned(),
                     "https://indexer.example/api".to_owned(),
                 ),
+                (
+                    "SPOROS__INDEXERS__ARR__RADARR__MAIN__URL".to_owned(),
+                    "http://radarr:7878".to_owned(),
+                ),
                 ("QBIT_PASSWORD".to_owned(), "super-secret".to_owned()),
                 ("INDEXER_API_KEY".to_owned(), "api-secret".to_owned()),
+                ("RADARR_API_KEY".to_owned(), "radarr-secret".to_owned()),
             ],
         )
         .unwrap();
         let client = &config.torrent_clients["qbit_main"];
         let indexer = &config.indexers.torznab["example"];
+        let radarr = &config.indexers.arr.radarr["main"];
 
         assert_eq!("http://qbittorrent:8080", client.url);
         assert_eq!(
@@ -1283,6 +1391,11 @@ mod tests {
         assert_eq!(
             Some("api-secret"),
             indexer.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert_eq!("http://radarr:7878", radarr.url);
+        assert_eq!(
+            Some("radarr-secret"),
+            radarr.api_key.as_ref().map(ApiKey::expose_secret)
         );
     }
 
@@ -1322,11 +1435,16 @@ mod tests {
             [indexers.torznab.example]
             url = "https://indexer.example/api"
             api_key = "api-secret"
+
+            [indexers.arr.sonarr.main]
+            url = "http://sonarr:8989"
+            api_key = "sonarr-secret"
             "#,
         )
         .unwrap();
         let client = &config.torrent_clients["qbit_main"];
         let indexer = &config.indexers.torznab["example"];
+        let sonarr = &config.indexers.arr.sonarr["main"];
 
         assert_eq!(
             Some("dev-secret"),
@@ -1338,6 +1456,11 @@ mod tests {
             indexer.api_key.as_ref().map(ApiKey::expose_secret)
         );
         assert!(!format!("{indexer:?}").contains("api-secret"));
+        assert_eq!(
+            Some("sonarr-secret"),
+            sonarr.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert!(!format!("{sonarr:?}").contains("sonarr-secret"));
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

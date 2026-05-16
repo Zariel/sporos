@@ -1287,11 +1287,15 @@ pub struct SearchIds {
     pub imdb_id: Option<String>,
     pub tvdb_id: Option<String>,
     pub tmdb_id: Option<String>,
+    pub tvmaze_id: Option<String>,
 }
 
 impl SearchIds {
     pub fn is_empty(&self) -> bool {
-        self.imdb_id.is_none() && self.tvdb_id.is_none() && self.tmdb_id.is_none()
+        self.imdb_id.is_none()
+            && self.tvdb_id.is_none()
+            && self.tmdb_id.is_none()
+            && self.tvmaze_id.is_none()
     }
 }
 
@@ -1393,6 +1397,10 @@ pub fn search_cache_key(
     if let Some(tmdb_id) = ids.tmdb_id.as_deref() {
         value.push_str("|tmdb:");
         value.push_str(&normalize_search_key(tmdb_id));
+    }
+    if let Some(tvmaze_id) = ids.tvmaze_id.as_deref() {
+        value.push_str("|tvmaze:");
+        value.push_str(&normalize_search_key(tvmaze_id));
     }
     SearchCacheKey { value }
 }
@@ -1510,7 +1518,7 @@ fn tv_query(
     metadata: ParsedSearchMetadata,
 ) -> Option<TorznabSearchQuery> {
     if caps.search.tv_search {
-        let ids = supported_ids(ids, caps, &["tvdbid", "imdbid"]);
+        let ids = supported_ids(ids, caps, &["tvdbid", "imdbid", "tvmazeid"]);
         return Some(TorznabSearchQuery {
             search_type: TorznabSearchType::TvSearch,
             q: if ids.is_empty() {
@@ -1559,7 +1567,7 @@ fn audio_query(
             q: Some(item.title.as_str().to_owned()),
             season: None,
             episode: None,
-            ids: supported_ids(ids, caps, &["imdbid", "tvdbid", "tmdbid"]),
+            ids: supported_ids(ids, caps, &["imdbid", "tvdbid", "tmdbid", "tvmazeid"]),
         });
     }
     generic_query(item, ids, caps)
@@ -1578,7 +1586,7 @@ fn generic_query(
         q: Some(item.title.as_str().to_owned()),
         season: None,
         episode: None,
-        ids: supported_ids(ids, caps, &["imdbid", "tvdbid", "tmdbid"]),
+        ids: supported_ids(ids, caps, &["imdbid", "tvdbid", "tmdbid", "tvmazeid"]),
     })
 }
 
@@ -1592,6 +1600,7 @@ fn supported_ids(ids: &SearchIds, caps: &TorznabCaps, priority: &[&str]) -> Sear
             "imdbid" => supported.imdb_id = ids.imdb_id.clone(),
             "tvdbid" => supported.tvdb_id = ids.tvdb_id.clone(),
             "tmdbid" => supported.tmdb_id = ids.tmdb_id.clone(),
+            "tvmazeid" => supported.tvmaze_id = ids.tvmaze_id.clone(),
             _ => {}
         }
         if !supported.is_empty() {

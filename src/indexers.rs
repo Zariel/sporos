@@ -22,6 +22,7 @@ use crate::domain::{
 };
 use crate::matching::{TorznabSearchPlan, TorznabSearchType};
 use crate::persistence::torrent_cache::cached_torrent_path;
+use crate::secrets::ApiKey;
 use crate::torrent::parse_metafile;
 
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +34,7 @@ const CANDIDATE_TORRENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 pub struct ConfiguredTorznabIndexer {
     pub name: DependencyName,
     pub url: SanitizedTorznabUrl,
+    pub api_key: Option<ApiKey>,
     pub api_key_source: ApiKeySource,
     pub enabled: bool,
 }
@@ -198,6 +200,9 @@ impl TorznabHttpClient {
                 }
                 if let Some(tmdb_id) = plan.query.ids.tmdb_id.as_deref() {
                     params.push(("tmdbid".to_owned(), tmdb_id.to_owned()));
+                }
+                if let Some(tvmaze_id) = plan.query.ids.tvmaze_id.as_deref() {
+                    params.push(("tvmazeid".to_owned(), tvmaze_id.to_owned()));
                 }
                 params.push(("limit".to_owned(), limit.to_string()));
             })
@@ -954,7 +959,7 @@ fn candidate_error(error: impl std::error::Error) -> TorznabRequestError {
     }
 }
 
-fn parse_retry_after(value: &str) -> Option<RetryAfter> {
+pub(crate) fn parse_retry_after(value: &str) -> Option<RetryAfter> {
     value
         .parse::<i64>()
         .ok()
@@ -1136,6 +1141,7 @@ fn configured_torznab_indexer(
     Ok(ConfiguredTorznabIndexer {
         name,
         url: SanitizedTorznabUrl::new(config.url.clone())?,
+        api_key: config.api_key.clone(),
         api_key_source: api_key_source(config),
         enabled: true,
     })
@@ -1524,6 +1530,7 @@ mod tests {
         let config = IndexersConfig {
             default_timeouts: IndexerTimeoutsConfig::default(),
             torznab,
+            arr: Default::default(),
         };
 
         let registry = TorznabRegistry::from_config(&config).unwrap();
@@ -1596,6 +1603,7 @@ mod tests {
         let config = IndexersConfig {
             default_timeouts: IndexerTimeoutsConfig::default(),
             torznab,
+            arr: Default::default(),
         };
 
         let error = TorznabRegistry::from_config(&config).unwrap_err();
@@ -1620,6 +1628,7 @@ mod tests {
         let config = IndexersConfig {
             default_timeouts: IndexerTimeoutsConfig::default(),
             torznab,
+            arr: Default::default(),
         };
 
         let error = TorznabRegistry::from_config(&config).unwrap_err();

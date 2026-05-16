@@ -8,7 +8,7 @@ use tracing::{error, warn};
 
 use crate::config::{SporosConfig, validate_server_auth};
 use crate::errors::{ConfigError, DatabaseError};
-use crate::http::router;
+use crate::http::{SearchWorkflowRequest, router};
 use crate::inventory_refresh::run_inventory_refresh_worker;
 use crate::notifications::{NotificationWorker, run_notification_worker};
 use crate::runtime::announce_worker::{AnnounceWorkerError, unix_time_ms};
@@ -176,7 +176,8 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     ));
     handles.push(BackgroundTask::new(
         "searches-receiver",
-        tokio::spawn(hold_receiver_open(
+        tokio::spawn(run_search_receiver(
+            runtime.state.clone(),
             searches,
             runtime.state.shutdown_signal.clone(),
         )),
@@ -200,6 +201,36 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     ));
 
     Ok(handles)
+}
+
+async fn run_search_receiver(
+    state: AppState,
+    mut receiver: crate::runtime::queue::WorkReceiver<SearchWorkflowRequest>,
+    mut shutdown: ShutdownSignal,
+) {
+    loop {
+        tokio::select! {
+            _state = shutdown.cancelled() => {
+                receiver.close();
+                break;
+            }
+            request = receiver.recv() => {
+                let Some(request) = request else {
+                    break;
+                };
+                match state.plan_search_workflow(request, unix_time_ms()).await {
+                    Ok(summary) => {
+                        receiver.mark_completed();
+                        tracing::info!(
+                            planned_indexers = summary.plans.len(),
+                            "search workflow query planning completed"
+                        );
+                    }
+                    Err(error) => warn!(error = %error, "search workflow query planning failed"),
+                }
+            }
+        }
+    }
 }
 
 fn runtime_client_inventory_interval(state: &AppState) -> Duration {
