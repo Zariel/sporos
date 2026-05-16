@@ -284,23 +284,44 @@ impl InjectionWorker {
         shutdown: ShutdownSignal,
     ) -> Result<Vec<InventoryRefreshSummary>, InventoryRefreshError> {
         let mut summaries = Vec::with_capacity(self.clients.len());
+        let mut refreshed_client_hosts = Vec::with_capacity(self.clients.len());
         let mut last_error = None;
+        let client_worker = worker.without_client_post_refresh_work();
         for client in &self.clients {
             if shutdown.state().phase != ShutdownPhase::Running {
-                return Err(InventoryRefreshError::Client {
+                let error = InventoryRefreshError::Client {
                     source: TorrentClientError::Cancelled {
                         client: client.descriptor().name.as_str().to_owned(),
                         message: "shutdown requested".to_owned(),
                     },
-                });
+                };
+                if !refreshed_client_hosts.is_empty() {
+                    worker
+                        .refresh_virtual_seasons_after_client_batch(&refreshed_client_hosts)
+                        .await?;
+                }
+                return Err(error);
             }
-            match client.refresh_inventory(worker, shutdown.clone()).await {
-                Ok(summary) => summaries.push(summary),
+            match client
+                .refresh_inventory(&client_worker, shutdown.clone())
+                .await
+            {
+                Ok(summary) => {
+                    summaries.push(summary);
+                    refreshed_client_hosts.push(client.descriptor().host.clone());
+                }
                 Err(
                     error @ InventoryRefreshError::Client {
                         source: TorrentClientError::Cancelled { .. },
                     },
-                ) => return Err(error),
+                ) => {
+                    if !refreshed_client_hosts.is_empty() {
+                        worker
+                            .refresh_virtual_seasons_after_client_batch(&refreshed_client_hosts)
+                            .await?;
+                    }
+                    return Err(error);
+                }
                 Err(error) => {
                     warn!(
                         client = %client.descriptor().name,
@@ -315,6 +336,11 @@ impl InjectionWorker {
             if let Some(error) = last_error {
                 return Err(error);
             }
+        }
+        if !summaries.is_empty() {
+            worker
+                .refresh_virtual_seasons_after_client_batch(&refreshed_client_hosts)
+                .await?;
         }
         Ok(summaries)
     }
@@ -1638,7 +1664,7 @@ mod tests {
         ByteSize, CandidateGuid, ClientHost, DisplayName, DownloadUrl, FileIndex, ItemTitle,
         LocalItemSource, MatchRatio, MediaType, TrackerName,
     };
-    use crate::inventory::InventoryScanOptions;
+    use crate::inventory::{InventoryScanOptions, ScannedLocalItem};
     use crate::persistence::repository::Repository;
 
     #[tokio::test]
@@ -1719,6 +1745,116 @@ mod tests {
         assert_eq!(2, summaries[0].persisted_items);
         assert_eq!(1, failing.calls.load(Ordering::SeqCst));
         assert_eq!(1, successful.calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn client_inventory_refresh_rebuilds_virtual_seasons_once_per_batch() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let virtual_refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh_worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default())
+                .with_virtual_refresh_attempts(virtual_refreshes.clone());
+        let first_host = ClientHost::new("first").unwrap();
+        let second_host = ClientHost::new("second").unwrap();
+        let first = Arc::new(FakeRefreshClient::persisting(
+            descriptor("first", first_host.as_str()),
+            vec![client_episode(
+                first_host,
+                "0123456789abcdef0123456789abcdef01234561",
+                "Client Show S01E01",
+                "client-e01.mkv",
+            )],
+        ));
+        let second = Arc::new(FakeRefreshClient::persisting(
+            descriptor("second", second_host.as_str()),
+            vec![
+                client_episode(
+                    second_host.clone(),
+                    "0123456789abcdef0123456789abcdef01234562",
+                    "Client Show S01E02",
+                    "client-e02.mkv",
+                ),
+                client_episode(
+                    second_host,
+                    "0123456789abcdef0123456789abcdef01234563",
+                    "Client Show S01E03",
+                    "client-e03.mkv",
+                ),
+            ],
+        ));
+        let worker = InjectionWorker::new(
+            repository.clone(),
+            vec![
+                first.clone() as Arc<dyn InjectionClient>,
+                second.clone() as Arc<dyn InjectionClient>,
+            ],
+        );
+
+        let summaries = worker
+            .refresh_client_inventories(&refresh_worker)
+            .await
+            .unwrap();
+
+        assert_eq!(2, summaries.len());
+        assert_eq!(1, virtual_refreshes.load(Ordering::SeqCst));
+        assert_virtual_season(&repository, "Client Show S01", 3).await;
+        assert_eq!(1, first.calls.load(Ordering::SeqCst));
+        assert_eq!(1, second.calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn client_inventory_refresh_finalizes_partial_batch_before_cancel() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let virtual_refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh_worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default())
+                .with_virtual_refresh_attempts(virtual_refreshes.clone());
+        let first_host = ClientHost::new("first").unwrap();
+        let first = Arc::new(FakeRefreshClient::persisting(
+            descriptor("first", first_host.as_str()),
+            vec![
+                client_episode(
+                    first_host.clone(),
+                    "0123456789abcdef0123456789abcdef01234561",
+                    "Old Show S01E01",
+                    "old-e01.mkv",
+                ),
+                client_episode(
+                    first_host.clone(),
+                    "0123456789abcdef0123456789abcdef01234562",
+                    "Old Show S01E02",
+                    "old-e02.mkv",
+                ),
+                client_episode(
+                    first_host,
+                    "0123456789abcdef0123456789abcdef01234563",
+                    "Old Show S01E03",
+                    "old-e03.mkv",
+                ),
+            ],
+        ));
+        let second = Arc::new(FakeRefreshClient::cancelled(descriptor("second", "second")));
+        let worker = InjectionWorker::new(
+            repository.clone(),
+            vec![
+                first.clone() as Arc<dyn InjectionClient>,
+                second.clone() as Arc<dyn InjectionClient>,
+            ],
+        );
+
+        let error = worker
+            .refresh_client_inventories(&refresh_worker)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            InventoryRefreshError::Client {
+                source: TorrentClientError::Cancelled { .. }
+            }
+        ));
+        assert_eq!(1, virtual_refreshes.load(Ordering::SeqCst));
+        assert_virtual_season(&repository, "Old Show S01", 3).await;
     }
 
     #[tokio::test]
@@ -2923,6 +3059,8 @@ mod tests {
         descriptor: TorrentClientDescriptor,
         calls: AtomicUsize,
         summary: Option<InventoryRefreshSummary>,
+        items: Vec<ScannedLocalItem>,
+        cancel: bool,
     }
 
     impl FakeRefreshClient {
@@ -2936,6 +3074,8 @@ mod tests {
                     pruned_items: 0,
                     scan_failures: Vec::new(),
                 }),
+                items: Vec::new(),
+                cancel: false,
             }
         }
 
@@ -2944,6 +3084,28 @@ mod tests {
                 descriptor,
                 calls: AtomicUsize::new(0),
                 summary: None,
+                items: Vec::new(),
+                cancel: false,
+            }
+        }
+
+        fn cancelled(descriptor: TorrentClientDescriptor) -> Self {
+            Self {
+                descriptor,
+                calls: AtomicUsize::new(0),
+                summary: None,
+                items: Vec::new(),
+                cancel: true,
+            }
+        }
+
+        fn persisting(descriptor: TorrentClientDescriptor, items: Vec<ScannedLocalItem>) -> Self {
+            Self {
+                descriptor,
+                calls: AtomicUsize::new(0),
+                summary: None,
+                items,
+                cancel: false,
             }
         }
     }
@@ -2985,13 +3147,27 @@ mod tests {
 
         fn refresh_inventory<'a>(
             &'a self,
-            _worker: &'a InventoryRefreshWorker,
+            worker: &'a InventoryRefreshWorker,
             _shutdown: ShutdownSignal,
         ) -> ClientInventoryRefreshFuture<'a> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let summary = self.summary.clone();
             let client = self.descriptor.name.as_str().to_owned();
+            let host = self.descriptor.host.clone();
+            let items = self.items.clone();
+            let cancel = self.cancel;
             Box::pin(async move {
+                if cancel {
+                    return Err(InventoryRefreshError::Client {
+                        source: TorrentClientError::Cancelled {
+                            client: client.clone(),
+                            message: "shutdown requested".to_owned(),
+                        },
+                    });
+                }
+                if !items.is_empty() {
+                    return worker.refresh_client_items(host, &items).await;
+                }
                 summary.ok_or_else(|| {
                     TorrentClientError::Unavailable {
                         client,
@@ -3188,6 +3364,67 @@ mod tests {
             "timed out waiting for at least {expected} calls; saw {}",
             counter.load(Ordering::SeqCst)
         );
+    }
+
+    fn client_episode(
+        client_host: ClientHost,
+        hash: &str,
+        title: &str,
+        relative_path: &str,
+    ) -> ScannedLocalItem {
+        crate::inventory_refresh::ClientInventoryItem {
+            client_host,
+            info_hash: InfoHash::new(hash).unwrap(),
+            display_name: DisplayName::new(title).unwrap(),
+            media_type: MediaType::Movie,
+            save_path: PathBuf::from("/downloads"),
+            files: vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from(relative_path),
+                    ByteSize::new(10),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+            ],
+        }
+        .into_scanned()
+        .unwrap()
+    }
+
+    async fn assert_virtual_season(repository: &Repository, title: &str, files: usize) {
+        let seasons = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 10)
+            .await
+            .unwrap();
+        let episodes = repository
+            .local_items_by_media_type(MediaType::Episode, 10)
+            .await
+            .unwrap();
+        let season_titles = seasons
+            .iter()
+            .map(|item| item.title.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let episode_titles = episodes
+            .iter()
+            .map(|item| item.title.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let item = seasons
+            .into_iter()
+            .find(|item| {
+                item.title.as_str() == title
+                    && matches!(item.source, LocalItemSource::Virtual { .. })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing virtual season {title}; saw seasons {season_titles:?}; episodes {episode_titles:?}"
+                )
+            });
+        let item_files = repository
+            .local_files_for_item(item.id.unwrap(), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(files, item_files.len());
     }
 
     async fn persisted_inputs(

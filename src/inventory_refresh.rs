@@ -136,8 +136,11 @@ pub struct InventoryRefreshWorker {
     repository: Repository,
     scan_options: InventoryScanOptions,
     season_from_episodes: f64,
+    run_client_post_refresh_work: bool,
     #[cfg(test)]
     data_root_scan_send_attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    virtual_refresh_attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl InventoryRefreshWorker {
@@ -146,8 +149,11 @@ impl InventoryRefreshWorker {
             repository,
             scan_options,
             season_from_episodes: 1.0,
+            run_client_post_refresh_work: true,
             #[cfg(test)]
             data_root_scan_send_attempts: None,
+            #[cfg(test)]
+            virtual_refresh_attempts: None,
         }
     }
 
@@ -156,12 +162,34 @@ impl InventoryRefreshWorker {
         self
     }
 
+    pub(crate) fn without_client_post_refresh_work(&self) -> Self {
+        Self {
+            repository: self.repository.clone(),
+            scan_options: self.scan_options,
+            season_from_episodes: self.season_from_episodes,
+            run_client_post_refresh_work: false,
+            #[cfg(test)]
+            data_root_scan_send_attempts: self.data_root_scan_send_attempts.clone(),
+            #[cfg(test)]
+            virtual_refresh_attempts: self.virtual_refresh_attempts.clone(),
+        }
+    }
+
     #[cfg(test)]
     fn with_data_root_scan_send_attempts(
         mut self,
         attempts: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         self.data_root_scan_send_attempts = Some(attempts);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_virtual_refresh_attempts(
+        mut self,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.virtual_refresh_attempts = Some(attempts);
         self
     }
 
@@ -296,10 +324,7 @@ impl InventoryRefreshWorker {
             )
             .await?;
         let now_ms = unix_time_ms();
-        self.refresh_virtual_seasons(now_ms).await?;
-        self.repository
-            .wake_announce_client_source_completion(&client_host, now_ms, 1_000)
-            .await?;
+        self.finish_client_refresh(&client_host, now_ms).await?;
 
         Ok(InventoryRefreshSummary {
             scanned_items: items.len(),
@@ -369,10 +394,7 @@ impl InventoryRefreshWorker {
                 })??;
         let LocalInventoryReplaceSummary { upserted, pruned } = replace_result?;
         let now_ms = unix_time_ms();
-        self.refresh_virtual_seasons(now_ms).await?;
-        self.repository
-            .wake_announce_client_source_completion(&client_host, now_ms, 1_000)
-            .await?;
+        self.finish_client_refresh(&client_host, now_ms).await?;
 
         Ok(InventoryRefreshSummary {
             scanned_items,
@@ -380,6 +402,37 @@ impl InventoryRefreshWorker {
             pruned_items: pruned,
             scan_failures: Vec::new(),
         })
+    }
+
+    pub(crate) async fn refresh_virtual_seasons_after_client_batch(
+        &self,
+        client_hosts: &[ClientHost],
+    ) -> Result<(), InventoryRefreshError> {
+        let now_ms = unix_time_ms();
+        self.refresh_virtual_seasons(now_ms).await?;
+        self.repository
+            .wake_announce_inventory_refresh(now_ms, 1_000)
+            .await?;
+        for client_host in client_hosts {
+            self.repository
+                .wake_announce_client_source_completion(client_host, now_ms, 1_000)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_client_refresh(
+        &self,
+        client_host: &ClientHost,
+        now_ms: i64,
+    ) -> Result<(), InventoryRefreshError> {
+        if self.run_client_post_refresh_work {
+            self.refresh_virtual_seasons(now_ms).await?;
+            self.repository
+                .wake_announce_client_source_completion(client_host, now_ms, 1_000)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -406,6 +459,10 @@ struct VirtualSeasonAccumulator {
 
 impl InventoryRefreshWorker {
     async fn refresh_virtual_seasons(&self, now_ms: i64) -> Result<(), InventoryRefreshError> {
+        #[cfg(test)]
+        if let Some(attempts) = &self.virtual_refresh_attempts {
+            attempts.fetch_add(1, Ordering::SeqCst);
+        }
         if !self.season_from_episodes.is_finite() || self.season_from_episodes <= 0.0 {
             self.replace_virtual_inventory(std::iter::empty(), now_ms)
                 .await?;
@@ -1931,6 +1988,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_client_refresh_wakes_matching_waits_after_virtual_refresh() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let batch_worker = worker.without_client_post_refresh_work();
+        let client_host = ClientHost::new("qbit.local").unwrap();
+        insert_waiting_announce(
+            &repository,
+            "ann_client",
+            "guid-client",
+            AnnounceReason::ClientChecking,
+            Some(("client", "qbit.local")),
+        )
+        .await;
+
+        batch_worker
+            .refresh_client_items(
+                client_host.clone(),
+                &[client_item(
+                    client_host.clone(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "First",
+                    "First/file-a.mkv",
+                    10,
+                )],
+            )
+            .await
+            .unwrap();
+        let status_before = announce_status(&repository, "ann_client").await;
+
+        worker
+            .refresh_virtual_seasons_after_client_batch(&[client_host])
+            .await
+            .unwrap();
+        let status_after = announce_status(&repository, "ann_client").await;
+
+        assert_eq!("waiting", status_before);
+        assert_eq!("queued", status_after);
+    }
+
+    #[tokio::test]
     async fn client_inventory_items_materialize_scanned_batches() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
@@ -2409,6 +2507,14 @@ mod tests {
         .execute(repository.pool())
         .await
         .unwrap();
+    }
+
+    async fn announce_status(repository: &Repository, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM announce_work WHERE id = ?")
+            .bind(id)
+            .fetch_one(repository.pool())
+            .await
+            .unwrap()
     }
 
     async fn insert_legacy_client_item(repository: &Repository, source_key: &str, title: &str) {
