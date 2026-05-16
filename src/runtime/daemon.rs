@@ -76,16 +76,35 @@ pub async fn serve_with_listener(
 struct BackgroundTask {
     name: &'static str,
     handle: JoinHandle<()>,
-    abort_on_timeout: bool,
+    shutdown_policy: BackgroundShutdownPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BackgroundShutdownPolicy {
+    AbortOnTimeout,
+    // Use for workers that may own external side effects and must record a
+    // durable outcome instead of being dropped mid-operation.
+    AwaitInFlight,
 }
 
 impl BackgroundTask {
-    fn new(name: &'static str, handle: JoinHandle<()>, abort_on_timeout: bool) -> Self {
+    fn new(
+        name: &'static str,
+        handle: JoinHandle<()>,
+        shutdown_policy: BackgroundShutdownPolicy,
+    ) -> Self {
         Self {
             name,
             handle,
-            abort_on_timeout,
+            shutdown_policy,
         }
+    }
+
+    const fn should_abort_on_timeout(&self) -> bool {
+        matches!(
+            self.shutdown_policy,
+            BackgroundShutdownPolicy::AbortOnTimeout
+        )
     }
 }
 
@@ -114,7 +133,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             inventory_refresh,
             runtime.state.shutdown_signal.clone(),
         )),
-        true,
+        BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "notifications",
@@ -122,7 +141,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             NotificationWorker::new(runtime.state.health.clone(), runtime.state.metrics.clone()),
             notifications,
         )),
-        true,
+        BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "saved-torrent-retry",
@@ -135,7 +154,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             runtime.state.saved_retry_interval,
             runtime.state.shutdown_signal.clone(),
         )),
-        false,
+        BackgroundShutdownPolicy::AwaitInFlight,
     ));
     let client_inventory_interval = runtime_client_inventory_interval(&runtime.state);
     handles.push(BackgroundTask::new(
@@ -145,7 +164,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             client_inventory_interval,
             runtime.state.shutdown_signal.clone(),
         )),
-        true,
+        BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "announcements-receiver",
@@ -153,7 +172,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             announcements,
             runtime.state.shutdown_signal.clone(),
         )),
-        true,
+        BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "searches-receiver",
@@ -161,7 +180,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             searches,
             runtime.state.shutdown_signal.clone(),
         )),
-        true,
+        BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "jobs-receiver",
@@ -169,7 +188,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             jobs,
             runtime.state.shutdown_signal.clone(),
         )),
-        true,
+        BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "scheduler-receiver",
@@ -177,7 +196,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             scheduler,
             runtime.state.shutdown_signal.clone(),
         )),
-        true,
+        BackgroundShutdownPolicy::AbortOnTimeout,
     ));
 
     Ok(handles)
@@ -350,8 +369,9 @@ async fn stop_background_tasks_with_timeout(mut handles: Vec<BackgroundTask>, ti
         }
     }
 
+    let mut await_in_flight = Vec::new();
     for task in handles {
-        if task.abort_on_timeout {
+        if task.should_abort_on_timeout() {
             task.handle.abort();
             warn!(
                 task = task.name,
@@ -369,20 +389,24 @@ async fn stop_background_tasks_with_timeout(mut handles: Vec<BackgroundTask>, ti
                 }
             }
         } else {
-            warn!(
-                task = task.name,
-                "background task did not stop before shutdown timeout; waiting for in-flight work"
-            );
-            match task.handle.await {
-                Ok(()) => {}
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => {
-                    error!(
-                        task = task.name,
-                        error = %error,
-                        "background task failed during shutdown"
-                    );
-                }
+            await_in_flight.push(task);
+        }
+    }
+
+    for task in await_in_flight {
+        warn!(
+            task = task.name,
+            "background task did not stop before shutdown timeout; waiting for in-flight work"
+        );
+        match task.handle.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                error!(
+                    task = task.name,
+                    error = %error,
+                    "background task failed during shutdown"
+                );
             }
         }
     }
@@ -512,14 +536,14 @@ mod tests {
                 tokio::spawn(async {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }),
-                true,
+                BackgroundShutdownPolicy::AbortOnTimeout,
             ),
             BackgroundTask::new(
                 "stuck-b",
                 tokio::spawn(async {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }),
-                true,
+                BackgroundShutdownPolicy::AbortOnTimeout,
             ),
         ];
         let started = tokio::time::Instant::now();
@@ -545,7 +569,7 @@ mod tests {
                 let _cleanup = cleanup;
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }),
-            true,
+            BackgroundShutdownPolicy::AbortOnTimeout,
         )];
 
         stop_background_tasks_with_timeout(handles, Duration::from_millis(10)).await;
@@ -560,13 +584,59 @@ mod tests {
             tokio::spawn(async {
                 tokio::time::sleep(Duration::from_millis(75)).await;
             }),
-            false,
+            BackgroundShutdownPolicy::AwaitInFlight,
         )];
         let started = tokio::time::Instant::now();
 
         stop_background_tasks_with_timeout(handles, Duration::from_millis(10)).await;
 
         assert!(started.elapsed() >= Duration::from_millis(60));
+    }
+
+    #[tokio::test]
+    async fn timeout_aborts_abortable_tasks_before_waiting_in_flight() {
+        let cleaned_up = Arc::new(AtomicUsize::new(0));
+        struct CleanupCounter(Arc<AtomicUsize>, Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for CleanupCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                if let Some(sender) = self.1.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (release_in_flight, wait_in_flight) = tokio::sync::oneshot::channel::<()>();
+        let (abort_seen, abort_seen_receiver) = tokio::sync::oneshot::channel::<()>();
+        let abort_cleanup = CleanupCounter(cleaned_up.clone(), Some(abort_seen));
+        let handles = vec![
+            BackgroundTask::new(
+                "await-first",
+                tokio::spawn(async {
+                    let _ = wait_in_flight.await;
+                }),
+                BackgroundShutdownPolicy::AwaitInFlight,
+            ),
+            BackgroundTask::new(
+                "abort-second",
+                tokio::spawn(async move {
+                    let _abort_cleanup = abort_cleanup;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }),
+                BackgroundShutdownPolicy::AbortOnTimeout,
+            ),
+        ];
+        let shutdown = tokio::spawn(stop_background_tasks_with_timeout(
+            handles,
+            Duration::from_millis(10),
+        ));
+        abort_seen_receiver.await.unwrap();
+        assert_eq!(1, cleaned_up.load(Ordering::SeqCst));
+
+        release_in_flight.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

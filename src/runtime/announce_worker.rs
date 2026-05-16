@@ -527,13 +527,16 @@ impl AnnounceWorker {
     pub async fn run_batch<F, Fut>(
         &self,
         now_ms: i64,
-        mut shutdown: ShutdownSignal,
+        shutdown: ShutdownSignal,
         mut process: F,
     ) -> Result<AnnounceWorkerSummary, AnnounceWorkerError>
     where
-        F: FnMut(AnnounceWorkId) -> Fut,
+        F: FnMut(AnnounceWorkId, ShutdownSignal) -> Fut,
         Fut: Future<Output = AnnounceWorkOutcome>,
     {
+        // The processing future owns side effects for this work item. Once it
+        // starts, keep its lease alive until it records a durable outcome;
+        // dropping it on shutdown can duplicate remote side effects.
         let _span = info_span!(
             "announce.worker_batch",
             lease_owner = %self.config.owner,
@@ -557,7 +560,7 @@ impl AnnounceWorker {
                 continue;
             }
 
-            let processing = process(id.clone());
+            let processing = process(id.clone(), shutdown.clone());
             tokio::pin!(processing);
             let renewal = tokio::time::sleep(self.config.lease_renewal);
             tokio::pin!(renewal);
@@ -579,11 +582,6 @@ impl AnnounceWorker {
                             summary.released += 1;
                             break;
                         }
-                    }
-                    _state = shutdown.cancelled() => {
-                        self.release_for_shutdown(&id, unix_time_ms()).await?;
-                        summary.cancelled += 1;
-                        break;
                     }
                 }
             }
@@ -666,7 +664,7 @@ mod tests {
         let (_controller, signal) = shutdown_channel();
 
         let summary = worker
-            .run_batch(10, signal, |id| async move {
+            .run_batch(10, signal, |id, _shutdown| async move {
                 AnnounceWorkOutcome::Succeeded {
                     reason: AnnounceReason::Saved,
                     outcome: id.as_str().to_owned(),
@@ -855,7 +853,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             first_worker
-                .run_batch(10, signal, |_id| async move {
+                .run_batch(10, signal, |_id, _shutdown| async move {
                     tokio::time::sleep(Duration::from_millis(2_500)).await;
                     AnnounceWorkOutcome::Succeeded {
                         reason: AnnounceReason::Saved,
@@ -919,7 +917,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             first_worker
-                .run_batch(10, signal, move |id| {
+                .run_batch(10, signal, move |id, _shutdown| {
                     let processed = processed_by_first.clone();
                     async move {
                         processed.lock().unwrap().push(id.as_str().to_owned());
@@ -1175,7 +1173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_shutdown_releases_claimed_work() {
+    async fn worker_shutdown_lets_in_flight_work_complete() {
         let repository = Repository::connect_in_memory().await.unwrap();
         insert_work(&repository, "ann_40", "guid-40", 1).await;
         insert_work(&repository, "ann_41", "guid-41", 2).await;
@@ -1183,14 +1181,15 @@ mod tests {
         let (controller, signal) = shutdown_channel();
 
         let summary = worker
-            .run_batch(10, signal, move |_id| {
+            .run_batch(10, signal, move |_id, mut shutdown| {
                 let controller = controller.clone();
                 async move {
                     controller.cancel_now("test shutdown").unwrap();
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    AnnounceWorkOutcome::TerminalFailed {
-                        reason: AnnounceReason::InvalidRequest,
-                        redacted_message: "should not complete".to_owned(),
+                    let state = shutdown.cancelled().await;
+                    assert_eq!(ShutdownPhase::Cancelled, state.phase);
+                    AnnounceWorkOutcome::Succeeded {
+                        reason: AnnounceReason::Saved,
+                        outcome: "saved".to_owned(),
                     }
                 }
             })
@@ -1200,20 +1199,76 @@ mod tests {
         assert_eq!(
             AnnounceWorkerSummary {
                 claimed: 2,
-                completed: 0,
+                completed: 1,
                 released: 0,
-                cancelled: 2
+                cancelled: 1
             },
             summary
         );
         assert_eq!(
             vec![
-                ("queued".to_owned(), "dependency_backoff".to_owned()),
+                ("succeeded".to_owned(), "saved".to_owned()),
                 ("queued".to_owned(), "dependency_backoff".to_owned())
             ],
             status_rows(&repository).await
         );
         assert_eq!(0, leased_count(&repository).await);
+    }
+
+    #[tokio::test]
+    async fn worker_shutdown_keeps_stalled_in_flight_work_leased() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_42", "guid-42", 1).await;
+        let config = AnnounceQueueConfig {
+            claim_batch_size: 1,
+            lease_duration_secs: 2,
+            lease_renewal_secs: 1,
+            ..test_config()
+        };
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        let second_worker = AnnounceWorker::new(repository.clone(), "worker-2", &config).unwrap();
+        let (controller, signal) = shutdown_channel();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+
+        let handle = tokio::spawn(async move {
+            let mut started_sender = Some(started_sender);
+            worker
+                .run_batch(10, signal, move |_id, mut shutdown| {
+                    let controller = controller.clone();
+                    let started_sender = started_sender.take();
+                    async move {
+                        controller.cancel_now("test shutdown").unwrap();
+                        let _state = shutdown.cancelled().await;
+                        if let Some(started_sender) = started_sender {
+                            let _ = started_sender.send(());
+                        }
+                        std::future::pending().await
+                    }
+                })
+                .await
+        });
+
+        started_receiver.await.unwrap();
+        let lease_after_shutdown: i64 =
+            sqlx::query_scalar("SELECT lease_until FROM announce_work WHERE id = 'ann_42'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let lease_after_renewal_intervals: i64 =
+            sqlx::query_scalar("SELECT lease_until FROM announce_work WHERE id = 'ann_42'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let duplicate = second_worker.claim_ready(unix_time_ms()).await.unwrap();
+
+        assert!(
+            lease_after_renewal_intervals > lease_after_shutdown,
+            "active in-flight work must keep its lease until it records an outcome"
+        );
+        assert!(duplicate.is_empty());
+        assert!(!handle.is_finished());
+        handle.abort();
     }
 
     fn test_config() -> AnnounceQueueConfig {
