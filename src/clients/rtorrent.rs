@@ -113,6 +113,43 @@ impl RtorrentClient {
         Ok(total)
     }
 
+    pub async fn list_inventory_chunks_until_shutdown<F, Fut, C, CFut>(
+        &self,
+        mut cancelled: C,
+        mut on_chunk: F,
+    ) -> Result<usize, TorrentClientError>
+    where
+        F: FnMut(Vec<RtorrentDownload>) -> Fut,
+        Fut: Future<Output = Result<(), TorrentClientError>>,
+        C: FnMut() -> CFut,
+        CFut: Future<Output = ()>,
+    {
+        let hashes = tokio::select! {
+            biased;
+            () = cancelled() => return Err(cancelled_error(&self.client_name)),
+            hashes = self.download_hashes() => hashes?,
+        };
+        let mut total = 0usize;
+        for chunk in hashes.chunks(RTORRENT_INVENTORY_CHUNK_SIZE) {
+            let response = tokio::select! {
+                biased;
+                () = cancelled() => return Err(cancelled_error(&self.client_name)),
+                response = self.call("system.multicall", vec![inventory_multicall_param(chunk)]) => response?,
+            };
+            let downloads = parse_inventory_response(&self.client_name, chunk, &response)?;
+            let chunk_len = downloads.len();
+            total = total.saturating_add(chunk_len);
+            if chunk_len > 0 {
+                tokio::select! {
+                    biased;
+                    () = cancelled() => return Err(cancelled_error(&self.client_name)),
+                    result = on_chunk(downloads) => result?,
+                }
+            }
+        }
+        Ok(total)
+    }
+
     pub async fn download_info(
         &self,
         info_hash: &InfoHash,
@@ -147,6 +184,22 @@ impl RtorrentClient {
             )
             .await?;
         parse_files_response(&self.client_name, &response)
+    }
+
+    pub async fn fetch_files_until_shutdown<C, CFut>(
+        &self,
+        info_hash: &InfoHash,
+        mut cancelled: C,
+    ) -> Result<Vec<TorrentFile>, TorrentClientError>
+    where
+        C: FnMut() -> CFut,
+        CFut: Future<Output = ()>,
+    {
+        tokio::select! {
+            biased;
+            () = cancelled() => Err(cancelled_error(&self.client_name)),
+            files = self.fetch_files(info_hash) => files,
+        }
     }
 
     pub async fn fetch_trackers(
@@ -855,6 +908,13 @@ fn unavailable(client: &str, message: String) -> TorrentClientError {
     }
 }
 
+fn cancelled_error(client: &str) -> TorrentClientError {
+    TorrentClientError::Cancelled {
+        client: client.to_owned(),
+        message: "shutdown requested".to_owned(),
+    }
+}
+
 fn bad_response(client: &str, message: impl Into<String>) -> TorrentClientError {
     TorrentClientError::BadResponse {
         client: client.to_owned(),
@@ -1223,6 +1283,42 @@ mod tests {
             vec![RTORRENT_INVENTORY_CHUNK_SIZE, 1],
             *seen_chunks.lock().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn client_inventory_chunks_stop_before_request_on_shutdown() {
+        let requests = Arc::new(StdMutex::new(0usize));
+        let seen_requests = requests.clone();
+        let endpoint = spawn_rtorrent_server(move |_request| {
+            let seen_requests = seen_requests.clone();
+            async move {
+                *seen_requests.lock().unwrap() += 1;
+                (
+                    AxumStatusCode::OK,
+                    xml_response("<array><data></data></array>"),
+                )
+            }
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+        let (shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        shutdown.cancel_now("test shutdown").unwrap();
+
+        let error = client
+            .list_inventory_chunks_until_shutdown(
+                || {
+                    let mut signal = signal.clone();
+                    async move {
+                        let _ = signal.cancelled().await;
+                    }
+                },
+                |_chunk| async { Ok(()) },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TorrentClientError::Cancelled { .. }));
+        assert_eq!(0, *requests.lock().unwrap());
     }
 
     #[tokio::test]

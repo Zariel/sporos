@@ -273,6 +273,10 @@ pub enum TorrentClientError {
     Unauthorized {
         client: String,
     },
+    Cancelled {
+        client: String,
+        message: String,
+    },
     Unavailable {
         client: String,
         retry_after_ms: Option<i64>,
@@ -288,6 +292,7 @@ impl ClassifyFailure for TorrentClientError {
     fn failure_class(&self) -> FailureClass {
         match self {
             Self::BadResponse { .. } => FailureClass::BadRemoteData,
+            Self::Cancelled { .. } => FailureClass::FatalLocal,
             Self::Unavailable { .. } => FailureClass::RetryableDependency,
             Self::ApiChanged { .. }
             | Self::Unauthorized { .. }
@@ -302,6 +307,7 @@ impl TorrentClientError {
             Self::Unavailable { retry_after_ms, .. } => *retry_after_ms,
             Self::ApiChanged { .. }
             | Self::BadResponse { .. }
+            | Self::Cancelled { .. }
             | Self::Unauthorized { .. }
             | Self::UnsupportedCapability { .. } => None,
         }
@@ -325,6 +331,12 @@ impl fmt::Display for TorrentClientError {
             }
             Self::Unauthorized { client } => {
                 write!(formatter, "torrent client `{client}` rejected credentials")
+            }
+            Self::Cancelled { client, message } => {
+                write!(
+                    formatter,
+                    "torrent client `{client}` operation cancelled: {message}"
+                )
             }
             Self::Unavailable {
                 client, message, ..

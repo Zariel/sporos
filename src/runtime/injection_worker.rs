@@ -40,7 +40,7 @@ use crate::matching::{
 use crate::persistence::repository::Repository;
 use crate::persistence::torrent_cache::{TorrentOutputMetadata, parse_torrent_output_filename};
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
-use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
+use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal, shutdown_channel};
 use crate::torrent::parse_metafile;
 
 const MAX_SAVED_TORRENT_BYTES: u64 = 32 * 1024 * 1024;
@@ -62,10 +62,11 @@ pub trait InjectionClient: Send + Sync {
     fn refresh_inventory<'a>(
         &'a self,
         worker: &'a InventoryRefreshWorker,
+        shutdown: ShutdownSignal,
     ) -> ClientInventoryRefreshFuture<'a> {
         Box::pin(async move {
             let descriptor = self.descriptor();
-            let _ = worker;
+            let _ = (worker, shutdown);
             Err(TorrentClientError::UnsupportedCapability {
                 client: descriptor.name.as_str().to_owned(),
                 capability: "refresh inventory".to_owned(),
@@ -272,11 +273,34 @@ impl InjectionWorker {
         &self,
         worker: &InventoryRefreshWorker,
     ) -> Result<Vec<InventoryRefreshSummary>, InventoryRefreshError> {
+        let (_controller, shutdown) = shutdown_channel();
+        self.refresh_client_inventories_until_shutdown(worker, shutdown)
+            .await
+    }
+
+    pub async fn refresh_client_inventories_until_shutdown(
+        &self,
+        worker: &InventoryRefreshWorker,
+        shutdown: ShutdownSignal,
+    ) -> Result<Vec<InventoryRefreshSummary>, InventoryRefreshError> {
         let mut summaries = Vec::with_capacity(self.clients.len());
         let mut last_error = None;
         for client in &self.clients {
-            match client.refresh_inventory(worker).await {
+            if shutdown.state().phase != ShutdownPhase::Running {
+                return Err(InventoryRefreshError::Client {
+                    source: TorrentClientError::Cancelled {
+                        client: client.descriptor().name.as_str().to_owned(),
+                        message: "shutdown requested".to_owned(),
+                    },
+                });
+            }
+            match client.refresh_inventory(worker, shutdown.clone()).await {
                 Ok(summary) => summaries.push(summary),
+                Err(
+                    error @ InventoryRefreshError::Client {
+                        source: TorrentClientError::Cancelled { .. },
+                    },
+                ) => return Err(error),
                 Err(error) => {
                     warn!(
                         client = %client.descriptor().name,
@@ -2439,6 +2463,7 @@ mod tests {
         fn refresh_inventory<'a>(
             &'a self,
             _worker: &'a InventoryRefreshWorker,
+            _shutdown: ShutdownSignal,
         ) -> ClientInventoryRefreshFuture<'a> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let summary = self.summary.clone();

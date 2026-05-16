@@ -138,6 +138,42 @@ impl QbittorrentClient {
         Ok(total)
     }
 
+    pub async fn list_inventory_pages_until_shutdown<F, Fut, C, CFut>(
+        &self,
+        mut cancelled: C,
+        mut on_page: F,
+    ) -> Result<usize, TorrentClientError>
+    where
+        F: FnMut(Vec<QbitTorrent>) -> Fut,
+        Fut: Future<Output = Result<(), TorrentClientError>>,
+        C: FnMut() -> CFut,
+        CFut: Future<Output = ()>,
+    {
+        let mut total = 0usize;
+        let mut offset = 0usize;
+        loop {
+            let page = tokio::select! {
+                biased;
+                () = cancelled() => return Err(cancelled_error(&self.client_name)),
+                page = self.inventory_page(offset) => page?,
+            };
+            let page_len = page.len();
+            total = total.saturating_add(page_len);
+            if page_len > 0 {
+                tokio::select! {
+                    biased;
+                    () = cancelled() => return Err(cancelled_error(&self.client_name)),
+                    result = on_page(page) => result?,
+                }
+            }
+            if page_len < QBIT_INVENTORY_PAGE_SIZE {
+                break;
+            }
+            offset = offset.saturating_add(QBIT_INVENTORY_PAGE_SIZE);
+        }
+        Ok(total)
+    }
+
     pub async fn torrent_info(
         &self,
         info_hash: &InfoHash,
@@ -203,6 +239,22 @@ impl QbittorrentClient {
                 })
             })
             .collect()
+    }
+
+    pub async fn fetch_files_until_shutdown<C, CFut>(
+        &self,
+        info_hash: &InfoHash,
+        mut cancelled: C,
+    ) -> Result<Vec<TorrentFile>, TorrentClientError>
+    where
+        C: FnMut() -> CFut,
+        CFut: Future<Output = ()>,
+    {
+        tokio::select! {
+            biased;
+            () = cancelled() => Err(cancelled_error(&self.client_name)),
+            files = self.fetch_files(info_hash) => files,
+        }
     }
 
     pub async fn fetch_trackers(
@@ -669,6 +721,13 @@ fn unavailable(client: &str, message: String) -> TorrentClientError {
     }
 }
 
+fn cancelled_error(client: &str) -> TorrentClientError {
+    TorrentClientError::Cancelled {
+        client: client.to_owned(),
+        message: "shutdown requested".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -1072,6 +1131,39 @@ mod tests {
             ],
             *seen_queries.lock().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn client_inventory_pages_stop_before_request_on_shutdown() {
+        let requests = Arc::new(StdMutex::new(0usize));
+        let seen_requests = requests.clone();
+        let endpoint = spawn_qbit_server(move |_request| {
+            let seen_requests = seen_requests.clone();
+            async move {
+                *seen_requests.lock().unwrap() += 1;
+                (AxumStatusCode::OK, "[]").into_response()
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+        let (shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        shutdown.cancel_now("test shutdown").unwrap();
+
+        let error = client
+            .list_inventory_pages_until_shutdown(
+                || {
+                    let mut signal = signal.clone();
+                    async move {
+                        let _ = signal.cancelled().await;
+                    }
+                },
+                |_page| async { Ok(()) },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TorrentClientError::Cancelled { .. }));
+        assert_eq!(0, *requests.lock().unwrap());
     }
 
     fn response_with_cookie(
