@@ -352,7 +352,11 @@ impl InjectionWorker {
             .ok_or(InjectionWorkerError::NoWritableClient)?;
         let target_name = dependency_name(target.descriptor())?;
         let existing = self
-            .find_existing_client(request.metafile.info_hash(), target.descriptor())
+            .find_existing_client(
+                request.metafile.info_hash(),
+                target.descriptor(),
+                request.assessed_at_ms,
+            )
             .await?;
         if let Some(existing_client) = existing {
             self.record_client_health(
@@ -415,19 +419,21 @@ impl InjectionWorker {
             let _guard = self.mutation_lock.lock().await;
             if should_stop() {
                 InjectionMutationResult::SavedForShutdown
-            } else if target.has_torrent(request.metafile.info_hash()).await? {
-                InjectionMutationResult::AlreadyExists
             } else {
-                InjectionMutationResult::Injected(
-                    target
-                        .inject(ClientInjectionRequest {
-                            info_hash: request.metafile.info_hash(),
-                            torrent_bytes: &request.torrent_bytes,
-                            save_path: save_path.as_deref(),
-                            pause_for_recheck,
-                        })
-                        .await,
-                )
+                match target.has_torrent(request.metafile.info_hash()).await {
+                    Ok(true) => InjectionMutationResult::AlreadyExists,
+                    Ok(false) => InjectionMutationResult::Injected(
+                        target
+                            .inject(ClientInjectionRequest {
+                                info_hash: request.metafile.info_hash(),
+                                torrent_bytes: &request.torrent_bytes,
+                                save_path: save_path.as_deref(),
+                                pause_for_recheck,
+                            })
+                            .await,
+                    ),
+                    Err(error) => InjectionMutationResult::PrecheckFailed(error),
+                }
             }
         };
 
@@ -492,6 +498,17 @@ impl InjectionWorker {
                     saved_for_retry: true,
                     linked_files,
                 })
+            }
+            InjectionMutationResult::PrecheckFailed(error) => {
+                let _ = cleanup_created_roots(&created_roots);
+                self.record_client_health(
+                    target.descriptor(),
+                    false,
+                    Some(&error),
+                    request.assessed_at_ms,
+                )
+                .await?;
+                Err(error.into())
             }
         }
     }
@@ -717,13 +734,25 @@ impl InjectionWorker {
         &self,
         info_hash: &InfoHash,
         target: &TorrentClientDescriptor,
+        checked_at_ms: i64,
     ) -> Result<Option<Arc<dyn InjectionClient>>, InjectionWorkerError> {
         for client in &self.clients {
             if client.descriptor().host == target.host {
                 continue;
             }
-            if client.has_torrent(info_hash).await? {
-                return Ok(Some(Arc::clone(client)));
+            match client.has_torrent(info_hash).await {
+                Ok(true) => return Ok(Some(Arc::clone(client))),
+                Ok(false) => {}
+                Err(error) => {
+                    self.record_client_health(
+                        client.descriptor(),
+                        false,
+                        Some(&error),
+                        checked_at_ms,
+                    )
+                    .await?;
+                    return Err(error.into());
+                }
             }
         }
         Ok(None)
@@ -1257,6 +1286,7 @@ enum InjectionMutationResult {
     SavedForShutdown,
     AlreadyExists,
     Injected(Result<(), TorrentClientError>),
+    PrecheckFailed(TorrentClientError),
 }
 
 pub fn injection_queue(
@@ -1433,6 +1463,30 @@ mod tests {
         assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
         assert_eq!(1, existing.has_calls.load(Ordering::SeqCst));
         assert_eq!("healthy", health[0].state);
+    }
+
+    #[tokio::test]
+    async fn worker_records_client_health_when_has_torrent_fails() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-has-error");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")).with_has_errors(1));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let worker = InjectionWorker::new(
+            repository.clone(),
+            vec![target.clone() as Arc<dyn InjectionClient>],
+        );
+
+        let error = worker
+            .process(request(local, candidate, candidate_id, &root))
+            .await
+            .unwrap_err();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert!(matches!(error, InjectionWorkerError::Client(_)));
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!("degraded", health[0].state);
+        assert_eq!(Some(1_000), health[0].retry_after_ms);
     }
 
     #[tokio::test]

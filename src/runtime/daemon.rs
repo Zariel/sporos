@@ -13,12 +13,15 @@ use crate::announce::{AnnounceReason, AnnounceWorkId};
 use crate::config::{SporosConfig, validate_server_auth};
 use crate::content_filter::ContentFilterContext;
 use crate::domain::{
-    CandidateAssessment, CandidateGuid, DownloadUrl, IndexerId, InfoHash, InjectionOutcome,
-    ItemTitle, JobName, MatchDecision, RemoteCandidate, RemoteCandidateId, TrackerName,
+    CandidateAssessment, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash,
+    InjectionOutcome, ItemTitle, JobName, MatchDecision, ReasonText, RemoteCandidate,
+    RemoteCandidateId, TrackerName,
 };
 use crate::errors::{ConfigError, DatabaseError};
 use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
-use crate::indexers::{CachedCandidateTorrent, CandidateDownloadClient, CandidateDownloadError};
+use crate::indexers::{
+    CachedCandidateTorrent, CandidateDownloadClient, CandidateDownloadError, IndexerBackoffPolicy,
+};
 use crate::inventory_refresh::run_inventory_refresh_worker;
 use crate::matching::{
     PersistedCandidateAssessment, ReverseLookupConfig, ReverseLookupError, ReverseLookupOutcome,
@@ -34,6 +37,7 @@ use crate::runtime::announce_worker::{
     classify_injection_result, classify_reverse_lookup_outcome, unix_time_ms,
 };
 use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
+use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
     InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
@@ -525,6 +529,14 @@ async fn process_search_candidate(
                                 candidate_download_metric_outcome(&error),
                                 elapsed_ms(started),
                             );
+                            record_candidate_download_failure(
+                                &state,
+                                &candidate,
+                                &error,
+                                now_ms,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
                             return Err(error.to_string());
                         }
                     }
@@ -770,6 +782,106 @@ fn candidate_download_metric_outcome(error: &CandidateDownloadError) -> External
         | CandidateDownloadError::InvalidContents { .. }
         | CandidateDownloadError::ResponseTooLarge { .. }
         | CandidateDownloadError::CacheWrite { .. } => ExternalOutcome::Failed,
+    }
+}
+
+async fn record_candidate_download_failure(
+    state: &AppState,
+    candidate: &RemoteCandidate,
+    error: &CandidateDownloadError,
+    now_ms: i64,
+) -> Result<(), DatabaseError> {
+    if !candidate_download_is_dependency_failure(error) {
+        return Ok(());
+    }
+    let name = DependencyName::new(candidate.tracker.as_str()).map_err(|error| {
+        DatabaseError::QueryFailed {
+            operation: "build candidate download dependency name".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let reason =
+        ReasonText::new(error.to_string()).map_err(|error| DatabaseError::QueryFailed {
+            operation: "build candidate download health reason".to_owned(),
+            message: error.to_string(),
+        })?;
+    let failure_count = state
+        .repository
+        .dependency_failure_count("indexer", &name)
+        .await?;
+    let retry_after_ms = candidate_download_retry_after(error, now_ms, failure_count);
+    if candidate_download_error_is_unavailable(error) {
+        state.health.set_unavailable(
+            DependencyKind::Indexer,
+            name.clone(),
+            reason.clone(),
+            Some(retry_after_ms),
+        );
+    } else {
+        state.health.set_degraded(
+            DependencyKind::Indexer,
+            name.clone(),
+            reason.clone(),
+            Some(retry_after_ms),
+        );
+    }
+    state
+        .repository
+        .record_indexer_request_backoff(
+            &name,
+            &reason,
+            retry_after_ms,
+            now_ms,
+            candidate_download_error_is_unavailable(error),
+        )
+        .await
+}
+
+fn candidate_download_is_dependency_failure(error: &CandidateDownloadError) -> bool {
+    match error {
+        CandidateDownloadError::RateLimited { .. }
+        | CandidateDownloadError::Timeout
+        | CandidateDownloadError::Request { .. }
+        | CandidateDownloadError::ResponseTooLarge { .. } => true,
+        CandidateDownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+        CandidateDownloadError::MagnetLink
+        | CandidateDownloadError::InvalidContents { .. }
+        | CandidateDownloadError::CacheWrite { .. } => false,
+    }
+}
+
+fn candidate_download_retry_after(
+    error: &CandidateDownloadError,
+    now_ms: i64,
+    consecutive_failures: u16,
+) -> i64 {
+    let policy = IndexerBackoffPolicy::default();
+    match error {
+        CandidateDownloadError::RateLimited { retry_after }
+        | CandidateDownloadError::HttpStatus { retry_after, .. } => {
+            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after)
+        }
+        CandidateDownloadError::MagnetLink
+        | CandidateDownloadError::Timeout
+        | CandidateDownloadError::Request { .. }
+        | CandidateDownloadError::InvalidContents { .. }
+        | CandidateDownloadError::ResponseTooLarge { .. }
+        | CandidateDownloadError::CacheWrite { .. } => {
+            policy.retry_after_deadline(now_ms, consecutive_failures, None)
+        }
+    }
+}
+
+fn candidate_download_error_is_unavailable(error: &CandidateDownloadError) -> bool {
+    match error {
+        CandidateDownloadError::RateLimited { .. } => false,
+        CandidateDownloadError::HttpStatus { status, .. } => *status >= 500,
+        CandidateDownloadError::Timeout
+        | CandidateDownloadError::Request { .. }
+        | CandidateDownloadError::ResponseTooLarge { .. } => true,
+        CandidateDownloadError::MagnetLink
+        | CandidateDownloadError::InvalidContents { .. }
+        | CandidateDownloadError::CacheWrite { .. } => false,
     }
 }
 
@@ -1121,6 +1233,12 @@ async fn process_announce_work(
                         candidate_download_metric_outcome(&error),
                         elapsed_ms(started),
                     );
+                    if let Err(error) =
+                        record_candidate_download_failure(&state, &candidate.candidate, &error, now_ms)
+                            .await
+                    {
+                        return retryable_database_outcome(error, now_ms);
+                    }
                     return classify_candidate_download_error(error, now_ms);
                 }
             }
@@ -1768,7 +1886,10 @@ mod tests {
     use crate::persistence::repository::Repository;
     use crate::secrets::ApiKey;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode, header::SET_COOKIE};
+    use axum::http::{
+        Request, StatusCode,
+        header::{CONTENT_LENGTH, SET_COOKIE},
+    };
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use serde_json::Value;
@@ -2071,6 +2192,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_tasks_record_oversized_indexer_health_and_metrics() {
+        let root = unique_temp_dir("daemon-search-oversized-indexer");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let indexer_url = spawn_daemon_torznab_oversized_server().await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut item = local_item(&root);
+        item.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&item, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(
+                &DependencyName::new("main").unwrap(),
+                &daemon_movie_caps(),
+                unix_time_ms(),
+            )
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+        let search_queue = runtime.state.queues.workflow.searches.clone();
+        let metrics = runtime.state.metrics.clone();
+        let app = router(runtime.state.http.clone());
+        let handles = start_background_tasks(runtime).await.unwrap();
+
+        let accepted = app
+            .oneshot(json_post(
+                "/v1/searches",
+                serde_json::json!({ "query": "movie.mkv" }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::ACCEPTED, accepted.status());
+        wait_for_queue_completed(&search_queue, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        let metrics = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(metrics.contains("sporos_search_attempts_total{outcome=\"failed\"} 1"));
+        assert!(
+            metrics.contains(
+                "sporos_indexer_requests_total{operation=\"search\",outcome=\"failed\"} 1"
+            )
+        );
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        let entry = health
+            .iter()
+            .find(|entry| entry.dependency_name.as_str() == "main")
+            .unwrap();
+        assert_eq!("unavailable", entry.state);
+        assert!(entry.reason.as_deref().unwrap().contains("exceeded"));
+    }
+
+    #[tokio::test]
     async fn search_planning_stops_on_shutdown() {
         let search_requests = Arc::new(AtomicUsize::new(0));
         let indexer_url =
@@ -2258,6 +2447,60 @@ mod tests {
         assert!(metrics.contains(
             "sporos_indexer_requests_total{operation=\"download\",outcome=\"rate_limited\"} 1"
         ));
+    }
+
+    #[tokio::test]
+    async fn announce_candidate_download_records_oversized_health_and_metrics() {
+        let root = unique_temp_dir("daemon-announce-oversized");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let download_url = spawn_daemon_torrent_oversized_server().await;
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        let id = AnnounceWorkId::new("ann_oversized").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-oversized",
+            "tracker.example",
+            &download_url,
+        )
+        .await;
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let metrics = state.metrics.clone();
+
+        let result = process_announce_work(state.clone(), id, state.shutdown_signal.clone()).await;
+
+        assert!(matches!(result, AnnounceWorkOutcome::TerminalFailed { .. }));
+        let metrics = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(metrics.contains(
+            "sporos_indexer_requests_total{operation=\"download\",outcome=\"failed\"} 1"
+        ));
+        let runtime_health = state.health.snapshot();
+        assert!(
+            runtime_health
+                .summaries
+                .get(&DependencyKind::Indexer)
+                .is_some_and(|summary| {
+                    *summary == crate::runtime::health::DependencySummary::Unavailable
+                })
+        );
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        let entry = health
+            .iter()
+            .find(|entry| entry.dependency_name.as_str() == "tracker.example")
+            .unwrap();
+        assert_eq!("unavailable", entry.state);
+        assert!(entry.reason.as_deref().unwrap().contains("exceeded"));
     }
 
     #[tokio::test]
@@ -3088,6 +3331,19 @@ mod tests {
         format!("http://{address}/download")
     }
 
+    async fn spawn_daemon_torrent_oversized_server() -> String {
+        let app = axum::Router::new().route(
+            "/download",
+            get(|| async { oversized_response(33 * 1024 * 1024) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/download")
+    }
+
     async fn spawn_daemon_stalled_torrent_download_server(requests: Arc<AtomicUsize>) -> String {
         let app = axum::Router::new().route(
             "/download",
@@ -3183,6 +3439,27 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}/api")
+    }
+
+    async fn spawn_daemon_torznab_oversized_server() -> String {
+        let app = axum::Router::new().route(
+            "/api",
+            get(|| async { oversized_response(9 * 1024 * 1024) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    fn oversized_response(length: u64) -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, length.to_string())
+            .body(Body::from(vec![b'a'; length as usize]))
+            .unwrap()
     }
 
     async fn spawn_daemon_torznab_search_server_with_stalled_download(
