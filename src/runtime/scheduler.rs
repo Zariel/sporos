@@ -316,6 +316,27 @@ impl PersistedScheduler {
         Ok(())
     }
 
+    pub async fn complete_shutdown(
+        &self,
+        job_name: &JobName,
+        finished_at_ms: i64,
+    ) -> Result<(), SchedulerError> {
+        self.job(job_name)?;
+        self.repository
+            .record_job_status(
+                job_name,
+                JobStateUpdate {
+                    state: JobState::Waiting,
+                    last_started_at_ms: None,
+                    last_finished_at_ms: Some(finished_at_ms),
+                    next_run_at_ms: Some(finished_at_ms),
+                    last_error: Some("scheduler shutting down"),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     fn job(&self, job_name: &JobName) -> Result<&ScheduledJob, SchedulerError> {
         self.jobs
             .get(job_name)

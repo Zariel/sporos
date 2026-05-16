@@ -43,6 +43,7 @@ const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const ANNOUNCE_IDLE_SLEEP: Duration = Duration::from_millis(500);
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
+const SCHEDULER_SHUTDOWN_ERROR: &str = "scheduler is shutting down";
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -377,10 +378,15 @@ async fn process_search_workflow(
     }
 
     let now_ms = unix_time_ms();
-    let planned = state
-        .plan_search_workflow(request, now_ms)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut planning_shutdown = shutdown.clone();
+    let planned = tokio::select! {
+        _state = planning_shutdown.cancelled() => {
+            return Err("search workflow is shutting down".to_owned());
+        }
+        result = state.plan_search_workflow(request, now_ms) => {
+            result.map_err(|error| error.to_string())?
+        }
+    };
     let mut summary = SearchWorkflowExecutionSummary {
         planned_indexers: planned.plans.len(),
         failed_indexers: planned.failed_indexers,
@@ -395,6 +401,9 @@ async fn process_search_workflow(
         match process_search_candidate(state.clone(), candidate, now_ms, shutdown.clone()).await {
             Ok(outcome) => summary.record(outcome),
             Err(error) => {
+                if shutdown.state().phase != ShutdownPhase::Running {
+                    return Err("search workflow is shutting down".to_owned());
+                }
                 summary.failed += 1;
                 warn!(error = %error, "search candidate processing failed");
             }
@@ -463,10 +472,19 @@ async fn process_search_candidate(
                 return Err("search workflow is shutting down".to_owned());
             }
             let downloader = CandidateDownloadClient::new(Duration::from_secs(120));
-            let cached = downloader
-                .download_and_cache(&candidate, &state.config.paths.torrent_cache_dir, None)
-                .await
-                .map_err(|error| error.to_string())?;
+            let mut download_shutdown = shutdown.clone();
+            let cached = tokio::select! {
+                _state = download_shutdown.cancelled() => {
+                    return Err("search workflow is shutting down".to_owned());
+                }
+                result = downloader.download_and_cache(
+                    &candidate,
+                    &state.config.paths.torrent_cache_dir,
+                    None,
+                ) => {
+                    result.map_err(|error| error.to_string())?
+                }
+            };
             let torrent_bytes = read_cached_torrent(&cached.cache_path).await?;
             process_downloaded_search_candidate(state, cached, torrent_bytes, now_ms, shutdown)
                 .await
@@ -727,7 +745,7 @@ async fn release_queued_scheduler_runs(
         let now_ms = unix_time_ms();
         if let Err(error) = state
             .scheduler
-            .complete_failure(&run.job_name, now_ms, "scheduler shutting down")
+            .complete_shutdown(&run.job_name, now_ms)
             .await
         {
             warn!(
@@ -747,7 +765,7 @@ async fn process_scheduled_job_run(
 ) {
     let started = Instant::now();
     let job_name = run.job_name.clone();
-    let result = execute_scheduled_job(state, &job_name, shutdown).await;
+    let result = execute_scheduled_job(state, &job_name, shutdown.clone()).await;
     let finished_at_ms = unix_time_ms();
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
@@ -772,6 +790,27 @@ async fn process_scheduled_job_run(
             );
         }
         Err(error) => {
+            if error == SCHEDULER_SHUTDOWN_ERROR && shutdown.state().phase != ShutdownPhase::Running
+            {
+                if let Err(status_error) = state
+                    .scheduler
+                    .complete_shutdown(&job_name, finished_at_ms)
+                    .await
+                {
+                    warn!(
+                        job_name = %job_name,
+                        error = %status_error,
+                        "scheduled job shutdown status update failed"
+                    );
+                }
+                state.metrics.record_job_duration(
+                    job_name.as_str(),
+                    ExternalOutcome::Failed,
+                    duration_ms,
+                );
+                warn!(job_name = %job_name, error = %error, "scheduled job stopped for shutdown");
+                return;
+            }
             if let Err(status_error) = state
                 .scheduler
                 .complete_failure(&job_name, finished_at_ms, &error)
@@ -796,18 +835,22 @@ async fn process_scheduled_job_run(
 async fn execute_scheduled_job(
     state: &AppState,
     job_name: &JobName,
-    shutdown: ShutdownSignal,
+    mut shutdown: ShutdownSignal,
 ) -> Result<(), String> {
     if shutdown.state().phase != ShutdownPhase::Running {
-        return Err("scheduler is shutting down".to_owned());
+        return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
     }
 
     match job_name.as_str() {
         "indexer_caps" => {
-            let summary = state
-                .refresh_indexer_capabilities(unix_time_ms())
-                .await
-                .map_err(|error| error.to_string())?;
+            let summary = tokio::select! {
+                _state = shutdown.cancelled() => {
+                    return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
+                }
+                result = state.refresh_indexer_capabilities(unix_time_ms()) => {
+                    result.map_err(|error| error.to_string())?
+                }
+            };
             if summary.refreshed > 0 && summary.failed == 0 {
                 Ok(())
             } else if summary.failed == 0 && summary.skipped_backoff > 0 {
@@ -1543,7 +1586,7 @@ impl std::error::Error for DaemonError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::future::Future;
+    use std::future::{Future, pending};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1791,6 +1834,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_planning_stops_on_shutdown() {
+        let search_requests = Arc::new(AtomicUsize::new(0));
+        let indexer_url =
+            spawn_daemon_stalled_torznab_search_server(Arc::clone(&search_requests)).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(
+                &DependencyName::new("main").unwrap(),
+                &daemon_movie_caps(),
+                unix_time_ms(),
+            )
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let shutdown = state.shutdown.clone();
+        let signal = state.shutdown_signal.clone();
+
+        let handle = tokio::spawn(process_search_workflow(
+            state,
+            SearchWorkflowRequest {
+                query: ItemTitle::new("movie.mkv").unwrap(),
+            },
+            signal,
+        ));
+        wait_for_atomic_count(&search_requests, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(Err("search workflow is shutting down".to_owned()), result);
+    }
+
+    #[tokio::test]
+    async fn search_candidate_download_stops_on_shutdown() {
+        let root = unique_temp_dir("daemon-search-shutdown");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let download_requests = Arc::new(AtomicUsize::new(0));
+        let indexer_url = spawn_daemon_torznab_search_server_with_stalled_download(Arc::clone(
+            &download_requests,
+        ))
+        .await;
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut item = local_item(&root);
+        item.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&item, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(
+                &DependencyName::new("main").unwrap(),
+                &daemon_movie_caps(),
+                unix_time_ms(),
+            )
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let shutdown = state.shutdown.clone();
+        let signal = state.shutdown_signal.clone();
+
+        let handle = tokio::spawn(process_search_workflow(
+            state,
+            SearchWorkflowRequest {
+                query: ItemTitle::new("movie.mkv").unwrap(),
+            },
+            signal,
+        ));
+        wait_for_atomic_count(&download_requests, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(Err("search workflow is shutting down".to_owned()), result);
+    }
+
+    #[tokio::test]
     async fn background_search_workflow_uses_cached_candidate_without_redownloading() {
         let root = unique_temp_dir("daemon-search-cached");
         let output_dir = root.join("output");
@@ -1944,6 +2096,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_indexer_caps_stops_on_shutdown() {
+        let caps_requests = Arc::new(AtomicUsize::new(0));
+        let indexer_url =
+            spawn_daemon_stalled_torznab_caps_server(Arc::clone(&caps_requests)).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let shutdown = state.shutdown.clone();
+        let signal = state.shutdown_signal.clone();
+
+        let handle = tokio::spawn(async move {
+            let job_name = JobName::new("indexer_caps").unwrap();
+            execute_scheduled_job(&state, &job_name, signal).await
+        });
+        wait_for_atomic_count(&caps_requests, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(Err("scheduler is shutting down".to_owned()), result);
+    }
+
+    #[tokio::test]
+    async fn scheduled_indexer_caps_shutdown_persists_waiting() {
+        let caps_requests = Arc::new(AtomicUsize::new(0));
+        let indexer_url =
+            spawn_daemon_stalled_torznab_caps_server(Arc::clone(&caps_requests)).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let shutdown = state.shutdown.clone();
+        let signal = state.shutdown_signal.clone();
+        let job_name = JobName::new("indexer_caps").unwrap();
+        repository
+            .claim_immediate_job_run(&job_name, unix_time_ms())
+            .await
+            .unwrap();
+
+        let handle = tokio::spawn(async move {
+            process_scheduled_job_run(
+                &state,
+                ScheduledJobRun {
+                    job_name,
+                    scheduled_at_ms: unix_time_ms(),
+                },
+                signal,
+            )
+            .await;
+        });
+        wait_for_atomic_count(&caps_requests, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let indexer_caps = jobs
+            .iter()
+            .find(|job| job.name.as_str() == "indexer_caps")
+            .unwrap();
+
+        assert_eq!("waiting", indexer_caps.state);
+        assert_eq!(
+            Some("scheduler shutting down".to_owned()),
+            indexer_caps.last_error
+        );
+        assert!(indexer_caps.next_run_at_ms.is_some());
+    }
+
+    #[tokio::test]
     async fn background_scheduler_tick_refreshes_prowlarr_import_caps() {
         let catalog_requests = Arc::new(AtomicUsize::new(0));
         let caps_requests = Arc::new(AtomicUsize::new(0));
@@ -2032,9 +2280,6 @@ mod tests {
 
         assert_eq!(StatusCode::ACCEPTED, accepted.status());
         wait_for_job_state(&repository, "indexer_caps", "failed").await;
-        shutdown.cancel_now("test shutdown").unwrap();
-        stop_background_tasks(handles).await;
-
         let jobs = repository.job_status_snapshot(10).await.unwrap();
         let indexer_caps = jobs
             .iter()
@@ -2049,6 +2294,8 @@ mod tests {
             "unexpected last_error: {:?}",
             indexer_caps.last_error
         );
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
         assert_eq!(0, caps_requests.load(Ordering::SeqCst));
     }
 
@@ -2081,7 +2328,7 @@ mod tests {
             .iter()
             .find(|job| job.name.as_str() == "indexer_caps")
             .unwrap();
-        assert_eq!("failed", indexer_caps.state);
+        assert_eq!("waiting", indexer_caps.state);
         assert!(
             matches!(
                 indexer_caps.last_error.as_deref(),
@@ -2398,6 +2645,16 @@ mod tests {
         assert_eq!(Some(expected), status.as_deref());
     }
 
+    async fn wait_for_atomic_count(counter: &AtomicUsize, expected: usize) {
+        for _attempt in 0..50 {
+            if counter.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(expected, counter.load(Ordering::SeqCst));
+    }
+
     async fn wait_for_queue_completed<T>(
         queue: &crate::runtime::queue::BoundedWorkQueue<T>,
         expected: u64,
@@ -2510,6 +2767,64 @@ mod tests {
         format!("http://{address}/api")
     }
 
+    async fn spawn_daemon_stalled_torznab_search_server(requests: Arc<AtomicUsize>) -> String {
+        let app = axum::Router::new().route(
+            "/api",
+            get(move || {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    pending::<Response>().await
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    async fn spawn_daemon_torznab_search_server_with_stalled_download(
+        download_requests: Arc<AtomicUsize>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let download_url = format!("http://{address}/download");
+        let app = axum::Router::new()
+            .route(
+                "/api",
+                get(move || {
+                    let download_url = download_url.clone();
+                    async move {
+                        (
+                            StatusCode::OK,
+                            search_rss_with_download(
+                                "candidate-search",
+                                "movie.mkv",
+                                &download_url,
+                            ),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/download",
+                get(move || {
+                    let download_requests = Arc::clone(&download_requests);
+                    async move {
+                        download_requests.fetch_add(1, Ordering::SeqCst);
+                        pending::<Response>().await
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
     async fn spawn_daemon_torznab_caps_server(requests: Arc<AtomicUsize>) -> String {
         let app = axum::Router::new().route(
             "/api",
@@ -2518,6 +2833,25 @@ mod tests {
                 async move {
                     requests.fetch_add(1, Ordering::SeqCst);
                     (StatusCode::OK, torznab_caps_xml())
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    async fn spawn_daemon_stalled_torznab_caps_server(requests: Arc<AtomicUsize>) -> String {
+        let app = axum::Router::new().route(
+            "/api",
+            get(move || {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    pending::<Response>().await
                 }
             }),
         );
