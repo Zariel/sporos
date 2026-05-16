@@ -25,7 +25,6 @@ impl SchedulerConfig {
         Ok(Self {
             jobs: vec![
                 ScheduledJob::new("rss", &config.rss_interval)?,
-                ScheduledJob::new("search", &config.search_interval)?,
                 ScheduledJob::new("indexer_caps", &config.indexer_caps_interval)?,
                 ScheduledJob::new("cleanup", &config.cleanup_interval)?,
             ],
@@ -590,13 +589,13 @@ mod tests {
     fn scheduler_parses_config_intervals() {
         let config = SchedulerConfig::from_scheduling_config(&SchedulingConfig::default()).unwrap();
 
-        assert_eq!(4, config.jobs.len());
+        assert_eq!(3, config.jobs.len());
         assert_eq!(1_800_000, config.jobs[0].interval_ms);
         assert!(
             config
                 .jobs
                 .iter()
-                .all(|job| job.name.as_str() != "saved_retry")
+                .all(|job| !matches!(job.name.as_str(), "search" | "saved_retry"))
         );
         ScheduledJob::new("bad", "0s").unwrap_err();
         ScheduledJob::new("bad", "1w").unwrap_err();

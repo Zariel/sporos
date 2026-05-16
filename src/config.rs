@@ -242,7 +242,7 @@ impl Default for InventoryConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulingConfig {
     pub rss_interval: String,
-    pub search_interval: String,
+    pub client_inventory_interval: String,
     pub indexer_caps_interval: String,
     pub saved_retry_interval: String,
     pub cleanup_interval: String,
@@ -252,7 +252,7 @@ impl Default for SchedulingConfig {
     fn default() -> Self {
         Self {
             rss_interval: "30m".to_owned(),
-            search_interval: "24h".to_owned(),
+            client_inventory_interval: "24h".to_owned(),
             indexer_caps_interval: "24h".to_owned(),
             saved_retry_interval: "30m".to_owned(),
             cleanup_interval: "24h".to_owned(),
@@ -1191,7 +1191,7 @@ media_scan_max_depth = 3
 
 [scheduling]
 rss_interval = "30m"
-search_interval = "24h"
+client_inventory_interval = "24h"
 indexer_caps_interval = "24h"
 saved_retry_interval = "30m"
 cleanup_interval = "24h"
@@ -1272,6 +1272,20 @@ mod tests {
 
         assert!(error.to_string().contains("unknown field"));
         assert!(error.to_string().contains("base_dir"));
+    }
+
+    #[test]
+    fn rejects_unsupported_scheduled_search_interval() {
+        let error = parse_config(
+            r#"
+            [scheduling]
+            search_interval = "24h"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("search_interval"));
     }
 
     #[test]

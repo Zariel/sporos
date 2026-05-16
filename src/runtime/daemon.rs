@@ -1106,7 +1106,7 @@ async fn execute_scheduled_job(
                     .unwrap_or_else(|| "indexer caps refresh failed".to_owned()))
             }
         }
-        "rss" | "search" | "cleanup" => Err(format!(
+        "rss" | "cleanup" => Err(format!(
             "scheduled job {} does not have an executor yet",
             job_name.as_str()
         )),
@@ -1589,7 +1589,7 @@ fn domain_database_error(error: crate::domain::DomainError) -> DatabaseError {
 
 fn runtime_client_inventory_interval(state: &AppState) -> Duration {
     let interval_ms =
-        parse_interval_ms(&state.config.scheduling.search_interval).unwrap_or(86_400_000);
+        parse_interval_ms(&state.config.scheduling.client_inventory_interval).unwrap_or(86_400_000);
     Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
 }
 
@@ -1980,6 +1980,21 @@ mod tests {
             .unwrap();
         assert_eq!(1, file_count);
         assert_eq!(1, info_requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn client_inventory_refresh_uses_own_interval() {
+        let mut config = SporosConfig::default();
+        config.scheduling.client_inventory_interval = "5m".to_owned();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Duration::from_secs(300),
+            runtime_client_inventory_interval(&runtime.state)
+        );
     }
 
     #[tokio::test]

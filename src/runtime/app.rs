@@ -792,6 +792,12 @@ impl AppRuntime {
             })?;
         let scheduler_config = daemon_scheduler_config(scheduler_config);
         let http_jobs = http_supported_jobs(&scheduler_config);
+        parse_interval_ms(&config.scheduling.client_inventory_interval).map_err(|error| {
+            DatabaseError::Unavailable {
+                operation: "build client inventory interval".to_owned(),
+                message: error.to_string(),
+            }
+        })?;
         let saved_retry_interval_ms = parse_interval_ms(&config.scheduling.saved_retry_interval)
             .map_err(|error| DatabaseError::Unavailable {
                 operation: "build saved retry interval".to_owned(),
@@ -3496,6 +3502,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_rejects_invalid_client_inventory_interval() {
+        let mut config = SporosConfig::default();
+        config.scheduling.client_inventory_interval = "0s".to_owned();
+        let repository = Repository::connect_in_memory().await.unwrap();
+
+        let error = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("client inventory interval"));
+    }
+
+    #[tokio::test]
     async fn runtime_accepts_durable_workflows() {
         let config = SporosConfig::default();
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3522,6 +3541,17 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/jobs/rss/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let unsupported_search_job = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/search/runs")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3569,6 +3599,7 @@ mod tests {
         assert_eq!(StatusCode::ACCEPTED, search.status());
         assert_eq!(StatusCode::ACCEPTED, job_run.status());
         assert_eq!(StatusCode::NOT_FOUND, unavailable_job.status());
+        assert_eq!(StatusCode::NOT_FOUND, unsupported_search_job.status());
         assert_eq!(StatusCode::ACCEPTED, announcement.status());
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());
         assert_eq!(true, status_json["readiness"]["accepting_work"]);
