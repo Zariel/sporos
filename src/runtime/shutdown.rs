@@ -115,10 +115,17 @@ pub async fn shutdown_queue<T>(
     receiver.close();
 
     match policy {
-        QueueShutdownPolicy::Cancel => QueueShutdownSummary {
-            drained: 0,
-            cancelled: true,
-        },
+        QueueShutdownPolicy::Cancel => {
+            let mut cancelled_items = 0;
+            while receiver.recv().await.is_some() {
+                receiver.mark_cancelled();
+                cancelled_items += 1;
+            }
+            QueueShutdownSummary {
+                drained: cancelled_items,
+                cancelled: true,
+            }
+        }
         QueueShutdownPolicy::Drain => {
             let mut drained = 0;
             while receiver.recv().await.is_some() {
@@ -227,11 +234,13 @@ mod tests {
 
         assert_eq!(
             QueueShutdownSummary {
-                drained: 0,
+                drained: 1,
                 cancelled: true
             },
             cancelled
         );
+        assert_eq!(0, cancel_queue.stats().depth);
+        assert_eq!(1, cancel_queue.stats().cancelled);
     }
 
     #[tokio::test]

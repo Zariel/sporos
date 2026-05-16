@@ -573,6 +573,11 @@ fn write_descriptors(output: &mut String) {
             "Completed workflow queue items.",
         ),
         (
+            "sporos_queue_cancelled_total",
+            "counter",
+            "Cancelled workflow queue items.",
+        ),
+        (
             "sporos_dependency_health_state",
             "gauge",
             "Dependency health summaries.",
@@ -680,6 +685,12 @@ fn write_queue_metrics(output: &mut String, queues: &[QueueStats]) {
             "sporos_queue_completed_total",
             &labels,
             stats.completed,
+        );
+        write_metric(
+            output,
+            "sporos_queue_cancelled_total",
+            &labels,
+            stats.cancelled,
         );
     }
 }
@@ -949,6 +960,7 @@ mod tests {
                 accepted: 2,
                 rejected: 1,
                 completed: 1,
+                cancelled: 1,
             }],
             dependency_health: DependencyHealthSnapshot {
                 entries: Vec::new(),
@@ -1031,6 +1043,7 @@ mod tests {
         assert!(output.contains("sporos_announce_worker_busy 1"));
         assert!(output.contains("sporos_announce_worker_idle 1"));
         assert!(output.contains("sporos_queue_depth{queue=\"search\"} 1"));
+        assert!(output.contains("sporos_queue_cancelled_total{queue=\"search\"} 1"));
         assert!(output.contains(
             "sporos_dependency_health_state{dependency=\"indexer\",state=\"degraded\"} 1"
         ));

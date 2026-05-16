@@ -72,6 +72,7 @@ pub struct QueueStats {
     pub accepted: u64,
     pub rejected: u64,
     pub completed: u64,
+    pub cancelled: u64,
 }
 
 #[derive(Debug)]
@@ -97,6 +98,7 @@ struct QueueMetrics {
     accepted: AtomicU64,
     rejected: AtomicU64,
     completed: AtomicU64,
+    cancelled: AtomicU64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -172,6 +174,10 @@ impl<T> WorkReceiver<T> {
         self.metrics.completed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn mark_cancelled(&self) {
+        self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn stats(&self) -> QueueStats {
         queue_stats(self.kind, self.capacity, &self.depth, &self.metrics)
     }
@@ -221,6 +227,7 @@ fn queue_stats(
         accepted: metrics.accepted.load(Ordering::Relaxed),
         rejected: metrics.rejected.load(Ordering::Relaxed),
         completed: metrics.completed.load(Ordering::Relaxed),
+        cancelled: metrics.cancelled.load(Ordering::Relaxed),
     }
 }
 
@@ -248,6 +255,7 @@ mod tests {
                 accepted: 1,
                 rejected: 1,
                 completed: 0,
+                cancelled: 0,
             },
             queue.stats()
         );
@@ -255,6 +263,9 @@ mod tests {
         receiver.mark_completed();
         assert_eq!(0, queue.stats().depth);
         assert_eq!(1, queue.stats().completed);
+        assert_eq!(0, queue.stats().cancelled);
+        receiver.mark_cancelled();
+        assert_eq!(1, queue.stats().cancelled);
     }
 
     #[tokio::test]
@@ -284,6 +295,7 @@ mod tests {
                 accepted: 0,
                 rejected: 1,
                 completed: 0,
+                cancelled: 0,
             },
             queue.stats()
         );

@@ -315,6 +315,7 @@ async fn run_search_receiver(
 ) {
     loop {
         tokio::select! {
+            biased;
             _state = shutdown.cancelled() => {
                 receiver.close();
                 release_queued_search_requests(&mut receiver).await;
@@ -324,6 +325,12 @@ async fn run_search_receiver(
                 let Some(request) = request else {
                     break;
                 };
+                if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
+                    receiver.mark_cancelled();
+                    receiver.close();
+                    release_queued_search_requests(&mut receiver).await;
+                    break;
+                }
                 match process_search_workflow(state.clone(), request, shutdown.clone()).await {
                     Ok(summary) => {
                         tracing::info!(
@@ -351,7 +358,9 @@ async fn run_search_receiver(
 async fn release_queued_search_requests(
     receiver: &mut crate::runtime::queue::WorkReceiver<SearchWorkflowRequest>,
 ) {
-    while receiver.recv().await.is_some() {}
+    while receiver.recv().await.is_some() {
+        receiver.mark_cancelled();
+    }
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -2442,6 +2451,35 @@ mod tests {
 
         assert_eq!(0, search_queue.stats().depth);
         assert_eq!(0, search_queue.stats().completed);
+        assert_eq!(1, search_queue.stats().cancelled);
+    }
+
+    #[tokio::test]
+    async fn search_receiver_prioritizes_shutdown_over_ready_request() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let search_queue = state.queues.workflow.searches.clone();
+
+        search_queue
+            .try_enqueue(SearchWorkflowRequest {
+                query: ItemTitle::new("movie.mkv").unwrap(),
+            })
+            .unwrap();
+        state.shutdown.cancel_now("test shutdown").unwrap();
+        run_search_receiver(
+            state.clone(),
+            runtime.receivers.searches,
+            state.shutdown_signal.clone(),
+        )
+        .await;
+
+        assert_eq!(0, search_queue.stats().depth);
+        assert_eq!(0, search_queue.stats().completed);
+        assert_eq!(1, search_queue.stats().cancelled);
     }
 
     #[tokio::test]
