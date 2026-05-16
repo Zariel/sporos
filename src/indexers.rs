@@ -1673,6 +1673,7 @@ pub fn configured_torznab_by_name(
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TorznabCaps {
     pub search: SearchCaps,
     pub categories: CategoryCaps,
@@ -1704,6 +1705,7 @@ impl TorznabCaps {
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchCaps {
     pub generic_search: bool,
     pub tv_search: bool,
@@ -1713,6 +1715,7 @@ pub struct SearchCaps {
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CategoryCaps {
     pub movie: bool,
     pub tv: bool,
@@ -1724,6 +1727,7 @@ pub struct CategoryCaps {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TorznabLimits {
     pub default: u16,
     pub max: u16,

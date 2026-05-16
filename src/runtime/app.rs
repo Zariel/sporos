@@ -1815,6 +1815,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_workflow_skips_unrefreshed_indexer_caps() {
+        let torznab_queries = Arc::new(Mutex::new(Vec::new()));
+        let torznab_url = spawn_runtime_torznab_search_server(Arc::clone(&torznab_queries)).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: torznab_url,
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(0, summary.plans.len());
+        assert_eq!(0, summary.failed_indexers);
+        assert_eq!(0, summary.candidate_count);
+        assert!(torznab_queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn indexer_caps_refresh_honors_persisted_backoff() {
         let caps_requests = Arc::new(Mutex::new(Vec::new()));
         let torznab_url = spawn_runtime_torznab_search_server(Arc::clone(&caps_requests)).await;
