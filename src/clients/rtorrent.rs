@@ -70,19 +70,17 @@ impl RtorrentClient {
     }
 
     pub async fn list_inventory(&self) -> Result<Vec<RtorrentDownload>, TorrentClientError> {
-        let hashes = self.download_hashes().await?;
-        if hashes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut downloads = Vec::with_capacity(hashes.len());
-        for chunk in hashes.chunks(RTORRENT_INVENTORY_CHUNK_SIZE) {
+        let response = self.call_text("download_list", Vec::new()).await?;
+        let mut hash_chunks =
+            DownloadHashChunks::new(&self.client_name, &response, RTORRENT_INVENTORY_CHUNK_SIZE);
+        let mut downloads = Vec::new();
+        while let Some(chunk) = hash_chunks.next_chunk()? {
             let response = self
-                .call("system.multicall", vec![inventory_multicall_param(chunk)])
+                .call("system.multicall", vec![inventory_multicall_param(&chunk)])
                 .await?;
             downloads.extend(parse_inventory_response(
                 &self.client_name,
-                chunk,
+                &chunk,
                 &response,
             )?);
         }
@@ -97,13 +95,15 @@ impl RtorrentClient {
         F: FnMut(Vec<RtorrentDownload>) -> Fut,
         Fut: Future<Output = Result<(), TorrentClientError>>,
     {
-        let hashes = self.download_hashes().await?;
+        let response = self.call_text("download_list", Vec::new()).await?;
+        let mut hash_chunks =
+            DownloadHashChunks::new(&self.client_name, &response, RTORRENT_INVENTORY_CHUNK_SIZE);
         let mut total = 0usize;
-        for chunk in hashes.chunks(RTORRENT_INVENTORY_CHUNK_SIZE) {
+        while let Some(chunk) = hash_chunks.next_chunk()? {
             let response = self
-                .call("system.multicall", vec![inventory_multicall_param(chunk)])
+                .call("system.multicall", vec![inventory_multicall_param(&chunk)])
                 .await?;
-            let downloads = parse_inventory_response(&self.client_name, chunk, &response)?;
+            let downloads = parse_inventory_response(&self.client_name, &chunk, &response)?;
             let chunk_len = downloads.len();
             total = total.saturating_add(chunk_len);
             if chunk_len > 0 {
@@ -124,19 +124,21 @@ impl RtorrentClient {
         C: FnMut() -> CFut,
         CFut: Future<Output = ()>,
     {
-        let hashes = tokio::select! {
+        let response = tokio::select! {
             biased;
             () = cancelled() => return Err(cancelled_error(&self.client_name)),
-            hashes = self.download_hashes() => hashes?,
+            response = self.call_text("download_list", Vec::new()) => response?,
         };
+        let mut hash_chunks =
+            DownloadHashChunks::new(&self.client_name, &response, RTORRENT_INVENTORY_CHUNK_SIZE);
         let mut total = 0usize;
-        for chunk in hashes.chunks(RTORRENT_INVENTORY_CHUNK_SIZE) {
+        while let Some(chunk) = hash_chunks.next_chunk()? {
             let response = tokio::select! {
                 biased;
                 () = cancelled() => return Err(cancelled_error(&self.client_name)),
-                response = self.call("system.multicall", vec![inventory_multicall_param(chunk)]) => response?,
+                response = self.call("system.multicall", vec![inventory_multicall_param(&chunk)]) => response?,
             };
-            let downloads = parse_inventory_response(&self.client_name, chunk, &response)?;
+            let downloads = parse_inventory_response(&self.client_name, &chunk, &response)?;
             let chunk_len = downloads.len();
             total = total.saturating_add(chunk_len);
             if chunk_len > 0 {
@@ -271,27 +273,20 @@ impl RtorrentClient {
         .map(|_| ())
     }
 
-    async fn download_hashes(&self) -> Result<Vec<InfoHash>, TorrentClientError> {
-        let response = self.call("download_list", Vec::new()).await?;
-        let values = response.as_array(&self.client_name, "download_list result")?;
-        values
-            .iter()
-            .map(|value| {
-                InfoHash::new(value.as_string(&self.client_name, "download hash")?).map_err(
-                    |error| TorrentClientError::BadResponse {
-                        client: self.client_name.clone(),
-                        message: error.to_string(),
-                    },
-                )
-            })
-            .collect()
-    }
-
     async fn call(
         &self,
         method: &str,
         params: Vec<XmlRpcValue>,
     ) -> Result<XmlRpcValue, TorrentClientError> {
+        let body = self.call_text(method, params).await?;
+        parse_method_response(&self.client_name, &body)
+    }
+
+    async fn call_text(
+        &self,
+        method: &str,
+        params: Vec<XmlRpcValue>,
+    ) -> Result<String, TorrentClientError> {
         let response = self
             .client
             .post(&self.endpoint)
@@ -314,9 +309,7 @@ impl RtorrentClient {
             ));
         }
 
-        let body =
-            read_client_text(response, &self.client_name, RTORRENT_RESPONSE_MAX_BYTES).await?;
-        parse_method_response(&self.client_name, &body)
+        read_client_text(response, &self.client_name, RTORRENT_RESPONSE_MAX_BYTES).await
     }
 }
 
@@ -420,6 +413,132 @@ pub fn parse_method_response(client: &str, xml: &str) -> Result<XmlRpcValue, Tor
             Ok(_) => {}
             Err(error) => return Err(bad_response(client, error.to_string())),
         }
+    }
+}
+
+struct DownloadHashChunks<'a> {
+    client: &'a str,
+    reader: Reader<&'a [u8]>,
+    chunk_size: usize,
+    in_array: bool,
+    in_array_data: bool,
+    in_hash_value: bool,
+    typed_value: bool,
+    finished: bool,
+}
+
+impl<'a> DownloadHashChunks<'a> {
+    fn new(client: &'a str, xml: &'a str, chunk_size: usize) -> Self {
+        // rTorrent exposes download_list and d.multicall2 over a whole view,
+        // not offset ranges. Keep the unavoidable XML-RPC response body as the
+        // memory floor, but avoid retaining the full parsed hash list.
+        Self {
+            client,
+            reader: Reader::from_str(xml),
+            chunk_size: chunk_size.max(1),
+            in_array: false,
+            in_array_data: false,
+            in_hash_value: false,
+            typed_value: false,
+            finished: false,
+        }
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<Vec<InfoHash>>, TorrentClientError> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        let mut chunk = Vec::with_capacity(self.chunk_size);
+        loop {
+            match self.reader.read_event() {
+                Ok(Event::Start(start)) if start.name() == QName(b"fault") => {
+                    let fault = parse_fault(&mut self.reader)?;
+                    return Err(fault_error(self.client, &fault));
+                }
+                Ok(Event::Start(start)) if start.name() == QName(b"array") && !self.in_array => {
+                    self.in_array = true;
+                }
+                Ok(Event::Start(start)) if start.name() == QName(b"data") && self.in_array => {
+                    self.in_array_data = true;
+                }
+                Ok(Event::Start(start))
+                    if start.name() == QName(b"value") && self.in_array_data =>
+                {
+                    self.in_hash_value = true;
+                    self.typed_value = false;
+                }
+                Ok(Event::Start(start))
+                    if start.name() == QName(b"string")
+                        && self.in_hash_value
+                        && !self.typed_value =>
+                {
+                    self.typed_value = true;
+                    let value = read_text_until(&mut self.reader, QName(b"string"))?;
+                    self.push_hash(&mut chunk, value)?;
+                }
+                Ok(Event::Start(start)) if self.in_hash_value && !self.typed_value => {
+                    return Err(bad_response(
+                        self.client,
+                        format!(
+                            "download hash uses unsupported XML-RPC type `{}`",
+                            String::from_utf8_lossy(start.name().as_ref())
+                        ),
+                    ));
+                }
+                Ok(Event::Text(text)) if self.in_hash_value && !self.typed_value => {
+                    let value = xml_text_value(&text)?;
+                    if !value.trim().is_empty() {
+                        self.push_hash(&mut chunk, value)?;
+                        self.typed_value = true;
+                    }
+                }
+                Ok(Event::CData(cdata)) if self.in_hash_value && !self.typed_value => {
+                    self.push_hash(&mut chunk, xml_cdata_value(&cdata)?)?;
+                    self.typed_value = true;
+                }
+                Ok(Event::GeneralRef(reference)) if self.in_hash_value && !self.typed_value => {
+                    self.push_hash(&mut chunk, xml_reference_value(&reference)?)?;
+                    self.typed_value = true;
+                }
+                Ok(Event::End(end)) if end.name() == QName(b"value") && self.in_hash_value => {
+                    if !self.typed_value {
+                        return Err(bad_response(self.client, "empty download hash value"));
+                    }
+                    self.in_hash_value = false;
+                }
+                Ok(Event::End(end)) if end.name() == QName(b"data") && self.in_array_data => {
+                    self.in_array_data = false;
+                }
+                Ok(Event::End(end)) if end.name() == QName(b"array") && self.in_array => {
+                    self.finished = true;
+                    return Ok((!chunk.is_empty()).then_some(chunk));
+                }
+                Ok(Event::Eof) => {
+                    return Err(bad_response(
+                        self.client,
+                        "unterminated download_list result",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => return Err(bad_response(self.client, error.to_string())),
+            }
+
+            if chunk.len() >= self.chunk_size {
+                return Ok(Some(chunk));
+            }
+        }
+    }
+
+    fn push_hash(
+        &self,
+        chunk: &mut Vec<InfoHash>,
+        value: String,
+    ) -> Result<(), TorrentClientError> {
+        let hash =
+            InfoHash::new(&value).map_err(|error| bad_response(self.client, error.to_string()))?;
+        chunk.push(hash);
+        Ok(())
     }
 }
 
@@ -1057,6 +1176,23 @@ mod tests {
                 XmlRpcValue::Bool(true),
             ]),
             value
+        );
+    }
+
+    #[test]
+    fn download_hash_parser_returns_bounded_chunks() {
+        let xml = xml_response(&download_list_xml(RTORRENT_INVENTORY_CHUNK_SIZE + 2));
+        let mut chunks = DownloadHashChunks::new("rtorrent", &xml, RTORRENT_INVENTORY_CHUNK_SIZE);
+
+        let first = chunks.next_chunk().unwrap().unwrap();
+        let second = chunks.next_chunk().unwrap().unwrap();
+
+        assert_eq!(RTORRENT_INVENTORY_CHUNK_SIZE, first.len());
+        assert_eq!(2, second.len());
+        assert!(chunks.next_chunk().unwrap().is_none());
+        assert_eq!(
+            "0000000000000000000000000000000000000001",
+            first[0].as_str()
         );
     }
 
