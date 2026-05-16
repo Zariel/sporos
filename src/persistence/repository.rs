@@ -96,6 +96,19 @@ pub struct LocalInventoryReplaceSummary {
     pub pruned: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SourceKeyPrefixRange {
+    start: String,
+    end: Option<String>,
+}
+
+impl SourceKeyPrefixRange {
+    fn new(prefix: String) -> Self {
+        let end = next_text_prefix(&prefix);
+        Self { start: prefix, end }
+    }
+}
+
 impl LocalInventoryScope {
     fn accepts(&self, source_type: &str, source_key: &str) -> bool {
         match self {
@@ -118,9 +131,11 @@ impl LocalInventoryScope {
         }
     }
 
-    fn source_key_prefix(&self) -> Option<String> {
+    fn source_key_range(&self) -> Option<SourceKeyPrefixRange> {
         match self {
-            Self::Client { client_host } => Some(client_source_key_prefix(client_host)),
+            Self::Client { client_host } => Some(SourceKeyPrefixRange::new(
+                client_source_key_prefix(client_host),
+            )),
             Self::DataRoot | Self::TorrentCache | Self::Virtual => None,
         }
     }
@@ -2939,23 +2954,44 @@ async fn prune_local_items_not_retained(
     transaction: &mut Transaction<'_, Sqlite>,
     scope: &LocalInventoryScope,
 ) -> Result<u64, DatabaseError> {
-    let result = if let Some(prefix) = scope.source_key_prefix() {
-        sqlx::query(
-            r#"
-            DELETE FROM local_items
-            WHERE source_type = ?
-              AND instr(source_key, ?) = 1
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM retained_local_item_keys retained
-                  WHERE retained.source_key = local_items.source_key
-              )
-            "#,
-        )
-        .bind(scope.source_type())
-        .bind(prefix)
-        .execute(&mut **transaction)
-        .await
+    let result = if let Some(range) = scope.source_key_range() {
+        if let Some(end) = range.end {
+            sqlx::query(
+                r#"
+                DELETE FROM local_items
+                WHERE source_type = ?
+                  AND source_key >= ?
+                  AND source_key < ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM retained_local_item_keys retained
+                      WHERE retained.source_key = local_items.source_key
+                  )
+                "#,
+            )
+            .bind(scope.source_type())
+            .bind(range.start)
+            .bind(end)
+            .execute(&mut **transaction)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                DELETE FROM local_items
+                WHERE source_type = ?
+                  AND source_key >= ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM retained_local_item_keys retained
+                      WHERE retained.source_key = local_items.source_key
+                  )
+                "#,
+            )
+            .bind(scope.source_type())
+            .bind(range.start)
+            .execute(&mut **transaction)
+            .await
+        }
     } else {
         sqlx::query(
             r#"
@@ -2981,24 +3017,39 @@ async fn normalize_client_source_keys(
     transaction: &mut Transaction<'_, Sqlite>,
     client_host: &ClientHost,
 ) -> Result<(), DatabaseError> {
-    let encoded_prefix = client_source_key_prefix(client_host);
-    let rows = sqlx::query(
-        r#"
-        SELECT id, source_key
-        FROM local_items
-        WHERE source_type = 'client'
-        "#,
-    )
-    .fetch_all(&mut **transaction)
-    .await
+    let legacy_range = SourceKeyPrefixRange::new(format!("{}:", client_host.as_str()));
+    let rows = if let Some(end) = legacy_range.end {
+        sqlx::query(
+            r#"
+            SELECT id, source_key
+            FROM local_items
+            WHERE source_type = 'client'
+              AND source_key >= ?
+              AND source_key < ?
+            "#,
+        )
+        .bind(legacy_range.start)
+        .bind(end)
+        .fetch_all(&mut **transaction)
+        .await
+    } else {
+        sqlx::query(
+            r#"
+            SELECT id, source_key
+            FROM local_items
+            WHERE source_type = 'client'
+              AND source_key >= ?
+            "#,
+        )
+        .bind(legacy_range.start)
+        .fetch_all(&mut **transaction)
+        .await
+    }
     .map_err(|error| db_error("read client inventory source keys", error))?;
 
     for row in rows {
         let id: i64 = row.get("id");
         let old_source_key: String = row.get("source_key");
-        if old_source_key.starts_with(&encoded_prefix) {
-            continue;
-        }
         let Some((row_client_host, row_source_key)) = parse_client_source_key(&old_source_key)
         else {
             continue;
@@ -3307,6 +3358,22 @@ fn client_source_key_prefix(client_host: &ClientHost) -> String {
     format!("{}:{}:", client_host.as_str().len(), client_host.as_str())
 }
 
+fn next_text_prefix(prefix: &str) -> Option<String> {
+    let (last_index, last_char) = prefix.char_indices().next_back()?;
+    let mut next_codepoint = u32::from(last_char).checked_add(1)?;
+    while next_codepoint <= 0x10ffff {
+        if let Some(next_char) = char::from_u32(next_codepoint) {
+            let mut end = String::with_capacity(last_index + next_char.len_utf8());
+            end.push_str(&prefix[..last_index]);
+            end.push(next_char);
+            return Some(end);
+        }
+        next_codepoint = next_codepoint.saturating_add(1);
+    }
+
+    None
+}
+
 fn parse_client_source_key(source_key: &str) -> Option<(&str, &str)> {
     if let Some((host_len, rest)) = source_key.split_once(':')
         && let Ok(host_len) = host_len.parse::<usize>()
@@ -3471,6 +3538,56 @@ mod tests {
 
         repository.pool().close().await;
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_key_prefix_range_uses_exclusive_text_bound() {
+        assert_eq!(
+            SourceKeyPrefixRange::new("12:qbit-a.local:".to_owned()),
+            SourceKeyPrefixRange {
+                start: "12:qbit-a.local:".to_owned(),
+                end: Some("12:qbit-a.local;".to_owned()),
+            }
+        );
+        assert_eq!(
+            SourceKeyPrefixRange::new("rtorrent:5000:".to_owned()),
+            SourceKeyPrefixRange {
+                start: "rtorrent:5000:".to_owned(),
+                end: Some("rtorrent:5000;".to_owned()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn client_source_key_range_queries_use_local_item_key_index() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let range = SourceKeyPrefixRange::new(client_source_key_prefix(
+            &ClientHost::new("qbit.local").unwrap(),
+        ));
+        let rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT id
+            FROM local_items
+            WHERE source_type = 'client'
+              AND source_key >= ?
+              AND source_key < ?
+            "#,
+        )
+        .bind(range.start)
+        .bind(range.end.unwrap())
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+        let details = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(details.contains("USING COVERING INDEX") || details.contains("USING INDEX"));
+        assert!(details.contains("source_type"));
+        assert!(details.contains("source_key"));
     }
 
     #[tokio::test]
