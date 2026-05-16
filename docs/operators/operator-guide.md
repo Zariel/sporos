@@ -245,7 +245,10 @@ The service exposes:
 - `GET /metrics`: Prometheus text metrics.
 - `GET /v1/status`: readiness plus durable announce queue status.
 - `POST /v1/announcements`: accepts validated announcements as durable queued
-  work when the announce queue is running.
+  work.
+- `POST /v1/searches`: queues an explicit search workflow.
+- `POST /v1/jobs/{job_name}/runs`: queues a supported scheduler job run.
+  `indexer_caps` is currently the supported daemon job.
 
 Workflow endpoints require bearer auth when an API token is configured. Startup
 rejects externally reachable binds without a configured token.
@@ -277,7 +280,17 @@ Scrape `GET /metrics` as Prometheus text. Important metric families include:
 - `sporos_queue_depth` and related queue gauges for bounded in-memory queues.
 - `sporos_dependency_health_state` for dependency summaries.
 - `sporos_announce_*` metrics for durable announce backlog, retries, leases,
-  worker capacity, and dependency waits when the announce workflow is enabled.
+  worker capacity, and dependency waits.
+- `sporos_search_attempts_total`, `sporos_decisions_total`, and
+  `sporos_actions_total` for search, matching, and action outcomes.
+- `sporos_indexer_requests_total`,
+  `sporos_indexer_request_duration_seconds`,
+  `sporos_client_requests_total`, and
+  `sporos_client_request_duration_seconds` for external indexer and torrent
+  client dependency calls.
+- `sporos_job_duration_seconds`, `sporos_job_state`, and
+  `sporos_job_last_duration_seconds` for scheduled and explicitly posted job
+  runs.
 - `sporos_prowlarr_refresh_total`,
   `sporos_prowlarr_refresh_duration_seconds`,
   `sporos_prowlarr_refresh_imported_total`, and
@@ -286,17 +299,16 @@ Scrape `GET /metrics` as Prometheus text. Important metric families include:
 - `sporos_notification_requests_total` and notification latency metrics for
   webhook delivery.
 
-Indexer and torrent-client request counters are planned but are not wired into
-the daemon runtime in this release.
-
 Labels are intentionally bounded. Do not expect raw titles, request bodies,
 cookies, API keys, or full secret-bearing URLs in metrics.
 
 ## Announce Queue Operations
 
-The durable announce API and worker are not enabled in the daemon runtime in
-this release. `POST /v1/announcements` returns `503 Service Unavailable`
-instead of accepting work until that workflow is wired into production.
+The durable announce API and worker run in the daemon runtime.
+`POST /v1/announcements` validates the request, persists accepted work in
+SQLite, and returns `202 Accepted` before matching, saving, or client injection
+has necessarily completed. If the durable queue is unavailable or at capacity,
+the endpoint returns an error and records the rejected enqueue outcome.
 
 See [Announce Queue Operations](announce-queue.md) for queue health, TTL,
 retention, retry, restart, and single-writer details.
@@ -311,8 +323,10 @@ Use diagnostics that do not mutate state first:
 - `GET /readyz`
 - `GET /v1/status`
 - `GET /metrics`
+- `POST /v1/jobs/indexer_caps/runs`
 
 For dependency issues, compare readiness dependency summaries with metric
-outcome counters. Queued announcement diagnostics are unavailable in this
-release because the daemon does not accept announcements; the durable queue
-state and `sporos_announce_*` metrics apply only when that workflow is enabled.
+outcome counters. For queued announcement issues, compare `/v1/status`
+`announce_queue` counts with `sporos_announce_*` metrics, especially active
+work, retry delay, worker busy/idle gauges, attempt classes, and dependency
+wait counts.
