@@ -5767,9 +5767,10 @@ mod tests {
     async fn remote_candidate_upsert_uses_indexer_guid_natural_key() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let mut candidate = test_remote_candidate("guid-1", "Original");
-        candidate.download_url =
-            DownloadUrl::new("https://user:password@indexer.example/download?id=1&passkey=secret")
-                .unwrap();
+        candidate.download_url = DownloadUrl::new(
+            "https://user:password@indexer.example/download?id=1&authkey=secret&torrent_pass=other-secret",
+        )
+        .unwrap();
 
         let first_id = repository
             .upsert_remote_candidate(&candidate)
@@ -5804,10 +5805,11 @@ mod tests {
         assert_eq!(first_id, third_id);
         assert_eq!("Updated", title);
         assert_eq!(
-            "https://[REDACTED]@indexer.example/download?id=1&passkey=[REDACTED]",
+            "https://[REDACTED]@indexer.example/download?id=1&authkey=[REDACTED]&torrent_pass=[REDACTED]",
             redacted_download_url
         );
         assert!(!redacted_download_url.contains("secret"));
+        assert!(!redacted_download_url.contains("other-secret"));
         assert!(!redacted_download_url.contains("password"));
         assert_eq!(1, info_hash_matches.len());
         assert_eq!(first_id, info_hash_matches[0].id);

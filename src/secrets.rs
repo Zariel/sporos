@@ -216,11 +216,7 @@ fn sanitize_query_pair(pair: &str) -> String {
 }
 
 fn is_sensitive_query_key(key: &str) -> bool {
-    let normalized = key
-        .bytes()
-        .filter(|byte| byte.is_ascii_alphanumeric())
-        .map(|byte| byte.to_ascii_lowercase())
-        .collect::<Vec<_>>();
+    let normalized = normalized_query_key(key);
 
     matches!(
         normalized.as_slice(),
@@ -229,14 +225,60 @@ fn is_sensitive_query_key(key: &str) -> bool {
             | b"apitoken"
             | b"authorization"
             | b"auth"
+            | b"authkey"
             | b"cookie"
+            | b"downloadkey"
             | b"key"
+            | b"pass"
             | b"passkey"
             | b"password"
             | b"passwd"
+            | b"rsskey"
+            | b"rsspasskey"
             | b"secret"
             | b"token"
+            | b"torrentkey"
+            | b"torrentpass"
+            | b"torrentpasskey"
     )
+}
+
+fn normalized_query_key(key: &str) -> Vec<u8> {
+    let bytes = key.as_bytes();
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = if bytes[index] == b'%' && index + 2 < bytes.len() {
+            match (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
+                (Some(high), Some(low)) => {
+                    index += 3;
+                    high * 16 + low
+                }
+                _ => {
+                    let byte = bytes[index];
+                    index += 1;
+                    byte
+                }
+            }
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            byte
+        };
+        if byte.is_ascii_alphanumeric() {
+            normalized.push(byte.to_ascii_lowercase());
+        }
+    }
+    normalized
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +342,30 @@ mod tests {
 
         assert_eq!(
             "https://example.invalid/hook?token=[REDACTED]&ok=true",
+            sanitized.as_str()
+        );
+    }
+
+    #[test]
+    fn url_sanitizer_redacts_tracker_credential_variants() {
+        let sanitized = sanitize_url_for_logging(
+            "https://tracker.example/rss?authkey=a&torrent_pass=b&rsskey=c&download_key=d&id=1",
+        );
+
+        assert_eq!(
+            "https://tracker.example/rss?authkey=[REDACTED]&torrent_pass=[REDACTED]&rsskey=[REDACTED]&download_key=[REDACTED]&id=1",
+            sanitized.as_str()
+        );
+    }
+
+    #[test]
+    fn url_sanitizer_redacts_percent_encoded_sensitive_keys() {
+        let sanitized = sanitize_url_for_logging(
+            "https://tracker.example/rss?auth%6Bey=a&torrent%5Fpass=b&id=1",
+        );
+
+        assert_eq!(
+            "https://tracker.example/rss?auth%6Bey=[REDACTED]&torrent%5Fpass=[REDACTED]&id=1",
             sanitized.as_str()
         );
     }

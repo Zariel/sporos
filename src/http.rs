@@ -1246,7 +1246,7 @@ mod tests {
                 serde_json::json!({
                     "name": "Example",
                     "guid": "guid-1",
-                    "download_url": "https://tracker.example/download?id=1&passkey=secret",
+                    "download_url": "https://tracker.example/download?id=1&authkey=secret&torrent_pass=other-secret",
                     "tracker": "tracker.example",
                     "cookie": "sid=secret-cookie",
                     "size": 42
@@ -1270,6 +1270,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let redacted_download_url: String =
+            sqlx::query_scalar("SELECT redacted_download_url FROM announce_work WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
 
         assert_eq!(StatusCode::UNAUTHORIZED, unauthorized.status());
         assert_eq!(StatusCode::ACCEPTED, status);
@@ -1278,11 +1284,21 @@ mod tests {
         assert!(json["id"].as_str().is_some_and(|id| id.starts_with("ann_")));
         assert_eq!(1, stored_count);
         assert_eq!(
-            "https://tracker.example/download?id=1&passkey=secret",
+            "https://tracker.example/download?id=1&authkey=secret&torrent_pass=other-secret",
             fetch.expose_download_url()
         );
         assert_eq!("sid=secret-cookie", fetch.cookie().unwrap().expose_secret());
         assert!(!fetch.redacted_download_url().as_str().contains("secret"));
+        assert!(
+            !fetch
+                .redacted_download_url()
+                .as_str()
+                .contains("other-secret")
+        );
+        assert_eq!(
+            "https://tracker.example/download?id=1&authkey=[REDACTED]&torrent_pass=[REDACTED]",
+            redacted_download_url
+        );
     }
 
     #[tokio::test]
