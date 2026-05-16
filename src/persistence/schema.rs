@@ -115,6 +115,10 @@ CREATE TABLE IF NOT EXISTS indexers (
 
 CREATE INDEX IF NOT EXISTS idx_indexers_enabled_state_retry_after
     ON indexers (enabled, state, retry_after);
+CREATE INDEX IF NOT EXISTS idx_indexers_enabled_name
+    ON indexers (enabled, name);
+CREATE INDEX IF NOT EXISTS idx_indexers_search_ready
+    ON indexers (enabled, last_caps_refresh_at, retry_after, name);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_indexers_active_url_unique
     ON indexers (url)
     WHERE enabled != 0;
@@ -263,6 +267,8 @@ mod tests {
             "PRIMARY KEY (local_item_id, candidate_id)",
             "UNIQUE (name)",
             "UNIQUE (source_kind, source_name, source_indexer_id)",
+            "idx_indexers_enabled_name",
+            "idx_indexers_search_ready",
             "idx_indexers_active_url_unique",
             "idx_indexers_url",
             "api_key_source TEXT NOT NULL",

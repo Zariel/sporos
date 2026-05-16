@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Acquire, Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -1647,33 +1647,74 @@ impl Repository {
         .map_err(|error| db_error("read indexer registry snapshot", error))?;
 
         rows.into_iter()
-            .map(|row| {
-                let id = u64::try_from(row.get::<i64, _>("id")).map_err(|error| {
-                    DatabaseError::QueryFailed {
-                        operation: "read indexer id".to_owned(),
-                        message: error.to_string(),
-                    }
-                })?;
-                Ok(IndexerRegistryRow {
-                    id,
-                    name: DependencyName::new(row.get::<String, _>("name")).map_err(|error| {
-                        DatabaseError::QueryFailed {
-                            operation: "read indexer name".to_owned(),
-                            message: error.to_string(),
-                        }
-                    })?,
-                    url: row.get("url"),
-                    source_kind: row.get("source_kind"),
-                    source_name: row.get("source_name"),
-                    source_indexer_id: row.get("source_indexer_id"),
-                    api_key_source: row.get("api_key_source"),
-                    enabled: row.get::<i64, _>("enabled") != 0,
-                    state: row.get("state"),
-                    retry_after_ms: row.get("retry_after"),
-                    last_caps_refresh_at_ms: row.get("last_caps_refresh_at"),
-                })
-            })
+            .map(indexer_registry_row_from_row)
             .collect()
+    }
+
+    pub async fn due_indexer_registry_page(
+        &self,
+        now_ms: i64,
+        after_name: Option<&DependencyName>,
+        limit: u16,
+    ) -> Result<Vec<IndexerRegistryRow>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                name,
+                url,
+                source_kind,
+                source_name,
+                source_indexer_id,
+                api_key_source,
+                enabled,
+                state,
+                retry_after,
+                last_caps_refresh_at
+            FROM indexers
+            WHERE enabled != 0
+              AND (retry_after IS NULL OR retry_after <= ?)
+              AND (? IS NULL OR name > ?)
+            ORDER BY name
+            LIMIT ?
+            "#,
+        )
+        .bind(now_ms)
+        .bind(after_name.map(DependencyName::as_str))
+        .bind(after_name.map(DependencyName::as_str))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read due indexer registry page", error))?;
+
+        rows.into_iter()
+            .map(indexer_registry_row_from_row)
+            .collect()
+    }
+
+    pub async fn indexer_caps_backoff_summary(
+        &self,
+        now_ms: i64,
+    ) -> Result<(usize, Option<i64>), DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS backoff_count, MIN(retry_after) AS next_retry_after
+            FROM indexers
+            WHERE enabled != 0
+              AND retry_after > ?
+            "#,
+        )
+        .bind(now_ms)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| db_error("read indexer caps backoff summary", error))?;
+        let count = usize::try_from(row.get::<i64, _>("backoff_count")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read indexer caps backoff count".to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        Ok((count, row.get("next_retry_after")))
     }
 
     pub async fn record_indexer_caps_success(
@@ -1780,32 +1821,48 @@ impl Repository {
         .map_err(|error| db_error("read indexer search caps snapshot", error))?;
 
         rows.into_iter()
-            .map(|row| {
-                let caps_json: String = row.get("capabilities_json");
-                let caps = serde_json::from_str::<TorznabCaps>(&caps_json).map_err(|error| {
-                    DatabaseError::QueryFailed {
-                        operation: "deserialize indexer caps".to_owned(),
-                        message: error.to_string(),
-                    }
-                })?;
-                Ok(IndexerSearchCapsRow {
-                    indexer_id: indexer_id_from_i64(row.get("id"), "indexer search caps id")?,
-                    name: DependencyName::new(row.get::<String, _>("name")).map_err(|error| {
-                        DatabaseError::QueryFailed {
-                            operation: "read indexer search caps name".to_owned(),
-                            message: error.to_string(),
-                        }
-                    })?,
-                    url: row.get("url"),
-                    source_kind: row.get("source_kind"),
-                    source_name: row.get("source_name"),
-                    source_indexer_id: row.get("source_indexer_id"),
-                    api_key_source: row.get("api_key_source"),
-                    enabled: row.get::<i64, _>("enabled") != 0,
-                    retry_after_ms: row.get("retry_after"),
-                    caps,
-                })
-            })
+            .map(indexer_search_caps_row_from_row)
+            .collect()
+    }
+
+    pub async fn ready_indexer_search_caps_page(
+        &self,
+        now_ms: i64,
+        after_name: Option<&DependencyName>,
+        limit: u16,
+    ) -> Result<Vec<IndexerSearchCapsRow>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                name,
+                url,
+                source_kind,
+                source_name,
+                source_indexer_id,
+                api_key_source,
+                enabled,
+                retry_after,
+                capabilities_json
+            FROM indexers
+            WHERE enabled != 0
+              AND last_caps_refresh_at IS NOT NULL
+              AND (retry_after IS NULL OR retry_after <= ?)
+              AND (? IS NULL OR name > ?)
+            ORDER BY name
+            LIMIT ?
+            "#,
+        )
+        .bind(now_ms)
+        .bind(after_name.map(DependencyName::as_str))
+        .bind(after_name.map(DependencyName::as_str))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read ready indexer search caps page", error))?;
+
+        rows.into_iter()
+            .map(indexer_search_caps_row_from_row)
             .collect()
     }
 
@@ -3702,6 +3759,59 @@ fn file_index_from_i64(value: i64, field: &'static str) -> Result<FileIndex, Dat
             operation: format!("read {field}"),
             message: error.to_string(),
         })
+}
+
+fn indexer_registry_row_from_row(row: SqliteRow) -> Result<IndexerRegistryRow, DatabaseError> {
+    let id =
+        u64::try_from(row.get::<i64, _>("id")).map_err(|error| DatabaseError::QueryFailed {
+            operation: "read indexer id".to_owned(),
+            message: error.to_string(),
+        })?;
+    Ok(IndexerRegistryRow {
+        id,
+        name: DependencyName::new(row.get::<String, _>("name")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read indexer name".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        url: row.get("url"),
+        source_kind: row.get("source_kind"),
+        source_name: row.get("source_name"),
+        source_indexer_id: row.get("source_indexer_id"),
+        api_key_source: row.get("api_key_source"),
+        enabled: row.get::<i64, _>("enabled") != 0,
+        state: row.get("state"),
+        retry_after_ms: row.get("retry_after"),
+        last_caps_refresh_at_ms: row.get("last_caps_refresh_at"),
+    })
+}
+
+fn indexer_search_caps_row_from_row(row: SqliteRow) -> Result<IndexerSearchCapsRow, DatabaseError> {
+    let caps_json: String = row.get("capabilities_json");
+    let caps = serde_json::from_str::<TorznabCaps>(&caps_json).map_err(|error| {
+        DatabaseError::QueryFailed {
+            operation: "deserialize indexer caps".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    Ok(IndexerSearchCapsRow {
+        indexer_id: indexer_id_from_i64(row.get("id"), "indexer search caps id")?,
+        name: DependencyName::new(row.get::<String, _>("name")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read indexer search caps name".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        url: row.get("url"),
+        source_kind: row.get("source_kind"),
+        source_name: row.get("source_name"),
+        source_indexer_id: row.get("source_indexer_id"),
+        api_key_source: row.get("api_key_source"),
+        enabled: row.get::<i64, _>("enabled") != 0,
+        retry_after_ms: row.get("retry_after"),
+        caps,
+    })
 }
 
 fn local_file_snapshot_from_row(
