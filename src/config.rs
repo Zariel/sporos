@@ -336,7 +336,7 @@ where
             field: "announce",
             reason: error.to_string(),
         })?;
-    validate_prowlarr_sources(&config)?;
+    validate_prowlarr_sources(&config, &raw)?;
     resolve_secret_env(&mut config, &env)?;
 
     Ok((config, raw))
@@ -509,6 +509,9 @@ fn resolve_secret_env(
             && let Some(env_name) =
                 nonempty_secret_env("indexers.prowlarr.api_key_env", name, &source.api_key_env)?
         {
+            if !source.enabled {
+                continue;
+            }
             let value = secret_env_value(env, env_name, "indexers.prowlarr.api_key_env", name)?;
             source.api_key = Some(
                 ApiKey::new(value.clone())
@@ -562,6 +565,9 @@ fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
         if source.api_key.is_none()
             && let Some(path) = &source.api_key_file
         {
+            if !source.enabled {
+                continue;
+            }
             let value = secret_file_value("indexers.prowlarr.api_key_file", name, path)?;
             source.api_key =
                 Some(ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
@@ -616,7 +622,7 @@ fn resolve_arr_secret_files(
     Ok(())
 }
 
-fn validate_prowlarr_sources(config: &SporosConfig) -> Result<(), ConfigError> {
+fn validate_prowlarr_sources(config: &SporosConfig, raw: &Value) -> Result<(), ConfigError> {
     for (name, source) in &config.indexers.prowlarr {
         if name.trim().is_empty() {
             return Err(ConfigError::InvalidField {
@@ -624,12 +630,16 @@ fn validate_prowlarr_sources(config: &SporosConfig) -> Result<(), ConfigError> {
                 reason: "source names must not be empty".to_owned(),
             });
         }
-        validate_http_url("indexers.prowlarr.url", name, &source.url)?;
-        validate_interval(
-            "indexers.prowlarr.update_interval",
-            name,
-            &source.update_interval,
-        )?;
+        if source.enabled || prowlarr_source_field_supplied(raw, name, &["url", "base_url"]) {
+            validate_http_url("indexers.prowlarr.url", name, &source.url)?;
+        }
+        if source.enabled || prowlarr_source_field_supplied(raw, name, &["update_interval"]) {
+            validate_interval(
+                "indexers.prowlarr.update_interval",
+                name,
+                &source.update_interval,
+            )?;
+        }
         validate_secret_source_count(
             "indexers.prowlarr.api_key",
             name,
@@ -648,6 +658,16 @@ fn validate_prowlarr_sources(config: &SporosConfig) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+fn prowlarr_source_field_supplied(raw: &Value, name: &str, fields: &[&str]) -> bool {
+    raw.get("indexers")
+        .and_then(Value::as_table)
+        .and_then(|indexers| indexers.get("prowlarr"))
+        .and_then(Value::as_table)
+        .and_then(|prowlarr| prowlarr.get(name))
+        .and_then(Value::as_table)
+        .is_some_and(|source| fields.iter().any(|field| source.contains_key(*field)))
 }
 
 fn validate_http_url(field: &'static str, name: &str, value: &str) -> Result<(), ConfigError> {
@@ -1503,6 +1523,39 @@ mod tests {
     }
 
     #[test]
+    fn startup_config_ignores_disabled_prowlarr_secret_files() {
+        let cwd = unique_temp_dir("disabled-prowlarr-secret");
+        let missing_secret = cwd.join("future-prowlarr-api-key");
+        let contents = format!(
+            r#"
+            [paths]
+            database = "{}/state/sporos.db"
+            torrent_cache_dir = "{}/cache/torrents"
+            output_dir = "{}/output"
+
+            [indexers.prowlarr.future]
+            enabled = false
+            api_key_file = "{}"
+            "#,
+            cwd.display(),
+            cwd.display(),
+            cwd.display(),
+            missing_secret.display()
+        );
+
+        let config = parse_startup_config(&contents, &cwd).unwrap();
+        let source = &config.indexers.prowlarr["future"];
+
+        assert_eq!(None, source.api_key);
+        assert_eq!(
+            Some(missing_secret.as_path()),
+            source.api_key_file.as_deref()
+        );
+
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
     fn schema_documents_sporos_native_surface() {
         assert!(CONFIG_SCHEMA.contains("sporos config schema"));
         assert!(CONFIG_SCHEMA.contains("[torrent_clients.<name>]"));
@@ -1688,6 +1741,87 @@ mod tests {
         assert_eq!("24h", backup.update_interval);
         assert_eq!(ProwlarrTagMatch::Any, backup.tag_match);
         assert_eq!(ProwlarrRemovePolicy::Deactivate, backup.remove_policy);
+    }
+
+    #[test]
+    fn disabled_prowlarr_sources_can_be_placeholders() {
+        let config = parse_config(
+            r#"
+            [indexers.prowlarr.future]
+            enabled = false
+            api_key_env = "FUTURE_PROWLARR_API_KEY"
+            "#,
+        )
+        .unwrap();
+        let source = &config.indexers.prowlarr["future"];
+
+        assert!(!source.enabled);
+        assert_eq!("", source.url);
+        assert_eq!(None, source.api_key);
+        assert_eq!(
+            Some("FUTURE_PROWLARR_API_KEY"),
+            source.api_key_env.as_deref()
+        );
+        assert_eq!("24h", source.update_interval);
+
+        for (contents, expected) in [
+            (
+                r#"
+                [indexers.prowlarr.future]
+                enabled = false
+                url = "file:///tmp/prowlarr"
+                "#,
+                "URL scheme",
+            ),
+            (
+                r#"
+                [indexers.prowlarr.future]
+                enabled = false
+                update_interval = "0m"
+                "#,
+                "interval must be positive",
+            ),
+        ] {
+            let error = parse_config(contents).unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{error} did not contain {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_disabled_prowlarr_sources_can_be_placeholders() {
+        let config = parse_config_with_env(
+            "",
+            vec![(
+                "SPOROS__INDEXERS__PROWLARR__FUTURE__ENABLED".to_owned(),
+                "false".to_owned(),
+            )],
+        )
+        .unwrap();
+        let source = &config.indexers.prowlarr["future"];
+
+        assert!(!source.enabled);
+        assert_eq!("", source.url);
+
+        let error = parse_config_with_env(
+            "",
+            vec![
+                (
+                    "SPOROS__INDEXERS__PROWLARR__FUTURE__ENABLED".to_owned(),
+                    "false".to_owned(),
+                ),
+                (
+                    "SPOROS__INDEXERS__PROWLARR__FUTURE__URL".to_owned(),
+                    "file:///tmp/prowlarr".to_owned(),
+                ),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("URL scheme"));
     }
 
     #[test]
