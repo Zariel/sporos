@@ -757,8 +757,8 @@ impl Repository {
                 JOIN local_files ON local_files.item_id = paged_items.id
             )
             SELECT id, source_type, source_key, title, display_name, media_type,
-                   info_hash, path, save_path, total_size, mtime_ms,
-                   item_id, relative_path, file_name, size, file_mtime_ms AS mtime_ms,
+                   info_hash, path, save_path, total_size, mtime_ms AS item_mtime_ms,
+                   item_id, relative_path, file_name, size, file_mtime_ms,
                    file_index
             FROM ranked_files
             WHERE file_rank = 1
@@ -775,8 +775,8 @@ impl Repository {
         rows.into_iter()
             .map(|row| {
                 Ok(LocalItemWithFile {
-                    item: local_item_from_row_ref(&row)?,
-                    file: local_file_snapshot_from_row_ref(&row)?,
+                    item: local_item_with_file_item_from_row_ref(&row)?,
+                    file: local_item_with_file_file_from_row_ref(&row)?,
                 })
             })
             .collect()
@@ -3631,6 +3631,19 @@ fn local_item_from_row(row: sqlx::sqlite::SqliteRow) -> Result<LocalItem, Databa
 }
 
 fn local_item_from_row_ref(row: &sqlx::sqlite::SqliteRow) -> Result<LocalItem, DatabaseError> {
+    local_item_from_row_ref_with_mtime(row, "mtime_ms")
+}
+
+fn local_item_with_file_item_from_row_ref(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<LocalItem, DatabaseError> {
+    local_item_from_row_ref_with_mtime(row, "item_mtime_ms")
+}
+
+fn local_item_from_row_ref_with_mtime(
+    row: &sqlx::sqlite::SqliteRow,
+    mtime_column: &'static str,
+) -> Result<LocalItem, DatabaseError> {
     let id = id_from_i64(row.get("id"), "local item id")?;
     let source_type: String = row.get("source_type");
     let source_key: String = row.get("source_key");
@@ -3663,7 +3676,20 @@ fn local_item_from_row_ref(row: &sqlx::sqlite::SqliteRow) -> Result<LocalItem, D
         path: row.get::<Option<String>, _>("path").map(PathBuf::from),
         save_path: row.get::<Option<String>, _>("save_path").map(PathBuf::from),
         total_size: byte_size_from_i64(row.get("total_size"), "local item total size")?,
-        mtime_ms: row.get("mtime_ms"),
+        mtime_ms: row.get(mtime_column),
+    })
+}
+
+fn local_item_with_file_file_from_row_ref(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<LocalFileSnapshot, DatabaseError> {
+    Ok(LocalFileSnapshot {
+        item_id: id_from_i64(row.get("item_id"), "local file item id")?,
+        relative_path: PathBuf::from(row.get::<String, _>("relative_path")),
+        file_name: row.get("file_name"),
+        size: byte_size_from_i64(row.get("size"), "local file size")?,
+        mtime_ms: row.get("file_mtime_ms"),
+        file_index: file_index_from_i64(row.get("file_index"), "local file index")?,
     })
 }
 
@@ -4289,6 +4315,44 @@ mod tests {
                 .iter()
                 .any(|file| file.item_id == second_item_id)
         );
+    }
+
+    #[tokio::test]
+    async fn local_item_with_largest_file_preserves_distinct_mtimes() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut item = test_local_item("Example");
+        item.media_type = MediaType::SeasonPack;
+        item.mtime_ms = Some(1_700_000_000_111);
+        let small_newer_file = LocalFile::new(
+            None,
+            PathBuf::from("Example/file-a.mkv"),
+            ByteSize::new(10),
+            FileIndex::new(0),
+        )
+        .unwrap()
+        .with_mtime_ms(Some(1_700_000_000_999));
+        let largest_older_file = LocalFile::new(
+            None,
+            PathBuf::from("Example/file-b.mkv"),
+            ByteSize::new(20),
+            FileIndex::new(1),
+        )
+        .unwrap()
+        .with_mtime_ms(Some(1_700_000_000_222));
+        repository
+            .upsert_local_item_with_files(&item, &[small_newer_file, largest_older_file])
+            .await
+            .unwrap();
+
+        let rows = repository
+            .local_items_with_largest_file_by_media_type_page(MediaType::SeasonPack, 10, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(1, rows.len());
+        assert_eq!(Some(1_700_000_000_111), rows[0].item.mtime_ms);
+        assert_eq!("file-b.mkv", rows[0].file.file_name);
+        assert_eq!(Some(1_700_000_000_222), rows[0].file.mtime_ms);
     }
 
     #[tokio::test]
