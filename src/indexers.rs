@@ -11,7 +11,7 @@ use quick_xml::escape::{resolve_predefined_entity, unescape};
 use quick_xml::events::{BytesCData, BytesRef, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 use reqwest::StatusCode;
-use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
+use reqwest::header::{CONTENT_TYPE, COOKIE, LOCATION, RETRY_AFTER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -454,6 +454,15 @@ impl CandidateDownloadClient {
             .map_err(CandidateDownloadError::from_reqwest)?;
         let status = response.status();
         if !status.is_success() {
+            if status.is_redirection()
+                && response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(is_magnet_uri)
+            {
+                return Err(CandidateDownloadError::MagnetLink);
+            }
             let retry_after = response
                 .headers()
                 .get(RETRY_AFTER)
@@ -1239,6 +1248,12 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn is_magnet_uri(value: &str) -> bool {
+    value
+        .split_once(':')
+        .is_some_and(|(scheme, _rest)| scheme.eq_ignore_ascii_case("magnet"))
+}
+
 pub fn configured_torznab_by_name(
     config: &IndexersConfig,
 ) -> Result<BTreeMap<DependencyName, ConfiguredTorznabIndexer>, IndexerConfigError> {
@@ -1501,7 +1516,10 @@ mod tests {
     use crate::secrets::ApiKey;
     use axum::Router;
     use axum::body::Body;
-    use axum::http::{HeaderValue, Request, StatusCode as AxumStatusCode, header::CONTENT_LENGTH};
+    use axum::http::{
+        HeaderValue, Request, StatusCode as AxumStatusCode,
+        header::{CONTENT_LENGTH, LOCATION},
+    };
     use axum::response::{IntoResponse, Response};
     use axum::routing::get;
     use tokio::net::TcpListener;
@@ -2218,6 +2236,38 @@ mod tests {
         ));
         assert!(CandidateDownloadPolicy::default().should_attempt(2));
         assert!(!CandidateDownloadPolicy::default().should_attempt(3));
+
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_maps_magnet_redirects() {
+        let redirect = test_candidate(
+            &spawn_torznab_server(|_request| async move {
+                (
+                    AxumStatusCode::FOUND,
+                    [(
+                        LOCATION,
+                        "MAGNET:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                    )],
+                    "",
+                )
+                    .into_response()
+            })
+            .await,
+        );
+        let cache_dir = unique_temp_dir("candidate-magnet-redirect");
+        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+
+        let error = client
+            .download_and_cache(&redirect, &cache_dir, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CandidateDownloadError::MagnetLink),
+            "{error:?}"
+        );
 
         remove_temp_dir(&cache_dir);
     }

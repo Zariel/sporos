@@ -847,6 +847,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lookup_falls_back_after_empty_arr_ids() {
+        let sonarr = endpoint(
+            ArrKind::Sonarr,
+            spawn_arr_server(|_request| async move {
+                (AxumStatusCode::OK, r#"{"series":{"tvdbId":0}}"#).into_response()
+            })
+            .await,
+        );
+        let radarr = endpoint(
+            ArrKind::Radarr,
+            spawn_arr_server(|_request| async move {
+                (AxumStatusCode::OK, r#"{"movie":{"tmdbId":99}}"#).into_response()
+            })
+            .await,
+        );
+        let client = ArrHttpClient::new(Duration::from_secs(5));
+
+        let result = client
+            .lookup_ids(
+                &[sonarr, radarr],
+                MediaType::Video,
+                &ItemTitle::new("Example.Movie.2160p.WEB-DL").unwrap(),
+                1_000,
+            )
+            .await;
+
+        assert_eq!(Some("99"), result.ids.tmdb_id.as_deref());
+        assert_eq!(2, result.attempts.len());
+        assert!(matches!(
+            result.attempts[0].outcome,
+            ArrLookupOutcome::Empty
+        ));
+        assert!(matches!(
+            result.attempts[1].outcome,
+            ArrLookupOutcome::Found { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn client_honors_endpoint_backoff_without_request() {
         let endpoint = ArrEndpoint {
             retry_after_ms: Some(5_000),
