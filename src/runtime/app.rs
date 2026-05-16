@@ -114,6 +114,30 @@ struct ProwlarrRefreshResult {
     deactivated: u64,
 }
 
+#[derive(Debug)]
+enum ProwlarrRefreshError {
+    Local(DatabaseError),
+    Remote(DatabaseError),
+}
+
+impl ProwlarrRefreshError {
+    fn as_database_error(&self) -> &DatabaseError {
+        match self {
+            Self::Local(error) | Self::Remote(error) => error,
+        }
+    }
+
+    fn into_database_error(self) -> DatabaseError {
+        match self {
+            Self::Local(error) | Self::Remote(error) => error,
+        }
+    }
+
+    fn optional_suppressible(&self) -> bool {
+        matches!(self, Self::Remote(_))
+    }
+}
+
 impl AppState {
     pub async fn refresh_torrent_client_inventories(
         &self,
@@ -210,24 +234,26 @@ impl AppState {
             let semaphore = Arc::clone(&semaphore);
             tasks.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.map_err(|error| {
-                    DatabaseError::Unavailable {
+                    ProwlarrRefreshError::Local(DatabaseError::Unavailable {
                         operation: "refresh Prowlarr source".to_owned(),
                         message: error.to_string(),
-                    }
+                    })
                 })?;
                 let required = source.required;
                 let result = state
                     .refresh_prowlarr_source_until_shutdown(&source, now_ms)
                     .await;
-                Ok::<_, DatabaseError>((required, result))
+                Ok::<_, ProwlarrRefreshError>((required, result))
             });
         }
 
         while let Some(result) = tasks.join_next().await {
-            let (required, result) = result.map_err(|error| DatabaseError::Unavailable {
+            let task_result = result.map_err(|error| DatabaseError::Unavailable {
                 operation: "refresh Prowlarr source".to_owned(),
                 message: error.to_string(),
-            })??;
+            })?;
+            let (required, result) =
+                task_result.map_err(ProwlarrRefreshError::into_database_error)?;
             match result {
                 Ok(result) => {
                     summary.refreshed += 1;
@@ -236,10 +262,10 @@ impl AppState {
                 }
                 Err(error) => {
                     summary.failed += 1;
-                    summary.last_error = Some(error.to_string());
-                    if required && !optional_failures_only {
+                    summary.last_error = Some(error.as_database_error().to_string());
+                    if !error.optional_suppressible() || (required && !optional_failures_only) {
                         tasks.abort_all();
-                        return Err(error);
+                        return Err(error.into_database_error());
                     }
                 }
             }
@@ -251,16 +277,16 @@ impl AppState {
         &self,
         source: &RuntimeProwlarrSource,
         now_ms: i64,
-    ) -> Result<ProwlarrRefreshResult, DatabaseError> {
+    ) -> Result<ProwlarrRefreshResult, ProwlarrRefreshError> {
         let mut shutdown = self.shutdown_signal.clone();
         let refresh = self.refresh_prowlarr_source(source, now_ms);
         tokio::select! {
             result = refresh => result,
             _state = shutdown.cancelled() => {
-                Err(DatabaseError::Unavailable {
+                Err(ProwlarrRefreshError::Remote(DatabaseError::Unavailable {
                     operation: "refresh Prowlarr source".to_owned(),
                     message: "shutdown requested".to_owned(),
-                })
+                }))
             }
         }
     }
@@ -269,7 +295,7 @@ impl AppState {
         &self,
         source: &RuntimeProwlarrSource,
         now_ms: i64,
-    ) -> Result<ProwlarrRefreshResult, DatabaseError> {
+    ) -> Result<ProwlarrRefreshResult, ProwlarrRefreshError> {
         let started = Instant::now();
         match self.prowlarr_client.indexers(&source.source).await {
             Ok(indexers) => {
@@ -298,7 +324,8 @@ impl AppState {
                             },
                             now_ms,
                         )
-                        .await?;
+                        .await
+                        .map_err(ProwlarrRefreshError::Local)?;
                         Ok(ProwlarrRefreshResult {
                             imported: sync.imported,
                             deactivated: sync.deactivated,
@@ -312,7 +339,7 @@ impl AppState {
                             0,
                             0,
                         );
-                        Err(error)
+                        Err(ProwlarrRefreshError::Local(error))
                     }
                 }
             }
@@ -326,11 +353,12 @@ impl AppState {
                 );
                 let state = prowlarr_error_dependency_state(&error, now_ms);
                 self.record_prowlarr_health(&source.source.name, state.clone(), now_ms)
-                    .await?;
-                Err(DatabaseError::Unavailable {
+                    .await
+                    .map_err(ProwlarrRefreshError::Local)?;
+                Err(ProwlarrRefreshError::Remote(DatabaseError::Unavailable {
                     operation: format!("refresh Prowlarr source {}", source.source.name.as_str()),
                     message: error.to_string(),
-                })
+                }))
             }
         }
     }
@@ -1658,6 +1686,54 @@ mod tests {
         assert_eq!("prowlarr", health[0].dependency_type);
         assert_eq!("unavailable", health[0].state);
         assert!(health[0].retry_after_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_optional_prowlarr_refresh_surfaces_database_failure() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let prowlarr_url = spawn_runtime_prowlarr_server(
+            Arc::clone(&requests),
+            StatusCode::OK,
+            prowlarr_catalog(),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, false, false, "24h"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER fail_prowlarr_sync
+            BEFORE INSERT ON indexers
+            BEGIN
+                SELECT RAISE(FAIL, 'forced prowlarr sync failure');
+            END;
+            "#,
+        )
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        let due_at = runtime
+            .state
+            .prowlarr_sources
+            .values()
+            .next()
+            .unwrap()
+            .initial_refresh_after_ms;
+
+        let error = runtime
+            .state
+            .refresh_due_prowlarr_sources(due_at)
+            .await
+            .unwrap_err();
+
+        assert_eq!(1, requests.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("forced prowlarr sync failure"));
     }
 
     #[tokio::test]
