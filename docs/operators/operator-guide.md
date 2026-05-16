@@ -66,6 +66,17 @@ download = "30s"
 url = "https://indexer.example/api"
 api_key_file = "/var/run/secrets/indexer-api-key"
 
+[indexers.prowlarr.main]
+url = "https://prowlarr.example"
+api_key_file = "/var/run/secrets/prowlarr-api-key"
+update_interval = "24h"
+tags = ["movies", "hd"]
+tag_match = "any"
+include_untagged = true
+refresh_on_startup = true
+required = false
+remove_policy = "deactivate"
+
 [matching]
 mode = "partial"
 fuzzy_size_threshold = 0.02
@@ -105,6 +116,70 @@ Supported indexers are Torznab-compatible endpoints. Put API keys in
 `api_key_file`, `api_key_env`, or development-only `api_key`; do not put API
 keys in the indexer URL query string.
 
+## Prowlarr Discovery
+
+Prowlarr discovery is optional. Configure one or more named
+`[indexers.prowlarr.<name>]` sources when Sporos should import Torznab endpoints
+from Prowlarr instead of listing every indexer under `indexers.torznab`.
+
+```toml
+[indexers.prowlarr.main]
+url = "https://prowlarr.example"
+api_key_file = "/var/run/secrets/prowlarr-api-key"
+update_interval = "24h"
+tags = ["movies", "hd"]
+tag_match = "any"
+include_untagged = true
+refresh_on_startup = true
+required = false
+remove_policy = "deactivate"
+```
+
+Use `url` for the Prowlarr address; `base_url` is accepted as an alias. The
+value should be the Prowlarr base URL, without `/api/v1` and without an API key
+query parameter. Sporos contacts `/api/v1/indexer`, reads tag labels from
+`/api/v1/tag` when tag names need resolving, and builds imported Torznab proxy
+URLs through the configured Prowlarr source.
+
+Prowlarr API keys support `api_key_file`, `api_key_env`, and local-development
+`api_key`, with the same one-source-only rule as direct Torznab keys. For
+Kubernetes, mount the key as a secret file and point `api_key_file` at the
+mounted path. If the key is provided through the process environment instead,
+set the TOML field to `api_key_env = "PROWLARR_API_KEY"` or use an environment
+override such as:
+
+```bash
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV='"PROWLARR_API_KEY"'
+```
+
+`update_interval` controls the periodic refresh cadence. `refresh_on_startup`
+performs an immediate refresh during startup when true; when false, the first
+daemon refresh waits for the configured interval plus deterministic jitter.
+`required = true` makes startup fail if the startup refresh fails. The default
+`required = false` records the source as degraded and lets Sporos continue so
+operators can fix Prowlarr without restarting the service.
+
+Only enabled Prowlarr indexers whose protocol is `torrent` and which support RSS
+or search are imported. Tag filters apply before import. With `tags = []`, all
+tagged indexers are imported and `include_untagged` decides whether untagged
+indexers are also imported. With configured tags, `tag_match = "any"` imports an
+indexer that has at least one configured tag, while `tag_match = "all"` requires
+every configured tag. Prowlarr may return numeric tag IDs; Sporos resolves tag
+labels when needed, and numeric tag IDs can also be configured directly.
+
+Imported indexers keep a stable source identity from the Prowlarr source name
+and Prowlarr indexer id, so Prowlarr renames update the existing Sporos row
+rather than creating a new one. `remove_policy = "deactivate"` deactivates
+previously imported rows that disappear from Prowlarr, are disabled there, no
+longer match tags, or no longer look Torznab-compatible. The `ignore` remove
+policy leaves previously imported rows active when they are absent from the
+current refresh result.
+
+Prowlarr outages are dependency degradation unless the source is required at
+startup. Failed refreshes update health and retry/backoff state; previously
+imported indexers remain in their last synced state until a later successful
+refresh applies additions, updates, or deactivations.
+
 ## Environment Overrides
 
 Scalar config fields can be overridden with `SPOROS__` environment variables.
@@ -119,6 +194,7 @@ SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD='0.02'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-password"'
 SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_FILE='"/var/run/secrets/indexer-api-key"'
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE='"/var/run/secrets/prowlarr-api-key"'
 ```
 
 Override values are parsed as TOML scalars first. Quote string values when the
@@ -132,13 +208,15 @@ sources. Callers must send it as `Authorization: Bearer <token>` when using
 mutating workflow endpoints.
 
 Torrent client passwords support `password`, `password_file`, and
-`password_env`. Torznab indexer keys support `api_key`, `api_key_file`, and
-`api_key_env`.
+`password_env`. Torznab and Prowlarr indexer keys support `api_key`,
+`api_key_file`, and `api_key_env`.
 
 Use file or environment-backed secrets in production. Inline `password` and
 `api_key` values are for local development. Secret wrappers redact debug and
 display output, and operator endpoints intentionally avoid exposing request
-cookies, API keys, passkeys, and secret-bearing URLs.
+cookies, API keys, passkeys, and secret-bearing URLs. Prowlarr API keys and the
+keys attached to imported Prowlarr indexers are redacted from logs, metrics,
+status, support output, and validation errors.
 
 ## Paths And State
 
