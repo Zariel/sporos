@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -110,6 +112,7 @@ impl ClientInventoryItem {
 pub enum InventoryRefreshError {
     InvalidClientInventory { message: String },
     ScanWorkerFailed { message: String },
+    Cancelled { message: String },
     Client { source: TorrentClientError },
     Database { source: DatabaseError },
 }
@@ -118,19 +121,48 @@ pub enum InventoryRefreshError {
 pub struct InventoryRefreshWorker {
     repository: Repository,
     scan_options: InventoryScanOptions,
+    #[cfg(test)]
+    data_root_scan_send_attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl InventoryRefreshWorker {
-    pub const fn new(repository: Repository, scan_options: InventoryScanOptions) -> Self {
+    pub fn new(repository: Repository, scan_options: InventoryScanOptions) -> Self {
         Self {
             repository,
             scan_options,
+            #[cfg(test)]
+            data_root_scan_send_attempts: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_data_root_scan_send_attempts(
+        mut self,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.data_root_scan_send_attempts = Some(attempts);
+        self
     }
 
     pub async fn refresh_data_dirs(
         &self,
         request: InventoryRefreshRequest,
+    ) -> Result<InventoryRefreshSummary, InventoryRefreshError> {
+        self.refresh_data_dirs_inner(request, None).await
+    }
+
+    pub async fn refresh_data_dirs_until_shutdown(
+        &self,
+        request: InventoryRefreshRequest,
+        shutdown: ShutdownSignal,
+    ) -> Result<InventoryRefreshSummary, InventoryRefreshError> {
+        self.refresh_data_dirs_inner(request, Some(shutdown)).await
+    }
+
+    async fn refresh_data_dirs_inner(
+        &self,
+        request: InventoryRefreshRequest,
+        mut shutdown: Option<ShutdownSignal>,
     ) -> Result<InventoryRefreshSummary, InventoryRefreshError> {
         let _span = info_span!(
             "inventory.refresh_data_dirs",
@@ -138,25 +170,67 @@ impl InventoryRefreshWorker {
         );
         let scanner = InventoryScanner::new(self.scan_options);
         let (sender, receiver) = mpsc::channel(DATA_ROOT_SCAN_BUFFER);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let scanner_cancelled = cancelled.clone();
+        #[cfg(test)]
+        let send_attempts = self.data_root_scan_send_attempts.clone();
         let scan_task = task::spawn_blocking(move || {
-            let report = scanner.scan_media_dirs_with(&request.media_dirs, |scanned| {
-                sender
-                    .blocking_send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
-                        item: scanned.item,
-                        files: scanned.files,
-                    }))
-                    .is_ok()
-            });
-            let _ = sender.blocking_send(OwnedLocalInventoryMessage::Finished);
+            let report = scanner.scan_media_dirs_until(
+                &request.media_dirs,
+                || !scanner_cancelled.load(Ordering::Relaxed),
+                |scanned| {
+                    if scanner_cancelled.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    if let Some(send_attempts) = &send_attempts {
+                        send_attempts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    sender
+                        .blocking_send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                            item: scanned.item,
+                            files: scanned.files,
+                        }))
+                        .is_ok()
+                },
+            );
+            if !scanner_cancelled.load(Ordering::Relaxed) {
+                let _ = sender.blocking_send(OwnedLocalInventoryMessage::Finished);
+            }
             report
         });
-        let replace_result = self
-            .repository
-            .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver)
-            .await;
+        let mut replace = Box::pin(
+            self.repository
+                .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver),
+        );
+        let replace_result = if let Some(shutdown) = shutdown.as_mut() {
+            let mut cancelled_by_shutdown = false;
+            let selected = tokio::select! {
+                result = replace.as_mut() => Some(result),
+                _state = shutdown.cancelled() => {
+                    cancelled_by_shutdown = true;
+                    None
+                }
+            };
+            if cancelled_by_shutdown {
+                cancelled.store(true, Ordering::Relaxed);
+                drop(replace);
+                let _ = scan_task.await;
+                return Err(InventoryRefreshError::Cancelled {
+                    message: "shutdown requested".to_owned(),
+                });
+            }
+            selected.ok_or_else(|| DatabaseError::Unavailable {
+                operation: "refresh inventory".to_owned(),
+                message: "inventory refresh ended without repository result".to_owned(),
+            })?
+        } else {
+            replace.await
+        };
         let LocalInventoryReplaceSummary { upserted, pruned } = match replace_result {
             Ok(summary) => summary,
             Err(error) => {
+                cancelled.store(true, Ordering::Relaxed);
                 let _ = scan_task.await;
                 return Err(error.into());
             }
@@ -328,7 +402,10 @@ async fn run_inventory_refresh_with_retry(
 ) -> bool {
     let mut delay = INVENTORY_REFRESH_RETRY_INITIAL;
     loop {
-        match worker.refresh_data_dirs(request.clone()).await {
+        match worker
+            .refresh_data_dirs_until_shutdown(request.clone(), shutdown.clone())
+            .await
+        {
             Ok(summary) if summary.scan_failures.is_empty() => {
                 record_inventory_refresh_health(worker, None, None).await;
                 return true;
@@ -339,6 +416,7 @@ async fn run_inventory_refresh_with_retry(
                 record_inventory_refresh_health(worker, Some(reason), None).await;
                 return true;
             }
+            Err(InventoryRefreshError::Cancelled { .. }) => return false,
             Err(error) => {
                 let reason = error.to_string();
                 warn!(error = %reason, "inventory refresh failed; retrying");
@@ -431,6 +509,9 @@ impl fmt::Display for InventoryRefreshError {
             Self::ScanWorkerFailed { message } => {
                 write!(formatter, "inventory scan worker failed: {message}")
             }
+            Self::Cancelled { message } => {
+                write!(formatter, "inventory refresh cancelled: {message}")
+            }
             Self::Client { source } => write!(formatter, "{source}"),
             Self::Database { source } => write!(formatter, "{source}"),
         }
@@ -442,6 +523,7 @@ impl Error for InventoryRefreshError {
         match self {
             Self::InvalidClientInventory { .. } => None,
             Self::ScanWorkerFailed { .. } => None,
+            Self::Cancelled { .. } => None,
             Self::Client { source } => Some(source),
             Self::Database { source } => Some(source),
         }
@@ -499,6 +581,91 @@ mod tests {
         assert_eq!(1, file.len());
         assert_eq!(ByteSize::new(10), file[0].size);
         assert!(file[0].mtime_ms.is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_until_shutdown_cancels_before_scan() {
+        let root = unique_temp_dir("shutdown-before-scan");
+        let release = root.join("Movie.2026.1080p");
+        fs::create_dir_all(&release).unwrap();
+        write_file(&release.join("movie.mkv"), 10);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let (shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        shutdown.cancel_now("test shutdown").unwrap();
+
+        let error = worker
+            .refresh_data_dirs_until_shutdown(
+                InventoryRefreshRequest {
+                    media_dirs: vec![root.clone()],
+                },
+                signal,
+            )
+            .await
+            .unwrap_err();
+        let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert!(matches!(error, InventoryRefreshError::Cancelled { .. }));
+        assert_eq!(0, local_count);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_until_shutdown_cancels_mid_scan() {
+        let root = unique_temp_dir("shutdown-mid-scan");
+        for index in 0..128 {
+            let release = root.join(format!("Movie.{index:03}.2026.1080p"));
+            fs::create_dir_all(&release).unwrap();
+            write_file(&release.join("movie.mkv"), 10);
+        }
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let send_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default())
+                .with_data_root_scan_send_attempts(send_attempts.clone());
+        let mut lock = repository.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let (shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        let scan_root = root.clone();
+        let refresh = tokio::spawn(async move {
+            worker
+                .refresh_data_dirs_until_shutdown(
+                    InventoryRefreshRequest {
+                        media_dirs: vec![scan_root],
+                    },
+                    signal,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while send_attempts.load(Ordering::SeqCst) <= DATA_ROOT_SCAN_BUFFER {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel_now("test shutdown").unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+
+        assert!(matches!(error, InventoryRefreshError::Cancelled { .. }));
 
         fs::remove_dir_all(root).unwrap();
     }
