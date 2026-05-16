@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +31,12 @@ pub struct ScannedLocalItem {
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct InventoryScanReport {
     pub items: Vec<ScannedLocalItem>,
+    pub failures: Vec<InventoryScanFailure>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct InventoryScanStreamReport {
+    pub scanned_items: usize,
     pub failures: Vec<InventoryScanFailure>,
 }
 
@@ -242,6 +247,12 @@ struct AnimeEpisode {
     episode: u16,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct RootDiscoveryOutcome {
+    emitted: bool,
+    keep_going: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct InventoryScanner {
     options: InventoryScanOptions,
@@ -253,19 +264,56 @@ impl InventoryScanner {
     }
 
     pub fn scan_media_dirs(&self, media_dirs: &[PathBuf]) -> InventoryScanReport {
-        let mut report = InventoryScanReport::default();
-        for media_dir in media_dirs {
-            let roots = self.discover_roots(media_dir, &mut report);
-            for root in roots {
-                if let Some(item) = self.scan_item_root(&root, &mut report) {
-                    report.items.push(item);
-                }
-            }
+        let mut items = Vec::new();
+        let report = self.scan_media_dirs_with(media_dirs, |item| {
+            items.push(item);
+            true
+        });
+
+        InventoryScanReport {
+            items,
+            failures: report.failures,
         }
-        report
     }
 
-    fn discover_roots(&self, root: &Path, report: &mut InventoryScanReport) -> Vec<PathBuf> {
+    pub fn scan_media_dirs_with<F>(
+        &self,
+        media_dirs: &[PathBuf],
+        mut on_item: F,
+    ) -> InventoryScanStreamReport
+    where
+        F: FnMut(ScannedLocalItem) -> bool,
+    {
+        let mut report = InventoryScanReport::default();
+        let mut scanned_items = 0usize;
+        for media_dir in media_dirs {
+            let outcome = self.discover_roots_with(media_dir, &mut report, &mut |root, report| {
+                if let Some(item) = self.scan_item_root(&root, report) {
+                    scanned_items = scanned_items.saturating_add(1);
+                    on_item(item)
+                } else {
+                    true
+                }
+            });
+            if !outcome.keep_going {
+                break;
+            }
+        }
+        InventoryScanStreamReport {
+            scanned_items,
+            failures: report.failures,
+        }
+    }
+
+    fn discover_roots_with<F>(
+        &self,
+        root: &Path,
+        report: &mut InventoryScanReport,
+        on_root: &mut F,
+    ) -> RootDiscoveryOutcome
+    where
+        F: FnMut(PathBuf, &mut InventoryScanReport) -> bool,
+    {
         let Ok(metadata) = fs::symlink_metadata(root) else {
             push_io_failure(
                 report,
@@ -273,33 +321,52 @@ impl InventoryScanner {
                 InventoryScanFailureKind::Metadata,
                 "read metadata",
             );
-            return Vec::new();
+            return RootDiscoveryOutcome {
+                emitted: false,
+                keep_going: true,
+            };
         };
 
         if metadata.is_file() {
             return if is_video_file(root) {
-                vec![root.to_path_buf()]
+                RootDiscoveryOutcome {
+                    emitted: true,
+                    keep_going: on_root(root.to_path_buf(), report),
+                }
             } else {
-                Vec::new()
+                RootDiscoveryOutcome {
+                    emitted: false,
+                    keep_going: true,
+                }
             };
         }
 
         if !metadata.is_dir() {
-            return Vec::new();
+            return RootDiscoveryOutcome {
+                emitted: false,
+                keep_going: true,
+            };
         }
 
-        self.discover_directory_roots(root, 0, true, report)
+        self.discover_directory_roots(root, 0, true, report, on_root)
     }
 
-    fn discover_directory_roots(
+    fn discover_directory_roots<F>(
         &self,
         dir: &Path,
         depth: u16,
         is_scan_root: bool,
         report: &mut InventoryScanReport,
-    ) -> Vec<PathBuf> {
+        on_root: &mut F,
+    ) -> RootDiscoveryOutcome
+    where
+        F: FnMut(PathBuf, &mut InventoryScanReport) -> bool,
+    {
         if !is_scan_root && should_ignore_dir(dir) {
-            return Vec::new();
+            return RootDiscoveryOutcome {
+                emitted: false,
+                keep_going: true,
+            };
         }
 
         if !path_has_utf8_name(dir) {
@@ -309,7 +376,10 @@ impl InventoryScanner {
                 InventoryScanFailureKind::NonUtf8Path,
                 "directory name is not valid UTF-8",
             );
-            return Vec::new();
+            return RootDiscoveryOutcome {
+                emitted: false,
+                keep_going: true,
+            };
         }
 
         let Ok(entries) = fs::read_dir(dir) else {
@@ -319,11 +389,13 @@ impl InventoryScanner {
                 InventoryScanFailureKind::ReadDirectory,
                 "read directory",
             );
-            return Vec::new();
+            return RootDiscoveryOutcome {
+                emitted: false,
+                keep_going: true,
+            };
         };
 
-        let mut direct_files = Vec::new();
-        let mut child_roots = Vec::new();
+        let mut child_emitted = false;
         for entry in entries {
             let Ok(entry) = entry else {
                 push_io_failure(
@@ -345,29 +417,102 @@ impl InventoryScanner {
                 continue;
             };
 
-            if metadata.is_dir() {
-                if depth < self.options.max_depth {
-                    child_roots.extend(self.discover_directory_roots(
-                        &path,
-                        depth + 1,
-                        false,
-                        report,
-                    ));
-                }
-            } else if metadata.is_file() && is_video_file(&path) {
-                if is_scan_root {
-                    direct_files.push(path);
-                } else {
-                    direct_files.push(dir.to_path_buf());
+            if metadata.is_dir() && depth < self.options.max_depth {
+                let outcome =
+                    self.discover_directory_roots(&path, depth + 1, false, report, on_root);
+                child_emitted |= outcome.emitted;
+                if !outcome.keep_going {
+                    return RootDiscoveryOutcome {
+                        emitted: child_emitted,
+                        keep_going: false,
+                    };
                 }
             }
         }
 
-        if !child_roots.is_empty() {
-            return child_roots;
+        if child_emitted {
+            return RootDiscoveryOutcome {
+                emitted: true,
+                keep_going: true,
+            };
         }
 
-        dedupe_preserving_order(direct_files)
+        self.discover_direct_file_roots(dir, is_scan_root, report, on_root)
+    }
+
+    fn discover_direct_file_roots<F>(
+        &self,
+        dir: &Path,
+        is_scan_root: bool,
+        report: &mut InventoryScanReport,
+        on_root: &mut F,
+    ) -> RootDiscoveryOutcome
+    where
+        F: FnMut(PathBuf, &mut InventoryScanReport) -> bool,
+    {
+        let Ok(entries) = fs::read_dir(dir) else {
+            push_io_failure(
+                report,
+                dir,
+                InventoryScanFailureKind::ReadDirectory,
+                "read directory",
+            );
+            return RootDiscoveryOutcome {
+                emitted: false,
+                keep_going: true,
+            };
+        };
+
+        let mut emitted = false;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                push_io_failure(
+                    report,
+                    dir,
+                    InventoryScanFailureKind::ReadDirectory,
+                    "read directory entry",
+                );
+                continue;
+            };
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                push_io_failure(
+                    report,
+                    &path,
+                    InventoryScanFailureKind::Metadata,
+                    "read metadata",
+                );
+                continue;
+            };
+
+            if !metadata.is_file() || !is_video_file(&path) {
+                continue;
+            }
+
+            let root = if is_scan_root {
+                path
+            } else {
+                dir.to_path_buf()
+            };
+            emitted = true;
+            if !on_root(root, report) {
+                return RootDiscoveryOutcome {
+                    emitted,
+                    keep_going: false,
+                };
+            }
+            if !is_scan_root {
+                return RootDiscoveryOutcome {
+                    emitted: true,
+                    keep_going: true,
+                };
+            }
+        }
+
+        RootDiscoveryOutcome {
+            emitted,
+            keep_going: true,
+        }
     }
 
     fn scan_item_root(
@@ -910,17 +1055,6 @@ fn path_has_utf8_name(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name.to_str().is_some())
 }
 
-fn dedupe_preserving_order(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut unique = Vec::new();
-    let mut pending = VecDeque::from(paths);
-    while let Some(path) = pending.pop_front() {
-        if !unique.iter().any(|existing| existing == &path) {
-            unique.push(path);
-        }
-    }
-    unique
-}
-
 fn push_io_failure(
     report: &mut InventoryScanReport,
     path: &Path,
@@ -1150,6 +1284,82 @@ mod tests {
         assert_eq!(Some(release), scanned.item.path);
         assert_eq!(1, scanned.files.len());
         assert_eq!(PathBuf::from("movie.mkv"), scanned.files[0].relative_path);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_media_dirs_with_streams_items_without_collecting_report_items() {
+        let root = unique_temp_dir("stream");
+        let first = root.join("First.2024.1080p");
+        let second = root.join("Second.2024.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("first.mkv"), 10);
+        write_file(&second.join("second.mkv"), 20);
+        let scanner = InventoryScanner::new(InventoryScanOptions { max_depth: 3 });
+        let mut names = Vec::new();
+
+        let report = scanner.scan_media_dirs_with(std::slice::from_ref(&root), |item| {
+            names.push(item.item.display_name.as_str().to_owned());
+            true
+        });
+        names.sort();
+
+        assert!(report.failures.is_empty());
+        assert_eq!(2, report.scanned_items);
+        assert_eq!(
+            vec![
+                "First.2024.1080p".to_owned(),
+                "Second.2024.1080p".to_owned()
+            ],
+            names
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_media_dirs_with_stops_after_callback_returns_false() {
+        let root = unique_temp_dir("stream-stop");
+        let first = root.join("First.2024.1080p");
+        let second = root.join("Second.2024.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("first.mkv"), 10);
+        write_file(&second.join("second.mkv"), 20);
+        let scanner = InventoryScanner::new(InventoryScanOptions { max_depth: 3 });
+        let mut names = Vec::new();
+
+        let report = scanner.scan_media_dirs_with(std::slice::from_ref(&root), |item| {
+            names.push(item.item.display_name.as_str().to_owned());
+            false
+        });
+
+        assert!(report.failures.is_empty());
+        assert_eq!(1, report.scanned_items);
+        assert_eq!(1, names.len());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_media_dirs_with_stops_after_direct_file_callback_returns_false() {
+        let root = unique_temp_dir("stream-stop-direct");
+        fs::create_dir_all(&root).unwrap();
+        write_file(&root.join("first.mkv"), 10);
+        write_file(&root.join("second.mkv"), 20);
+        let scanner = InventoryScanner::new(InventoryScanOptions { max_depth: 3 });
+        let mut names = Vec::new();
+
+        let report = scanner.scan_media_dirs_with(std::slice::from_ref(&root), |item| {
+            names.push(item.item.display_name.as_str().to_owned());
+            false
+        });
+
+        assert!(report.failures.is_empty());
+        assert_eq!(1, report.scanned_items);
+        assert_eq!(1, names.len());
 
         fs::remove_dir_all(root).unwrap();
     }

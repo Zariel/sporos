@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{info_span, warn};
 
@@ -16,7 +17,8 @@ use crate::inventory::{
     InventoryScanFailure, InventoryScanOptions, InventoryScanner, ScannedLocalItem,
 };
 use crate::persistence::repository::{
-    LocalInventoryReplaceSummary, LocalInventoryScope, LocalItemFileBatch, Repository,
+    LocalInventoryReplaceSummary, LocalInventoryScope, LocalItemFileBatch,
+    OwnedLocalInventoryMessage, OwnedLocalItemFileBatch, Repository,
 };
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::DependencyKind;
@@ -26,6 +28,7 @@ use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 const INVENTORY_REFRESH_DEPENDENCY: &str = "inventory-refresh";
 const INVENTORY_REFRESH_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const INVENTORY_REFRESH_RETRY_MAX: Duration = Duration::from_secs(5);
+const DATA_ROOT_SCAN_BUFFER: usize = 64;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InventoryRefreshRequest {
@@ -126,26 +129,42 @@ impl InventoryRefreshWorker {
             media_dir_count = request.media_dirs.len()
         );
         let scanner = InventoryScanner::new(self.scan_options);
+        let (sender, receiver) = mpsc::channel(DATA_ROOT_SCAN_BUFFER);
+        let scan_task = task::spawn_blocking(move || {
+            let report = scanner.scan_media_dirs_with(&request.media_dirs, |scanned| {
+                sender
+                    .blocking_send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                        item: scanned.item,
+                        files: scanned.files,
+                    }))
+                    .is_ok()
+            });
+            let _ = sender.blocking_send(OwnedLocalInventoryMessage::Finished);
+            report
+        });
+        let replace_result = self
+            .repository
+            .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver)
+            .await;
+        let LocalInventoryReplaceSummary { upserted, pruned } = match replace_result {
+            Ok(summary) => summary,
+            Err(error) => {
+                let _ = scan_task.await;
+                return Err(error.into());
+            }
+        };
         let scan_report =
-            task::spawn_blocking(move || scanner.scan_media_dirs(&request.media_dirs))
+            scan_task
                 .await
                 .map_err(|error| InventoryRefreshError::ScanWorkerFailed {
                     message: error.to_string(),
                 })?;
-        let scanned_items = scan_report.items.len();
-        let LocalInventoryReplaceSummary { upserted, pruned } = self
-            .repository
-            .replace_local_inventory_stream(
-                LocalInventoryScope::DataRoot,
-                scan_report.items.iter().map(local_item_file_batch),
-            )
-            .await?;
         self.repository
             .wake_announce_inventory_refresh(unix_time_ms(), 1_000)
             .await?;
 
         Ok(InventoryRefreshSummary {
-            scanned_items,
+            scanned_items: scan_report.scanned_items,
             persisted_items: upserted,
             pruned_items: pruned,
             scan_failures: scan_report.failures,

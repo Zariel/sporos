@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use tokio::sync::mpsc;
 use tracing::{debug_span, info_span};
 
 use crate::announce::{
@@ -67,6 +68,18 @@ pub struct AnnounceQueueSnapshot {
 pub struct LocalItemFileBatch<'a> {
     pub item: &'a LocalItem,
     pub files: &'a [LocalFile],
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OwnedLocalItemFileBatch {
+    pub item: LocalItem,
+    pub files: Vec<LocalFile>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum OwnedLocalInventoryMessage {
+    Item(OwnedLocalItemFileBatch),
+    Finished,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -356,6 +369,65 @@ impl Repository {
                 .await?;
             insert_retained_key(&mut transaction, &source_key).await?;
             upserted = upserted.saturating_add(1);
+        }
+
+        let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
+
+        clear_retained_keys(&mut transaction).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit local inventory transaction", error))?;
+
+        Ok(LocalInventoryReplaceSummary { upserted, pruned })
+    }
+
+    pub async fn replace_local_inventory_owned_receiver(
+        &self,
+        scope: LocalInventoryScope,
+        mut items: mpsc::Receiver<OwnedLocalInventoryMessage>,
+    ) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
+        let _span = info_span!("inventory.replace", source_type = scope.source_type());
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("begin local inventory transaction", error))?;
+
+        if let LocalInventoryScope::Client { client_host } = &scope {
+            normalize_client_source_keys(&mut transaction, client_host).await?;
+        }
+        initialize_retained_keys(&mut transaction).await?;
+
+        let mut upserted = 0usize;
+        let mut finished = false;
+        while let Some(message) = items.recv().await {
+            let OwnedLocalInventoryMessage::Item(batch) = message else {
+                finished = true;
+                break;
+            };
+            let (source_type, source_key) = local_source(&batch.item.source);
+            if !scope.accepts(&source_type, &source_key) {
+                return Err(DatabaseError::QueryFailed {
+                    operation: "validate local inventory refresh scope".to_owned(),
+                    message: format!("item source {source_type}:{source_key} is outside {scope:?}"),
+                });
+            }
+
+            upsert_local_item_with_files_in_transaction(
+                &mut transaction,
+                &batch.item,
+                &batch.files,
+            )
+            .await?;
+            insert_retained_key(&mut transaction, &source_key).await?;
+            upserted = upserted.saturating_add(1);
+        }
+        if !finished {
+            return Err(DatabaseError::QueryFailed {
+                operation: "replace local inventory stream".to_owned(),
+                message: "inventory stream ended before completion marker".to_owned(),
+            });
         }
 
         let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
@@ -3406,6 +3478,71 @@ mod tests {
         assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
         assert_eq!("Original", title);
         assert_eq!(1, file_count);
+    }
+
+    #[tokio::test]
+    async fn unfinished_owned_inventory_stream_rolls_back_partial_refresh() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut existing = test_local_item("Existing");
+        existing.source = LocalItemSource::DataRoot {
+            path: PathBuf::from("/media/existing"),
+        };
+        existing.info_hash = None;
+        existing.path = Some(PathBuf::from("/media/existing"));
+        let existing_file = LocalFile::new(
+            None,
+            PathBuf::from("existing.mkv"),
+            ByteSize::new(10),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        repository
+            .upsert_local_item_with_files(&existing, &[existing_file])
+            .await
+            .unwrap();
+
+        let mut partial = test_local_item("Partial");
+        partial.source = LocalItemSource::DataRoot {
+            path: PathBuf::from("/media/partial"),
+        };
+        partial.info_hash = None;
+        partial.path = Some(PathBuf::from("/media/partial"));
+        let partial_file = LocalFile::new(
+            None,
+            PathBuf::from("partial.mkv"),
+            ByteSize::new(20),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                item: partial,
+                files: vec![partial_file],
+            }))
+            .await
+            .unwrap();
+        drop(sender);
+
+        let result = repository
+            .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver)
+            .await;
+        let existing_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_items WHERE source_key = ?")
+                .bind("/media/existing")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let partial_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_items WHERE source_key = ?")
+                .bind("/media/partial")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
+        assert_eq!(1, existing_count);
+        assert_eq!(0, partial_count);
     }
 
     #[tokio::test]
