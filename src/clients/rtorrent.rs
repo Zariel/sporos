@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -86,6 +87,30 @@ impl RtorrentClient {
             )?);
         }
         Ok(downloads)
+    }
+
+    pub async fn list_inventory_chunks<F, Fut>(
+        &self,
+        mut on_chunk: F,
+    ) -> Result<usize, TorrentClientError>
+    where
+        F: FnMut(Vec<RtorrentDownload>) -> Fut,
+        Fut: Future<Output = Result<(), TorrentClientError>>,
+    {
+        let hashes = self.download_hashes().await?;
+        let mut total = 0usize;
+        for chunk in hashes.chunks(RTORRENT_INVENTORY_CHUNK_SIZE) {
+            let response = self
+                .call("system.multicall", vec![inventory_multicall_param(chunk)])
+                .await?;
+            let downloads = parse_inventory_response(&self.client_name, chunk, &response)?;
+            let chunk_len = downloads.len();
+            total = total.saturating_add(chunk_len);
+            if chunk_len > 0 {
+                on_chunk(downloads).await?;
+            }
+        }
+        Ok(total)
     }
 
     pub async fn download_info(
@@ -1168,6 +1193,32 @@ mod tests {
         let inventory = client.list_inventory().await.unwrap();
 
         assert_eq!(RTORRENT_INVENTORY_CHUNK_SIZE + 1, inventory.len());
+        assert_eq!(
+            vec![RTORRENT_INVENTORY_CHUNK_SIZE, 1],
+            *seen_chunks.lock().unwrap()
+        );
+
+        seen_chunks.lock().unwrap().clear();
+        let streamed_chunks = Arc::new(StdMutex::new(Vec::<usize>::new()));
+        let streamed = client
+            .list_inventory_chunks({
+                let streamed_chunks = streamed_chunks.clone();
+                move |chunk| {
+                    let streamed_chunks = streamed_chunks.clone();
+                    async move {
+                        streamed_chunks.lock().unwrap().push(chunk.len());
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(RTORRENT_INVENTORY_CHUNK_SIZE + 1, streamed);
+        assert_eq!(
+            vec![RTORRENT_INVENTORY_CHUNK_SIZE, 1],
+            *streamed_chunks.lock().unwrap()
+        );
         assert_eq!(
             vec![RTORRENT_INVENTORY_CHUNK_SIZE, 1],
             *seen_chunks.lock().unwrap()

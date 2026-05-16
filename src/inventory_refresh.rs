@@ -12,7 +12,7 @@ use crate::domain::{
     ClientHost, DependencyName, DependencyState, DisplayName, InfoHash, ItemTitle, LocalFile,
     LocalItem, LocalItemSource, MediaType, ReasonText, SourceKey, TorrentFile, checked_file_total,
 };
-use crate::errors::DatabaseError;
+use crate::errors::{DatabaseError, TorrentClientError};
 use crate::inventory::{
     InventoryScanFailure, InventoryScanOptions, InventoryScanner, ScannedLocalItem,
 };
@@ -29,6 +29,7 @@ const INVENTORY_REFRESH_DEPENDENCY: &str = "inventory-refresh";
 const INVENTORY_REFRESH_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const INVENTORY_REFRESH_RETRY_MAX: Duration = Duration::from_secs(5);
 const DATA_ROOT_SCAN_BUFFER: usize = 64;
+const CLIENT_INVENTORY_BUFFER: usize = 64;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InventoryRefreshRequest {
@@ -51,6 +52,12 @@ pub struct ClientInventoryItem {
     pub media_type: MediaType,
     pub save_path: PathBuf,
     pub files: Vec<TorrentFile>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ClientInventoryMessage {
+    Item(ClientInventoryItem),
+    Finished,
 }
 
 impl ClientInventoryItem {
@@ -103,6 +110,7 @@ impl ClientInventoryItem {
 pub enum InventoryRefreshError {
     InvalidClientInventory { message: String },
     ScanWorkerFailed { message: String },
+    Client { source: TorrentClientError },
     Database { source: DatabaseError },
 }
 
@@ -196,6 +204,77 @@ impl InventoryRefreshWorker {
 
         Ok(InventoryRefreshSummary {
             scanned_items: items.len(),
+            persisted_items: upserted,
+            pruned_items: pruned,
+            scan_failures: Vec::new(),
+        })
+    }
+
+    pub async fn refresh_client_inventory_receiver(
+        &self,
+        client_host: ClientHost,
+        mut items: mpsc::Receiver<ClientInventoryMessage>,
+    ) -> Result<InventoryRefreshSummary, InventoryRefreshError> {
+        let _span = info_span!(
+            "inventory.refresh_client_items",
+            client_host = %client_host
+        );
+        let (sender, receiver) = mpsc::channel(CLIENT_INVENTORY_BUFFER);
+        let transform_host = client_host.clone();
+        let transform_task = tokio::spawn(async move {
+            let mut scanned_items = 0usize;
+            while let Some(message) = items.recv().await {
+                let ClientInventoryMessage::Item(item) = message else {
+                    let _ = sender.send(OwnedLocalInventoryMessage::Finished).await;
+                    return Ok(scanned_items);
+                };
+                if item.client_host != transform_host {
+                    return Err(InventoryRefreshError::InvalidClientInventory {
+                        message: format!(
+                            "client inventory item for {} is outside {} refresh",
+                            item.client_host.as_str(),
+                            transform_host.as_str()
+                        ),
+                    });
+                }
+                let scanned = item.into_scanned()?;
+                let message = OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                    item: scanned.item,
+                    files: scanned.files,
+                });
+                if sender.send(message).await.is_err() {
+                    return Ok(scanned_items);
+                }
+                scanned_items = scanned_items.saturating_add(1);
+            }
+
+            Err(InventoryRefreshError::InvalidClientInventory {
+                message: "client inventory stream ended before completion marker".to_owned(),
+            })
+        });
+
+        let replace_result = self
+            .repository
+            .replace_local_inventory_owned_receiver(
+                LocalInventoryScope::Client {
+                    client_host: client_host.clone(),
+                },
+                receiver,
+            )
+            .await;
+        let scanned_items =
+            transform_task
+                .await
+                .map_err(|error| InventoryRefreshError::ScanWorkerFailed {
+                    message: error.to_string(),
+                })??;
+        let LocalInventoryReplaceSummary { upserted, pruned } = replace_result?;
+        self.repository
+            .wake_announce_client_source_completion(&client_host, unix_time_ms(), 1_000)
+            .await?;
+
+        Ok(InventoryRefreshSummary {
+            scanned_items,
             persisted_items: upserted,
             pruned_items: pruned,
             scan_failures: Vec::new(),
@@ -337,6 +416,12 @@ impl From<DatabaseError> for InventoryRefreshError {
     }
 }
 
+impl From<TorrentClientError> for InventoryRefreshError {
+    fn from(source: TorrentClientError) -> Self {
+        Self::Client { source }
+    }
+}
+
 impl fmt::Display for InventoryRefreshError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -346,6 +431,7 @@ impl fmt::Display for InventoryRefreshError {
             Self::ScanWorkerFailed { message } => {
                 write!(formatter, "inventory scan worker failed: {message}")
             }
+            Self::Client { source } => write!(formatter, "{source}"),
             Self::Database { source } => write!(formatter, "{source}"),
         }
     }
@@ -356,6 +442,7 @@ impl Error for InventoryRefreshError {
         match self {
             Self::InvalidClientInventory { .. } => None,
             Self::ScanWorkerFailed { .. } => None,
+            Self::Client { source } => Some(source),
             Self::Database { source } => Some(source),
         }
     }
@@ -800,6 +887,100 @@ mod tests {
         assert_eq!(42, total_size);
     }
 
+    #[tokio::test]
+    async fn refresh_client_inventory_receiver_persists_streamed_items() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let client_host = ClientHost::new("qbit.local").unwrap();
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .send(ClientInventoryMessage::Item(client_inventory_item(
+                client_host.clone(),
+                "0123456789abcdef0123456789abcdef01234567",
+                "Example",
+                "Example/file.mkv",
+                42,
+            )))
+            .await
+            .unwrap();
+        sender.send(ClientInventoryMessage::Finished).await.unwrap();
+        drop(sender);
+
+        let summary = worker
+            .refresh_client_inventory_receiver(client_host, receiver)
+            .await
+            .unwrap();
+
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let file_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_files")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.scanned_items);
+        assert_eq!(1, summary.persisted_items);
+        assert_eq!(1, item_count);
+        assert_eq!(1, file_count);
+    }
+
+    #[tokio::test]
+    async fn unfinished_client_inventory_receiver_rolls_back_partial_refresh() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let client_host = ClientHost::new("qbit.local").unwrap();
+        let existing = client_item(
+            client_host.clone(),
+            "0123456789abcdef0123456789abcdef01234567",
+            "Existing",
+            "Existing/file.mkv",
+            10,
+        );
+        worker
+            .refresh_client_items(client_host.clone(), &[existing])
+            .await
+            .unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(ClientInventoryMessage::Item(client_inventory_item(
+                client_host.clone(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "Partial",
+                "Partial/file.mkv",
+                20,
+            )))
+            .await
+            .unwrap();
+        drop(sender);
+
+        let result = worker
+            .refresh_client_inventory_receiver(client_host, receiver)
+            .await;
+        let existing_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_items WHERE source_key LIKE ?")
+                .bind("%0123456789abcdef0123456789abcdef01234567")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let partial_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_items WHERE source_key LIKE ?")
+                .bind("%aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            result,
+            Err(InventoryRefreshError::InvalidClientInventory { .. })
+        ));
+        assert_eq!(1, existing_count);
+        assert_eq!(0, partial_count);
+    }
+
     #[test]
     fn client_inventory_rejects_total_size_overflow() {
         let inventory = ClientInventoryItem {
@@ -1002,6 +1183,30 @@ mod tests {
             files: vec![
                 LocalFile::new(
                     None,
+                    PathBuf::from(relative_path),
+                    ByteSize::new(size),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+            ],
+        }
+    }
+
+    fn client_inventory_item(
+        client_host: ClientHost,
+        hash: &str,
+        title: &str,
+        relative_path: &str,
+        size: u64,
+    ) -> ClientInventoryItem {
+        ClientInventoryItem {
+            client_host,
+            info_hash: InfoHash::new(hash).unwrap(),
+            display_name: DisplayName::new(title).unwrap(),
+            media_type: MediaType::Movie,
+            save_path: PathBuf::from("/downloads"),
+            files: vec![
+                crate::domain::TorrentFile::new(
                     PathBuf::from(relative_path),
                     ByteSize::new(size),
                     FileIndex::new(0),

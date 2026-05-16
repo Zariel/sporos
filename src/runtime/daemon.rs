@@ -12,8 +12,9 @@ use crate::http::router;
 use crate::inventory_refresh::run_inventory_refresh_worker;
 use crate::notifications::{NotificationWorker, run_notification_worker};
 use crate::runtime::announce_worker::{AnnounceWorkerError, unix_time_ms};
-use crate::runtime::app::{AppRuntime, RuntimeReceivers};
+use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
 use crate::runtime::injection_worker::{InjectionWorker, SavedTorrentRetryConfig};
+use crate::runtime::scheduler::parse_interval_ms;
 use crate::runtime::shutdown::{ShutdownController, ShutdownSignal};
 
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -136,6 +137,16 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         )),
         false,
     ));
+    let client_inventory_interval = runtime_client_inventory_interval(&runtime.state);
+    handles.push(BackgroundTask::new(
+        "client-inventory-refresh",
+        tokio::spawn(run_client_inventory_refresh_loop(
+            runtime.state.clone(),
+            client_inventory_interval,
+            runtime.state.shutdown_signal.clone(),
+        )),
+        true,
+    ));
     handles.push(BackgroundTask::new(
         "announcements-receiver",
         tokio::spawn(hold_receiver_open(
@@ -170,6 +181,54 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     ));
 
     Ok(handles)
+}
+
+fn runtime_client_inventory_interval(state: &AppState) -> Duration {
+    let interval_ms =
+        parse_interval_ms(&state.config.scheduling.search_interval).unwrap_or(86_400_000);
+    Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
+}
+
+async fn run_client_inventory_refresh_loop(
+    state: AppState,
+    interval: Duration,
+    mut shutdown: ShutdownSignal,
+) {
+    loop {
+        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
+            break;
+        }
+
+        match state.refresh_torrent_client_inventories().await {
+            Ok(summaries) => {
+                let scanned: usize = summaries.iter().map(|summary| summary.scanned_items).sum();
+                let persisted: usize = summaries
+                    .iter()
+                    .map(|summary| summary.persisted_items)
+                    .sum();
+                let pruned: u64 = summaries.iter().map(|summary| summary.pruned_items).sum();
+                tracing::info!(
+                    clients = summaries.len(),
+                    scanned,
+                    persisted,
+                    pruned,
+                    "client inventory refresh completed"
+                );
+            }
+            Err(error) => warn!(error = %error, "client inventory refresh failed"),
+        }
+
+        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
+            break;
+        }
+
+        tokio::select! {
+            _state = shutdown.cancelled() => {
+                break;
+            }
+            () = tokio::time::sleep(interval) => {}
+        }
+    }
 }
 
 async fn run_saved_retry_loop(
@@ -298,6 +357,17 @@ async fn stop_background_tasks_with_timeout(mut handles: Vec<BackgroundTask>, ti
                 task = task.name,
                 "background task did not stop before shutdown timeout; aborted"
             );
+            match task.handle.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    error!(
+                        task = task.name,
+                        error = %error,
+                        "background task failed during shutdown"
+                    );
+                }
+            }
         } else {
             warn!(
                 task = task.name,
@@ -342,11 +412,18 @@ impl std::error::Error for DaemonError {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
-    use crate::config::SporosConfig;
+    use crate::config::{ConfigTorrentClientKind, SporosConfig, TorrentClientConfig};
     use crate::persistence::repository::Repository;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header::SET_COOKIE};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
 
     #[tokio::test]
     async fn serve_runtime_listens_until_aborted() {
@@ -391,6 +468,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_tasks_refresh_client_inventory() {
+        let info_requests = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_daemon_qbit_inventory_server(info_requests.clone()).await;
+        let mut config = SporosConfig::default();
+        config.torrent_clients.insert(
+            "qbit".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Qbittorrent,
+                url: endpoint,
+                username: None,
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads/default".into(),
+                label_field: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+
+        let handles = start_background_tasks(runtime).await.unwrap();
+        wait_for_local_item_count(&repository, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        let file_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_files")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(1, file_count);
+        assert_eq!(1, info_requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn background_shutdown_timeout_is_global() {
         let handles = vec![
             BackgroundTask::new(
@@ -413,6 +527,30 @@ mod tests {
         stop_background_tasks_with_timeout(handles, Duration::from_millis(50)).await;
 
         assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn aborted_background_task_is_awaited_for_cleanup() {
+        let cleaned_up = Arc::new(AtomicUsize::new(0));
+        struct CleanupCounter(Arc<AtomicUsize>);
+        impl Drop for CleanupCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let cleanup = CleanupCounter(cleaned_up.clone());
+        let handles = vec![BackgroundTask::new(
+            "stuck-cleanup",
+            tokio::spawn(async move {
+                let _cleanup = cleanup;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }),
+            true,
+        )];
+
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(10)).await;
+
+        assert_eq!(1, cleaned_up.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -461,5 +599,80 @@ mod tests {
         }
 
         0
+    }
+
+    async fn wait_for_local_item_count(repository: &Repository, expected: i64) {
+        for _attempt in 0..50 {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+            if count == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(expected, count);
+    }
+
+    async fn spawn_daemon_qbit_inventory_server(info_requests: Arc<AtomicUsize>) -> String {
+        spawn_daemon_test_server(move |request| {
+            let info_requests = info_requests.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                match path.as_str() {
+                    "/api/v2/auth/login" => response_with_cookie(StatusCode::OK, "Ok.", "SID=ok"),
+                    "/api/v2/torrents/info" => {
+                        info_requests.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            r#"[{"hash":"0123456789abcdef0123456789abcdef01234567","name":"Example","save_path":"/downloads/example","amount_left":0,"progress":1.0}]"#,
+                        )
+                            .into_response()
+                    }
+                    "/api/v2/torrents/files" => (
+                        StatusCode::OK,
+                        r#"[{"name":"Example/file.mkv","size":42,"progress":1.0,"priority":1}]"#,
+                    )
+                        .into_response(),
+                    _ => (StatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await
+    }
+
+    async fn spawn_daemon_test_server<F, Fut, R>(handler: F) -> String
+    where
+        F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: IntoResponse + Send + 'static,
+    {
+        let app = axum::Router::new()
+            .route("/api/v2/auth/login", post(handler.clone()))
+            .route("/api/v2/torrents/info", get(handler.clone()))
+            .route("/api/v2/torrents/files", get(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn response_with_cookie(
+        status: StatusCode,
+        body: &'static str,
+        cookie: &'static str,
+    ) -> Response {
+        let mut response = (status, body).into_response();
+        response
+            .headers_mut()
+            .insert(SET_COOKIE, cookie.parse().unwrap());
+        response
     }
 }

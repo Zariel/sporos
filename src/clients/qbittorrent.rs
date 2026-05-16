@@ -1,4 +1,5 @@
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -101,16 +102,7 @@ impl QbittorrentClient {
         let mut torrents = Vec::new();
         let mut offset = 0usize;
         loop {
-            let text = self
-                .get_text(&format!(
-                    "/api/v2/torrents/info?sort=hash&limit={QBIT_INVENTORY_PAGE_SIZE}&offset={offset}"
-                ))
-                .await?;
-            let page: Vec<QbitTorrent> =
-                serde_json::from_str(&text).map_err(|error| TorrentClientError::BadResponse {
-                    client: self.client_name.clone(),
-                    message: error.to_string(),
-                })?;
+            let page = self.inventory_page(offset).await?;
             let page_len = page.len();
             torrents.extend(page);
             if page_len < QBIT_INVENTORY_PAGE_SIZE {
@@ -119,6 +111,31 @@ impl QbittorrentClient {
             offset = offset.saturating_add(QBIT_INVENTORY_PAGE_SIZE);
         }
         Ok(torrents)
+    }
+
+    pub async fn list_inventory_pages<F, Fut>(
+        &self,
+        mut on_page: F,
+    ) -> Result<usize, TorrentClientError>
+    where
+        F: FnMut(Vec<QbitTorrent>) -> Fut,
+        Fut: Future<Output = Result<(), TorrentClientError>>,
+    {
+        let mut total = 0usize;
+        let mut offset = 0usize;
+        loop {
+            let page = self.inventory_page(offset).await?;
+            let page_len = page.len();
+            total = total.saturating_add(page_len);
+            if page_len > 0 {
+                on_page(page).await?;
+            }
+            if page_len < QBIT_INVENTORY_PAGE_SIZE {
+                break;
+            }
+            offset = offset.saturating_add(QBIT_INVENTORY_PAGE_SIZE);
+        }
+        Ok(total)
     }
 
     pub async fn torrent_info(
@@ -137,6 +154,18 @@ impl QbittorrentClient {
                 message: error.to_string(),
             })?;
         Ok(torrents.pop())
+    }
+
+    async fn inventory_page(&self, offset: usize) -> Result<Vec<QbitTorrent>, TorrentClientError> {
+        let text = self
+            .get_text(&format!(
+                "/api/v2/torrents/info?sort=hash&limit={QBIT_INVENTORY_PAGE_SIZE}&offset={offset}"
+            ))
+            .await?;
+        serde_json::from_str(&text).map_err(|error| TorrentClientError::BadResponse {
+            client: self.client_name.clone(),
+            message: error.to_string(),
+        })
     }
 
     pub async fn fetch_files(
@@ -1003,6 +1032,37 @@ mod tests {
         let inventory = client.list_inventory().await.unwrap();
 
         assert_eq!(QBIT_INVENTORY_PAGE_SIZE + 1, inventory.len());
+        assert_eq!(
+            vec![
+                format!("sort=hash&limit={QBIT_INVENTORY_PAGE_SIZE}&offset=0"),
+                format!(
+                    "sort=hash&limit={QBIT_INVENTORY_PAGE_SIZE}&offset={QBIT_INVENTORY_PAGE_SIZE}"
+                ),
+            ],
+            *seen_queries.lock().unwrap()
+        );
+
+        seen_queries.lock().unwrap().clear();
+        let page_lengths = Arc::new(StdMutex::new(Vec::<usize>::new()));
+        let streamed = client
+            .list_inventory_pages({
+                let page_lengths = page_lengths.clone();
+                move |page| {
+                    let page_lengths = page_lengths.clone();
+                    async move {
+                        page_lengths.lock().unwrap().push(page.len());
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(QBIT_INVENTORY_PAGE_SIZE + 1, streamed);
+        assert_eq!(
+            vec![QBIT_INVENTORY_PAGE_SIZE, 1],
+            *page_lengths.lock().unwrap()
+        );
         assert_eq!(
             vec![
                 format!("sort=hash&limit={QBIT_INVENTORY_PAGE_SIZE}&offset=0"),

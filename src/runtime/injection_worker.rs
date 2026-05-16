@@ -13,6 +13,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::fs::MetadataExt;
 
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use crate::actions::{
     LinkActionError, LinkDirOptions, LinkFilesOptions, LinkType, SaveTorrentError,
@@ -29,6 +30,9 @@ use crate::domain::{
 use crate::errors::{
     ClassifyFailure, DatabaseError, FailureClass, TorrentClientError, TorrentParseError,
 };
+use crate::inventory_refresh::{
+    InventoryRefreshError, InventoryRefreshSummary, InventoryRefreshWorker,
+};
 use crate::matching::{
     CandidateAssessmentConfig, FileTreeMatchConfig, PersistedCandidateAssessment,
     ReverseLookupConfig, assess_and_persist_candidate, reverse_lookup_candidates_for_media_types,
@@ -43,6 +47,9 @@ const MAX_SAVED_TORRENT_BYTES: u64 = 32 * 1024 * 1024;
 
 pub type ClientResultFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, TorrentClientError>> + Send + 'a>>;
+pub type ClientInventoryRefreshFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<InventoryRefreshSummary, InventoryRefreshError>> + Send + 'a>,
+>;
 
 pub trait InjectionClient: Send + Sync {
     fn descriptor(&self) -> &TorrentClientDescriptor;
@@ -52,6 +59,20 @@ pub trait InjectionClient: Send + Sync {
     fn is_checking<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool>;
     fn remaining_bytes<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ByteSize>;
     fn resume<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()>;
+    fn refresh_inventory<'a>(
+        &'a self,
+        worker: &'a InventoryRefreshWorker,
+    ) -> ClientInventoryRefreshFuture<'a> {
+        Box::pin(async move {
+            let descriptor = self.descriptor();
+            let _ = worker;
+            Err(TorrentClientError::UnsupportedCapability {
+                client: descriptor.name.as_str().to_owned(),
+                capability: "refresh inventory".to_owned(),
+            }
+            .into())
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -245,6 +266,33 @@ impl InjectionWorker {
 
     pub fn client_count(&self) -> usize {
         self.clients.len()
+    }
+
+    pub async fn refresh_client_inventories(
+        &self,
+        worker: &InventoryRefreshWorker,
+    ) -> Result<Vec<InventoryRefreshSummary>, InventoryRefreshError> {
+        let mut summaries = Vec::with_capacity(self.clients.len());
+        let mut last_error = None;
+        for client in &self.clients {
+            match client.refresh_inventory(worker).await {
+                Ok(summary) => summaries.push(summary),
+                Err(error) => {
+                    warn!(
+                        client = %client.descriptor().name,
+                        error = %error,
+                        "client inventory refresh failed"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        if summaries.is_empty() {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+        Ok(summaries)
     }
 
     pub async fn process(
@@ -1333,6 +1381,7 @@ mod tests {
         ByteSize, CandidateGuid, ClientHost, DisplayName, DownloadUrl, FileIndex, ItemTitle,
         LocalItemSource, MatchRatio, MediaType, TrackerName,
     };
+    use crate::inventory::InventoryScanOptions;
     use crate::persistence::repository::Repository;
 
     #[tokio::test]
@@ -1360,6 +1409,35 @@ mod tests {
         assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
         assert_eq!(1, existing.has_calls.load(Ordering::SeqCst));
         assert_eq!("healthy", health[0].state);
+    }
+
+    #[tokio::test]
+    async fn client_inventory_refresh_continues_after_one_client_fails() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let refresh_worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let failing = Arc::new(FakeRefreshClient::failing(descriptor("failing", "failing")));
+        let successful = Arc::new(FakeRefreshClient::successful(
+            descriptor("successful", "successful"),
+            2,
+        ));
+        let worker = InjectionWorker::new(
+            repository,
+            vec![
+                failing.clone() as Arc<dyn InjectionClient>,
+                successful.clone() as Arc<dyn InjectionClient>,
+            ],
+        );
+
+        let summaries = worker
+            .refresh_client_inventories(&refresh_worker)
+            .await
+            .unwrap();
+
+        assert_eq!(1, summaries.len());
+        assert_eq!(2, summaries[0].persisted_items);
+        assert_eq!(1, failing.calls.load(Ordering::SeqCst));
+        assert_eq!(1, successful.calls.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -2292,6 +2370,90 @@ mod tests {
         recheck_calls: AtomicUsize,
         resume_calls: AtomicUsize,
         last_pause_for_recheck: StdMutex<Option<bool>>,
+    }
+
+    struct FakeRefreshClient {
+        descriptor: TorrentClientDescriptor,
+        calls: AtomicUsize,
+        summary: Option<InventoryRefreshSummary>,
+    }
+
+    impl FakeRefreshClient {
+        fn successful(descriptor: TorrentClientDescriptor, persisted_items: usize) -> Self {
+            Self {
+                descriptor,
+                calls: AtomicUsize::new(0),
+                summary: Some(InventoryRefreshSummary {
+                    scanned_items: persisted_items,
+                    persisted_items,
+                    pruned_items: 0,
+                    scan_failures: Vec::new(),
+                }),
+            }
+        }
+
+        fn failing(descriptor: TorrentClientDescriptor) -> Self {
+            Self {
+                descriptor,
+                calls: AtomicUsize::new(0),
+                summary: None,
+            }
+        }
+    }
+
+    impl InjectionClient for FakeRefreshClient {
+        fn descriptor(&self) -> &TorrentClientDescriptor {
+            &self.descriptor
+        }
+
+        fn has_torrent<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
+            Box::pin(async move { Ok(false) })
+        }
+
+        fn inject<'a>(
+            &'a self,
+            _request: ClientInjectionRequest<'a>,
+        ) -> ClientResultFuture<'a, ()> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn recheck<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn is_checking<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
+            Box::pin(async move { Ok(false) })
+        }
+
+        fn remaining_bytes<'a>(
+            &'a self,
+            _info_hash: &'a InfoHash,
+        ) -> ClientResultFuture<'a, ByteSize> {
+            Box::pin(async move { Ok(ByteSize::new(0)) })
+        }
+
+        fn resume<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn refresh_inventory<'a>(
+            &'a self,
+            _worker: &'a InventoryRefreshWorker,
+        ) -> ClientInventoryRefreshFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let summary = self.summary.clone();
+            let client = self.descriptor.name.as_str().to_owned();
+            Box::pin(async move {
+                summary.ok_or_else(|| {
+                    TorrentClientError::Unavailable {
+                        client,
+                        retry_after_ms: None,
+                        message: "offline".to_owned(),
+                    }
+                    .into()
+                })
+            })
+        }
     }
 
     impl FakeClient {
