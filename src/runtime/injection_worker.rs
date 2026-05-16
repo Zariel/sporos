@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::warn;
 
 use crate::actions::{
@@ -323,13 +323,28 @@ impl InjectionWorker {
         &self,
         request: InjectionRequest,
     ) -> Result<InjectionWorkResult, InjectionWorkerError> {
-        self.process_inner(request, &mut || false).await
+        self.process_inner(request, &mut || false, None).await
+    }
+
+    pub async fn process_until_shutdown(
+        &self,
+        request: InjectionRequest,
+        shutdown: ShutdownSignal,
+    ) -> Result<InjectionWorkResult, InjectionWorkerError> {
+        let stop_signal = shutdown.clone();
+        self.process_inner(
+            request,
+            &mut || stop_signal.state().phase != ShutdownPhase::Running,
+            Some(&shutdown),
+        )
+        .await
     }
 
     async fn process_inner<F>(
         &self,
         request: InjectionRequest,
         should_stop: &mut F,
+        shutdown: Option<&ShutdownSignal>,
     ) -> Result<InjectionWorkResult, InjectionWorkerError>
     where
         F: FnMut() -> bool,
@@ -351,27 +366,49 @@ impl InjectionWorker {
             .select_target(&request.local_item)
             .ok_or(InjectionWorkerError::NoWritableClient)?;
         let target_name = dependency_name(target.descriptor())?;
+        if should_stop() {
+            self.save_for_retry(&request)?;
+            return Ok(InjectionWorkResult {
+                outcome: InjectionOutcome::Saved,
+                target_client: Some(target_name),
+                saved_for_retry: true,
+                linked_files: 0,
+            });
+        }
         let existing = self
             .find_existing_client(
                 request.metafile.info_hash(),
                 target.descriptor(),
                 request.assessed_at_ms,
+                shutdown,
             )
             .await?;
-        if let Some(existing_client) = existing {
-            self.record_client_health(
-                existing_client.descriptor(),
-                true,
-                None,
-                request.assessed_at_ms,
-            )
-            .await?;
-            return Ok(InjectionWorkResult {
-                outcome: InjectionOutcome::AlreadyExists,
-                target_client: Some(dependency_name(existing_client.descriptor())?),
-                saved_for_retry: false,
-                linked_files: 0,
-            });
+        match existing {
+            ExistingClientLookup::Found(existing_client) => {
+                self.record_client_health(
+                    existing_client.descriptor(),
+                    true,
+                    None,
+                    request.assessed_at_ms,
+                )
+                .await?;
+                return Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::AlreadyExists,
+                    target_client: Some(dependency_name(existing_client.descriptor())?),
+                    saved_for_retry: false,
+                    linked_files: 0,
+                });
+            }
+            ExistingClientLookup::NotFound => {}
+            ExistingClientLookup::Shutdown => {
+                self.save_for_retry(&request)?;
+                return Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::Saved,
+                    target_client: Some(target_name),
+                    saved_for_retry: true,
+                    linked_files: 0,
+                });
+            }
         }
 
         if should_stop() {
@@ -416,23 +453,45 @@ impl InjectionWorker {
             });
         }
         let mutation_result = {
-            let _guard = self.mutation_lock.lock().await;
+            let Some(_guard) = lock_until_shutdown(&self.mutation_lock, shutdown).await else {
+                self.save_for_retry(&request)?;
+                return Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::Saved,
+                    target_client: Some(target_name),
+                    saved_for_retry: true,
+                    linked_files,
+                });
+            };
             if should_stop() {
                 InjectionMutationResult::SavedForShutdown
             } else {
-                match target.has_torrent(request.metafile.info_hash()).await {
-                    Ok(true) => InjectionMutationResult::AlreadyExists,
-                    Ok(false) => InjectionMutationResult::Injected(
-                        target
-                            .inject(ClientInjectionRequest {
+                match client_call_until_shutdown(shutdown, || {
+                    target.has_torrent(request.metafile.info_hash())
+                })
+                .await
+                {
+                    ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
+                    ClientCall::Completed(Ok(true)) => InjectionMutationResult::AlreadyExists,
+                    ClientCall::Completed(Ok(false)) => {
+                        match client_call_until_shutdown(shutdown, || {
+                            target.inject(ClientInjectionRequest {
                                 info_hash: request.metafile.info_hash(),
                                 torrent_bytes: &request.torrent_bytes,
                                 save_path: save_path.as_deref(),
                                 pause_for_recheck,
                             })
-                            .await,
-                    ),
-                    Err(error) => InjectionMutationResult::PrecheckFailed(error),
+                        })
+                        .await
+                        {
+                            ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
+                            ClientCall::Completed(result) => {
+                                InjectionMutationResult::Injected(result)
+                            }
+                        }
+                    }
+                    ClientCall::Completed(Err(error)) => {
+                        InjectionMutationResult::PrecheckFailed(error)
+                    }
                 }
             }
         };
@@ -450,19 +509,26 @@ impl InjectionWorker {
             InjectionMutationResult::AlreadyExists => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
+                let mut saved_for_retry = false;
                 if linked_files > 0 {
                     let recheck_plan = RecheckResumePlan {
                         should_recheck: true,
                         ..recheck_plan
                     };
-                    let _ = self
-                        .run_recheck_resume(target.as_ref(), &request, recheck_plan)
+                    let resume_outcome = self
+                        .run_recheck_resume(target.as_ref(), &request, recheck_plan, shutdown)
                         .await?;
+                    if resume_outcome == ResumeLoopOutcome::StillChecking
+                        && shutdown_requested(shutdown)
+                    {
+                        self.save_for_retry(&request)?;
+                        saved_for_retry = true;
+                    }
                 }
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::AlreadyExists,
                     target_client: Some(target_name),
-                    saved_for_retry: false,
+                    saved_for_retry,
                     linked_files,
                 })
             }
@@ -471,7 +537,7 @@ impl InjectionWorker {
                     .await?;
                 if recheck_plan.should_recheck {
                     let _ = self
-                        .run_recheck_resume(target.as_ref(), &request, recheck_plan)
+                        .run_recheck_resume(target.as_ref(), &request, recheck_plan, shutdown)
                         .await?;
                     self.save_for_retry(&request)?;
                 }
@@ -517,7 +583,8 @@ impl InjectionWorker {
         &self,
         config: SavedTorrentRetryConfig,
     ) -> Result<SavedTorrentRetrySummary, InjectionWorkerError> {
-        self.retry_saved_torrents_inner(config, || false).await
+        self.retry_saved_torrents_inner(config, || false, None)
+            .await
     }
 
     pub async fn retry_saved_torrents_until_shutdown(
@@ -525,14 +592,20 @@ impl InjectionWorker {
         config: SavedTorrentRetryConfig,
         shutdown: &mut ShutdownSignal,
     ) -> Result<SavedTorrentRetrySummary, InjectionWorkerError> {
-        self.retry_saved_torrents_inner(config, || shutdown.state().phase != ShutdownPhase::Running)
-            .await
+        let wait_signal = shutdown.clone();
+        self.retry_saved_torrents_inner(
+            config,
+            || shutdown.state().phase != ShutdownPhase::Running,
+            Some(&wait_signal),
+        )
+        .await
     }
 
     async fn retry_saved_torrents_inner<F>(
         &self,
         config: SavedTorrentRetryConfig,
         mut should_stop: F,
+        shutdown: Option<&ShutdownSignal>,
     ) -> Result<SavedTorrentRetrySummary, InjectionWorkerError>
     where
         F: FnMut() -> bool,
@@ -553,8 +626,15 @@ impl InjectionWorker {
                     return Ok(summary);
                 }
                 summary.scanned += 1;
-                self.retry_saved_torrent(directory, &path, &config, &mut summary, &mut should_stop)
-                    .await?;
+                self.retry_saved_torrent(
+                    directory,
+                    &path,
+                    &config,
+                    &mut summary,
+                    &mut should_stop,
+                    shutdown,
+                )
+                .await?;
             }
         }
 
@@ -568,6 +648,7 @@ impl InjectionWorker {
         config: &SavedTorrentRetryConfig,
         summary: &mut SavedTorrentRetrySummary,
         should_stop: &mut F,
+        shutdown: Option<&ShutdownSignal>,
     ) -> Result<(), InjectionWorkerError>
     where
         F: FnMut() -> bool,
@@ -661,7 +742,7 @@ impl InjectionWorker {
                 flat_linking: config.flat_linking,
                 recheck: config.recheck,
             };
-            let result = match self.process_inner(request, should_stop).await {
+            let result = match self.process_inner(request, should_stop, shutdown).await {
                 Ok(result) => result,
                 Err(error) if saved_retry_can_continue_after_error(&error) => {
                     summary.failed += 1;
@@ -684,6 +765,7 @@ impl InjectionWorker {
                             &metadata.info_hash,
                             saved.identity,
                             &result,
+                            shutdown,
                         )
                         .await
                     {
@@ -735,15 +817,19 @@ impl InjectionWorker {
         info_hash: &InfoHash,
         target: &TorrentClientDescriptor,
         checked_at_ms: i64,
-    ) -> Result<Option<Arc<dyn InjectionClient>>, InjectionWorkerError> {
+        shutdown: Option<&ShutdownSignal>,
+    ) -> Result<ExistingClientLookup, InjectionWorkerError> {
         for client in &self.clients {
             if client.descriptor().host == target.host {
                 continue;
             }
-            match client.has_torrent(info_hash).await {
-                Ok(true) => return Ok(Some(Arc::clone(client))),
-                Ok(false) => {}
-                Err(error) => {
+            match client_call_until_shutdown(shutdown, || client.has_torrent(info_hash)).await {
+                ClientCall::Shutdown => return Ok(ExistingClientLookup::Shutdown),
+                ClientCall::Completed(Ok(true)) => {
+                    return Ok(ExistingClientLookup::Found(Arc::clone(client)));
+                }
+                ClientCall::Completed(Ok(false)) => {}
+                ClientCall::Completed(Err(error)) => {
                     self.record_client_health(
                         client.descriptor(),
                         false,
@@ -755,7 +841,7 @@ impl InjectionWorker {
                 }
             }
         }
-        Ok(None)
+        Ok(ExistingClientLookup::NotFound)
     }
 
     async fn prepare_links(
@@ -870,6 +956,7 @@ impl InjectionWorker {
         info_hash: &InfoHash,
         identity: SavedTorrentIdentity,
         result: &InjectionWorkResult,
+        shutdown: Option<&ShutdownSignal>,
     ) -> Result<bool, InjectionWorkerError> {
         if !matches!(
             result.outcome,
@@ -887,9 +974,20 @@ impl InjectionWorker {
         let Some(client) = self.client_by_dependency_name(client_name) else {
             return Ok(false);
         };
-        if client.is_checking(info_hash).await?
-            || client.remaining_bytes(info_hash).await?.get() > 0
+        let checking =
+            match client_call_until_shutdown(shutdown, || client.is_checking(info_hash)).await {
+                ClientCall::Shutdown => return Ok(false),
+                ClientCall::Completed(result) => result?,
+            };
+        let remaining = match client_call_until_shutdown(shutdown, || {
+            client.remaining_bytes(info_hash)
+        })
+        .await
         {
+            ClientCall::Shutdown => return Ok(false),
+            ClientCall::Completed(result) => result?,
+        };
+        if checking || remaining.get() > 0 {
             return Ok(false);
         }
         delete_saved_torrent(path, identity).await
@@ -909,21 +1007,48 @@ impl InjectionWorker {
         client: &dyn InjectionClient,
         request: &InjectionRequest,
         plan: RecheckResumePlan,
+        shutdown: Option<&ShutdownSignal>,
     ) -> Result<ResumeLoopOutcome, InjectionWorkerError> {
         if !plan.should_recheck {
             return Ok(ResumeLoopOutcome::NotRequired);
         }
         {
-            let _guard = self.mutation_lock.lock().await;
-            client.recheck(request.metafile.info_hash()).await?;
+            let Some(_guard) = lock_until_shutdown(&self.mutation_lock, shutdown).await else {
+                return Ok(ResumeLoopOutcome::StillChecking);
+            };
+            match client_call_until_shutdown(shutdown, || {
+                client.recheck(request.metafile.info_hash())
+            })
+            .await
+            {
+                ClientCall::Shutdown => return Ok(ResumeLoopOutcome::StillChecking),
+                ClientCall::Completed(result) => result?,
+            }
         }
         let max_polls = max_resume_polls(request.recheck);
         for _ in 0..max_polls {
-            if client.is_checking(request.metafile.info_hash()).await? {
-                sleep_between_resume_polls(request.recheck).await;
+            let checking = match client_call_until_shutdown(shutdown, || {
+                client.is_checking(request.metafile.info_hash())
+            })
+            .await
+            {
+                ClientCall::Shutdown => return Ok(ResumeLoopOutcome::StillChecking),
+                ClientCall::Completed(result) => result?,
+            };
+            if checking {
+                if sleep_between_resume_polls(request.recheck, shutdown).await {
+                    return Ok(ResumeLoopOutcome::StillChecking);
+                }
                 continue;
             }
-            let remaining = client.remaining_bytes(request.metafile.info_hash()).await?;
+            let remaining = match client_call_until_shutdown(shutdown, || {
+                client.remaining_bytes(request.metafile.info_hash())
+            })
+            .await
+            {
+                ClientCall::Shutdown => return Ok(ResumeLoopOutcome::StillChecking),
+                ClientCall::Completed(result) => result?,
+            };
             if can_resume_with_remaining(
                 &request.metafile,
                 &request.assessment,
@@ -931,14 +1056,78 @@ impl InjectionWorker {
                 plan,
                 remaining,
             ) {
-                let _guard = self.mutation_lock.lock().await;
-                client.resume(request.metafile.info_hash()).await?;
+                let Some(_guard) = lock_until_shutdown(&self.mutation_lock, shutdown).await else {
+                    return Ok(ResumeLoopOutcome::StillChecking);
+                };
+                match client_call_until_shutdown(shutdown, || {
+                    client.resume(request.metafile.info_hash())
+                })
+                .await
+                {
+                    ClientCall::Shutdown => return Ok(ResumeLoopOutcome::StillChecking),
+                    ClientCall::Completed(result) => result?,
+                }
                 return Ok(ResumeLoopOutcome::Resumed);
             }
             return Ok(ResumeLoopOutcome::WaitingForCompletion);
         }
         Ok(ResumeLoopOutcome::StillChecking)
     }
+}
+
+async fn client_call_until_shutdown<T, MakeFuture, Fut>(
+    shutdown: Option<&ShutdownSignal>,
+    make_future: MakeFuture,
+) -> ClientCall<T>
+where
+    MakeFuture: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, TorrentClientError>>,
+{
+    let Some(shutdown) = shutdown else {
+        return ClientCall::Completed(make_future().await);
+    };
+    if shutdown_requested(Some(shutdown)) {
+        return ClientCall::Shutdown;
+    }
+    let mut shutdown = shutdown.clone();
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => ClientCall::Shutdown,
+        result = make_future() => ClientCall::Completed(result),
+    }
+}
+
+async fn lock_until_shutdown<'a>(
+    mutex: &'a Mutex<()>,
+    shutdown: Option<&ShutdownSignal>,
+) -> Option<MutexGuard<'a, ()>> {
+    let Some(shutdown) = shutdown else {
+        return Some(mutex.lock().await);
+    };
+    if shutdown_requested(Some(shutdown)) {
+        return None;
+    }
+    let mut shutdown = shutdown.clone();
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        guard = mutex.lock() => Some(guard),
+    }
+}
+
+fn shutdown_requested(shutdown: Option<&ShutdownSignal>) -> bool {
+    shutdown.is_some_and(|signal| signal.state().phase != ShutdownPhase::Running)
+}
+
+enum ClientCall<T> {
+    Completed(Result<T, TorrentClientError>),
+    Shutdown,
+}
+
+enum ExistingClientLookup {
+    Found(Arc<dyn InjectionClient>),
+    NotFound,
+    Shutdown,
 }
 
 async fn saved_torrent_paths(
@@ -1405,9 +1594,22 @@ fn max_resume_polls(config: RecheckResumeConfig) -> u64 {
     config.max_resume_wait_ms.div_ceil(interval).max(1)
 }
 
-async fn sleep_between_resume_polls(config: RecheckResumeConfig) {
-    if config.poll_interval_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
+async fn sleep_between_resume_polls(
+    config: RecheckResumeConfig,
+    shutdown: Option<&ShutdownSignal>,
+) -> bool {
+    if config.poll_interval_ms == 0 {
+        return false;
+    }
+    let sleep = tokio::time::sleep(Duration::from_millis(config.poll_interval_ms));
+    let Some(shutdown) = shutdown else {
+        sleep.await;
+        return false;
+    };
+    let mut shutdown = shutdown.clone();
+    tokio::select! {
+        () = sleep => false,
+        _ = shutdown.cancelled() => true,
     }
 }
 
@@ -1425,9 +1627,10 @@ fn dependency_name(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::future::pending;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::clients::TorrentClientCapabilities;
@@ -1629,6 +1832,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_process_until_shutdown_stops_pending_has_torrent() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-shutdown-has");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")).with_pending_has());
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let output_dir = root.join("output");
+        let request = request(local, candidate, candidate_id, &root);
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let (shutdown, signal) = shutdown_channel();
+        let handle =
+            tokio::spawn(async move { worker.process_until_shutdown(request, signal).await });
+
+        wait_for_calls(&target.has_calls, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(InjectionOutcome::Saved, result.outcome);
+        assert!(result.saved_for_retry);
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, saved_torrent_count(&output_dir));
+    }
+
+    #[tokio::test]
+    async fn worker_process_until_shutdown_stops_pending_inject() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-shutdown-inject");
+        let target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_pending_inject());
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let output_dir = root.join("output");
+        let request = request(local, candidate, candidate_id, &root);
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let (shutdown, signal) = shutdown_channel();
+        let handle =
+            tokio::spawn(async move { worker.process_until_shutdown(request, signal).await });
+
+        wait_for_calls(&target.inject_calls, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(InjectionOutcome::Saved, result.outcome);
+        assert!(result.saved_for_retry);
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(1, saved_torrent_count(&output_dir));
+    }
+
+    #[tokio::test]
+    async fn worker_process_until_shutdown_stops_pending_resume() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-shutdown-resume");
+        let target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_pending_resume());
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.recheck = RecheckResumeConfig {
+            skip_recheck: false,
+            poll_interval_ms: 0,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let (shutdown, signal) = shutdown_channel();
+        let handle =
+            tokio::spawn(async move { worker.process_until_shutdown(request, signal).await });
+
+        wait_for_calls(&target.resume_calls, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(InjectionOutcome::Injected, result.outcome);
+        assert!(result.saved_for_retry);
+        assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn worker_process_until_shutdown_saves_existing_linked_recheck() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-shutdown-existing");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let target = Arc::new(
+            FakeClient::new(descriptor("target", "target"))
+                .with_existing(true)
+                .with_pending_resume(),
+        );
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let output_dir = root.join("output");
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("links")];
+        fs::create_dir_all(&request.link_dirs[0]).unwrap();
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let (shutdown, signal) = shutdown_channel();
+        let handle =
+            tokio::spawn(async move { worker.process_until_shutdown(request, signal).await });
+
+        wait_for_calls(&target.resume_calls, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(InjectionOutcome::AlreadyExists, result.outcome);
+        assert!(result.saved_for_retry);
+        assert_eq!(1, result.linked_files);
+        assert_eq!(1, saved_torrent_count(&output_dir));
+    }
+
+    #[tokio::test]
+    async fn recheck_resume_does_not_call_ready_client_after_shutdown() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-shutdown-ready-recheck");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.recheck = RecheckResumeConfig {
+            skip_recheck: false,
+            poll_interval_ms: 0,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let (shutdown, signal) = shutdown_channel();
+        shutdown.cancel_now("test shutdown").unwrap();
+        let plan = recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
+
+        let outcome = worker
+            .run_recheck_resume(target.as_ref(), &request, plan, Some(&signal))
+            .await
+            .unwrap();
+
+        assert_eq!(ResumeLoopOutcome::StillChecking, outcome);
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_cleanup_does_not_probe_client_after_shutdown() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-shutdown-cleanup");
+        let output_dir = root.join("output");
+        save_test_torrent(
+            &output_dir,
+            "movie.mkv",
+            test_torrent_bytes(),
+            MediaType::Movie,
+        );
+        let path = fs::read_dir(&output_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let file_name = path.file_name().and_then(|name| name.to_str()).unwrap();
+        let saved = read_saved_torrent(&path).await.unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let result = InjectionWorkResult {
+            outcome: InjectionOutcome::Injected,
+            target_client: Some(DependencyName::new("target").unwrap()),
+            saved_for_retry: false,
+            linked_files: 0,
+        };
+        let (shutdown, signal) = shutdown_channel();
+        shutdown.cancel_now("test shutdown").unwrap();
+
+        let deleted = worker
+            .delete_saved_torrent_if_complete(
+                &path,
+                file_name,
+                saved.parsed.metafile.info_hash(),
+                saved.identity,
+                &result,
+                Some(&signal),
+            )
+            .await
+            .unwrap();
+
+        assert!(!deleted);
+        assert!(path.exists());
+        assert_eq!(0, target.checking_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.remaining_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn saved_torrent_retry_injects_match_and_deletes_completed_file() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("saved-retry-success");
@@ -1800,6 +2206,7 @@ mod tests {
                     checks += 1;
                     checks >= 4
                 },
+                None,
             )
             .await
             .unwrap();
@@ -2496,11 +2903,16 @@ mod tests {
         descriptor: TorrentClientDescriptor,
         existing: bool,
         inject_error: bool,
+        has_pending: bool,
+        inject_pending: bool,
+        resume_pending: bool,
         has_errors_remaining: AtomicUsize,
         completion_errors_remaining: AtomicUsize,
         inject_calls: AtomicUsize,
         has_calls: AtomicUsize,
         recheck_calls: AtomicUsize,
+        checking_calls: AtomicUsize,
+        remaining_calls: AtomicUsize,
         resume_calls: AtomicUsize,
         save_path_file_exists_at_inject: AtomicUsize,
         last_pause_for_recheck: StdMutex<Option<bool>>,
@@ -2598,11 +3010,16 @@ mod tests {
                 descriptor,
                 existing: false,
                 inject_error: false,
+                has_pending: false,
+                inject_pending: false,
+                resume_pending: false,
                 has_errors_remaining: AtomicUsize::new(0),
                 completion_errors_remaining: AtomicUsize::new(0),
                 inject_calls: AtomicUsize::new(0),
                 has_calls: AtomicUsize::new(0),
                 recheck_calls: AtomicUsize::new(0),
+                checking_calls: AtomicUsize::new(0),
+                remaining_calls: AtomicUsize::new(0),
                 resume_calls: AtomicUsize::new(0),
                 save_path_file_exists_at_inject: AtomicUsize::new(0),
                 last_pause_for_recheck: StdMutex::new(None),
@@ -2617,6 +3034,21 @@ mod tests {
 
         const fn with_inject_error(mut self) -> Self {
             self.inject_error = true;
+            self
+        }
+
+        const fn with_pending_has(mut self) -> Self {
+            self.has_pending = true;
+            self
+        }
+
+        const fn with_pending_inject(mut self) -> Self {
+            self.inject_pending = true;
+            self
+        }
+
+        const fn with_pending_resume(mut self) -> Self {
+            self.resume_pending = true;
             self
         }
 
@@ -2647,6 +3079,11 @@ mod tests {
 
         fn has_torrent<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
             self.has_calls.fetch_add(1, Ordering::SeqCst);
+            if self.has_pending {
+                return Box::pin(
+                    async move { pending::<Result<bool, TorrentClientError>>().await },
+                );
+            }
             let error = self
                 .has_errors_remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -2679,6 +3116,9 @@ mod tests {
                 self.save_path_file_exists_at_inject
                     .fetch_add(1, Ordering::SeqCst);
             }
+            if self.inject_pending {
+                return Box::pin(async move { pending::<Result<(), TorrentClientError>>().await });
+            }
             let error = self.inject_error.then(|| TorrentClientError::Unavailable {
                 client: self.descriptor.name.as_str().to_owned(),
                 retry_after_ms: Some(1_000),
@@ -2699,6 +3139,7 @@ mod tests {
         }
 
         fn is_checking<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
+            self.checking_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(false) })
         }
 
@@ -2706,6 +3147,7 @@ mod tests {
             &'a self,
             _info_hash: &'a InfoHash,
         ) -> ClientResultFuture<'a, ByteSize> {
+            self.remaining_calls.fetch_add(1, Ordering::SeqCst);
             let error = self
                 .completion_errors_remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -2728,8 +3170,24 @@ mod tests {
 
         fn resume<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()> {
             self.resume_calls.fetch_add(1, Ordering::SeqCst);
+            if self.resume_pending {
+                return Box::pin(async move { pending::<Result<(), TorrentClientError>>().await });
+            }
             Box::pin(async move { Ok(()) })
         }
+    }
+
+    async fn wait_for_calls(counter: &AtomicUsize, expected: usize) {
+        for _ in 0..100 {
+            if counter.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for at least {expected} calls; saw {}",
+            counter.load(Ordering::SeqCst)
+        );
     }
 
     async fn persisted_inputs(

@@ -691,21 +691,24 @@ async fn process_downloaded_search_candidate(
             }
             let result = state
                 .injection_worker
-                .process(InjectionRequest {
-                    local_item: lookup.local_item,
-                    local_files: lookup.local_files,
-                    candidate: cached.candidate.clone(),
-                    candidate_id,
-                    metafile: cached.metafile,
-                    torrent_bytes,
-                    assessment,
-                    assessed_at_ms: now_ms,
-                    output_dir: state.config.paths.output_dir,
-                    link_dirs: Vec::new(),
-                    link_type: None,
-                    flat_linking: false,
-                    recheck: RecheckResumeConfig::default(),
-                })
+                .process_until_shutdown(
+                    InjectionRequest {
+                        local_item: lookup.local_item,
+                        local_files: lookup.local_files,
+                        candidate: cached.candidate.clone(),
+                        candidate_id,
+                        metafile: cached.metafile,
+                        torrent_bytes,
+                        assessment,
+                        assessed_at_ms: now_ms,
+                        output_dir: state.config.paths.output_dir,
+                        link_dirs: Vec::new(),
+                        link_type: None,
+                        flat_linking: false,
+                        recheck: RecheckResumeConfig::default(),
+                    },
+                    shutdown.clone(),
+                )
                 .await;
             let result = match result {
                 Ok(result) => result,
@@ -1331,21 +1334,24 @@ async fn process_downloaded_announce_candidate(
             }
             let result = state
                 .injection_worker
-                .process(InjectionRequest {
-                    local_item: lookup.local_item,
-                    local_files: lookup.local_files,
-                    candidate: cached.candidate.clone(),
-                    candidate_id,
-                    metafile: cached.metafile,
-                    torrent_bytes,
-                    assessment,
-                    assessed_at_ms: now_ms,
-                    output_dir: state.config.paths.output_dir,
-                    link_dirs: Vec::new(),
-                    link_type: None,
-                    flat_linking: false,
-                    recheck: RecheckResumeConfig::default(),
-                })
+                .process_until_shutdown(
+                    InjectionRequest {
+                        local_item: lookup.local_item,
+                        local_files: lookup.local_files,
+                        candidate: cached.candidate.clone(),
+                        candidate_id,
+                        metafile: cached.metafile,
+                        torrent_bytes,
+                        assessment,
+                        assessed_at_ms: now_ms,
+                        output_dir: state.config.paths.output_dir,
+                        link_dirs: Vec::new(),
+                        link_type: None,
+                        flat_linking: false,
+                        recheck: RecheckResumeConfig::default(),
+                    },
+                    shutdown.clone(),
+                )
                 .await;
             let result = match result {
                 Ok(result) => result,
