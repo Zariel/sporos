@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +21,8 @@ use crate::http::{
     SearchWorkflowRequest, WorkflowQueues,
 };
 use crate::indexers::{
-    ConfiguredTorznabIndexer, TorznabEndpoint, TorznabHttpClient, TorznabRegistry,
+    ConfiguredTorznabIndexer, IndexerBackoffPolicy, TorznabEndpoint, TorznabHttpClient,
+    TorznabRegistry, TorznabRequestError,
 };
 use crate::inventory::InventoryScanOptions;
 use crate::inventory_refresh::{
@@ -151,12 +152,81 @@ impl AppState {
             candidate_count,
         })
     }
+
+    pub async fn refresh_indexer_capabilities(
+        &self,
+        now_ms: i64,
+    ) -> Result<IndexerCapsRefreshSummary, DatabaseError> {
+        let mut summary = IndexerCapsRefreshSummary::default();
+        let mut last_error = None;
+        let registry = self.repository.indexer_registry_snapshot(1_000).await?;
+
+        for indexer in self
+            .torznab_indexers
+            .values()
+            .filter(|indexer| indexer.enabled)
+        {
+            let Some(row) = registry.iter().find(|row| row.name == indexer.name) else {
+                continue;
+            };
+            if row
+                .retry_after_ms
+                .is_some_and(|retry_after| retry_after > now_ms)
+            {
+                summary.skipped_backoff += 1;
+                summary.next_backoff_deadline_ms = Some(
+                    summary
+                        .next_backoff_deadline_ms
+                        .map_or(row.retry_after_ms.unwrap_or(now_ms), |current| {
+                            current.min(row.retry_after_ms.unwrap_or(now_ms))
+                        }),
+                );
+                continue;
+            }
+            match self.torznab_client.caps(indexer).await {
+                Ok(caps) => {
+                    self.repository
+                        .record_indexer_caps_success(&indexer.name, &caps, now_ms)
+                        .await?;
+                    summary.refreshed += 1;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let reason = health_reason(Some(&message), "caps failed")
+                        .unwrap_or_else(|| ReasonText::new("caps failed").unwrap());
+                    let retry_after_ms = indexer_error_retry_after(&error, now_ms);
+                    self.repository
+                        .record_indexer_caps_failure(
+                            &indexer.name,
+                            &reason,
+                            Some(retry_after_ms),
+                            now_ms,
+                        )
+                        .await?;
+                    summary.failed += 1;
+                    last_error = Some(message);
+                }
+            }
+        }
+
+        summary.last_error = last_error;
+        Ok(summary)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SearchWorkflowPlanSummary {
     pub plans: Vec<IndexerSearchPlan>,
     pub candidate_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct IndexerCapsRefreshSummary {
+    pub refreshed: usize,
+    pub failed: usize,
+    pub skipped_backoff: usize,
+    pub next_backoff_deadline_ms: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -238,6 +308,7 @@ impl AppRuntime {
                 operation: "build scheduler config".to_owned(),
                 message: error.to_string(),
             })?;
+        let http_jobs = http_supported_jobs(&scheduler_config);
         let saved_retry_interval_ms = parse_interval_ms(&config.scheduling.saved_retry_interval)
             .map_err(|error| DatabaseError::Unavailable {
                 operation: "build saved retry interval".to_owned(),
@@ -296,6 +367,8 @@ impl AppRuntime {
         readiness.workers_running = false;
         let mut http = HttpState::new(readiness, health.clone())
             .with_metrics(metrics.clone())
+            .with_job_queue(workflow.jobs.clone())
+            .with_allowed_jobs(http_jobs)
             .with_announce_acceptor(repository.clone(), config.announce.clone());
         if let Some(api_token) = config.server.api_token.as_ref() {
             http = http.with_api_token(api_token.expose_secret());
@@ -451,6 +524,35 @@ fn health_reason(value: Option<&str>, fallback: &'static str) -> Option<ReasonTe
     value
         .and_then(|reason| ReasonText::new(reason).ok())
         .or_else(|| ReasonText::new(fallback).ok())
+}
+
+fn http_supported_jobs(config: &SchedulerConfig) -> BTreeSet<crate::domain::JobName> {
+    config
+        .jobs
+        .iter()
+        .filter(|job| job.name.as_str() == "indexer_caps")
+        .map(|job| job.name.clone())
+        .collect()
+}
+
+fn indexer_error_retry_after(error: &TorznabRequestError, now_ms: i64) -> i64 {
+    let policy = IndexerBackoffPolicy::default();
+    match error {
+        TorznabRequestError::Backoff { retry_after_ms } => retry_after_ms
+            .filter(|retry_after| *retry_after > now_ms)
+            .unwrap_or_else(|| policy.retry_after_deadline(now_ms, 0, None)),
+        TorznabRequestError::RateLimited { retry_after }
+        | TorznabRequestError::HttpStatus { retry_after, .. } => {
+            policy.retry_after_deadline(now_ms, 0, *retry_after)
+        }
+        TorznabRequestError::Timeout
+        | TorznabRequestError::Request { .. }
+        | TorznabRequestError::InvalidXml { .. }
+        | TorznabRequestError::InvalidCandidate { .. }
+        | TorznabRequestError::ResponseTooLarge { .. } => {
+            policy.retry_after_deadline(now_ms, 0, None)
+        }
+    }
 }
 
 enum RuntimeInjectionClientInner {
@@ -1025,6 +1127,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indexer_caps_refresh_honors_persisted_backoff() {
+        let caps_requests = Arc::new(Mutex::new(Vec::new()));
+        let torznab_url = spawn_runtime_torznab_search_server(Arc::clone(&caps_requests)).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: torznab_url,
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_failure(
+                &DependencyName::new("main").unwrap(),
+                &ReasonText::new("rate limited").unwrap(),
+                Some(2_000),
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        let skipped = runtime
+            .state
+            .refresh_indexer_capabilities(1_500)
+            .await
+            .unwrap();
+        let refreshed = runtime
+            .state
+            .refresh_indexer_capabilities(2_000)
+            .await
+            .unwrap();
+        let queries = caps_requests.lock().unwrap();
+
+        assert_eq!(1, skipped.skipped_backoff);
+        assert_eq!(0, skipped.refreshed);
+        assert_eq!(1, refreshed.refreshed);
+        assert_eq!(1, queries.len());
+        assert!(queries[0].contains("t=caps"));
+    }
+
+    #[tokio::test]
     async fn runtime_restores_arr_backoff_before_search_planning() {
         let torznab_queries = Arc::new(Mutex::new(Vec::new()));
         let torznab_url = spawn_runtime_torznab_search_server(Arc::clone(&torznab_queries)).await;
@@ -1438,7 +1587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_accepts_durable_announcements_only_until_executors_exist() {
+    async fn runtime_accepts_durable_work_without_enabling_searches() {
         let config = SporosConfig::default();
         let repository = Repository::connect_in_memory().await.unwrap();
         let runtime = AppRuntime::from_repository(config, repository)
@@ -1448,6 +1597,17 @@ mod tests {
 
         let search = app.clone().oneshot(search_request(None)).await.unwrap();
         let job_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/indexer_caps/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let unavailable_job = app
             .clone()
             .oneshot(
                 Request::builder()
@@ -1498,7 +1658,8 @@ mod tests {
         let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
 
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, search.status());
-        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, job_run.status());
+        assert_eq!(StatusCode::ACCEPTED, job_run.status());
+        assert_eq!(StatusCode::NOT_FOUND, unavailable_job.status());
         assert_eq!(StatusCode::ACCEPTED, announcement.status());
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());
         assert_eq!(true, status_json["readiness"]["accepting_work"]);
@@ -1842,11 +2003,14 @@ mod tests {
             get(move |request: Request<Body>| {
                 let queries = Arc::clone(&queries);
                 async move {
-                    queries
-                        .lock()
-                        .unwrap()
-                        .push(request.uri().query().unwrap_or_default().to_owned());
-                    (StatusCode::OK, search_rss("candidate-1", "Example"))
+                    let query = request.uri().query().unwrap_or_default().to_owned();
+                    queries.lock().unwrap().push(query.clone());
+                    let body = if query.contains("t=caps") {
+                        torznab_caps_xml().to_owned()
+                    } else {
+                        search_rss("candidate-1", "Example")
+                    };
+                    (StatusCode::OK, body)
                 }
             }),
         );
@@ -1904,6 +2068,21 @@ mod tests {
             </rss>
             "#
         )
+    }
+
+    fn torznab_caps_xml() -> &'static str {
+        r#"
+        <caps>
+          <limits default="50" max="200"/>
+          <searching>
+            <search available="yes" supportedParams="q"/>
+            <movie-search available="yes" supportedParams="q,imdbid"/>
+          </searching>
+          <categories>
+            <category id="2000" name="Movies"/>
+          </categories>
+        </caps>
+        "#
     }
 
     fn response_with_cookie(

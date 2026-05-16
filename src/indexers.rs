@@ -285,6 +285,25 @@ impl TorznabHttpClient {
         })
     }
 
+    pub async fn caps(
+        &self,
+        indexer: &ConfiguredTorznabIndexer,
+    ) -> Result<TorznabCaps, TorznabRequestError> {
+        let response = self
+            .request_parts(
+                indexer.url.as_str(),
+                indexer
+                    .api_key
+                    .as_ref()
+                    .map(|api_key| api_key.expose_secret()),
+                |params| params.push(("t".to_owned(), "caps".to_owned())),
+            )
+            .await?;
+        parse_torznab_caps(&response).map_err(|error| TorznabRequestError::InvalidXml {
+            message: error.to_string(),
+        })
+    }
+
     async fn request<F>(
         &self,
         endpoint: &TorznabEndpoint,
@@ -293,15 +312,32 @@ impl TorznabHttpClient {
     where
         F: FnOnce(&mut Vec<(String, String)>),
     {
+        self.request_parts(
+            endpoint.url.as_str(),
+            endpoint.api_key.as_deref(),
+            build_params,
+        )
+        .await
+    }
+
+    async fn request_parts<F>(
+        &self,
+        url: &str,
+        api_key: Option<&str>,
+        build_params: F,
+    ) -> Result<String, TorznabRequestError>
+    where
+        F: FnOnce(&mut Vec<(String, String)>),
+    {
         let mut params = Vec::new();
         build_params(&mut params);
-        if let Some(api_key) = endpoint.api_key.as_deref() {
+        if let Some(api_key) = api_key {
             params.push(("apikey".to_owned(), api_key.to_owned()));
         }
 
         let response = self
             .client
-            .get(endpoint.url.as_str())
+            .get(url)
             .query(&params)
             .timeout(self.timeout)
             .send()

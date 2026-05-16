@@ -64,6 +64,13 @@ pub struct SchedulerTickSummary {
     pub deferred: usize,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ImmediateRunOutcome {
+    Queued,
+    Coalesced,
+    Deferred,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SchedulerError {
     InvalidConfig {
@@ -225,6 +232,56 @@ impl PersistedScheduler {
             )
             .await?;
         Ok(true)
+    }
+
+    pub async fn enqueue_immediate_run(
+        &self,
+        job_name: &JobName,
+        now_ms: i64,
+    ) -> Result<ImmediateRunOutcome, SchedulerError> {
+        self.job(job_name)?;
+        let snapshots = self.repository.job_status_snapshot(1_000).await?;
+        if snapshots
+            .iter()
+            .any(|snapshot| snapshot.name == *job_name && snapshot.state == "running")
+        {
+            return Ok(ImmediateRunOutcome::Coalesced);
+        }
+
+        self.repository
+            .record_job_status(
+                job_name,
+                JobStateUpdate {
+                    state: JobState::Running,
+                    last_started_at_ms: Some(now_ms),
+                    last_finished_at_ms: None,
+                    next_run_at_ms: None,
+                    last_error: None,
+                },
+            )
+            .await?;
+
+        match self.queue.try_enqueue(ScheduledJobRun {
+            job_name: job_name.clone(),
+            scheduled_at_ms: now_ms,
+        }) {
+            Ok(()) => Ok(ImmediateRunOutcome::Queued),
+            Err(EnqueueError::Full { .. } | EnqueueError::Closed { .. }) => {
+                self.repository
+                    .record_job_status(
+                        job_name,
+                        JobStateUpdate {
+                            state: JobState::Waiting,
+                            last_started_at_ms: None,
+                            last_finished_at_ms: Some(now_ms),
+                            next_run_at_ms: Some(now_ms + self.failure_backoff_ms),
+                            last_error: Some("scheduler queue unavailable"),
+                        },
+                    )
+                    .await?;
+                Ok(ImmediateRunOutcome::Deferred)
+            }
+        }
     }
 
     pub async fn complete_success(
@@ -429,6 +486,48 @@ mod tests {
         assert!(!scheduler.trigger_now(&rss, 100).await.unwrap());
         scheduler.tick(100).await.unwrap();
         assert!(!scheduler.trigger_now(&rss, 100).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scheduler_immediate_run_enqueues_only_requested_job() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let (queue, mut receiver) = scheduler_queue(nonzero(4));
+        let scheduler = PersistedScheduler::new(repository.clone(), queue, test_config());
+        let rss = JobName::new("rss").unwrap();
+
+        let outcome = scheduler.enqueue_immediate_run(&rss, 100).await.unwrap();
+        let run = receiver.recv().await.unwrap();
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+
+        assert_eq!(ImmediateRunOutcome::Queued, outcome);
+        assert_eq!("rss", run.job_name.as_str());
+        assert_eq!(1, jobs.len());
+        assert_eq!("running", jobs[0].state);
+    }
+
+    #[tokio::test]
+    async fn scheduler_immediate_run_defers_when_queue_is_full() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let (queue, _receiver) = scheduler_queue(nonzero(1));
+        let scheduler = PersistedScheduler::new(repository.clone(), queue, test_config());
+        let rss = JobName::new("rss").unwrap();
+        let cleanup = JobName::new("cleanup").unwrap();
+
+        scheduler.enqueue_immediate_run(&rss, 100).await.unwrap();
+        let outcome = scheduler
+            .enqueue_immediate_run(&cleanup, 150)
+            .await
+            .unwrap();
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let cleanup_job = jobs.iter().find(|job| job.name == cleanup).unwrap();
+
+        assert_eq!(ImmediateRunOutcome::Deferred, outcome);
+        assert_eq!("waiting", cleanup_job.state);
+        assert_eq!(Some(60_150), cleanup_job.next_run_at_ms);
+        assert_eq!(
+            Some("scheduler queue unavailable".to_owned()),
+            cleanup_job.last_error
+        );
     }
 
     #[tokio::test]

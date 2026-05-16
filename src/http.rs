@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -35,6 +35,8 @@ pub struct HttpState {
     readiness: Arc<RwLock<ReadinessState>>,
     health: HealthRegistry,
     workflow_queues: Option<WorkflowQueues>,
+    job_queue: Option<BoundedWorkQueue<JobRunWorkflowRequest>>,
+    allowed_jobs: Option<Arc<BTreeSet<JobName>>>,
     announce_acceptor: Option<AnnounceAcceptor>,
     api_auth: Option<ApiAuth>,
     request_timeout: Duration,
@@ -47,6 +49,8 @@ impl HttpState {
             readiness: Arc::new(RwLock::new(readiness)),
             health,
             workflow_queues: None,
+            job_queue: None,
+            allowed_jobs: None,
             announce_acceptor: None,
             api_auth: None,
             request_timeout: Duration::from_secs(5),
@@ -56,6 +60,16 @@ impl HttpState {
 
     pub fn with_workflow_queues(mut self, workflow_queues: WorkflowQueues) -> Self {
         self.workflow_queues = Some(workflow_queues);
+        self
+    }
+
+    pub fn with_job_queue(mut self, job_queue: BoundedWorkQueue<JobRunWorkflowRequest>) -> Self {
+        self.job_queue = Some(job_queue);
+        self
+    }
+
+    pub fn with_allowed_jobs(mut self, allowed_jobs: BTreeSet<JobName>) -> Self {
+        self.allowed_jobs = Some(Arc::new(allowed_jobs));
         self
     }
 
@@ -110,6 +124,32 @@ impl HttpState {
             .ok_or(ApiErrorResponse::service_unavailable(
                 "workflow queues are not running",
             ))
+    }
+
+    fn job_queue(&self) -> Result<&BoundedWorkQueue<JobRunWorkflowRequest>, ApiErrorResponse> {
+        self.workflow_queues
+            .as_ref()
+            .map(|queues| &queues.jobs)
+            .or(self.job_queue.as_ref())
+            .ok_or(ApiErrorResponse::service_unavailable(
+                "job workflow queue is not running",
+            ))
+    }
+
+    fn accepts_job(&self, job_name: &JobName) -> bool {
+        self.allowed_jobs
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(job_name))
+    }
+
+    fn queue_stats(&self) -> Vec<crate::runtime::queue::QueueStats> {
+        if let Some(workflow_queues) = self.workflow_queues.as_ref() {
+            return workflow_queues.stats();
+        }
+        self.job_queue
+            .as_ref()
+            .map(|queue| vec![queue.stats()])
+            .unwrap_or_default()
     }
 }
 
@@ -397,6 +437,14 @@ impl ApiErrorResponse {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "service_unavailable",
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
             message: message.into(),
         }
     }
@@ -730,9 +778,21 @@ async fn post_job_run(State(state): State<HttpState>, Path(job_name): Path<Strin
             return error.into_response();
         }
     };
+    if !state.accepts_job(&request.job_name) {
+        state
+            .metrics
+            .record_workflow_enqueue(WorkflowMetric::JobRun, WorkflowOutcome::Invalid);
+        let error = ApiErrorResponse::not_found("unknown scheduled job");
+        state.metrics.record_http_request(
+            HttpMethod::Post,
+            HttpRoute::JobRuns,
+            error.status.as_u16(),
+        );
+        return error.into_response();
+    }
     let _span = info_span!("http.job_run", job_name = %request.job_name);
-    let queues = match state.workflow_queues() {
-        Ok(queues) => queues,
+    let queue = match state.job_queue() {
+        Ok(queue) => queue,
         Err(error) => {
             state
                 .metrics
@@ -748,7 +808,7 @@ async fn post_job_run(State(state): State<HttpState>, Path(job_name): Path<Strin
 
     let response = enqueue_work(
         &state.metrics,
-        queues.jobs.try_enqueue(request),
+        queue.try_enqueue(request),
         WorkflowKind::JobRun,
     );
     state.metrics.record_http_request(
@@ -818,11 +878,7 @@ fn enqueue_work<T>(
 }
 
 async fn metrics_snapshot(state: &HttpState) -> MetricsSnapshot {
-    let queues = state
-        .workflow_queues
-        .as_ref()
-        .map(WorkflowQueues::stats)
-        .unwrap_or_default();
+    let queues = state.queue_stats();
     let dependency_health = state.dependency_health();
     let mut snapshot = MetricsSnapshot {
         queues,

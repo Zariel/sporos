@@ -13,17 +13,18 @@ use crate::announce::{AnnounceReason, AnnounceWorkId};
 use crate::config::{SporosConfig, validate_server_auth};
 use crate::content_filter::ContentFilterContext;
 use crate::domain::{
-    CandidateAssessment, CandidateGuid, DownloadUrl, IndexerId, ItemTitle, MatchDecision,
+    CandidateAssessment, CandidateGuid, DownloadUrl, IndexerId, ItemTitle, JobName, MatchDecision,
     RemoteCandidate, RemoteCandidateId, TrackerName,
 };
 use crate::errors::{ConfigError, DatabaseError};
-use crate::http::{SearchWorkflowRequest, router};
+use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
 use crate::indexers::{CachedCandidateTorrent, CandidateDownloadClient, CandidateDownloadError};
 use crate::inventory_refresh::run_inventory_refresh_worker;
 use crate::matching::{
     PersistedCandidateAssessment, ReverseLookupConfig, ReverseLookupError, ReverseLookupOutcome,
     assess_and_persist_candidate, reverse_lookup_and_assess_candidate, reverse_lookup_candidates,
 };
+use crate::metrics::ExternalOutcome;
 use crate::notifications::{NotificationWorker, run_notification_worker};
 use crate::persistence::repository::Repository;
 use crate::runtime::announce_worker::{
@@ -34,7 +35,7 @@ use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
 use crate::runtime::injection_worker::{
     InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
-use crate::runtime::scheduler::parse_interval_ms;
+use crate::runtime::scheduler::{ImmediateRunOutcome, ScheduledJobRun, parse_interval_ms};
 use crate::runtime::shutdown::{ShutdownController, ShutdownPhase, ShutdownSignal};
 
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -225,19 +226,21 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     ));
     handles.push(BackgroundTask::new(
         "jobs-receiver",
-        tokio::spawn(hold_receiver_open(
+        tokio::spawn(run_job_receiver(
+            runtime.state.clone(),
             jobs,
             runtime.state.shutdown_signal.clone(),
         )),
-        BackgroundShutdownPolicy::AbortOnTimeout,
+        BackgroundShutdownPolicy::AwaitInFlight,
     ));
     handles.push(BackgroundTask::new(
         "scheduler-receiver",
-        tokio::spawn(hold_receiver_open(
+        tokio::spawn(run_scheduler_receiver(
+            runtime.state.clone(),
             scheduler,
             runtime.state.shutdown_signal.clone(),
         )),
-        BackgroundShutdownPolicy::AbortOnTimeout,
+        BackgroundShutdownPolicy::AwaitInFlight,
     ));
 
     Ok(handles)
@@ -278,6 +281,201 @@ async fn run_search_receiver(
                 }
             }
         }
+    }
+}
+
+async fn run_job_receiver(
+    state: AppState,
+    mut receiver: crate::runtime::queue::WorkReceiver<JobRunWorkflowRequest>,
+    mut shutdown: ShutdownSignal,
+) {
+    loop {
+        tokio::select! {
+            _state = shutdown.cancelled() => {
+                receiver.close();
+                release_queued_job_requests(&state, &mut receiver).await;
+                break;
+            }
+            request = receiver.recv() => {
+                let Some(request) = request else {
+                    break;
+                };
+                let job_name = request.job_name.clone();
+                match state
+                    .scheduler
+                    .enqueue_immediate_run(&request.job_name, unix_time_ms())
+                    .await
+                {
+                    Ok(ImmediateRunOutcome::Queued) => {
+                        tracing::info!(job_name = %job_name, "scheduled job run queued");
+                    }
+                    Ok(ImmediateRunOutcome::Coalesced) => {
+                        tracing::info!(job_name = %job_name, "scheduled job run already active");
+                    }
+                    Ok(ImmediateRunOutcome::Deferred) => {
+                        warn!(job_name = %job_name, "scheduled job run deferred");
+                    }
+                    Err(error) => warn!(job_name = %job_name, error = %error, "scheduled job trigger failed"),
+                }
+                receiver.mark_completed();
+            }
+        }
+    }
+}
+
+async fn release_queued_job_requests(
+    state: &AppState,
+    receiver: &mut crate::runtime::queue::WorkReceiver<JobRunWorkflowRequest>,
+) {
+    while let Some(request) = receiver.recv().await {
+        let now_ms = unix_time_ms();
+        if let Err(error) = state
+            .scheduler
+            .complete_failure(&request.job_name, now_ms, "scheduler shutting down")
+            .await
+        {
+            warn!(
+                job_name = %request.job_name,
+                error = %error,
+                "queued scheduled job request shutdown release failed"
+            );
+        }
+        receiver.mark_completed();
+    }
+}
+
+async fn run_scheduler_receiver(
+    state: AppState,
+    mut receiver: crate::runtime::queue::WorkReceiver<ScheduledJobRun>,
+    mut shutdown: ShutdownSignal,
+) {
+    loop {
+        tokio::select! {
+            _state = shutdown.cancelled() => {
+                receiver.close();
+                release_queued_scheduler_runs(&state, &mut receiver).await;
+                break;
+            }
+            run = receiver.recv() => {
+                let Some(run) = run else {
+                    break;
+                };
+                process_scheduled_job_run(&state, run, shutdown.clone()).await;
+                receiver.mark_completed();
+            }
+        }
+    }
+}
+
+async fn release_queued_scheduler_runs(
+    state: &AppState,
+    receiver: &mut crate::runtime::queue::WorkReceiver<ScheduledJobRun>,
+) {
+    while let Some(run) = receiver.recv().await {
+        let now_ms = unix_time_ms();
+        if let Err(error) = state
+            .scheduler
+            .complete_failure(&run.job_name, now_ms, "scheduler shutting down")
+            .await
+        {
+            warn!(
+                job_name = %run.job_name,
+                error = %error,
+                "scheduled job shutdown release failed"
+            );
+        }
+        receiver.mark_completed();
+    }
+}
+
+async fn process_scheduled_job_run(
+    state: &AppState,
+    run: ScheduledJobRun,
+    shutdown: ShutdownSignal,
+) {
+    let started = Instant::now();
+    let job_name = run.job_name.clone();
+    let result = execute_scheduled_job(state, &job_name, shutdown).await;
+    let finished_at_ms = unix_time_ms();
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
+    match result {
+        Ok(()) => {
+            if let Err(error) = state
+                .scheduler
+                .complete_success(&job_name, finished_at_ms)
+                .await
+            {
+                warn!(job_name = %job_name, error = %error, "scheduled job success status update failed");
+            }
+            state.metrics.record_job_duration(
+                job_name.as_str(),
+                ExternalOutcome::Succeeded,
+                duration_ms,
+            );
+            tracing::info!(
+                job_name = %job_name,
+                scheduled_at_ms = run.scheduled_at_ms,
+                "scheduled job completed"
+            );
+        }
+        Err(error) => {
+            if let Err(status_error) = state
+                .scheduler
+                .complete_failure(&job_name, finished_at_ms, &error)
+                .await
+            {
+                warn!(
+                    job_name = %job_name,
+                    error = %status_error,
+                    "scheduled job failure status update failed"
+                );
+            }
+            state.metrics.record_job_duration(
+                job_name.as_str(),
+                ExternalOutcome::Failed,
+                duration_ms,
+            );
+            warn!(job_name = %job_name, error = %error, "scheduled job failed");
+        }
+    }
+}
+
+async fn execute_scheduled_job(
+    state: &AppState,
+    job_name: &JobName,
+    shutdown: ShutdownSignal,
+) -> Result<(), String> {
+    if shutdown.state().phase != ShutdownPhase::Running {
+        return Err("scheduler is shutting down".to_owned());
+    }
+
+    match job_name.as_str() {
+        "indexer_caps" => {
+            let summary = state
+                .refresh_indexer_capabilities(unix_time_ms())
+                .await
+                .map_err(|error| error.to_string())?;
+            if summary.refreshed > 0 && summary.failed == 0 {
+                Ok(())
+            } else if summary.failed == 0 && summary.skipped_backoff > 0 {
+                Err(match summary.next_backoff_deadline_ms {
+                    Some(deadline) => {
+                        format!("indexer caps refresh is in backoff until {deadline}")
+                    }
+                    None => "indexer caps refresh is in backoff".to_owned(),
+                })
+            } else {
+                Err(summary
+                    .last_error
+                    .unwrap_or_else(|| "indexer caps refresh failed".to_owned()))
+            }
+        }
+        "rss" | "search" | "cleanup" => Err(format!(
+            "scheduled job {} does not have an executor yet",
+            job_name.as_str()
+        )),
+        other => Err(format!("unknown scheduled job {other}")),
     }
 }
 
@@ -950,12 +1148,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::config::{ConfigTorrentClientKind, SporosConfig, TorrentClientConfig};
+    use crate::config::{
+        ConfigTorrentClientKind, SporosConfig, TorrentClientConfig, TorznabIndexerConfig,
+    };
     use crate::domain::{
-        ByteSize, CandidateGuid, DisplayName, DownloadUrl, FileIndex, IndexerId, InfoHash,
-        ItemTitle, LocalFile, LocalItem, LocalItemSource, MediaType, RemoteCandidate, TrackerName,
+        ByteSize, CandidateGuid, DependencyName, DisplayName, DownloadUrl, FileIndex, IndexerId,
+        InfoHash, ItemTitle, LocalFile, LocalItem, LocalItemSource, MediaType, ReasonText,
+        RemoteCandidate, TrackerName,
     };
     use crate::persistence::repository::Repository;
+    use crate::secrets::ApiKey;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header::SET_COOKIE};
     use axum::response::{IntoResponse, Response};
@@ -1110,6 +1312,210 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(2, candidates);
+    }
+
+    #[tokio::test]
+    async fn background_tasks_process_posted_job_runs() {
+        let caps_requests = Arc::new(AtomicUsize::new(0));
+        let indexer_url = spawn_daemon_torznab_caps_server(caps_requests.clone()).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+        let job_queue = runtime.state.queues.workflow.jobs.clone();
+        let scheduler_queue = runtime.state.queues.scheduler.clone();
+        let app = router(runtime.state.http.clone());
+        let handles = start_background_tasks(runtime).await.unwrap();
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/indexer_caps/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::ACCEPTED, accepted.status());
+        wait_for_job_state(&repository, "indexer_caps", "succeeded").await;
+        wait_for_queue_completed(&job_queue, 1).await;
+        wait_for_queue_completed(&scheduler_queue, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let indexer_caps = jobs
+            .iter()
+            .find(|job| job.name.as_str() == "indexer_caps")
+            .unwrap();
+        let stored_caps: String =
+            sqlx::query_scalar("SELECT capabilities_json FROM indexers WHERE name = 'main'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let stored_caps: Value = serde_json::from_str(&stored_caps).unwrap();
+        assert_eq!("succeeded", indexer_caps.state);
+        assert!(indexer_caps.last_started_at_ms.is_some());
+        assert!(indexer_caps.last_finished_at_ms.is_some());
+        assert!(indexer_caps.next_run_at_ms.is_some());
+        assert_eq!(None, indexer_caps.last_error);
+        assert_eq!(true, stored_caps["search"]["movie_search"]);
+        assert_eq!(true, stored_caps["categories"]["movie"]);
+        assert_eq!(1, caps_requests.load(Ordering::SeqCst));
+        assert_eq!(0, job_queue.stats().depth);
+        assert_eq!(0, scheduler_queue.stats().depth);
+    }
+
+    #[tokio::test]
+    async fn posted_indexer_caps_job_does_not_succeed_when_every_indexer_is_backed_off() {
+        let caps_requests = Arc::new(AtomicUsize::new(0));
+        let indexer_url = spawn_daemon_torznab_caps_server(caps_requests.clone()).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_failure(
+                &DependencyName::new("main").unwrap(),
+                &ReasonText::new("rate limited").unwrap(),
+                Some(unix_time_ms() + 60_000),
+                unix_time_ms(),
+            )
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+        let app = router(runtime.state.http.clone());
+        let handles = start_background_tasks(runtime).await.unwrap();
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/indexer_caps/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::ACCEPTED, accepted.status());
+        wait_for_job_state(&repository, "indexer_caps", "failed").await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let indexer_caps = jobs
+            .iter()
+            .find(|job| job.name.as_str() == "indexer_caps")
+            .unwrap();
+        assert_eq!("failed", indexer_caps.state);
+        assert!(
+            indexer_caps
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("backoff")),
+            "unexpected last_error: {:?}",
+            indexer_caps.last_error
+        );
+        assert_eq!(0, caps_requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn scheduler_receiver_releases_queued_runs_on_shutdown() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let scheduler_queue = state.queues.scheduler.clone();
+        let job_name = JobName::new("indexer_caps").unwrap();
+
+        state
+            .scheduler
+            .enqueue_immediate_run(&job_name, 100)
+            .await
+            .unwrap();
+        state.shutdown.cancel_now("test shutdown").unwrap();
+        run_scheduler_receiver(
+            state.clone(),
+            runtime.receivers.scheduler,
+            state.shutdown_signal.clone(),
+        )
+        .await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let indexer_caps = jobs
+            .iter()
+            .find(|job| job.name.as_str() == "indexer_caps")
+            .unwrap();
+        assert_eq!("failed", indexer_caps.state);
+        assert!(
+            matches!(
+                indexer_caps.last_error.as_deref(),
+                Some("scheduler shutting down") | Some("scheduler is shutting down")
+            ),
+            "unexpected last_error: {:?}",
+            indexer_caps.last_error
+        );
+        assert_eq!(0, scheduler_queue.stats().depth);
+        assert_eq!(1, scheduler_queue.stats().completed);
+    }
+
+    #[tokio::test]
+    async fn job_receiver_releases_queued_requests_on_shutdown() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let job_queue = state.queues.workflow.jobs.clone();
+        let job_name = JobName::new("indexer_caps").unwrap();
+
+        job_queue
+            .try_enqueue(JobRunWorkflowRequest {
+                job_name: job_name.clone(),
+            })
+            .unwrap();
+        runtime.receivers.jobs.close();
+        release_queued_job_requests(&state, &mut runtime.receivers.jobs).await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let indexer_caps = jobs
+            .iter()
+            .find(|job| job.name.as_str() == "indexer_caps")
+            .unwrap();
+        assert_eq!("failed", indexer_caps.state);
+        assert_eq!(
+            Some("scheduler shutting down".to_owned()),
+            indexer_caps.last_error
+        );
+        assert_eq!(0, job_queue.stats().depth);
+        assert_eq!(1, job_queue.stats().completed);
     }
 
     #[tokio::test]
@@ -1342,6 +1748,39 @@ mod tests {
         assert_eq!(expected, status);
     }
 
+    async fn wait_for_job_state(repository: &Repository, name: &str, expected: &str) {
+        for _attempt in 0..50 {
+            let status = sqlx::query_scalar::<_, String>("SELECT state FROM jobs WHERE name = ?")
+                .bind(name)
+                .fetch_optional(repository.pool())
+                .await
+                .unwrap();
+            if status.as_deref() == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let status = sqlx::query_scalar::<_, String>("SELECT state FROM jobs WHERE name = ?")
+            .bind(name)
+            .fetch_optional(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(Some(expected), status.as_deref());
+    }
+
+    async fn wait_for_queue_completed<T>(
+        queue: &crate::runtime::queue::BoundedWorkQueue<T>,
+        expected: u64,
+    ) {
+        for _attempt in 0..50 {
+            if queue.stats().completed >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(expected, queue.stats().completed);
+    }
+
     async fn spawn_daemon_qbit_inventory_server(info_requests: Arc<AtomicUsize>) -> String {
         spawn_daemon_test_server(move |request| {
             let info_requests = info_requests.clone();
@@ -1380,6 +1819,25 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}/download")
+    }
+
+    async fn spawn_daemon_torznab_caps_server(requests: Arc<AtomicUsize>) -> String {
+        let app = axum::Router::new().route(
+            "/api",
+            get(move || {
+                let requests = requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, torznab_caps_xml())
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
     }
 
     async fn spawn_daemon_test_server<F, Fut, R>(handler: F) -> String
@@ -1494,6 +1952,21 @@ mod tests {
 
     fn test_torrent_bytes() -> &'static [u8] {
         b"d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"
+    }
+
+    fn torznab_caps_xml() -> &'static str {
+        r#"
+        <caps>
+          <limits default="50" max="200"/>
+          <searching>
+            <search available="yes" supportedParams="q"/>
+            <movie-search available="yes" supportedParams="q,imdbid"/>
+          </searching>
+          <categories>
+            <category id="2000" name="Movies"/>
+          </categories>
+        </caps>
+        "#
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
