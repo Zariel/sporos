@@ -1138,6 +1138,67 @@ impl Repository {
             .collect()
     }
 
+    pub async fn claim_scheduled_job_run(
+        &self,
+        name: &JobName,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET state = 'running',
+                last_started_at = ?,
+                next_run_at = NULL,
+                last_error = NULL
+            WHERE name = ?
+              AND state NOT IN ('running', 'disabled')
+              AND (next_run_at IS NULL OR next_run_at <= ?)
+            "#,
+        )
+        .bind(now_ms)
+        .bind(name.as_str())
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("claim scheduled job run", error))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn claim_immediate_job_run(
+        &self,
+        name: &JobName,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO jobs (
+                name,
+                state,
+                last_started_at,
+                last_finished_at,
+                next_run_at,
+                last_error
+            )
+            VALUES (?, 'running', ?, NULL, NULL, NULL)
+            ON CONFLICT (name) DO UPDATE SET
+                state = excluded.state,
+                last_started_at = excluded.last_started_at,
+                last_finished_at = COALESCE(excluded.last_finished_at, jobs.last_finished_at),
+                next_run_at = excluded.next_run_at,
+                last_error = excluded.last_error
+            WHERE jobs.state NOT IN ('running', 'disabled')
+            "#,
+        )
+        .bind(name.as_str())
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("claim immediate job run", error))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn job_status_snapshot(
         &self,
         limit: u16,

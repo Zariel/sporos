@@ -41,6 +41,7 @@ use crate::torrent::parse_metafile;
 
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const ANNOUNCE_IDLE_SLEEP: Duration = Duration::from_millis(500);
+const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
 
 #[derive(Debug)]
@@ -246,6 +247,15 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         BackgroundShutdownPolicy::AwaitInFlight,
     ));
     handles.push(BackgroundTask::new(
+        "scheduler-tick",
+        tokio::spawn(run_scheduler_tick_loop(
+            runtime.state.clone(),
+            SCHEDULER_TICK_INTERVAL,
+            runtime.state.shutdown_signal.clone(),
+        )),
+        BackgroundShutdownPolicy::AbortOnTimeout,
+    ));
+    handles.push(BackgroundTask::new(
         "scheduler-receiver",
         tokio::spawn(run_scheduler_receiver(
             runtime.state.clone(),
@@ -256,6 +266,37 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     ));
 
     Ok(handles)
+}
+
+async fn run_scheduler_tick_loop(
+    state: AppState,
+    interval: Duration,
+    mut shutdown: ShutdownSignal,
+) {
+    loop {
+        tokio::select! {
+            _state = shutdown.cancelled() => break,
+            () = tokio::time::sleep(interval) => {}
+        }
+
+        if shutdown.state().phase != ShutdownPhase::Running {
+            break;
+        }
+
+        match state.scheduler.tick(unix_time_ms()).await {
+            Ok(summary) => {
+                if summary.seeded > 0 || summary.enqueued > 0 || summary.deferred > 0 {
+                    tracing::debug!(
+                        seeded = summary.seeded,
+                        enqueued = summary.enqueued,
+                        deferred = summary.deferred,
+                        "scheduler tick completed"
+                    );
+                }
+            }
+            Err(error) => warn!(error = %error, "scheduler tick failed"),
+        }
+    }
 }
 
 fn announce_worker_owner_prefix() -> String {
@@ -1511,7 +1552,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        ConfigTorrentClientKind, SporosConfig, TorrentClientConfig, TorznabIndexerConfig,
+        ConfigTorrentClientKind, ProwlarrSourceConfig, SporosConfig, TorrentClientConfig,
+        TorznabIndexerConfig,
     };
     use crate::domain::{
         ByteSize, CandidateGuid, DependencyName, DisplayName, DownloadUrl, FileIndex, IndexerId,
@@ -1898,6 +1940,51 @@ mod tests {
         assert_eq!(true, stored_caps["categories"]["movie"]);
         assert_eq!(1, caps_requests.load(Ordering::SeqCst));
         assert_eq!(0, job_queue.stats().depth);
+        assert_eq!(0, scheduler_queue.stats().depth);
+    }
+
+    #[tokio::test]
+    async fn background_scheduler_tick_refreshes_prowlarr_import_caps() {
+        let catalog_requests = Arc::new(AtomicUsize::new(0));
+        let caps_requests = Arc::new(AtomicUsize::new(0));
+        let prowlarr_url = spawn_daemon_prowlarr_with_caps_server(
+            Arc::clone(&catalog_requests),
+            Arc::clone(&caps_requests),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            ProwlarrSourceConfig {
+                url: prowlarr_url,
+                api_key: Some(ApiKey::new("prowlarr-secret").unwrap()),
+                refresh_on_startup: true,
+                ..ProwlarrSourceConfig::default()
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+        let scheduler_queue = runtime.state.queues.scheduler.clone();
+        let handles = start_background_tasks(runtime).await.unwrap();
+
+        wait_for_job_state(&repository, "indexer_caps", "succeeded").await;
+        wait_for_queue_completed(&scheduler_queue, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        let stored_caps: String =
+            sqlx::query_scalar("SELECT capabilities_json FROM indexers WHERE name = 'main:Movies'")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let stored_caps: Value = serde_json::from_str(&stored_caps).unwrap();
+        assert_eq!(true, stored_caps["search"]["movie_search"]);
+        assert_eq!(true, stored_caps["categories"]["movie"]);
+        assert_eq!(1, catalog_requests.load(Ordering::SeqCst));
+        assert_eq!(1, caps_requests.load(Ordering::SeqCst));
         assert_eq!(0, scheduler_queue.stats().depth);
     }
 
@@ -2442,6 +2529,35 @@ mod tests {
         format!("http://{address}/api")
     }
 
+    async fn spawn_daemon_prowlarr_with_caps_server(
+        catalog_requests: Arc<AtomicUsize>,
+        caps_requests: Arc<AtomicUsize>,
+    ) -> String {
+        let catalog = move || {
+            let catalog_requests = Arc::clone(&catalog_requests);
+            async move {
+                catalog_requests.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, prowlarr_catalog())
+            }
+        };
+        let caps = move || {
+            let caps_requests = Arc::clone(&caps_requests);
+            async move {
+                caps_requests.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, torznab_caps_xml())
+            }
+        };
+        let app = axum::Router::new()
+            .route("/api/v1/indexer", get(catalog))
+            .route("/101/api", get(caps));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
     async fn spawn_daemon_test_server<F, Fut, R>(handler: F) -> String
     where
         F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
@@ -2568,6 +2684,23 @@ mod tests {
             <category id="2000" name="Movies"/>
           </categories>
         </caps>
+        "#
+    }
+
+    fn prowlarr_catalog() -> &'static str {
+        r#"
+        [
+          {
+            "id": 101,
+            "name": "Movies",
+            "enable": true,
+            "protocol": "torrent",
+            "implementation": "Cardigann",
+            "supportsRss": true,
+            "supportsSearch": true,
+            "tags": []
+          }
+        ]
         "#
     }
 

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use crate::config::SchedulingConfig;
 use crate::domain::{JobName, JobState};
@@ -9,6 +10,7 @@ use crate::persistence::repository::{JobStateUpdate, Repository};
 use crate::runtime::queue::{
     BoundedWorkQueue, EnqueueError, QueueKind, WorkReceiver, bounded_work_queue,
 };
+use tokio::sync::Mutex;
 use tracing::{debug_span, info_span};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -92,6 +94,7 @@ pub struct PersistedScheduler {
     jobs: BTreeMap<JobName, ScheduledJob>,
     claim_limit: u16,
     failure_backoff_ms: i64,
+    claim_lock: Arc<Mutex<()>>,
 }
 
 impl PersistedScheduler {
@@ -111,6 +114,7 @@ impl PersistedScheduler {
             jobs,
             claim_limit: config.claim_limit,
             failure_backoff_ms: config.failure_backoff_ms,
+            claim_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -148,6 +152,7 @@ impl PersistedScheduler {
 
     pub async fn tick(&self, now_ms: i64) -> Result<SchedulerTickSummary, SchedulerError> {
         let _span = info_span!("scheduler.tick", now_ms, claim_limit = self.claim_limit);
+        let _claim_guard = self.claim_lock.lock().await;
         let seeded = self.seed_jobs(now_ms).await?;
         let ready_jobs = self.repository.ready_jobs(now_ms, self.claim_limit).await?;
         let mut enqueued = 0;
@@ -158,18 +163,13 @@ impl PersistedScheduler {
             if !self.jobs.contains_key(&job_name) {
                 continue;
             }
-            self.repository
-                .record_job_status(
-                    &job_name,
-                    JobStateUpdate {
-                        state: JobState::Running,
-                        last_started_at_ms: Some(now_ms),
-                        last_finished_at_ms: None,
-                        next_run_at_ms: None,
-                        last_error: None,
-                    },
-                )
-                .await?;
+            if !self
+                .repository
+                .claim_scheduled_job_run(&job_name, now_ms)
+                .await?
+            {
+                continue;
+            }
             match self.queue.try_enqueue(ScheduledJobRun {
                 job_name: job_name.clone(),
                 scheduled_at_ms: now_ms,
@@ -205,6 +205,7 @@ impl PersistedScheduler {
         job_name: &JobName,
         now_ms: i64,
     ) -> Result<bool, SchedulerError> {
+        let _claim_guard = self.claim_lock.lock().await;
         if !self.jobs.contains_key(job_name) {
             return Err(SchedulerError::UnknownJob {
                 name: job_name.clone(),
@@ -239,27 +240,15 @@ impl PersistedScheduler {
         job_name: &JobName,
         now_ms: i64,
     ) -> Result<ImmediateRunOutcome, SchedulerError> {
+        let _claim_guard = self.claim_lock.lock().await;
         self.job(job_name)?;
-        let snapshots = self.repository.job_status_snapshot(1_000).await?;
-        if snapshots
-            .iter()
-            .any(|snapshot| snapshot.name == *job_name && snapshot.state == "running")
+        if !self
+            .repository
+            .claim_immediate_job_run(job_name, now_ms)
+            .await?
         {
             return Ok(ImmediateRunOutcome::Coalesced);
         }
-
-        self.repository
-            .record_job_status(
-                job_name,
-                JobStateUpdate {
-                    state: JobState::Running,
-                    last_started_at_ms: Some(now_ms),
-                    last_finished_at_ms: None,
-                    next_run_at_ms: None,
-                    last_error: None,
-                },
-            )
-            .await?;
 
         match self.queue.try_enqueue(ScheduledJobRun {
             job_name: job_name.clone(),
@@ -503,6 +492,38 @@ mod tests {
         assert_eq!("rss", run.job_name.as_str());
         assert_eq!(1, jobs.len());
         assert_eq!("running", jobs[0].state);
+    }
+
+    #[tokio::test]
+    async fn scheduler_coalesces_concurrent_tick_and_immediate_run() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let (queue, _receiver) = scheduler_queue(nonzero(4));
+        let scheduler = PersistedScheduler::new(
+            repository.clone(),
+            queue.clone(),
+            SchedulerConfig {
+                jobs: vec![ScheduledJob::new("rss", "1s").unwrap()],
+                claim_limit: 10,
+                failure_backoff_ms: 60_000,
+            },
+        );
+        let rss = JobName::new("rss").unwrap();
+
+        let (tick, immediate) = tokio::join!(
+            scheduler.tick(100),
+            scheduler.enqueue_immediate_run(&rss, 100)
+        );
+        let tick = tick.unwrap();
+        let immediate = immediate.unwrap();
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+
+        assert_eq!(1, queue.stats().accepted);
+        assert_eq!(1, jobs.len());
+        assert_eq!("running", jobs[0].state);
+        assert!(
+            (tick.enqueued == 1 && immediate == ImmediateRunOutcome::Coalesced)
+                || (tick.enqueued == 0 && immediate == ImmediateRunOutcome::Queued)
+        );
     }
 
     #[tokio::test]

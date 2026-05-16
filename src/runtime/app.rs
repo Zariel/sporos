@@ -652,6 +652,7 @@ impl AppRuntime {
                 operation: "build scheduler config".to_owned(),
                 message: error.to_string(),
             })?;
+        let scheduler_config = daemon_scheduler_config(scheduler_config);
         let http_jobs = http_supported_jobs(&scheduler_config);
         let saved_retry_interval_ms = parse_interval_ms(&config.scheduling.saved_retry_interval)
             .map_err(|error| DatabaseError::Unavailable {
@@ -945,6 +946,13 @@ fn http_supported_jobs(config: &SchedulerConfig) -> BTreeSet<crate::domain::JobN
         .filter(|job| job.name.as_str() == "indexer_caps")
         .map(|job| job.name.clone())
         .collect()
+}
+
+fn daemon_scheduler_config(mut config: SchedulerConfig) -> SchedulerConfig {
+    config
+        .jobs
+        .retain(|job| matches!(job.name.as_str(), "indexer_caps"));
+    config
 }
 
 fn indexer_error_retry_after(error: &TorznabRequestError, now_ms: i64) -> i64 {
