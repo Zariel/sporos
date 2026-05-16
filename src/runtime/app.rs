@@ -294,7 +294,9 @@ impl AppRuntime {
         };
         let mut readiness = ReadinessState::ready();
         readiness.workers_running = false;
-        let mut http = HttpState::new(readiness, health.clone()).with_metrics(metrics.clone());
+        let mut http = HttpState::new(readiness, health.clone())
+            .with_metrics(metrics.clone())
+            .with_announce_acceptor(repository.clone(), config.announce.clone());
         if let Some(api_token) = config.server.api_token.as_ref() {
             http = http.with_api_token(api_token.expose_secret());
         }
@@ -1436,7 +1438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_does_not_accept_unimplemented_workflows() {
+    async fn runtime_accepts_durable_announcements_only_until_executors_exist() {
         let config = SporosConfig::default();
         let repository = Repository::connect_in_memory().await.unwrap();
         let runtime = AppRuntime::from_repository(config, repository)
@@ -1497,9 +1499,9 @@ mod tests {
 
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, search.status());
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, job_run.status());
-        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, announcement.status());
+        assert_eq!(StatusCode::ACCEPTED, announcement.status());
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());
-        assert_eq!(false, status_json["readiness"]["accepting_work"]);
+        assert_eq!(true, status_json["readiness"]["accepting_work"]);
         assert_eq!(false, status_json["readiness"]["processing_ready"]);
     }
 
