@@ -1584,6 +1584,7 @@ mod tests {
         let config = IndexersConfig {
             default_timeouts: IndexerTimeoutsConfig::default(),
             torznab,
+            prowlarr: Default::default(),
             arr: Default::default(),
         };
 
@@ -1657,6 +1658,7 @@ mod tests {
         let config = IndexersConfig {
             default_timeouts: IndexerTimeoutsConfig::default(),
             torznab,
+            prowlarr: Default::default(),
             arr: Default::default(),
         };
 
@@ -1682,6 +1684,7 @@ mod tests {
         let config = IndexersConfig {
             default_timeouts: IndexerTimeoutsConfig::default(),
             torznab,
+            prowlarr: Default::default(),
             arr: Default::default(),
         };
 

@@ -93,6 +93,7 @@ pub enum ConfigTorrentClientKind {
 pub struct IndexersConfig {
     pub default_timeouts: IndexerTimeoutsConfig,
     pub torznab: BTreeMap<String, TorznabIndexerConfig>,
+    pub prowlarr: BTreeMap<String, ProwlarrSourceConfig>,
     pub arr: ArrServicesConfig,
 }
 
@@ -119,6 +120,59 @@ pub struct TorznabIndexerConfig {
     pub api_key: Option<ApiKey>,
     pub api_key_file: Option<PathBuf>,
     pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProwlarrSourceConfig {
+    pub enabled: bool,
+    #[serde(alias = "base_url")]
+    pub url: String,
+    pub api_key: Option<ApiKey>,
+    pub api_key_file: Option<PathBuf>,
+    pub api_key_env: Option<String>,
+    pub update_interval: String,
+    pub tags: Vec<String>,
+    pub tag_match: ProwlarrTagMatch,
+    pub include_untagged: bool,
+    pub refresh_on_startup: bool,
+    pub required: bool,
+    pub remove_policy: ProwlarrRemovePolicy,
+}
+
+impl Default for ProwlarrSourceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: String::new(),
+            api_key: None,
+            api_key_file: None,
+            api_key_env: None,
+            update_interval: "24h".to_owned(),
+            tags: Vec::new(),
+            tag_match: ProwlarrTagMatch::Any,
+            include_untagged: true,
+            refresh_on_startup: true,
+            required: false,
+            remove_policy: ProwlarrRemovePolicy::Deactivate,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProwlarrTagMatch {
+    #[default]
+    Any,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProwlarrRemovePolicy {
+    #[default]
+    Deactivate,
+    Ignore,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize)]
@@ -282,6 +336,7 @@ where
             field: "announce",
             reason: error.to_string(),
         })?;
+    validate_prowlarr_sources(&config)?;
     resolve_secret_env(&mut config, &env)?;
 
     Ok((config, raw))
@@ -449,6 +504,18 @@ fn resolve_secret_env(
             }
         }
     }
+    for (name, source) in &mut config.indexers.prowlarr {
+        if source.api_key.is_none()
+            && let Some(env_name) =
+                nonempty_secret_env("indexers.prowlarr.api_key_env", name, &source.api_key_env)?
+        {
+            let value = secret_env_value(env, env_name, "indexers.prowlarr.api_key_env", name)?;
+            source.api_key = Some(
+                ApiKey::new(value.clone())
+                    .map_err(|source| ConfigError::InvalidSecret { source })?,
+            );
+        }
+    }
     resolve_arr_secret_env(
         "indexers.arr.sonarr.api_key_env",
         &mut config.indexers.arr.sonarr,
@@ -489,6 +556,15 @@ fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
                     ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?,
                 );
             }
+        }
+    }
+    for (name, source) in &mut config.indexers.prowlarr {
+        if source.api_key.is_none()
+            && let Some(path) = &source.api_key_file
+        {
+            let value = secret_file_value("indexers.prowlarr.api_key_file", name, path)?;
+            source.api_key =
+                Some(ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
         }
     }
     resolve_arr_secret_files(
@@ -538,6 +614,134 @@ fn resolve_arr_secret_files(
     }
 
     Ok(())
+}
+
+fn validate_prowlarr_sources(config: &SporosConfig) -> Result<(), ConfigError> {
+    for (name, source) in &config.indexers.prowlarr {
+        if name.trim().is_empty() {
+            return Err(ConfigError::InvalidField {
+                field: "indexers.prowlarr",
+                reason: "source names must not be empty".to_owned(),
+            });
+        }
+        validate_http_url("indexers.prowlarr.url", name, &source.url)?;
+        validate_interval(
+            "indexers.prowlarr.update_interval",
+            name,
+            &source.update_interval,
+        )?;
+        validate_secret_source_count(
+            "indexers.prowlarr.api_key",
+            name,
+            source.api_key.is_some(),
+            source.api_key_file.is_some(),
+            source.api_key_env.is_some(),
+        )?;
+        for tag in &source.tags {
+            if tag.trim().is_empty() {
+                return Err(ConfigError::InvalidField {
+                    field: "indexers.prowlarr.tags",
+                    reason: format!("{name} contains an empty tag"),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_http_url(field: &'static str, name: &str, value: &str) -> Result<(), ConfigError> {
+    let parsed = reqwest::Url::parse(value).map_err(|error| ConfigError::InvalidField {
+        field,
+        reason: format!("{name}: {error}"),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{name}: URL scheme must be http or https"),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{name}: URL userinfo is not supported"),
+        });
+    }
+    if parsed.query().is_some() {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{name}: URL query parameters are not supported"),
+        });
+    }
+    if parsed.fragment().is_some() {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{name}: URL fragments are not supported"),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_interval(field: &'static str, name: &str, value: &str) -> Result<(), ConfigError> {
+    let trimmed = value.trim();
+    let split_at = trimmed
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(|| ConfigError::InvalidField {
+            field,
+            reason: format!("{name}: {value} is missing a duration unit"),
+        })?;
+    let (amount, unit) = trimmed.split_at(split_at);
+    let amount = amount
+        .parse::<i64>()
+        .map_err(|error| ConfigError::InvalidField {
+            field,
+            reason: format!("{name}: {error}"),
+        })?;
+    if amount <= 0 {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{name}: interval must be positive"),
+        });
+    }
+    let multiplier = match unit {
+        "s" => 1_000_i64,
+        "m" => 60_000_i64,
+        "h" => 3_600_000_i64,
+        "d" => 86_400_000_i64,
+        _ => {
+            return Err(ConfigError::InvalidField {
+                field,
+                reason: format!("{name}: unsupported duration unit {unit}"),
+            });
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| ConfigError::InvalidField {
+            field,
+            reason: format!("{name}: interval is too large"),
+        })?;
+
+    Ok(())
+}
+
+fn validate_secret_source_count(
+    field: &'static str,
+    name: &str,
+    direct: bool,
+    file: bool,
+    env: bool,
+) -> Result<(), ConfigError> {
+    let count = usize::from(direct) + usize::from(file) + usize::from(env);
+    if count <= 1 {
+        return Ok(());
+    }
+
+    Err(ConfigError::InvalidField {
+        field,
+        reason: format!("{name} must use only one of api_key, api_key_file, or api_key_env"),
+    })
 }
 
 pub(crate) fn validate_server_auth(config: &SporosConfig) -> Result<(), ConfigError> {
@@ -846,6 +1050,20 @@ api_key = "optional local-development secret"
 api_key_file = "optional path"
 api_key_env = "optional env var containing api key"
 
+[indexers.prowlarr.<name>]
+enabled = true
+url = "https://prowlarr.example"
+api_key = "optional local-development secret"
+api_key_file = "optional path"
+api_key_env = "optional env var containing api key"
+update_interval = "24h"
+tags = ["optional", "tag"]
+tag_match = "any|all"
+include_untagged = true
+refresh_on_startup = true
+required = false
+remove_policy = "deactivate|ignore"
+
 [indexers.arr.sonarr.<name>]
 url = "http://sonarr:8989"
 api_key = "optional local-development secret"
@@ -866,6 +1084,7 @@ SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE = "/var/run/secrets/qbit-password"
 SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY_FILE = "/var/run/secrets/indexer-api-key"
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE = "/var/run/secrets/prowlarr-api-key"
 SPOROS__INDEXERS__ARR__SONARR__MAIN__API_KEY_FILE = "/var/run/secrets/sonarr-api-key"
 
 [matching]
@@ -1167,10 +1386,12 @@ mod tests {
         let api_token_file = cwd.join("api-token");
         let password_file = cwd.join("qbit-password");
         let api_key_file = cwd.join("indexer-api-key");
+        let prowlarr_api_key_file = cwd.join("prowlarr-api-key");
         let sonarr_api_key_file = cwd.join("sonarr-api-key");
         fs::write(&api_token_file, "server-secret\n").unwrap();
         fs::write(&password_file, "super-secret\n").unwrap();
         fs::write(&api_key_file, "api-secret\r\n").unwrap();
+        fs::write(&prowlarr_api_key_file, "prowlarr-secret\n").unwrap();
         fs::write(&sonarr_api_key_file, "sonarr-secret\n").unwrap();
         let contents = format!(
             r#"
@@ -1193,6 +1414,10 @@ mod tests {
             url = "https://indexer.example/api"
             api_key_file = "{}"
 
+            [indexers.prowlarr.main]
+            url = "https://prowlarr.example"
+            api_key_file = "{}"
+
             [indexers.arr.sonarr.main]
             url = "http://sonarr:8989"
             api_key_file = "{}"
@@ -1203,12 +1428,14 @@ mod tests {
             api_token_file.display(),
             password_file.display(),
             api_key_file.display(),
+            prowlarr_api_key_file.display(),
             sonarr_api_key_file.display()
         );
 
         let config = parse_startup_config(&contents, &cwd).unwrap();
         let client = &config.torrent_clients["qbit_main"];
         let indexer = &config.indexers.torznab["example"];
+        let prowlarr = &config.indexers.prowlarr["main"];
         let sonarr = &config.indexers.arr.sonarr["main"];
 
         assert_eq!(
@@ -1228,12 +1455,17 @@ mod tests {
             indexer.api_key.as_ref().map(ApiKey::expose_secret)
         );
         assert_eq!(
+            Some("prowlarr-secret"),
+            prowlarr.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert_eq!(
             Some("sonarr-secret"),
             sonarr.api_key.as_ref().map(ApiKey::expose_secret)
         );
         assert!(!format!("{:?}", config.server).contains("server-secret"));
         assert!(!format!("{client:?}").contains("super-secret"));
         assert!(!format!("{indexer:?}").contains("api-secret"));
+        assert!(!format!("{prowlarr:?}").contains("prowlarr-secret"));
         assert!(!format!("{sonarr:?}").contains("sonarr-secret"));
 
         fs::remove_dir_all(cwd).unwrap();
@@ -1275,9 +1507,11 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("sporos config schema"));
         assert!(CONFIG_SCHEMA.contains("[torrent_clients.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[indexers.torznab.<name>]"));
+        assert!(CONFIG_SCHEMA.contains("[indexers.prowlarr.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[inventory]"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE"));
     }
 
     #[test]
@@ -1351,6 +1585,10 @@ mod tests {
             url = "https://old.example/api"
             api_key_env = "INDEXER_API_KEY"
 
+            [indexers.prowlarr.main]
+            url = "https://old-prowlarr.example"
+            api_key_env = "PROWLARR_API_KEY"
+
             [indexers.arr.radarr.main]
             url = "http://old-radarr:7878"
             api_key_env = "RADARR_API_KEY"
@@ -1365,17 +1603,23 @@ mod tests {
                     "https://indexer.example/api".to_owned(),
                 ),
                 (
+                    "SPOROS__INDEXERS__PROWLARR__MAIN__URL".to_owned(),
+                    "https://prowlarr.example".to_owned(),
+                ),
+                (
                     "SPOROS__INDEXERS__ARR__RADARR__MAIN__URL".to_owned(),
                     "http://radarr:7878".to_owned(),
                 ),
                 ("QBIT_PASSWORD".to_owned(), "super-secret".to_owned()),
                 ("INDEXER_API_KEY".to_owned(), "api-secret".to_owned()),
+                ("PROWLARR_API_KEY".to_owned(), "prowlarr-secret".to_owned()),
                 ("RADARR_API_KEY".to_owned(), "radarr-secret".to_owned()),
             ],
         )
         .unwrap();
         let client = &config.torrent_clients["qbit_main"];
         let indexer = &config.indexers.torznab["example"];
+        let prowlarr = &config.indexers.prowlarr["main"];
         let radarr = &config.indexers.arr.radarr["main"];
 
         assert_eq!("http://qbittorrent:8080", client.url);
@@ -1392,11 +1636,142 @@ mod tests {
             Some("api-secret"),
             indexer.api_key.as_ref().map(ApiKey::expose_secret)
         );
+        assert_eq!("https://prowlarr.example", prowlarr.url);
+        assert_eq!(
+            Some("prowlarr-secret"),
+            prowlarr.api_key.as_ref().map(ApiKey::expose_secret)
+        );
         assert_eq!("http://radarr:7878", radarr.url);
         assert_eq!(
             Some("radarr-secret"),
             radarr.api_key.as_ref().map(ApiKey::expose_secret)
         );
+    }
+
+    #[test]
+    fn parses_prowlarr_sources_with_defaults_and_policies() {
+        let config = parse_config(
+            r#"
+            [indexers.prowlarr.main]
+            url = "https://prowlarr.example"
+            api_key = "prowlarr-secret"
+            update_interval = "30m"
+            tags = ["movies", "hd"]
+            tag_match = "all"
+            include_untagged = false
+            refresh_on_startup = false
+            required = true
+            remove_policy = "ignore"
+
+            [indexers.prowlarr.backup]
+            base_url = "http://backup-prowlarr.example"
+            "#,
+        )
+        .unwrap();
+        let main = &config.indexers.prowlarr["main"];
+        let backup = &config.indexers.prowlarr["backup"];
+
+        assert!(main.enabled);
+        assert_eq!("https://prowlarr.example", main.url);
+        assert_eq!(
+            Some("prowlarr-secret"),
+            main.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert_eq!("30m", main.update_interval);
+        assert_eq!(vec!["movies".to_owned(), "hd".to_owned()], main.tags);
+        assert_eq!(ProwlarrTagMatch::All, main.tag_match);
+        assert!(!main.include_untagged);
+        assert!(!main.refresh_on_startup);
+        assert!(main.required);
+        assert_eq!(ProwlarrRemovePolicy::Ignore, main.remove_policy);
+        assert_eq!("http://backup-prowlarr.example", backup.url);
+        assert_eq!("24h", backup.update_interval);
+        assert_eq!(ProwlarrTagMatch::Any, backup.tag_match);
+        assert_eq!(ProwlarrRemovePolicy::Deactivate, backup.remove_policy);
+    }
+
+    #[test]
+    fn rejects_invalid_prowlarr_sources() {
+        for (contents, expected) in [
+            (
+                r#"
+                [indexers.prowlarr.""]
+                url = "https://prowlarr.example"
+                "#,
+                "source names",
+            ),
+            (
+                r#"
+                [indexers.prowlarr.main]
+                url = "file:///tmp/prowlarr"
+                "#,
+                "URL scheme",
+            ),
+            (
+                r#"
+                [indexers.prowlarr.main]
+                url = "https://user:secret@prowlarr.example"
+                "#,
+                "userinfo",
+            ),
+            (
+                r#"
+                [indexers.prowlarr.main]
+                url = "https://prowlarr.example?apikey=secret"
+                "#,
+                "query parameters",
+            ),
+            (
+                r#"
+                [indexers.prowlarr.main]
+                url = "https://prowlarr.example#secret"
+                "#,
+                "fragments",
+            ),
+            (
+                r#"
+                [indexers.prowlarr.main]
+                url = "https://prowlarr.example"
+                update_interval = "0m"
+                "#,
+                "interval must be positive",
+            ),
+            (
+                r#"
+                [indexers.prowlarr.main]
+                url = "https://prowlarr.example"
+                api_key = "direct"
+                api_key_file = "/var/run/secrets/prowlarr"
+                "#,
+                "only one",
+            ),
+            (
+                r#"
+                [indexers.prowlarr.main]
+                url = "https://prowlarr.example"
+                tags = [""]
+                "#,
+                "empty tag",
+            ),
+        ] {
+            let error = parse_config(contents).unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{error} did not contain {expected}"
+            );
+        }
+
+        let tag_policy = parse_config(
+            r#"
+            [indexers.prowlarr.main]
+            url = "https://prowlarr.example"
+            tag_match = "xor"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(tag_policy.to_string().contains("tag_match"));
     }
 
     #[test]
@@ -1436,6 +1811,10 @@ mod tests {
             url = "https://indexer.example/api"
             api_key = "api-secret"
 
+            [indexers.prowlarr.main]
+            url = "https://prowlarr.example"
+            api_key = "prowlarr-secret"
+
             [indexers.arr.sonarr.main]
             url = "http://sonarr:8989"
             api_key = "sonarr-secret"
@@ -1444,6 +1823,7 @@ mod tests {
         .unwrap();
         let client = &config.torrent_clients["qbit_main"];
         let indexer = &config.indexers.torznab["example"];
+        let prowlarr = &config.indexers.prowlarr["main"];
         let sonarr = &config.indexers.arr.sonarr["main"];
 
         assert_eq!(
@@ -1456,6 +1836,11 @@ mod tests {
             indexer.api_key.as_ref().map(ApiKey::expose_secret)
         );
         assert!(!format!("{indexer:?}").contains("api-secret"));
+        assert_eq!(
+            Some("prowlarr-secret"),
+            prowlarr.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert!(!format!("{prowlarr:?}").contains("prowlarr-secret"));
         assert_eq!(
             Some("sonarr-secret"),
             sonarr.api_key.as_ref().map(ApiKey::expose_secret)
