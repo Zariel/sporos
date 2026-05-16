@@ -33,6 +33,8 @@ CREATE INDEX IF NOT EXISTS idx_local_items_info_hash_media_type
     WHERE info_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_local_items_media_title
     ON local_items (media_type, title);
+CREATE INDEX IF NOT EXISTS idx_local_items_media_title_source
+    ON local_items (media_type, title, source_type, source_key);
 CREATE INDEX IF NOT EXISTS idx_local_items_updated_at
     ON local_items (updated_at);
 
@@ -278,6 +280,7 @@ mod tests {
             "PRIMARY KEY (dependency_type, dependency_name)",
             "failure_count INTEGER NOT NULL DEFAULT 0",
             "idx_local_files_item_size",
+            "idx_local_items_media_title_source",
             "idx_local_files_size_name",
             "idx_local_files_relative_path",
             "idx_jobs_next_run_at",

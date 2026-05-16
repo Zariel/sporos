@@ -101,6 +101,45 @@ pub struct LocalInventoryReplaceSummary {
     pub pruned: u64,
 }
 
+pub struct LocalInventoryReplaceTransaction<'a> {
+    scope: LocalInventoryScope,
+    transaction: Transaction<'a, Sqlite>,
+    upserted: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StagedVirtualEpisodeCandidate {
+    pub title: String,
+    pub season: u16,
+    pub episode: u16,
+    pub source_file: PathBuf,
+    pub size: ByteSize,
+    pub mtime_ms: Option<i64>,
+    pub newest_mtime_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StagedVirtualSeasonCursor {
+    pub title: String,
+    pub season: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StagedVirtualSeasonEpisode {
+    pub episode: u16,
+    pub source_file: PathBuf,
+    pub size: ByteSize,
+    pub mtime_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StagedVirtualSeason {
+    pub title: String,
+    pub season: u16,
+    pub newest_mtime_ms: Option<i64>,
+    pub episodes: Vec<StagedVirtualSeasonEpisode>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct SourceKeyPrefixRange {
     start: String,
@@ -237,6 +276,24 @@ pub struct LocalItemWithFile {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LocalItemPageCursor {
+    pub title: ItemTitle,
+    pub source_type: String,
+    pub source_key: String,
+}
+
+impl LocalItemPageCursor {
+    pub fn from_item(item: &LocalItem) -> Self {
+        let (source_type, source_key) = local_source(&item.source);
+        Self {
+            title: item.title.clone(),
+            source_type,
+            source_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LocalFilePage {
     pub files: Vec<LocalFileSnapshot>,
     pub truncated: bool,
@@ -340,6 +397,28 @@ impl Repository {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub async fn begin_local_inventory_replace_transaction(
+        &self,
+        scope: LocalInventoryScope,
+    ) -> Result<LocalInventoryReplaceTransaction<'_>, DatabaseError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("begin local inventory transaction", error))?;
+
+        if let LocalInventoryScope::Client { client_host } = &scope {
+            normalize_client_source_keys(&mut transaction, client_host).await?;
+        }
+        initialize_retained_keys(&mut transaction).await?;
+
+        Ok(LocalInventoryReplaceTransaction {
+            scope,
+            transaction,
+            upserted: 0,
+        })
     }
 
     pub async fn initialize(&self) -> Result<(), DatabaseError> {
@@ -594,6 +673,52 @@ impl Repository {
         rows.into_iter().map(local_item_from_row).collect()
     }
 
+    pub async fn local_items_by_media_type_keyset_page(
+        &self,
+        media_type: MediaType,
+        limit: u16,
+        after: Option<&LocalItemPageCursor>,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
+        let rows = if let Some(after) = after {
+            sqlx::query(
+                r#"
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms
+                FROM local_items
+                WHERE media_type = ?
+                  AND (title, source_type, source_key) > (?, ?, ?)
+                ORDER BY title, source_type, source_key
+                LIMIT ?
+                "#,
+            )
+            .bind(media_type_key(media_type))
+            .bind(after.title.as_str())
+            .bind(after.source_type.as_str())
+            .bind(after.source_key.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms
+                FROM local_items
+                WHERE media_type = ?
+                ORDER BY title, source_type, source_key
+                LIMIT ?
+                "#,
+            )
+            .bind(media_type_key(media_type))
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| db_error("lookup local items by media type keyset page", error))?;
+
+        rows.into_iter().map(local_item_from_row).collect()
+    }
+
     pub async fn local_items_by_media_type_and_title_token(
         &self,
         media_type: MediaType,
@@ -789,6 +914,121 @@ impl Repository {
         .fetch_all(&self.pool)
         .await
         .map_err(|error| db_error("lookup local items with largest file", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(LocalItemWithFile {
+                    item: local_item_with_file_item_from_row_ref(&row)?,
+                    file: local_item_with_file_file_from_row_ref(&row)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn local_items_with_largest_file_by_media_type_keyset_page(
+        &self,
+        media_type: MediaType,
+        limit: u16,
+        after: Option<&LocalItemPageCursor>,
+    ) -> Result<Vec<LocalItemWithFile>, DatabaseError> {
+        let rows = if let Some(after) = after {
+            sqlx::query(
+                r#"
+                WITH paged_items AS (
+                    SELECT id, source_type, source_key, title, display_name, media_type,
+                           info_hash, path, save_path, total_size, mtime_ms
+                    FROM local_items
+                    WHERE media_type = ?
+                      AND (title, source_type, source_key) > (?, ?, ?)
+                      AND EXISTS (
+                          SELECT 1
+                          FROM local_files
+                          WHERE local_files.item_id = local_items.id
+                      )
+                    ORDER BY title, source_type, source_key
+                    LIMIT ?
+                ),
+                ranked_files AS (
+                    SELECT paged_items.id, paged_items.source_type, paged_items.source_key,
+                           paged_items.title, paged_items.display_name, paged_items.media_type,
+                           paged_items.info_hash, paged_items.path, paged_items.save_path,
+                           paged_items.total_size, paged_items.mtime_ms,
+                           local_files.item_id, local_files.relative_path, local_files.file_name,
+                           local_files.size, local_files.mtime_ms AS file_mtime_ms,
+                           local_files.file_index,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY paged_items.id
+                               ORDER BY local_files.size DESC,
+                                        COALESCE(local_files.mtime_ms, -9223372036854775808),
+                                        local_files.file_index
+                           ) AS file_rank
+                    FROM paged_items
+                    JOIN local_files ON local_files.item_id = paged_items.id
+                )
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms AS item_mtime_ms,
+                       item_id, relative_path, file_name, size, file_mtime_ms,
+                       file_index
+                FROM ranked_files
+                WHERE file_rank = 1
+                ORDER BY title, source_type, source_key
+                "#,
+            )
+            .bind(media_type_key(media_type))
+            .bind(after.title.as_str())
+            .bind(after.source_type.as_str())
+            .bind(after.source_key.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                WITH paged_items AS (
+                    SELECT id, source_type, source_key, title, display_name, media_type,
+                           info_hash, path, save_path, total_size, mtime_ms
+                    FROM local_items
+                    WHERE media_type = ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM local_files
+                          WHERE local_files.item_id = local_items.id
+                      )
+                    ORDER BY title, source_type, source_key
+                    LIMIT ?
+                ),
+                ranked_files AS (
+                    SELECT paged_items.id, paged_items.source_type, paged_items.source_key,
+                           paged_items.title, paged_items.display_name, paged_items.media_type,
+                           paged_items.info_hash, paged_items.path, paged_items.save_path,
+                           paged_items.total_size, paged_items.mtime_ms,
+                           local_files.item_id, local_files.relative_path, local_files.file_name,
+                           local_files.size, local_files.mtime_ms AS file_mtime_ms,
+                           local_files.file_index,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY paged_items.id
+                               ORDER BY local_files.size DESC,
+                                        COALESCE(local_files.mtime_ms, -9223372036854775808),
+                                        local_files.file_index
+                           ) AS file_rank
+                    FROM paged_items
+                    JOIN local_files ON local_files.item_id = paged_items.id
+                )
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms AS item_mtime_ms,
+                       item_id, relative_path, file_name, size, file_mtime_ms,
+                       file_index
+                FROM ranked_files
+                WHERE file_rank = 1
+                ORDER BY title, source_type, source_key
+                "#,
+            )
+            .bind(media_type_key(media_type))
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| db_error("lookup local items with largest file keyset page", error))?;
 
         rows.into_iter()
             .map(|row| {
@@ -2989,6 +3229,449 @@ impl Repository {
     }
 }
 
+impl<'a> LocalInventoryReplaceTransaction<'a> {
+    pub async fn local_items_by_media_type_keyset_page(
+        &mut self,
+        media_type: MediaType,
+        limit: u16,
+        after: Option<&LocalItemPageCursor>,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
+        let rows = if let Some(after) = after {
+            sqlx::query(
+                r#"
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms
+                FROM local_items
+                WHERE media_type = ?
+                  AND (title, source_type, source_key) > (?, ?, ?)
+                ORDER BY title, source_type, source_key
+                LIMIT ?
+                "#,
+            )
+            .bind(media_type_key(media_type))
+            .bind(after.title.as_str())
+            .bind(after.source_type.as_str())
+            .bind(after.source_key.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&mut *self.transaction)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms
+                FROM local_items
+                WHERE media_type = ?
+                ORDER BY title, source_type, source_key
+                LIMIT ?
+                "#,
+            )
+            .bind(media_type_key(media_type))
+            .bind(i64::from(limit))
+            .fetch_all(&mut *self.transaction)
+            .await
+        }
+        .map_err(|error| db_error("lookup local items by media type keyset page", error))?;
+
+        rows.into_iter().map(local_item_from_row).collect()
+    }
+
+    pub async fn local_items_with_largest_file_by_media_type_keyset_page(
+        &mut self,
+        media_type: MediaType,
+        limit: u16,
+        after: Option<&LocalItemPageCursor>,
+    ) -> Result<Vec<LocalItemWithFile>, DatabaseError> {
+        let rows = if let Some(after) = after {
+            sqlx::query(
+                r#"
+                WITH paged_items AS (
+                    SELECT id, source_type, source_key, title, display_name, media_type,
+                           info_hash, path, save_path, total_size, mtime_ms
+                    FROM local_items
+                    WHERE media_type = ?
+                      AND (title, source_type, source_key) > (?, ?, ?)
+                      AND EXISTS (
+                          SELECT 1
+                          FROM local_files
+                          WHERE local_files.item_id = local_items.id
+                      )
+                    ORDER BY title, source_type, source_key
+                    LIMIT ?
+                ),
+                ranked_files AS (
+                    SELECT paged_items.id, paged_items.source_type, paged_items.source_key,
+                           paged_items.title, paged_items.display_name, paged_items.media_type,
+                           paged_items.info_hash, paged_items.path, paged_items.save_path,
+                           paged_items.total_size, paged_items.mtime_ms,
+                           local_files.item_id, local_files.relative_path, local_files.file_name,
+                           local_files.size, local_files.mtime_ms AS file_mtime_ms,
+                           local_files.file_index,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY paged_items.id
+                               ORDER BY local_files.size DESC,
+                                        COALESCE(local_files.mtime_ms, -9223372036854775808),
+                                        local_files.file_index
+                           ) AS file_rank
+                    FROM paged_items
+                    JOIN local_files ON local_files.item_id = paged_items.id
+                )
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms AS item_mtime_ms,
+                       item_id, relative_path, file_name, size, file_mtime_ms,
+                       file_index
+                FROM ranked_files
+                WHERE file_rank = 1
+                ORDER BY title, source_type, source_key
+                "#,
+            )
+            .bind(media_type_key(media_type))
+            .bind(after.title.as_str())
+            .bind(after.source_type.as_str())
+            .bind(after.source_key.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&mut *self.transaction)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                WITH paged_items AS (
+                    SELECT id, source_type, source_key, title, display_name, media_type,
+                           info_hash, path, save_path, total_size, mtime_ms
+                    FROM local_items
+                    WHERE media_type = ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM local_files
+                          WHERE local_files.item_id = local_items.id
+                      )
+                    ORDER BY title, source_type, source_key
+                    LIMIT ?
+                ),
+                ranked_files AS (
+                    SELECT paged_items.id, paged_items.source_type, paged_items.source_key,
+                           paged_items.title, paged_items.display_name, paged_items.media_type,
+                           paged_items.info_hash, paged_items.path, paged_items.save_path,
+                           paged_items.total_size, paged_items.mtime_ms,
+                           local_files.item_id, local_files.relative_path, local_files.file_name,
+                           local_files.size, local_files.mtime_ms AS file_mtime_ms,
+                           local_files.file_index,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY paged_items.id
+                               ORDER BY local_files.size DESC,
+                                        COALESCE(local_files.mtime_ms, -9223372036854775808),
+                                        local_files.file_index
+                           ) AS file_rank
+                    FROM paged_items
+                    JOIN local_files ON local_files.item_id = paged_items.id
+                )
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms AS item_mtime_ms,
+                       item_id, relative_path, file_name, size, file_mtime_ms,
+                       file_index
+                FROM ranked_files
+                WHERE file_rank = 1
+                ORDER BY title, source_type, source_key
+                "#,
+            )
+            .bind(media_type_key(media_type))
+            .bind(i64::from(limit))
+            .fetch_all(&mut *self.transaction)
+            .await
+        }
+        .map_err(|error| db_error("lookup local items with largest file keyset page", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(LocalItemWithFile {
+                    item: local_item_with_file_item_from_row_ref(&row)?,
+                    file: local_item_with_file_file_from_row_ref(&row)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn initialize_virtual_season_candidate_stage(&mut self) -> Result<(), DatabaseError> {
+        for statement in [
+            "DROP TABLE IF EXISTS staged_virtual_season_real_keys",
+            "DROP TABLE IF EXISTS staged_virtual_season_state",
+            "DROP TABLE IF EXISTS staged_virtual_season_episodes",
+            r#"
+            CREATE TEMP TABLE staged_virtual_season_real_keys (
+                title TEXT NOT NULL,
+                season INTEGER NOT NULL,
+                PRIMARY KEY (title, season)
+            ) WITHOUT ROWID
+            "#,
+            r#"
+            CREATE TEMP TABLE staged_virtual_season_state (
+                title TEXT NOT NULL,
+                season INTEGER NOT NULL,
+                newest_mtime_ms INTEGER,
+                PRIMARY KEY (title, season)
+            ) WITHOUT ROWID
+            "#,
+            r#"
+            CREATE TEMP TABLE staged_virtual_season_episodes (
+                title TEXT NOT NULL,
+                season INTEGER NOT NULL,
+                episode INTEGER NOT NULL,
+                source_file TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ms INTEGER,
+                PRIMARY KEY (title, season, episode)
+            ) WITHOUT ROWID
+            "#,
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *self.transaction)
+                .await
+                .map_err(|error| db_error("initialize virtual season stage", error))?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn stage_virtual_real_season_key(
+        &mut self,
+        title: &str,
+        season: u16,
+    ) -> Result<(), DatabaseError> {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO staged_virtual_season_real_keys (title, season)
+            VALUES (?, ?)
+            "#,
+        )
+        .bind(title)
+        .bind(i64::from(season))
+        .execute(&mut *self.transaction)
+        .await
+        .map_err(|error| db_error("stage real virtual season key", error))?;
+
+        Ok(())
+    }
+
+    pub async fn stage_virtual_episode_candidate(
+        &mut self,
+        candidate: &StagedVirtualEpisodeCandidate,
+    ) -> Result<(), DatabaseError> {
+        sqlx::query(
+            r#"
+            INSERT INTO staged_virtual_season_state (
+                title,
+                season,
+                newest_mtime_ms
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT (title, season) DO UPDATE SET
+                newest_mtime_ms = CASE
+                    WHEN staged_virtual_season_state.newest_mtime_ms IS NULL
+                        THEN excluded.newest_mtime_ms
+                    WHEN excluded.newest_mtime_ms IS NULL
+                        THEN staged_virtual_season_state.newest_mtime_ms
+                    WHEN excluded.newest_mtime_ms > staged_virtual_season_state.newest_mtime_ms
+                        THEN excluded.newest_mtime_ms
+                    ELSE staged_virtual_season_state.newest_mtime_ms
+                END
+            "#,
+        )
+        .bind(&candidate.title)
+        .bind(i64::from(candidate.season))
+        .bind(candidate.newest_mtime_ms)
+        .execute(&mut *self.transaction)
+        .await
+        .map_err(|error| db_error("stage virtual season state", error))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO staged_virtual_season_episodes (
+                title,
+                season,
+                episode,
+                source_file,
+                size,
+                mtime_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (title, season, episode) DO UPDATE SET
+                source_file = excluded.source_file,
+                size = excluded.size,
+                mtime_ms = excluded.mtime_ms
+            WHERE excluded.size > staged_virtual_season_episodes.size
+               OR (
+                   excluded.size = staged_virtual_season_episodes.size
+                   AND COALESCE(excluded.mtime_ms, -9223372036854775808)
+                       < COALESCE(staged_virtual_season_episodes.mtime_ms, -9223372036854775808)
+               )
+            "#,
+        )
+        .bind(&candidate.title)
+        .bind(i64::from(candidate.season))
+        .bind(i64::from(candidate.episode))
+        .bind(path_to_string(&candidate.source_file))
+        .bind(i64_from_u64(
+            candidate.size.get(),
+            "virtual season candidate size",
+        )?)
+        .bind(candidate.mtime_ms)
+        .execute(&mut *self.transaction)
+        .await
+        .map_err(|error| db_error("stage virtual episode candidate", error))?;
+
+        Ok(())
+    }
+
+    pub async fn staged_virtual_seasons_page(
+        &mut self,
+        limit: u16,
+        after: Option<&StagedVirtualSeasonCursor>,
+    ) -> Result<Vec<StagedVirtualSeason>, DatabaseError> {
+        let rows = if let Some(after) = after {
+            sqlx::query(
+                r#"
+                WITH paged_seasons AS (
+                    SELECT state.title, state.season, state.newest_mtime_ms
+                    FROM staged_virtual_season_state state
+                    WHERE (state.title, state.season) > (?, ?)
+                      AND EXISTS (
+                            SELECT 1
+                            FROM staged_virtual_season_episodes episodes
+                            WHERE episodes.title = state.title
+                              AND episodes.season = state.season
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1
+                            FROM staged_virtual_season_real_keys real_keys
+                            WHERE real_keys.title = state.title
+                              AND real_keys.season = state.season
+                          )
+                    ORDER BY state.title, state.season
+                    LIMIT ?
+                )
+                SELECT paged_seasons.title, paged_seasons.season,
+                       paged_seasons.newest_mtime_ms, episodes.episode,
+                       episodes.source_file, episodes.size, episodes.mtime_ms
+                FROM paged_seasons
+                INNER JOIN staged_virtual_season_episodes episodes
+                    ON episodes.title = paged_seasons.title
+                   AND episodes.season = paged_seasons.season
+                ORDER BY paged_seasons.title, paged_seasons.season, episodes.episode
+                "#,
+            )
+            .bind(after.title.as_str())
+            .bind(i64::from(after.season))
+            .bind(i64::from(limit))
+            .fetch_all(&mut *self.transaction)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                WITH paged_seasons AS (
+                    SELECT state.title, state.season, state.newest_mtime_ms
+                    FROM staged_virtual_season_state state
+                    WHERE EXISTS (
+                            SELECT 1
+                            FROM staged_virtual_season_episodes episodes
+                            WHERE episodes.title = state.title
+                              AND episodes.season = state.season
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1
+                            FROM staged_virtual_season_real_keys real_keys
+                            WHERE real_keys.title = state.title
+                              AND real_keys.season = state.season
+                          )
+                    ORDER BY state.title, state.season
+                    LIMIT ?
+                )
+                SELECT paged_seasons.title, paged_seasons.season,
+                       paged_seasons.newest_mtime_ms, episodes.episode,
+                       episodes.source_file, episodes.size, episodes.mtime_ms
+                FROM paged_seasons
+                INNER JOIN staged_virtual_season_episodes episodes
+                    ON episodes.title = paged_seasons.title
+                   AND episodes.season = paged_seasons.season
+                ORDER BY paged_seasons.title, paged_seasons.season, episodes.episode
+                "#,
+            )
+            .bind(i64::from(limit))
+            .fetch_all(&mut *self.transaction)
+            .await
+        }
+        .map_err(|error| db_error("lookup staged virtual seasons", error))?;
+
+        let mut seasons = Vec::<StagedVirtualSeason>::new();
+        for row in rows {
+            let title: String = row.get("title");
+            let season = u16_from_i64(row.get("season"), "virtual season number")?;
+            let is_new_season = seasons
+                .last()
+                .is_none_or(|current| current.title != title || current.season != season);
+            if is_new_season {
+                seasons.push(StagedVirtualSeason {
+                    title,
+                    season,
+                    newest_mtime_ms: row.get("newest_mtime_ms"),
+                    episodes: Vec::new(),
+                });
+            }
+            let season = seasons
+                .last_mut()
+                .expect("staged season exists after insertion");
+            season.episodes.push(StagedVirtualSeasonEpisode {
+                episode: u16_from_i64(row.get("episode"), "virtual season episode number")?,
+                source_file: PathBuf::from(row.get::<String, _>("source_file")),
+                size: byte_size_from_i64(row.get("size"), "virtual season episode size")?,
+                mtime_ms: row.get("mtime_ms"),
+            });
+        }
+
+        Ok(seasons)
+    }
+
+    pub async fn retain_item(
+        &mut self,
+        batch: &OwnedLocalItemFileBatch,
+    ) -> Result<(), DatabaseError> {
+        let (source_type, source_key) = local_source(&batch.item.source);
+        if !self.scope.accepts(&source_type, &source_key) {
+            return Err(DatabaseError::QueryFailed {
+                operation: "validate local inventory refresh scope".to_owned(),
+                message: format!(
+                    "item source {source_type}:{source_key} is outside {:?}",
+                    self.scope
+                ),
+            });
+        }
+
+        upsert_local_item_with_files_in_transaction(
+            &mut self.transaction,
+            &batch.item,
+            &batch.files,
+        )
+        .await?;
+        insert_retained_key(&mut self.transaction, &source_key).await?;
+        self.upserted = self.upserted.saturating_add(1);
+
+        Ok(())
+    }
+
+    pub async fn commit(mut self) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
+        let pruned = prune_local_items_not_retained(&mut self.transaction, &self.scope).await?;
+        clear_retained_keys(&mut self.transaction).await?;
+        self.transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit local inventory transaction", error))?;
+
+        Ok(LocalInventoryReplaceSummary {
+            upserted: self.upserted,
+            pruned,
+        })
+    }
+}
+
 async fn select_active_announce_id(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     dedupe_hash: &AnnounceDedupeHash,
@@ -3782,6 +4465,13 @@ fn i64_from_u64(value: u64, field: &'static str) -> Result<i64, DatabaseError> {
     })
 }
 
+fn u16_from_i64(value: i64, field: &'static str) -> Result<u16, DatabaseError> {
+    u16::try_from(value).map_err(|error| DatabaseError::QueryFailed {
+        operation: format!("read {field}"),
+        message: error.to_string(),
+    })
+}
+
 fn id_from_i64(value: i64, field: &'static str) -> Result<LocalItemId, DatabaseError> {
     u64::try_from(value)
         .ok()
@@ -4450,6 +5140,73 @@ mod tests {
         assert!(details.contains("USING COVERING INDEX") || details.contains("USING INDEX"));
         assert!(details.contains("source_type"));
         assert!(details.contains("source_key"));
+    }
+
+    #[tokio::test]
+    async fn local_item_keyset_queries_use_media_title_source_index() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT id
+            FROM local_items
+            WHERE media_type = 'episode'
+              AND (title, source_type, source_key) > (?, ?, ?)
+            ORDER BY title, source_type, source_key
+            LIMIT 512
+            "#,
+        )
+        .bind("Paged Show 0511 S01E03")
+        .bind("data_root")
+        .bind("/media/paged-0511-e03.mkv")
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+        let details = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(details.contains("idx_local_items_media_title_source"));
+        assert!(details.contains("media_type"));
+        assert!(details.contains("title"));
+    }
+
+    #[tokio::test]
+    async fn staged_virtual_season_keyset_query_uses_primary_key_range() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut replacement = repository
+            .begin_local_inventory_replace_transaction(LocalInventoryScope::Virtual)
+            .await
+            .unwrap();
+        replacement
+            .initialize_virtual_season_candidate_stage()
+            .await
+            .unwrap();
+        let rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT state.title, state.season
+            FROM staged_virtual_season_state state
+            WHERE (state.title, state.season) > (?, ?)
+            ORDER BY state.title, state.season
+            LIMIT 512
+            "#,
+        )
+        .bind("Paged Show 0511")
+        .bind(1_i64)
+        .fetch_all(&mut *replacement.transaction)
+        .await
+        .unwrap();
+        let details = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(details.contains("USING PRIMARY KEY"));
+        assert!(details.contains("title"));
     }
 
     #[tokio::test]

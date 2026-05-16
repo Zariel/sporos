@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -22,8 +22,10 @@ use crate::inventory::{
     parse_media_title,
 };
 use crate::persistence::repository::{
-    LocalFileSnapshot, LocalInventoryReplaceSummary, LocalInventoryScope, LocalItemFileBatch,
-    LocalItemWithFile, OwnedLocalInventoryMessage, OwnedLocalItemFileBatch, Repository,
+    LocalFileSnapshot, LocalInventoryReplaceSummary, LocalInventoryReplaceTransaction,
+    LocalInventoryScope, LocalItemFileBatch, LocalItemPageCursor, LocalItemWithFile,
+    OwnedLocalInventoryMessage, OwnedLocalItemFileBatch, Repository, StagedVirtualEpisodeCandidate,
+    StagedVirtualSeason, StagedVirtualSeasonCursor,
 };
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::DependencyKind;
@@ -410,53 +412,130 @@ impl InventoryRefreshWorker {
             return Ok(());
         }
 
-        let existing = self.existing_real_season_keys().await?;
-        let mut seasons = BTreeMap::<VirtualSeasonKey, VirtualSeasonAccumulator>::new();
-        let mut offset = 0_u32;
+        let mut replacement = self
+            .repository
+            .begin_local_inventory_replace_transaction(LocalInventoryScope::Virtual)
+            .await?;
+        replacement
+            .initialize_virtual_season_candidate_stage()
+            .await?;
+
+        self.stage_existing_real_season_keys(&mut replacement)
+            .await?;
+        self.stage_virtual_episode_candidates(&mut replacement)
+            .await?;
+        self.replace_staged_virtual_seasons(&mut replacement, now_ms)
+            .await?;
+        replacement.commit().await?;
+
+        Ok(())
+    }
+
+    async fn stage_existing_real_season_keys(
+        &self,
+        replacement: &mut LocalInventoryReplaceTransaction<'_>,
+    ) -> Result<(), InventoryRefreshError> {
+        let mut cursor = None::<LocalItemPageCursor>;
         loop {
-            let page = self
-                .repository
-                .local_items_with_largest_file_by_media_type_page(
-                    MediaType::Episode,
+            let page = replacement
+                .local_items_by_media_type_keyset_page(
+                    MediaType::SeasonPack,
                     VIRTUAL_SEASON_PAGE_SIZE,
-                    offset,
+                    cursor.as_ref(),
                 )
                 .await?;
             if page.is_empty() {
                 break;
             }
-            let page_len = page.len();
+            for item in page {
+                cursor = Some(LocalItemPageCursor::from_item(&item));
+                if matches!(item.source, LocalItemSource::Virtual { .. }) {
+                    continue;
+                }
+                if let Some(key) = real_season_key(&item) {
+                    replacement
+                        .stage_virtual_real_season_key(&key.title, key.season)
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stage_virtual_episode_candidates(
+        &self,
+        replacement: &mut LocalInventoryReplaceTransaction<'_>,
+    ) -> Result<(), InventoryRefreshError> {
+        let mut cursor = None::<LocalItemPageCursor>;
+        loop {
+            let page = replacement
+                .local_items_with_largest_file_by_media_type_keyset_page(
+                    MediaType::Episode,
+                    VIRTUAL_SEASON_PAGE_SIZE,
+                    cursor.as_ref(),
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
             for row in page {
                 let LocalItemWithFile { item, file } = row;
+                cursor = Some(LocalItemPageCursor::from_item(&item));
                 if !is_virtual_episode_source(&item.source) {
                     continue;
                 }
                 let Some((key, episode)) = episode_season_key(&item) else {
                     continue;
                 };
-                if existing.contains(&key) {
-                    continue;
-                }
                 let Some(episode_file) = virtual_episode_file(&item, episode, file) else {
                     continue;
                 };
-                let entry =
-                    seasons
-                        .entry(key.clone())
-                        .or_insert_with(|| VirtualSeasonAccumulator {
-                            key,
-                            episodes: BTreeMap::new(),
-                            newest_mtime_ms: None,
-                        });
-                entry.newest_mtime_ms = newest_mtime(entry.newest_mtime_ms, item.mtime_ms);
-                entry.newest_mtime_ms = newest_mtime(entry.newest_mtime_ms, episode_file.mtime_ms);
-                retain_best_episode_file(&mut entry.episodes, episode_file);
+                replacement
+                    .stage_virtual_episode_candidate(&StagedVirtualEpisodeCandidate {
+                        title: key.title,
+                        season: key.season,
+                        episode,
+                        newest_mtime_ms: newest_mtime(item.mtime_ms, episode_file.mtime_ms),
+                        source_file: episode_file.source_file,
+                        size: episode_file.size,
+                        mtime_ms: episode_file.mtime_ms,
+                    })
+                    .await?;
             }
-            offset = offset.saturating_add(u32::try_from(page_len).unwrap_or(u32::MAX));
         }
 
-        self.replace_virtual_inventory(seasons.into_values(), now_ms)
-            .await?;
+        Ok(())
+    }
+
+    async fn replace_staged_virtual_seasons(
+        &self,
+        replacement: &mut LocalInventoryReplaceTransaction<'_>,
+        now_ms: i64,
+    ) -> Result<(), InventoryRefreshError> {
+        let mut cursor = None::<StagedVirtualSeasonCursor>;
+        loop {
+            let page = replacement
+                .staged_virtual_seasons_page(VIRTUAL_SEASON_PAGE_SIZE, cursor.as_ref())
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for staged in page {
+                cursor = Some(StagedVirtualSeasonCursor {
+                    title: staged.title.clone(),
+                    season: staged.season,
+                });
+                let Some(item) = self.materialize_virtual_season(
+                    staged_virtual_season_accumulator(staged),
+                    now_ms,
+                )?
+                else {
+                    continue;
+                };
+                replacement.retain_item(&item).await?;
+            }
+        }
 
         Ok(())
     }
@@ -501,34 +580,6 @@ impl InventoryRefreshWorker {
                 message: error.to_string(),
             })?
             .map_err(InventoryRefreshError::from)
-    }
-
-    async fn existing_real_season_keys(&self) -> Result<BTreeSet<VirtualSeasonKey>, DatabaseError> {
-        let mut keys = BTreeSet::new();
-        let mut offset = 0_u32;
-        loop {
-            let page = self
-                .repository
-                .local_items_by_media_type_page(
-                    MediaType::SeasonPack,
-                    VIRTUAL_SEASON_PAGE_SIZE,
-                    offset,
-                )
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            for item in &page {
-                if matches!(item.source, LocalItemSource::Virtual { .. }) {
-                    continue;
-                }
-                if let Some(key) = real_season_key(item) {
-                    keys.insert(key);
-                }
-            }
-            offset = offset.saturating_add(u32::try_from(page.len()).unwrap_or(u32::MAX));
-        }
-        Ok(keys)
     }
 
     fn materialize_virtual_season(
@@ -652,6 +703,33 @@ fn real_season_key(item: &LocalItem) -> Option<VirtualSeasonKey> {
     Some(VirtualSeasonKey { title, season })
 }
 
+fn staged_virtual_season_accumulator(staged: StagedVirtualSeason) -> VirtualSeasonAccumulator {
+    let key = VirtualSeasonKey {
+        title: staged.title,
+        season: staged.season,
+    };
+    let episodes = staged
+        .episodes
+        .into_iter()
+        .map(|episode| {
+            (
+                episode.episode,
+                VirtualEpisodeFile {
+                    episode: episode.episode,
+                    source_file: episode.source_file,
+                    size: episode.size,
+                    mtime_ms: episode.mtime_ms,
+                },
+            )
+        })
+        .collect();
+    VirtualSeasonAccumulator {
+        key,
+        episodes,
+        newest_mtime_ms: staged.newest_mtime_ms,
+    }
+}
+
 fn virtual_episode_file(
     item: &LocalItem,
     episode: u16,
@@ -673,27 +751,6 @@ fn virtual_episode_file(
         mtime_ms: file.mtime_ms,
     }
     .into()
-}
-
-fn retain_best_episode_file(
-    episodes: &mut BTreeMap<u16, VirtualEpisodeFile>,
-    candidate: VirtualEpisodeFile,
-) {
-    let replace = episodes
-        .get(&candidate.episode)
-        .is_none_or(|current| better_virtual_episode_file(&candidate, current));
-    if replace {
-        episodes.insert(candidate.episode, candidate);
-    }
-}
-
-fn better_virtual_episode_file(
-    candidate: &VirtualEpisodeFile,
-    current: &VirtualEpisodeFile,
-) -> bool {
-    candidate.size.get() > current.size.get()
-        || (candidate.size == current.size
-            && candidate.mtime_ms.unwrap_or(i64::MIN) < current.mtime_ms.unwrap_or(i64::MIN))
 }
 
 fn newest_mtime(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
@@ -1064,6 +1121,133 @@ mod tests {
             .unwrap();
         assert_eq!(vec![10, 25, 30], file_sizes(&files));
         assert_eq!(PathBuf::from("media/e02b.mkv"), files[1].relative_path);
+    }
+
+    #[tokio::test]
+    async fn refresh_virtual_seasons_pages_large_episode_inventory() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let season_count = usize::from(VIRTUAL_SEASON_PAGE_SIZE) + 8;
+        let mut items = Vec::with_capacity(season_count * 3);
+        for season_index in 0..season_count {
+            for episode in 1..=3 {
+                items.push(data_root_item(
+                    &format!("Paged Show {season_index:04} S01E{episode:02}"),
+                    MediaType::Episode,
+                    &format!("paged-{season_index:04}-e{episode:02}.mkv"),
+                    u64::try_from(episode).unwrap(),
+                    100 + i64::try_from(episode).unwrap(),
+                ));
+            }
+            items.push(data_root_item(
+                &format!("Existing Show {season_index:04} S01"),
+                MediaType::SeasonPack,
+                &format!("existing-{season_index:04}.mkv"),
+                100,
+                100,
+            ));
+        }
+        let last_title = format!("Paged Show {:04} S01", season_count - 1);
+        items.push(data_root_item(
+            &last_title,
+            MediaType::SeasonPack,
+            "paged-last-real-pack.mkv",
+            100,
+            100,
+        ));
+        repository
+            .replace_local_inventory_stream(
+                LocalInventoryScope::DataRoot,
+                items.iter().map(local_item_file_batch),
+            )
+            .await
+            .unwrap();
+
+        worker
+            .refresh_virtual_seasons(VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS + 1_000)
+            .await
+            .unwrap();
+
+        let virtual_seasons = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 2_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| matches!(item.source, LocalItemSource::Virtual { .. }))
+            .collect::<Vec<_>>();
+
+        assert_eq!(season_count - 1, virtual_seasons.len());
+        assert!(
+            virtual_seasons
+                .iter()
+                .any(|item| item.title.as_str() == "Paged Show 0000 S01")
+        );
+        assert!(
+            virtual_seasons
+                .iter()
+                .all(|item| item.title.as_str() != last_title)
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_virtual_seasons_groups_normalized_non_contiguous_titles() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let items = vec![
+            data_root_item(
+                "Example Show S01E01",
+                MediaType::Episode,
+                "example-e01.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Example Zebra S01E01",
+                MediaType::Episode,
+                "zebra-e01.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Example.Show S01E02",
+                MediaType::Episode,
+                "example-e02.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Example.Show S01E03",
+                MediaType::Episode,
+                "example-e03.mkv",
+                10,
+                100,
+            ),
+        ];
+        repository
+            .replace_local_inventory_stream(
+                LocalInventoryScope::DataRoot,
+                items.iter().map(local_item_file_batch),
+            )
+            .await
+            .unwrap();
+
+        worker
+            .refresh_virtual_seasons(VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS + 1_000)
+            .await
+            .unwrap();
+
+        let virtual_seasons = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| matches!(item.source, LocalItemSource::Virtual { .. }))
+            .collect::<Vec<_>>();
+
+        assert_eq!(1, virtual_seasons.len());
+        assert_eq!("Example Show S01", virtual_seasons[0].title.as_str());
     }
 
     #[tokio::test]
