@@ -381,7 +381,7 @@ impl TorznabRequestError {
             Self::Timeout
         } else {
             Self::Request {
-                message: error.to_string(),
+                message: sanitized_reqwest_error(error),
             }
         }
     }
@@ -615,7 +615,7 @@ impl CandidateDownloadError {
             Self::Timeout
         } else {
             Self::Request {
-                message: error.to_string(),
+                message: sanitized_reqwest_error(error),
             }
         }
     }
@@ -1207,6 +1207,28 @@ fn url_has_apikey_query(value: &str) -> bool {
         .any(|(key, _value)| key.eq_ignore_ascii_case("apikey"))
 }
 
+fn sanitized_reqwest_error(error: reqwest::Error) -> String {
+    let url = error.url().map(reqwest_error_origin);
+    let mut message = error.without_url().to_string();
+    if let Some(url) = url {
+        message.push_str(" for ");
+        message.push_str(&url);
+    }
+    message
+}
+
+fn reqwest_error_origin(url: &reqwest::Url) -> String {
+    let mut origin = String::new();
+    origin.push_str(url.scheme());
+    origin.push_str("://");
+    origin.push_str(url.host_str().unwrap_or("[unknown-host]"));
+    if let Some(port) = url.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    origin
+}
+
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -1518,6 +1540,45 @@ mod tests {
             main.api_key_source
         );
         assert!(!format!("{registry:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn request_errors_redact_secret_bearing_urls() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let torznab_url = format!(
+            "http://url-user:url-password@{address}/api/path-token?apikey=secret&t=search#frag"
+        );
+        let candidate_url =
+            format!("http://{address}/download/path-token?id=1&authkey=secret&torrent_pass=secret");
+
+        let torznab_error = reqwest::Client::new()
+            .get(&torznab_url)
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .map_err(TorznabRequestError::from_reqwest)
+            .unwrap_err()
+            .to_string();
+        let candidate_error = reqwest::Client::new()
+            .get(&candidate_url)
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .map_err(CandidateDownloadError::from_reqwest)
+            .unwrap_err()
+            .to_string();
+
+        assert!(!torznab_error.contains("url-user"));
+        assert!(!torznab_error.contains("url-password"));
+        assert!(!torznab_error.contains("path-token"));
+        assert!(!torznab_error.contains("apikey=secret"));
+        assert!(torznab_error.contains(&format!("http://{address}")));
+        assert!(!candidate_error.contains("path-token"));
+        assert!(!candidate_error.contains("authkey=secret"));
+        assert!(!candidate_error.contains("torrent_pass=secret"));
+        assert!(candidate_error.contains(&format!("http://{address}")));
     }
 
     #[test]

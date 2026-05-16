@@ -1,8 +1,13 @@
 # Announce Queue Operations
 
-Sporos accepts announcements as durable work. A `202 Accepted` response means
-the request was validated and stored in SQLite, not that matching, saving, or
-client injection has already finished.
+The durable announce queue is implemented but is not enabled in the daemon
+runtime in this release. `POST /v1/announcements` returns
+`503 Service Unavailable` until the production announce worker is wired.
+
+The rest of this runbook describes the queue behavior for builds or tests that
+explicitly enable the durable acceptor and workers. In that mode, a
+`202 Accepted` response means the request was validated and stored in SQLite,
+not that matching, saving, or client injection has already finished.
 
 ## Accepted Versus Processed
 

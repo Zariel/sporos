@@ -36,6 +36,7 @@ use crate::matching::{
 use crate::persistence::repository::Repository;
 use crate::persistence::torrent_cache::{TorrentOutputMetadata, parse_torrent_output_filename};
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
+use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 use crate::torrent::parse_metafile;
 
 const MAX_SAVED_TORRENT_BYTES: u64 = 32 * 1024 * 1024;
@@ -250,6 +251,17 @@ impl InjectionWorker {
         &self,
         request: InjectionRequest,
     ) -> Result<InjectionWorkResult, InjectionWorkerError> {
+        self.process_inner(request, &mut || false).await
+    }
+
+    async fn process_inner<F>(
+        &self,
+        request: InjectionRequest,
+        should_stop: &mut F,
+    ) -> Result<InjectionWorkResult, InjectionWorkerError>
+    where
+        F: FnMut() -> bool,
+    {
         let local_item_id = request
             .local_item
             .id
@@ -286,6 +298,16 @@ impl InjectionWorker {
             });
         }
 
+        if should_stop() {
+            self.save_for_retry(&request)?;
+            return Ok(InjectionWorkResult {
+                outcome: InjectionOutcome::Saved,
+                target_client: Some(target_name),
+                saved_for_retry: true,
+                linked_files: 0,
+            });
+        }
+
         let link_result = self.prepare_links(&request).await?;
         if matches!(link_result, LinkPreparation::SourceIncomplete) {
             self.save_for_retry(&request)?;
@@ -308,9 +330,20 @@ impl InjectionWorker {
         let recheck_plan =
             recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
         let pause_for_recheck = recheck_plan.should_recheck;
+        if should_stop() {
+            self.save_for_retry(&request)?;
+            return Ok(InjectionWorkResult {
+                outcome: InjectionOutcome::Saved,
+                target_client: Some(target_name),
+                saved_for_retry: true,
+                linked_files,
+            });
+        }
         let mutation_result = {
             let _guard = self.mutation_lock.lock().await;
-            if target.has_torrent(request.metafile.info_hash()).await? {
+            if should_stop() {
+                InjectionMutationResult::SavedForShutdown
+            } else if target.has_torrent(request.metafile.info_hash()).await? {
                 InjectionMutationResult::AlreadyExists
             } else {
                 InjectionMutationResult::Injected(
@@ -327,6 +360,15 @@ impl InjectionWorker {
         };
 
         match mutation_result {
+            InjectionMutationResult::SavedForShutdown => {
+                self.save_for_retry(&request)?;
+                Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::Saved,
+                    target_client: Some(target_name),
+                    saved_for_retry: true,
+                    linked_files,
+                })
+            }
             InjectionMutationResult::AlreadyExists => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
@@ -386,20 +428,43 @@ impl InjectionWorker {
         &self,
         config: SavedTorrentRetryConfig,
     ) -> Result<SavedTorrentRetrySummary, InjectionWorkerError> {
+        self.retry_saved_torrents_inner(config, || false).await
+    }
+
+    pub async fn retry_saved_torrents_until_shutdown(
+        &self,
+        config: SavedTorrentRetryConfig,
+        shutdown: &mut ShutdownSignal,
+    ) -> Result<SavedTorrentRetrySummary, InjectionWorkerError> {
+        self.retry_saved_torrents_inner(config, || shutdown.state().phase != ShutdownPhase::Running)
+            .await
+    }
+
+    async fn retry_saved_torrents_inner<F>(
+        &self,
+        config: SavedTorrentRetryConfig,
+        mut should_stop: F,
+    ) -> Result<SavedTorrentRetrySummary, InjectionWorkerError>
+    where
+        F: FnMut() -> bool,
+    {
         let mut summary = SavedTorrentRetrySummary::default();
         if config.directories.is_empty() || config.max_saved_torrents == 0 {
             return Ok(summary);
         }
 
         for directory in &config.directories {
+            if should_stop() {
+                return Ok(summary);
+            }
             let paths =
                 saved_torrent_paths(directory, config.max_saved_torrents - summary.scanned).await?;
             for path in paths {
-                if summary.scanned >= config.max_saved_torrents {
+                if summary.scanned >= config.max_saved_torrents || should_stop() {
                     return Ok(summary);
                 }
                 summary.scanned += 1;
-                self.retry_saved_torrent(directory, &path, &config, &mut summary)
+                self.retry_saved_torrent(directory, &path, &config, &mut summary, &mut should_stop)
                     .await?;
             }
         }
@@ -407,13 +472,21 @@ impl InjectionWorker {
         Ok(summary)
     }
 
-    async fn retry_saved_torrent(
+    async fn retry_saved_torrent<F>(
         &self,
         directory: &Path,
         path: &Path,
         config: &SavedTorrentRetryConfig,
         summary: &mut SavedTorrentRetrySummary,
-    ) -> Result<(), InjectionWorkerError> {
+        should_stop: &mut F,
+    ) -> Result<(), InjectionWorkerError>
+    where
+        F: FnMut() -> bool,
+    {
+        if should_stop() {
+            summary.kept += 1;
+            return Ok(());
+        }
         let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
             summary.skipped += 1;
             summary.kept += 1;
@@ -459,6 +532,10 @@ impl InjectionWorker {
 
         let mut attempted_match = false;
         for lookup in lookups {
+            if should_stop() {
+                summary.kept += 1;
+                return Ok(());
+            }
             let assessment = assess_and_persist_candidate(
                 &self.repository,
                 &lookup.local_item,
@@ -474,26 +551,28 @@ impl InjectionWorker {
             let Some((candidate_id, assessment)) = actionable_saved_assessment(assessment) else {
                 continue;
             };
+            if should_stop() {
+                summary.kept += 1;
+                return Ok(());
+            }
             attempted_match = true;
             summary.attempted += 1;
-            let result = match self
-                .process(InjectionRequest {
-                    local_item: lookup.local_item,
-                    local_files: lookup.local_files,
-                    candidate: candidate.clone(),
-                    candidate_id,
-                    metafile: saved.parsed.metafile.clone(),
-                    torrent_bytes: saved.bytes.clone(),
-                    assessment,
-                    assessed_at_ms: config.assessed_at_ms,
-                    output_dir: directory.to_path_buf(),
-                    link_dirs: config.link_dirs.clone(),
-                    link_type: config.link_type,
-                    flat_linking: config.flat_linking,
-                    recheck: config.recheck,
-                })
-                .await
-            {
+            let request = InjectionRequest {
+                local_item: lookup.local_item,
+                local_files: lookup.local_files,
+                candidate: candidate.clone(),
+                candidate_id,
+                metafile: saved.parsed.metafile.clone(),
+                torrent_bytes: saved.bytes.clone(),
+                assessment,
+                assessed_at_ms: config.assessed_at_ms,
+                output_dir: directory.to_path_buf(),
+                link_dirs: config.link_dirs.clone(),
+                link_type: config.link_type,
+                flat_linking: config.flat_linking,
+                recheck: config.recheck,
+            };
+            let result = match self.process_inner(request, should_stop).await {
                 Ok(result) => result,
                 Err(error) if saved_retry_can_continue_after_error(&error) => {
                     summary.failed += 1;
@@ -1103,6 +1182,7 @@ enum LinkPreparation {
 }
 
 enum InjectionMutationResult {
+    SavedForShutdown,
     AlreadyExists,
     Injected(Result<(), TorrentClientError>),
 }
@@ -1430,6 +1510,94 @@ mod tests {
         assert_eq!(1, summary.deleted);
         assert_eq!(0, saved_torrent_count(&output_dir));
         assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_retry_observes_shutdown_before_mutation() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-shutdown");
+        let output_dir = root.join("output");
+        let local = local_item(&root);
+        repository
+            .upsert_local_item_with_files(&local, &[local_file()])
+            .await
+            .unwrap();
+        let parsed = parse_metafile(test_torrent_bytes()).unwrap();
+        let mut candidate = remote_candidate();
+        candidate.info_hash = Some(parsed.metafile.info_hash().clone());
+        save_candidate_torrent(
+            &output_dir,
+            &candidate_output_metadata(MediaType::Movie, &candidate, &parsed.metafile),
+            test_torrent_bytes(),
+        )
+        .unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let (shutdown, mut signal) = crate::runtime::shutdown::shutdown_channel();
+        shutdown.cancel_now("test shutdown").unwrap();
+
+        let summary = worker
+            .retry_saved_torrents_until_shutdown(
+                SavedTorrentRetryConfig {
+                    directories: vec![output_dir.clone()],
+                    assessed_at_ms: 1_700_000_000_000,
+                    ..SavedTorrentRetryConfig::default()
+                },
+                &mut signal,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(0, summary.scanned);
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_retry_stops_before_actionable_mutation() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-mid-shutdown");
+        let output_dir = root.join("output");
+        let local = local_item(&root);
+        repository
+            .upsert_local_item_with_files(&local, &[local_file()])
+            .await
+            .unwrap();
+        let parsed = parse_metafile(test_torrent_bytes()).unwrap();
+        let mut candidate = remote_candidate();
+        candidate.info_hash = Some(parsed.metafile.info_hash().clone());
+        save_candidate_torrent(
+            &output_dir,
+            &candidate_output_metadata(MediaType::Movie, &candidate, &parsed.metafile),
+            test_torrent_bytes(),
+        )
+        .unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let mut checks = 0;
+
+        let summary = worker
+            .retry_saved_torrents_inner(
+                SavedTorrentRetryConfig {
+                    directories: vec![output_dir.clone()],
+                    assessed_at_ms: 1_700_000_000_000,
+                    ..SavedTorrentRetryConfig::default()
+                },
+                || {
+                    checks += 1;
+                    checks >= 4
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.scanned);
+        assert_eq!(0, summary.attempted);
+        assert_eq!(1, summary.kept);
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

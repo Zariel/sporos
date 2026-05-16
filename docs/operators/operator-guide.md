@@ -197,13 +197,14 @@ Scrape `GET /metrics` as Prometheus text. Important metric families include:
 - `sporos_workflow_enqueue_total` for accepted, rejected, deduplicated, and
   invalid workflow submissions.
 - `sporos_queue_depth` and related queue gauges for bounded in-memory queues.
-- `sporos_indexer_requests_total` and `sporos_client_requests_total` for
-  external request outcomes and latency.
 - `sporos_dependency_health_state` for dependency summaries.
 - `sporos_announce_*` metrics for durable announce backlog, retries, leases,
   worker capacity, and dependency waits when the announce workflow is enabled.
 - `sporos_notification_requests_total` and notification latency metrics for
   webhook delivery.
+
+Indexer and torrent-client request counters are planned but are not wired into
+the daemon runtime in this release.
 
 Labels are intentionally bounded. Do not expect raw titles, request bodies,
 cookies, API keys, or full secret-bearing URLs in metrics.
@@ -229,6 +230,6 @@ Use diagnostics that do not mutate state first:
 - `GET /metrics`
 
 For dependency issues, compare readiness dependency summaries with metric
-outcome counters. For queued announcement issues, inspect `announce_queue` in
-`/v1/status` and the `sporos_announce_*` metric families before retrying
-external webhook senders.
+outcome counters. Queued announcement diagnostics are unavailable in this
+release because the daemon does not accept announcements; the durable queue
+state and `sporos_announce_*` metrics apply only when that workflow is enabled.

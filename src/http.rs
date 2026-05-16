@@ -919,12 +919,14 @@ fn announce_queue_status_response(
 
 fn readiness_response(state: &HttpState) -> ReadinessResponse {
     let readiness = state.readiness();
-    let accepting_work = readiness.config_loaded
+    let local_ready = readiness.config_loaded
         && readiness.database_available
         && readiness.schema_initialized
-        && readiness.state_paths_writable
-        && readiness.workers_running;
-    let processing_ready = accepting_work;
+        && readiness.state_paths_writable;
+    let work_acceptors_configured =
+        state.workflow_queues.is_some() || state.announce_acceptor.is_some();
+    let accepting_work = local_ready && work_acceptors_configured;
+    let processing_ready = accepting_work && readiness.workers_running;
     ReadinessResponse {
         status: if readiness.is_ready() {
             "ready"
@@ -1055,6 +1057,50 @@ mod tests {
         assert_eq!(StatusCode::OK, status);
         assert_eq!("ok", json["status"]);
         assert_eq!("ready", json["readiness"]["status"]);
+    }
+
+    #[tokio::test]
+    async fn status_distinguishes_accepting_work_from_processing() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(4));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
+        let state = HttpState::new(
+            ReadinessState {
+                config_loaded: true,
+                database_available: true,
+                schema_initialized: true,
+                state_paths_writable: true,
+                workers_running: false,
+            },
+            HealthRegistry::new(),
+        )
+        .with_workflow_queues(WorkflowQueues {
+            announcements,
+            searches,
+            jobs,
+        })
+        .with_announce_acceptor(repository, AnnounceQueueConfig::default());
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(true, json["readiness"]["accepting_work"]);
+        assert_eq!(false, json["readiness"]["processing_ready"]);
+        assert_eq!(false, json["readiness"]["checks"]["workers_running"]);
     }
 
     #[tokio::test]
