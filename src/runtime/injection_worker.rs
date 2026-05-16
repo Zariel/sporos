@@ -1615,6 +1615,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_torrent_retry_links_data_dir_files_before_injecting() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-linking");
+        let output_dir = root.join("output");
+        let link_dir = root.join("links");
+        fs::create_dir_all(&link_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        let parsed = parse_metafile(test_torrent_bytes()).unwrap();
+        let mut candidate = remote_candidate();
+        candidate.info_hash = Some(parsed.metafile.info_hash().clone());
+        save_candidate_torrent(
+            &output_dir,
+            &candidate_output_metadata(MediaType::Movie, &candidate, &parsed.metafile),
+            test_torrent_bytes(),
+        )
+        .unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let summary = worker
+            .retry_saved_torrents(SavedTorrentRetryConfig {
+                directories: vec![output_dir.clone()],
+                link_dirs: vec![link_dir],
+                link_type: Some(LinkType::Hardlink),
+                assessed_at_ms: 1_700_000_000_000,
+                ..SavedTorrentRetryConfig::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.scanned);
+        assert_eq!(1, summary.attempted);
+        assert_eq!(1, summary.injected);
+        assert_eq!(1, summary.deleted);
+        assert_eq!(0, saved_torrent_count(&output_dir));
+        assert!(root.join("links/tracker.example/movie.mkv").exists());
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(
+            Some(root.join("links/tracker.example")),
+            target.last_save_path()
+        );
+        assert_eq!(
+            1,
+            target
+                .save_path_file_exists_at_inject
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
     async fn saved_torrent_retry_observes_shutdown_before_mutation() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("saved-retry-shutdown");
@@ -2393,7 +2448,9 @@ mod tests {
         has_calls: AtomicUsize,
         recheck_calls: AtomicUsize,
         resume_calls: AtomicUsize,
+        save_path_file_exists_at_inject: AtomicUsize,
         last_pause_for_recheck: StdMutex<Option<bool>>,
+        last_save_path: StdMutex<Option<PathBuf>>,
     }
 
     struct FakeRefreshClient {
@@ -2493,7 +2550,9 @@ mod tests {
                 has_calls: AtomicUsize::new(0),
                 recheck_calls: AtomicUsize::new(0),
                 resume_calls: AtomicUsize::new(0),
+                save_path_file_exists_at_inject: AtomicUsize::new(0),
                 last_pause_for_recheck: StdMutex::new(None),
+                last_save_path: StdMutex::new(None),
             }
         }
 
@@ -2520,6 +2579,10 @@ mod tests {
 
         fn last_pause_for_recheck(&self) -> Option<bool> {
             *self.last_pause_for_recheck.lock().unwrap()
+        }
+
+        fn last_save_path(&self) -> Option<PathBuf> {
+            self.last_save_path.lock().unwrap().clone()
         }
     }
 
@@ -2554,6 +2617,14 @@ mod tests {
         fn inject<'a>(&'a self, request: ClientInjectionRequest<'a>) -> ClientResultFuture<'a, ()> {
             self.inject_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_pause_for_recheck.lock().unwrap() = Some(request.pause_for_recheck);
+            *self.last_save_path.lock().unwrap() = request.save_path.map(Path::to_path_buf);
+            if request
+                .save_path
+                .is_some_and(|save_path| save_path.join("movie.mkv").exists())
+            {
+                self.save_path_file_exists_at_inject
+                    .fetch_add(1, Ordering::SeqCst);
+            }
             let error = self.inject_error.then(|| TorrentClientError::Unavailable {
                 client: self.descriptor.name.as_str().to_owned(),
                 retry_after_ms: Some(1_000),
