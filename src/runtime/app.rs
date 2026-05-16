@@ -353,7 +353,12 @@ impl AppState {
                     0,
                     0,
                 );
-                let state = prowlarr_error_dependency_state(&error, now_ms);
+                let failure_count = self
+                    .repository
+                    .dependency_failure_count("prowlarr", &source.source.name)
+                    .await
+                    .map_err(ProwlarrRefreshError::Local)?;
+                let state = prowlarr_error_dependency_state(&error, now_ms, failure_count);
                 self.record_prowlarr_health(&source.source.name, state.clone(), now_ms)
                     .await
                     .map_err(ProwlarrRefreshError::Local)?;
@@ -538,6 +543,9 @@ impl AppState {
                     .await;
                 match candidates {
                     Ok(candidates) => {
+                        self.repository
+                            .record_indexer_request_success(&endpoint.name, now_ms)
+                            .await?;
                         candidate_count = candidate_count.saturating_add(candidates.len());
                         all_candidates.extend(candidates);
                     }
@@ -550,7 +558,12 @@ impl AppState {
                         let message = error.to_string();
                         let reason = health_reason(Some(&message), "search failed")
                             .unwrap_or_else(|| ReasonText::new("search failed").unwrap());
-                        let retry_after_ms = indexer_error_retry_after(&error, now_ms);
+                        let failure_count = self
+                            .repository
+                            .dependency_failure_count("indexer", &endpoint.name)
+                            .await?;
+                        let retry_after_ms =
+                            indexer_error_retry_after(&error, now_ms, failure_count);
                         self.repository
                             .record_indexer_request_backoff(
                                 &endpoint.name,
@@ -615,7 +628,12 @@ impl AppState {
                         let message = error.to_string();
                         let reason = health_reason(Some(&message), "caps failed")
                             .unwrap_or_else(|| ReasonText::new("caps failed").unwrap());
-                        let retry_after_ms = indexer_error_retry_after(&error, now_ms);
+                        let failure_count = self
+                            .repository
+                            .dependency_failure_count("indexer", &row.name)
+                            .await?;
+                        let retry_after_ms =
+                            indexer_error_retry_after(&error, now_ms, failure_count);
                         self.repository
                             .record_indexer_caps_failure(
                                 &row.name,
@@ -1039,30 +1057,42 @@ fn daemon_scheduler_config(mut config: SchedulerConfig) -> SchedulerConfig {
     config
 }
 
-fn indexer_error_retry_after(error: &TorznabRequestError, now_ms: i64) -> i64 {
+fn indexer_error_retry_after(
+    error: &TorznabRequestError,
+    now_ms: i64,
+    consecutive_failures: u16,
+) -> i64 {
     let policy = IndexerBackoffPolicy::default();
     match error {
         TorznabRequestError::Backoff { retry_after_ms } => retry_after_ms
             .filter(|retry_after| *retry_after > now_ms)
-            .unwrap_or_else(|| policy.retry_after_deadline(now_ms, 0, None)),
+            .unwrap_or_else(|| policy.retry_after_deadline(now_ms, consecutive_failures, None)),
         TorznabRequestError::RateLimited { retry_after }
         | TorznabRequestError::HttpStatus { retry_after, .. } => {
-            policy.retry_after_deadline(now_ms, 0, *retry_after)
+            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after)
         }
         TorznabRequestError::Timeout
         | TorznabRequestError::Request { .. }
         | TorznabRequestError::InvalidXml { .. }
         | TorznabRequestError::InvalidCandidate { .. }
         | TorznabRequestError::ResponseTooLarge { .. } => {
-            policy.retry_after_deadline(now_ms, 0, None)
+            policy.retry_after_deadline(now_ms, consecutive_failures, None)
         }
     }
 }
 
-fn prowlarr_error_dependency_state(error: &ProwlarrRequestError, now_ms: i64) -> DependencyState {
+fn prowlarr_error_dependency_state(
+    error: &ProwlarrRequestError,
+    now_ms: i64,
+    consecutive_failures: u16,
+) -> DependencyState {
     let reason = health_reason(Some(&error.to_string()), "Prowlarr refresh failed")
         .unwrap_or_else(|| ReasonText::new("Prowlarr refresh failed").unwrap());
-    let retry_after_ms = Some(prowlarr_error_retry_after(error, now_ms));
+    let retry_after_ms = Some(prowlarr_error_retry_after(
+        error,
+        now_ms,
+        consecutive_failures,
+    ));
     match error {
         ProwlarrRequestError::HttpStatus { status, .. } if *status == 401 || *status == 403 => {
             DependencyState::Unavailable {
@@ -1094,18 +1124,22 @@ fn prowlarr_refresh_outcome(error: &ProwlarrRequestError) -> ProwlarrRefreshOutc
     }
 }
 
-fn prowlarr_error_retry_after(error: &ProwlarrRequestError, now_ms: i64) -> i64 {
+fn prowlarr_error_retry_after(
+    error: &ProwlarrRequestError,
+    now_ms: i64,
+    consecutive_failures: u16,
+) -> i64 {
     let policy = IndexerBackoffPolicy::default();
     match error {
         ProwlarrRequestError::HttpStatus { retry_after, .. } => {
-            policy.retry_after_deadline(now_ms, 0, *retry_after)
+            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after)
         }
         ProwlarrRequestError::Timeout
         | ProwlarrRequestError::Request { .. }
         | ProwlarrRequestError::InvalidResponse { .. }
         | ProwlarrRequestError::InvalidIndexer { .. }
         | ProwlarrRequestError::ResponseTooLarge { .. } => {
-            policy.retry_after_deadline(now_ms, 0, None)
+            policy.retry_after_deadline(now_ms, consecutive_failures, None)
         }
     }
 }
@@ -1915,6 +1949,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_repeated_prowlarr_failures_back_off_exponentially() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let prowlarr_url = spawn_runtime_prowlarr_server(
+            Arc::clone(&requests),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "down",
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, false, false, "24h"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let now_ms = runtime
+            .state
+            .prowlarr_sources
+            .values()
+            .next()
+            .unwrap()
+            .initial_refresh_after_ms;
+
+        runtime
+            .state
+            .refresh_due_prowlarr_sources(now_ms)
+            .await
+            .unwrap();
+        let first = repository.dependency_health_snapshot(10).await.unwrap();
+        let first_retry_after = first[0].retry_after_ms.unwrap();
+        runtime
+            .state
+            .refresh_due_prowlarr_sources(first_retry_after)
+            .await
+            .unwrap();
+        let second = repository.dependency_health_snapshot(10).await.unwrap();
+        let second_retry_after = second[0].retry_after_ms.unwrap();
+
+        assert_eq!(2, requests.load(Ordering::SeqCst));
+        assert!(second_retry_after > first_retry_after.saturating_add(600_000));
+        assert_eq!(2, second[0].failure_count);
+    }
+
+    #[tokio::test]
     async fn runtime_prowlarr_refresh_exports_metrics() {
         let success_url = spawn_runtime_prowlarr_server(
             Arc::new(AtomicUsize::new(0)),
@@ -2481,7 +2561,7 @@ mod tests {
             .find(|row| row.name.as_str() == "failing")
             .unwrap()
             .retry_after_ms;
-        assert!(retry_after.is_some_and(|deadline| deadline > 1_000));
+        assert_eq!(Some(6_000), retry_after);
 
         let skipped = runtime
             .state
@@ -2498,6 +2578,160 @@ mod tests {
         assert_eq!(0, skipped.failed_indexers);
         assert_eq!(2, ok_queries.lock().unwrap().len());
         assert_eq!(1, failing_queries.lock().unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn search_workflow_repeated_indexer_failures_back_off_exponentially() {
+        let failing_queries = Arc::new(Mutex::new(Vec::new()));
+        let failing_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&failing_queries),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "failing".to_owned(),
+            TorznabIndexerConfig {
+                url: failing_url,
+                api_key: Some(ApiKey::new("failing-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(
+                &DependencyName::new("failing").unwrap(),
+                &movie_caps(),
+                100,
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+        let first_retry_after = repository
+            .indexer_registry_snapshot(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.name.as_str() == "failing")
+            .unwrap()
+            .retry_after_ms
+            .unwrap();
+
+        runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                first_retry_after,
+            )
+            .await
+            .unwrap();
+        let second_retry_after = repository
+            .indexer_registry_snapshot(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.name.as_str() == "failing")
+            .unwrap()
+            .retry_after_ms
+            .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert_eq!(2, failing_queries.lock().unwrap().len());
+        assert!(second_retry_after > first_retry_after.saturating_add(600_000));
+        assert_eq!(2, health[0].failure_count);
+    }
+
+    #[tokio::test]
+    async fn search_workflow_success_resets_indexer_failure_count() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let torznab_url =
+            spawn_runtime_torznab_dynamic_server(Arc::clone(&queries), |query, call| {
+                if query.contains("t=caps") || call == 2 {
+                    (StatusCode::OK, search_rss("candidate-1", "Example"))
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "unavailable".to_owned())
+                }
+            })
+            .await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: torznab_url,
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(&DependencyName::new("main").unwrap(), &movie_caps(), 100)
+            .await
+            .unwrap();
+
+        runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+        let first_retry_after = repository.indexer_registry_snapshot(10).await.unwrap()[0]
+            .retry_after_ms
+            .unwrap();
+        runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                first_retry_after,
+            )
+            .await
+            .unwrap();
+        let after_success = repository.dependency_health_snapshot(10).await.unwrap();
+        runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                first_retry_after + 1,
+            )
+            .await
+            .unwrap();
+        let final_health = repository.dependency_health_snapshot(10).await.unwrap();
+        let final_retry_after = repository.indexer_registry_snapshot(10).await.unwrap()[0]
+            .retry_after_ms
+            .unwrap();
+
+        assert_eq!(3, queries.lock().unwrap().len());
+        assert_eq!("healthy", after_success[0].state);
+        assert_eq!(0, after_success[0].failure_count);
+        assert_eq!(1, final_health[0].failure_count);
+        assert!(final_retry_after < first_retry_after.saturating_add(1_200_000));
     }
 
     #[tokio::test]
@@ -3407,19 +3641,38 @@ mod tests {
     }
 
     async fn spawn_runtime_torznab_search_server(queries: Arc<Mutex<Vec<String>>>) -> String {
+        spawn_runtime_torznab_dynamic_server(queries, |query, _call| {
+            if query.contains("t=caps") {
+                (StatusCode::OK, torznab_caps_xml().to_owned())
+            } else {
+                (StatusCode::OK, search_rss("candidate-1", "Example"))
+            }
+        })
+        .await
+    }
+
+    async fn spawn_runtime_torznab_dynamic_server<F>(
+        queries: Arc<Mutex<Vec<String>>>,
+        handler: F,
+    ) -> String
+    where
+        F: Fn(&str, usize) -> (StatusCode, String) + Clone + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
         let app = axum::Router::new().route(
             "/api",
             get(move |request: Request<Body>| {
                 let queries = Arc::clone(&queries);
+                let handler = Arc::clone(&handler);
                 async move {
                     let query = request.uri().query().unwrap_or_default().to_owned();
-                    queries.lock().unwrap().push(query.clone());
-                    let body = if query.contains("t=caps") {
-                        torznab_caps_xml().to_owned()
-                    } else {
-                        search_rss("candidate-1", "Example")
+                    let call = {
+                        let mut queries = queries.lock().unwrap();
+                        queries.push(query.clone());
+                        queries.len()
                     };
-                    (StatusCode::OK, body)
+                    let (status, body) = handler(&query, call);
+                    (status, body)
                 }
             }),
         );

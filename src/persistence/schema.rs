@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS dependency_health (
     state TEXT NOT NULL,
     reason TEXT,
     retry_after INTEGER,
+    failure_count INTEGER NOT NULL DEFAULT 0,
     checked_at INTEGER NOT NULL,
     PRIMARY KEY (dependency_type, dependency_name)
 );
@@ -275,6 +276,7 @@ mod tests {
             "PRIMARY KEY (local_item_id, indexer_id)",
             "name TEXT PRIMARY KEY",
             "PRIMARY KEY (dependency_type, dependency_name)",
+            "failure_count INTEGER NOT NULL DEFAULT 0",
             "idx_local_files_item_size",
             "idx_local_files_size_name",
             "idx_local_files_relative_path",

@@ -172,6 +172,7 @@ pub struct DependencyHealthSnapshot {
     pub state: String,
     pub reason: Option<String>,
     pub retry_after_ms: Option<i64>,
+    pub failure_count: u16,
     pub checked_at_ms: i64,
 }
 
@@ -1260,6 +1261,14 @@ impl Repository {
         checked_at_ms: i64,
     ) -> Result<(), DatabaseError> {
         let (state_key, reason, retry_after) = dependency_state_row(state);
+        let failure_count = if matches!(
+            state,
+            DependencyState::Healthy { .. } | DependencyState::Unknown
+        ) {
+            0_i64
+        } else {
+            1_i64
+        };
         let _span = debug_span!(
             "dependency_health.record",
             dependency_type,
@@ -1274,13 +1283,18 @@ impl Repository {
                 state,
                 reason,
                 retry_after,
+                failure_count,
                 checked_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (dependency_type, dependency_name) DO UPDATE SET
                 state = excluded.state,
                 reason = excluded.reason,
                 retry_after = excluded.retry_after,
+                failure_count = CASE
+                    WHEN excluded.failure_count = 0 THEN 0
+                    ELSE MIN(dependency_health.failure_count + 1, 65535)
+                END,
                 checked_at = excluded.checked_at
             "#,
         )
@@ -1289,6 +1303,7 @@ impl Repository {
         .bind(state_key)
         .bind(reason)
         .bind(retry_after)
+        .bind(failure_count)
         .bind(checked_at_ms)
         .execute(&self.pool)
         .await
@@ -1310,13 +1325,37 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn dependency_failure_count(
+        &self,
+        dependency_type: &str,
+        dependency_name: &DependencyName,
+    ) -> Result<u16, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT failure_count
+            FROM dependency_health
+            WHERE dependency_type = ?
+              AND dependency_name = ?
+            "#,
+        )
+        .bind(dependency_type)
+        .bind(dependency_name.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read dependency failure count", error))?;
+        row.map(|row| failure_count_from_i64(row.get("failure_count")))
+            .transpose()
+            .map(|count| count.unwrap_or(0))
+    }
+
     pub async fn dependency_health_snapshot(
         &self,
         limit: u16,
     ) -> Result<Vec<DependencyHealthSnapshot>, DatabaseError> {
         let rows = sqlx::query(
             r#"
-            SELECT dependency_type, dependency_name, state, reason, retry_after, checked_at
+            SELECT dependency_type, dependency_name, state, reason, retry_after, failure_count,
+                   checked_at
             FROM dependency_health
             ORDER BY dependency_type, dependency_name
             LIMIT ?
@@ -1339,6 +1378,7 @@ impl Repository {
                     state: row.get("state"),
                     reason: row.get("reason"),
                     retry_after_ms: row.get("retry_after"),
+                    failure_count: failure_count_from_i64(row.get("failure_count"))?,
                     checked_at_ms: row.get("checked_at"),
                 })
             })
@@ -1979,6 +2019,35 @@ impl Repository {
         };
         self.record_dependency_health("indexer", name, &dependency_state, checked_at_ms)
             .await
+    }
+
+    pub async fn record_indexer_request_success(
+        &self,
+        name: &DependencyName,
+        checked_at_ms: i64,
+    ) -> Result<(), DatabaseError> {
+        sqlx::query(
+            r#"
+            UPDATE indexers
+            SET state = 'healthy',
+                retry_after = NULL,
+                updated_at = ?
+            WHERE name = ?
+            "#,
+        )
+        .bind(checked_at_ms)
+        .bind(name.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record indexer request success", error))?;
+
+        self.record_dependency_health(
+            "indexer",
+            name,
+            &DependencyState::Healthy { checked_at_ms },
+            checked_at_ms,
+        )
+        .await
     }
 
     pub async fn insert_or_dedupe_announce_work(
@@ -3759,6 +3828,13 @@ fn file_index_from_i64(value: i64, field: &'static str) -> Result<FileIndex, Dat
             operation: format!("read {field}"),
             message: error.to_string(),
         })
+}
+
+fn failure_count_from_i64(value: i64) -> Result<u16, DatabaseError> {
+    u16::try_from(value).map_err(|error| DatabaseError::QueryFailed {
+        operation: "read dependency failure count".to_owned(),
+        message: error.to_string(),
+    })
 }
 
 fn indexer_registry_row_from_row(row: SqliteRow) -> Result<IndexerRegistryRow, DatabaseError> {
@@ -5697,6 +5773,7 @@ mod tests {
         assert_eq!("degraded", rows[0].state);
         assert_eq!(Some(10_000), rows[0].retry_after_ms);
         assert_eq!("degraded", health[0].state);
+        assert_eq!(1, health[0].failure_count);
 
         repository
             .record_indexer_request_backoff(
@@ -5716,6 +5793,15 @@ mod tests {
         assert_eq!(Some(20_000), rows[0].retry_after_ms);
         assert_eq!("unavailable", health[0].state);
         assert_eq!(Some("network unavailable".to_owned()), health[0].reason);
+        assert_eq!(2, health[0].failure_count);
+
+        repository
+            .record_indexer_caps_success(&name, &TorznabCaps::default(), 400)
+            .await
+            .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        assert_eq!("healthy", health[0].state);
+        assert_eq!(0, health[0].failure_count);
     }
 
     #[tokio::test]

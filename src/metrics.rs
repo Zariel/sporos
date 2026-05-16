@@ -989,6 +989,7 @@ mod tests {
                 state: "healthy".to_owned(),
                 reason: None,
                 retry_after_ms: None,
+                failure_count: 0,
                 checked_at_ms: 2_000,
             }],
             snapshot_errors: vec!["announce_work"],
