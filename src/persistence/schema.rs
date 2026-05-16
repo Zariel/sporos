@@ -98,6 +98,9 @@ CREATE TABLE IF NOT EXISTS indexers (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     url TEXT NOT NULL,
+    source_kind TEXT NOT NULL DEFAULT 'static',
+    source_name TEXT NOT NULL DEFAULT '',
+    source_indexer_id TEXT NOT NULL DEFAULT '',
     api_key_source TEXT NOT NULL,
     enabled INTEGER NOT NULL,
     capabilities_json TEXT NOT NULL DEFAULT '{}',
@@ -107,7 +110,7 @@ CREATE TABLE IF NOT EXISTS indexers (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE (name),
-    UNIQUE (url)
+    UNIQUE (source_kind, source_name, source_indexer_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_indexers_enabled_state_retry_after
@@ -254,7 +257,7 @@ mod tests {
             "redacted_download_url TEXT NOT NULL",
             "PRIMARY KEY (local_item_id, candidate_id)",
             "UNIQUE (name)",
-            "UNIQUE (url)",
+            "UNIQUE (source_kind, source_name, source_indexer_id)",
             "api_key_source TEXT NOT NULL",
             "PRIMARY KEY (local_item_id, indexer_id)",
             "name TEXT PRIMARY KEY",
