@@ -795,8 +795,8 @@ impl Repository {
                 tracker = excluded.tracker,
                 size = excluded.size,
                 published_at = excluded.published_at,
-                info_hash = excluded.info_hash,
-                torrent_cache_path = excluded.torrent_cache_path,
+                info_hash = COALESCE(excluded.info_hash, remote_candidates.info_hash),
+                torrent_cache_path = COALESCE(excluded.torrent_cache_path, remote_candidates.torrent_cache_path),
                 last_seen_at = excluded.last_seen_at
             "#,
         )
@@ -4176,6 +4176,11 @@ mod tests {
             .upsert_remote_candidate(&candidate)
             .await
             .unwrap();
+        candidate.torrent_cache_path = None;
+        let third_id = repository
+            .upsert_remote_candidate(&candidate)
+            .await
+            .unwrap();
 
         let row =
             sqlx::query("SELECT title, redacted_download_url FROM remote_candidates WHERE id = ?")
@@ -4191,6 +4196,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(first_id, second_id);
+        assert_eq!(first_id, third_id);
         assert_eq!("Updated", title);
         assert_eq!(
             "https://[REDACTED]@indexer.example/download?id=1&passkey=[REDACTED]",

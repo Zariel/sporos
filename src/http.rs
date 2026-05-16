@@ -35,6 +35,7 @@ pub struct HttpState {
     readiness: Arc<RwLock<ReadinessState>>,
     health: HealthRegistry,
     workflow_queues: Option<WorkflowQueues>,
+    search_queue: Option<BoundedWorkQueue<SearchWorkflowRequest>>,
     job_queue: Option<BoundedWorkQueue<JobRunWorkflowRequest>>,
     allowed_jobs: Option<Arc<BTreeSet<JobName>>>,
     announce_acceptor: Option<AnnounceAcceptor>,
@@ -49,6 +50,7 @@ impl HttpState {
             readiness: Arc::new(RwLock::new(readiness)),
             health,
             workflow_queues: None,
+            search_queue: None,
             job_queue: None,
             allowed_jobs: None,
             announce_acceptor: None,
@@ -60,6 +62,14 @@ impl HttpState {
 
     pub fn with_workflow_queues(mut self, workflow_queues: WorkflowQueues) -> Self {
         self.workflow_queues = Some(workflow_queues);
+        self
+    }
+
+    pub fn with_search_queue(
+        mut self,
+        search_queue: BoundedWorkQueue<SearchWorkflowRequest>,
+    ) -> Self {
+        self.search_queue = Some(search_queue);
         self
     }
 
@@ -118,14 +128,6 @@ impl HttpState {
         self.health.snapshot()
     }
 
-    fn workflow_queues(&self) -> Result<&WorkflowQueues, ApiErrorResponse> {
-        self.workflow_queues
-            .as_ref()
-            .ok_or(ApiErrorResponse::service_unavailable(
-                "workflow queues are not running",
-            ))
-    }
-
     fn job_queue(&self) -> Result<&BoundedWorkQueue<JobRunWorkflowRequest>, ApiErrorResponse> {
         self.workflow_queues
             .as_ref()
@@ -133,6 +135,16 @@ impl HttpState {
             .or(self.job_queue.as_ref())
             .ok_or(ApiErrorResponse::service_unavailable(
                 "job workflow queue is not running",
+            ))
+    }
+
+    fn search_queue(&self) -> Result<&BoundedWorkQueue<SearchWorkflowRequest>, ApiErrorResponse> {
+        self.workflow_queues
+            .as_ref()
+            .map(|queues| &queues.searches)
+            .or(self.search_queue.as_ref())
+            .ok_or(ApiErrorResponse::service_unavailable(
+                "search workflow queue is not running",
             ))
     }
 
@@ -146,10 +158,14 @@ impl HttpState {
         if let Some(workflow_queues) = self.workflow_queues.as_ref() {
             return workflow_queues.stats();
         }
-        self.job_queue
-            .as_ref()
-            .map(|queue| vec![queue.stats()])
-            .unwrap_or_default()
+        let mut queues = Vec::new();
+        if let Some(search_queue) = self.search_queue.as_ref() {
+            queues.push(search_queue.stats());
+        }
+        if let Some(job_queue) = self.job_queue.as_ref() {
+            queues.push(job_queue.stats());
+        }
+        queues
     }
 }
 
@@ -734,8 +750,8 @@ async fn post_search(
         }
     };
     let _span = debug_span!("http.search", query = %request.query);
-    let queues = match state.workflow_queues() {
-        Ok(queues) => queues,
+    let queue = match state.search_queue() {
+        Ok(queue) => queue,
         Err(error) => {
             state
                 .metrics
@@ -751,7 +767,7 @@ async fn post_search(
 
     let response = enqueue_work(
         &state.metrics,
-        queues.searches.try_enqueue(request),
+        queue.try_enqueue(request),
         WorkflowKind::Search,
     );
     state.metrics.record_http_request(
