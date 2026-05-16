@@ -969,14 +969,20 @@ async fn process_announce_work(
         };
     };
     let downloader = CandidateDownloadClient::new(Duration::from_secs(120));
-    let cached = match downloader
-        .download_and_cache(
+    let mut download_shutdown = shutdown.clone();
+    let cached = match tokio::select! {
+        _state = download_shutdown.cancelled() => {
+            return AnnounceWorkOutcome::Release {
+                reason: AnnounceReason::DependencyBackoff,
+                next_attempt_at_ms: now_ms,
+            };
+        }
+        result = downloader.download_and_cache(
             &candidate.candidate,
             &state.config.paths.torrent_cache_dir,
             fetch.cookie.as_deref(),
-        )
-        .await
-    {
+        ) => result
+    } {
         Ok(cached) => cached,
         Err(error) => return classify_candidate_download_error(error, now_ms),
     };
@@ -1943,6 +1949,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_candidate_download_stops_on_shutdown() {
+        let root = unique_temp_dir("daemon-announce-shutdown");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let download_requests = Arc::new(AtomicUsize::new(0));
+        let download_url =
+            spawn_daemon_stalled_torrent_download_server(Arc::clone(&download_requests)).await;
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        let id = AnnounceWorkId::new("ann_stalled").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-stalled",
+            "tracker.example",
+            &download_url,
+        )
+        .await;
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let shutdown = state.shutdown.clone();
+        let signal = state.shutdown_signal.clone();
+
+        let handle = tokio::spawn(process_announce_work(state, id, signal));
+        wait_for_atomic_count(&download_requests, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(result, AnnounceWorkOutcome::Release { .. }));
+    }
+
+    #[tokio::test]
     async fn background_search_workflow_uses_cached_candidate_without_redownloading() {
         let root = unique_temp_dir("daemon-search-cached");
         let output_dir = root.join("output");
@@ -2710,6 +2759,25 @@ mod tests {
         let app = axum::Router::new().route(
             "/download",
             get(|| async { (StatusCode::OK, test_torrent_bytes()) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/download")
+    }
+
+    async fn spawn_daemon_stalled_torrent_download_server(requests: Arc<AtomicUsize>) -> String {
+        let app = axum::Router::new().route(
+            "/download",
+            get(move || {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    pending::<Response>().await
+                }
+            }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
