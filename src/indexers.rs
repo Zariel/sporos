@@ -10,24 +10,25 @@ use quick_xml::Reader;
 use quick_xml::escape::{resolve_predefined_entity, unescape};
 use quick_xml::events::{BytesCData, BytesRef, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
-use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, COOKIE, LOCATION, RETRY_AFTER, USER_AGENT};
+use reqwest::{StatusCode, redirect};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::config::{IndexersConfig, TorznabIndexerConfig};
+use crate::config::{IndexersConfig, ProwlarrSourceConfig, ProwlarrTagMatch, TorznabIndexerConfig};
 use crate::domain::{
     ByteSize, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash, ItemTitle,
     MediaType, RemoteCandidate, TorrentMetafile, TrackerName,
 };
 use crate::matching::{TorznabSearchPlan, TorznabSearchType};
 use crate::persistence::torrent_cache::cached_torrent_path;
-use crate::secrets::ApiKey;
+use crate::secrets::{ApiKey, sanitize_url_for_logging};
 use crate::torrent::parse_metafile;
 
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const TORZNAB_RSS_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const PROWLARR_CATALOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const CANDIDATE_TORRENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -387,6 +388,311 @@ pub struct RssPageOptions<'a> {
 pub struct RssPageResult {
     pub candidates: Vec<RemoteCandidate>,
     pub new_last_seen_guid: Option<String>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProwlarrSource {
+    pub name: DependencyName,
+    pub url: String,
+    pub api_key: ApiKey,
+    pub api_key_source: ApiKeySource,
+    pub tags: BTreeSet<String>,
+    pub tag_match: ProwlarrTagMatch,
+    pub include_untagged: bool,
+}
+
+impl ProwlarrSource {
+    pub fn from_config(
+        name: &str,
+        config: &ProwlarrSourceConfig,
+    ) -> Result<Option<Self>, ProwlarrConfigError> {
+        if !config.enabled {
+            return Ok(None);
+        }
+        let Some(api_key) = config.api_key.clone() else {
+            return Err(ProwlarrConfigError::MissingApiKey {
+                source: name.to_owned(),
+            });
+        };
+        let name = DependencyName::new(name.to_owned()).map_err(|error| {
+            ProwlarrConfigError::InvalidName {
+                message: error.to_string(),
+            }
+        })?;
+        Ok(Some(Self {
+            name,
+            url: config.url.trim_end_matches('/').to_owned(),
+            api_key,
+            api_key_source: prowlarr_api_key_source(config),
+            tags: config.tags.iter().cloned().collect(),
+            tag_match: config.tag_match,
+            include_untagged: config.include_untagged,
+        }))
+    }
+}
+
+impl fmt::Debug for ProwlarrSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProwlarrSource")
+            .field("name", &self.name)
+            .field("url", &redacted_url_origin(&self.url))
+            .field("api_key", &self.api_key)
+            .field("api_key_source", &self.api_key_source)
+            .field("tags", &self.tags)
+            .field("tag_match", &self.tag_match)
+            .field("include_untagged", &self.include_untagged)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProwlarrIndexer {
+    pub source: DependencyName,
+    pub prowlarr_id: i64,
+    pub name: DependencyName,
+    pub url: SanitizedTorznabUrl,
+    pub api_key: Option<ApiKey>,
+    pub api_key_source: ApiKeySource,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProwlarrHttpClient {
+    client: reqwest::Client,
+    timeout: Duration,
+}
+
+impl ProwlarrHttpClient {
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .redirect(redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_error| reqwest::Client::new()),
+            timeout,
+        }
+    }
+
+    pub async fn indexers(
+        &self,
+        source: &ProwlarrSource,
+    ) -> Result<Vec<ProwlarrIndexer>, ProwlarrRequestError> {
+        let tag_labels = self.tag_labels(source).await?;
+        let bytes = self
+            .get_bytes(source, "/api/v1/indexer", PROWLARR_CATALOG_MAX_BYTES)
+            .await?;
+        let rows =
+            serde_json::from_slice::<Vec<ProwlarrIndexerResource>>(&bytes).map_err(|error| {
+                ProwlarrRequestError::InvalidResponse {
+                    message: error.to_string(),
+                }
+            })?;
+        rows.into_iter()
+            .filter_map(|row| {
+                let tags = prowlarr_tag_values(&row.tags, &tag_labels);
+                if source_accepts_prowlarr_tags(source, &tags) {
+                    normalize_prowlarr_indexer(source, row, tags).transpose()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    async fn tag_labels(
+        &self,
+        source: &ProwlarrSource,
+    ) -> Result<BTreeMap<i64, String>, ProwlarrRequestError> {
+        if !source_needs_prowlarr_tag_labels(source) {
+            return Ok(BTreeMap::new());
+        }
+        let bytes = self
+            .get_bytes(source, "/api/v1/tag", PROWLARR_CATALOG_MAX_BYTES)
+            .await?;
+        let rows = serde_json::from_slice::<Vec<ProwlarrTagResource>>(&bytes).map_err(|error| {
+            ProwlarrRequestError::InvalidResponse {
+                message: error.to_string(),
+            }
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| !row.label.trim().is_empty())
+            .map(|row| (row.id, row.label))
+            .collect())
+    }
+
+    async fn get_bytes(
+        &self,
+        source: &ProwlarrSource,
+        path: &str,
+        limit: u64,
+    ) -> Result<Vec<u8>, ProwlarrRequestError> {
+        let url = format!("{}{}", source.url, path);
+        let response = self
+            .client
+            .get(&url)
+            .header("X-Api-Key", source.api_key.expose_secret())
+            .header(USER_AGENT, concat!("Sporos/", env!("CARGO_PKG_VERSION")))
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(ProwlarrRequestError::from_reqwest)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProwlarrRequestError::HttpStatus {
+                status: status.as_u16(),
+            });
+        }
+
+        read_prowlarr_response(response, limit).await
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ProwlarrConfigError {
+    InvalidName { message: String },
+    MissingApiKey { source: String },
+}
+
+impl fmt::Display for ProwlarrConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName { message } => {
+                write!(formatter, "invalid Prowlarr source name: {message}")
+            }
+            Self::MissingApiKey { source } => {
+                write!(formatter, "Prowlarr source `{source}` requires an API key")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProwlarrConfigError {}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ProwlarrRequestError {
+    HttpStatus { status: u16 },
+    Timeout,
+    Request { message: String },
+    InvalidResponse { message: String },
+    InvalidIndexer { message: String },
+    ResponseTooLarge { limit: u64 },
+}
+
+impl ProwlarrRequestError {
+    fn from_reqwest(error: reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else {
+            Self::Request {
+                message: sanitized_reqwest_error(error),
+            }
+        }
+    }
+}
+
+impl fmt::Display for ProwlarrRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HttpStatus { status } => {
+                write!(formatter, "Prowlarr returned HTTP status {status}")
+            }
+            Self::Timeout => formatter.write_str("Prowlarr request timed out"),
+            Self::Request { message } => write!(formatter, "Prowlarr request failed: {message}"),
+            Self::InvalidResponse { message } => {
+                write!(formatter, "invalid Prowlarr response: {message}")
+            }
+            Self::InvalidIndexer { message } => {
+                write!(formatter, "invalid Prowlarr indexer: {message}")
+            }
+            Self::ResponseTooLarge { limit } => {
+                write!(formatter, "Prowlarr response exceeded {limit} bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProwlarrRequestError {}
+
+fn source_accepts_prowlarr_tags(source: &ProwlarrSource, tags: &[String]) -> bool {
+    if source.tags.is_empty() {
+        return source.include_untagged || !tags.is_empty();
+    }
+    if tags.is_empty() {
+        return source.include_untagged;
+    }
+    match source.tag_match {
+        ProwlarrTagMatch::Any => tags.iter().any(|tag| source.tags.contains(tag)),
+        ProwlarrTagMatch::All => source.tags.iter().all(|tag| tags.contains(tag)),
+    }
+}
+
+fn source_needs_prowlarr_tag_labels(source: &ProwlarrSource) -> bool {
+    source.tags.iter().any(|tag| tag.parse::<i64>().is_err())
+}
+
+fn prowlarr_tag_values(tags: &[i64], labels: &BTreeMap<i64, String>) -> Vec<String> {
+    tags.iter()
+        .map(|tag| labels.get(tag).cloned().unwrap_or_else(|| tag.to_string()))
+        .collect()
+}
+
+fn normalize_prowlarr_indexer(
+    source: &ProwlarrSource,
+    row: ProwlarrIndexerResource,
+    tags: Vec<String>,
+) -> Result<Option<ProwlarrIndexer>, ProwlarrRequestError> {
+    if !row.enable
+        || !row
+            .protocol
+            .as_deref()
+            .is_some_and(|protocol| protocol.eq_ignore_ascii_case("torrent"))
+        || (!row.supports_rss && !row.supports_search)
+    {
+        return Ok(None);
+    }
+    let name = DependencyName::new(row.name.clone()).map_err(|error| {
+        ProwlarrRequestError::InvalidIndexer {
+            message: format!("{}: {error}", row.name),
+        }
+    })?;
+    let proxy_url = format!("{}/{}/api", source.url, row.id);
+    Ok(Some(ProwlarrIndexer {
+        source: source.name.clone(),
+        prowlarr_id: row.id,
+        name,
+        url: SanitizedTorznabUrl::new(proxy_url).map_err(|error| {
+            ProwlarrRequestError::InvalidIndexer {
+                message: format!("{}: {error}", row.name),
+            }
+        })?,
+        api_key: Some(source.api_key.clone()),
+        api_key_source: source.api_key_source.clone(),
+        tags,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProwlarrIndexerResource {
+    id: i64,
+    name: String,
+    enable: bool,
+    protocol: Option<String>,
+    #[serde(default)]
+    supports_rss: bool,
+    #[serde(default)]
+    supports_search: bool,
+    #[serde(default)]
+    tags: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProwlarrTagResource {
+    id: i64,
+    label: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1041,6 +1347,35 @@ async fn read_torznab_response(
     Ok(body)
 }
 
+async fn read_prowlarr_response(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<Vec<u8>, ProwlarrRequestError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(ProwlarrRequestError::ResponseTooLarge { limit });
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default(),
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(ProwlarrRequestError::from_reqwest)?
+    {
+        if !append_limited_body_chunk(&mut body, &chunk, limit) {
+            return Err(ProwlarrRequestError::ResponseTooLarge { limit });
+        }
+    }
+    Ok(body)
+}
+
 async fn read_candidate_response(
     mut response: reqwest::Response,
     limit: u64,
@@ -1204,6 +1539,18 @@ fn api_key_source(config: &TorznabIndexerConfig) -> ApiKeySource {
     }
 }
 
+fn prowlarr_api_key_source(config: &ProwlarrSourceConfig) -> ApiKeySource {
+    if config.api_key.is_some() {
+        ApiKeySource::Direct
+    } else if let Some(path) = &config.api_key_file {
+        ApiKeySource::File(display_path(path))
+    } else if let Some(name) = &config.api_key_env {
+        ApiKeySource::Env(name.clone())
+    } else {
+        ApiKeySource::Missing
+    }
+}
+
 fn sanitize_torznab_url(value: &str) -> Result<String, IndexerConfigError> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
@@ -1278,6 +1625,12 @@ fn reqwest_error_origin(url: &reqwest::Url) -> String {
         origin.push_str(&port.to_string());
     }
     origin
+}
+
+fn redacted_url_origin(value: &str) -> String {
+    reqwest::Url::parse(value)
+        .map(|url| reqwest_error_origin(&url))
+        .unwrap_or_else(|_error| sanitize_url_for_logging(value).to_string())
 }
 
 fn display_path(path: &Path) -> String {
@@ -1546,6 +1899,10 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener as StdTcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    };
 
     use crate::config::{IndexerTimeoutsConfig, IndexersConfig};
     use crate::matching::{SearchIds, TorznabSearchPlan, TorznabSearchQuery};
@@ -1752,6 +2109,304 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef01234567"),
             candidates[0].info_hash.as_ref().map(InfoHash::as_str)
         );
+    }
+
+    #[tokio::test]
+    async fn prowlarr_client_fetches_and_filters_torznab_indexers() {
+        let url = spawn_prowlarr_server(|request| async move {
+            if request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                != Some("prowlarr-secret")
+            {
+                return (AxumStatusCode::UNAUTHORIZED, "missing key").into_response();
+            }
+            match request.uri().path() {
+                "/api/v1/tag" => (
+                    AxumStatusCode::OK,
+                    r#"[{"id":1,"label":"movies"},{"id":2,"label":"hd"}]"#,
+                )
+                    .into_response(),
+                "/api/v1/indexer" => (
+                    AxumStatusCode::OK,
+                    r#"
+                [
+                  {
+                    "id": 101,
+                    "name": "Movies",
+                    "enable": true,
+                    "protocol": "torrent",
+                    "implementation": "Cardigann",
+                    "indexerUrls": ["https://tracker.example"],
+                    "supportsRss": true,
+                    "supportsSearch": true,
+                    "tags": [1, 2]
+                  },
+                  {
+                    "id": 102,
+                    "name": "Disabled",
+                    "enable": false,
+                    "protocol": "torrent",
+                    "implementation": "Torznab",
+                    "supportsRss": true,
+                    "supportsSearch": true,
+                    "tags": [1]
+                  },
+                  {
+                    "id": 103,
+                    "name": "Usenet",
+                    "enable": true,
+                    "protocol": "usenet",
+                    "implementation": "Newznab",
+                    "supportsRss": true,
+                    "supportsSearch": true,
+                    "tags": [1]
+                  },
+                  {
+                    "id": 104,
+                    "name": "Untagged",
+                    "enable": true,
+                    "protocol": "torrent",
+                    "implementation": "Torznab",
+                    "supportsRss": true,
+                    "supportsSearch": true,
+                    "tags": []
+                  },
+                  {
+                    "id": 105,
+                    "name": "No Search",
+                    "enable": true,
+                    "protocol": "torrent",
+                    "implementation": "Cardigann",
+                    "supportsRss": false,
+                    "supportsSearch": false,
+                    "tags": [1]
+                  }
+                ]
+                "#,
+                )
+                    .into_response(),
+                _ => (AxumStatusCode::NOT_FOUND, "bad path").into_response(),
+            }
+        })
+        .await;
+        let source_url = url.clone();
+        let source = test_prowlarr_source(url, &["movies"], ProwlarrTagMatch::Any, false);
+        let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+
+        let indexers = client.indexers(&source).await.unwrap();
+
+        assert_eq!(1, indexers.len());
+        assert_eq!(101, indexers[0].prowlarr_id);
+        assert_eq!("Movies", indexers[0].name.as_str());
+        assert_eq!(format!("{source_url}/101/api"), indexers[0].url.as_str());
+        assert_eq!(
+            Some("prowlarr-secret"),
+            indexers[0].api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert_eq!(ApiKeySource::Direct, indexers[0].api_key_source);
+        assert_eq!(vec!["movies", "hd"], indexers[0].tags);
+    }
+
+    #[tokio::test]
+    async fn prowlarr_client_applies_all_tags_and_include_untagged() {
+        let url = spawn_prowlarr_server(|request| async move {
+            match request.uri().path() {
+                "/api/v1/tag" => (
+                    AxumStatusCode::OK,
+                    r#"[{"id":1,"label":"movies"},{"id":2,"label":"hd"}]"#,
+                )
+                    .into_response(),
+                "/api/v1/indexer" => (
+                    AxumStatusCode::OK,
+                    r#"
+                [
+                  {
+                    "id": 201,
+                    "name": "Tagged",
+                    "enable": true,
+                    "protocol": "torrent",
+                    "implementation": "Torznab",
+                    "supportsRss": true,
+                    "supportsSearch": true,
+                    "tags": [1, 2]
+                  },
+                  {
+                    "id": 202,
+                    "name": "Partial",
+                    "enable": true,
+                    "protocol": "torrent",
+                    "implementation": "Torznab",
+                    "supportsRss": true,
+                    "supportsSearch": true,
+                    "tags": [1]
+                  },
+                  {
+                    "id": 203,
+                    "name": "Untagged",
+                    "enable": true,
+                    "protocol": "torrent",
+                    "implementation": "Torznab",
+                    "supportsRss": true,
+                    "supportsSearch": true,
+                    "tags": []
+                  }
+                ]
+                "#,
+                )
+                    .into_response(),
+                _ => (AxumStatusCode::NOT_FOUND, "bad path").into_response(),
+            }
+        })
+        .await;
+        let source = test_prowlarr_source(url, &["movies", "hd"], ProwlarrTagMatch::All, true);
+        let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+
+        let indexers = client.indexers(&source).await.unwrap();
+        let names = indexers
+            .iter()
+            .map(|indexer| indexer.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(vec!["Tagged", "Untagged"], names);
+    }
+
+    #[tokio::test]
+    async fn prowlarr_client_maps_status_malformed_and_oversized_responses() {
+        let status_url =
+            spawn_prowlarr_server(|_request| async move { (AxumStatusCode::UNAUTHORIZED, "no") })
+                .await;
+        let malformed_url =
+            spawn_prowlarr_server(|_request| async move { (AxumStatusCode::OK, "not json") }).await;
+        let oversized_url = spawn_prowlarr_server(|_request| async move {
+            oversized_response(PROWLARR_CATALOG_MAX_BYTES.saturating_add(1))
+        })
+        .await;
+        let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+
+        let status = client
+            .indexers(&test_prowlarr_source(
+                status_url,
+                &[],
+                ProwlarrTagMatch::Any,
+                true,
+            ))
+            .await
+            .unwrap_err();
+        let malformed = client
+            .indexers(&test_prowlarr_source(
+                malformed_url,
+                &[],
+                ProwlarrTagMatch::Any,
+                true,
+            ))
+            .await
+            .unwrap_err();
+        let oversized = client
+            .indexers(&test_prowlarr_source(
+                oversized_url,
+                &[],
+                ProwlarrTagMatch::Any,
+                true,
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            status,
+            ProwlarrRequestError::HttpStatus { status: 401 }
+        ));
+        assert!(matches!(
+            malformed,
+            ProwlarrRequestError::InvalidResponse { .. }
+        ));
+        assert!(matches!(
+            oversized,
+            ProwlarrRequestError::ResponseTooLarge {
+                limit: PROWLARR_CATALOG_MAX_BYTES
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn prowlarr_client_does_not_forward_api_key_on_redirect() {
+        let saw_redirected_key = Arc::new(AtomicBool::new(false));
+        let target_saw_redirected_key = saw_redirected_key.clone();
+        let target_url = spawn_prowlarr_server(move |request| {
+            let target_saw_redirected_key = target_saw_redirected_key.clone();
+            async move {
+                if request.headers().get("x-api-key").is_some() {
+                    target_saw_redirected_key.store(true, AtomicOrdering::Relaxed);
+                }
+                (AxumStatusCode::OK, "[]").into_response()
+            }
+        })
+        .await;
+        let redirect_url = target_url.clone();
+        let source_url = spawn_prowlarr_server(move |_request| {
+            let redirect_url = redirect_url.clone();
+            async move {
+                (
+                    AxumStatusCode::FOUND,
+                    [(
+                        LOCATION,
+                        HeaderValue::from_str(&format!("{redirect_url}/api/v1/indexer")).unwrap(),
+                    )],
+                    "",
+                )
+                    .into_response()
+            }
+        })
+        .await;
+        let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+
+        let error = client
+            .indexers(&test_prowlarr_source(
+                source_url,
+                &[],
+                ProwlarrTagMatch::Any,
+                true,
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProwlarrRequestError::HttpStatus { status: 302 }
+        ));
+        assert!(!saw_redirected_key.load(AtomicOrdering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn prowlarr_errors_redact_secret_bearing_urls() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let source = ProwlarrSource {
+            name: DependencyName::new("main").unwrap(),
+            url: format!("http://user:password@{address}/path-token?apikey=secret#frag"),
+            api_key: ApiKey::new("prowlarr-secret").unwrap(),
+            api_key_source: ApiKeySource::Direct,
+            tags: BTreeSet::new(),
+            tag_match: ProwlarrTagMatch::Any,
+            include_untagged: true,
+        };
+        let client = ProwlarrHttpClient::new(Duration::from_millis(100));
+
+        let error = client.indexers(&source).await.unwrap_err().to_string();
+        let debug = format!("{source:?}");
+
+        assert!(!error.contains("user"));
+        assert!(!error.contains("password"));
+        assert!(!error.contains("path-token"));
+        assert!(!error.contains("apikey=secret"));
+        assert!(error.contains(&format!("http://{address}")));
+        assert!(!debug.contains("user"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("path-token"));
+        assert!(!debug.contains("apikey=secret"));
+        assert!(!debug.contains("prowlarr-secret"));
     }
 
     #[tokio::test]
@@ -2493,6 +3148,40 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}/api")
+    }
+
+    async fn spawn_prowlarr_server<F, Fut, R>(handler: F) -> String
+    where
+        F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: std::future::Future<Output = R> + Send + 'static,
+        R: IntoResponse + Send + 'static,
+    {
+        let app = Router::new()
+            .route("/api/v1/indexer", get(handler.clone()))
+            .route("/api/v1/tag", get(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn test_prowlarr_source(
+        url: String,
+        tags: &[&str],
+        tag_match: ProwlarrTagMatch,
+        include_untagged: bool,
+    ) -> ProwlarrSource {
+        ProwlarrSource {
+            name: DependencyName::new("main").unwrap(),
+            url,
+            api_key: ApiKey::new("prowlarr-secret").unwrap(),
+            api_key_source: ApiKeySource::Direct,
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            tag_match,
+            include_untagged,
+        }
     }
 
     fn test_endpoint(url: String) -> TorznabEndpoint {
