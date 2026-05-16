@@ -1211,7 +1211,7 @@ mod tests {
         ));
         assert!(
             text.contains(
-                "sporos_workflow_enqueue_total{workflow=\"search\",outcome=\"accepted\"} 1"
+                "sporos_workflow_enqueue_total{outcome=\"accepted\",workflow=\"search\"} 1"
             )
         );
         assert!(text.contains("sporos_queue_depth{queue=\"search\"} 1"));
@@ -1487,7 +1487,7 @@ mod tests {
         assert!(metrics_text.contains("sporos_announce_worker_capacity 3"));
         assert!(
             metrics_text
-                .contains("sporos_announce_work_total{status=\"queued\",reason=\"accepted\"} 1")
+                .contains("sporos_announce_work_total{reason=\"accepted\",status=\"queued\"} 1")
         );
         assert!(!metrics_text.contains("secret"));
     }

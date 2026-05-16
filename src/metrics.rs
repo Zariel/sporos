@@ -1,5 +1,11 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::fmt;
+use std::sync::Arc;
+
+use prometheus::{
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+    TextEncoder,
+};
 
 use crate::persistence::repository::{
     AnnounceQueueSnapshot, DependencyHealthSnapshot as StoredDependencyHealthSnapshot,
@@ -8,33 +14,29 @@ use crate::persistence::repository::{
 use crate::runtime::health::DependencyHealthSnapshot;
 use crate::runtime::queue::QueueStats;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct MetricsRegistry {
-    state: Arc<RwLock<MetricsState>>,
+    inner: Arc<MetricsInner>,
 }
 
-#[derive(Debug, Default)]
-struct MetricsState {
-    counters: BTreeMap<MetricKey, u64>,
-    durations: BTreeMap<MetricKey, DurationStats>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct MetricKey {
-    name: &'static str,
-    labels: Vec<MetricLabel>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct MetricLabel {
-    name: &'static str,
-    value: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-struct DurationStats {
-    count: u64,
-    sum_ms: u64,
+struct MetricsInner {
+    registry: Registry,
+    http_requests: IntCounterVec,
+    workflow_enqueue: IntCounterVec,
+    search_attempts: IntCounterVec,
+    decisions: IntCounterVec,
+    indexer_requests: IntCounterVec,
+    indexer_request_duration: HistogramVec,
+    client_requests: IntCounterVec,
+    client_request_duration: HistogramVec,
+    notification_requests: IntCounterVec,
+    notification_request_duration: HistogramVec,
+    actions: IntCounterVec,
+    job_duration: HistogramVec,
+    prowlarr_refresh: IntCounterVec,
+    prowlarr_refresh_duration: HistogramVec,
+    prowlarr_refresh_imported: IntCounterVec,
+    prowlarr_refresh_deactivated: IntCounterVec,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -267,44 +269,174 @@ impl Default for MetricsSnapshot {
     }
 }
 
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for MetricsRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsRegistry")
+            .finish_non_exhaustive()
+    }
+}
+
 impl MetricsRegistry {
     pub fn new() -> Self {
-        Self::default()
+        let registry = Registry::new();
+        let http_requests = counter_vec(
+            "sporos_http_requests_total",
+            "HTTP requests with bounded route labels.",
+            &["method", "route", "status"],
+        );
+        let workflow_enqueue = counter_vec(
+            "sporos_workflow_enqueue_total",
+            "Workflow enqueue outcomes.",
+            &["workflow", "outcome"],
+        );
+        let search_attempts = counter_vec(
+            "sporos_search_attempts_total",
+            "Search attempt outcomes.",
+            &["outcome"],
+        );
+        let decisions = counter_vec(
+            "sporos_decisions_total",
+            "Candidate decision outcomes.",
+            &["outcome"],
+        );
+        let indexer_requests = counter_vec(
+            "sporos_indexer_requests_total",
+            "Indexer request outcomes.",
+            &["operation", "outcome"],
+        );
+        let indexer_request_duration = histogram_vec(
+            "sporos_indexer_request_duration_seconds",
+            "Indexer request latency.",
+            &["operation", "outcome"],
+        );
+        let client_requests = counter_vec(
+            "sporos_client_requests_total",
+            "Torrent client request outcomes.",
+            &["operation", "outcome"],
+        );
+        let client_request_duration = histogram_vec(
+            "sporos_client_request_duration_seconds",
+            "Torrent client request latency.",
+            &["operation", "outcome"],
+        );
+        let notification_requests = counter_vec(
+            "sporos_notification_requests_total",
+            "Notification request outcomes.",
+            &["operation", "outcome"],
+        );
+        let notification_request_duration = histogram_vec(
+            "sporos_notification_request_duration_seconds",
+            "Notification request latency.",
+            &["operation", "outcome"],
+        );
+        let actions = counter_vec(
+            "sporos_actions_total",
+            "Saved, injected, already-existing, and failed action outcomes.",
+            &["outcome"],
+        );
+        let job_duration = histogram_vec(
+            "sporos_job_duration_seconds",
+            "Recorded job duration observations.",
+            &["job", "outcome"],
+        );
+        let prowlarr_refresh = counter_vec(
+            "sporos_prowlarr_refresh_total",
+            "Prowlarr refresh attempts by configured source and safe outcome.",
+            &["source", "outcome"],
+        );
+        let prowlarr_refresh_duration = histogram_vec(
+            "sporos_prowlarr_refresh_duration_seconds",
+            "Prowlarr refresh duration by configured source and safe outcome.",
+            &["source", "outcome"],
+        );
+        let prowlarr_refresh_imported = counter_vec(
+            "sporos_prowlarr_refresh_imported_total",
+            "Prowlarr indexers accepted during successful refreshes.",
+            &["source"],
+        );
+        let prowlarr_refresh_deactivated = counter_vec(
+            "sporos_prowlarr_refresh_deactivated_total",
+            "Prowlarr indexers deactivated during successful refreshes.",
+            &["source"],
+        );
+
+        for metric in [
+            Box::new(http_requests.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(workflow_enqueue.clone()),
+            Box::new(search_attempts.clone()),
+            Box::new(decisions.clone()),
+            Box::new(indexer_requests.clone()),
+            Box::new(indexer_request_duration.clone()),
+            Box::new(client_requests.clone()),
+            Box::new(client_request_duration.clone()),
+            Box::new(notification_requests.clone()),
+            Box::new(notification_request_duration.clone()),
+            Box::new(actions.clone()),
+            Box::new(job_duration.clone()),
+            Box::new(prowlarr_refresh.clone()),
+            Box::new(prowlarr_refresh_duration.clone()),
+            Box::new(prowlarr_refresh_imported.clone()),
+            Box::new(prowlarr_refresh_deactivated.clone()),
+        ] {
+            register(&registry, metric);
+        }
+
+        Self {
+            inner: Arc::new(MetricsInner {
+                registry,
+                http_requests,
+                workflow_enqueue,
+                search_attempts,
+                decisions,
+                indexer_requests,
+                indexer_request_duration,
+                client_requests,
+                client_request_duration,
+                notification_requests,
+                notification_request_duration,
+                actions,
+                job_duration,
+                prowlarr_refresh,
+                prowlarr_refresh_duration,
+                prowlarr_refresh_imported,
+                prowlarr_refresh_deactivated,
+            }),
+        }
     }
 
     pub fn record_http_request(&self, method: HttpMethod, route: HttpRoute, status: u16) {
-        self.increment(
-            "sporos_http_requests_total",
-            vec![
-                label("method", method.as_str()),
-                label("route", route.as_str()),
-                label("status", status.to_string()),
-            ],
-        );
+        self.inner
+            .http_requests
+            .with_label_values(&[method.as_str(), route.as_str(), &status.to_string()])
+            .inc();
     }
 
     pub fn record_workflow_enqueue(&self, workflow: WorkflowMetric, outcome: WorkflowOutcome) {
-        self.increment(
-            "sporos_workflow_enqueue_total",
-            vec![
-                label("workflow", workflow.as_str()),
-                label("outcome", outcome.as_str()),
-            ],
-        );
+        self.inner
+            .workflow_enqueue
+            .with_label_values(&[workflow.as_str(), outcome.as_str()])
+            .inc();
     }
 
     pub fn record_search_attempt(&self, outcome: SearchOutcome) {
-        self.increment(
-            "sporos_search_attempts_total",
-            vec![label("outcome", outcome.as_str())],
-        );
+        self.inner
+            .search_attempts
+            .with_label_values(&[outcome.as_str()])
+            .inc();
     }
 
     pub fn record_decision(&self, outcome: DecisionOutcome) {
-        self.increment(
-            "sporos_decisions_total",
-            vec![label("outcome", outcome.as_str())],
-        );
+        self.inner
+            .decisions
+            .with_label_values(&[outcome.as_str()])
+            .inc();
     }
 
     pub fn record_indexer_request(
@@ -313,13 +445,14 @@ impl MetricsRegistry {
         outcome: ExternalOutcome,
         latency_ms: u64,
     ) {
-        self.record_external_request(
-            "sporos_indexer_requests_total",
-            "sporos_indexer_request_duration_seconds",
-            operation,
-            outcome,
-            latency_ms,
-        );
+        self.inner
+            .indexer_requests
+            .with_label_values(&[operation.as_str(), outcome.as_str()])
+            .inc();
+        self.inner
+            .indexer_request_duration
+            .with_label_values(&[operation.as_str(), outcome.as_str()])
+            .observe(ms_to_seconds(latency_ms));
     }
 
     pub fn record_client_request(
@@ -328,38 +461,39 @@ impl MetricsRegistry {
         outcome: ExternalOutcome,
         latency_ms: u64,
     ) {
-        self.record_external_request(
-            "sporos_client_requests_total",
-            "sporos_client_request_duration_seconds",
-            operation,
-            outcome,
-            latency_ms,
-        );
+        self.inner
+            .client_requests
+            .with_label_values(&[operation.as_str(), outcome.as_str()])
+            .inc();
+        self.inner
+            .client_request_duration
+            .with_label_values(&[operation.as_str(), outcome.as_str()])
+            .observe(ms_to_seconds(latency_ms));
     }
 
     pub fn record_notification_request(&self, outcome: ExternalOutcome, latency_ms: u64) {
-        self.record_external_request(
-            "sporos_notification_requests_total",
-            "sporos_notification_request_duration_seconds",
-            ExternalOperation::Notify,
-            outcome,
-            latency_ms,
-        );
+        self.inner
+            .notification_requests
+            .with_label_values(&[ExternalOperation::Notify.as_str(), outcome.as_str()])
+            .inc();
+        self.inner
+            .notification_request_duration
+            .with_label_values(&[ExternalOperation::Notify.as_str(), outcome.as_str()])
+            .observe(ms_to_seconds(latency_ms));
     }
 
     pub fn record_action(&self, outcome: ActionOutcome) {
-        self.increment(
-            "sporos_actions_total",
-            vec![label("outcome", outcome.as_str())],
-        );
+        self.inner
+            .actions
+            .with_label_values(&[outcome.as_str()])
+            .inc();
     }
 
     pub fn record_job_duration(&self, job: &str, outcome: ExternalOutcome, duration_ms: u64) {
-        self.observe_duration(
-            "sporos_job_duration_seconds",
-            vec![label("job", job), label("outcome", outcome.as_str())],
-            duration_ms,
-        );
+        self.inner
+            .job_duration
+            .with_label_values(&[job, outcome.as_str()])
+            .observe(ms_to_seconds(duration_ms));
     }
 
     pub fn record_prowlarr_refresh(
@@ -370,557 +504,302 @@ impl MetricsRegistry {
         imported: u64,
         deactivated: u64,
     ) {
-        let labels = vec![label("source", source), label("outcome", outcome.as_str())];
-        self.increment("sporos_prowlarr_refresh_total", labels.clone());
-        self.observe_duration(
-            "sporos_prowlarr_refresh_duration_seconds",
-            labels,
-            duration_ms,
-        );
-        let source_labels = vec![label("source", source)];
-        self.add_counter(
-            "sporos_prowlarr_refresh_imported_total",
-            source_labels.clone(),
-            imported,
-        );
-        self.add_counter(
-            "sporos_prowlarr_refresh_deactivated_total",
-            source_labels,
-            deactivated,
-        );
+        self.inner
+            .prowlarr_refresh
+            .with_label_values(&[source, outcome.as_str()])
+            .inc();
+        self.inner
+            .prowlarr_refresh_duration
+            .with_label_values(&[source, outcome.as_str()])
+            .observe(ms_to_seconds(duration_ms));
+        self.inner
+            .prowlarr_refresh_imported
+            .with_label_values(&[source])
+            .inc_by(imported);
+        self.inner
+            .prowlarr_refresh_deactivated
+            .with_label_values(&[source])
+            .inc_by(deactivated);
     }
 
     pub fn render_prometheus(&self, snapshot: &MetricsSnapshot) -> String {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut output = String::new();
-        write_descriptors(&mut output);
+        let mut families = self.inner.registry.gather();
+        families.extend(snapshot_metric_families(snapshot));
 
-        for (key, value) in &state.counters {
-            write_metric(&mut output, key.name, &key.labels, *value);
+        let encoder = TextEncoder::new();
+        let mut bytes = Vec::new();
+        if encoder.encode(&families, &mut bytes).is_err() {
+            return String::new();
         }
-        for (key, stats) in &state.durations {
-            write_duration(&mut output, key, *stats);
-        }
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+}
 
-        write_queue_metrics(&mut output, &snapshot.queues);
-        write_dependency_metrics(&mut output, &snapshot.dependency_health);
-        write_announce_metrics(
-            &mut output,
-            snapshot.announce_queue.as_ref(),
-            snapshot.announce_worker_capacity,
-        );
-        write_job_snapshot_metrics(&mut output, &snapshot.jobs);
-        write_stored_dependency_metrics(&mut output, &snapshot.stored_dependency_health);
-        write_snapshot_errors(&mut output, &snapshot.snapshot_errors);
-
-        output
+fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto::MetricFamily> {
+    let registry = Registry::new();
+    let queue_depth = int_gauge_vec(
+        "sporos_queue_depth",
+        "Current workflow queue depth.",
+        &["queue"],
+    );
+    let queue_capacity = int_gauge_vec(
+        "sporos_queue_capacity",
+        "Configured workflow queue capacity.",
+        &["queue"],
+    );
+    let queue_enqueued = counter_vec(
+        "sporos_queue_enqueued_total",
+        "Accepted workflow queue items.",
+        &["queue"],
+    );
+    let queue_rejected = counter_vec(
+        "sporos_queue_rejected_total",
+        "Rejected workflow queue items.",
+        &["queue"],
+    );
+    let queue_completed = counter_vec(
+        "sporos_queue_completed_total",
+        "Completed workflow queue items.",
+        &["queue"],
+    );
+    let queue_cancelled = counter_vec(
+        "sporos_queue_cancelled_total",
+        "Cancelled workflow queue items.",
+        &["queue"],
+    );
+    for stats in &snapshot.queues {
+        let queue = stats.kind.as_str();
+        queue_depth
+            .with_label_values(&[queue])
+            .set(i64_from_usize(stats.depth));
+        queue_capacity
+            .with_label_values(&[queue])
+            .set(i64_from_usize(stats.capacity));
+        queue_enqueued
+            .with_label_values(&[queue])
+            .inc_by(stats.accepted);
+        queue_rejected
+            .with_label_values(&[queue])
+            .inc_by(stats.rejected);
+        queue_completed
+            .with_label_values(&[queue])
+            .inc_by(stats.completed);
+        queue_cancelled
+            .with_label_values(&[queue])
+            .inc_by(stats.cancelled);
     }
 
-    fn record_external_request(
-        &self,
-        counter_name: &'static str,
-        duration_name: &'static str,
-        operation: ExternalOperation,
-        outcome: ExternalOutcome,
-        latency_ms: u64,
-    ) {
-        let labels = vec![
-            label("operation", operation.as_str()),
-            label("outcome", outcome.as_str()),
-        ];
-        self.increment(counter_name, labels.clone());
-        self.observe_duration(duration_name, labels, latency_ms);
+    let dependency_health = int_gauge_vec(
+        "sporos_dependency_health_state",
+        "Dependency health summaries.",
+        &["dependency", "state"],
+    );
+    for (kind, summary) in &snapshot.dependency_health.summaries {
+        dependency_health
+            .with_label_values(&[kind.as_str(), summary.as_str()])
+            .set(1);
     }
-
-    fn increment(&self, name: &'static str, labels: Vec<MetricLabel>) {
-        self.add_counter(name, labels, 1);
-    }
-
-    fn add_counter(&self, name: &'static str, labels: Vec<MetricLabel>, amount: u64) {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let counter = state
-            .counters
-            .entry(MetricKey { name, labels })
+    let mut stored_dependency_counts = BTreeMap::<(String, String), i64>::new();
+    for entry in &snapshot.stored_dependency_health {
+        let count = stored_dependency_counts
+            .entry((entry.dependency_type.clone(), entry.state.clone()))
             .or_insert(0);
-        *counter = counter.saturating_add(amount);
+        *count = count.saturating_add(1);
+    }
+    for ((dependency, state), count) in stored_dependency_counts {
+        dependency_health
+            .with_label_values(&[&dependency, &state])
+            .set(count);
     }
 
-    fn observe_duration(&self, name: &'static str, labels: Vec<MetricLabel>, duration_ms: u64) {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let stats = state
-            .durations
-            .entry(MetricKey { name, labels })
-            .or_default();
-        stats.count = stats.count.saturating_add(1);
-        stats.sum_ms = stats.sum_ms.saturating_add(duration_ms);
-    }
-}
-
-fn write_descriptors(output: &mut String) {
-    let descriptors = [
-        (
-            "sporos_http_requests_total",
-            "counter",
-            "HTTP requests with bounded route labels.",
-        ),
-        (
-            "sporos_workflow_enqueue_total",
-            "counter",
-            "Workflow enqueue outcomes.",
-        ),
-        (
-            "sporos_search_attempts_total",
-            "counter",
-            "Search attempt outcomes.",
-        ),
-        (
-            "sporos_decisions_total",
-            "counter",
-            "Candidate decision outcomes.",
-        ),
-        (
-            "sporos_indexer_requests_total",
-            "counter",
-            "Indexer request outcomes.",
-        ),
-        (
-            "sporos_indexer_request_duration_seconds",
-            "summary",
-            "Indexer request latency.",
-        ),
-        (
-            "sporos_client_requests_total",
-            "counter",
-            "Torrent client request outcomes.",
-        ),
-        (
-            "sporos_client_request_duration_seconds",
-            "summary",
-            "Torrent client request latency.",
-        ),
-        (
-            "sporos_notification_requests_total",
-            "counter",
-            "Notification request outcomes.",
-        ),
-        (
-            "sporos_notification_request_duration_seconds",
-            "summary",
-            "Notification request latency.",
-        ),
-        (
-            "sporos_actions_total",
-            "counter",
-            "Saved, injected, already-existing, and failed action outcomes.",
-        ),
-        (
-            "sporos_job_duration_seconds",
-            "summary",
-            "Recorded job duration observations.",
-        ),
-        (
-            "sporos_prowlarr_refresh_total",
-            "counter",
-            "Prowlarr refresh attempts by configured source and safe outcome.",
-        ),
-        (
-            "sporos_prowlarr_refresh_duration_seconds",
-            "summary",
-            "Prowlarr refresh duration by configured source and safe outcome.",
-        ),
-        (
-            "sporos_prowlarr_refresh_imported_total",
-            "counter",
-            "Prowlarr indexers accepted during successful refreshes.",
-        ),
-        (
-            "sporos_prowlarr_refresh_deactivated_total",
-            "counter",
-            "Prowlarr indexers deactivated during successful refreshes.",
-        ),
-        (
-            "sporos_queue_depth",
-            "gauge",
-            "Current workflow queue depth.",
-        ),
-        (
-            "sporos_queue_capacity",
-            "gauge",
-            "Configured workflow queue capacity.",
-        ),
-        (
-            "sporos_queue_enqueued_total",
-            "counter",
-            "Accepted workflow queue items.",
-        ),
-        (
-            "sporos_queue_rejected_total",
-            "counter",
-            "Rejected workflow queue items.",
-        ),
-        (
-            "sporos_queue_completed_total",
-            "counter",
-            "Completed workflow queue items.",
-        ),
-        (
-            "sporos_queue_cancelled_total",
-            "counter",
-            "Cancelled workflow queue items.",
-        ),
-        (
-            "sporos_dependency_health_state",
-            "gauge",
-            "Dependency health summaries.",
-        ),
-        (
-            "sporos_announce_work_total",
-            "gauge",
-            "Durable announce work by status and reason.",
-        ),
-        (
+    let announce_work = int_gauge_vec(
+        "sporos_announce_work_total",
+        "Durable announce work by status and reason.",
+        &["status", "reason"],
+    );
+    let announce_dependency_wait = int_gauge_vec(
+        "sporos_announce_dependency_wait_count",
+        "Announce work waiting on dependency state.",
+        &["dependency_kind", "dependency_name"],
+    );
+    let announce_attempts = counter_vec(
+        "sporos_announce_attempts_total",
+        "Announce attempts by safe outcome class.",
+        &["outcome_class"],
+    );
+    if let Some(queue) = &snapshot.announce_queue {
+        let announce_active = int_gauge(
             "sporos_announce_active_work",
-            "gauge",
             "Active durable announce work.",
-        ),
-        (
+        );
+        let announce_oldest_age = gauge(
             "sporos_announce_oldest_active_age_seconds",
-            "gauge",
             "Oldest active announce work age.",
-        ),
-        (
+        );
+        let announce_next_retry = gauge(
             "sporos_announce_next_retry_delay_seconds",
-            "gauge",
             "Next announce retry delay.",
-        ),
-        (
-            "sporos_announce_running_leases",
-            "gauge",
-            "Running announce leases.",
-        ),
-        (
-            "sporos_announce_worker_capacity",
-            "gauge",
-            "Configured announce worker capacity.",
-        ),
-        (
-            "sporos_announce_worker_busy",
-            "gauge",
-            "Busy announce workers inferred from running leases.",
-        ),
-        (
-            "sporos_announce_worker_idle",
-            "gauge",
-            "Idle announce worker capacity.",
-        ),
-        (
-            "sporos_announce_attempts_total",
-            "counter",
-            "Announce attempts by safe outcome class.",
-        ),
-        (
-            "sporos_announce_dependency_wait_count",
-            "gauge",
-            "Announce work waiting on dependency state.",
-        ),
-        (
-            "sporos_job_state",
-            "gauge",
-            "Persisted job state snapshots.",
-        ),
-        (
-            "sporos_job_last_duration_seconds",
-            "gauge",
-            "Last persisted job duration.",
-        ),
-        (
-            "sporos_metrics_snapshot_error",
-            "gauge",
-            "Metrics snapshot source errors.",
-        ),
-    ];
-
-    for (name, metric_type, help) in descriptors {
-        output.push_str("# HELP ");
-        output.push_str(name);
-        output.push(' ');
-        output.push_str(help);
-        output.push('\n');
-        output.push_str("# TYPE ");
-        output.push_str(name);
-        output.push(' ');
-        output.push_str(metric_type);
-        output.push('\n');
+        );
+        let announce_running_leases =
+            int_gauge("sporos_announce_running_leases", "Running announce leases.");
+        announce_active.set(queue.active_count);
+        if let Some(age_ms) = queue.oldest_active_age_ms {
+            announce_oldest_age.set(ms_to_seconds(i64_to_u64_floor(age_ms)));
+        }
+        if let Some(delay_ms) = queue.next_retry_delay_ms {
+            announce_next_retry.set(ms_to_seconds(i64_to_u64_floor(delay_ms)));
+        }
+        announce_running_leases.set(queue.running_leases);
+        register(&registry, Box::new(announce_active.clone()));
+        register(&registry, Box::new(announce_running_leases.clone()));
+        if queue.oldest_active_age_ms.is_some() {
+            register(&registry, Box::new(announce_oldest_age.clone()));
+        }
+        if queue.next_retry_delay_ms.is_some() {
+            register(&registry, Box::new(announce_next_retry.clone()));
+        }
+        if let Some(capacity) = snapshot.announce_worker_capacity {
+            let announce_worker_capacity = int_gauge(
+                "sporos_announce_worker_capacity",
+                "Configured announce worker capacity.",
+            );
+            let announce_worker_busy = int_gauge(
+                "sporos_announce_worker_busy",
+                "Busy announce workers inferred from running leases.",
+            );
+            let announce_worker_idle = int_gauge(
+                "sporos_announce_worker_idle",
+                "Idle announce worker capacity.",
+            );
+            let capacity = i64::from(capacity);
+            let busy = queue.running_leases.min(capacity).max(0);
+            announce_worker_capacity.set(capacity);
+            announce_worker_busy.set(busy);
+            announce_worker_idle.set(capacity.saturating_sub(busy));
+            register(&registry, Box::new(announce_worker_capacity.clone()));
+            register(&registry, Box::new(announce_worker_busy.clone()));
+            register(&registry, Box::new(announce_worker_idle.clone()));
+        }
+        for count in &queue.status_counts {
+            announce_work
+                .with_label_values(&[&count.status, &count.reason])
+                .set(count.count);
+        }
+        for count in &queue.attempt_counts {
+            announce_attempts
+                .with_label_values(&[&count.outcome_class])
+                .inc_by(i64_to_u64_floor(count.attempts));
+        }
+        for count in &queue.dependency_wait_counts {
+            announce_dependency_wait
+                .with_label_values(&[&count.dependency_kind, &count.dependency_name])
+                .set(count.count);
+        }
     }
-}
 
-fn write_queue_metrics(output: &mut String, queues: &[QueueStats]) {
-    for stats in queues {
-        let labels = vec![label("queue", stats.kind.as_str())];
-        write_metric(output, "sporos_queue_depth", &labels, stats.depth);
-        write_metric(output, "sporos_queue_capacity", &labels, stats.capacity);
-        write_metric(
-            output,
-            "sporos_queue_enqueued_total",
-            &labels,
-            stats.accepted,
-        );
-        write_metric(
-            output,
-            "sporos_queue_rejected_total",
-            &labels,
-            stats.rejected,
-        );
-        write_metric(
-            output,
-            "sporos_queue_completed_total",
-            &labels,
-            stats.completed,
-        );
-        write_metric(
-            output,
-            "sporos_queue_cancelled_total",
-            &labels,
-            stats.cancelled,
-        );
-    }
-}
-
-fn write_dependency_metrics(output: &mut String, health: &DependencyHealthSnapshot) {
-    for (kind, summary) in &health.summaries {
-        let labels = vec![
-            label("dependency", kind.as_str()),
-            label("state", summary.as_str()),
-        ];
-        write_metric(output, "sporos_dependency_health_state", &labels, 1_u8);
-    }
-}
-
-fn write_announce_metrics(
-    output: &mut String,
-    queue: Option<&AnnounceQueueSnapshot>,
-    worker_capacity: Option<u16>,
-) {
-    let Some(queue) = queue else {
-        return;
-    };
-
-    write_metric(
-        output,
-        "sporos_announce_active_work",
-        &[],
-        queue.active_count,
+    let job_state = int_gauge_vec(
+        "sporos_job_state",
+        "Persisted job state snapshots.",
+        &["job", "state"],
     );
-    if let Some(age_ms) = queue.oldest_active_age_ms {
-        let value_ms = u64::try_from(age_ms).unwrap_or(0);
-        write_metric_seconds(
-            output,
-            "sporos_announce_oldest_active_age_seconds",
-            &[],
-            value_ms,
-        );
-    }
-    if let Some(delay_ms) = queue.next_retry_delay_ms {
-        let value_ms = u64::try_from(delay_ms).unwrap_or(0);
-        write_metric_seconds(
-            output,
-            "sporos_announce_next_retry_delay_seconds",
-            &[],
-            value_ms,
-        );
-    }
-    write_metric(
-        output,
-        "sporos_announce_running_leases",
-        &[],
-        queue.running_leases,
+    let job_last_duration = gauge_vec(
+        "sporos_job_last_duration_seconds",
+        "Last persisted job duration.",
+        &["job", "state"],
     );
-    if let Some(worker_capacity) = worker_capacity {
-        let capacity = i64::from(worker_capacity);
-        let busy = queue.running_leases.min(capacity).max(0);
-        let idle = capacity.saturating_sub(busy);
-        write_metric(output, "sporos_announce_worker_capacity", &[], capacity);
-        write_metric(output, "sporos_announce_worker_busy", &[], busy);
-        write_metric(output, "sporos_announce_worker_idle", &[], idle);
-    }
-
-    for count in &queue.status_counts {
-        let labels = vec![
-            label("status", &count.status),
-            label("reason", &count.reason),
-        ];
-        write_metric(output, "sporos_announce_work_total", &labels, count.count);
-    }
-    for count in &queue.attempt_counts {
-        let labels = vec![label("outcome_class", &count.outcome_class)];
-        write_metric(
-            output,
-            "sporos_announce_attempts_total",
-            &labels,
-            count.attempts,
-        );
-    }
-    for count in &queue.dependency_wait_counts {
-        let labels = vec![
-            label("dependency_kind", &count.dependency_kind),
-            label("dependency_name", &count.dependency_name),
-        ];
-        write_metric(
-            output,
-            "sporos_announce_dependency_wait_count",
-            &labels,
-            count.count,
-        );
-    }
-}
-
-fn write_job_snapshot_metrics(output: &mut String, jobs: &[JobStatusSnapshot]) {
-    for job in jobs {
-        let labels = vec![label("job", job.name.as_str()), label("state", &job.state)];
-        write_metric(output, "sporos_job_state", &labels, 1_u8);
+    for job in &snapshot.jobs {
+        job_state
+            .with_label_values(&[job.name.as_str(), &job.state])
+            .set(1);
         if let (Some(started_at), Some(finished_at)) =
             (job.last_started_at_ms, job.last_finished_at_ms)
         {
-            let duration_ms = finished_at.saturating_sub(started_at).max(0);
-            let value = u64::try_from(duration_ms).unwrap_or(0);
-            write_metric_seconds(output, "sporos_job_last_duration_seconds", &labels, value);
+            let duration_ms = i64_to_u64_floor(finished_at.saturating_sub(started_at).max(0));
+            job_last_duration
+                .with_label_values(&[job.name.as_str(), &job.state])
+                .set(ms_to_seconds(duration_ms));
         }
     }
-}
 
-fn write_stored_dependency_metrics(output: &mut String, health: &[StoredDependencyHealthSnapshot]) {
-    let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
-    for entry in health {
-        let key = (entry.dependency_type.clone(), entry.state.clone());
-        let count = counts.entry(key).or_insert(0);
-        *count = count.saturating_add(1);
+    let snapshot_errors = int_gauge_vec(
+        "sporos_metrics_snapshot_error",
+        "Metrics snapshot source errors.",
+        &["source"],
+    );
+    for source in &snapshot.snapshot_errors {
+        snapshot_errors.with_label_values(&[source]).set(1);
     }
-    for ((dependency, state), count) in counts {
-        let labels = vec![label("dependency", dependency), label("state", state)];
-        write_metric(output, "sporos_dependency_health_state", &labels, count);
+
+    for metric in [
+        Box::new(queue_depth.clone()) as Box<dyn prometheus::core::Collector>,
+        Box::new(queue_capacity.clone()),
+        Box::new(queue_enqueued.clone()),
+        Box::new(queue_rejected.clone()),
+        Box::new(queue_completed.clone()),
+        Box::new(queue_cancelled.clone()),
+        Box::new(dependency_health.clone()),
+        Box::new(announce_work.clone()),
+        Box::new(announce_attempts.clone()),
+        Box::new(announce_dependency_wait.clone()),
+        Box::new(job_state.clone()),
+        Box::new(job_last_duration.clone()),
+        Box::new(snapshot_errors.clone()),
+    ] {
+        register(&registry, metric);
     }
+
+    registry.gather()
 }
 
-fn write_snapshot_errors(output: &mut String, errors: &[&'static str]) {
-    for source in errors {
-        let labels = vec![label("source", *source)];
-        write_metric(output, "sporos_metrics_snapshot_error", &labels, 1_u8);
-    }
+fn counter_vec(name: &'static str, help: &'static str, labels: &[&'static str]) -> IntCounterVec {
+    IntCounterVec::new(Opts::new(name, help), labels)
+        .expect("static counter metric definition is valid")
 }
 
-fn write_duration(output: &mut String, key: &MetricKey, stats: DurationStats) {
-    let count_name = format!("{}_count", key.name);
-    write_metric(output, &count_name, &key.labels, stats.count);
-
-    let sum_name = format!("{}_sum", key.name);
-    write_metric_seconds(output, &sum_name, &key.labels, stats.sum_ms);
+fn histogram_vec(name: &'static str, help: &'static str, labels: &[&'static str]) -> HistogramVec {
+    HistogramVec::new(
+        HistogramOpts::new(name, help).buckets(vec![
+            0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000, 30.000,
+            60.000,
+        ]),
+        labels,
+    )
+    .expect("static histogram metric definition is valid")
 }
 
-fn write_metric(
-    output: &mut String,
-    name: &str,
-    labels: &[MetricLabel],
-    value: impl PrometheusValue,
-) {
-    output.push_str(name);
-    write_labels(output, labels);
-    output.push(' ');
-    output.push_str(&value.prometheus_value());
-    output.push('\n');
+fn int_gauge_vec(name: &'static str, help: &'static str, labels: &[&'static str]) -> IntGaugeVec {
+    IntGaugeVec::new(Opts::new(name, help), labels)
+        .expect("static integer gauge metric definition is valid")
 }
 
-fn write_metric_seconds(output: &mut String, name: &str, labels: &[MetricLabel], value_ms: u64) {
-    output.push_str(name);
-    write_labels(output, labels);
-    output.push(' ');
-    output.push_str(&format_millis_as_seconds(value_ms));
-    output.push('\n');
+fn gauge_vec(name: &'static str, help: &'static str, labels: &[&'static str]) -> GaugeVec {
+    GaugeVec::new(Opts::new(name, help), labels).expect("static gauge metric definition is valid")
 }
 
-fn write_labels(output: &mut String, labels: &[MetricLabel]) {
-    if labels.is_empty() {
-        return;
-    }
-    output.push('{');
-    for (index, label) in labels.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push_str(label.name);
-        output.push_str("=\"");
-        write_escaped_label_value(output, &label.value);
-        output.push('"');
-    }
-    output.push('}');
+fn int_gauge(name: &'static str, help: &'static str) -> prometheus::IntGauge {
+    prometheus::IntGauge::new(name, help).expect("static integer gauge metric definition is valid")
 }
 
-fn write_escaped_label_value(output: &mut String, value: &str) {
-    for character in value.chars() {
-        match character {
-            '\\' => {
-                output.push_str("\\\\");
-            }
-            '"' => {
-                output.push_str("\\\"");
-            }
-            '\n' => {
-                output.push_str("\\n");
-            }
-            _ => {
-                output.push(character);
-            }
-        }
-    }
+fn gauge(name: &'static str, help: &'static str) -> prometheus::Gauge {
+    prometheus::Gauge::new(name, help).expect("static gauge metric definition is valid")
 }
 
-fn format_millis_as_seconds(value_ms: u64) -> String {
-    let seconds = value_ms / 1_000;
-    let millis = value_ms % 1_000;
-    format!("{seconds}.{millis:03}")
+fn register(registry: &Registry, metric: Box<dyn prometheus::core::Collector>) {
+    registry
+        .register(metric)
+        .expect("static metric registration is unique and valid");
 }
 
-fn label(name: &'static str, value: impl Into<String>) -> MetricLabel {
-    MetricLabel {
-        name,
-        value: value.into(),
-    }
+fn ms_to_seconds(value_ms: u64) -> f64 {
+    value_ms as f64 / 1_000.0
 }
 
-trait PrometheusValue {
-    fn prometheus_value(self) -> String;
+fn i64_from_usize(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-impl PrometheusValue for u8 {
-    fn prometheus_value(self) -> String {
-        self.to_string()
-    }
-}
-
-impl PrometheusValue for u64 {
-    fn prometheus_value(self) -> String {
-        self.to_string()
-    }
-}
-
-impl PrometheusValue for usize {
-    fn prometheus_value(self) -> String {
-        self.to_string()
-    }
-}
-
-impl PrometheusValue for i64 {
-    fn prometheus_value(self) -> String {
-        self.to_string()
-    }
+fn i64_to_u64_floor(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1014,7 +893,7 @@ mod tests {
         ));
         assert!(
             output.contains(
-                "sporos_workflow_enqueue_total{workflow=\"search\",outcome=\"accepted\"} 1"
+                "sporos_workflow_enqueue_total{outcome=\"accepted\",workflow=\"search\"} 1"
             )
         );
         assert!(output.contains("sporos_search_attempts_total{outcome=\"no_match\"} 1"));
@@ -1022,24 +901,23 @@ mod tests {
         assert!(output.contains(
             "sporos_indexer_requests_total{operation=\"search\",outcome=\"rate_limited\"} 1"
         ));
-        assert!(output.contains("sporos_client_request_duration_seconds_sum{operation=\"inject\",outcome=\"succeeded\"} 0.250"));
+        assert!(output.contains("sporos_indexer_request_duration_seconds_sum{operation=\"search\",outcome=\"rate_limited\"} 1.25"));
+        assert!(output.contains("sporos_client_request_duration_seconds_sum{operation=\"inject\",outcome=\"succeeded\"} 0.25"));
         assert!(output.contains("sporos_actions_total{outcome=\"already_existing\"} 1"));
         assert!(
-            output.contains(
-                "sporos_job_duration_seconds_sum{job=\"rss\",outcome=\"succeeded\"} 3.000"
-            )
+            output.contains("sporos_job_duration_seconds_sum{job=\"rss\",outcome=\"succeeded\"} 3")
         );
         assert!(
             output
-                .contains("sporos_prowlarr_refresh_total{source=\"main\",outcome=\"succeeded\"} 1")
+                .contains("sporos_prowlarr_refresh_total{outcome=\"succeeded\",source=\"main\"} 1")
         );
         assert!(output.contains(
-            "sporos_prowlarr_refresh_duration_seconds_sum{source=\"main\",outcome=\"succeeded\"} 0.500"
+            "sporos_prowlarr_refresh_duration_seconds_sum{outcome=\"succeeded\",source=\"main\"} 0.5"
         ));
         assert!(output.contains("sporos_prowlarr_refresh_imported_total{source=\"main\"} 2"));
         assert!(output.contains("sporos_prowlarr_refresh_deactivated_total{source=\"main\"} 1"));
         assert!(output.contains("sporos_announce_active_work 3"));
-        assert!(output.contains("sporos_announce_oldest_active_age_seconds 4.000"));
+        assert!(output.contains("sporos_announce_oldest_active_age_seconds 4"));
         assert!(output.contains("sporos_announce_worker_busy 1"));
         assert!(output.contains("sporos_announce_worker_idle 1"));
         assert!(output.contains("sporos_queue_depth{queue=\"search\"} 1"));
@@ -1048,7 +926,7 @@ mod tests {
             "sporos_dependency_health_state{dependency=\"indexer\",state=\"degraded\"} 1"
         ));
         assert!(
-            output.contains("sporos_announce_work_total{status=\"queued\",reason=\"accepted\"} 3")
+            output.contains("sporos_announce_work_total{reason=\"accepted\",status=\"queued\"} 3")
         );
         assert!(
             output.contains(
@@ -1057,18 +935,34 @@ mod tests {
         );
         assert!(output.contains("sporos_announce_dependency_wait_count{dependency_kind=\"indexer\",dependency_name=\"torznab\"} 1"));
         assert!(
-            output.contains(
-                "sporos_job_last_duration_seconds{job=\"rss\",state=\"succeeded\"} 1.500"
-            )
+            output
+                .contains("sporos_job_last_duration_seconds{job=\"rss\",state=\"succeeded\"} 1.5")
         );
         assert!(output.contains("sporos_metrics_snapshot_error{source=\"announce_work\"} 1"));
     }
 
     #[test]
-    fn escapes_prometheus_label_values() {
-        let mut output = String::new();
-        write_labels(&mut output, &[label("value", "quote\"slash\\newline\n")]);
+    fn prometheus_encoder_escapes_label_values() {
+        let registry = MetricsRegistry::new();
+        registry.record_job_duration("quote\"slash\\newline\n", ExternalOutcome::Succeeded, 1_000);
 
-        assert_eq!("{value=\"quote\\\"slash\\\\newline\\n\"}", output);
+        let output = registry.render_prometheus(&MetricsSnapshot::default());
+
+        assert!(output.contains("job=\"quote\\\"slash\\\\newline\\n\""));
+    }
+
+    #[test]
+    fn scrape_omits_absent_optional_announce_scalars() {
+        let registry = MetricsRegistry::new();
+
+        let output = registry.render_prometheus(&MetricsSnapshot::default());
+
+        assert!(!output.contains("sporos_announce_active_work"));
+        assert!(!output.contains("sporos_announce_oldest_active_age_seconds"));
+        assert!(!output.contains("sporos_announce_next_retry_delay_seconds"));
+        assert!(!output.contains("sporos_announce_running_leases"));
+        assert!(!output.contains("sporos_announce_worker_capacity"));
+        assert!(!output.contains("sporos_announce_worker_busy"));
+        assert!(!output.contains("sporos_announce_worker_idle"));
     }
 }

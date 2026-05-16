@@ -33,7 +33,7 @@ use crate::inventory_refresh::{
     ClientInventoryItem, ClientInventoryMessage, InventoryRefreshError, InventoryRefreshRequest,
     InventoryRefreshSummary, InventoryRefreshWorker, inventory_refresh_queue,
 };
-use crate::metrics::{MetricsRegistry, ProwlarrRefreshOutcome};
+use crate::metrics::{ExternalOperation, ExternalOutcome, MetricsRegistry, ProwlarrRefreshOutcome};
 use crate::notifications::{NotificationJob, notification_queue};
 use crate::persistence::repository::{IndexerRegistryRow, IndexerSearchCapsRow, Repository};
 use crate::runtime::announce_worker::AnnounceWorker;
@@ -537,12 +537,18 @@ impl AppState {
                     indexer_name: indexer.name.clone(),
                     plan: plan.clone(),
                 });
+                let started = Instant::now();
                 let candidates = self
                     .torznab_client
                     .search(&endpoint, item.media_type, &plan.plan, now_ms)
                     .await;
                 match candidates {
                     Ok(candidates) => {
+                        self.metrics.record_indexer_request(
+                            ExternalOperation::Search,
+                            ExternalOutcome::Succeeded,
+                            elapsed_ms(started),
+                        );
                         self.repository
                             .record_indexer_request_success(&endpoint.name, now_ms)
                             .await?;
@@ -550,6 +556,11 @@ impl AppState {
                         all_candidates.extend(candidates);
                     }
                     Err(error) => {
+                        self.metrics.record_indexer_request(
+                            ExternalOperation::Search,
+                            indexer_request_metric_outcome(&error),
+                            elapsed_ms(started),
+                        );
                         tracing::warn!(
                             indexer_name = %endpoint.name,
                             error = %error,
@@ -617,14 +628,25 @@ impl AppState {
                 let Some(endpoint) = self.registry_endpoint(&row, TorznabCaps::default())? else {
                     continue;
                 };
+                let started = Instant::now();
                 match self.torznab_client.caps_endpoint(&endpoint).await {
                     Ok(caps) => {
+                        self.metrics.record_indexer_request(
+                            ExternalOperation::Capabilities,
+                            ExternalOutcome::Succeeded,
+                            elapsed_ms(started),
+                        );
                         self.repository
                             .record_indexer_caps_success(&row.name, &caps, now_ms)
                             .await?;
                         summary.refreshed += 1;
                     }
                     Err(error) => {
+                        self.metrics.record_indexer_request(
+                            ExternalOperation::Capabilities,
+                            indexer_request_metric_outcome(&error),
+                            elapsed_ms(started),
+                        );
                         let message = error.to_string();
                         let reason = health_reason(Some(&message), "caps failed")
                             .unwrap_or_else(|| ReasonText::new("caps failed").unwrap());
@@ -741,7 +763,8 @@ impl AppRuntime {
                     message: error.to_string(),
                 }
             })?;
-        let injection_clients = build_injection_clients(&config.torrent_clients, &clients)?;
+        let injection_clients =
+            build_injection_clients(&config.torrent_clients, &clients, &metrics)?;
         let queue_config = RuntimeQueueConfig::default();
         let (workflow, workflow_receivers) = workflow_queues(queue_config);
         let (scheduler_queue, scheduler_receiver) = scheduler_queue(queue_config.indexing_limit);
@@ -1148,6 +1171,30 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn external_result_metric_outcome<T>(result: &Result<T, TorrentClientError>) -> ExternalOutcome {
+    match result {
+        Ok(_) => ExternalOutcome::Succeeded,
+        Err(TorrentClientError::UnsupportedCapability { .. }) => ExternalOutcome::Unsupported,
+        Err(_) => ExternalOutcome::Failed,
+    }
+}
+
+fn indexer_request_metric_outcome(error: &TorznabRequestError) -> ExternalOutcome {
+    match error {
+        TorznabRequestError::RateLimited { .. } => ExternalOutcome::RateLimited,
+        TorznabRequestError::Backoff { .. } => ExternalOutcome::Failed,
+        TorznabRequestError::HttpStatus { status, .. } if *status == 429 => {
+            ExternalOutcome::RateLimited
+        }
+        TorznabRequestError::HttpStatus { .. }
+        | TorznabRequestError::Timeout
+        | TorznabRequestError::Request { .. }
+        | TorznabRequestError::InvalidXml { .. }
+        | TorznabRequestError::InvalidCandidate { .. }
+        | TorznabRequestError::ResponseTooLarge { .. } => ExternalOutcome::Failed,
+    }
+}
+
 fn indexer_error_is_unavailable(error: &TorznabRequestError) -> bool {
     match error {
         TorznabRequestError::Backoff { .. } | TorznabRequestError::RateLimited { .. } => false,
@@ -1169,10 +1216,16 @@ struct RuntimeInjectionClient {
     descriptor: TorrentClientDescriptor,
     inner: RuntimeInjectionClientInner,
     qbit_validated: AsyncMutex<bool>,
+    metrics: MetricsRegistry,
 }
 
 impl RuntimeInjectionClient {
-    fn new(name: &str, config: &TorrentClientConfig, descriptor: TorrentClientDescriptor) -> Self {
+    fn new(
+        name: &str,
+        config: &TorrentClientConfig,
+        descriptor: TorrentClientDescriptor,
+        metrics: MetricsRegistry,
+    ) -> Self {
         let timeout = Duration::from_secs(30);
         let inner = match config.kind {
             ConfigTorrentClientKind::Qbittorrent => {
@@ -1196,6 +1249,7 @@ impl RuntimeInjectionClient {
             descriptor,
             inner,
             qbit_validated: AsyncMutex::new(false),
+            metrics,
         }
     }
 
@@ -1328,107 +1382,168 @@ impl InjectionClient for RuntimeInjectionClient {
 
     fn has_torrent<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
         Box::pin(async move {
-            match &self.inner {
+            let started = Instant::now();
+            let result = match &self.inner {
                 RuntimeInjectionClientInner::Qbittorrent(client) => {
-                    Ok(client.torrent_info(info_hash).await?.is_some())
+                    match client.torrent_info(info_hash).await {
+                        Ok(torrent) => Ok(torrent.is_some()),
+                        Err(error) => Err(error),
+                    }
                 }
                 RuntimeInjectionClientInner::Rtorrent(client) => {
-                    Ok(client.download_info(info_hash).await?.is_some())
+                    match client.download_info(info_hash).await {
+                        Ok(download) => Ok(download.is_some()),
+                        Err(error) => Err(error),
+                    }
                 }
-            }
+            };
+            self.metrics.record_client_request(
+                ExternalOperation::Inventory,
+                external_result_metric_outcome(&result),
+                elapsed_ms(started),
+            );
+            result
         })
     }
 
     fn inject<'a>(&'a self, request: ClientInjectionRequest<'a>) -> ClientResultFuture<'a, ()> {
         Box::pin(async move {
-            match &self.inner {
+            let started = Instant::now();
+            let result = match &self.inner {
                 RuntimeInjectionClientInner::Qbittorrent(client) => {
-                    self.ensure_qbittorrent_ready(client).await?;
-                    let save_path = request.save_path.map(PathBuf::from);
-                    client
-                        .inject(QbitAddTorrent {
-                            torrent_bytes: request.torrent_bytes,
-                            save_path: save_path.as_ref(),
-                            category: None,
-                            pause_for_recheck: request.pause_for_recheck,
-                            content_layout: QbitContentLayout::Original,
-                        })
-                        .await
+                    match self.ensure_qbittorrent_ready(client).await {
+                        Ok(()) => {
+                            let save_path = request.save_path.map(PathBuf::from);
+                            client
+                                .inject(QbitAddTorrent {
+                                    torrent_bytes: request.torrent_bytes,
+                                    save_path: save_path.as_ref(),
+                                    category: None,
+                                    pause_for_recheck: request.pause_for_recheck,
+                                    content_layout: QbitContentLayout::Original,
+                                })
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 RuntimeInjectionClientInner::Rtorrent(client) => {
-                    client
+                    match client
                         .inject(
                             request.torrent_bytes,
                             request.save_path,
                             !request.pause_for_recheck,
                         )
-                        .await?;
-                    Ok(())
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(error),
+                    }
                 }
-            }
+            };
+            self.metrics.record_client_request(
+                ExternalOperation::Inject,
+                external_result_metric_outcome(&result),
+                elapsed_ms(started),
+            );
+            result
         })
     }
 
     fn recheck<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()> {
         Box::pin(async move {
-            match &self.inner {
+            let started = Instant::now();
+            let result = match &self.inner {
                 RuntimeInjectionClientInner::Qbittorrent(client) => client.recheck(info_hash).await,
                 RuntimeInjectionClientInner::Rtorrent(client) => client.recheck(info_hash).await,
-            }
+            };
+            self.metrics.record_client_request(
+                ExternalOperation::Recheck,
+                external_result_metric_outcome(&result),
+                elapsed_ms(started),
+            );
+            result
         })
     }
 
     fn is_checking<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
         Box::pin(async move {
-            match &self.inner {
-                RuntimeInjectionClientInner::Qbittorrent(client) => Ok(client
-                    .torrent_info(info_hash)
-                    .await?
-                    .and_then(|torrent| torrent.state)
-                    .is_some_and(|state| state.to_ascii_lowercase().contains("check"))),
-                RuntimeInjectionClientInner::Rtorrent(client) => Ok(client
-                    .download_info(info_hash)
-                    .await?
-                    .is_some_and(|download| download.hashing)),
-            }
+            let started = Instant::now();
+            let result = match &self.inner {
+                RuntimeInjectionClientInner::Qbittorrent(client) => {
+                    match client.torrent_info(info_hash).await {
+                        Ok(torrent) => Ok(torrent
+                            .and_then(|torrent| torrent.state)
+                            .is_some_and(|state| state.to_ascii_lowercase().contains("check"))),
+                        Err(error) => Err(error),
+                    }
+                }
+                RuntimeInjectionClientInner::Rtorrent(client) => {
+                    match client.download_info(info_hash).await {
+                        Ok(download) => Ok(download.is_some_and(|download| download.hashing)),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            self.metrics.record_client_request(
+                ExternalOperation::Inventory,
+                external_result_metric_outcome(&result),
+                elapsed_ms(started),
+            );
+            result
         })
     }
 
     fn remaining_bytes<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ByteSize> {
         Box::pin(async move {
-            match &self.inner {
+            let started = Instant::now();
+            let result = match &self.inner {
                 RuntimeInjectionClientInner::Qbittorrent(client) => {
-                    let torrent = client
-                        .torrent_info(info_hash)
-                        .await?
-                        .ok_or_else(|| missing_torrent(&self.descriptor, info_hash))?;
-                    let remaining =
-                        torrent
-                            .amount_left
-                            .ok_or_else(|| TorrentClientError::BadResponse {
+                    match client.torrent_info(info_hash).await {
+                        Ok(Some(torrent)) => match torrent.amount_left {
+                            Some(remaining) => Ok(ByteSize::new(remaining)),
+                            None => Err(TorrentClientError::BadResponse {
                                 client: self.descriptor.name.as_str().to_owned(),
                                 message: format!(
                                     "torrent {} is missing amount_left",
                                     info_hash.as_str()
                                 ),
-                            })?;
-                    Ok(ByteSize::new(remaining))
+                            }),
+                        },
+                        Ok(None) => Err(missing_torrent(&self.descriptor, info_hash)),
+                        Err(error) => Err(error),
+                    }
                 }
-                RuntimeInjectionClientInner::Rtorrent(client) => client
-                    .download_info(info_hash)
-                    .await?
-                    .map(|download| download.left_bytes)
-                    .ok_or_else(|| missing_torrent(&self.descriptor, info_hash)),
-            }
+                RuntimeInjectionClientInner::Rtorrent(client) => {
+                    match client.download_info(info_hash).await {
+                        Ok(Some(download)) => Ok(download.left_bytes),
+                        Ok(None) => Err(missing_torrent(&self.descriptor, info_hash)),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            self.metrics.record_client_request(
+                ExternalOperation::Inventory,
+                external_result_metric_outcome(&result),
+                elapsed_ms(started),
+            );
+            result
         })
     }
 
     fn resume<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()> {
         Box::pin(async move {
-            match &self.inner {
+            let started = Instant::now();
+            let result = match &self.inner {
                 RuntimeInjectionClientInner::Qbittorrent(client) => client.resume(info_hash).await,
                 RuntimeInjectionClientInner::Rtorrent(client) => client.resume(info_hash).await,
-            }
+            };
+            self.metrics.record_client_request(
+                ExternalOperation::Resume,
+                external_result_metric_outcome(&result),
+                elapsed_ms(started),
+            );
+            result
         })
     }
 
@@ -1444,6 +1559,7 @@ impl InjectionClient for RuntimeInjectionClient {
 fn build_injection_clients(
     config: &BTreeMap<String, TorrentClientConfig>,
     registry: &TorrentClientRegistry,
+    metrics: &MetricsRegistry,
 ) -> Result<Vec<Arc<dyn InjectionClient>>, DatabaseError> {
     let mut clients = Vec::<Arc<dyn InjectionClient>>::new();
     for (name, client_config) in config {
@@ -1483,6 +1599,7 @@ fn build_injection_clients(
             name,
             client_config,
             descriptor.clone(),
+            metrics.clone(),
         )));
     }
 
@@ -2062,13 +2179,13 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(
-            text.contains("sporos_prowlarr_refresh_total{source=\"main\",outcome=\"succeeded\"} 1")
+            text.contains("sporos_prowlarr_refresh_total{outcome=\"succeeded\",source=\"main\"} 1")
         );
         assert!(
-            text.contains("sporos_prowlarr_refresh_total{source=\"failed\",outcome=\"failed\"} 1")
+            text.contains("sporos_prowlarr_refresh_total{outcome=\"failed\",source=\"failed\"} 1")
         );
         assert!(text.contains(
-            "sporos_prowlarr_refresh_total{source=\"limited\",outcome=\"rate_limited\"} 1"
+            "sporos_prowlarr_refresh_total{outcome=\"rate_limited\",source=\"limited\"} 1"
         ));
         assert!(text.contains("sporos_prowlarr_refresh_imported_total{source=\"main\"} 1"));
         assert!(text.contains("sporos_prowlarr_refresh_deactivated_total{source=\"main\"} 1"));
@@ -2378,6 +2495,54 @@ mod tests {
         assert_eq!(1, refreshed.refreshed);
         assert_eq!(1, queries.len());
         assert!(queries[0].contains("t=caps"));
+        let metrics = runtime
+            .state
+            .metrics
+            .render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(metrics.contains(
+            "sporos_indexer_requests_total{operation=\"capabilities\",outcome=\"succeeded\"} 1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn indexer_caps_refresh_records_rate_limited_metrics() {
+        let caps_requests = Arc::new(Mutex::new(Vec::new()));
+        let torznab_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&caps_requests),
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: torznab_url,
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .refresh_indexer_capabilities(1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(0, summary.refreshed);
+        assert_eq!(1, summary.failed);
+        assert_eq!(1, caps_requests.lock().unwrap().len());
+        let metrics = runtime
+            .state
+            .metrics
+            .render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(metrics.contains(
+            "sporos_indexer_requests_total{operation=\"capabilities\",outcome=\"rate_limited\"} 1"
+        ));
     }
 
     #[tokio::test]
@@ -2553,6 +2718,16 @@ mod tests {
         assert_eq!(1, summary.candidates.len());
         assert_eq!(1, ok_queries.lock().unwrap().len());
         assert_eq!(1, failing_queries.lock().unwrap().len());
+        let metrics = runtime
+            .state
+            .metrics
+            .render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(metrics.contains(
+            "sporos_indexer_requests_total{operation=\"search\",outcome=\"succeeded\"} 1"
+        ));
+        assert!(metrics.contains(
+            "sporos_indexer_requests_total{operation=\"search\",outcome=\"rate_limited\"} 1"
+        ));
         let retry_after = repository
             .indexer_registry_snapshot(10)
             .await
@@ -3301,7 +3476,8 @@ mod tests {
             default_save_path: "/downloads".into(),
             label_field: None,
         };
-        let client = RuntimeInjectionClient::new("qbit", &config, descriptor);
+        let metrics = MetricsRegistry::new();
+        let client = RuntimeInjectionClient::new("qbit", &config, descriptor, metrics.clone());
         let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
 
         let error = client
@@ -3320,6 +3496,16 @@ mod tests {
             TorrentClientError::UnsupportedCapability { .. }
         ));
         assert_eq!(0, add_calls.load(Ordering::SeqCst));
+        let output = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(output.contains("sporos_client_requests_total"));
+        assert!(output.contains("operation=\"inject\""));
+        assert!(output.contains("outcome=\"unsupported\""));
+
+        let _error = client.has_torrent(&info_hash).await.unwrap_err();
+        let output = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(output.contains("sporos_client_requests_total"));
+        assert!(output.contains("operation=\"inventory\""));
+        assert!(output.contains("outcome=\"failed\""));
     }
 
     #[tokio::test]
