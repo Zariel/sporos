@@ -337,7 +337,9 @@ where
             reason: error.to_string(),
         })?;
     validate_prowlarr_sources(&config, &raw)?;
+    validate_arr_secret_source_counts(&config)?;
     resolve_secret_env(&mut config, &env)?;
+    validate_integration_api_keys(&config)?;
 
     Ok((config, raw))
 }
@@ -658,6 +660,74 @@ fn validate_prowlarr_sources(config: &SporosConfig, raw: &Value) -> Result<(), C
     }
 
     Ok(())
+}
+
+fn validate_integration_api_keys(config: &SporosConfig) -> Result<(), ConfigError> {
+    for (name, source) in &config.indexers.prowlarr {
+        if source.enabled
+            && !has_api_key_source(&source.api_key, &source.api_key_file, &source.api_key_env)
+        {
+            return Err(missing_api_key_source("indexers.prowlarr.api_key", name));
+        }
+    }
+    validate_arr_api_key_sources("indexers.arr.sonarr.api_key", &config.indexers.arr.sonarr)?;
+    validate_arr_api_key_sources("indexers.arr.radarr.api_key", &config.indexers.arr.radarr)?;
+
+    Ok(())
+}
+
+fn validate_arr_secret_source_counts(config: &SporosConfig) -> Result<(), ConfigError> {
+    validate_arr_secret_source_count("indexers.arr.sonarr.api_key", &config.indexers.arr.sonarr)?;
+    validate_arr_secret_source_count("indexers.arr.radarr.api_key", &config.indexers.arr.radarr)
+}
+
+fn validate_arr_secret_source_count(
+    field: &'static str,
+    instances: &BTreeMap<String, ArrInstanceConfig>,
+) -> Result<(), ConfigError> {
+    for (name, instance) in instances {
+        validate_secret_source_count(
+            field,
+            name,
+            instance.api_key.is_some(),
+            instance.api_key_file.is_some(),
+            instance.api_key_env.is_some(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_arr_api_key_sources(
+    field: &'static str,
+    instances: &BTreeMap<String, ArrInstanceConfig>,
+) -> Result<(), ConfigError> {
+    for (name, instance) in instances {
+        if !has_api_key_source(
+            &instance.api_key,
+            &instance.api_key_file,
+            &instance.api_key_env,
+        ) {
+            return Err(missing_api_key_source(field, name));
+        }
+    }
+
+    Ok(())
+}
+
+fn has_api_key_source(
+    direct: &Option<ApiKey>,
+    file: &Option<PathBuf>,
+    env: &Option<String>,
+) -> bool {
+    direct.is_some() || file.is_some() || env.is_some()
+}
+
+fn missing_api_key_source(field: &'static str, name: &str) -> ConfigError {
+    ConfigError::InvalidField {
+        field,
+        reason: format!("{name} must configure api_key, api_key_file, or api_key_env"),
+    }
 }
 
 fn prowlarr_source_field_supplied(raw: &Value, name: &str, fields: &[&str]) -> bool {
@@ -1718,6 +1788,7 @@ mod tests {
 
             [indexers.prowlarr.backup]
             base_url = "http://backup-prowlarr.example"
+            api_key = "backup-secret"
             "#,
         )
         .unwrap();
@@ -1738,6 +1809,10 @@ mod tests {
         assert!(main.required);
         assert_eq!(ProwlarrRemovePolicy::Ignore, main.remove_policy);
         assert_eq!("http://backup-prowlarr.example", backup.url);
+        assert_eq!(
+            Some("backup-secret"),
+            backup.api_key.as_ref().map(ApiKey::expose_secret)
+        );
         assert_eq!("24h", backup.update_interval);
         assert_eq!(ProwlarrTagMatch::Any, backup.tag_match);
         assert_eq!(ProwlarrRemovePolicy::Deactivate, backup.remove_policy);
@@ -1906,6 +1981,49 @@ mod tests {
         .unwrap_err();
 
         assert!(tag_policy.to_string().contains("tag_match"));
+    }
+
+    #[test]
+    fn enabled_prowlarr_sources_require_api_key_source() {
+        let error = parse_config(
+            r#"
+            [indexers.prowlarr.main]
+            url = "https://prowlarr.example"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("indexers.prowlarr.api_key"));
+        assert!(error.to_string().contains("api_key_file"));
+    }
+
+    #[test]
+    fn arr_instances_require_api_key_source() {
+        let missing = parse_config(
+            r#"
+            [indexers.arr.sonarr.main]
+            url = "http://sonarr:8989"
+            "#,
+        )
+        .unwrap_err();
+        let duplicate = parse_config(
+            r#"
+            [indexers.arr.radarr.main]
+            url = "http://radarr:7878"
+            api_key = "direct"
+            api_key_env = "RADARR_API_KEY"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(missing.to_string().contains("indexers.arr.sonarr.api_key"));
+        assert!(missing.to_string().contains("api_key_file"));
+        assert!(
+            duplicate
+                .to_string()
+                .contains("indexers.arr.radarr.api_key")
+        );
+        assert!(duplicate.to_string().contains("only one"));
     }
 
     #[test]

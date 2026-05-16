@@ -116,6 +116,42 @@ mod tests {
     }
 
     #[test]
+    fn check_config_rejects_missing_integration_api_keys() {
+        let prowlarr_config = write_temp_config(
+            r#"
+            [indexers.prowlarr.main]
+            url = "https://prowlarr.example"
+            "#,
+        );
+        let arr_config = write_temp_config(
+            r#"
+            [indexers.arr.sonarr.main]
+            url = "http://sonarr:8989"
+            "#,
+        );
+
+        let prowlarr_error = run([
+            OsString::from("sporos"),
+            OsString::from("check-config"),
+            OsString::from("--config"),
+            prowlarr_config.clone().into_os_string(),
+        ])
+        .unwrap_err();
+        let arr_error = run([
+            OsString::from("sporos"),
+            OsString::from("check-config"),
+            OsString::from("--config"),
+            arr_config.clone().into_os_string(),
+        ])
+        .unwrap_err();
+
+        assert!(prowlarr_error.contains("indexers.prowlarr.api_key"));
+        assert!(arr_error.contains("indexers.arr.sonarr.api_key"));
+        remove_temp_config(prowlarr_config);
+        remove_temp_config(arr_config);
+    }
+
+    #[test]
     fn print_config_schema_reports_supported_surface() {
         let output = run([
             OsString::from("sporos"),
