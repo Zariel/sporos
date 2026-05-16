@@ -115,6 +115,11 @@ CREATE TABLE IF NOT EXISTS indexers (
 
 CREATE INDEX IF NOT EXISTS idx_indexers_enabled_state_retry_after
     ON indexers (enabled, state, retry_after);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_indexers_active_url_unique
+    ON indexers (url)
+    WHERE enabled != 0;
+CREATE INDEX IF NOT EXISTS idx_indexers_url
+    ON indexers (url);
 
 CREATE TABLE IF NOT EXISTS search_history (
     local_item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE,
@@ -258,6 +263,8 @@ mod tests {
             "PRIMARY KEY (local_item_id, candidate_id)",
             "UNIQUE (name)",
             "UNIQUE (source_kind, source_name, source_indexer_id)",
+            "idx_indexers_active_url_unique",
+            "idx_indexers_url",
             "api_key_source TEXT NOT NULL",
             "PRIMARY KEY (local_item_id, indexer_id)",
             "name TEXT PRIMARY KEY",

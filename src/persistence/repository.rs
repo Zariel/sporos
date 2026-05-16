@@ -1,8 +1,11 @@
+use std::cmp::Ordering as CompareOrdering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Acquire, Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug_span, info_span};
 
@@ -26,6 +29,7 @@ use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
 #[derive(Debug, Clone)]
 pub struct Repository {
     pool: SqlitePool,
+    prowlarr_sync_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -309,7 +313,10 @@ impl Repository {
             .await
             .map_err(|error| db_error("connect sqlite database", error))?;
 
-        let repository = Self { pool };
+        let repository = Self {
+            pool,
+            prowlarr_sync_lock: Arc::new(Mutex::new(())),
+        };
         repository.initialize().await?;
         Ok(repository)
     }
@@ -322,7 +329,10 @@ impl Repository {
             .await
             .map_err(|error| db_error("connect in-memory sqlite database", error))?;
 
-        let repository = Self { pool };
+        let repository = Self {
+            pool,
+            prowlarr_sync_lock: Arc::new(Mutex::new(())),
+        };
         repository.initialize().await?;
         Ok(repository)
     }
@@ -1445,6 +1455,7 @@ impl Repository {
         remove_policy: ProwlarrRemovePolicy,
         now_ms: i64,
     ) -> Result<ProwlarrSyncSummary, DatabaseError> {
+        let _sync_guard = self.prowlarr_sync_lock.lock().await;
         let _span = info_span!(
             "indexers.prowlarr.sync",
             source = source.as_str(),
@@ -1477,20 +1488,13 @@ impl Repository {
         for indexer in discovered {
             let source_indexer_id = indexer.prowlarr_id.to_string();
             source_indexer_ids.insert(source_indexer_id.clone());
-            reconcile_prowlarr_source_rename(
-                &mut transaction,
-                indexer.url.as_str(),
-                source.as_str(),
-                &source_indexer_id,
-                now_ms,
-            )
-            .await?;
-            if indexer_url_conflicts(
+            if resolve_active_url_conflicts(
                 &mut transaction,
                 indexer.url.as_str(),
                 "prowlarr",
                 source.as_str(),
                 &source_indexer_id,
+                now_ms,
             )
             .await?
             {
@@ -3960,115 +3964,63 @@ async fn displace_non_static_indexer_conflicts(
     Ok(())
 }
 
-async fn reconcile_prowlarr_source_rename(
-    transaction: &mut Transaction<'_, Sqlite>,
-    url: &str,
-    source_name: &str,
-    source_indexer_id: &str,
-    now_ms: i64,
-) -> Result<(), DatabaseError> {
-    let target_exists = sqlx::query(
-        r#"
-        SELECT 1
-        FROM indexers
-        WHERE source_kind = 'prowlarr'
-          AND source_name = ?
-          AND source_indexer_id = ?
-        LIMIT 1
-        "#,
-    )
-    .bind(source_name)
-    .bind(source_indexer_id)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(|error| db_error("read Prowlarr source rename target", error))?
-    .is_some();
-    if target_exists {
-        return Ok(());
-    }
-
-    let rows = sqlx::query(
-        r#"
-        SELECT id
-        FROM indexers
-        WHERE source_kind = 'prowlarr'
-          AND source_indexer_id = ?
-          AND source_name != ?
-        "#,
-    )
-    .bind(source_indexer_id)
-    .bind(source_name)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(|error| db_error("read Prowlarr source rename candidates", error))?;
-    if rows.len() == 1 {
-        let id: i64 = rows[0].get("id");
-        sqlx::query(
-            r#"
-            UPDATE indexers
-            SET source_name = ?, url = ?, updated_at = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(source_name)
-        .bind(url)
-        .bind(now_ms)
-        .bind(id)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|error| db_error("reconcile Prowlarr source rename", error))?;
-        return Ok(());
-    }
-
-    sqlx::query(
-        r#"
-        UPDATE indexers
-        SET source_name = ?, updated_at = ?
-        WHERE source_kind = 'prowlarr'
-          AND source_indexer_id = ?
-          AND url = ?
-          AND source_name != ?
-        "#,
-    )
-    .bind(source_name)
-    .bind(now_ms)
-    .bind(source_indexer_id)
-    .bind(url)
-    .bind(source_name)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|error| db_error("reconcile Prowlarr source rename", error))?;
-    Ok(())
-}
-
-async fn indexer_url_conflicts(
+async fn resolve_active_url_conflicts(
     transaction: &mut Transaction<'_, Sqlite>,
     url: &str,
     source_kind: &str,
     source_name: &str,
     source_indexer_id: &str,
+    now_ms: i64,
 ) -> Result<bool, DatabaseError> {
-    let row = sqlx::query(
+    let rows = sqlx::query(
         r#"
-        SELECT source_kind, source_name, source_indexer_id
+        SELECT id, source_kind, source_name, source_indexer_id
         FROM indexers
         WHERE url = ?
+          AND enabled != 0
         "#,
     )
     .bind(url)
     .fetch_all(&mut **transaction)
     .await
     .map_err(|error| db_error("read indexer URL conflict", error))?;
-    Ok(row.into_iter().any(|row| {
-        !same_indexer_source_identity(
-            row.get::<String, _>("source_kind").as_str(),
-            row.get::<String, _>("source_name").as_str(),
-            row.get::<String, _>("source_indexer_id").as_str(),
+    let mut current_loses = false;
+    for row in rows {
+        let existing_kind: String = row.get("source_kind");
+        let existing_name: String = row.get("source_name");
+        let existing_indexer_id: String = row.get("source_indexer_id");
+        if same_indexer_source_identity(
+            existing_kind.as_str(),
+            existing_name.as_str(),
+            existing_indexer_id.as_str(),
             source_kind,
             source_name,
             source_indexer_id,
-        )
-    }))
+        ) {
+            continue;
+        }
+        if indexer_source_identity_cmp(
+            existing_kind.as_str(),
+            existing_name.as_str(),
+            existing_indexer_id.as_str(),
+            source_kind,
+            source_name,
+            source_indexer_id,
+        ) != CompareOrdering::Greater
+        {
+            current_loses = true;
+            continue;
+        }
+
+        let id: i64 = row.get("id");
+        sqlx::query("UPDATE indexers SET enabled = 0, updated_at = ? WHERE id = ?")
+            .bind(now_ms)
+            .bind(id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| db_error("disable lower-priority duplicate URL indexer", error))?;
+    }
+    Ok(current_loses)
 }
 
 async fn available_indexer_name(
@@ -4130,6 +4082,35 @@ fn same_indexer_source_identity(
     right_indexer_id: &str,
 ) -> bool {
     left_kind == right_kind && left_name == right_name && left_indexer_id == right_indexer_id
+}
+
+fn indexer_source_identity_cmp(
+    left_kind: &str,
+    left_name: &str,
+    left_indexer_id: &str,
+    right_kind: &str,
+    right_name: &str,
+    right_indexer_id: &str,
+) -> CompareOrdering {
+    (
+        indexer_source_kind_rank(left_kind),
+        left_name,
+        left_indexer_id,
+        left_kind,
+    )
+        .cmp(&(
+            indexer_source_kind_rank(right_kind),
+            right_name,
+            right_indexer_id,
+            right_kind,
+        ))
+}
+
+fn indexer_source_kind_rank(source_kind: &str) -> u8 {
+    match source_kind {
+        "static" => 0,
+        _ => 1,
+    }
 }
 
 fn prowlarr_registry_name(source: &DependencyName, indexer: &ProwlarrIndexer) -> String {
@@ -4993,7 +4974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_prowlarr_indexers_reconciles_source_name_changes() {
+    async fn sync_prowlarr_indexers_does_not_infer_source_name_changes() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let source = DependencyName::new("main").unwrap();
         let renamed_source = DependencyName::new("renamed").unwrap();
@@ -5023,17 +5004,21 @@ mod tests {
             .unwrap();
         let row = resynced
             .iter()
-            .find(|indexer| indexer.source_indexer_id == "101")
+            .find(|indexer| indexer.source_name == "main" && indexer.source_indexer_id == "101")
             .unwrap();
 
         assert_eq!(row_id, row.id);
-        assert_eq!("renamed", row.source_name);
-        assert_eq!("renamed:Movies", row.name.as_str());
+        assert_eq!("main", row.source_name);
         assert!(row.enabled);
+        assert!(
+            resynced
+                .iter()
+                .all(|indexer| indexer.source_name != "renamed")
+        );
     }
 
     #[tokio::test]
-    async fn sync_prowlarr_indexers_reconciles_source_name_and_url_changes() {
+    async fn sync_prowlarr_indexers_does_not_infer_source_name_and_url_changes() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let source = DependencyName::new("main").unwrap();
         let renamed_source = DependencyName::new("renamed").unwrap();
@@ -5069,11 +5054,106 @@ mod tests {
             .filter(|indexer| indexer.source_indexer_id == "101")
             .collect::<Vec<_>>();
 
-        assert_eq!(1, rows.len());
-        assert_eq!(row_id, rows[0].id);
-        assert_eq!("renamed", rows[0].source_name);
-        assert_eq!("https://new-prowlarr.example/101/api", rows[0].url);
-        assert!(rows[0].enabled);
+        assert_eq!(2, rows.len());
+        assert!(rows.iter().any(|row| row.id == row_id
+            && row.source_name == "main"
+            && row.url == "https://prowlarr.example/101/api"
+            && row.enabled));
+        assert!(rows.iter().any(|row| row.id != row_id
+            && row.source_name == "renamed"
+            && row.url == "https://new-prowlarr.example/101/api"
+            && row.enabled));
+    }
+
+    #[tokio::test]
+    async fn sync_prowlarr_indexers_keeps_ids_source_local() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let main = DependencyName::new("main").unwrap();
+        let backup = DependencyName::new("backup").unwrap();
+        let main_indexer =
+            test_prowlarr_indexer("main", 101, "Movies", "https://main.example/101/api");
+        let backup_indexer =
+            test_prowlarr_indexer("backup", 101, "Movies", "https://backup.example/101/api");
+
+        repository
+            .sync_prowlarr_indexers(
+                &main,
+                &[main_indexer],
+                ProwlarrRemovePolicy::Deactivate,
+                100,
+            )
+            .await
+            .unwrap();
+        let rows = repository
+            .sync_prowlarr_indexers(
+                &backup,
+                &[backup_indexer],
+                ProwlarrRemovePolicy::Deactivate,
+                200,
+            )
+            .await
+            .unwrap();
+        let main_row = rows
+            .iter()
+            .find(|indexer| indexer.source_name == "main" && indexer.source_indexer_id == "101")
+            .unwrap();
+        let backup_row = rows
+            .iter()
+            .find(|indexer| indexer.source_name == "backup" && indexer.source_indexer_id == "101")
+            .unwrap();
+
+        assert_ne!(main_row.id, backup_row.id);
+        assert_eq!("https://main.example/101/api", main_row.url);
+        assert_eq!("https://backup.example/101/api", backup_row.url);
+        assert!(main_row.enabled);
+        assert!(backup_row.enabled);
+    }
+
+    #[tokio::test]
+    async fn sync_prowlarr_indexers_does_not_rewrite_same_url_source() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let main = DependencyName::new("main").unwrap();
+        let backup = DependencyName::new("backup").unwrap();
+        let url = "https://prowlarr.example/shared/api";
+        let main_indexer = test_prowlarr_indexer("main", 101, "Movies", url);
+        let backup_indexer = test_prowlarr_indexer("backup", 101, "Movies", url);
+
+        let synced = repository
+            .sync_prowlarr_indexers(
+                &main,
+                &[main_indexer],
+                ProwlarrRemovePolicy::Deactivate,
+                100,
+            )
+            .await
+            .unwrap();
+        let main_id = synced
+            .iter()
+            .find(|indexer| indexer.source_name == "main" && indexer.source_indexer_id == "101")
+            .unwrap()
+            .id;
+        let rows = repository
+            .sync_prowlarr_indexers(
+                &backup,
+                &[backup_indexer],
+                ProwlarrRemovePolicy::Deactivate,
+                200,
+            )
+            .await
+            .unwrap();
+        let main_row = rows
+            .iter()
+            .find(|indexer| indexer.source_name == "main" && indexer.source_indexer_id == "101")
+            .unwrap();
+        let backup_row = rows
+            .iter()
+            .find(|indexer| indexer.source_name == "backup" && indexer.source_indexer_id == "101")
+            .unwrap();
+
+        assert_eq!(main_id, main_row.id);
+        assert!(!main_row.enabled);
+        assert_ne!(main_id, backup_row.id);
+        assert!(backup_row.enabled);
     }
 
     #[tokio::test]
@@ -5180,6 +5260,94 @@ mod tests {
             .unwrap();
 
         assert!(row.enabled);
+    }
+
+    #[tokio::test]
+    async fn sync_prowlarr_indexers_can_take_over_disabled_static_url() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let source = DependencyName::new("main").unwrap();
+        let url = "https://prowlarr.example/101/api";
+        let imported = test_prowlarr_indexer("main", 101, "Movies", url);
+
+        repository
+            .sync_torznab_indexers(&[test_indexer("legacy", url, ApiKeySource::Direct)], 100)
+            .await
+            .unwrap();
+        let disabled_static = repository.sync_torznab_indexers(&[], 200).await.unwrap();
+        let static_row = disabled_static
+            .iter()
+            .find(|indexer| indexer.source_kind == "static")
+            .unwrap();
+        assert!(!static_row.enabled);
+
+        let rows = repository
+            .sync_prowlarr_indexers(&source, &[imported], ProwlarrRemovePolicy::Deactivate, 300)
+            .await
+            .unwrap();
+        let prowlarr_row = rows
+            .iter()
+            .find(|indexer| indexer.source_kind == "prowlarr")
+            .unwrap();
+
+        assert_eq!(url, prowlarr_row.url);
+        assert!(prowlarr_row.enabled);
+    }
+
+    #[tokio::test]
+    async fn concurrent_prowlarr_sync_keeps_one_active_url() {
+        let root = unique_temp_dir("prowlarr-active-url");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+        let main_repository = repository.clone();
+        let backup_repository = repository.clone();
+        let main = DependencyName::new("main").unwrap();
+        let backup = DependencyName::new("backup").unwrap();
+        let url = "https://prowlarr.example/shared/api";
+        let main_indexer = test_prowlarr_indexer("main", 101, "Movies", url);
+        let backup_indexer = test_prowlarr_indexer("backup", 202, "Movies", url);
+
+        let (main_result, backup_result) = tokio::join!(
+            async move {
+                main_repository
+                    .sync_prowlarr_indexers(
+                        &main,
+                        &[main_indexer],
+                        ProwlarrRemovePolicy::Deactivate,
+                        100,
+                    )
+                    .await
+            },
+            async move {
+                backup_repository
+                    .sync_prowlarr_indexers(
+                        &backup,
+                        &[backup_indexer],
+                        ProwlarrRemovePolicy::Deactivate,
+                        100,
+                    )
+                    .await
+            }
+        );
+
+        main_result.unwrap();
+        backup_result.unwrap();
+        let active_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM indexers WHERE url = ? AND enabled != 0")
+                .bind(url)
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(1, active_count);
+        let active_source: String =
+            sqlx::query_scalar("SELECT source_name FROM indexers WHERE url = ? AND enabled != 0")
+                .bind(url)
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!("backup", active_source);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
