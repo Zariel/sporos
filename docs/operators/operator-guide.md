@@ -55,7 +55,6 @@ default_save_path = "/downloads"
 [torrent_clients.rtorrent_archive]
 kind = "rtorrent"
 url = "http://rtorrent:5000/RPC2"
-password_env = "RTORRENT_PASSWORD"
 default_save_path = "/downloads/archive"
 label_field = "custom1"
 
@@ -185,6 +184,11 @@ Use `/readyz` for Kubernetes readiness. A degraded dependency can appear in
 readiness and metrics without requiring a restart. Sporos records retry and
 backoff state so workers can resume safely after dependency recovery.
 
+rTorrent HTTP authentication is not supported in this release. Configure
+authentication at a reverse proxy or use a private RPC endpoint; Sporos rejects
+rTorrent `username`, `password`, `password_file`, and `password_env` settings so
+credentials are not silently ignored.
+
 ## Metrics
 
 Scrape `GET /metrics` as Prometheus text. Important metric families include:
@@ -197,7 +201,7 @@ Scrape `GET /metrics` as Prometheus text. Important metric families include:
   external request outcomes and latency.
 - `sporos_dependency_health_state` for dependency summaries.
 - `sporos_announce_*` metrics for durable announce backlog, retries, leases,
-  worker capacity, and dependency waits.
+  worker capacity, and dependency waits when the announce workflow is enabled.
 - `sporos_notification_requests_total` and notification latency metrics for
   webhook delivery.
 
@@ -206,10 +210,9 @@ cookies, API keys, or full secret-bearing URLs in metrics.
 
 ## Announce Queue Operations
 
-`POST /v1/announcements` returns `202 Accepted` after validation and durable
-SQLite insertion. It does not mean matching, saving, or torrent-client injection
-has completed. Duplicate active work returns the existing work id with
-`deduplicated: true`.
+The durable announce API and worker are not enabled in the daemon runtime in
+this release. `POST /v1/announcements` returns `503 Service Unavailable`
+instead of accepting work until that workflow is wired into production.
 
 See [Announce Queue Operations](announce-queue.md) for queue health, TTL,
 retention, retry, restart, and single-writer details.

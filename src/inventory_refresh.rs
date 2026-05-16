@@ -21,6 +21,7 @@ use crate::persistence::repository::{
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::DependencyKind;
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
+use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 
 const INVENTORY_REFRESH_DEPENDENCY: &str = "inventory-refresh";
 const INVENTORY_REFRESH_RETRY_INITIAL: Duration = Duration::from_millis(25);
@@ -202,29 +203,43 @@ pub fn inventory_refresh_queue(
 pub async fn run_inventory_refresh_worker(
     worker: InventoryRefreshWorker,
     mut receiver: WorkReceiver<InventoryRefreshRequest>,
+    mut shutdown: ShutdownSignal,
 ) {
-    while let Some(request) = receiver.recv().await {
-        run_inventory_refresh_with_retry(&worker, request).await;
-        receiver.mark_completed();
+    loop {
+        let request = tokio::select! {
+            request = receiver.recv() => request,
+            _state = shutdown.cancelled() => break,
+        };
+        let Some(request) = request else {
+            break;
+        };
+        let completed = run_inventory_refresh_with_retry(&worker, request, &mut shutdown).await;
+        if completed {
+            receiver.mark_completed();
+        }
+        if shutdown.state().phase != ShutdownPhase::Running {
+            break;
+        }
     }
 }
 
 async fn run_inventory_refresh_with_retry(
     worker: &InventoryRefreshWorker,
     request: InventoryRefreshRequest,
-) {
+    shutdown: &mut ShutdownSignal,
+) -> bool {
     let mut delay = INVENTORY_REFRESH_RETRY_INITIAL;
     loop {
         match worker.refresh_data_dirs(request.clone()).await {
             Ok(summary) if summary.scan_failures.is_empty() => {
                 record_inventory_refresh_health(worker, None, None).await;
-                return;
+                return true;
             }
             Ok(summary) => {
                 let reason = scan_failure_reason(&summary.scan_failures);
                 warn!(reason, "inventory refresh reported scan failures");
                 record_inventory_refresh_health(worker, Some(reason), None).await;
-                return;
+                return true;
             }
             Err(error) => {
                 let reason = error.to_string();
@@ -233,7 +248,10 @@ async fn run_inventory_refresh_with_retry(
             }
         }
 
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            _state = shutdown.cancelled() => return false,
+            () = tokio::time::sleep(delay) => {}
+        }
         delay = delay.saturating_mul(2).min(INVENTORY_REFRESH_RETRY_MAX);
     }
 }
@@ -469,7 +487,8 @@ mod tests {
             })
             .unwrap();
         drop(queue);
-        run_inventory_refresh_worker(worker, receiver).await;
+        let (_shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        run_inventory_refresh_worker(worker, receiver, signal).await;
 
         let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
             .fetch_one(repository.pool())
@@ -505,7 +524,8 @@ mod tests {
             })
             .unwrap();
         drop(queue);
-        run_inventory_refresh_worker(worker, receiver).await;
+        let (_shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        run_inventory_refresh_worker(worker, receiver, signal).await;
 
         let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
             .fetch_one(repository.pool())
@@ -536,13 +556,46 @@ mod tests {
                 media_dirs: vec![root.clone()],
             })
             .unwrap();
-        let handle = tokio::spawn(run_inventory_refresh_worker(worker, receiver));
+        let (_shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        let handle = tokio::spawn(run_inventory_refresh_worker(worker, receiver, signal));
 
         tokio::time::sleep(Duration::from_millis(75)).await;
 
         assert_eq!(0, queue.stats().completed);
         handle.abort();
         let _ = handle.await;
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inventory_refresh_worker_stops_retry_sleep_on_shutdown() {
+        let root = unique_temp_dir("queue-retry-shutdown");
+        let release = root.join("Stopped.2026.1080p");
+        fs::create_dir_all(&release).unwrap();
+        write_file(&release.join("stopped.mkv"), 10);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository.pool().close().await;
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let (queue, receiver) = inventory_refresh_queue(NonZeroUsize::new(1).unwrap());
+
+        queue
+            .try_enqueue(InventoryRefreshRequest {
+                media_dirs: vec![root.clone()],
+            })
+            .unwrap();
+        let (shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        let handle = tokio::spawn(run_inventory_refresh_worker(worker, receiver, signal));
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(0, queue.stats().completed);
 
         fs::remove_dir_all(root).unwrap();
     }

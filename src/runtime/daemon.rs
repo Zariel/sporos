@@ -9,15 +9,11 @@ use crate::config::{SporosConfig, validate_server_auth};
 use crate::errors::{ConfigError, DatabaseError};
 use crate::http::router;
 use crate::inventory_refresh::run_inventory_refresh_worker;
-use crate::metrics::MetricsRegistry;
 use crate::notifications::{NotificationWorker, run_notification_worker};
 use crate::runtime::announce_worker::{AnnounceWorkerError, unix_time_ms};
 use crate::runtime::app::{AppRuntime, RuntimeReceivers};
 use crate::runtime::injection_worker::{InjectionWorker, SavedTorrentRetryConfig};
-use crate::runtime::scheduler::PersistedScheduler;
 use crate::runtime::shutdown::ShutdownSignal;
-
-const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -75,16 +71,13 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<JoinHandle<()
     } = runtime.receivers;
 
     let mut handles = Vec::new();
-    handles.push(tokio::spawn(run_scheduler_loop(
-        runtime.state.scheduler.clone(),
-        runtime.state.shutdown_signal.clone(),
-    )));
     handles.push(tokio::spawn(run_inventory_refresh_worker(
         runtime.state.inventory_refresh.clone(),
         inventory_refresh,
+        runtime.state.shutdown_signal.clone(),
     )));
     handles.push(tokio::spawn(run_notification_worker(
-        NotificationWorker::new(runtime.state.health.clone(), MetricsRegistry::new()),
+        NotificationWorker::new(runtime.state.health.clone(), runtime.state.metrics.clone()),
         notifications,
     )));
     handles.push(tokio::spawn(run_saved_retry_loop(
@@ -114,24 +107,6 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<JoinHandle<()
     )));
 
     Ok(handles)
-}
-
-async fn run_scheduler_loop(scheduler: PersistedScheduler, mut shutdown: ShutdownSignal) {
-    loop {
-        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
-            break;
-        }
-        if let Err(error) = scheduler.tick(unix_time_ms()).await {
-            warn!(error = %error, "scheduler tick failed");
-        }
-
-        tokio::select! {
-            _state = shutdown.cancelled() => {
-                break;
-            }
-            () = tokio::time::sleep(SCHEDULER_TICK_INTERVAL) => {}
-        }
-    }
 }
 
 async fn run_saved_retry_loop(

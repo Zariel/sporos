@@ -20,6 +20,7 @@ use crate::inventory::InventoryScanOptions;
 use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshWorker, inventory_refresh_queue,
 };
+use crate::metrics::MetricsRegistry;
 use crate::notifications::{NotificationJob, notification_queue};
 use crate::persistence::repository::Repository;
 use crate::runtime::announce_worker::AnnounceWorker;
@@ -45,6 +46,7 @@ pub struct AppState {
     pub repository: Repository,
     pub clients: TorrentClientRegistry,
     pub health: HealthRegistry,
+    pub metrics: MetricsRegistry,
     pub http: HttpState,
     pub queues: RuntimeQueues,
     pub announce_worker: AnnounceWorker,
@@ -85,6 +87,7 @@ impl AppRuntime {
         repository: Repository,
     ) -> Result<Self, DatabaseError> {
         let health = HealthRegistry::new();
+        let metrics = MetricsRegistry::new();
         let indexers = TorznabRegistry::from_config(&config.indexers).map_err(|error| {
             DatabaseError::Unavailable {
                 operation: "build Torznab indexer registry".to_owned(),
@@ -157,9 +160,9 @@ impl AppRuntime {
             inventory_refresh: inventory_queue,
             notifications: notification_queue,
         };
-        let mut http = HttpState::new(ReadinessState::ready(), health.clone())
-            .with_workflow_queues(workflow)
-            .with_announce_acceptor(repository.clone(), config.announce.clone());
+        let mut readiness = ReadinessState::ready();
+        readiness.workers_running = false;
+        let mut http = HttpState::new(readiness, health.clone()).with_metrics(metrics.clone());
         if let Some(api_token) = config.server.api_token.as_ref() {
             http = http.with_api_token(api_token.expose_secret());
         }
@@ -170,6 +173,7 @@ impl AppRuntime {
                 repository,
                 clients,
                 health,
+                metrics,
                 http,
                 queues,
                 announce_worker,
@@ -253,19 +257,11 @@ impl InjectionClient for RuntimeInjectionClient {
         Box::pin(async move {
             match &self.inner {
                 RuntimeInjectionClientInner::Qbittorrent(client) => {
-                    Ok(client.list_inventory().await?.into_iter().any(|torrent| {
-                        torrent
-                            .info_hash(self.descriptor.name.as_str())
-                            .ok()
-                            .as_ref()
-                            == Some(info_hash)
-                    }))
+                    Ok(client.torrent_info(info_hash).await?.is_some())
                 }
-                RuntimeInjectionClientInner::Rtorrent(client) => Ok(client
-                    .list_inventory()
-                    .await?
-                    .into_iter()
-                    .any(|download| &download.info_hash == info_hash)),
+                RuntimeInjectionClientInner::Rtorrent(client) => {
+                    Ok(client.download_info(info_hash).await?.is_some())
+                }
             }
         })
     }
@@ -313,23 +309,13 @@ impl InjectionClient for RuntimeInjectionClient {
         Box::pin(async move {
             match &self.inner {
                 RuntimeInjectionClientInner::Qbittorrent(client) => Ok(client
-                    .list_inventory()
+                    .torrent_info(info_hash)
                     .await?
-                    .into_iter()
-                    .find(|torrent| {
-                        torrent
-                            .info_hash(self.descriptor.name.as_str())
-                            .ok()
-                            .as_ref()
-                            == Some(info_hash)
-                    })
                     .and_then(|torrent| torrent.state)
                     .is_some_and(|state| state.to_ascii_lowercase().contains("check"))),
                 RuntimeInjectionClientInner::Rtorrent(client) => Ok(client
-                    .list_inventory()
+                    .download_info(info_hash)
                     .await?
-                    .into_iter()
-                    .find(|download| &download.info_hash == info_hash)
                     .is_some_and(|download| download.hashing)),
             }
         })
@@ -340,16 +326,8 @@ impl InjectionClient for RuntimeInjectionClient {
             match &self.inner {
                 RuntimeInjectionClientInner::Qbittorrent(client) => {
                     let torrent = client
-                        .list_inventory()
+                        .torrent_info(info_hash)
                         .await?
-                        .into_iter()
-                        .find(|torrent| {
-                            torrent
-                                .info_hash(self.descriptor.name.as_str())
-                                .ok()
-                                .as_ref()
-                                == Some(info_hash)
-                        })
                         .ok_or_else(|| missing_torrent(&self.descriptor, info_hash))?;
                     let remaining =
                         torrent
@@ -364,10 +342,8 @@ impl InjectionClient for RuntimeInjectionClient {
                     Ok(ByteSize::new(remaining))
                 }
                 RuntimeInjectionClientInner::Rtorrent(client) => client
-                    .list_inventory()
+                    .download_info(info_hash)
                     .await?
-                    .into_iter()
-                    .find(|download| &download.info_hash == info_hash)
                     .map(|download| download.left_bytes)
                     .ok_or_else(|| missing_torrent(&self.descriptor, info_hash)),
             }
@@ -409,6 +385,17 @@ fn build_injection_clients(
             return Err(DatabaseError::Unavailable {
                 operation: "build injection client".to_owned(),
                 message: format!("rtorrent client {name} only supports label_field custom1"),
+            });
+        }
+        if descriptor.kind == crate::domain::TorrentClientKind::Rtorrent
+            && (client_config.username.is_some()
+                || client_config.password.is_some()
+                || client_config.password_file.is_some()
+                || client_config.password_env.is_some())
+        {
+            return Err(DatabaseError::Unavailable {
+                operation: "build injection client".to_owned(),
+                message: format!("rtorrent client {name} does not support configured auth fields"),
             });
         }
         clients.push(Arc::new(RuntimeInjectionClient::new(
@@ -468,6 +455,7 @@ mod tests {
     use crate::config::TorznabIndexerConfig;
     use crate::domain::{ClientHost, TorrentClientKind};
     use crate::http::router;
+    use crate::metrics::ExternalOutcome;
     use crate::secrets::{ApiKey, ApiToken};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -507,7 +495,8 @@ mod tests {
             .unwrap();
         let indexers = repository.indexer_registry_snapshot(10).await.unwrap();
 
-        assert!(runtime.state.http.clone().readiness().is_ready());
+        assert!(!runtime.state.http.clone().readiness().is_ready());
+        assert!(!runtime.state.http.clone().readiness().workers_running);
         assert_eq!(1, indexers.len());
         assert_eq!("main", indexers[0].name.as_str());
         assert_eq!("https://indexer.example/api", indexers[0].url);
@@ -568,6 +557,135 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("label_field custom1"));
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_unsupported_rtorrent_auth_fields() {
+        let mut config = SporosConfig::default();
+        config.torrent_clients.insert(
+            "rtorrent".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Rtorrent,
+                url: "http://rtorrent:5000/RPC2".to_owned(),
+                username: Some("sporos".to_owned()),
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads".into(),
+                label_field: Some("custom1".to_owned()),
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+
+        let error = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not support configured auth")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_does_not_accept_unimplemented_workflows() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let app = router(runtime.state.http.clone());
+
+        let search = app.clone().oneshot(search_request(None)).await.unwrap();
+        let job_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/rss/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let announcement = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/announcements")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Example","guid":"guid-1","download_url":"https://indexer.example/download","tracker":"tracker"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let readyz = router(runtime.state.http.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = router(runtime.state.http.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status_body = axum::body::to_bytes(status.into_body(), 65_536)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, search.status());
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, job_run.status());
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, announcement.status());
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());
+        assert_eq!(false, status_json["readiness"]["accepting_work"]);
+        assert_eq!(false, status_json["readiness"]["processing_ready"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_http_exposes_shared_metrics_registry() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        runtime
+            .state
+            .metrics
+            .record_notification_request(ExternalOutcome::Succeeded, 25);
+        let app = router(runtime.state.http.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("sporos_notification_requests_total"));
+        assert!(text.contains("outcome=\"succeeded\""));
     }
 
     #[tokio::test]
@@ -645,13 +763,13 @@ mod tests {
         let app = router(runtime.state.http.clone());
 
         let unauthorized = app.clone().oneshot(search_request(None)).await.unwrap();
-        let accepted = app
+        let unavailable = app
             .oneshot(search_request(Some("Bearer secret-token")))
             .await
             .unwrap();
 
         assert_eq!(StatusCode::UNAUTHORIZED, unauthorized.status());
-        assert_eq!(StatusCode::ACCEPTED, accepted.status());
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, unavailable.status());
     }
 
     fn search_request(auth: Option<&str>) -> Request<Body> {

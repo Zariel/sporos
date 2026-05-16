@@ -88,6 +88,24 @@ impl RtorrentClient {
         Ok(downloads)
     }
 
+    pub async fn download_info(
+        &self,
+        info_hash: &InfoHash,
+    ) -> Result<Option<RtorrentDownload>, TorrentClientError> {
+        let response = match self
+            .call(
+                "system.multicall",
+                vec![inventory_multicall_param(std::slice::from_ref(info_hash))],
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if is_missing_download_error(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        parse_optional_inventory_response(&self.client_name, info_hash, &response)
+    }
+
     pub async fn fetch_files(
         &self,
         info_hash: &InfoHash,
@@ -362,6 +380,33 @@ pub fn parse_inventory_response(
         });
     }
     Ok(downloads)
+}
+
+fn parse_optional_inventory_response(
+    client: &str,
+    info_hash: &InfoHash,
+    response: &XmlRpcValue,
+) -> Result<Option<RtorrentDownload>, TorrentClientError> {
+    let values = response.as_array(client, "system.multicall result")?;
+    let expected = INVENTORY_METHODS.len();
+    if values.len() != expected {
+        return Err(bad_response(
+            client,
+            format!("expected {expected} inventory values, got {}", values.len()),
+        ));
+    }
+    if values.iter().all(is_missing_download_fault_value) {
+        return Ok(None);
+    }
+    if values.iter().any(is_missing_download_fault_value) {
+        return Err(bad_response(
+            client,
+            "partial missing download response from system.multicall",
+        ));
+    }
+
+    let downloads = parse_inventory_response(client, std::slice::from_ref(info_hash), response)?;
+    Ok(downloads.into_iter().next())
 }
 
 pub fn parse_files_response(
@@ -693,16 +738,9 @@ fn nonempty_string(value: &str) -> Option<String> {
 }
 
 fn fault_error(client: &str, fault: &XmlRpcValue) -> TorrentClientError {
-    let message = match fault {
-        XmlRpcValue::Struct(fields) => fields
-            .get("faultString")
-            .and_then(|value| match value {
-                XmlRpcValue::String(value) => Some(value.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| format!("{fault:?}")),
-        _ => format!("{fault:?}"),
-    };
+    let message = fault_message(fault)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{fault:?}"));
     let lower = message.to_ascii_lowercase();
     if lower.contains("method") && (lower.contains("not found") || lower.contains("unknown")) {
         TorrentClientError::UnsupportedCapability {
@@ -712,6 +750,37 @@ fn fault_error(client: &str, fault: &XmlRpcValue) -> TorrentClientError {
     } else {
         bad_response(client, message)
     }
+}
+
+fn fault_message(fault: &XmlRpcValue) -> Option<&str> {
+    match fault {
+        XmlRpcValue::Struct(fields) => fields.get("faultString").and_then(|value| match value {
+            XmlRpcValue::String(value) => Some(value.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn is_missing_download_fault_value(value: &XmlRpcValue) -> bool {
+    fault_message(value).is_some_and(is_missing_download_message)
+}
+
+fn is_missing_download_error(error: &TorrentClientError) -> bool {
+    matches!(
+        error,
+        TorrentClientError::BadResponse { message, .. }
+            if is_missing_download_message(message)
+    )
+}
+
+fn is_missing_download_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("could not find")
+        && (lower.contains("info-hash")
+            || lower.contains("info hash")
+            || lower.contains("download")
+            || lower.contains("torrent"))
 }
 
 async fn read_client_text(
@@ -932,6 +1001,20 @@ mod tests {
     }
 
     #[test]
+    fn optional_inventory_response_maps_missing_download_fault_to_none() {
+        let hash = InfoHash::new(SHA1).unwrap();
+        let rows = XmlRpcValue::Array(
+            std::iter::repeat_with(missing_download_fault)
+                .take(INVENTORY_METHODS.len())
+                .collect(),
+        );
+
+        let download = parse_optional_inventory_response("rtorrent", &hash, &rows).unwrap();
+
+        assert!(download.is_none());
+    }
+
+    #[test]
     fn file_and_tracker_responses_map_typed_rows() {
         let files = parse_files_response(
             "rtorrent",
@@ -999,6 +1082,25 @@ mod tests {
 
         assert_eq!(1, inventory.len());
         assert_eq!("Example", inventory[0].name.as_str());
+    }
+
+    #[tokio::test]
+    async fn client_download_info_treats_missing_hash_as_absent() {
+        let endpoint = spawn_rtorrent_server(|request| async move {
+            let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            if body.contains("<methodName>system.multicall</methodName>")
+                && body.contains("d.custom1")
+            {
+                return (AxumStatusCode::OK, missing_inventory_xml_response());
+            }
+            (AxumStatusCode::BAD_REQUEST, body)
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+        let hash = InfoHash::new(SHA1).unwrap();
+
+        assert!(client.download_info(&hash).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1098,6 +1200,13 @@ mod tests {
         XmlRpcValue::Array(vec![value])
     }
 
+    fn missing_download_fault() -> XmlRpcValue {
+        XmlRpcValue::Struct(BTreeMap::from([(
+            "faultString".to_owned(),
+            XmlRpcValue::String("Could not find info-hash.".to_owned()),
+        )]))
+    }
+
     fn xml_response(value: &str) -> String {
         format!(
             "<methodResponse><params><param><value>{value}</value></param></params></methodResponse>"
@@ -1160,6 +1269,19 @@ mod tests {
               <value><array><data><value><string>sporos</string></value></data></array></value>
             </data></array>"#,
         )
+    }
+
+    fn missing_inventory_xml_response() -> String {
+        let mut body = String::from("<array><data>");
+        for _ in INVENTORY_METHODS {
+            body.push_str(
+                r#"<value><struct>
+                  <member><name>faultString</name><value><string>Could not find info-hash.</string></value></member>
+                </struct></value>"#,
+            );
+        }
+        body.push_str("</data></array>");
+        xml_response(&body)
     }
 
     fn download_list_xml(count: usize) -> String {

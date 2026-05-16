@@ -922,8 +922,9 @@ fn readiness_response(state: &HttpState) -> ReadinessResponse {
     let accepting_work = readiness.config_loaded
         && readiness.database_available
         && readiness.schema_initialized
-        && readiness.state_paths_writable;
-    let processing_ready = accepting_work && readiness.workers_running;
+        && readiness.state_paths_writable
+        && readiness.workers_running;
+    let processing_ready = accepting_work;
     ReadinessResponse {
         status: if readiness.is_ready() {
             "ready"

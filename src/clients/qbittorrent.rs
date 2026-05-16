@@ -121,6 +121,24 @@ impl QbittorrentClient {
         Ok(torrents)
     }
 
+    pub async fn torrent_info(
+        &self,
+        info_hash: &InfoHash,
+    ) -> Result<Option<QbitTorrent>, TorrentClientError> {
+        let text = self
+            .get_text(&format!(
+                "/api/v2/torrents/info?hashes={}",
+                info_hash.as_str()
+            ))
+            .await?;
+        let mut torrents: Vec<QbitTorrent> =
+            serde_json::from_str(&text).map_err(|error| TorrentClientError::BadResponse {
+                client: self.client_name.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(torrents.pop())
+    }
+
     pub async fn fetch_files(
         &self,
         info_hash: &InfoHash,

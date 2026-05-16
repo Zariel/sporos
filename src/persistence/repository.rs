@@ -1988,6 +1988,8 @@ impl Repository {
                 reason = ?,
                 updated_at = ?,
                 finished_at = ?,
+                download_url = NULL,
+                cookie = NULL,
                 lease_owner = NULL,
                 lease_until = NULL,
                 last_error_message = ?
@@ -2015,6 +2017,8 @@ impl Repository {
                 reason = 'expired',
                 updated_at = ?,
                 finished_at = ?,
+                download_url = NULL,
+                cookie = NULL,
                 lease_owner = NULL,
                 lease_until = NULL
             WHERE status IN ('queued', 'running', 'waiting', 'retryable')
@@ -2293,6 +2297,8 @@ impl Repository {
                 reason = ?,
                 updated_at = ?,
                 finished_at = ?,
+                download_url = NULL,
+                cookie = NULL,
                 lease_owner = NULL,
                 lease_until = NULL,
                 last_action_outcome = ?
@@ -4041,6 +4047,94 @@ mod tests {
         );
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn terminal_announce_transitions_clear_fetch_material() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut work = test_announce_work("ann_fetch_clear", "guid-fetch-clear", 1);
+        let download_url =
+            DownloadUrl::new("https://tracker.example/download?id=1&apikey=secret").unwrap();
+        work.fetch = Some(
+            AnnounceFetchMaterial::new(
+                &download_url,
+                Some(CookieSecret::new("sid=secret-cookie").unwrap()),
+            )
+            .unwrap(),
+        );
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        let claimed = repository
+            .claim_announce_work("worker-1", 1, 100, 1)
+            .await
+            .unwrap();
+
+        assert!(
+            repository
+                .mark_announce_succeeded(
+                    &claimed[0],
+                    "worker-1",
+                    AnnounceReason::Injected,
+                    "injected",
+                    2,
+                )
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            repository
+                .announce_fetch_material(&work.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_announce_fetch_columns_cleared(&repository, work.id.as_str()).await;
+    }
+
+    #[tokio::test]
+    async fn expired_announce_work_clears_fetch_material() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut work = test_announce_work("ann_fetch_expired", "guid-fetch-expired", 1);
+        let download_url =
+            DownloadUrl::new("https://tracker.example/download?id=1&apikey=secret").unwrap();
+        work.fetch = Some(
+            AnnounceFetchMaterial::new(
+                &download_url,
+                Some(CookieSecret::new("sid=secret-cookie").unwrap()),
+            )
+            .unwrap(),
+        );
+        work.expires_at_ms = 10;
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(1, repository.expire_announce_work(10).await.unwrap());
+
+        assert!(
+            repository
+                .announce_fetch_material(&work.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_announce_fetch_columns_cleared(&repository, work.id.as_str()).await;
+    }
+
+    async fn assert_announce_fetch_columns_cleared(repository: &Repository, id: &str) {
+        let (download_url, cookie): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT download_url, cookie FROM announce_work WHERE id = ?")
+                .bind(id)
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert!(download_url.is_none());
+        assert!(cookie.is_none());
     }
 
     #[tokio::test]
