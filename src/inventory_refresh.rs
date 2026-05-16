@@ -1,7 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -11,16 +12,18 @@ use tokio::task;
 use tracing::{info_span, warn};
 
 use crate::domain::{
-    ClientHost, DependencyName, DependencyState, DisplayName, InfoHash, ItemTitle, LocalFile,
-    LocalItem, LocalItemSource, MediaType, ReasonText, SourceKey, TorrentFile, checked_file_total,
+    ByteSize, ClientHost, DependencyName, DependencyState, DisplayName, InfoHash, ItemTitle,
+    LocalFile, LocalItem, LocalItemSource, MediaType, ReasonText, SourceKey, TorrentFile,
+    checked_file_total,
 };
 use crate::errors::{DatabaseError, TorrentClientError};
 use crate::inventory::{
     InventoryScanFailure, InventoryScanOptions, InventoryScanner, ScannedLocalItem,
+    parse_media_title,
 };
 use crate::persistence::repository::{
-    LocalInventoryReplaceSummary, LocalInventoryScope, LocalItemFileBatch,
-    OwnedLocalInventoryMessage, OwnedLocalItemFileBatch, Repository,
+    LocalFileSnapshot, LocalInventoryReplaceSummary, LocalInventoryScope, LocalItemFileBatch,
+    LocalItemWithFile, OwnedLocalInventoryMessage, OwnedLocalItemFileBatch, Repository,
 };
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::DependencyKind;
@@ -32,6 +35,9 @@ const INVENTORY_REFRESH_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const INVENTORY_REFRESH_RETRY_MAX: Duration = Duration::from_secs(5);
 const DATA_ROOT_SCAN_BUFFER: usize = 64;
 const CLIENT_INVENTORY_BUFFER: usize = 64;
+const VIRTUAL_SEASON_PAGE_SIZE: u16 = 512;
+const VIRTUAL_SEASON_MIN_EPISODES: usize = 3;
+const VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InventoryRefreshRequest {
@@ -64,6 +70,12 @@ pub enum ClientInventoryMessage {
 
 impl ClientInventoryItem {
     pub fn into_scanned(self) -> Result<ScannedLocalItem, InventoryRefreshError> {
+        let file_paths = self
+            .files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect::<Vec<_>>();
+        let parsed = parse_media_title(self.display_name.as_str(), &file_paths);
         let total_size = checked_file_total(
             self.files.iter().map(|file| file.size),
             "client inventory total",
@@ -96,7 +108,7 @@ impl ClientInventoryItem {
                     }
                 })?,
                 display_name: self.display_name,
-                media_type: self.media_type,
+                media_type: parsed.media_type,
                 info_hash: Some(self.info_hash),
                 path: None,
                 save_path: Some(self.save_path),
@@ -121,6 +133,7 @@ pub enum InventoryRefreshError {
 pub struct InventoryRefreshWorker {
     repository: Repository,
     scan_options: InventoryScanOptions,
+    season_from_episodes: f64,
     #[cfg(test)]
     data_root_scan_send_attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -130,9 +143,15 @@ impl InventoryRefreshWorker {
         Self {
             repository,
             scan_options,
+            season_from_episodes: 1.0,
             #[cfg(test)]
             data_root_scan_send_attempts: None,
         }
+    }
+
+    pub const fn with_season_from_episodes(mut self, season_from_episodes: f64) -> Self {
+        self.season_from_episodes = season_from_episodes;
+        self
     }
 
     #[cfg(test)]
@@ -241,8 +260,10 @@ impl InventoryRefreshWorker {
                 .map_err(|error| InventoryRefreshError::ScanWorkerFailed {
                     message: error.to_string(),
                 })?;
+        let now_ms = unix_time_ms();
+        self.refresh_virtual_seasons(now_ms).await?;
         self.repository
-            .wake_announce_inventory_refresh(unix_time_ms(), 1_000)
+            .wake_announce_inventory_refresh(now_ms, 1_000)
             .await?;
 
         Ok(InventoryRefreshSummary {
@@ -272,8 +293,10 @@ impl InventoryRefreshWorker {
                 items.iter().map(local_item_file_batch),
             )
             .await?;
+        let now_ms = unix_time_ms();
+        self.refresh_virtual_seasons(now_ms).await?;
         self.repository
-            .wake_announce_client_source_completion(&client_host, unix_time_ms(), 1_000)
+            .wake_announce_client_source_completion(&client_host, now_ms, 1_000)
             .await?;
 
         Ok(InventoryRefreshSummary {
@@ -343,8 +366,10 @@ impl InventoryRefreshWorker {
                     message: error.to_string(),
                 })??;
         let LocalInventoryReplaceSummary { upserted, pruned } = replace_result?;
+        let now_ms = unix_time_ms();
+        self.refresh_virtual_seasons(now_ms).await?;
         self.repository
-            .wake_announce_client_source_completion(&client_host, unix_time_ms(), 1_000)
+            .wake_announce_client_source_completion(&client_host, now_ms, 1_000)
             .await?;
 
         Ok(InventoryRefreshSummary {
@@ -356,11 +381,398 @@ impl InventoryRefreshWorker {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct VirtualSeasonKey {
+    title: String,
+    season: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct VirtualEpisodeFile {
+    episode: u16,
+    source_file: PathBuf,
+    size: ByteSize,
+    mtime_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct VirtualSeasonAccumulator {
+    key: VirtualSeasonKey,
+    episodes: BTreeMap<u16, VirtualEpisodeFile>,
+    newest_mtime_ms: Option<i64>,
+}
+
+impl InventoryRefreshWorker {
+    async fn refresh_virtual_seasons(&self, now_ms: i64) -> Result<(), InventoryRefreshError> {
+        if !self.season_from_episodes.is_finite() || self.season_from_episodes <= 0.0 {
+            self.replace_virtual_inventory(std::iter::empty(), now_ms)
+                .await?;
+            return Ok(());
+        }
+
+        let existing = self.existing_real_season_keys().await?;
+        let mut seasons = BTreeMap::<VirtualSeasonKey, VirtualSeasonAccumulator>::new();
+        let mut offset = 0_u32;
+        loop {
+            let page = self
+                .repository
+                .local_items_with_largest_file_by_media_type_page(
+                    MediaType::Episode,
+                    VIRTUAL_SEASON_PAGE_SIZE,
+                    offset,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            for row in page {
+                let LocalItemWithFile { item, file } = row;
+                if !is_virtual_episode_source(&item.source) {
+                    continue;
+                }
+                let Some((key, episode)) = episode_season_key(&item) else {
+                    continue;
+                };
+                if existing.contains(&key) {
+                    continue;
+                }
+                let Some(episode_file) = virtual_episode_file(&item, episode, file) else {
+                    continue;
+                };
+                let entry =
+                    seasons
+                        .entry(key.clone())
+                        .or_insert_with(|| VirtualSeasonAccumulator {
+                            key,
+                            episodes: BTreeMap::new(),
+                            newest_mtime_ms: None,
+                        });
+                entry.newest_mtime_ms = newest_mtime(entry.newest_mtime_ms, item.mtime_ms);
+                entry.newest_mtime_ms = newest_mtime(entry.newest_mtime_ms, episode_file.mtime_ms);
+                retain_best_episode_file(&mut entry.episodes, episode_file);
+            }
+            offset = offset.saturating_add(u32::try_from(page_len).unwrap_or(u32::MAX));
+        }
+
+        self.replace_virtual_inventory(seasons.into_values(), now_ms)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn replace_virtual_inventory<I>(
+        &self,
+        seasons: I,
+        now_ms: i64,
+    ) -> Result<LocalInventoryReplaceSummary, InventoryRefreshError>
+    where
+        I: IntoIterator<Item = VirtualSeasonAccumulator>,
+    {
+        let (sender, receiver) = mpsc::channel(CLIENT_INVENTORY_BUFFER);
+        let repository = self.repository.clone();
+        let replace = tokio::spawn(async move {
+            repository
+                .replace_local_inventory_owned_receiver(LocalInventoryScope::Virtual, receiver)
+                .await
+        });
+        for season in seasons {
+            let Some(item) = self.materialize_virtual_season(season, now_ms)? else {
+                continue;
+            };
+            sender
+                .send(OwnedLocalInventoryMessage::Item(item))
+                .await
+                .map_err(|error| InventoryRefreshError::InvalidClientInventory {
+                    message: format!("stage virtual season inventory: {error}"),
+                })?;
+        }
+        sender
+            .send(OwnedLocalInventoryMessage::Finished)
+            .await
+            .map_err(|error| InventoryRefreshError::InvalidClientInventory {
+                message: format!("finish virtual season inventory: {error}"),
+            })?;
+        drop(sender);
+
+        replace
+            .await
+            .map_err(|error| InventoryRefreshError::ScanWorkerFailed {
+                message: error.to_string(),
+            })?
+            .map_err(InventoryRefreshError::from)
+    }
+
+    async fn existing_real_season_keys(&self) -> Result<BTreeSet<VirtualSeasonKey>, DatabaseError> {
+        let mut keys = BTreeSet::new();
+        let mut offset = 0_u32;
+        loop {
+            let page = self
+                .repository
+                .local_items_by_media_type_page(
+                    MediaType::SeasonPack,
+                    VIRTUAL_SEASON_PAGE_SIZE,
+                    offset,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for item in &page {
+                if matches!(item.source, LocalItemSource::Virtual { .. }) {
+                    continue;
+                }
+                if let Some(key) = real_season_key(item) {
+                    keys.insert(key);
+                }
+            }
+            offset = offset.saturating_add(u32::try_from(page.len()).unwrap_or(u32::MAX));
+        }
+        Ok(keys)
+    }
+
+    fn materialize_virtual_season(
+        &self,
+        season: VirtualSeasonAccumulator,
+        now_ms: i64,
+    ) -> Result<Option<OwnedLocalItemFileBatch>, InventoryRefreshError> {
+        if season.episodes.len() < VIRTUAL_SEASON_MIN_EPISODES {
+            return Ok(None);
+        }
+        let Some(highest_episode) = season.episodes.keys().next_back().copied() else {
+            return Ok(None);
+        };
+        let coverage = season.episodes.len() as f64 / f64::from(highest_episode);
+        if coverage < self.season_from_episodes {
+            return Ok(None);
+        }
+        if season.newest_mtime_ms.is_some_and(|mtime| {
+            now_ms.saturating_sub(mtime) < VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS
+        }) {
+            return Ok(None);
+        }
+
+        let mut files = Vec::with_capacity(season.episodes.len());
+        for (index, episode) in season.episodes.into_values().enumerate() {
+            let index = u32::try_from(index).map_err(|error| {
+                InventoryRefreshError::InvalidClientInventory {
+                    message: format!("virtual season has too many files: {error}"),
+                }
+            })?;
+            files.push(
+                LocalFile::new(
+                    None,
+                    virtual_relative_path(&episode.source_file).ok_or_else(|| {
+                        InventoryRefreshError::InvalidClientInventory {
+                            message: format!(
+                                "virtual season source path is not absolute: {}",
+                                episode.source_file.display()
+                            ),
+                        }
+                    })?,
+                    episode.size,
+                    crate::domain::FileIndex::new(index),
+                )
+                .map_err(|error| InventoryRefreshError::InvalidClientInventory {
+                    message: error.to_string(),
+                })?
+                .with_mtime_ms(episode.mtime_ms),
+            );
+        }
+        let total_size = estimated_virtual_total_size(&files, highest_episode)?;
+        let title = format!("{} S{:02}", season.key.title, season.key.season);
+        let source_key = SourceKey::new(format!(
+            "season:{}:s{:02}:{}",
+            source_key_title(&season.key.title),
+            season.key.season,
+            stable_hash_hex(&season.key.title)
+        ))
+        .map_err(|error| InventoryRefreshError::InvalidClientInventory {
+            message: error.to_string(),
+        })?;
+        let item = LocalItem {
+            id: None,
+            source: LocalItemSource::Virtual { source_key },
+            title: ItemTitle::new(&title).map_err(|error| {
+                InventoryRefreshError::InvalidClientInventory {
+                    message: error.to_string(),
+                }
+            })?,
+            display_name: DisplayName::new(&title).map_err(|error| {
+                InventoryRefreshError::InvalidClientInventory {
+                    message: error.to_string(),
+                }
+            })?,
+            media_type: MediaType::SeasonPack,
+            info_hash: None,
+            path: Some(PathBuf::from("/")),
+            save_path: None,
+            total_size,
+            mtime_ms: season.newest_mtime_ms,
+        };
+
+        Ok(Some(OwnedLocalItemFileBatch { item, files }))
+    }
+}
+
 fn local_item_file_batch(scanned: &ScannedLocalItem) -> LocalItemFileBatch<'_> {
     LocalItemFileBatch {
         item: &scanned.item,
         files: &scanned.files,
     }
+}
+
+fn is_virtual_episode_source(source: &LocalItemSource) -> bool {
+    matches!(
+        source,
+        LocalItemSource::Client { .. } | LocalItemSource::DataRoot { .. }
+    )
+}
+
+fn episode_season_key(item: &LocalItem) -> Option<(VirtualSeasonKey, u16)> {
+    let parsed = parse_media_title(item.title.as_str(), &[]);
+    if parsed.media_type != MediaType::Episode {
+        return None;
+    }
+    let season = parsed.season?;
+    let episode = parsed.episode?;
+    let suffix = format!(" S{season:02}E{episode:02}");
+    let title = parsed.search_title.strip_suffix(&suffix)?.to_owned();
+    Some((VirtualSeasonKey { title, season }, episode))
+}
+
+fn real_season_key(item: &LocalItem) -> Option<VirtualSeasonKey> {
+    let parsed = parse_media_title(item.title.as_str(), &[]);
+    if parsed.media_type != MediaType::SeasonPack {
+        return None;
+    }
+    let season = parsed.season?;
+    let suffix = format!(" S{season:02}");
+    let title = parsed.search_title.strip_suffix(&suffix)?.to_owned();
+    Some(VirtualSeasonKey { title, season })
+}
+
+fn virtual_episode_file(
+    item: &LocalItem,
+    episode: u16,
+    file: LocalFileSnapshot,
+) -> Option<VirtualEpisodeFile> {
+    let source_root = item.save_path.as_deref().or(item.path.as_deref())?;
+    let source_file = if item.path.as_deref().is_some_and(|path| {
+        path.file_name()
+            .is_some_and(|name| name == file.relative_path.as_os_str())
+    }) {
+        source_root.to_path_buf()
+    } else {
+        source_root.join(&file.relative_path)
+    };
+    VirtualEpisodeFile {
+        episode,
+        source_file,
+        size: file.size,
+        mtime_ms: file.mtime_ms,
+    }
+    .into()
+}
+
+fn retain_best_episode_file(
+    episodes: &mut BTreeMap<u16, VirtualEpisodeFile>,
+    candidate: VirtualEpisodeFile,
+) {
+    let replace = episodes
+        .get(&candidate.episode)
+        .is_none_or(|current| better_virtual_episode_file(&candidate, current));
+    if replace {
+        episodes.insert(candidate.episode, candidate);
+    }
+}
+
+fn better_virtual_episode_file(
+    candidate: &VirtualEpisodeFile,
+    current: &VirtualEpisodeFile,
+) -> bool {
+    candidate.size.get() > current.size.get()
+        || (candidate.size == current.size
+            && candidate.mtime_ms.unwrap_or(i64::MIN) < current.mtime_ms.unwrap_or(i64::MIN))
+}
+
+fn newest_mtime(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (Some(current), None) => Some(current),
+        (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
+    }
+}
+
+fn estimated_virtual_total_size(
+    files: &[LocalFile],
+    highest_episode: u16,
+) -> Result<ByteSize, InventoryRefreshError> {
+    let total = files.iter().try_fold(0_u128, |total, file| {
+        total.checked_add(u128::from(file.size.get())).ok_or(
+            InventoryRefreshError::InvalidClientInventory {
+                message: "virtual season total size overflowed".to_owned(),
+            },
+        )
+    })?;
+    let count = u128::try_from(files.len()).map_err(|error| {
+        InventoryRefreshError::InvalidClientInventory {
+            message: format!("virtual season file count overflowed: {error}"),
+        }
+    })?;
+    let estimated = total
+        .checked_mul(u128::from(highest_episode))
+        .and_then(|value| value.checked_add(count.saturating_sub(1)))
+        .map(|value| value / count)
+        .ok_or(InventoryRefreshError::InvalidClientInventory {
+            message: "virtual season estimated size overflowed".to_owned(),
+        })?;
+    let estimated = u64::try_from(estimated).map_err(|error| {
+        InventoryRefreshError::InvalidClientInventory {
+            message: format!("virtual season estimated size overflowed: {error}"),
+        }
+    })?;
+    Ok(ByteSize::new(estimated))
+}
+
+fn virtual_relative_path(source_file: &Path) -> Option<PathBuf> {
+    source_file
+        .strip_prefix("/")
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+}
+
+fn source_key_title(title: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_separator = false;
+    for character in title.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character);
+            last_separator = false;
+        } else if !last_separator && !normalized.is_empty() {
+            normalized.push('-');
+            last_separator = true;
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        "unknown".to_owned()
+    } else {
+        normalized
+    }
+}
+
+fn stable_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 pub fn inventory_refresh_queue(
@@ -583,6 +995,334 @@ mod tests {
         assert!(file[0].mtime_ms.is_some());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_virtual_seasons_materializes_complete_episode_sets() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let items = vec![
+            data_root_item(
+                "Example Show S01E01",
+                MediaType::Episode,
+                "e01.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Example Show S01E02",
+                MediaType::Episode,
+                "e02a.mkv",
+                20,
+                200,
+            ),
+            data_root_item(
+                "Example Show S01E02",
+                MediaType::Episode,
+                "e02b.mkv",
+                25,
+                150,
+            ),
+            data_root_item(
+                "Example Show S01E03",
+                MediaType::Episode,
+                "e03.mkv",
+                30,
+                300,
+            ),
+        ];
+        repository
+            .replace_local_inventory_stream(
+                LocalInventoryScope::DataRoot,
+                items.iter().map(local_item_file_batch),
+            )
+            .await
+            .unwrap();
+
+        worker
+            .refresh_virtual_seasons(VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS + 1_000)
+            .await
+            .unwrap();
+
+        let virtual_seasons = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| matches!(item.source, LocalItemSource::Virtual { .. }))
+            .collect::<Vec<_>>();
+
+        assert_eq!(1, virtual_seasons.len());
+        assert_eq!("Example Show S01", virtual_seasons[0].title.as_str());
+        assert_eq!(ByteSize::new(65), virtual_seasons[0].total_size);
+        assert_eq!(Some(300), virtual_seasons[0].mtime_ms);
+        assert_eq!(Some(PathBuf::from("/")), virtual_seasons[0].path);
+        let files = repository
+            .local_files_for_item(virtual_seasons[0].id.unwrap(), 10)
+            .await
+            .unwrap();
+        assert_eq!(vec![10, 25, 30], file_sizes(&files));
+        assert_eq!(PathBuf::from("media/e02b.mkv"), files[1].relative_path);
+    }
+
+    #[tokio::test]
+    async fn refresh_virtual_seasons_suppresses_real_and_young_incomplete_packs() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default())
+                .with_season_from_episodes(0.75);
+        let items = vec![
+            data_root_item("Real Pack S01", MediaType::SeasonPack, "pack.mkv", 99, 900),
+            data_root_item(
+                "Real Pack S01E01",
+                MediaType::Episode,
+                "real-e01.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Real Pack S01E02",
+                MediaType::Episode,
+                "real-e02.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Real Pack S01E03",
+                MediaType::Episode,
+                "real-e03.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Young Show S01E01",
+                MediaType::Episode,
+                "young-e01.mkv",
+                10,
+                900,
+            ),
+            data_root_item(
+                "Young Show S01E02",
+                MediaType::Episode,
+                "young-e02.mkv",
+                10,
+                900,
+            ),
+            data_root_item(
+                "Young Show S01E04",
+                MediaType::Episode,
+                "young-e04.mkv",
+                10,
+                900,
+            ),
+            data_root_item(
+                "Old Show S01E01",
+                MediaType::Episode,
+                "old-e01.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Old Show S01E02",
+                MediaType::Episode,
+                "old-e02.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Old Show S01E04",
+                MediaType::Episode,
+                "old-e04.mkv",
+                10,
+                100,
+            ),
+        ];
+        repository
+            .replace_local_inventory_stream(
+                LocalInventoryScope::DataRoot,
+                items.iter().map(local_item_file_batch),
+            )
+            .await
+            .unwrap();
+
+        worker
+            .refresh_virtual_seasons(VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS + 500)
+            .await
+            .unwrap();
+
+        let virtual_seasons = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| matches!(item.source, LocalItemSource::Virtual { .. }))
+            .collect::<Vec<_>>();
+
+        let virtual_titles = virtual_seasons
+            .iter()
+            .map(|item| item.title.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["Old Show S01"], virtual_titles);
+        assert_eq!(ByteSize::new(40), virtual_seasons[0].total_size);
+    }
+
+    #[tokio::test]
+    async fn refresh_virtual_seasons_classifies_client_items_and_real_packs() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let host = ClientHost::new("qbit.local").unwrap();
+        let episodes = vec![
+            client_inventory_item(
+                host.clone(),
+                "0123456789abcdef0123456789abcdef01234561",
+                "Client Show S01E01",
+                "client-e01.mkv",
+                10,
+            )
+            .into_scanned()
+            .unwrap(),
+            client_inventory_item(
+                host.clone(),
+                "0123456789abcdef0123456789abcdef01234562",
+                "Client Show S01E02",
+                "client-e02.mkv",
+                10,
+            )
+            .into_scanned()
+            .unwrap(),
+            client_inventory_item(
+                host.clone(),
+                "0123456789abcdef0123456789abcdef01234563",
+                "Client Show S01E03",
+                "client-e03.mkv",
+                10,
+            )
+            .into_scanned()
+            .unwrap(),
+        ];
+        worker
+            .refresh_client_items(host.clone(), &episodes)
+            .await
+            .unwrap();
+        let created = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|item| {
+                item.title.as_str() == "Client Show S01"
+                    && matches!(item.source, LocalItemSource::Virtual { .. })
+            });
+        assert!(created);
+
+        let real_pack = vec![
+            client_inventory_item(
+                host.clone(),
+                "0123456789abcdef0123456789abcdef01234571",
+                "Client Show S01",
+                "client-pack.mkv",
+                30,
+            )
+            .into_scanned()
+            .unwrap(),
+        ];
+        worker.refresh_client_items(host, &real_pack).await.unwrap();
+
+        let created_after_pack = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.title.as_str() == "Client Show S01"
+                    && matches!(item.source, LocalItemSource::Virtual { .. })
+            })
+            .count();
+        assert_eq!(0, created_after_pack);
+    }
+
+    #[tokio::test]
+    async fn refresh_virtual_season_source_keys_include_stable_hash() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let items = vec![
+            data_root_item(
+                "Æther Show S01E01",
+                MediaType::Episode,
+                "ae-e01.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Æther Show S01E02",
+                MediaType::Episode,
+                "ae-e02.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Æther Show S01E03",
+                MediaType::Episode,
+                "ae-e03.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "東京 Show S01E01",
+                MediaType::Episode,
+                "tokyo-e01.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "東京 Show S01E02",
+                MediaType::Episode,
+                "tokyo-e02.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "東京 Show S01E03",
+                MediaType::Episode,
+                "tokyo-e03.mkv",
+                10,
+                100,
+            ),
+        ];
+        repository
+            .replace_local_inventory_stream(
+                LocalInventoryScope::DataRoot,
+                items.iter().map(local_item_file_batch),
+            )
+            .await
+            .unwrap();
+
+        worker
+            .refresh_virtual_seasons(VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS + 1_000)
+            .await
+            .unwrap();
+
+        let source_keys = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|item| match item.source {
+                LocalItemSource::Virtual { source_key } => Some(source_key.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(2, source_keys.len());
+        assert_ne!(source_keys[0], source_keys[1]);
+        assert!(
+            source_keys
+                .iter()
+                .all(|key| key.len() > "season:show:s01:".len())
+        );
     }
 
     #[tokio::test]
@@ -1322,6 +2062,45 @@ mod tests {
                 health.dependency_type == DependencyKind::LocalState.as_str()
                     && health.dependency_name.as_str() == INVENTORY_REFRESH_DEPENDENCY
             })
+    }
+
+    fn data_root_item(
+        title: &str,
+        media_type: MediaType,
+        relative_path: &str,
+        size: u64,
+        mtime_ms: i64,
+    ) -> ScannedLocalItem {
+        ScannedLocalItem {
+            item: LocalItem {
+                id: None,
+                source: LocalItemSource::DataRoot {
+                    path: PathBuf::from(format!("/media/{relative_path}")),
+                },
+                title: ItemTitle::new(title).unwrap(),
+                display_name: DisplayName::new(title).unwrap(),
+                media_type,
+                info_hash: None,
+                path: Some(PathBuf::from(format!("/media/{relative_path}"))),
+                save_path: None,
+                total_size: ByteSize::new(size),
+                mtime_ms: Some(mtime_ms),
+            },
+            files: vec![
+                LocalFile::new(
+                    None,
+                    PathBuf::from(relative_path),
+                    ByteSize::new(size),
+                    FileIndex::new(0),
+                )
+                .unwrap()
+                .with_mtime_ms(Some(mtime_ms)),
+            ],
+        }
+    }
+
+    fn file_sizes(files: &[LocalFileSnapshot]) -> Vec<u64> {
+        files.iter().map(|file| file.size.get()).collect()
     }
 
     fn client_item(

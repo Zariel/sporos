@@ -368,7 +368,8 @@ impl AppRuntime {
             InventoryScanOptions {
                 max_depth: config.inventory.media_scan_max_depth,
             },
-        );
+        )
+        .with_season_from_episodes(config.matching.season_from_episodes);
         let injection_worker = InjectionWorker::new(repository.clone(), injection_clients);
         let mut arr_endpoints = arr
             .instances()

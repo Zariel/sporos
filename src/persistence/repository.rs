@@ -210,6 +210,12 @@ pub struct LocalFileSnapshot {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LocalItemWithFile {
+    pub item: LocalItem,
+    pub file: LocalFileSnapshot,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LocalFilePage {
     pub files: Vec<LocalFileSnapshot>,
     pub truncated: bool,
@@ -679,6 +685,92 @@ impl Repository {
         }
 
         Ok(LocalFilePage { files, truncated })
+    }
+
+    pub async fn largest_local_file_for_item(
+        &self,
+        item_id: LocalItemId,
+    ) -> Result<Option<LocalFileSnapshot>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT item_id, relative_path, file_name, size, mtime_ms, file_index
+            FROM local_files
+            WHERE item_id = ?
+            ORDER BY size DESC, COALESCE(mtime_ms, -9223372036854775808), file_index
+            LIMIT 1
+            "#,
+        )
+        .bind(i64_from_u64(item_id.get(), "local item id")?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup largest local file", error))?;
+
+        row.map(local_file_snapshot_from_row).transpose()
+    }
+
+    pub async fn local_items_with_largest_file_by_media_type_page(
+        &self,
+        media_type: MediaType,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<LocalItemWithFile>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            WITH paged_items AS (
+                SELECT id, source_type, source_key, title, display_name, media_type,
+                       info_hash, path, save_path, total_size, mtime_ms
+                FROM local_items
+                WHERE media_type = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM local_files
+                      WHERE local_files.item_id = local_items.id
+                  )
+                ORDER BY title, source_type, source_key
+                LIMIT ?
+                OFFSET ?
+            ),
+            ranked_files AS (
+                SELECT paged_items.id, paged_items.source_type, paged_items.source_key,
+                       paged_items.title, paged_items.display_name, paged_items.media_type,
+                       paged_items.info_hash, paged_items.path, paged_items.save_path,
+                       paged_items.total_size, paged_items.mtime_ms,
+                       local_files.item_id, local_files.relative_path, local_files.file_name,
+                       local_files.size, local_files.mtime_ms AS file_mtime_ms,
+                       local_files.file_index,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY paged_items.id
+                           ORDER BY local_files.size DESC,
+                                    COALESCE(local_files.mtime_ms, -9223372036854775808),
+                                    local_files.file_index
+                       ) AS file_rank
+                FROM paged_items
+                JOIN local_files ON local_files.item_id = paged_items.id
+            )
+            SELECT id, source_type, source_key, title, display_name, media_type,
+                   info_hash, path, save_path, total_size, mtime_ms,
+                   item_id, relative_path, file_name, size, file_mtime_ms AS mtime_ms,
+                   file_index
+            FROM ranked_files
+            WHERE file_rank = 1
+            ORDER BY title, source_type, source_key
+            "#,
+        )
+        .bind(media_type_key(media_type))
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local items with largest file", error))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(LocalItemWithFile {
+                    item: local_item_from_row_ref(&row)?,
+                    file: local_file_snapshot_from_row_ref(&row)?,
+                })
+            })
+            .collect()
     }
 
     pub async fn local_files_by_size(
@@ -3304,6 +3396,12 @@ fn file_index_from_i64(value: i64, field: &'static str) -> Result<FileIndex, Dat
 fn local_file_snapshot_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<LocalFileSnapshot, DatabaseError> {
+    local_file_snapshot_from_row_ref(&row)
+}
+
+fn local_file_snapshot_from_row_ref(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<LocalFileSnapshot, DatabaseError> {
     Ok(LocalFileSnapshot {
         item_id: id_from_i64(row.get("item_id"), "local file item id")?,
         relative_path: PathBuf::from(row.get::<String, _>("relative_path")),
@@ -3315,6 +3413,10 @@ fn local_file_snapshot_from_row(
 }
 
 fn local_item_from_row(row: sqlx::sqlite::SqliteRow) -> Result<LocalItem, DatabaseError> {
+    local_item_from_row_ref(&row)
+}
+
+fn local_item_from_row_ref(row: &sqlx::sqlite::SqliteRow) -> Result<LocalItem, DatabaseError> {
     let id = id_from_i64(row.get("id"), "local item id")?;
     let source_type: String = row.get("source_type");
     let source_key: String = row.get("source_key");
