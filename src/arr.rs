@@ -276,6 +276,7 @@ impl ArrHttpClient {
                             now_ms,
                             endpoint.consecutive_failures.saturating_add(1),
                             error.retry_after(),
+                            endpoint.name.as_str(),
                         );
                         attempts.push(ArrLookupAttempt::failure(
                             endpoint,

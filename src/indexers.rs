@@ -935,12 +935,13 @@ impl IndexerBackoffPolicy {
         now_ms: i64,
         consecutive_failures: u16,
         retry_after: Option<RetryAfter>,
+        jitter_key: &str,
     ) -> i64 {
         if let Some(retry_after) = retry_after {
             return retry_after.deadline_ms(now_ms);
         }
 
-        now_ms.saturating_add(self.exponential_delay_ms(consecutive_failures))
+        now_ms.saturating_add(self.exponential_delay_ms(consecutive_failures, jitter_key))
     }
 
     pub fn should_probe(
@@ -961,17 +962,28 @@ impl IndexerBackoffPolicy {
         true
     }
 
-    fn exponential_delay_ms(self, consecutive_failures: u16) -> i64 {
+    fn exponential_delay_ms(self, consecutive_failures: u16, jitter_key: &str) -> i64 {
         let shift = u32::from(consecutive_failures.min(6));
         let multiplier = 1_i64.checked_shl(shift).unwrap_or(i64::MAX);
         let delay = self.base_delay_ms.saturating_mul(multiplier);
         let jitter = if self.jitter_ms <= 0 {
             0
         } else {
-            (i64::from(consecutive_failures).saturating_mul(97)) % self.jitter_ms
+            let seeded = stable_jitter_seed(jitter_key)
+                .saturating_add(u64::from(consecutive_failures).saturating_mul(97));
+            i64::try_from(seeded % u64::try_from(self.jitter_ms).unwrap_or(0)).unwrap_or(0)
         };
         delay.saturating_add(jitter).min(self.max_delay_ms)
     }
+}
+
+fn stable_jitter_seed(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3067,17 +3079,25 @@ mod tests {
 
         assert_eq!(
             1_500,
-            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DelayMs(500)))
+            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DelayMs(500)), "main")
         );
         assert_eq!(
             6_000,
-            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DeadlineMs(6_000)))
+            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DeadlineMs(6_000)), "main")
         );
         assert_eq!(
             1_000,
-            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DeadlineMs(500)))
+            policy.retry_after_deadline(1_000, 3, Some(RetryAfter::DeadlineMs(500)), "main")
         );
-        assert_eq!(9_000 + 91, policy.retry_after_deadline(1_000, 3, None));
+        let main_deadline = policy.retry_after_deadline(1_000, 3, None, "main");
+        let backup_deadline = policy.retry_after_deadline(1_000, 3, None, "backup");
+        assert_eq!(
+            main_deadline,
+            policy.retry_after_deadline(1_000, 3, None, "main")
+        );
+        assert_ne!(main_deadline, backup_deadline);
+        assert!((9_000..9_100).contains(&main_deadline));
+        assert!((9_000..9_100).contains(&backup_deadline));
         assert!(!policy.should_probe(1_100, Some(2_000), Some(800), false));
         assert!(policy.should_probe(1_400, Some(2_000), Some(800), false));
         assert!(!policy.should_probe(1_400, Some(2_000), Some(800), true));

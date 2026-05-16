@@ -812,7 +812,8 @@ async fn record_candidate_download_failure(
         .repository
         .dependency_failure_count("indexer", &name)
         .await?;
-    let retry_after_ms = candidate_download_retry_after(error, now_ms, failure_count);
+    let retry_after_ms =
+        candidate_download_retry_after(error, now_ms, failure_count, name.as_str());
     if candidate_download_error_is_unavailable(error) {
         state.health.set_unavailable(
             DependencyKind::Indexer,
@@ -857,12 +858,13 @@ fn candidate_download_retry_after(
     error: &CandidateDownloadError,
     now_ms: i64,
     consecutive_failures: u16,
+    jitter_key: &str,
 ) -> i64 {
     let policy = IndexerBackoffPolicy::default();
     match error {
         CandidateDownloadError::RateLimited { retry_after }
         | CandidateDownloadError::HttpStatus { retry_after, .. } => {
-            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after)
+            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after, jitter_key)
         }
         CandidateDownloadError::MagnetLink
         | CandidateDownloadError::Timeout
@@ -870,7 +872,7 @@ fn candidate_download_retry_after(
         | CandidateDownloadError::InvalidContents { .. }
         | CandidateDownloadError::ResponseTooLarge { .. }
         | CandidateDownloadError::CacheWrite { .. } => {
-            policy.retry_after_deadline(now_ms, consecutive_failures, None)
+            policy.retry_after_deadline(now_ms, consecutive_failures, None, jitter_key)
         }
     }
 }

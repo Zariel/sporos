@@ -358,7 +358,12 @@ impl AppState {
                     .dependency_failure_count("prowlarr", &source.source.name)
                     .await
                     .map_err(ProwlarrRefreshError::Local)?;
-                let state = prowlarr_error_dependency_state(&error, now_ms, failure_count);
+                let state = prowlarr_error_dependency_state(
+                    &error,
+                    now_ms,
+                    failure_count,
+                    source.source.name.as_str(),
+                );
                 self.record_prowlarr_health(&source.source.name, state.clone(), now_ms)
                     .await
                     .map_err(ProwlarrRefreshError::Local)?;
@@ -573,8 +578,12 @@ impl AppState {
                             .repository
                             .dependency_failure_count("indexer", &endpoint.name)
                             .await?;
-                        let retry_after_ms =
-                            indexer_error_retry_after(&error, now_ms, failure_count);
+                        let retry_after_ms = indexer_error_retry_after(
+                            &error,
+                            now_ms,
+                            failure_count,
+                            endpoint.name.as_str(),
+                        );
                         self.repository
                             .record_indexer_request_backoff(
                                 &endpoint.name,
@@ -654,8 +663,12 @@ impl AppState {
                             .repository
                             .dependency_failure_count("indexer", &row.name)
                             .await?;
-                        let retry_after_ms =
-                            indexer_error_retry_after(&error, now_ms, failure_count);
+                        let retry_after_ms = indexer_error_retry_after(
+                            &error,
+                            now_ms,
+                            failure_count,
+                            row.name.as_str(),
+                        );
                         self.repository
                             .record_indexer_caps_failure(
                                 &row.name,
@@ -1084,22 +1097,25 @@ fn indexer_error_retry_after(
     error: &TorznabRequestError,
     now_ms: i64,
     consecutive_failures: u16,
+    jitter_key: &str,
 ) -> i64 {
     let policy = IndexerBackoffPolicy::default();
     match error {
         TorznabRequestError::Backoff { retry_after_ms } => retry_after_ms
             .filter(|retry_after| *retry_after > now_ms)
-            .unwrap_or_else(|| policy.retry_after_deadline(now_ms, consecutive_failures, None)),
+            .unwrap_or_else(|| {
+                policy.retry_after_deadline(now_ms, consecutive_failures, None, jitter_key)
+            }),
         TorznabRequestError::RateLimited { retry_after }
         | TorznabRequestError::HttpStatus { retry_after, .. } => {
-            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after)
+            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after, jitter_key)
         }
         TorznabRequestError::Timeout
         | TorznabRequestError::Request { .. }
         | TorznabRequestError::InvalidXml { .. }
         | TorznabRequestError::InvalidCandidate { .. }
         | TorznabRequestError::ResponseTooLarge { .. } => {
-            policy.retry_after_deadline(now_ms, consecutive_failures, None)
+            policy.retry_after_deadline(now_ms, consecutive_failures, None, jitter_key)
         }
     }
 }
@@ -1108,6 +1124,7 @@ fn prowlarr_error_dependency_state(
     error: &ProwlarrRequestError,
     now_ms: i64,
     consecutive_failures: u16,
+    jitter_key: &str,
 ) -> DependencyState {
     let reason = health_reason(Some(&error.to_string()), "Prowlarr refresh failed")
         .unwrap_or_else(|| ReasonText::new("Prowlarr refresh failed").unwrap());
@@ -1115,6 +1132,7 @@ fn prowlarr_error_dependency_state(
         error,
         now_ms,
         consecutive_failures,
+        jitter_key,
     ));
     match error {
         ProwlarrRequestError::HttpStatus { status, .. } if *status == 401 || *status == 403 => {
@@ -1151,18 +1169,19 @@ fn prowlarr_error_retry_after(
     error: &ProwlarrRequestError,
     now_ms: i64,
     consecutive_failures: u16,
+    jitter_key: &str,
 ) -> i64 {
     let policy = IndexerBackoffPolicy::default();
     match error {
         ProwlarrRequestError::HttpStatus { retry_after, .. } => {
-            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after)
+            policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after, jitter_key)
         }
         ProwlarrRequestError::Timeout
         | ProwlarrRequestError::Request { .. }
         | ProwlarrRequestError::InvalidResponse { .. }
         | ProwlarrRequestError::InvalidIndexer { .. }
         | ProwlarrRequestError::ResponseTooLarge { .. } => {
-            policy.retry_after_deadline(now_ms, consecutive_failures, None)
+            policy.retry_after_deadline(now_ms, consecutive_failures, None, jitter_key)
         }
     }
 }
@@ -2833,6 +2852,157 @@ mod tests {
         assert_eq!(2, failing_queries.lock().unwrap().len());
         assert!(second_retry_after > first_retry_after.saturating_add(600_000));
         assert_eq!(2, health[0].failure_count);
+    }
+
+    #[tokio::test]
+    async fn search_workflow_jitters_simultaneous_indexer_failures_by_name() {
+        let first_queries = Arc::new(Mutex::new(Vec::new()));
+        let second_queries = Arc::new(Mutex::new(Vec::new()));
+        let first_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&first_queries),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let second_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&second_queries),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "alpha".to_owned(),
+            TorznabIndexerConfig {
+                url: first_url,
+                api_key: Some(ApiKey::new("alpha-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        config.indexers.torznab.insert(
+            "bravo".to_owned(),
+            TorznabIndexerConfig {
+                url: second_url,
+                api_key: Some(ApiKey::new("bravo-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in ["alpha", "bravo"] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+        let registry = repository.indexer_registry_snapshot(10).await.unwrap();
+        let alpha_retry = registry
+            .iter()
+            .find(|row| row.name.as_str() == "alpha")
+            .unwrap()
+            .retry_after_ms
+            .unwrap();
+        let bravo_retry = registry
+            .iter()
+            .find(|row| row.name.as_str() == "bravo")
+            .unwrap()
+            .retry_after_ms
+            .unwrap();
+
+        assert_eq!(2, summary.failed_indexers);
+        assert_eq!(1, first_queries.lock().unwrap().len());
+        assert_eq!(1, second_queries.lock().unwrap().len());
+        assert_ne!(alpha_retry, bravo_retry);
+        assert!((601_000..631_000).contains(&alpha_retry));
+        assert!((601_000..631_000).contains(&bravo_retry));
+    }
+
+    #[tokio::test]
+    async fn search_workflow_retry_after_overrides_indexer_jitter() {
+        let first_queries = Arc::new(Mutex::new(Vec::new()));
+        let second_queries = Arc::new(Mutex::new(Vec::new()));
+        let first_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&first_queries),
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+        let second_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&second_queries),
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "alpha".to_owned(),
+            TorznabIndexerConfig {
+                url: first_url,
+                api_key: Some(ApiKey::new("alpha-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        config.indexers.torznab.insert(
+            "bravo".to_owned(),
+            TorznabIndexerConfig {
+                url: second_url,
+                api_key: Some(ApiKey::new("bravo-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in ["alpha", "bravo"] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+        let registry = repository.indexer_registry_snapshot(10).await.unwrap();
+
+        assert_eq!(2, summary.failed_indexers);
+        for name in ["alpha", "bravo"] {
+            let retry_after = registry
+                .iter()
+                .find(|row| row.name.as_str() == name)
+                .unwrap()
+                .retry_after_ms;
+            assert_eq!(Some(6_000), retry_after);
+        }
     }
 
     #[tokio::test]
