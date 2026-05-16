@@ -278,6 +278,11 @@ Scrape `GET /metrics` as Prometheus text. Important metric families include:
 - `sporos_dependency_health_state` for dependency summaries.
 - `sporos_announce_*` metrics for durable announce backlog, retries, leases,
   worker capacity, and dependency waits when the announce workflow is enabled.
+- `sporos_prowlarr_refresh_total`,
+  `sporos_prowlarr_refresh_duration_seconds`,
+  `sporos_prowlarr_refresh_imported_total`, and
+  `sporos_prowlarr_refresh_deactivated_total` for Prowlarr source refresh
+  outcomes, latency, and import/deactivation counts.
 - `sporos_notification_requests_total` and notification latency metrics for
   webhook delivery.
 
