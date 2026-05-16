@@ -558,8 +558,14 @@ impl ProwlarrHttpClient {
             .map_err(ProwlarrRequestError::from_reqwest)?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after);
             return Err(ProwlarrRequestError::HttpStatus {
                 status: status.as_u16(),
+                retry_after,
             });
         }
 
@@ -590,12 +596,23 @@ impl std::error::Error for ProwlarrConfigError {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ProwlarrRequestError {
-    HttpStatus { status: u16 },
+    HttpStatus {
+        status: u16,
+        retry_after: Option<RetryAfter>,
+    },
     Timeout,
-    Request { message: String },
-    InvalidResponse { message: String },
-    InvalidIndexer { message: String },
-    ResponseTooLarge { limit: u64 },
+    Request {
+        message: String,
+    },
+    InvalidResponse {
+        message: String,
+    },
+    InvalidIndexer {
+        message: String,
+    },
+    ResponseTooLarge {
+        limit: u64,
+    },
 }
 
 impl ProwlarrRequestError {
@@ -613,7 +630,7 @@ impl ProwlarrRequestError {
 impl fmt::Display for ProwlarrRequestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HttpStatus { status } => {
+            Self::HttpStatus { status, .. } => {
                 write!(formatter, "Prowlarr returned HTTP status {status}")
             }
             Self::Timeout => formatter.write_str("Prowlarr request timed out"),
@@ -2337,7 +2354,7 @@ mod tests {
 
         assert!(matches!(
             status,
-            ProwlarrRequestError::HttpStatus { status: 401 }
+            ProwlarrRequestError::HttpStatus { status: 401, .. }
         ));
         assert!(matches!(
             malformed,
@@ -2395,7 +2412,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProwlarrRequestError::HttpStatus { status: 302 }
+            ProwlarrRequestError::HttpStatus { status: 302, .. }
         ));
         assert!(!saw_redirected_key.load(AtomicOrdering::Relaxed));
     }

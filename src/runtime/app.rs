@@ -970,9 +970,9 @@ fn indexer_error_retry_after(error: &TorznabRequestError, now_ms: i64) -> i64 {
 fn prowlarr_error_dependency_state(error: &ProwlarrRequestError, now_ms: i64) -> DependencyState {
     let reason = health_reason(Some(&error.to_string()), "Prowlarr refresh failed")
         .unwrap_or_else(|| ReasonText::new("Prowlarr refresh failed").unwrap());
-    let retry_after_ms = Some(now_ms.saturating_add(60_000));
+    let retry_after_ms = Some(prowlarr_error_retry_after(error, now_ms));
     match error {
-        ProwlarrRequestError::HttpStatus { status } if *status == 401 || *status == 403 => {
+        ProwlarrRequestError::HttpStatus { status, .. } if *status == 401 || *status == 403 => {
             DependencyState::Unavailable {
                 reason,
                 retry_after_ms,
@@ -990,6 +990,22 @@ fn prowlarr_error_dependency_state(error: &ProwlarrRequestError, now_ms: i64) ->
             reason,
             retry_after_ms,
         },
+    }
+}
+
+fn prowlarr_error_retry_after(error: &ProwlarrRequestError, now_ms: i64) -> i64 {
+    let policy = IndexerBackoffPolicy::default();
+    match error {
+        ProwlarrRequestError::HttpStatus { retry_after, .. } => {
+            policy.retry_after_deadline(now_ms, 0, *retry_after)
+        }
+        ProwlarrRequestError::Timeout
+        | ProwlarrRequestError::Request { .. }
+        | ProwlarrRequestError::InvalidResponse { .. }
+        | ProwlarrRequestError::InvalidIndexer { .. }
+        | ProwlarrRequestError::ResponseTooLarge { .. } => {
+            policy.retry_after_deadline(now_ms, 0, None)
+        }
     }
 }
 
@@ -1459,7 +1475,7 @@ mod tests {
     use crate::metrics::ExternalOutcome;
     use crate::secrets::{ApiKey, ApiToken};
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode, header::SET_COOKIE};
+    use axum::http::{Request, StatusCode, header::RETRY_AFTER, header::SET_COOKIE};
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use tokio::net::TcpListener;
@@ -1704,6 +1720,45 @@ mod tests {
         assert_eq!(1, backed_off.skipped_backoff);
         assert_eq!(1, retried.refreshed);
         assert_eq!(1, requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn runtime_prowlarr_refresh_honors_retry_after() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let prowlarr_url =
+            spawn_runtime_prowlarr_server_with_retry_after(Arc::clone(&requests), "3600").await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, false, false, "24h"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let now_ms = runtime
+            .state
+            .prowlarr_sources
+            .values()
+            .next()
+            .unwrap()
+            .initial_refresh_after_ms;
+        let summary = runtime
+            .state
+            .refresh_due_prowlarr_sources(now_ms)
+            .await
+            .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert_eq!(1, summary.failed);
+        assert_eq!(1, requests.load(Ordering::SeqCst));
+        assert_eq!("prowlarr", health[0].dependency_type);
+        assert_eq!("unavailable", health[0].state);
+        assert_eq!(
+            Some(now_ms.saturating_add(3_600_000)),
+            health[0].retry_after_ms
+        );
     }
 
     #[tokio::test]
@@ -2798,6 +2853,32 @@ mod tests {
             async move {
                 requests.fetch_add(1, Ordering::SeqCst);
                 (status, body).into_response()
+            }
+        };
+        let app = axum::Router::new()
+            .route("/api/v1/indexer", get(handler.clone()))
+            .route("/api/v1/tag", get(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    async fn spawn_runtime_prowlarr_server_with_retry_after(
+        requests: Arc<AtomicUsize>,
+        retry_after: &'static str,
+    ) -> String {
+        let handler = move |_request: Request<Body>| {
+            let requests = Arc::clone(&requests);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, "limited").into_response();
+                response
+                    .headers_mut()
+                    .insert(RETRY_AFTER, retry_after.parse().unwrap());
+                response
             }
         };
         let app = axum::Router::new()
