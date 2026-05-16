@@ -305,6 +305,24 @@ impl TorznabHttpClient {
         })
     }
 
+    pub async fn caps_endpoint(
+        &self,
+        endpoint: &TorznabEndpoint,
+    ) -> Result<TorznabCaps, TorznabRequestError> {
+        let response = self
+            .request_parts(
+                endpoint.url.as_str(),
+                endpoint.api_key.as_deref(),
+                |params| {
+                    params.push(("t".to_owned(), "caps".to_owned()));
+                },
+            )
+            .await?;
+        parse_torznab_caps(&response).map_err(|error| TorznabRequestError::InvalidXml {
+            message: error.to_string(),
+        })
+    }
+
     async fn request<F>(
         &self,
         endpoint: &TorznabEndpoint,
@@ -469,7 +487,7 @@ impl ProwlarrHttpClient {
             client: reqwest::Client::builder()
                 .redirect(redirect::Policy::none())
                 .build()
-                .unwrap_or_else(|_error| reqwest::Client::new()),
+                .expect("redirect-disabled Prowlarr HTTP client should build"),
             timeout,
         }
     }

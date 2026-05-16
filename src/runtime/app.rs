@@ -3,17 +3,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
+use tokio::task::JoinSet;
 
 use crate::arr::{ArrEndpoint, ArrRegistry};
 use crate::clients::qbittorrent::QbitTorrent;
 use crate::clients::qbittorrent::{QbitAddTorrent, QbitContentLayout, QbittorrentClient};
 use crate::clients::rtorrent::{RtorrentClient, RtorrentDownload};
 use crate::clients::{TorrentClientDescriptor, TorrentClientRegistry};
-use crate::config::{ConfigTorrentClientKind, SporosConfig, TorrentClientConfig};
+use crate::config::{
+    ConfigTorrentClientKind, ProwlarrRemovePolicy, SporosConfig, TorrentClientConfig,
+};
 use crate::domain::{
-    ByteSize, DependencyName, DisplayName, IndexerId, InfoHash, ItemTitle, LocalItem,
-    LocalItemSource, MediaType, ReasonText, RemoteCandidate, SourceKey, TorrentFile,
+    ByteSize, DependencyName, DependencyState, DisplayName, IndexerId, InfoHash, ItemTitle,
+    LocalItem, LocalItemSource, MediaType, ReasonText, RemoteCandidate, SourceKey, TorrentFile,
 };
 use crate::errors::{DatabaseError, TorrentClientError};
 use crate::http::{
@@ -21,8 +24,9 @@ use crate::http::{
     SearchWorkflowRequest, WorkflowQueues,
 };
 use crate::indexers::{
-    ConfiguredTorznabIndexer, IndexerBackoffPolicy, TorznabEndpoint, TorznabHttpClient,
-    TorznabRegistry, TorznabRequestError,
+    ConfiguredTorznabIndexer, IndexerBackoffPolicy, ProwlarrConfigError, ProwlarrHttpClient,
+    ProwlarrRequestError, ProwlarrSource, SanitizedTorznabUrl, TorznabCaps, TorznabEndpoint,
+    TorznabHttpClient, TorznabRegistry, TorznabRequestError,
 };
 use crate::inventory::InventoryScanOptions;
 use crate::inventory_refresh::{
@@ -31,9 +35,9 @@ use crate::inventory_refresh::{
 };
 use crate::metrics::MetricsRegistry;
 use crate::notifications::{NotificationJob, notification_queue};
-use crate::persistence::repository::Repository;
+use crate::persistence::repository::{IndexerRegistryRow, IndexerSearchCapsRow, Repository};
 use crate::runtime::announce_worker::AnnounceWorker;
-use crate::runtime::health::HealthRegistry;
+use crate::runtime::health::{DependencyKind, HealthRegistry};
 use crate::runtime::injection_worker::{
     ClientInjectionRequest, ClientInventoryRefreshFuture, ClientResultFuture, InjectionClient,
     InjectionWorker,
@@ -51,6 +55,7 @@ use crate::runtime::shutdown::{
 };
 
 const RUNTIME_CLIENT_INVENTORY_BUFFER: usize = 64;
+const PROWLARR_REFRESH_CONCURRENCY: usize = 4;
 
 #[derive(Debug)]
 pub struct AppRuntime {
@@ -73,10 +78,33 @@ pub struct AppState {
     pub injection_worker: InjectionWorker,
     pub search_planner: RuntimeSearchPlanner,
     pub torznab_indexers: BTreeMap<DependencyName, ConfiguredTorznabIndexer>,
+    pub prowlarr_sources: BTreeMap<DependencyName, RuntimeProwlarrSource>,
     pub torznab_client: TorznabHttpClient,
+    pub prowlarr_client: ProwlarrHttpClient,
     pub saved_retry_interval: Duration,
     pub shutdown: ShutdownController,
     pub shutdown_signal: ShutdownSignal,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeProwlarrSource {
+    pub source: ProwlarrSource,
+    pub update_interval_ms: i64,
+    pub initial_refresh_after_ms: i64,
+    pub refresh_on_startup: bool,
+    pub required: bool,
+    pub remove_policy: ProwlarrRemovePolicy,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ProwlarrRefreshSummary {
+    pub refreshed: usize,
+    pub failed: usize,
+    pub skipped_backoff: usize,
+    pub skipped_interval: usize,
+    pub skipped_shutdown: usize,
+    pub imported: usize,
+    pub last_error: Option<String>,
 }
 
 impl AppState {
@@ -89,6 +117,308 @@ impl AppState {
                 self.shutdown_signal.clone(),
             )
             .await
+    }
+
+    pub async fn refresh_startup_prowlarr_sources(
+        &self,
+        now_ms: i64,
+    ) -> Result<ProwlarrRefreshSummary, DatabaseError> {
+        let sources = self
+            .prowlarr_sources
+            .values()
+            .filter(|source| source.refresh_on_startup)
+            .collect::<Vec<_>>();
+        self.refresh_selected_prowlarr_sources(sources, now_ms, false)
+            .await
+    }
+
+    pub async fn refresh_due_prowlarr_sources(
+        &self,
+        now_ms: i64,
+    ) -> Result<ProwlarrRefreshSummary, DatabaseError> {
+        let persisted = self.repository.dependency_health_snapshot(1_000).await?;
+        let mut sources = Vec::new();
+        let mut summary = ProwlarrRefreshSummary::default();
+        for source in self.prowlarr_sources.values() {
+            let Some(row) = persisted.iter().find(|row| {
+                row.dependency_type == "prowlarr" && row.dependency_name == source.source.name
+            }) else {
+                if source.initial_refresh_after_ms <= now_ms {
+                    sources.push(source);
+                } else {
+                    summary.skipped_interval += 1;
+                }
+                continue;
+            };
+            if let Some(retry_after) = row.retry_after_ms {
+                if retry_after > now_ms {
+                    summary.skipped_backoff += 1;
+                } else {
+                    sources.push(source);
+                }
+                continue;
+            }
+            let due_at = row
+                .checked_at_ms
+                .saturating_add(source.update_interval_ms)
+                .saturating_add(prowlarr_refresh_jitter_ms(
+                    &source.source.name,
+                    source.update_interval_ms,
+                ));
+            if due_at > now_ms {
+                summary.skipped_interval += 1;
+                continue;
+            }
+            sources.push(source);
+        }
+        let refreshed = self
+            .refresh_selected_prowlarr_sources(sources, now_ms, true)
+            .await?;
+        summary.refreshed += refreshed.refreshed;
+        summary.failed += refreshed.failed;
+        summary.skipped_backoff += refreshed.skipped_backoff;
+        summary.skipped_interval += refreshed.skipped_interval;
+        summary.skipped_shutdown += refreshed.skipped_shutdown;
+        summary.imported += refreshed.imported;
+        summary.last_error = refreshed.last_error;
+        Ok(summary)
+    }
+
+    async fn refresh_selected_prowlarr_sources(
+        &self,
+        sources: Vec<&RuntimeProwlarrSource>,
+        now_ms: i64,
+        optional_failures_only: bool,
+    ) -> Result<ProwlarrRefreshSummary, DatabaseError> {
+        let mut summary = ProwlarrRefreshSummary::default();
+        let semaphore = Arc::new(Semaphore::new(PROWLARR_REFRESH_CONCURRENCY));
+        let mut tasks = JoinSet::new();
+        for source in sources.into_iter().cloned() {
+            if self.shutdown_signal.state().phase != ShutdownPhase::Running {
+                summary.skipped_shutdown += 1;
+                break;
+            }
+            let state = self.clone();
+            let semaphore = Arc::clone(&semaphore);
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.map_err(|error| {
+                    DatabaseError::Unavailable {
+                        operation: "refresh Prowlarr source".to_owned(),
+                        message: error.to_string(),
+                    }
+                })?;
+                let required = source.required;
+                let result = state
+                    .refresh_prowlarr_source_until_shutdown(&source, now_ms)
+                    .await;
+                Ok::<_, DatabaseError>((required, result))
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            let (required, result) = result.map_err(|error| DatabaseError::Unavailable {
+                operation: "refresh Prowlarr source".to_owned(),
+                message: error.to_string(),
+            })??;
+            match result {
+                Ok(imported) => {
+                    summary.refreshed += 1;
+                    summary.imported += imported;
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    summary.last_error = Some(error.to_string());
+                    if required && !optional_failures_only {
+                        tasks.abort_all();
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    async fn refresh_prowlarr_source_until_shutdown(
+        &self,
+        source: &RuntimeProwlarrSource,
+        now_ms: i64,
+    ) -> Result<usize, DatabaseError> {
+        let mut shutdown = self.shutdown_signal.clone();
+        let refresh = self.refresh_prowlarr_source(source, now_ms);
+        tokio::select! {
+            result = refresh => result,
+            _state = shutdown.cancelled() => {
+                Err(DatabaseError::Unavailable {
+                    operation: "refresh Prowlarr source".to_owned(),
+                    message: "shutdown requested".to_owned(),
+                })
+            }
+        }
+    }
+
+    async fn refresh_prowlarr_source(
+        &self,
+        source: &RuntimeProwlarrSource,
+        now_ms: i64,
+    ) -> Result<usize, DatabaseError> {
+        match self.prowlarr_client.indexers(&source.source).await {
+            Ok(indexers) => {
+                let imported = indexers.len();
+                self.repository
+                    .sync_prowlarr_indexers(
+                        &source.source.name,
+                        &indexers,
+                        source.remove_policy,
+                        now_ms,
+                    )
+                    .await?;
+                self.record_prowlarr_health(
+                    &source.source.name,
+                    DependencyState::Healthy {
+                        checked_at_ms: now_ms,
+                    },
+                    now_ms,
+                )
+                .await?;
+                Ok(imported)
+            }
+            Err(error) => {
+                let state = prowlarr_error_dependency_state(&error, now_ms);
+                self.record_prowlarr_health(&source.source.name, state.clone(), now_ms)
+                    .await?;
+                Err(DatabaseError::Unavailable {
+                    operation: format!("refresh Prowlarr source {}", source.source.name.as_str()),
+                    message: error.to_string(),
+                })
+            }
+        }
+    }
+
+    async fn record_prowlarr_health(
+        &self,
+        name: &DependencyName,
+        state: DependencyState,
+        now_ms: i64,
+    ) -> Result<(), DatabaseError> {
+        self.repository
+            .record_dependency_health("prowlarr", name, &state, now_ms)
+            .await?;
+        match state {
+            DependencyState::Healthy { checked_at_ms } => {
+                self.health
+                    .set_healthy(DependencyKind::Prowlarr, name.clone(), checked_at_ms);
+            }
+            DependencyState::Degraded {
+                reason,
+                retry_after_ms,
+            } => self.health.set_degraded(
+                DependencyKind::Prowlarr,
+                name.clone(),
+                reason,
+                retry_after_ms,
+            ),
+            DependencyState::Unavailable {
+                reason,
+                retry_after_ms,
+            } => self.health.set_unavailable(
+                DependencyKind::Prowlarr,
+                name.clone(),
+                reason,
+                retry_after_ms,
+            ),
+            DependencyState::Unknown => self
+                .health
+                .set_unknown(DependencyKind::Prowlarr, name.clone()),
+        }
+        Ok(())
+    }
+
+    fn search_caps_endpoint(
+        &self,
+        row: &IndexerSearchCapsRow,
+    ) -> Result<Option<TorznabEndpoint>, DatabaseError> {
+        self.indexer_endpoint(
+            row.indexer_id,
+            &row.name,
+            &row.url,
+            &row.source_kind,
+            &row.source_name,
+            row.caps.clone(),
+            row.retry_after_ms,
+        )
+    }
+
+    fn registry_endpoint(
+        &self,
+        row: &IndexerRegistryRow,
+        caps: TorznabCaps,
+    ) -> Result<Option<TorznabEndpoint>, DatabaseError> {
+        let indexer_id = IndexerId::new(row.id).map_err(|error| DatabaseError::QueryFailed {
+            operation: "build runtime indexer id".to_owned(),
+            message: error.to_string(),
+        })?;
+        self.indexer_endpoint(
+            indexer_id,
+            &row.name,
+            &row.url,
+            &row.source_kind,
+            &row.source_name,
+            caps,
+            row.retry_after_ms,
+        )
+    }
+
+    fn indexer_endpoint(
+        &self,
+        indexer_id: IndexerId,
+        name: &DependencyName,
+        url: &str,
+        source_kind: &str,
+        source_name: &str,
+        caps: TorznabCaps,
+        retry_after_ms: Option<i64>,
+    ) -> Result<Option<TorznabEndpoint>, DatabaseError> {
+        if source_kind == "static" {
+            let Some(configured) = self.torznab_indexers.get(name) else {
+                return Ok(None);
+            };
+            return Ok(Some(TorznabEndpoint {
+                indexer_id,
+                name: name.clone(),
+                url: configured.url.clone(),
+                api_key: configured
+                    .api_key
+                    .as_ref()
+                    .map(|api_key| api_key.expose_secret().to_owned()),
+                caps,
+                retry_after_ms,
+            }));
+        }
+        if source_kind == "prowlarr" {
+            let source_name = DependencyName::new(source_name.to_owned()).map_err(|error| {
+                DatabaseError::QueryFailed {
+                    operation: "build Prowlarr source name".to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+            let Some(source) = self.prowlarr_sources.get(&source_name) else {
+                return Ok(None);
+            };
+            return Ok(Some(TorznabEndpoint {
+                indexer_id,
+                name: name.clone(),
+                url: SanitizedTorznabUrl::new(url.to_owned()).map_err(|error| {
+                    DatabaseError::QueryFailed {
+                        operation: "build Prowlarr Torznab endpoint".to_owned(),
+                        message: error.to_string(),
+                    }
+                })?,
+                api_key: Some(source.source.api_key.expose_secret().to_owned()),
+                caps,
+                retry_after_ms,
+            }));
+        }
+        Ok(None)
     }
 
     pub async fn plan_search_workflow(
@@ -119,25 +449,14 @@ impl AppState {
             let Some(plan) = plan_runtime_torznab_search(&item, &ids, &indexer.caps) else {
                 continue;
             };
+            let Some(endpoint) = self.search_caps_endpoint(&indexer)? else {
+                continue;
+            };
             plans.push(IndexerSearchPlan {
                 indexer_id: indexer.indexer_id,
                 indexer_name: indexer.name.clone(),
                 plan: plan.clone(),
             });
-            let Some(configured) = self.torznab_indexers.get(&indexer.name) else {
-                continue;
-            };
-            let endpoint = TorznabEndpoint {
-                indexer_id: indexer.indexer_id,
-                name: indexer.name,
-                url: configured.url.clone(),
-                api_key: configured
-                    .api_key
-                    .as_ref()
-                    .map(|api_key| api_key.expose_secret().to_owned()),
-                caps: indexer.caps,
-                retry_after_ms: indexer.retry_after_ms,
-            };
             let candidates = self
                 .torznab_client
                 .search(&endpoint, item.media_type, &plan.plan, now_ms)
@@ -187,12 +506,8 @@ impl AppState {
         let mut last_error = None;
         let registry = self.repository.indexer_registry_snapshot(1_000).await?;
 
-        for indexer in self
-            .torznab_indexers
-            .values()
-            .filter(|indexer| indexer.enabled)
-        {
-            let Some(row) = registry.iter().find(|row| row.name == indexer.name) else {
+        for row in registry.into_iter().filter(|row| row.enabled) {
+            let Some(endpoint) = self.registry_endpoint(&row, TorznabCaps::default())? else {
                 continue;
             };
             if row
@@ -209,10 +524,10 @@ impl AppState {
                 );
                 continue;
             }
-            match self.torznab_client.caps(indexer).await {
+            match self.torznab_client.caps_endpoint(&endpoint).await {
                 Ok(caps) => {
                     self.repository
-                        .record_indexer_caps_success(&indexer.name, &caps, now_ms)
+                        .record_indexer_caps_success(&row.name, &caps, now_ms)
                         .await?;
                     summary.refreshed += 1;
                 }
@@ -223,7 +538,7 @@ impl AppState {
                     let retry_after_ms = indexer_error_retry_after(&error, now_ms);
                     self.repository
                         .record_indexer_caps_failure(
-                            &indexer.name,
+                            &row.name,
                             &reason,
                             Some(retry_after_ms),
                             now_ms,
@@ -307,6 +622,7 @@ impl AppRuntime {
             .map(|indexer| (indexer.name.clone(), indexer))
             .collect::<BTreeMap<_, _>>();
         let now_ms = crate::runtime::announce_worker::unix_time_ms();
+        let prowlarr_sources = runtime_prowlarr_sources(&config, now_ms)?;
         repository
             .sync_torznab_indexers(indexers.indexers(), now_ms)
             .await?;
@@ -404,26 +720,31 @@ impl AppRuntime {
             http = http.with_api_token(api_token.expose_secret());
         }
 
+        let state = AppState {
+            config,
+            repository,
+            clients,
+            health,
+            metrics,
+            http,
+            queues,
+            announce_worker,
+            scheduler,
+            inventory_refresh,
+            injection_worker,
+            search_planner,
+            torznab_indexers,
+            prowlarr_sources,
+            torznab_client: TorznabHttpClient::new(Duration::from_secs(120)),
+            prowlarr_client: ProwlarrHttpClient::new(Duration::from_secs(30)),
+            saved_retry_interval,
+            shutdown,
+            shutdown_signal,
+        };
+        state.refresh_startup_prowlarr_sources(now_ms).await?;
+
         Ok(Self {
-            state: AppState {
-                config,
-                repository,
-                clients,
-                health,
-                metrics,
-                http,
-                queues,
-                announce_worker,
-                scheduler,
-                inventory_refresh,
-                injection_worker,
-                search_planner,
-                torznab_indexers,
-                torznab_client: TorznabHttpClient::new(Duration::from_secs(120)),
-                saved_retry_interval,
-                shutdown,
-                shutdown_signal,
-            },
+            state,
             receivers: RuntimeReceivers {
                 announcements: workflow_receivers.announcements,
                 searches: workflow_receivers.searches,
@@ -463,6 +784,66 @@ fn search_workflow_item(title: ItemTitle) -> Result<LocalItem, DatabaseError> {
         total_size: ByteSize::new(1),
         mtime_ms: None,
     })
+}
+
+fn runtime_prowlarr_sources(
+    config: &SporosConfig,
+    now_ms: i64,
+) -> Result<BTreeMap<DependencyName, RuntimeProwlarrSource>, DatabaseError> {
+    let mut sources = BTreeMap::new();
+    for (name, source_config) in &config.indexers.prowlarr {
+        let Some(source) = ProwlarrSource::from_config(name, source_config)
+            .map_err(|error| prowlarr_config_database_error("build Prowlarr source", error))?
+        else {
+            continue;
+        };
+        let update_interval_ms =
+            parse_interval_ms(&source_config.update_interval).map_err(|error| {
+                DatabaseError::Unavailable {
+                    operation: "build Prowlarr source interval".to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+        sources.insert(
+            source.name.clone(),
+            RuntimeProwlarrSource {
+                initial_refresh_after_ms: if source_config.refresh_on_startup {
+                    0
+                } else {
+                    now_ms.saturating_add(update_interval_ms).saturating_add(
+                        prowlarr_refresh_jitter_ms(&source.name, update_interval_ms),
+                    )
+                },
+                source,
+                update_interval_ms,
+                refresh_on_startup: source_config.refresh_on_startup,
+                required: source_config.required,
+                remove_policy: source_config.remove_policy,
+            },
+        );
+    }
+    Ok(sources)
+}
+
+fn prowlarr_config_database_error(
+    operation: &'static str,
+    error: ProwlarrConfigError,
+) -> DatabaseError {
+    DatabaseError::Unavailable {
+        operation: operation.to_owned(),
+        message: error.to_string(),
+    }
+}
+
+fn prowlarr_refresh_jitter_ms(name: &DependencyName, interval_ms: i64) -> i64 {
+    let max_jitter = (interval_ms / 10).clamp(0, 60_000);
+    if max_jitter == 0 {
+        return 0;
+    }
+    let hash = name.as_str().bytes().fold(0_u64, |accumulator, byte| {
+        accumulator.wrapping_mul(31).wrapping_add(u64::from(byte))
+    });
+    i64::try_from(hash % u64::try_from(max_jitter).unwrap_or(1)).unwrap_or_default()
 }
 
 fn infer_search_media_type(title: &str) -> MediaType {
@@ -518,8 +899,9 @@ fn seed_runtime_health(
 ) {
     for row in rows {
         let kind = match row.dependency_type.as_str() {
-            "arr" => crate::runtime::health::DependencyKind::Arr,
-            "indexer" => crate::runtime::health::DependencyKind::Indexer,
+            "arr" => DependencyKind::Arr,
+            "indexer" => DependencyKind::Indexer,
+            "prowlarr" => DependencyKind::Prowlarr,
             _ => continue,
         };
         match row.state.as_str() {
@@ -582,6 +964,32 @@ fn indexer_error_retry_after(error: &TorznabRequestError, now_ms: i64) -> i64 {
         | TorznabRequestError::ResponseTooLarge { .. } => {
             policy.retry_after_deadline(now_ms, 0, None)
         }
+    }
+}
+
+fn prowlarr_error_dependency_state(error: &ProwlarrRequestError, now_ms: i64) -> DependencyState {
+    let reason = health_reason(Some(&error.to_string()), "Prowlarr refresh failed")
+        .unwrap_or_else(|| ReasonText::new("Prowlarr refresh failed").unwrap());
+    let retry_after_ms = Some(now_ms.saturating_add(60_000));
+    match error {
+        ProwlarrRequestError::HttpStatus { status } if *status == 401 || *status == 403 => {
+            DependencyState::Unavailable {
+                reason,
+                retry_after_ms,
+            }
+        }
+        ProwlarrRequestError::InvalidResponse { .. }
+        | ProwlarrRequestError::InvalidIndexer { .. } => DependencyState::Degraded {
+            reason,
+            retry_after_ms,
+        },
+        ProwlarrRequestError::HttpStatus { .. }
+        | ProwlarrRequestError::Timeout
+        | ProwlarrRequestError::Request { .. }
+        | ProwlarrRequestError::ResponseTooLarge { .. } => DependencyState::Unavailable {
+            reason,
+            retry_after_ms,
+        },
     }
 }
 
@@ -1039,12 +1447,15 @@ mod tests {
 
     use super::*;
     use crate::clients::TorrentClientCapabilities;
-    use crate::config::{ArrInstanceConfig, TorznabIndexerConfig};
+    use crate::config::{ArrInstanceConfig, ProwlarrSourceConfig, TorznabIndexerConfig};
     use crate::domain::{
         ClientHost, DependencyName, DependencyState, ItemTitle, ReasonText, TorrentClientKind,
     };
     use crate::http::router;
-    use crate::indexers::{CategoryCaps, SearchCaps, TorznabCaps, TorznabLimits};
+    use crate::indexers::{
+        ApiKeySource, CategoryCaps, ProwlarrIndexer, SanitizedTorznabUrl, SearchCaps, TorznabCaps,
+        TorznabLimits,
+    };
     use crate::metrics::ExternalOutcome;
     use crate::secrets::{ApiKey, ApiToken};
     use axum::body::{Body, to_bytes};
@@ -1103,6 +1514,196 @@ mod tests {
             crate::runtime::shutdown::ShutdownPhase::Running,
             runtime.state.shutdown.state().phase
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_refreshes_optional_prowlarr_sources() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let prowlarr_url = spawn_runtime_prowlarr_server(
+            Arc::clone(&requests),
+            StatusCode::OK,
+            prowlarr_catalog(),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, true, false, "10m"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let indexers = repository.indexer_registry_snapshot(10).await.unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert_eq!(1, requests.load(Ordering::SeqCst));
+        assert_eq!(1, runtime.state.prowlarr_sources.len());
+        assert!(
+            indexers
+                .iter()
+                .any(|indexer| indexer.source_kind == "prowlarr"
+                    && indexer.source_indexer_id == "101"
+                    && indexer.enabled)
+        );
+        assert_eq!("prowlarr", health[0].dependency_type);
+        assert_eq!("healthy", health[0].state);
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_degrades_optional_prowlarr_failure() {
+        let prowlarr_url = spawn_runtime_prowlarr_server(
+            Arc::new(AtomicUsize::new(0)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "down",
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, true, false, "10m"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert!(
+            runtime
+                .state
+                .prowlarr_sources
+                .contains_key(&DependencyName::new("main").unwrap())
+        );
+        assert_eq!("prowlarr", health[0].dependency_type);
+        assert_eq!("unavailable", health[0].state);
+        assert!(health[0].retry_after_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_fails_required_prowlarr_failure() {
+        let prowlarr_url = spawn_runtime_prowlarr_server(
+            Arc::new(AtomicUsize::new(0)),
+            StatusCode::UNAUTHORIZED,
+            "bad key",
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, true, true, "10m"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+
+        let error = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Prowlarr returned HTTP status 401")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_periodic_prowlarr_refresh_respects_interval_and_shutdown() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let prowlarr_url = spawn_runtime_prowlarr_server(
+            Arc::clone(&requests),
+            StatusCode::OK,
+            prowlarr_catalog(),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, false, false, "10m"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let due_at = runtime
+            .state
+            .prowlarr_sources
+            .values()
+            .next()
+            .unwrap()
+            .initial_refresh_after_ms;
+
+        let skipped_before_due = runtime
+            .state
+            .refresh_due_prowlarr_sources(1_000)
+            .await
+            .unwrap();
+        let first = runtime
+            .state
+            .refresh_due_prowlarr_sources(due_at)
+            .await
+            .unwrap();
+        runtime.state.shutdown.cancel_now("test shutdown").unwrap();
+        let shutdown = runtime
+            .state
+            .refresh_due_prowlarr_sources(i64::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(1, skipped_before_due.skipped_interval);
+        assert_eq!(1, first.refreshed);
+        assert_eq!(1, first.imported);
+        assert_eq!(1, shutdown.skipped_shutdown);
+        assert_eq!(1, requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn runtime_periodic_prowlarr_refresh_retries_after_backoff() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let prowlarr_url = spawn_runtime_prowlarr_server(
+            Arc::clone(&requests),
+            StatusCode::OK,
+            prowlarr_catalog(),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, false, false, "24h"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let source = DependencyName::new("main").unwrap();
+        repository
+            .record_dependency_health(
+                "prowlarr",
+                &source,
+                &DependencyState::Unavailable {
+                    reason: ReasonText::new("down").unwrap(),
+                    retry_after_ms: Some(1_000),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let backed_off = runtime
+            .state
+            .refresh_due_prowlarr_sources(999)
+            .await
+            .unwrap();
+        let retried = runtime
+            .state
+            .refresh_due_prowlarr_sources(1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(1, backed_off.skipped_backoff);
+        assert_eq!(1, retried.refreshed);
+        assert_eq!(1, requests.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1166,6 +1767,51 @@ mod tests {
         assert_eq!(1, queries.len());
         assert!(queries[0].contains("tmdbid=99"));
         assert!(!queries[0].contains("q=Example"));
+    }
+
+    #[tokio::test]
+    async fn search_workflow_skips_unresolved_prowlarr_sources_before_planning() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let source = DependencyName::new("main").unwrap();
+        let name = DependencyName::new("main:Movies").unwrap();
+        repository
+            .sync_prowlarr_indexers(
+                &source,
+                &[ProwlarrIndexer {
+                    source: source.clone(),
+                    prowlarr_id: 101,
+                    name: DependencyName::new("Movies").unwrap(),
+                    url: SanitizedTorznabUrl::new("https://prowlarr.example/101/api").unwrap(),
+                    api_key: Some(ApiKey::new("prowlarr-secret").unwrap()),
+                    api_key_source: ApiKeySource::Direct,
+                    tags: Vec::new(),
+                }],
+                ProwlarrRemovePolicy::Deactivate,
+                100,
+            )
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(&name, &movie_caps(), 200)
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(SporosConfig::default(), repository)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(summary.plans.is_empty());
+        assert_eq!(0, summary.candidate_count);
     }
 
     #[tokio::test]
@@ -2104,6 +2750,62 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}")
+    }
+
+    async fn spawn_runtime_prowlarr_server(
+        requests: Arc<AtomicUsize>,
+        status: StatusCode,
+        body: &'static str,
+    ) -> String {
+        let handler = move |_request: Request<Body>| {
+            let requests = Arc::clone(&requests);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                (status, body).into_response()
+            }
+        };
+        let app = axum::Router::new()
+            .route("/api/v1/indexer", get(handler.clone()))
+            .route("/api/v1/tag", get(handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn test_prowlarr_config(
+        url: String,
+        refresh_on_startup: bool,
+        required: bool,
+        update_interval: &str,
+    ) -> ProwlarrSourceConfig {
+        ProwlarrSourceConfig {
+            url,
+            api_key: Some(ApiKey::new("prowlarr-secret").unwrap()),
+            refresh_on_startup,
+            required,
+            update_interval: update_interval.to_owned(),
+            ..ProwlarrSourceConfig::default()
+        }
+    }
+
+    fn prowlarr_catalog() -> &'static str {
+        r#"
+        [
+          {
+            "id": 101,
+            "name": "Movies",
+            "enable": true,
+            "protocol": "torrent",
+            "implementation": "Cardigann",
+            "supportsRss": true,
+            "supportsSearch": true,
+            "tags": []
+          }
+        ]
+        "#
     }
 
     async fn spawn_runtime_arr_parse_server(

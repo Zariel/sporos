@@ -198,6 +198,11 @@ pub struct SearchHistoryRow {
 pub struct IndexerSearchCapsRow {
     pub indexer_id: IndexerId,
     pub name: DependencyName,
+    pub url: String,
+    pub source_kind: String,
+    pub source_name: String,
+    pub source_indexer_id: String,
+    pub api_key_source: String,
     pub enabled: bool,
     pub retry_after_ms: Option<i64>,
     pub caps: TorznabCaps,
@@ -1655,7 +1660,17 @@ impl Repository {
     ) -> Result<Vec<IndexerSearchCapsRow>, DatabaseError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, enabled, retry_after, capabilities_json
+            SELECT
+                id,
+                name,
+                url,
+                source_kind,
+                source_name,
+                source_indexer_id,
+                api_key_source,
+                enabled,
+                retry_after,
+                capabilities_json
             FROM indexers
             WHERE capabilities_json IS NOT NULL
             ORDER BY name
@@ -1684,6 +1699,11 @@ impl Repository {
                             message: error.to_string(),
                         }
                     })?,
+                    url: row.get("url"),
+                    source_kind: row.get("source_kind"),
+                    source_name: row.get("source_name"),
+                    source_indexer_id: row.get("source_indexer_id"),
+                    api_key_source: row.get("api_key_source"),
                     enabled: row.get::<i64, _>("enabled") != 0,
                     retry_after_ms: row.get("retry_after"),
                     caps,
@@ -3828,6 +3848,59 @@ async fn reconcile_prowlarr_source_rename(
     source_indexer_id: &str,
     now_ms: i64,
 ) -> Result<(), DatabaseError> {
+    let target_exists = sqlx::query(
+        r#"
+        SELECT 1
+        FROM indexers
+        WHERE source_kind = 'prowlarr'
+          AND source_name = ?
+          AND source_indexer_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(source_name)
+    .bind(source_indexer_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| db_error("read Prowlarr source rename target", error))?
+    .is_some();
+    if target_exists {
+        return Ok(());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id
+        FROM indexers
+        WHERE source_kind = 'prowlarr'
+          AND source_indexer_id = ?
+          AND source_name != ?
+        "#,
+    )
+    .bind(source_indexer_id)
+    .bind(source_name)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| db_error("read Prowlarr source rename candidates", error))?;
+    if rows.len() == 1 {
+        let id: i64 = rows[0].get("id");
+        sqlx::query(
+            r#"
+            UPDATE indexers
+            SET source_name = ?, url = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(source_name)
+        .bind(url)
+        .bind(now_ms)
+        .bind(id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| db_error("reconcile Prowlarr source rename", error))?;
+        return Ok(());
+    }
+
     sqlx::query(
         r#"
         UPDATE indexers
@@ -4800,6 +4873,50 @@ mod tests {
         assert_eq!("renamed", row.source_name);
         assert_eq!("renamed:Movies", row.name.as_str());
         assert!(row.enabled);
+    }
+
+    #[tokio::test]
+    async fn sync_prowlarr_indexers_reconciles_source_name_and_url_changes() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let source = DependencyName::new("main").unwrap();
+        let renamed_source = DependencyName::new("renamed").unwrap();
+        let first =
+            test_prowlarr_indexer("main", 101, "Movies", "https://prowlarr.example/101/api");
+        let synced = repository
+            .sync_prowlarr_indexers(&source, &[first], ProwlarrRemovePolicy::Deactivate, 100)
+            .await
+            .unwrap();
+        let row_id = synced
+            .iter()
+            .find(|indexer| indexer.source_indexer_id == "101")
+            .unwrap()
+            .id;
+        let renamed = test_prowlarr_indexer(
+            "renamed",
+            101,
+            "Movies",
+            "https://new-prowlarr.example/101/api",
+        );
+
+        let resynced = repository
+            .sync_prowlarr_indexers(
+                &renamed_source,
+                &[renamed],
+                ProwlarrRemovePolicy::Deactivate,
+                200,
+            )
+            .await
+            .unwrap();
+        let rows = resynced
+            .iter()
+            .filter(|indexer| indexer.source_indexer_id == "101")
+            .collect::<Vec<_>>();
+
+        assert_eq!(1, rows.len());
+        assert_eq!(row_id, rows[0].id);
+        assert_eq!("renamed", rows[0].source_name);
+        assert_eq!("https://new-prowlarr.example/101/api", rows[0].url);
+        assert!(rows[0].enabled);
     }
 
     #[tokio::test]

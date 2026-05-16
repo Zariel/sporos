@@ -8,6 +8,7 @@ use crate::domain::{DependencyName, DependencyState, ReasonText};
 pub enum DependencyKind {
     TorrentClient,
     Indexer,
+    Prowlarr,
     Arr,
     Notification,
     LocalState,
@@ -20,6 +21,7 @@ impl DependencyKind {
         match self {
             Self::TorrentClient => "torrent_client",
             Self::Indexer => "indexer",
+            Self::Prowlarr => "prowlarr",
             Self::Arr => "arr",
             Self::Notification => "notification",
             Self::LocalState => "local_state",

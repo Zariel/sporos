@@ -208,6 +208,17 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         )),
         BackgroundShutdownPolicy::AbortOnTimeout,
     ));
+    if let Some(interval) = runtime_prowlarr_refresh_interval(&runtime.state) {
+        handles.push(BackgroundTask::new(
+            "prowlarr-refresh",
+            tokio::spawn(run_prowlarr_refresh_loop(
+                runtime.state.clone(),
+                interval,
+                runtime.state.shutdown_signal.clone(),
+            )),
+            BackgroundShutdownPolicy::AbortOnTimeout,
+        ));
+    }
     handles.push(BackgroundTask::new(
         "announcements-receiver",
         tokio::spawn(hold_receiver_open(
@@ -1209,6 +1220,57 @@ fn runtime_client_inventory_interval(state: &AppState) -> Duration {
     let interval_ms =
         parse_interval_ms(&state.config.scheduling.search_interval).unwrap_or(86_400_000);
     Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
+}
+
+fn runtime_prowlarr_refresh_interval(state: &AppState) -> Option<Duration> {
+    state
+        .prowlarr_sources
+        .values()
+        .map(|source| source.update_interval_ms)
+        .min()
+        .and_then(|interval_ms| u64::try_from(interval_ms).ok())
+        .map(|interval_ms| interval_ms.min(60_000))
+        .filter(|interval_ms| *interval_ms > 0)
+        .map(Duration::from_millis)
+}
+
+async fn run_prowlarr_refresh_loop(
+    state: AppState,
+    interval: Duration,
+    mut shutdown: ShutdownSignal,
+) {
+    loop {
+        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
+            break;
+        }
+
+        match state.refresh_due_prowlarr_sources(unix_time_ms()).await {
+            Ok(summary) => {
+                if summary.refreshed > 0 || summary.failed > 0 {
+                    tracing::info!(
+                        refreshed = summary.refreshed,
+                        failed = summary.failed,
+                        imported = summary.imported,
+                        skipped_backoff = summary.skipped_backoff,
+                        skipped_interval = summary.skipped_interval,
+                        "Prowlarr refresh completed"
+                    );
+                }
+            }
+            Err(error) => warn!(error = %error, "Prowlarr refresh failed"),
+        }
+
+        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
+            break;
+        }
+
+        tokio::select! {
+            _state = shutdown.cancelled() => {
+                break;
+            }
+            () = tokio::time::sleep(interval) => {}
+        }
+    }
 }
 
 async fn run_client_inventory_refresh_loop(
