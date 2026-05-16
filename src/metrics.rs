@@ -204,6 +204,23 @@ impl ExternalOutcome {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProwlarrRefreshOutcome {
+    Succeeded,
+    Failed,
+    RateLimited,
+}
+
+impl ProwlarrRefreshOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ActionOutcome {
     Saved,
     Injected,
@@ -345,6 +362,34 @@ impl MetricsRegistry {
         );
     }
 
+    pub fn record_prowlarr_refresh(
+        &self,
+        source: &str,
+        outcome: ProwlarrRefreshOutcome,
+        duration_ms: u64,
+        imported: u64,
+        deactivated: u64,
+    ) {
+        let labels = vec![label("source", source), label("outcome", outcome.as_str())];
+        self.increment("sporos_prowlarr_refresh_total", labels.clone());
+        self.observe_duration(
+            "sporos_prowlarr_refresh_duration_seconds",
+            labels,
+            duration_ms,
+        );
+        let source_labels = vec![label("source", source)];
+        self.add_counter(
+            "sporos_prowlarr_refresh_imported_total",
+            source_labels.clone(),
+            imported,
+        );
+        self.add_counter(
+            "sporos_prowlarr_refresh_deactivated_total",
+            source_labels,
+            deactivated,
+        );
+    }
+
     pub fn render_prometheus(&self, snapshot: &MetricsSnapshot) -> String {
         let state = self
             .state
@@ -391,6 +436,10 @@ impl MetricsRegistry {
     }
 
     fn increment(&self, name: &'static str, labels: Vec<MetricLabel>) {
+        self.add_counter(name, labels, 1);
+    }
+
+    fn add_counter(&self, name: &'static str, labels: Vec<MetricLabel>, amount: u64) {
         let mut state = self
             .state
             .write()
@@ -399,7 +448,7 @@ impl MetricsRegistry {
             .counters
             .entry(MetricKey { name, labels })
             .or_insert(0);
-        *counter = counter.saturating_add(1);
+        *counter = counter.saturating_add(amount);
     }
 
     fn observe_duration(&self, name: &'static str, labels: Vec<MetricLabel>, duration_ms: u64) {
@@ -477,6 +526,26 @@ fn write_descriptors(output: &mut String) {
             "sporos_job_duration_seconds",
             "summary",
             "Recorded job duration observations.",
+        ),
+        (
+            "sporos_prowlarr_refresh_total",
+            "counter",
+            "Prowlarr refresh attempts by configured source and safe outcome.",
+        ),
+        (
+            "sporos_prowlarr_refresh_duration_seconds",
+            "summary",
+            "Prowlarr refresh duration by configured source and safe outcome.",
+        ),
+        (
+            "sporos_prowlarr_refresh_imported_total",
+            "counter",
+            "Prowlarr indexers accepted during successful refreshes.",
+        ),
+        (
+            "sporos_prowlarr_refresh_deactivated_total",
+            "counter",
+            "Prowlarr indexers deactivated during successful refreshes.",
         ),
         (
             "sporos_queue_depth",
@@ -868,6 +937,7 @@ mod tests {
         registry.record_client_request(ExternalOperation::Inject, ExternalOutcome::Succeeded, 250);
         registry.record_action(ActionOutcome::AlreadyExisting);
         registry.record_job_duration("rss", ExternalOutcome::Succeeded, 3_000);
+        registry.record_prowlarr_refresh("main", ProwlarrRefreshOutcome::Succeeded, 500, 2, 1);
 
         let mut summaries = BTreeMap::new();
         summaries.insert(DependencyKind::Indexer, DependencySummary::Degraded);
@@ -946,6 +1016,15 @@ mod tests {
                 "sporos_job_duration_seconds_sum{job=\"rss\",outcome=\"succeeded\"} 3.000"
             )
         );
+        assert!(
+            output
+                .contains("sporos_prowlarr_refresh_total{source=\"main\",outcome=\"succeeded\"} 1")
+        );
+        assert!(output.contains(
+            "sporos_prowlarr_refresh_duration_seconds_sum{source=\"main\",outcome=\"succeeded\"} 0.500"
+        ));
+        assert!(output.contains("sporos_prowlarr_refresh_imported_total{source=\"main\"} 2"));
+        assert!(output.contains("sporos_prowlarr_refresh_deactivated_total{source=\"main\"} 1"));
         assert!(output.contains("sporos_announce_active_work 3"));
         assert!(output.contains("sporos_announce_oldest_active_age_seconds 4.000"));
         assert!(output.contains("sporos_announce_worker_busy 1"));

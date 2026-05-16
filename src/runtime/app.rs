@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -33,7 +33,7 @@ use crate::inventory_refresh::{
     ClientInventoryItem, ClientInventoryMessage, InventoryRefreshError, InventoryRefreshRequest,
     InventoryRefreshSummary, InventoryRefreshWorker, inventory_refresh_queue,
 };
-use crate::metrics::MetricsRegistry;
+use crate::metrics::{MetricsRegistry, ProwlarrRefreshOutcome};
 use crate::notifications::{NotificationJob, notification_queue};
 use crate::persistence::repository::{IndexerRegistryRow, IndexerSearchCapsRow, Repository};
 use crate::runtime::announce_worker::AnnounceWorker;
@@ -104,7 +104,14 @@ pub struct ProwlarrRefreshSummary {
     pub skipped_interval: usize,
     pub skipped_shutdown: usize,
     pub imported: usize,
+    pub deactivated: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct ProwlarrRefreshResult {
+    imported: usize,
+    deactivated: u64,
 }
 
 impl AppState {
@@ -180,6 +187,7 @@ impl AppState {
         summary.skipped_interval += refreshed.skipped_interval;
         summary.skipped_shutdown += refreshed.skipped_shutdown;
         summary.imported += refreshed.imported;
+        summary.deactivated += refreshed.deactivated;
         summary.last_error = refreshed.last_error;
         Ok(summary)
     }
@@ -221,9 +229,10 @@ impl AppState {
                 message: error.to_string(),
             })??;
             match result {
-                Ok(imported) => {
+                Ok(result) => {
                     summary.refreshed += 1;
-                    summary.imported += imported;
+                    summary.imported += result.imported;
+                    summary.deactivated += result.deactivated;
                 }
                 Err(error) => {
                     summary.failed += 1;
@@ -242,7 +251,7 @@ impl AppState {
         &self,
         source: &RuntimeProwlarrSource,
         now_ms: i64,
-    ) -> Result<usize, DatabaseError> {
+    ) -> Result<ProwlarrRefreshResult, DatabaseError> {
         let mut shutdown = self.shutdown_signal.clone();
         let refresh = self.refresh_prowlarr_source(source, now_ms);
         tokio::select! {
@@ -260,29 +269,61 @@ impl AppState {
         &self,
         source: &RuntimeProwlarrSource,
         now_ms: i64,
-    ) -> Result<usize, DatabaseError> {
+    ) -> Result<ProwlarrRefreshResult, DatabaseError> {
+        let started = Instant::now();
         match self.prowlarr_client.indexers(&source.source).await {
             Ok(indexers) => {
-                let imported = indexers.len();
-                self.repository
-                    .sync_prowlarr_indexers(
+                match self
+                    .repository
+                    .sync_prowlarr_indexers_with_summary(
                         &source.source.name,
                         &indexers,
                         source.remove_policy,
                         now_ms,
                     )
-                    .await?;
-                self.record_prowlarr_health(
-                    &source.source.name,
-                    DependencyState::Healthy {
-                        checked_at_ms: now_ms,
-                    },
-                    now_ms,
-                )
-                .await?;
-                Ok(imported)
+                    .await
+                {
+                    Ok(sync) => {
+                        self.metrics.record_prowlarr_refresh(
+                            source.source.name.as_str(),
+                            ProwlarrRefreshOutcome::Succeeded,
+                            elapsed_ms(started),
+                            sync.imported as u64,
+                            sync.deactivated,
+                        );
+                        self.record_prowlarr_health(
+                            &source.source.name,
+                            DependencyState::Healthy {
+                                checked_at_ms: now_ms,
+                            },
+                            now_ms,
+                        )
+                        .await?;
+                        Ok(ProwlarrRefreshResult {
+                            imported: sync.imported,
+                            deactivated: sync.deactivated,
+                        })
+                    }
+                    Err(error) => {
+                        self.metrics.record_prowlarr_refresh(
+                            source.source.name.as_str(),
+                            ProwlarrRefreshOutcome::Failed,
+                            elapsed_ms(started),
+                            0,
+                            0,
+                        );
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
+                self.metrics.record_prowlarr_refresh(
+                    source.source.name.as_str(),
+                    prowlarr_refresh_outcome(&error),
+                    elapsed_ms(started),
+                    0,
+                    0,
+                );
                 let state = prowlarr_error_dependency_state(&error, now_ms);
                 self.record_prowlarr_health(&source.source.name, state.clone(), now_ms)
                     .await?;
@@ -1001,6 +1042,15 @@ fn prowlarr_error_dependency_state(error: &ProwlarrRequestError, now_ms: i64) ->
     }
 }
 
+fn prowlarr_refresh_outcome(error: &ProwlarrRequestError) -> ProwlarrRefreshOutcome {
+    match error {
+        ProwlarrRequestError::HttpStatus { status, .. } if *status == 429 => {
+            ProwlarrRefreshOutcome::RateLimited
+        }
+        _ => ProwlarrRefreshOutcome::Failed,
+    }
+}
+
 fn prowlarr_error_retry_after(error: &ProwlarrRequestError, now_ms: i64) -> i64 {
     let policy = IndexerBackoffPolicy::default();
     match error {
@@ -1015,6 +1065,10 @@ fn prowlarr_error_retry_after(error: &ProwlarrRequestError, now_ms: i64) -> i64 
             policy.retry_after_deadline(now_ms, 0, None)
         }
     }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn indexer_error_is_unavailable(error: &TorznabRequestError) -> bool {
@@ -1767,6 +1821,90 @@ mod tests {
             Some(now_ms.saturating_add(3_600_000)),
             health[0].retry_after_ms
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_prowlarr_refresh_exports_metrics() {
+        let success_url = spawn_runtime_prowlarr_server(
+            Arc::new(AtomicUsize::new(0)),
+            StatusCode::OK,
+            prowlarr_catalog(),
+        )
+        .await;
+        let failed_url = spawn_runtime_prowlarr_server(
+            Arc::new(AtomicUsize::new(0)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "down",
+        )
+        .await;
+        let limited_url =
+            spawn_runtime_prowlarr_server_with_retry_after(Arc::new(AtomicUsize::new(0)), "60")
+                .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(success_url.clone(), true, false, "24h"),
+        );
+        config.indexers.prowlarr.insert(
+            "failed".to_owned(),
+            test_prowlarr_config(failed_url.clone(), true, false, "24h"),
+        );
+        config.indexers.prowlarr.insert(
+            "limited".to_owned(),
+            test_prowlarr_config(limited_url.clone(), true, false, "24h"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let source = DependencyName::new("main").unwrap();
+        repository
+            .sync_prowlarr_indexers(
+                &source,
+                &[ProwlarrIndexer {
+                    source: source.clone(),
+                    prowlarr_id: 202,
+                    name: DependencyName::new("OldMovies").unwrap(),
+                    url: SanitizedTorznabUrl::new("https://old.example/202/api").unwrap(),
+                    api_key: Some(ApiKey::new("old-secret").unwrap()),
+                    api_key_source: ApiKeySource::Direct,
+                    tags: Vec::new(),
+                }],
+                ProwlarrRemovePolicy::Deactivate,
+                100,
+            )
+            .await
+            .unwrap();
+
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let app = router(runtime.state.http.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("sporos_prowlarr_refresh_total{source=\"main\",outcome=\"succeeded\"} 1")
+        );
+        assert!(
+            text.contains("sporos_prowlarr_refresh_total{source=\"failed\",outcome=\"failed\"} 1")
+        );
+        assert!(text.contains(
+            "sporos_prowlarr_refresh_total{source=\"limited\",outcome=\"rate_limited\"} 1"
+        ));
+        assert!(text.contains("sporos_prowlarr_refresh_imported_total{source=\"main\"} 1"));
+        assert!(text.contains("sporos_prowlarr_refresh_deactivated_total{source=\"main\"} 1"));
+        assert!(!text.contains("prowlarr-secret"));
+        assert!(!text.contains(&success_url));
+        assert!(!text.contains(&failed_url));
+        assert!(!text.contains(&limited_url));
     }
 
     #[tokio::test]

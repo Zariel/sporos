@@ -186,6 +186,13 @@ pub struct IndexerRegistryRow {
     pub last_caps_refresh_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProwlarrSyncSummary {
+    pub registry: Vec<IndexerRegistryRow>,
+    pub imported: usize,
+    pub deactivated: u64,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SearchHistoryRow {
     pub local_item_id: LocalItemId,
@@ -1425,6 +1432,19 @@ impl Repository {
         remove_policy: ProwlarrRemovePolicy,
         now_ms: i64,
     ) -> Result<Vec<IndexerRegistryRow>, DatabaseError> {
+        Ok(self
+            .sync_prowlarr_indexers_with_summary(source, discovered, remove_policy, now_ms)
+            .await?
+            .registry)
+    }
+
+    pub async fn sync_prowlarr_indexers_with_summary(
+        &self,
+        source: &DependencyName,
+        discovered: &[ProwlarrIndexer],
+        remove_policy: ProwlarrRemovePolicy,
+        now_ms: i64,
+    ) -> Result<ProwlarrSyncSummary, DatabaseError> {
         let _span = info_span!(
             "indexers.prowlarr.sync",
             source = source.as_str(),
@@ -1436,6 +1456,8 @@ impl Repository {
             .await
             .map_err(|error| db_error("begin Prowlarr indexer sync transaction", error))?;
         let mut source_indexer_ids = BTreeSet::new();
+        let mut imported = 0_usize;
+        let mut deactivated = 0_u64;
         let mut discovered = discovered.iter().collect::<Vec<_>>();
         discovered.sort_by_key(|indexer| indexer.prowlarr_id);
         for indexer in &discovered {
@@ -1472,13 +1494,14 @@ impl Repository {
             )
             .await?
             {
-                sqlx::query(
+                let result = sqlx::query(
                     r#"
                     UPDATE indexers
                     SET enabled = 0, updated_at = ?
                     WHERE source_kind = 'prowlarr'
                       AND source_name = ?
                       AND source_indexer_id = ?
+                      AND enabled != 0
                     "#,
                 )
                 .bind(now_ms)
@@ -1487,6 +1510,7 @@ impl Repository {
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| db_error("disable duplicate Prowlarr indexer", error))?;
+                deactivated = deactivated.saturating_add(result.rows_affected());
                 continue;
             }
 
@@ -1539,15 +1563,16 @@ impl Repository {
             .execute(&mut *transaction)
             .await
             .map_err(|error| db_error("upsert Prowlarr indexer", error))?;
+            imported = imported.saturating_add(1);
         }
 
         if remove_policy == ProwlarrRemovePolicy::Deactivate {
             if source_indexer_ids.is_empty() {
-                sqlx::query(
+                let result = sqlx::query(
                     r#"
                     UPDATE indexers
                     SET enabled = 0, updated_at = ?
-                    WHERE source_kind = 'prowlarr' AND source_name = ?
+                    WHERE source_kind = 'prowlarr' AND source_name = ? AND enabled != 0
                     "#,
                 )
                 .bind(now_ms)
@@ -1555,22 +1580,25 @@ impl Repository {
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| db_error("disable removed Prowlarr indexers", error))?;
+                deactivated = deactivated.saturating_add(result.rows_affected());
             } else {
                 let mut query = QueryBuilder::new("UPDATE indexers SET enabled = 0, updated_at = ");
                 query.push_bind(now_ms);
                 query.push(" WHERE source_kind = 'prowlarr' AND source_name = ");
                 query.push_bind(source.as_str());
+                query.push(" AND enabled != 0");
                 query.push(" AND source_indexer_id NOT IN (");
                 let mut separated = query.separated(", ");
                 for source_indexer_id in &source_indexer_ids {
                     separated.push_bind(source_indexer_id);
                 }
                 separated.push_unseparated(")");
-                query
+                let result = query
                     .build()
                     .execute(&mut *transaction)
                     .await
                     .map_err(|error| db_error("disable removed Prowlarr indexers", error))?;
+                deactivated = deactivated.saturating_add(result.rows_affected());
             }
         }
 
@@ -1579,7 +1607,11 @@ impl Repository {
             .await
             .map_err(|error| db_error("commit Prowlarr indexer sync transaction", error))?;
 
-        self.indexer_registry_snapshot(1_000).await
+        Ok(ProwlarrSyncSummary {
+            registry: self.indexer_registry_snapshot(1_000).await?,
+            imported,
+            deactivated,
+        })
     }
 
     pub async fn indexer_registry_snapshot(
@@ -5067,8 +5099,8 @@ mod tests {
             test_prowlarr_indexer("main", 101, "Movies", "https://prowlarr.example/101/api");
         let second = test_prowlarr_indexer("main", 102, "TV", "https://prowlarr.example/102/api");
 
-        repository
-            .sync_prowlarr_indexers(
+        let initial = repository
+            .sync_prowlarr_indexers_with_summary(
                 &source,
                 &[first.clone(), second.clone()],
                 ProwlarrRemovePolicy::Deactivate,
@@ -5076,8 +5108,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(2, initial.imported);
+        assert_eq!(0, initial.deactivated);
         let removed = repository
-            .sync_prowlarr_indexers(
+            .sync_prowlarr_indexers_with_summary(
                 &source,
                 &[first.clone()],
                 ProwlarrRemovePolicy::Deactivate,
@@ -5085,14 +5119,29 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(1, removed.imported);
+        assert_eq!(1, removed.deactivated);
         let tv = removed
+            .registry
             .iter()
             .find(|indexer| indexer.source_indexer_id == "102")
             .unwrap();
         assert!(!tv.enabled);
 
+        let unchanged = repository
+            .sync_prowlarr_indexers_with_summary(
+                &source,
+                &[first.clone()],
+                ProwlarrRemovePolicy::Deactivate,
+                250,
+            )
+            .await
+            .unwrap();
+        assert_eq!(1, unchanged.imported);
+        assert_eq!(0, unchanged.deactivated);
+
         let reactivated = repository
-            .sync_prowlarr_indexers(
+            .sync_prowlarr_indexers_with_summary(
                 &source,
                 &[first, second],
                 ProwlarrRemovePolicy::Deactivate,
@@ -5100,7 +5149,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(2, reactivated.imported);
+        assert_eq!(0, reactivated.deactivated);
         let tv = reactivated
+            .registry
             .iter()
             .find(|indexer| indexer.source_indexer_id == "102")
             .unwrap();
