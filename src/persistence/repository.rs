@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Acquire, Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tokio::sync::mpsc;
 use tracing::{debug_span, info_span};
 
@@ -388,16 +388,12 @@ impl Repository {
         mut items: mpsc::Receiver<OwnedLocalInventoryMessage>,
     ) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
         let _span = info_span!("inventory.replace", source_type = scope.source_type());
-        let mut transaction = self
+        let mut connection = self
             .pool
-            .begin()
+            .acquire()
             .await
-            .map_err(|error| db_error("begin local inventory transaction", error))?;
-
-        if let LocalInventoryScope::Client { client_host } = &scope {
-            normalize_client_source_keys(&mut transaction, client_host).await?;
-        }
-        initialize_retained_keys(&mut transaction).await?;
+            .map_err(|error| db_error("acquire local inventory connection", error))?;
+        initialize_staged_local_inventory(&mut connection).await?;
 
         let mut upserted = 0usize;
         let mut finished = false;
@@ -414,13 +410,7 @@ impl Repository {
                 });
             }
 
-            upsert_local_item_with_files_in_transaction(
-                &mut transaction,
-                &batch.item,
-                &batch.files,
-            )
-            .await?;
-            insert_retained_key(&mut transaction, &source_key).await?;
+            stage_local_item_with_files(&mut connection, &batch.item, &batch.files).await?;
             upserted = upserted.saturating_add(1);
         }
         if !finished {
@@ -430,6 +420,17 @@ impl Repository {
             });
         }
 
+        let mut transaction = connection
+            .begin()
+            .await
+            .map_err(|error| db_error("begin local inventory transaction", error))?;
+
+        if let LocalInventoryScope::Client { client_host } = &scope {
+            normalize_client_source_keys(&mut transaction, client_host).await?;
+        }
+        initialize_retained_keys(&mut transaction).await?;
+        upsert_staged_local_inventory(&mut transaction).await?;
+        insert_staged_retained_keys(&mut transaction).await?;
         let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
 
         clear_retained_keys(&mut transaction).await?;
@@ -2645,6 +2646,253 @@ async fn insert_retained_key(
     Ok(())
 }
 
+async fn initialize_staged_local_inventory(
+    connection: &mut sqlx::pool::PoolConnection<Sqlite>,
+) -> Result<(), DatabaseError> {
+    for statement in [
+        "DROP TABLE IF EXISTS staged_local_inventory_items",
+        "DROP TABLE IF EXISTS staged_local_inventory_files",
+        r#"
+        CREATE TEMP TABLE staged_local_inventory_items (
+            source_type TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            info_hash TEXT,
+            path TEXT,
+            save_path TEXT,
+            total_size INTEGER NOT NULL,
+            mtime_ms INTEGER,
+            PRIMARY KEY (source_type, source_key)
+        ) WITHOUT ROWID
+        "#,
+        r#"
+        CREATE TEMP TABLE staged_local_inventory_files (
+            source_type TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime_ms INTEGER,
+            file_index INTEGER NOT NULL
+        )
+        "#,
+        r#"
+        CREATE INDEX staged_local_inventory_files_item_idx
+            ON staged_local_inventory_files (source_type, source_key)
+        "#,
+    ] {
+        sqlx::query(statement)
+            .execute(&mut **connection)
+            .await
+            .map_err(|error| db_error("initialize staged local inventory", error))?;
+    }
+
+    Ok(())
+}
+
+async fn stage_local_item_with_files(
+    connection: &mut sqlx::pool::PoolConnection<Sqlite>,
+    item: &LocalItem,
+    files: &[LocalFile],
+) -> Result<(), DatabaseError> {
+    let (source_type, source_key) = local_source(&item.source);
+    sqlx::query(
+        r#"
+        INSERT INTO staged_local_inventory_items (
+            source_type,
+            source_key,
+            title,
+            display_name,
+            media_type,
+            info_hash,
+            path,
+            save_path,
+            total_size,
+            mtime_ms
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (source_type, source_key) DO UPDATE SET
+            title = excluded.title,
+            display_name = excluded.display_name,
+            media_type = excluded.media_type,
+            info_hash = excluded.info_hash,
+            path = excluded.path,
+            save_path = excluded.save_path,
+            total_size = excluded.total_size,
+            mtime_ms = excluded.mtime_ms
+        "#,
+    )
+    .bind(&source_type)
+    .bind(&source_key)
+    .bind(item.title.as_str())
+    .bind(item.display_name.as_str())
+    .bind(media_type_key(item.media_type))
+    .bind(item.info_hash.as_ref().map(InfoHash::as_str))
+    .bind(item.path.as_ref().map(path_to_string))
+    .bind(item.save_path.as_ref().map(path_to_string))
+    .bind(i64_from_u64(
+        item.total_size.get(),
+        "local item total size",
+    )?)
+    .bind(item.mtime_ms)
+    .execute(&mut **connection)
+    .await
+    .map_err(|error| db_error("stage local item", error))?;
+
+    sqlx::query(
+        "DELETE FROM staged_local_inventory_files WHERE source_type = ? AND source_key = ?",
+    )
+    .bind(&source_type)
+    .bind(&source_key)
+    .execute(&mut **connection)
+    .await
+    .map_err(|error| db_error("replace staged local files", error))?;
+
+    for file in files {
+        sqlx::query(
+            r#"
+            INSERT INTO staged_local_inventory_files (
+                source_type,
+                source_key,
+                relative_path,
+                file_name,
+                size,
+                mtime_ms,
+                file_index
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&source_type)
+        .bind(&source_key)
+        .bind(path_to_string(&file.relative_path))
+        .bind(file.file_name.as_str())
+        .bind(i64_from_u64(file.size.get(), "local file size")?)
+        .bind(file.mtime_ms)
+        .bind(i64::from(file.file_index.get()))
+        .execute(&mut **connection)
+        .await
+        .map_err(|error| db_error("stage local file", error))?;
+    }
+
+    Ok(())
+}
+
+async fn upsert_staged_local_inventory(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DatabaseError> {
+    sqlx::query(
+        r#"
+        INSERT INTO local_items (
+            source_type,
+            source_key,
+            title,
+            display_name,
+            media_type,
+            info_hash,
+            path,
+            save_path,
+            total_size,
+            mtime_ms,
+            created_at,
+            updated_at
+        )
+        SELECT
+            source_type,
+            source_key,
+            title,
+            display_name,
+            media_type,
+            info_hash,
+            path,
+            save_path,
+            total_size,
+            mtime_ms,
+            unixepoch() * 1000,
+            unixepoch() * 1000
+        FROM staged_local_inventory_items
+        WHERE true
+        ON CONFLICT (source_type, source_key) DO UPDATE SET
+            title = excluded.title,
+            display_name = excluded.display_name,
+            media_type = excluded.media_type,
+            info_hash = excluded.info_hash,
+            path = excluded.path,
+            save_path = excluded.save_path,
+            total_size = excluded.total_size,
+            mtime_ms = excluded.mtime_ms,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("upsert staged local inventory", error))?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM local_files
+        WHERE item_id IN (
+            SELECT local_items.id
+            FROM local_items
+            INNER JOIN staged_local_inventory_items staged
+                ON staged.source_type = local_items.source_type
+               AND staged.source_key = local_items.source_key
+        )
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("replace staged local files", error))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO local_files (
+            item_id,
+            relative_path,
+            file_name,
+            size,
+            mtime_ms,
+            file_index
+        )
+        SELECT
+            local_items.id,
+            staged.relative_path,
+            staged.file_name,
+            staged.size,
+            staged.mtime_ms,
+            staged.file_index
+        FROM staged_local_inventory_files staged
+        INNER JOIN local_items
+            ON local_items.source_type = staged.source_type
+           AND local_items.source_key = staged.source_key
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("insert staged local files", error))?;
+
+    Ok(())
+}
+
+async fn insert_staged_retained_keys(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DatabaseError> {
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO retained_local_item_keys (source_key)
+        SELECT source_key
+        FROM staged_local_inventory_items
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("insert staged retained local item keys", error))?;
+
+    Ok(())
+}
+
 fn announce_dependency_schedule_action(
     row: &AnnounceDependencyScheduleRow,
     now_ms: i64,
@@ -3543,6 +3791,202 @@ mod tests {
         assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
         assert_eq!(1, existing_count);
         assert_eq!(0, partial_count);
+    }
+
+    #[tokio::test]
+    async fn failed_staged_inventory_commit_rolls_back_item_files_and_prune() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut existing = test_local_item("Original");
+        existing.source = LocalItemSource::DataRoot {
+            path: PathBuf::from("/media/existing"),
+        };
+        existing.info_hash = None;
+        existing.path = Some(PathBuf::from("/media/existing"));
+        let existing_file = LocalFile::new(
+            None,
+            PathBuf::from("existing.mkv"),
+            ByteSize::new(10),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let item_id = repository
+            .upsert_local_item_with_files(&existing, &[existing_file])
+            .await
+            .unwrap();
+
+        let mut prunable = test_local_item("Prunable");
+        prunable.source = LocalItemSource::DataRoot {
+            path: PathBuf::from("/media/prunable"),
+        };
+        prunable.info_hash = None;
+        prunable.path = Some(PathBuf::from("/media/prunable"));
+        let prunable_file = LocalFile::new(
+            None,
+            PathBuf::from("prunable.mkv"),
+            ByteSize::new(15),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        repository
+            .upsert_local_item_with_files(&prunable, &[prunable_file])
+            .await
+            .unwrap();
+
+        let mut staged = existing.clone();
+        staged.title = ItemTitle::new("Should Roll Back").unwrap();
+        let duplicate_a = LocalFile::new(
+            None,
+            PathBuf::from("duplicate-a.mkv"),
+            ByteSize::new(20),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let duplicate_b = LocalFile::new(
+            None,
+            PathBuf::from("duplicate-b.mkv"),
+            ByteSize::new(30),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                item: staged,
+                files: vec![duplicate_a, duplicate_b],
+            }))
+            .await
+            .unwrap();
+        sender
+            .send(OwnedLocalInventoryMessage::Finished)
+            .await
+            .unwrap();
+        drop(sender);
+
+        let result = repository
+            .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver)
+            .await;
+        let title: String = sqlx::query_scalar("SELECT title FROM local_items WHERE id = ?")
+            .bind(i64_from_u64(item_id.get(), "local item id").unwrap())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let existing_files = repository.local_files_for_item(item_id, 10).await.unwrap();
+        let prunable_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_items WHERE source_key = ?")
+                .bind("/media/prunable")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
+        assert_eq!("Original", title);
+        assert_eq!(1, existing_files.len());
+        assert_eq!(
+            PathBuf::from("existing.mkv"),
+            existing_files[0].relative_path
+        );
+        assert_eq!(1, prunable_count);
+    }
+
+    #[tokio::test]
+    async fn failed_staged_inventory_prune_rolls_back_item_files_and_prune() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut existing = test_local_item("Original");
+        existing.source = LocalItemSource::DataRoot {
+            path: PathBuf::from("/media/existing"),
+        };
+        existing.info_hash = None;
+        existing.path = Some(PathBuf::from("/media/existing"));
+        let existing_file = LocalFile::new(
+            None,
+            PathBuf::from("existing.mkv"),
+            ByteSize::new(10),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let item_id = repository
+            .upsert_local_item_with_files(&existing, &[existing_file])
+            .await
+            .unwrap();
+
+        let mut prunable = test_local_item("Prunable");
+        prunable.source = LocalItemSource::DataRoot {
+            path: PathBuf::from("/media/prunable"),
+        };
+        prunable.info_hash = None;
+        prunable.path = Some(PathBuf::from("/media/prunable"));
+        let prunable_file = LocalFile::new(
+            None,
+            PathBuf::from("prunable.mkv"),
+            ByteSize::new(15),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        repository
+            .upsert_local_item_with_files(&prunable, &[prunable_file])
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER abort_prunable_local_item_delete
+            BEFORE DELETE ON local_items
+            WHEN old.source_key = '/media/prunable'
+            BEGIN
+                SELECT RAISE(ABORT, 'abort prunable delete');
+            END
+            "#,
+        )
+        .execute(repository.pool())
+        .await
+        .unwrap();
+
+        let mut staged = existing.clone();
+        staged.title = ItemTitle::new("Should Roll Back").unwrap();
+        let staged_file = LocalFile::new(
+            None,
+            PathBuf::from("staged.mkv"),
+            ByteSize::new(20),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                item: staged,
+                files: vec![staged_file],
+            }))
+            .await
+            .unwrap();
+        sender
+            .send(OwnedLocalInventoryMessage::Finished)
+            .await
+            .unwrap();
+        drop(sender);
+
+        let result = repository
+            .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver)
+            .await;
+        let title: String = sqlx::query_scalar("SELECT title FROM local_items WHERE id = ?")
+            .bind(i64_from_u64(item_id.get(), "local item id").unwrap())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let existing_files = repository.local_files_for_item(item_id, 10).await.unwrap();
+        let prunable_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_items WHERE source_key = ?")
+                .bind("/media/prunable")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
+        assert_eq!("Original", title);
+        assert_eq!(1, existing_files.len());
+        assert_eq!(
+            PathBuf::from("existing.mkv"),
+            existing_files[0].relative_path
+        );
+        assert_eq!(1, prunable_count);
     }
 
     #[tokio::test]
