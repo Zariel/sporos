@@ -263,11 +263,20 @@ impl InventoryRefreshWorker {
             };
             if cancelled_by_shutdown {
                 cancelled.store(true, Ordering::Relaxed);
-                drop(replace);
-                let _ = scan_task.await;
-                return Err(InventoryRefreshError::Cancelled {
-                    message: "shutdown requested".to_owned(),
-                });
+                let replace_result = replace.await;
+                scan_task
+                    .await
+                    .map_err(|error| InventoryRefreshError::ScanWorkerFailed {
+                        message: error.to_string(),
+                    })?;
+                match replace_result {
+                    Ok(_) | Err(DatabaseError::IncompleteStream { .. }) => {
+                        return Err(InventoryRefreshError::Cancelled {
+                            message: "shutdown requested".to_owned(),
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             selected.ok_or_else(|| DatabaseError::Unavailable {
                 operation: "refresh inventory".to_owned(),
@@ -1621,18 +1630,11 @@ mod tests {
             fs::create_dir_all(&release).unwrap();
             write_file(&release.join("movie.mkv"), 10);
         }
-        let repository = Repository::connect(root.join("sporos.sqlite"))
-            .await
-            .unwrap();
+        let repository = Repository::connect_in_memory().await.unwrap();
         let send_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker =
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default())
                 .with_data_root_scan_send_attempts(send_attempts.clone());
-        let mut lock = repository.pool().acquire().await.unwrap();
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *lock)
-            .await
-            .unwrap();
         let (shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
         let scan_root = root.clone();
         let refresh = tokio::spawn(async move {
@@ -1659,9 +1661,21 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap_err();
-        sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
 
         assert!(matches!(error, InventoryRefreshError::Cancelled { .. }));
+        let staged_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM temp.staged_local_inventory_items")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let staged_file_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM temp.staged_local_inventory_files")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(0, staged_count);
+        assert_eq!(0, staged_file_count);
 
         fs::remove_dir_all(root).unwrap();
     }
