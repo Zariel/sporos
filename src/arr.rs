@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::StatusCode;
 use reqwest::header::{RETRY_AFTER, USER_AGENT};
+use reqwest::{StatusCode, redirect};
 use serde::Deserialize;
 
 use crate::config::{ArrInstanceConfig, ArrServicesConfig};
@@ -237,7 +237,10 @@ pub struct ArrHttpClient {
 impl ArrHttpClient {
     pub fn new(timeout: Duration) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(redirect::Policy::none())
+                .build()
+                .expect("redirect-disabled Arr HTTP client should build"),
             timeout,
             backoff: IndexerBackoffPolicy::default(),
         }
@@ -665,10 +668,13 @@ fn nonempty_string(value: Option<String>) -> Option<String> {
 mod tests {
     use std::collections::BTreeMap;
     use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     use axum::Router;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode as AxumStatusCode};
+    use axum::http::header::LOCATION;
+    use axum::http::{HeaderValue, Request, StatusCode as AxumStatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::get;
     use tokio::net::TcpListener;
@@ -798,6 +804,58 @@ mod tests {
         assert_eq!(Some("42"), ids.tvdb_id.as_deref());
         assert_eq!(Some("84"), ids.tvmaze_id.as_deref());
         assert_eq!(Some("tt123"), ids.imdb_id.as_deref());
+    }
+
+    #[tokio::test]
+    async fn client_does_not_forward_api_key_on_redirect() {
+        let saw_redirected_key = Arc::new(AtomicBool::new(false));
+        let target_saw_redirected_key = saw_redirected_key.clone();
+        let target_url = spawn_arr_server(move |request| {
+            let target_saw_redirected_key = target_saw_redirected_key.clone();
+            async move {
+                if request.headers().get("x-api-key").is_some() {
+                    target_saw_redirected_key.store(true, AtomicOrdering::Relaxed);
+                }
+                (AxumStatusCode::OK, "{}").into_response()
+            }
+        })
+        .await;
+        let redirect_url = target_url.clone();
+        let endpoint = endpoint(
+            ArrKind::Sonarr,
+            spawn_arr_server(move |_request| {
+                let redirect_url = redirect_url.clone();
+                async move {
+                    (
+                        AxumStatusCode::FOUND,
+                        [(
+                            LOCATION,
+                            HeaderValue::from_str(&format!("{redirect_url}/api/v3/parse")).unwrap(),
+                        )],
+                        "",
+                    )
+                        .into_response()
+                }
+            })
+            .await,
+        );
+        let client = ArrHttpClient::new(Duration::from_secs(5));
+
+        let error = client
+            .lookup_endpoint(
+                &endpoint,
+                MediaType::Episode,
+                &ItemTitle::new("Example.1080p.WEB-DL").unwrap(),
+                1_000,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArrRequestError::HttpStatus { status: 302, .. }
+        ));
+        assert!(!saw_redirected_key.load(AtomicOrdering::Relaxed));
     }
 
     #[tokio::test]
