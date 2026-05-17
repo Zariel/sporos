@@ -3575,7 +3575,7 @@ mod tests {
                     .uri("/v1/announcements")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"name":"Example","guid":"guid-1","download_url":"https://indexer.example/download","tracker":"tracker"}"#,
+                        r#"{"name":"Example","guid":"guid-1","download_url":"https://93.184.216.34/download","tracker":"tracker"}"#,
                     ))
                     .unwrap(),
             )

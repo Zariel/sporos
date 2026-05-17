@@ -504,7 +504,7 @@ async fn process_search_candidate(
             if shutdown.state().phase != ShutdownPhase::Running {
                 return Err("search workflow is shutting down".to_owned());
             }
-            let downloader = CandidateDownloadClient::new(Duration::from_secs(120));
+            let downloader = candidate_download_client(Duration::from_secs(120));
             let mut download_shutdown = shutdown.clone();
             let started = Instant::now();
             let cached = tokio::select! {
@@ -781,6 +781,7 @@ fn candidate_download_metric_outcome(error: &CandidateDownloadError) -> External
             ExternalOutcome::RateLimited
         }
         CandidateDownloadError::HttpStatus { .. }
+        | CandidateDownloadError::InvalidUrl { .. }
         | CandidateDownloadError::MagnetLink
         | CandidateDownloadError::Timeout
         | CandidateDownloadError::Request { .. }
@@ -850,7 +851,8 @@ fn candidate_download_is_dependency_failure(error: &CandidateDownloadError) -> b
         | CandidateDownloadError::Request { .. }
         | CandidateDownloadError::ResponseTooLarge { .. } => true,
         CandidateDownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
-        CandidateDownloadError::MagnetLink
+        CandidateDownloadError::InvalidUrl { .. }
+        | CandidateDownloadError::MagnetLink
         | CandidateDownloadError::InvalidContents { .. }
         | CandidateDownloadError::CacheWrite { .. } => false,
     }
@@ -868,7 +870,8 @@ fn candidate_download_retry_after(
         | CandidateDownloadError::HttpStatus { retry_after, .. } => {
             policy.retry_after_deadline(now_ms, consecutive_failures, *retry_after, jitter_key)
         }
-        CandidateDownloadError::MagnetLink
+        CandidateDownloadError::InvalidUrl { .. }
+        | CandidateDownloadError::MagnetLink
         | CandidateDownloadError::Timeout
         | CandidateDownloadError::Request { .. }
         | CandidateDownloadError::InvalidContents { .. }
@@ -886,7 +889,8 @@ fn candidate_download_error_is_unavailable(error: &CandidateDownloadError) -> bo
         CandidateDownloadError::Timeout
         | CandidateDownloadError::Request { .. }
         | CandidateDownloadError::ResponseTooLarge { .. } => true,
-        CandidateDownloadError::MagnetLink
+        CandidateDownloadError::InvalidUrl { .. }
+        | CandidateDownloadError::MagnetLink
         | CandidateDownloadError::InvalidContents { .. }
         | CandidateDownloadError::CacheWrite { .. } => false,
     }
@@ -894,6 +898,16 @@ fn candidate_download_error_is_unavailable(error: &CandidateDownloadError) -> bo
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(not(test))]
+fn candidate_download_client(timeout: Duration) -> CandidateDownloadClient {
+    CandidateDownloadClient::new(timeout)
+}
+
+#[cfg(test)]
+fn candidate_download_client(timeout: Duration) -> CandidateDownloadClient {
+    CandidateDownloadClient::allow_internal_for_tests(timeout)
 }
 
 async fn run_job_receiver(
@@ -1210,7 +1224,7 @@ async fn process_announce_work(
             dependency: None,
         };
     };
-    let downloader = CandidateDownloadClient::new(Duration::from_secs(120));
+    let downloader = candidate_download_client(Duration::from_secs(120));
     let mut download_shutdown = shutdown.clone();
     let started = Instant::now();
     let cached = tokio::select! {
@@ -1548,6 +1562,10 @@ fn classify_candidate_download_error(
         CandidateDownloadError::HttpStatus { status, .. } => AnnounceWorkOutcome::TerminalFailed {
             reason: AnnounceReason::InvalidRequest,
             redacted_message: format!("candidate download returned HTTP status {status}"),
+        },
+        CandidateDownloadError::InvalidUrl { .. } => AnnounceWorkOutcome::TerminalFailed {
+            reason: AnnounceReason::InvalidRequest,
+            redacted_message: error.to_string(),
         },
         CandidateDownloadError::MagnetLink => AnnounceWorkOutcome::TerminalFailed {
             reason: AnnounceReason::UnsupportedShape,
@@ -2037,39 +2055,28 @@ mod tests {
             .upsert_remote_candidate(&preexisting_indexer_candidate())
             .await
             .unwrap();
+        let id = AnnounceWorkId::new("ann_daemon_announce").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce",
+            "tracker.example",
+            &download_url,
+        )
+        .await;
         let runtime = AppRuntime::from_repository(config, repository.clone())
             .await
             .unwrap();
         let shutdown = runtime.state.shutdown.clone();
         let metrics = runtime.state.metrics.clone();
-        let app = router(runtime.state.http.clone());
         let handles = start_background_tasks(runtime).await.unwrap();
 
-        let accepted = app
-            .oneshot(json_post(
-                "/v1/announcements",
-                serde_json::json!({
-                    "name": "movie.mkv",
-                    "guid": "guid-announce",
-                    "download_url": download_url,
-                    "tracker": "tracker.example",
-                    "size": 10
-                }),
-            ))
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(accepted.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        let id = json["id"].as_str().unwrap();
-
-        wait_for_announce_status(&repository, id, "succeeded").await;
+        wait_for_announce_status(&repository, id.as_str(), "succeeded").await;
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
         let reason: String = sqlx::query_scalar("SELECT reason FROM announce_work WHERE id = ?")
-            .bind(id)
+            .bind(id.as_str())
             .fetch_one(repository.pool())
             .await
             .unwrap();
@@ -3715,6 +3722,8 @@ mod tests {
         tracker: &str,
         download_url: &str,
     ) {
+        let now_ms = unix_time_ms();
+        let expires_at_ms = now_ms.saturating_add(100_000);
         sqlx::query(
             r#"
             INSERT INTO announce_work (
@@ -3722,15 +3731,19 @@ mod tests {
                 title, download_url, redacted_download_url, status, reason,
                 attempt_count, next_attempt_at, expires_at
             )
-            VALUES (?, ?, 1, 1, ?, ?, 'movie.mkv', ?, ?, 'queued', 'accepted', 0, 1, 100000)
+            VALUES (?, ?, ?, ?, ?, ?, 'movie.mkv', ?, ?, 'queued', 'accepted', 0, ?, ?)
             "#,
         )
         .bind(id.as_str())
         .bind(format!("dedupe-{}", id.as_str()))
+        .bind(now_ms)
+        .bind(now_ms)
         .bind(tracker)
         .bind(guid)
         .bind(download_url)
         .bind(download_url)
+        .bind(now_ms)
+        .bind(expires_at_ms)
         .execute(repository.pool())
         .await
         .unwrap();

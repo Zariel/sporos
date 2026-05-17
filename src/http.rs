@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -32,6 +36,57 @@ use crate::secrets::CookieSecret;
 
 const WORKFLOW_BODY_LIMIT_BYTES: usize = 16 * 1024;
 
+type ResolveDownloadUrlFuture = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
+type ResolveDownloadUrlHost =
+    dyn Fn(String, u16) -> ResolveDownloadUrlFuture + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct AnnounceDownloadUrlResolver {
+    resolve: Arc<ResolveDownloadUrlHost>,
+}
+
+impl fmt::Debug for AnnounceDownloadUrlResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnnounceDownloadUrlResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnnounceDownloadUrlResolver {
+    fn system() -> Self {
+        Self {
+            resolve: Arc::new(|host, port| {
+                Box::pin(async move {
+                    Ok(tokio::net::lookup_host((host.as_str(), port))
+                        .await?
+                        .map(|address| address.ip())
+                        .collect())
+                })
+            }),
+        }
+    }
+
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<IpAddr>> {
+        (self.resolve)(host.to_owned(), port).await
+    }
+
+    #[cfg(test)]
+    fn from_static_hosts(hosts: BTreeMap<String, Vec<IpAddr>>) -> Self {
+        let hosts = Arc::new(hosts);
+        Self {
+            resolve: Arc::new(move |host, _port| {
+                let hosts = Arc::clone(&hosts);
+                Box::pin(async move {
+                    hosts.get(&host).cloned().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "test host not found")
+                    })
+                })
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpState {
     readiness: Arc<RwLock<ReadinessState>>,
@@ -41,6 +96,7 @@ pub struct HttpState {
     job_queue: Option<BoundedWorkQueue<JobRunWorkflowRequest>>,
     allowed_jobs: Option<Arc<BTreeSet<JobName>>>,
     announce_acceptor: Option<AnnounceAcceptor>,
+    announce_download_resolver: AnnounceDownloadUrlResolver,
     api_auth: Option<ApiAuth>,
     request_timeout: Duration,
     metrics: MetricsRegistry,
@@ -56,6 +112,7 @@ impl HttpState {
             job_queue: None,
             allowed_jobs: None,
             announce_acceptor: None,
+            announce_download_resolver: AnnounceDownloadUrlResolver::system(),
             api_auth: None,
             request_timeout: Duration::from_secs(5),
             metrics: MetricsRegistry::new(),
@@ -91,6 +148,12 @@ impl HttpState {
         config: AnnounceQueueConfig,
     ) -> Self {
         self.announce_acceptor = Some(AnnounceAcceptor { repository, config });
+        self
+    }
+
+    #[cfg(test)]
+    fn with_announce_download_resolver(mut self, resolver: AnnounceDownloadUrlResolver) -> Self {
+        self.announce_download_resolver = resolver;
         self
     }
 
@@ -348,7 +411,10 @@ struct AnnouncementRequestDto {
 }
 
 impl AnnouncementRequestDto {
-    fn try_into_workflow(self) -> Result<AnnouncementWorkflowRequest, ApiErrorResponse> {
+    async fn try_into_workflow(
+        self,
+        resolver: &AnnounceDownloadUrlResolver,
+    ) -> Result<AnnouncementWorkflowRequest, ApiErrorResponse> {
         Ok(AnnouncementWorkflowRequest {
             title: ItemTitle::new(self.name).map_err(|error| {
                 ApiErrorResponse::unprocessable(format!("invalid name: {error}"))
@@ -356,9 +422,7 @@ impl AnnouncementRequestDto {
             guid: CandidateGuid::new(self.guid).map_err(|error| {
                 ApiErrorResponse::unprocessable(format!("invalid guid: {error}"))
             })?,
-            download_url: DownloadUrl::new(self.download_url).map_err(|error| {
-                ApiErrorResponse::unprocessable(format!("invalid download_url: {error}"))
-            })?,
+            download_url: validate_announcement_download_url(self.download_url, resolver).await?,
             tracker: TrackerName::new(self.tracker).map_err(|error| {
                 ApiErrorResponse::unprocessable(format!("invalid tracker: {error}"))
             })?,
@@ -366,6 +430,118 @@ impl AnnouncementRequestDto {
             size: self.size.map(ByteSize::new),
         })
     }
+}
+
+async fn validate_announcement_download_url(
+    value: String,
+    resolver: &AnnounceDownloadUrlResolver,
+) -> Result<DownloadUrl, ApiErrorResponse> {
+    let parsed = reqwest::Url::parse(&value).map_err(|error| {
+        ApiErrorResponse::unprocessable(format!("invalid download_url: {error}"))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiErrorResponse::unprocessable(
+            "invalid download_url: scheme must be http or https",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ApiErrorResponse::unprocessable(
+            "invalid download_url: credentials are not allowed",
+        ));
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err(ApiErrorResponse::unprocessable(
+            "invalid download_url: host is required",
+        ));
+    };
+    if is_internal_download_host(host) {
+        return Err(ApiErrorResponse::unprocessable(
+            "invalid download_url: internal hosts are not allowed",
+        ));
+    }
+    if ip_host_literal(host).parse::<IpAddr>().is_err() {
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            ApiErrorResponse::unprocessable("invalid download_url: port is required")
+        })?;
+        let resolved = resolver.resolve(host, port).await.map_err(|error| {
+            ApiErrorResponse::unprocessable(format!(
+                "invalid download_url: host could not be resolved: {error}"
+            ))
+        })?;
+        if resolved.is_empty() {
+            return Err(ApiErrorResponse::unprocessable(
+                "invalid download_url: host did not resolve",
+            ));
+        }
+        if resolved.into_iter().any(is_internal_download_ip) {
+            return Err(ApiErrorResponse::unprocessable(
+                "invalid download_url: internal hosts are not allowed",
+            ));
+        }
+    }
+
+    DownloadUrl::new(value)
+        .map_err(|error| ApiErrorResponse::unprocessable(format!("invalid download_url: {error}")))
+}
+
+fn is_internal_download_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+
+    ip_host_literal(&host)
+        .parse::<IpAddr>()
+        .is_ok_and(is_internal_download_ip)
+}
+
+fn ip_host_literal(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+fn is_internal_download_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_internal_download_ipv4(ip),
+        IpAddr::V6(ip) => is_internal_download_ipv6(ip),
+    }
+}
+
+fn is_internal_download_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 224
+}
+
+fn is_internal_download_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(ipv4) = ip.to_ipv4_mapped() {
+        return is_internal_download_ipv4(ipv4);
+    }
+
+    let segments = ip.segments();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+        || (segments[0] == 0x0100 && segments[1] == 0)
+        || (segments[0] == 0x2001 && segments[1] < 0x0200)
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || segments[0] == 0x2002
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] & 0xff00) == 0xff00
 }
 
 #[derive(Debug, Deserialize)]
@@ -587,7 +763,10 @@ async fn post_announcement(
         Ok(request) => request,
         Err(response) => return response,
     };
-    let request = match request.try_into_workflow() {
+    let request = match request
+        .try_into_workflow(&state.announce_download_resolver)
+        .await
+    {
         Ok(request) => request,
         Err(error) => {
             state
@@ -1410,6 +1589,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announcement_endpoint_rejects_unsafe_download_urls_before_persistence() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let app = announce_app_with_resolver(
+            repository.clone(),
+            AnnounceQueueConfig::default(),
+            AnnounceDownloadUrlResolver::from_static_hosts(BTreeMap::from([
+                (
+                    "tracker.example".to_owned(),
+                    vec!["93.184.216.34".parse().unwrap()],
+                ),
+                (
+                    "metadata.example".to_owned(),
+                    vec!["169.254.169.254".parse().unwrap()],
+                ),
+                (
+                    "benchmark.example".to_owned(),
+                    vec!["198.18.0.1".parse().unwrap()],
+                ),
+            ])),
+        );
+        let invalid_urls = [
+            "not a url",
+            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+            "ftp://tracker.example/download",
+            "http://127.0.0.1/download",
+            "http://198.18.0.1/download",
+            "http://[2001:db8::1]/download",
+            "http://[::ffff:127.0.0.1]/download",
+            "http://metadata.example/download",
+            "http://benchmark.example/download",
+            "http://localhost/download",
+            "http://user:pass@tracker.example/download",
+        ];
+
+        for (index, download_url) in invalid_urls.into_iter().enumerate() {
+            let response = app
+                .clone()
+                .oneshot(json_post(
+                    "/v1/announcements",
+                    serde_json::json!({
+                        "name": "Example",
+                        "guid": format!("guid-{index}"),
+                        "download_url": download_url,
+                        "tracker": "tracker.example"
+                    }),
+                    None,
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(StatusCode::UNPROCESSABLE_ENTITY, response.status());
+        }
+
+        let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM announce_work")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(0, stored_count);
+    }
+
+    #[tokio::test]
     async fn announcement_endpoint_deduplicates_active_work() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let app = announce_app(repository.clone(), None, AnnounceQueueConfig::default());
@@ -1505,13 +1746,13 @@ mod tests {
         let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
         let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
         let app = router(
-            HttpState::new(ReadinessState::ready(), HealthRegistry::new()).with_workflow_queues(
-                WorkflowQueues {
+            HttpState::new(ReadinessState::ready(), HealthRegistry::new())
+                .with_workflow_queues(WorkflowQueues {
                     announcements: announcements.clone(),
                     searches,
                     jobs,
-                },
-            ),
+                })
+                .with_announce_download_resolver(test_download_resolver()),
         );
 
         let response = app
@@ -1876,7 +2117,8 @@ mod tests {
                 announcements,
                 searches,
                 jobs,
-            });
+            })
+            .with_announce_download_resolver(test_download_resolver());
         if let Some(token) = token {
             state = state.with_api_token(token);
         }
@@ -1904,12 +2146,41 @@ mod tests {
                 searches,
                 jobs,
             })
-            .with_announce_acceptor(repository, config);
+            .with_announce_acceptor(repository, config)
+            .with_announce_download_resolver(test_download_resolver());
         if let Some(token) = token {
             state = state.with_api_token(token);
         }
 
         router(state)
+    }
+
+    fn announce_app_with_resolver(
+        repository: Repository,
+        config: AnnounceQueueConfig,
+        resolver: AnnounceDownloadUrlResolver,
+    ) -> Router {
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(4));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
+        router(
+            HttpState::new(ReadinessState::ready(), HealthRegistry::new())
+                .with_workflow_queues(WorkflowQueues {
+                    announcements,
+                    searches,
+                    jobs,
+                })
+                .with_announce_acceptor(repository, config)
+                .with_announce_download_resolver(resolver),
+        )
+    }
+
+    fn test_download_resolver() -> AnnounceDownloadUrlResolver {
+        AnnounceDownloadUrlResolver::from_static_hosts(BTreeMap::from([(
+            "tracker.example".to_owned(),
+            vec!["93.184.216.34".parse().unwrap()],
+        )]))
     }
 
     fn json_post(path: &str, body: Value, authorization: Option<&str>) -> Request<Body> {

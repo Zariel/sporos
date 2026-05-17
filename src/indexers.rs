@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -797,13 +799,37 @@ impl std::error::Error for TorznabRequestError {}
 pub struct CandidateDownloadClient {
     client: reqwest::Client,
     timeout: Duration,
+    allow_internal_targets: bool,
 }
 
 impl CandidateDownloadClient {
     pub fn new(timeout: Duration) -> Self {
+        Self::with_resolver(timeout, Arc::new(SafeCandidateDownloadResolver::system()))
+    }
+
+    fn with_resolver(timeout: Duration, resolver: Arc<SafeCandidateDownloadResolver>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(redirect::Policy::none())
+                .no_proxy()
+                .dns_resolver(resolver)
+                .build()
+                .expect("safe candidate download HTTP client should build"),
             timeout,
+            allow_internal_targets: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_internal_for_tests(timeout: Duration) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .redirect(redirect::Policy::none())
+                .no_proxy()
+                .build()
+                .expect("test candidate download HTTP client should build"),
+            timeout,
+            allow_internal_targets: true,
         }
     }
 
@@ -815,6 +841,9 @@ impl CandidateDownloadClient {
     ) -> Result<CachedCandidateTorrent, CandidateDownloadError> {
         if candidate.download_url.as_str().starts_with("magnet:") {
             return Err(CandidateDownloadError::MagnetLink);
+        }
+        if !self.allow_internal_targets {
+            validate_candidate_download_url(&candidate.download_url)?;
         }
 
         let mut request = self
@@ -884,6 +913,159 @@ impl CandidateDownloadClient {
             cache_path,
         })
     }
+}
+
+#[derive(Debug)]
+struct SafeCandidateDownloadResolver {
+    hosts: Option<BTreeMap<String, Vec<SocketAddr>>>,
+}
+
+impl SafeCandidateDownloadResolver {
+    fn system() -> Self {
+        Self { hosts: None }
+    }
+
+    #[cfg(test)]
+    fn from_static_hosts(hosts: BTreeMap<String, Vec<SocketAddr>>) -> Self {
+        Self { hosts: Some(hosts) }
+    }
+}
+
+impl reqwest::dns::Resolve for SafeCandidateDownloadResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        if let Some(hosts) = self.hosts.as_ref() {
+            return safe_candidate_download_addrs(host, hosts.get(name.as_str()).cloned());
+        }
+
+        Box::pin(async move {
+            let lookup_host = host.clone();
+            let addrs = tokio::net::lookup_host((lookup_host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            safe_candidate_download_addresses(host, addrs.collect())
+        })
+    }
+}
+
+fn safe_candidate_download_addrs(
+    host: String,
+    addrs: Option<Vec<SocketAddr>>,
+) -> reqwest::dns::Resolving {
+    Box::pin(async move { safe_candidate_download_addresses(host, addrs.unwrap_or_default()) })
+}
+
+fn safe_candidate_download_addresses(
+    host: String,
+    addrs: Vec<SocketAddr>,
+) -> Result<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>> {
+    if addrs.is_empty() {
+        let error = io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("candidate download host `{host}` did not resolve"),
+        );
+        return Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+    }
+    if addrs
+        .iter()
+        .map(SocketAddr::ip)
+        .any(is_internal_candidate_download_ip)
+    {
+        let error = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("candidate download host `{host}` resolved to an internal address"),
+        );
+        return Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+    }
+
+    Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+}
+
+fn validate_candidate_download_url(url: &DownloadUrl) -> Result<(), CandidateDownloadError> {
+    let parsed =
+        reqwest::Url::parse(url.as_str()).map_err(|error| CandidateDownloadError::InvalidUrl {
+            message: error.to_string(),
+        })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(CandidateDownloadError::InvalidUrl {
+            message: "scheme must be http or https".to_owned(),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(CandidateDownloadError::InvalidUrl {
+            message: "credentials are not allowed".to_owned(),
+        });
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err(CandidateDownloadError::InvalidUrl {
+            message: "host is required".to_owned(),
+        });
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(CandidateDownloadError::InvalidUrl {
+            message: "internal hosts are not allowed".to_owned(),
+        });
+    }
+    if ip_candidate_download_host_literal(&host)
+        .parse::<IpAddr>()
+        .is_ok_and(is_internal_candidate_download_ip)
+    {
+        return Err(CandidateDownloadError::InvalidUrl {
+            message: "internal hosts are not allowed".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn ip_candidate_download_host_literal(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+fn is_internal_candidate_download_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_internal_candidate_download_ipv4(ip),
+        IpAddr::V6(ip) => is_internal_candidate_download_ipv6(ip),
+    }
+}
+
+fn is_internal_candidate_download_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 224
+}
+
+fn is_internal_candidate_download_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(ipv4) = ip.to_ipv4_mapped() {
+        return is_internal_candidate_download_ipv4(ipv4);
+    }
+
+    let segments = ip.segments();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+        || (segments[0] == 0x0100 && segments[1] == 0)
+        || (segments[0] == 0x2001 && segments[1] < 0x0200)
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || segments[0] == 0x2002
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] & 0xff00) == 0xff00
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -971,6 +1153,9 @@ impl IndexerBackoffPolicy {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CandidateDownloadError {
+    InvalidUrl {
+        message: String,
+    },
     RateLimited {
         retry_after: Option<RetryAfter>,
     },
@@ -1010,6 +1195,9 @@ impl CandidateDownloadError {
 impl fmt::Display for CandidateDownloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidUrl { message } => {
+                write!(formatter, "invalid candidate download URL: {message}")
+            }
             Self::RateLimited { .. } => formatter.write_str("candidate download was rate limited"),
             Self::HttpStatus { status, .. } => {
                 write!(
@@ -2810,7 +2998,7 @@ mod tests {
         .await;
         let cache_dir = unique_temp_dir("candidate-cache");
         let candidate = test_candidate(&url);
-        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+        let client = test_candidate_download_client();
 
         let cached = client
             .download_and_cache(&candidate, &cache_dir, Some("sid=secret"))
@@ -2841,7 +3029,7 @@ mod tests {
         .await;
         let cache_dir = unique_temp_dir("candidate-cache-concurrent");
         let candidate = test_candidate(&url);
-        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+        let client = test_candidate_download_client();
 
         let downloads = tokio::join!(
             client.download_and_cache(&candidate, &cache_dir, None),
@@ -2932,7 +3120,7 @@ mod tests {
         );
         let magnet = test_candidate("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567");
         let cache_dir = unique_temp_dir("candidate-failures");
-        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+        let client = test_candidate_download_client();
 
         assert!(matches!(
             client
@@ -2985,7 +3173,7 @@ mod tests {
             .await,
         );
         let cache_dir = unique_temp_dir("candidate-magnet-redirect");
-        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+        let client = test_candidate_download_client();
 
         let error = client
             .download_and_cache(&redirect, &cache_dir, None)
@@ -3001,6 +3189,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_download_does_not_follow_internal_redirects() {
+        let reached_internal_target = Arc::new(AtomicBool::new(false));
+        let target_reached_internal_target = Arc::clone(&reached_internal_target);
+        let target_url = spawn_torznab_server(move |_request| {
+            let target_reached_internal_target = Arc::clone(&target_reached_internal_target);
+            async move {
+                target_reached_internal_target.store(true, AtomicOrdering::Relaxed);
+                (
+                    AxumStatusCode::OK,
+                    String::from_utf8(test_torrent_bytes()).unwrap(),
+                )
+                    .into_response()
+            }
+        })
+        .await;
+        let redirect = test_candidate(
+            &spawn_torznab_server(move |_request| {
+                let target_url = target_url.clone();
+                async move {
+                    (
+                        AxumStatusCode::FOUND,
+                        [(
+                            LOCATION,
+                            HeaderValue::from_str(&format!("{target_url}/download")).unwrap(),
+                        )],
+                        "",
+                    )
+                        .into_response()
+                }
+            })
+            .await,
+        );
+        let cache_dir = unique_temp_dir("candidate-internal-redirect");
+        let client = test_candidate_download_client();
+
+        let error = client
+            .download_and_cache(&redirect, &cache_dir, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CandidateDownloadError::HttpStatus { status: 302, .. }
+        ));
+        assert!(!reached_internal_target.load(AtomicOrdering::Relaxed));
+
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_rejects_internal_literal_urls_before_request() {
+        let reached_internal_target = Arc::new(AtomicBool::new(false));
+        let target_reached_internal_target = Arc::clone(&reached_internal_target);
+        let target_url = spawn_torznab_server(move |_request| {
+            let target_reached_internal_target = Arc::clone(&target_reached_internal_target);
+            async move {
+                target_reached_internal_target.store(true, AtomicOrdering::Relaxed);
+                (
+                    AxumStatusCode::OK,
+                    String::from_utf8(test_torrent_bytes()).unwrap(),
+                )
+                    .into_response()
+            }
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-internal-literal");
+        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+
+        for url in [
+            target_url,
+            "http://169.254.169.254/latest/meta-data".to_owned(),
+            "http://198.18.0.1/download".to_owned(),
+            "http://[2001:db8::1]/download".to_owned(),
+            "http://[::ffff:127.0.0.1]/download".to_owned(),
+        ] {
+            let error = client
+                .download_and_cache(&test_candidate(&url), &cache_dir, None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, CandidateDownloadError::InvalidUrl { .. }));
+        }
+        assert!(!reached_internal_target.load(AtomicOrdering::Relaxed));
+
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_rejects_internal_resolved_hosts() {
+        let cache_dir = unique_temp_dir("candidate-internal-dns");
+        let client = CandidateDownloadClient::with_resolver(
+            Duration::from_secs(5),
+            Arc::new(SafeCandidateDownloadResolver::from_static_hosts(
+                BTreeMap::from([(
+                    "rebind.example".to_owned(),
+                    vec!["198.18.0.1:0".parse().unwrap()],
+                )]),
+            )),
+        );
+
+        let error = client
+            .download_and_cache(
+                &test_candidate("https://rebind.example/download"),
+                &cache_dir,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CandidateDownloadError::Request { .. }));
+
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
     async fn candidate_download_rejects_oversized_torrent_response() {
         let url = spawn_torznab_server(|_request| async move {
             oversized_response(CANDIDATE_TORRENT_MAX_BYTES.saturating_add(1))
@@ -3008,7 +3311,7 @@ mod tests {
         .await;
         let cache_dir = unique_temp_dir("candidate-oversized");
         let candidate = test_candidate(&url);
-        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+        let client = test_candidate_download_client();
 
         let error = client
             .download_and_cache(&candidate, &cache_dir, None)
@@ -3032,7 +3335,7 @@ mod tests {
         );
         let cache_dir = unique_temp_dir("candidate-chunked-oversized");
         let candidate = test_candidate(&url);
-        let client = CandidateDownloadClient::new(Duration::from_secs(5));
+        let client = test_candidate_download_client();
 
         let error = client
             .download_and_cache(&candidate, &cache_dir, None)
@@ -3190,6 +3493,10 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}/api")
+    }
+
+    fn test_candidate_download_client() -> CandidateDownloadClient {
+        CandidateDownloadClient::allow_internal_for_tests(Duration::from_secs(5))
     }
 
     async fn spawn_prowlarr_server<F, Fut, R>(handler: F) -> String
