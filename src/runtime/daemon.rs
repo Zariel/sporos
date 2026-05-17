@@ -37,6 +37,7 @@ use crate::runtime::announce_worker::{
     classify_injection_result, classify_reverse_lookup_outcome, unix_time_ms,
 };
 use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
+use crate::runtime::backoff::fixed_retry_deadline_ms;
 use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
     InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
@@ -1504,7 +1505,9 @@ fn classify_candidate_download_error(
             reason: AnnounceReason::RetryAfter,
             next_attempt_at_ms: retry_after
                 .map(|retry_after| retry_after.deadline_ms(now_ms))
-                .unwrap_or_else(|| now_ms.saturating_add(outcome_config().retry_delay_ms)),
+                .unwrap_or_else(|| {
+                    fixed_retry_deadline_ms(now_ms, outcome_config().retry_delay_ms, None)
+                }),
             error_class: "candidate_download".to_owned(),
             redacted_message: "candidate download is rate limited".to_owned(),
         },
@@ -1520,7 +1523,11 @@ fn classify_candidate_download_error(
         CandidateDownloadError::HttpStatus { status, .. } if status >= 500 => {
             AnnounceWorkOutcome::Retryable {
                 reason: AnnounceReason::TransientDependencyFailure,
-                next_attempt_at_ms: now_ms.saturating_add(outcome_config().retry_delay_ms),
+                next_attempt_at_ms: fixed_retry_deadline_ms(
+                    now_ms,
+                    outcome_config().retry_delay_ms,
+                    None,
+                ),
                 error_class: "candidate_download".to_owned(),
                 redacted_message: format!("candidate download returned HTTP status {status}"),
             }
@@ -1528,7 +1535,11 @@ fn classify_candidate_download_error(
         CandidateDownloadError::Timeout | CandidateDownloadError::Request { .. } => {
             AnnounceWorkOutcome::Retryable {
                 reason: AnnounceReason::TransientDependencyFailure,
-                next_attempt_at_ms: now_ms.saturating_add(outcome_config().retry_delay_ms),
+                next_attempt_at_ms: fixed_retry_deadline_ms(
+                    now_ms,
+                    outcome_config().retry_delay_ms,
+                    None,
+                ),
                 error_class: "candidate_download".to_owned(),
                 redacted_message: error.to_string(),
             }
@@ -1548,7 +1559,11 @@ fn classify_candidate_download_error(
         },
         CandidateDownloadError::CacheWrite { .. } => AnnounceWorkOutcome::Retryable {
             reason: AnnounceReason::TransientDependencyFailure,
-            next_attempt_at_ms: now_ms.saturating_add(outcome_config().retry_delay_ms),
+            next_attempt_at_ms: fixed_retry_deadline_ms(
+                now_ms,
+                outcome_config().retry_delay_ms,
+                None,
+            ),
             error_class: "candidate_cache".to_owned(),
             redacted_message: error.to_string(),
         },
@@ -1558,10 +1573,11 @@ fn classify_candidate_download_error(
 fn retryable_database_outcome(error: DatabaseError, now_ms: i64) -> AnnounceWorkOutcome {
     AnnounceWorkOutcome::Retryable {
         reason: AnnounceReason::TransientDependencyFailure,
-        next_attempt_at_ms: error
-            .retry_after_ms()
-            .filter(|retry_after| *retry_after > now_ms)
-            .unwrap_or_else(|| now_ms.saturating_add(outcome_config().retry_delay_ms)),
+        next_attempt_at_ms: fixed_retry_deadline_ms(
+            now_ms,
+            outcome_config().retry_delay_ms,
+            error.retry_after_ms(),
+        ),
         error_class: "database".to_owned(),
         redacted_message: error.to_string(),
     }
@@ -1570,7 +1586,7 @@ fn retryable_database_outcome(error: DatabaseError, now_ms: i64) -> AnnounceWork
 fn retryable_worker_outcome(dependency: &str, message: String, now_ms: i64) -> AnnounceWorkOutcome {
     AnnounceWorkOutcome::Retryable {
         reason: AnnounceReason::TransientDependencyFailure,
-        next_attempt_at_ms: now_ms.saturating_add(outcome_config().retry_delay_ms),
+        next_attempt_at_ms: fixed_retry_deadline_ms(now_ms, outcome_config().retry_delay_ms, None),
         error_class: dependency.to_owned(),
         redacted_message: message,
     }
@@ -1890,7 +1906,7 @@ mod tests {
         InfoHash, ItemTitle, LocalFile, LocalItem, LocalItemSource, MediaType, ReasonText,
         RemoteCandidate, TrackerName,
     };
-    use crate::indexers::{CategoryCaps, SearchCaps, TorznabCaps, TorznabLimits};
+    use crate::indexers::{CategoryCaps, RetryAfter, SearchCaps, TorznabCaps, TorznabLimits};
     use crate::persistence::repository::Repository;
     use crate::secrets::ApiKey;
     use axum::body::Body;
@@ -2469,6 +2485,24 @@ mod tests {
         let metrics = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
         assert!(metrics.contains(
             "sporos_indexer_requests_total{operation=\"download\",outcome=\"rate_limited\"} 1"
+        ));
+    }
+
+    #[test]
+    fn candidate_download_retry_after_zero_stays_due_now() {
+        let outcome = classify_candidate_download_error(
+            CandidateDownloadError::RateLimited {
+                retry_after: Some(RetryAfter::DelayMs(0)),
+            },
+            1_000,
+        );
+
+        assert!(matches!(
+            outcome,
+            AnnounceWorkOutcome::Retryable {
+                next_attempt_at_ms: 1_000,
+                ..
+            }
         ));
     }
 

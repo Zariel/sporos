@@ -1,5 +1,6 @@
 pub mod announce_worker;
 pub mod app;
+pub mod backoff;
 pub mod daemon;
 pub mod health;
 pub mod injection_worker;

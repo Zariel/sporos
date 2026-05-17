@@ -22,6 +22,7 @@ use crate::domain::{
 };
 use crate::matching::{TorznabSearchPlan, TorznabSearchType};
 use crate::persistence::torrent_cache::cached_torrent_path;
+use crate::runtime::backoff::{BackoffProbePolicy, JitteredBackoffPolicy};
 use crate::secrets::{ApiKey, sanitize_url_for_logging};
 use crate::torrent::parse_metafile;
 
@@ -937,11 +938,12 @@ impl IndexerBackoffPolicy {
         retry_after: Option<RetryAfter>,
         jitter_key: &str,
     ) -> i64 {
-        if let Some(retry_after) = retry_after {
-            return retry_after.deadline_ms(now_ms);
-        }
-
-        now_ms.saturating_add(self.exponential_delay_ms(consecutive_failures, jitter_key))
+        self.retry_policy().retry_deadline_ms(
+            now_ms,
+            consecutive_failures,
+            retry_after.map(|retry_after| retry_after.deadline_ms(now_ms)),
+            jitter_key,
+        )
     }
 
     pub fn should_probe(
@@ -951,39 +953,20 @@ impl IndexerBackoffPolicy {
         last_probe_ms: Option<i64>,
         explicit_retry_after: bool,
     ) -> bool {
-        if retry_after_ms.is_some_and(|retry_after| retry_after > now_ms) {
-            if explicit_retry_after {
-                return false;
-            }
-            return last_probe_ms.is_none_or(|last_probe| {
-                now_ms.saturating_sub(last_probe) >= self.recovery_probe_interval_ms
-            });
+        BackoffProbePolicy {
+            retry: self.retry_policy(),
+            recovery_probe_interval_ms: self.recovery_probe_interval_ms,
         }
-        true
+        .should_probe(now_ms, retry_after_ms, last_probe_ms, explicit_retry_after)
     }
 
-    fn exponential_delay_ms(self, consecutive_failures: u16, jitter_key: &str) -> i64 {
-        let shift = u32::from(consecutive_failures.min(6));
-        let multiplier = 1_i64.checked_shl(shift).unwrap_or(i64::MAX);
-        let delay = self.base_delay_ms.saturating_mul(multiplier);
-        let jitter = if self.jitter_ms <= 0 {
-            0
-        } else {
-            let seeded = stable_jitter_seed(jitter_key)
-                .saturating_add(u64::from(consecutive_failures).saturating_mul(97));
-            i64::try_from(seeded % u64::try_from(self.jitter_ms).unwrap_or(0)).unwrap_or(0)
-        };
-        delay.saturating_add(jitter).min(self.max_delay_ms)
+    fn retry_policy(self) -> JitteredBackoffPolicy {
+        JitteredBackoffPolicy {
+            base_delay_ms: self.base_delay_ms,
+            max_delay_ms: self.max_delay_ms,
+            jitter_ms: self.jitter_ms,
+        }
     }
-}
-
-fn stable_jitter_seed(value: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

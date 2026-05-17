@@ -7,6 +7,7 @@ use crate::config::SchedulingConfig;
 use crate::domain::{JobName, JobState};
 use crate::errors::DatabaseError;
 use crate::persistence::repository::{JobStateUpdate, Repository};
+use crate::runtime::backoff::fixed_retry_deadline_ms;
 use crate::runtime::queue::{
     BoundedWorkQueue, EnqueueError, QueueKind, WorkReceiver, bounded_work_queue,
 };
@@ -182,7 +183,11 @@ impl PersistedScheduler {
                                 state: JobState::Waiting,
                                 last_started_at_ms: None,
                                 last_finished_at_ms: None,
-                                next_run_at_ms: Some(now_ms + self.failure_backoff_ms),
+                                next_run_at_ms: Some(fixed_retry_deadline_ms(
+                                    now_ms,
+                                    self.failure_backoff_ms,
+                                    None,
+                                )),
                                 last_error: Some("scheduler queue unavailable"),
                             },
                         )
@@ -262,7 +267,11 @@ impl PersistedScheduler {
                             state: JobState::Waiting,
                             last_started_at_ms: None,
                             last_finished_at_ms: Some(now_ms),
-                            next_run_at_ms: Some(now_ms + self.failure_backoff_ms),
+                            next_run_at_ms: Some(fixed_retry_deadline_ms(
+                                now_ms,
+                                self.failure_backoff_ms,
+                                None,
+                            )),
                             last_error: Some("scheduler queue unavailable"),
                         },
                     )
@@ -307,7 +316,11 @@ impl PersistedScheduler {
                     state: JobState::Failed,
                     last_started_at_ms: None,
                     last_finished_at_ms: Some(finished_at_ms),
-                    next_run_at_ms: Some(finished_at_ms + self.failure_backoff_ms),
+                    next_run_at_ms: Some(fixed_retry_deadline_ms(
+                        finished_at_ms,
+                        self.failure_backoff_ms,
+                        None,
+                    )),
                     last_error: Some(error),
                 },
             )

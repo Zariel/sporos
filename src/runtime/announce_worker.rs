@@ -8,6 +8,7 @@ use crate::domain::{DecisionReason, InjectionOutcome, MatchDecision, ReasonText}
 use crate::errors::{ClassifyFailure, DatabaseError, FailureClass, WorkerError};
 use crate::matching::{PersistedCandidateAssessment, ReverseLookupOutcome};
 use crate::persistence::repository::{AnnounceRetryUpdate, Repository};
+use crate::runtime::backoff::fixed_retry_deadline_ms;
 use crate::runtime::injection_worker::InjectionWorkResult;
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 
@@ -153,9 +154,11 @@ pub fn classify_announce_result(
             reason: retry_after_ms.map_or(AnnounceReason::DependencyBackoff, |_| {
                 AnnounceReason::RetryAfter
             }),
-            next_attempt_at_ms: retry_after_ms
-                .filter(|retry_after| *retry_after > now_ms)
-                .unwrap_or_else(|| now_ms.saturating_add(config.retry_delay_ms.max(1))),
+            next_attempt_at_ms: fixed_retry_deadline_ms(
+                now_ms,
+                config.retry_delay_ms,
+                retry_after_ms,
+            ),
             dependency: Some((dependency_kind, dependency_name)),
         },
         AnnounceWorkflowResult::NoMatch => AnnounceWorkOutcome::Waiting {
@@ -171,9 +174,11 @@ pub fn classify_announce_result(
             reason: retry_after_ms.map_or(AnnounceReason::TransientDependencyFailure, |_| {
                 AnnounceReason::RetryAfter
             }),
-            next_attempt_at_ms: retry_after_ms
-                .filter(|retry_after| *retry_after > now_ms)
-                .unwrap_or_else(|| now_ms.saturating_add(config.retry_delay_ms.max(1))),
+            next_attempt_at_ms: fixed_retry_deadline_ms(
+                now_ms,
+                config.retry_delay_ms,
+                retry_after_ms,
+            ),
             error_class,
             redacted_message,
         },

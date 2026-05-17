@@ -1,19 +1,23 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU8;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::domain::{DependencyName, ReasonText};
 use crate::metrics::{ExternalOutcome, MetricsRegistry};
+use crate::runtime::backoff::{
+    JitteredBackoffPolicy, RetryOutcome, fixed_retry_deadline_ms, retry_with_backoff,
+};
 use crate::runtime::health::{DependencyKey, DependencyKind, HealthRegistry};
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
+use crate::runtime::shutdown::ShutdownSignal;
 use crate::secrets::{NotificationToken, SanitizedUrl, sanitize_url_for_logging};
 
 const USER_AGENT_VALUE: &str = concat!("Sporos/", env!("CARGO_PKG_VERSION"));
@@ -187,21 +191,53 @@ impl NotificationWorker {
     }
 
     pub async fn deliver(&self, job: &NotificationJob) -> NotificationDeliveryReport {
-        let mut attempts = Vec::new();
+        self.deliver_until_shutdown(job, None).await
+    }
 
-        for attempt in 1..=self.retry.max_attempts.get() {
-            let report = self.send_once(job).await;
-            let retryable = report.retryable;
-            let succeeded = report.outcome == NotificationDeliveryOutcome::Succeeded;
-            attempts.push(report);
-            if succeeded || !retryable || attempt == self.retry.max_attempts.get() {
-                break;
-            }
+    pub async fn deliver_until_shutdown(
+        &self,
+        job: &NotificationJob,
+        shutdown: Option<&ShutdownSignal>,
+    ) -> NotificationDeliveryReport {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
 
-            let delay = retry_delay(self.retry, attempt);
-            if !delay.is_zero() {
-                sleep(delay).await;
-            }
+        let retry_attempts = Arc::clone(&attempts);
+        let outcome = retry_with_backoff(
+            self.retry.max_attempts.get(),
+            self.retry_backoff_policy(),
+            job.endpoint.name.as_str(),
+            shutdown,
+            move |_attempt| {
+                let retry_attempts = Arc::clone(&retry_attempts);
+                async move {
+                    let report = self.send_once(job).await;
+                    let retryable = report.retryable;
+                    let succeeded = report.outcome == NotificationDeliveryOutcome::Succeeded;
+                    retry_attempts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(report);
+                    if succeeded || !retryable {
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                }
+            },
+            |_| true,
+        )
+        .await;
+        let mut attempts = attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if matches!(outcome, RetryOutcome::Shutdown) && attempts.is_empty() {
+            attempts.push(NotificationAttemptReport {
+                outcome: NotificationDeliveryOutcome::Failed,
+                latency_ms: 0,
+                retryable: true,
+                error: Some("notification delivery stopped during shutdown".to_owned()),
+            });
         }
 
         let final_attempt = attempts
@@ -218,6 +254,14 @@ impl NotificationWorker {
         NotificationDeliveryReport {
             attempts,
             final_outcome: final_attempt.outcome,
+        }
+    }
+
+    fn retry_backoff_policy(&self) -> JitteredBackoffPolicy {
+        JitteredBackoffPolicy {
+            base_delay_ms: i64::try_from(self.retry.initial_delay.as_millis()).unwrap_or(i64::MAX),
+            max_delay_ms: i64::try_from(self.retry.max_delay.as_millis()).unwrap_or(i64::MAX),
+            jitter_ms: 0,
         }
     }
 
@@ -424,20 +468,10 @@ fn retryable_status(status: StatusCode) -> bool {
     status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
 }
 
-fn retry_delay(policy: NotificationRetryPolicy, attempt: u8) -> Duration {
-    let multiplier = 1_u32
-        .checked_shl(u32::from(attempt.saturating_sub(1)))
-        .unwrap_or(u32::MAX);
-    policy
-        .initial_delay
-        .saturating_mul(multiplier)
-        .min(policy.max_delay)
-}
-
 fn retry_after_deadline(policy: NotificationRetryPolicy) -> i64 {
     let now = crate::runtime::announce_worker::unix_time_ms();
     let delay_ms = i64::try_from(policy.max_delay.as_millis()).unwrap_or(i64::MAX);
-    now.saturating_add(delay_ms.max(1))
+    fixed_retry_deadline_ms(now, delay_ms, None)
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -474,6 +508,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::health::DependencySummary;
+    use crate::runtime::shutdown::shutdown_channel;
 
     #[tokio::test]
     async fn delivery_posts_json_and_marks_endpoint_healthy() {
@@ -566,6 +601,38 @@ mod tests {
         run_notification_worker(worker, receiver).await;
 
         assert_eq!(2, server.requests().len());
+    }
+
+    #[tokio::test]
+    async fn delivery_stops_retry_sleep_on_shutdown() {
+        let server = TestServer::new(TestBehavior::Status(StatusCode::SERVICE_UNAVAILABLE)).await;
+        let health = HealthRegistry::new();
+        let worker = NotificationWorker::with_config(
+            health,
+            MetricsRegistry::new(),
+            Duration::from_secs(2),
+            NotificationRetryPolicy {
+                max_attempts: NonZeroU8::new(2).unwrap_or(NonZeroU8::MIN),
+                initial_delay: Duration::from_secs(60),
+                max_delay: Duration::from_secs(60),
+            },
+        );
+        let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
+        let (controller, signal) = shutdown_channel();
+
+        let handle =
+            tokio::spawn(async move { worker.deliver_until_shutdown(&job, Some(&signal)).await });
+        while server.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        controller.cancel_now("test shutdown").unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(1, report.attempts.len());
+        assert_eq!(1, server.requests().len());
     }
 
     #[test]
@@ -683,7 +750,7 @@ mod tests {
             TestBehavior::Ok => StatusCode::NO_CONTENT,
             TestBehavior::Status(status) => status,
             TestBehavior::Slow(delay) => {
-                sleep(delay).await;
+                tokio::time::sleep(delay).await;
                 StatusCode::NO_CONTENT
             }
         }

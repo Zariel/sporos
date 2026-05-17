@@ -37,6 +37,7 @@ use crate::metrics::{ExternalOperation, ExternalOutcome, MetricsRegistry, Prowla
 use crate::notifications::{NotificationJob, notification_queue};
 use crate::persistence::repository::{IndexerRegistryRow, IndexerSearchCapsRow, Repository};
 use crate::runtime::announce_worker::AnnounceWorker;
+use crate::runtime::backoff::stable_jitter_seed;
 use crate::runtime::health::{DependencyKind, HealthRegistry};
 use crate::runtime::injection_worker::{
     ClientInjectionRequest, ClientInventoryRefreshFuture, ClientResultFuture, InjectionClient,
@@ -997,9 +998,7 @@ fn prowlarr_refresh_jitter_ms(name: &DependencyName, interval_ms: i64) -> i64 {
     if max_jitter == 0 {
         return 0;
     }
-    let hash = name.as_str().bytes().fold(0_u64, |accumulator, byte| {
-        accumulator.wrapping_mul(31).wrapping_add(u64::from(byte))
-    });
+    let hash = stable_jitter_seed(name.as_str());
     i64::try_from(hash % u64::try_from(max_jitter).unwrap_or(1)).unwrap_or_default()
 }
 
