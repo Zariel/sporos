@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
@@ -11,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tracing::{Instrument, debug_span, info_span};
 
 use crate::announce::{
@@ -228,11 +230,14 @@ impl fmt::Debug for ApiAuth {
 
 impl ApiAuth {
     fn authorizes(&self, headers: &HeaderMap) -> bool {
-        let expected = format!("Bearer {}", self.bearer_token);
-        headers
+        let Some(token) = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            == Some(expected.as_str())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return false;
+        };
+        token.as_bytes().ct_eq(self.bearer_token.as_bytes()).into()
     }
 }
 
@@ -472,6 +477,14 @@ impl ApiErrorResponse {
             message: message.into(),
         }
     }
+
+    fn invalid_body(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: "invalid_request",
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiErrorResponse {
@@ -568,8 +581,12 @@ async fn status(State(state): State<HttpState>) -> impl IntoResponse {
 
 async fn post_announcement(
     State(state): State<HttpState>,
-    Json(request): Json<AnnouncementRequestDto>,
+    request: Result<Json<AnnouncementRequestDto>, JsonRejection>,
 ) -> Response {
+    let Json(request) = match workflow_json(request, &state, HttpRoute::Announcements) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     let request = match request.try_into_workflow() {
         Ok(request) => request,
         Err(error) => {
@@ -733,8 +750,12 @@ fn announcement_work_item(
 
 async fn post_search(
     State(state): State<HttpState>,
-    Json(request): Json<SearchRequestDto>,
+    request: Result<Json<SearchRequestDto>, JsonRejection>,
 ) -> Response {
+    let Json(request) = match workflow_json(request, &state, HttpRoute::Searches) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     let request = match request.try_into_workflow() {
         Ok(request) => request,
         Err(error) => {
@@ -845,6 +866,18 @@ async fn auth_middleware(
         .as_ref()
         .is_some_and(|auth| !auth.authorizes(request.headers()))
     {
+        if let Some(route) = workflow_route(request.uri().path()) {
+            if let Some(metric) = workflow_metric(route) {
+                state
+                    .metrics
+                    .record_workflow_enqueue(metric, WorkflowOutcome::Invalid);
+            }
+            state.metrics.record_http_request(
+                HttpMethod::Post,
+                route,
+                StatusCode::UNAUTHORIZED.as_u16(),
+            );
+        }
         return ApiErrorResponse::unauthorized("missing or invalid bearer token").into_response();
     }
 
@@ -857,11 +890,69 @@ async fn timeout_middleware(
     next: Next,
 ) -> Response {
     if state.request_timeout.is_zero() {
+        record_workflow_timeout(&state, request.uri().path());
         return ApiErrorResponse::timeout("request timed out").into_response();
     }
+    let path = request.uri().path().to_owned();
     match tokio::time::timeout(state.request_timeout, next.run(request)).await {
         Ok(response) => response,
-        Err(_elapsed) => ApiErrorResponse::timeout("request timed out").into_response(),
+        Err(_elapsed) => {
+            record_workflow_timeout(&state, &path);
+            ApiErrorResponse::timeout("request timed out").into_response()
+        }
+    }
+}
+
+fn workflow_json<T>(
+    request: Result<Json<T>, JsonRejection>,
+    state: &HttpState,
+    route: HttpRoute,
+) -> Result<Json<T>, Response> {
+    request.map_err(|rejection| {
+        if let Some(metric) = workflow_metric(route) {
+            state
+                .metrics
+                .record_workflow_enqueue(metric, WorkflowOutcome::Invalid);
+        }
+        state
+            .metrics
+            .record_http_request(HttpMethod::Post, route, rejection.status().as_u16());
+        ApiErrorResponse::invalid_body(rejection.status(), rejection.body_text()).into_response()
+    })
+}
+
+fn record_workflow_timeout(state: &HttpState, path: &str) {
+    if let Some(route) = workflow_route(path) {
+        if let Some(metric) = workflow_metric(route) {
+            state
+                .metrics
+                .record_workflow_enqueue(metric, WorkflowOutcome::Invalid);
+        }
+        state.metrics.record_http_request(
+            HttpMethod::Post,
+            route,
+            StatusCode::REQUEST_TIMEOUT.as_u16(),
+        );
+    }
+}
+
+fn workflow_route(path: &str) -> Option<HttpRoute> {
+    match path {
+        "/v1/announcements" => Some(HttpRoute::Announcements),
+        "/v1/searches" => Some(HttpRoute::Searches),
+        path if path.starts_with("/v1/jobs/") && path.ends_with("/runs") => {
+            Some(HttpRoute::JobRuns)
+        }
+        _ => None,
+    }
+}
+
+fn workflow_metric(route: HttpRoute) -> Option<WorkflowMetric> {
+    match route {
+        HttpRoute::Announcements => Some(WorkflowMetric::Announcement),
+        HttpRoute::Searches => Some(WorkflowMetric::Search),
+        HttpRoute::JobRuns => Some(WorkflowMetric::JobRun),
+        HttpRoute::Livez | HttpRoute::Readyz | HttpRoute::Metrics | HttpRoute::Status => None,
     }
 }
 
@@ -1026,6 +1117,7 @@ fn readiness_response(state: &HttpState) -> ReadinessResponse {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::Arc;
 
     use super::*;
     use axum::body::Body;
@@ -1037,6 +1129,22 @@ mod tests {
     use crate::persistence::repository::Repository;
     use crate::runtime::health::DependencyKind;
     use crate::runtime::queue::{QueueKind, WorkReceiver, bounded_work_queue};
+
+    #[test]
+    fn bearer_auth_validates_prefix_and_token() {
+        let auth = ApiAuth {
+            bearer_token: Arc::from("secret"),
+        };
+        let mut headers = HeaderMap::new();
+
+        assert!(!auth.authorizes(&headers));
+        headers.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
+        assert!(!auth.authorizes(&headers));
+        headers.insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert!(!auth.authorizes(&headers));
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert!(auth.authorizes(&headers));
+    }
 
     #[tokio::test]
     async fn livez_does_not_depend_on_external_health() {
@@ -1606,6 +1714,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_json_rejections_use_error_envelope_and_metrics() {
+        let (app, _announcements, _searches, _jobs) = workflow_app(None);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/searches")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_body = axum::body::to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics_text = std::str::from_utf8(&metrics_body).unwrap();
+
+        assert_eq!(StatusCode::BAD_REQUEST, status);
+        assert_eq!("invalid_request", json["error"]["code"]);
+        assert!(metrics_text.contains(
+            "sporos_http_requests_total{method=\"POST\",route=\"/v1/searches\",status=\"400\"} 1"
+        ));
+        assert!(
+            metrics_text.contains(
+                "sporos_workflow_enqueue_total{outcome=\"invalid\",workflow=\"search\"} 1"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn workflow_routes_enforce_request_timeout() {
         let (announcements, _announcement_receiver) =
             bounded_work_queue(QueueKind::Announcement, nonzero(4));
@@ -1631,6 +1785,78 @@ mod tests {
             .unwrap();
 
         assert_eq!(StatusCode::REQUEST_TIMEOUT, response.status());
+    }
+
+    #[tokio::test]
+    async fn workflow_auth_and_timeout_rejections_record_metrics() {
+        let (auth_app, _announcements, _searches, _jobs) = workflow_app(Some("secret"));
+        let unauthorized = auth_app
+            .clone()
+            .oneshot(json_post(
+                "/v1/searches",
+                serde_json::json!({ "query": "Example" }),
+                Some("Bearer wrong"),
+            ))
+            .await
+            .unwrap();
+        let auth_metrics = auth_app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let auth_body = axum::body::to_bytes(auth_metrics.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let auth_text = std::str::from_utf8(&auth_body).unwrap();
+
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(4));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
+        let timeout_app = router(
+            HttpState::new(ReadinessState::ready(), HealthRegistry::new())
+                .with_workflow_queues(WorkflowQueues {
+                    announcements,
+                    searches,
+                    jobs,
+                })
+                .with_request_timeout(Duration::ZERO),
+        );
+        let timeout = timeout_app
+            .clone()
+            .oneshot(json_post(
+                "/v1/searches",
+                serde_json::json!({ "query": "Example" }),
+                None,
+            ))
+            .await
+            .unwrap();
+        let timeout_metrics = timeout_app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let timeout_body = axum::body::to_bytes(timeout_metrics.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let timeout_text = std::str::from_utf8(&timeout_body).unwrap();
+
+        assert_eq!(StatusCode::UNAUTHORIZED, unauthorized.status());
+        assert!(auth_text.contains(
+            "sporos_http_requests_total{method=\"POST\",route=\"/v1/searches\",status=\"401\"} 1"
+        ));
+        assert_eq!(StatusCode::REQUEST_TIMEOUT, timeout.status());
+        assert!(timeout_text.contains(
+            "sporos_http_requests_total{method=\"POST\",route=\"/v1/searches\",status=\"408\"} 1"
+        ));
     }
 
     fn workflow_app(

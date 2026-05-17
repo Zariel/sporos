@@ -393,7 +393,7 @@ impl InjectionWorker {
             .ok_or(InjectionWorkerError::NoWritableClient)?;
         let target_name = dependency_name(target.descriptor())?;
         if should_stop() {
-            self.save_for_retry(&request)?;
+            self.save_for_retry(&request).await?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
@@ -427,7 +427,7 @@ impl InjectionWorker {
             }
             ExistingClientLookup::NotFound => {}
             ExistingClientLookup::Shutdown => {
-                self.save_for_retry(&request)?;
+                self.save_for_retry(&request).await?;
                 return Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
@@ -438,7 +438,7 @@ impl InjectionWorker {
         }
 
         if should_stop() {
-            self.save_for_retry(&request)?;
+            self.save_for_retry(&request).await?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
@@ -449,7 +449,7 @@ impl InjectionWorker {
 
         let link_result = self.prepare_links(&request).await?;
         if matches!(link_result, LinkPreparation::SourceIncomplete) {
-            self.save_for_retry(&request)?;
+            self.save_for_retry(&request).await?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::SourceIncomplete,
                 target_client: Some(target_name),
@@ -470,7 +470,8 @@ impl InjectionWorker {
             recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
         let pause_for_recheck = recheck_plan.should_recheck;
         if should_stop() {
-            self.save_for_retry(&request)?;
+            self.save_for_retry(&request).await?;
+            cleanup_prepared_roots(&created_roots)?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
@@ -480,7 +481,8 @@ impl InjectionWorker {
         }
         let mutation_result = {
             let Some(_guard) = lock_until_shutdown(&self.mutation_lock, shutdown).await else {
-                self.save_for_retry(&request)?;
+                self.save_for_retry(&request).await?;
+                cleanup_prepared_roots(&created_roots)?;
                 return Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
@@ -524,7 +526,8 @@ impl InjectionWorker {
 
         match mutation_result {
             InjectionMutationResult::SavedForShutdown => {
-                self.save_for_retry(&request)?;
+                self.save_for_retry(&request).await?;
+                cleanup_prepared_roots(&created_roots)?;
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
@@ -547,7 +550,7 @@ impl InjectionWorker {
                     if resume_outcome == ResumeLoopOutcome::StillChecking
                         && shutdown_requested(shutdown)
                     {
-                        self.save_for_retry(&request)?;
+                        self.save_for_retry(&request).await?;
                         saved_for_retry = true;
                     }
                 }
@@ -565,7 +568,7 @@ impl InjectionWorker {
                     let _ = self
                         .run_recheck_resume(target.as_ref(), &request, recheck_plan, shutdown)
                         .await?;
-                    self.save_for_retry(&request)?;
+                    self.save_for_retry(&request).await?;
                 }
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Injected,
@@ -575,8 +578,8 @@ impl InjectionWorker {
                 })
             }
             InjectionMutationResult::Injected(Err(error)) => {
-                let _ = cleanup_created_roots(&created_roots);
-                self.save_for_retry(&request)?;
+                self.save_for_retry(&request).await?;
+                let cleanup_result = cleanup_prepared_roots(&created_roots);
                 self.record_client_health(
                     target.descriptor(),
                     false,
@@ -584,6 +587,7 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
+                cleanup_result?;
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Failed,
                     target_client: Some(target_name),
@@ -592,7 +596,7 @@ impl InjectionWorker {
                 })
             }
             InjectionMutationResult::PrecheckFailed(error) => {
-                let _ = cleanup_created_roots(&created_roots);
+                let cleanup_result = cleanup_prepared_roots(&created_roots);
                 self.record_client_health(
                     target.descriptor(),
                     false,
@@ -600,6 +604,7 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
+                cleanup_result?;
                 Err(error.into())
             }
         }
@@ -891,47 +896,68 @@ impl InjectionWorker {
         let Some(source_root) = source_root(&request.local_item) else {
             return Ok(LinkPreparation::SourceIncomplete);
         };
-        let link_dir = select_link_dir(
-            source_root,
-            &request.link_dirs,
-            LinkDirOptions::new(link_type),
-        )?;
-        let destination_dir = link_destination_dir(
-            &link_dir,
-            request.candidate.tracker.as_str(),
-            request.flat_linking,
-        )?;
-        let outcome = match link_metafile_files(
-            source_root,
-            &request.local_files,
-            request.metafile.files(),
-            request.assessment.decision,
-            &destination_dir,
-            LinkFilesOptions::new(link_type),
-        ) {
-            Ok(outcome) => outcome,
-            Err(LinkActionError::MissingSource { .. })
-            | Err(LinkActionError::NoSourceMatch { .. }) => {
-                return Ok(LinkPreparation::SourceIncomplete);
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let source_root = source_root.to_path_buf();
+        let link_dirs = request.link_dirs.clone();
+        let tracker = request.candidate.tracker.as_str().to_owned();
+        let flat_linking = request.flat_linking;
+        let local_files = request.local_files.clone();
+        let metafile_files = request.metafile.files().to_vec();
+        let decision = request.assessment.decision;
+        let join_error_path = source_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let link_dir =
+                select_link_dir(&source_root, &link_dirs, LinkDirOptions::new(link_type))?;
+            let destination_dir = link_destination_dir(&link_dir, &tracker, flat_linking)?;
+            let outcome = match link_metafile_files(
+                &source_root,
+                &local_files,
+                &metafile_files,
+                decision,
+                &destination_dir,
+                LinkFilesOptions::new(link_type),
+            ) {
+                Ok(outcome) => outcome,
+                Err(LinkActionError::MissingSource { .. })
+                | Err(LinkActionError::NoSourceMatch { .. }) => {
+                    return Ok(LinkPreparation::SourceIncomplete);
+                }
+                Err(error) => return Err(error),
+            };
 
-        Ok(LinkPreparation::Ready {
-            save_path: Some(destination_dir),
-            linked_files: outcome.created_links.len(),
-            created_roots: outcome.created_roots,
+            Ok(LinkPreparation::Ready {
+                save_path: Some(destination_dir),
+                linked_files: outcome.created_links.len(),
+                created_roots: outcome.created_roots,
+            })
         })
+        .await
+        .map_err(|error| InjectionWorkerError::Io {
+            operation: "join link preparation task",
+            path: join_error_path,
+            source: std::io::Error::other(error.to_string()),
+        })?
+        .map_err(InjectionWorkerError::Link)
     }
 
-    fn save_for_retry(&self, request: &InjectionRequest) -> Result<(), InjectionWorkerError> {
+    async fn save_for_retry(&self, request: &InjectionRequest) -> Result<(), InjectionWorkerError> {
         let metadata = candidate_output_metadata(
             request.local_item.media_type,
             &request.candidate,
             &request.metafile,
         );
-        save_candidate_torrent(&request.output_dir, &metadata, &request.torrent_bytes)?;
-        Ok(())
+        let output_dir = request.output_dir.clone();
+        let torrent_bytes = request.torrent_bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            save_candidate_torrent(&output_dir, &metadata, &torrent_bytes)
+        })
+        .await
+        .map_err(|error| InjectionWorkerError::Io {
+            operation: "join saved torrent write task",
+            path: request.output_dir.clone(),
+            source: std::io::Error::other(error.to_string()),
+        })?
+        .map(|_| ())
+        .map_err(InjectionWorkerError::Save)
     }
 
     async fn record_client_health(
@@ -1143,6 +1169,17 @@ async fn lock_until_shutdown<'a>(
 
 fn shutdown_requested(shutdown: Option<&ShutdownSignal>) -> bool {
     shutdown.is_some_and(|signal| signal.state().phase != ShutdownPhase::Running)
+}
+
+fn cleanup_prepared_roots(roots: &[PathBuf]) -> Result<(), InjectionWorkerError> {
+    cleanup_created_roots(roots).map_err(|error| {
+        warn!(
+            root_count = roots.len(),
+            error = %error,
+            "failed to clean prepared injection links"
+        );
+        InjectionWorkerError::Link(error)
+    })
 }
 
 enum ClientCall<T> {
@@ -2022,6 +2059,40 @@ mod tests {
         assert!(result.saved_for_retry);
         assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
         assert_eq!(1, saved_torrent_count(&output_dir));
+    }
+
+    #[tokio::test]
+    async fn worker_process_until_shutdown_cleans_prepared_links() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-shutdown-link-cleanup");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_pending_inject());
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let output_dir = root.join("output");
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("links")];
+        fs::create_dir_all(&request.link_dirs[0]).unwrap();
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let (shutdown, signal) = shutdown_channel();
+        let handle =
+            tokio::spawn(async move { worker.process_until_shutdown(request, signal).await });
+
+        wait_for_calls(&target.inject_calls, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(InjectionOutcome::Saved, result.outcome);
+        assert!(result.saved_for_retry);
+        assert_eq!(1, result.linked_files);
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        assert!(!root.join("links/tracker.example/movie.mkv").exists());
     }
 
     #[tokio::test]

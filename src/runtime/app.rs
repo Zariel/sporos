@@ -227,20 +227,32 @@ impl AppState {
         let mut summary = ProwlarrRefreshSummary::default();
         let semaphore = Arc::new(Semaphore::new(PROWLARR_REFRESH_CONCURRENCY));
         let mut tasks = JoinSet::new();
+        let mut shutdown = self.shutdown_signal.clone();
         for source in sources.into_iter().cloned() {
             if self.shutdown_signal.state().phase != ShutdownPhase::Running {
                 summary.skipped_shutdown += 1;
                 break;
             }
-            let state = self.clone();
-            let semaphore = Arc::clone(&semaphore);
-            tasks.spawn(async move {
-                let _permit = semaphore.acquire_owned().await.map_err(|error| {
-                    ProwlarrRefreshError::Local(DatabaseError::Unavailable {
+            let permit = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    summary.skipped_shutdown += 1;
+                    break;
+                }
+                permit = semaphore.clone().acquire_owned() => {
+                    permit.map_err(|error| DatabaseError::Unavailable {
                         operation: "refresh Prowlarr source".to_owned(),
                         message: error.to_string(),
-                    })
-                })?;
+                    })?
+                }
+            };
+            if self.shutdown_signal.state().phase != ShutdownPhase::Running {
+                summary.skipped_shutdown += 1;
+                break;
+            }
+            let state = self.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
                 let required = source.required;
                 let result = state
                     .refresh_prowlarr_source_until_shutdown(&source, now_ms)

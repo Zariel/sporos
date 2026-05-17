@@ -435,6 +435,13 @@ impl Repository {
                 .await
                 .map_err(|error| db_error("initialize sqlite schema", error))?;
         }
+        reconcile_inline_schema(&self.pool).await?;
+        for statement in initial_schema_statements() {
+            self.pool
+                .execute(statement)
+                .await
+                .map_err(|error| db_error("initialize reconciled sqlite schema", error))?;
+        }
 
         Ok(())
     }
@@ -1643,6 +1650,13 @@ impl Repository {
 
         for indexer in configured {
             displace_non_static_indexer_conflicts(
+                &mut transaction,
+                indexer.name.as_str(),
+                indexer.url.as_str(),
+                now_ms,
+            )
+            .await?;
+            displace_static_url_rename_conflicts(
                 &mut transaction,
                 indexer.name.as_str(),
                 indexer.url.as_str(),
@@ -3895,6 +3909,217 @@ async fn upsert_local_item_with_files_in_transaction(
     Ok(item_id)
 }
 
+async fn reconcile_inline_schema(pool: &SqlitePool) -> Result<(), DatabaseError> {
+    if table_exists(pool, "indexers").await? {
+        let columns = table_columns(pool, "indexers").await?;
+        if !columns.contains("source_kind")
+            || !columns.contains("source_name")
+            || !columns.contains("source_indexer_id")
+            || indexers_has_legacy_url_unique(pool).await?
+        {
+            rebuild_indexers_table(pool).await?;
+        }
+    }
+    add_column_if_missing(
+        pool,
+        "dependency_health",
+        "failure_count",
+        "ALTER TABLE dependency_health ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn table_exists(pool: &SqlitePool, table: &str) -> Result<bool, DatabaseError> {
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(table)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| db_error("inspect sqlite schema", error))?;
+    Ok(exists > 0)
+}
+
+async fn table_columns(pool: &SqlitePool, table: &str) -> Result<BTreeSet<String>, DatabaseError> {
+    let statement = format!("PRAGMA table_info({table})");
+    let rows = sqlx::query(&statement)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| db_error("inspect sqlite table columns", error))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect())
+}
+
+async fn add_column_if_missing(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    statement: &str,
+) -> Result<(), DatabaseError> {
+    if !table_columns(pool, table).await?.contains(column) {
+        pool.execute(statement)
+            .await
+            .map_err(|error| db_error("reconcile sqlite schema", error))?;
+    }
+    Ok(())
+}
+
+async fn indexers_has_legacy_url_unique(pool: &SqlitePool) -> Result<bool, DatabaseError> {
+    let rows = sqlx::query("PRAGMA index_list(indexers)")
+        .fetch_all(pool)
+        .await
+        .map_err(|error| db_error("inspect indexer indexes", error))?;
+    for row in rows {
+        let unique: i64 = row.get("unique");
+        let partial: i64 = row.get("partial");
+        if unique == 0 || partial != 0 {
+            continue;
+        }
+        let name: String = row.get("name");
+        let statement = format!("PRAGMA index_info({name})");
+        let columns = sqlx::query(&statement)
+            .fetch_all(pool)
+            .await
+            .map_err(|error| db_error("inspect indexer index columns", error))?
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        if columns == ["url"] {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn rebuild_indexers_table(pool: &SqlitePool) -> Result<(), DatabaseError> {
+    let legacy_columns = table_columns(pool, "indexers").await?;
+    let source_kind = if legacy_columns.contains("source_kind") {
+        "COALESCE(source_kind, 'static')"
+    } else {
+        "'static'"
+    };
+    let source_name = if legacy_columns.contains("source_name") {
+        "COALESCE(source_name, '')"
+    } else {
+        "''"
+    };
+    let source_indexer_id = if legacy_columns.contains("source_indexer_id") {
+        "COALESCE(NULLIF(source_indexer_id, ''), name)"
+    } else {
+        "name"
+    };
+    let insert_statement = format!(
+        r#"
+        INSERT INTO indexers (
+            id,
+            name,
+            url,
+            source_kind,
+            source_name,
+            source_indexer_id,
+            api_key_source,
+            enabled,
+            capabilities_json,
+            state,
+            retry_after,
+            last_caps_refresh_at,
+            created_at,
+            updated_at
+        )
+        SELECT
+            id,
+            name,
+            url,
+            {source_kind},
+            {source_name},
+            {source_indexer_id},
+            api_key_source,
+            enabled,
+            capabilities_json,
+            state,
+            retry_after,
+            last_caps_refresh_at,
+            created_at,
+            updated_at
+        FROM indexers_legacy
+        "#
+    );
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|error| db_error("acquire indexer schema reconciliation connection", error))?;
+    sqlx::query("PRAGMA legacy_alter_table = ON")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| db_error("enable legacy sqlite table rename", error))?;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            db_error(
+                "disable sqlite foreign keys for schema reconciliation",
+                error,
+            )
+        })?;
+
+    let rebuild_result = async {
+        let mut transaction = connection
+            .begin()
+            .await
+            .map_err(|error| db_error("begin indexer schema reconciliation", error))?;
+        for statement in [
+            "ALTER TABLE indexers RENAME TO indexers_legacy",
+            r#"
+            CREATE TABLE indexers (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT 'static',
+                source_name TEXT NOT NULL DEFAULT '',
+                source_indexer_id TEXT NOT NULL DEFAULT '',
+                api_key_source TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                capabilities_json TEXT NOT NULL DEFAULT '{}',
+                state TEXT NOT NULL,
+                retry_after INTEGER,
+                last_caps_refresh_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE (name),
+                UNIQUE (source_kind, source_name, source_indexer_id)
+            )
+            "#,
+            insert_statement.as_str(),
+            "DROP TABLE indexers_legacy",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| db_error("reconcile indexer schema", error))?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit indexer schema reconciliation", error))
+    }
+    .await;
+    let restore_foreign_keys = sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| db_error("restore sqlite foreign keys", error));
+    let restore_legacy_alter_table = sqlx::query("PRAGMA legacy_alter_table = OFF")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| db_error("restore sqlite table rename behavior", error));
+
+    rebuild_result?;
+    restore_foreign_keys?;
+    restore_legacy_alter_table?;
+    Ok(())
+}
+
 async fn initialize_retained_keys(
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), DatabaseError> {
@@ -4840,6 +5065,32 @@ async fn displace_non_static_indexer_conflicts(
     Ok(())
 }
 
+async fn displace_static_url_rename_conflicts(
+    transaction: &mut Transaction<'_, Sqlite>,
+    name: &str,
+    url: &str,
+    now_ms: i64,
+) -> Result<(), DatabaseError> {
+    sqlx::query(
+        r#"
+        UPDATE indexers
+        SET enabled = 0,
+            updated_at = ?
+        WHERE source_kind = 'static'
+          AND source_indexer_id != ?
+          AND url = ?
+          AND enabled != 0
+        "#,
+    )
+    .bind(now_ms)
+    .bind(name)
+    .bind(url)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("displace renamed static indexer url conflict", error))?;
+    Ok(())
+}
+
 async fn resolve_active_url_conflicts(
     transaction: &mut Transaction<'_, Sqlite>,
     url: &str,
@@ -5090,6 +5341,235 @@ mod tests {
 
         repository.pool().close().await;
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_backed_repository_reconciles_pre_prowlarr_schema() {
+        let root = unique_temp_dir("sqlite-reconcile");
+        let database = root.join("sporos.db");
+        let setup_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&database)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        for statement in [
+            r#"
+            CREATE TABLE indexers (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                api_key_source TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                capabilities_json TEXT NOT NULL DEFAULT '{}',
+                state TEXT NOT NULL,
+                retry_after INTEGER,
+                last_caps_refresh_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE (name),
+                UNIQUE (url)
+            )
+            "#,
+            r#"
+            CREATE TABLE dependency_health (
+                dependency_type TEXT NOT NULL,
+                dependency_name TEXT NOT NULL,
+                state TEXT NOT NULL,
+                reason TEXT,
+                retry_after INTEGER,
+                checked_at INTEGER NOT NULL,
+                PRIMARY KEY (dependency_type, dependency_name)
+            )
+            "#,
+            r#"
+            INSERT INTO indexers (
+                name,
+                url,
+                api_key_source,
+                enabled,
+                capabilities_json,
+                state,
+                retry_after,
+                last_caps_refresh_at,
+                created_at,
+                updated_at
+            )
+            VALUES ('legacy', 'https://indexer.example/api', 'direct', 1, '{}',
+                    'unknown', NULL, NULL, 10, 10)
+            "#,
+            r#"
+            INSERT INTO dependency_health (
+                dependency_type,
+                dependency_name,
+                state,
+                reason,
+                retry_after,
+                checked_at
+            )
+            VALUES ('indexer', 'legacy', 'degraded', 'rate limited', 123, 20)
+            "#,
+        ] {
+            sqlx::query(statement).execute(&setup_pool).await.unwrap();
+        }
+        setup_pool.close().await;
+
+        let repository = Repository::connect(&database).await.unwrap();
+        let rows = repository.indexer_registry_snapshot(10).await.unwrap();
+        let legacy = rows
+            .iter()
+            .find(|indexer| indexer.name.as_str() == "legacy")
+            .unwrap();
+        let failure_count = repository
+            .dependency_failure_count("indexer", &DependencyName::new("legacy").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!("static", legacy.source_kind);
+        assert_eq!("", legacy.source_name);
+        assert_eq!("legacy", legacy.source_indexer_id);
+        assert_eq!(0, failure_count);
+
+        let renamed = repository
+            .sync_torznab_indexers(
+                &[test_indexer(
+                    "renamed",
+                    "https://indexer.example/api",
+                    ApiKeySource::Direct,
+                )],
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(renamed.iter().any(|indexer| {
+            indexer.name.as_str() == "renamed"
+                && indexer.url == "https://indexer.example/api"
+                && indexer.enabled
+        }));
+
+        repository.pool().close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_backed_repository_reconciles_partial_indexer_source_schema() {
+        let root = unique_temp_dir("sqlite-reconcile-partial-source");
+        let database = root.join("sporos.db");
+        let setup_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&database)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        for statement in [
+            r#"
+            CREATE TABLE indexers (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT 'static',
+                api_key_source TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                capabilities_json TEXT NOT NULL DEFAULT '{}',
+                state TEXT NOT NULL,
+                retry_after INTEGER,
+                last_caps_refresh_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE (name)
+            )
+            "#,
+            r#"
+            INSERT INTO indexers (
+                name,
+                url,
+                source_kind,
+                api_key_source,
+                enabled,
+                capabilities_json,
+                state,
+                retry_after,
+                last_caps_refresh_at,
+                created_at,
+                updated_at
+            )
+            VALUES ('partial', 'https://partial.example/api', 'static', 'direct', 1,
+                    '{}', 'unknown', NULL, NULL, 10, 10)
+            "#,
+        ] {
+            sqlx::query(statement).execute(&setup_pool).await.unwrap();
+        }
+        setup_pool.close().await;
+
+        let repository = Repository::connect(&database).await.unwrap();
+        let rows = repository.indexer_registry_snapshot(10).await.unwrap();
+        let partial = rows
+            .iter()
+            .find(|indexer| indexer.name.as_str() == "partial")
+            .unwrap();
+
+        assert_eq!("static", partial.source_kind);
+        assert_eq!("", partial.source_name);
+        assert_eq!("partial", partial.source_indexer_id);
+
+        repository.pool().close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn indexer_schema_rebuild_restores_pragmas_after_failure() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE indexers (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT 'static',
+                source_name TEXT NOT NULL DEFAULT '',
+                source_indexer_id TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL,
+                capabilities_json TEXT NOT NULL DEFAULT '{}',
+                state TEXT NOT NULL,
+                retry_after INTEGER,
+                last_caps_refresh_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE (name)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = rebuild_indexers_table(&pool).await.unwrap_err();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let legacy_alter_table: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert!(error.to_string().contains("api_key_source"));
+        assert_eq!(1, foreign_keys);
+        assert_eq!(0, legacy_alter_table);
     }
 
     #[test]

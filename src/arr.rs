@@ -143,10 +143,9 @@ pub struct SanitizedArrUrl(String);
 impl SanitizedArrUrl {
     pub fn new(value: impl AsRef<str>) -> Result<Self, ArrConfigError> {
         let value = value.as_ref();
-        let mut parsed =
-            reqwest::Url::parse(value).map_err(|error| ArrConfigError::InvalidUrl {
-                message: error.to_string(),
-            })?;
+        let parsed = reqwest::Url::parse(value).map_err(|error| ArrConfigError::InvalidUrl {
+            message: error.to_string(),
+        })?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(ArrConfigError::InvalidUrl {
                 message: "Arr URL must use http or https".to_owned(),
@@ -162,7 +161,11 @@ impl SanitizedArrUrl {
                 message: "Arr URL must not include query parameters".to_owned(),
             });
         }
-        parsed.set_fragment(None);
+        if parsed.fragment().is_some() {
+            return Err(ArrConfigError::InvalidUrl {
+                message: "Arr URL must not include fragments".to_owned(),
+            });
+        }
         let sanitized = parsed.as_str().trim_end_matches('/').to_owned();
         Ok(Self(sanitized))
     }
@@ -746,6 +749,10 @@ mod tests {
         ));
         assert!(matches!(
             SanitizedArrUrl::new("http://sonarr:8989?apikey=secret").unwrap_err(),
+            ArrConfigError::InvalidUrl { .. }
+        ));
+        assert!(matches!(
+            SanitizedArrUrl::new("http://sonarr:8989#apikey=secret").unwrap_err(),
             ArrConfigError::InvalidUrl { .. }
         ));
         assert!(matches!(

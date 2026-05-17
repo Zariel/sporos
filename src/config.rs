@@ -703,6 +703,7 @@ fn validate_arr_api_key_sources(
     instances: &BTreeMap<String, ArrInstanceConfig>,
 ) -> Result<(), ConfigError> {
     for (name, instance) in instances {
+        validate_arr_url(name, &instance.url)?;
         if !has_api_key_source(
             &instance.api_key,
             &instance.api_key_file,
@@ -712,6 +713,38 @@ fn validate_arr_api_key_sources(
         }
     }
 
+    Ok(())
+}
+
+fn validate_arr_url(name: &str, value: &str) -> Result<(), ConfigError> {
+    let parsed = reqwest::Url::parse(value).map_err(|error| ConfigError::InvalidField {
+        field: "indexers.arr.url",
+        reason: format!("{name} has invalid URL: {error}"),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ConfigError::InvalidField {
+            field: "indexers.arr.url",
+            reason: format!("{name} URL must use http or https"),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConfigError::InvalidField {
+            field: "indexers.arr.url",
+            reason: format!("{name} URL must not include credentials"),
+        });
+    }
+    if parsed.query().is_some() {
+        return Err(ConfigError::InvalidField {
+            field: "indexers.arr.url",
+            reason: format!("{name} URL must not include query parameters"),
+        });
+    }
+    if parsed.fragment().is_some() {
+        return Err(ConfigError::InvalidField {
+            field: "indexers.arr.url",
+            reason: format!("{name} URL must not include fragments"),
+        });
+    }
     Ok(())
 }
 
@@ -2038,6 +2071,33 @@ mod tests {
                 .contains("indexers.arr.radarr.api_key")
         );
         assert!(duplicate.to_string().contains("only one"));
+    }
+
+    #[test]
+    fn arr_instances_reject_runtime_invalid_urls() {
+        for (url, expected) in [
+            ("file:///var/lib/sonarr", "http or https"),
+            (
+                "http://user:pass@sonarr:8989",
+                "must not include credentials",
+            ),
+            ("http://sonarr:8989?apikey=secret", "query parameters"),
+            ("http://sonarr:8989#apikey=secret", "fragments"),
+        ] {
+            let error = parse_config(&format!(
+                r#"
+                [indexers.arr.sonarr.main]
+                url = "{url}"
+                api_key = "direct"
+                "#
+            ))
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{error} did not contain {expected}"
+            );
+        }
     }
 
     #[test]
