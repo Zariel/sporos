@@ -37,7 +37,6 @@ use crate::runtime::announce_worker::{
     classify_injection_result, classify_reverse_lookup_outcome, unix_time_ms,
 };
 use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
-use crate::runtime::backoff::fixed_retry_deadline_ms;
 use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
     InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
@@ -1190,8 +1189,19 @@ async fn process_announce_work(
                 redacted_message: "announce work was not found".to_owned(),
             };
         }
-        Err(error) => return retryable_database_outcome(error, now_ms),
+        Err(error) => {
+            return retryable_database_outcome(
+                error,
+                now_ms,
+                1,
+                id.as_str(),
+                announce_outcome_config(&state.config.announce),
+            );
+        }
     };
+    let outcome_config = announce_outcome_config(&state.config.announce);
+    let attempt_count = candidate.attempt_count;
+    let jitter_key = id.as_str();
     let config = ReverseLookupConfig::default();
     let initial = match reverse_lookup_and_assess_candidate(
         &state.repository,
@@ -1204,12 +1214,28 @@ async fn process_announce_work(
     .await
     {
         Ok(outcome) => outcome,
-        Err(error) => return classify_reverse_lookup_error(error, now_ms),
+        Err(error) => {
+            return classify_reverse_lookup_error(
+                error,
+                now_ms,
+                attempt_count,
+                jitter_key,
+                outcome_config,
+            );
+        }
     };
 
     match initial {
         ReverseLookupOutcome::NeedsTorrentDownload { .. } => {}
-        outcome => return classify_reverse_lookup_outcome(&outcome, now_ms, outcome_config()),
+        outcome => {
+            return classify_reverse_lookup_outcome(
+                &outcome,
+                now_ms,
+                attempt_count,
+                jitter_key,
+                outcome_config,
+            );
+        }
     }
 
     if shutdown.state().phase != ShutdownPhase::Running {
@@ -1222,7 +1248,7 @@ async fn process_announce_work(
     let Some(fetch) = candidate.cookie_or_fetch.as_ref() else {
         return AnnounceWorkOutcome::Waiting {
             reason: AnnounceReason::CandidateDownloading,
-            next_attempt_at_ms: now_ms.saturating_add(outcome_config().candidate_download_wait_ms),
+            next_attempt_at_ms: now_ms.saturating_add(outcome_config.candidate_download_wait_ms),
             dependency: None,
         };
     };
@@ -1260,23 +1286,60 @@ async fn process_announce_work(
                         record_candidate_download_failure(&state, &candidate.candidate, &error, now_ms)
                             .await
                     {
-                        return retryable_database_outcome(error, now_ms);
+                        return retryable_database_outcome(
+                            error,
+                            now_ms,
+                            attempt_count,
+                            jitter_key,
+                            outcome_config,
+                        );
                     }
-                    return classify_candidate_download_error(error, now_ms);
+                    return classify_candidate_download_error(
+                        error,
+                        now_ms,
+                        attempt_count,
+                        jitter_key,
+                        outcome_config,
+                    );
                 }
             }
         }
     };
     let torrent_bytes = match read_cached_torrent(&cached.cache_path).await {
         Ok(bytes) => bytes,
-        Err(error) => return retryable_worker_outcome("torrent-cache", error, now_ms),
+        Err(error) => {
+            return retryable_worker_outcome(
+                "torrent-cache",
+                error,
+                now_ms,
+                attempt_count,
+                jitter_key,
+                outcome_config,
+            );
+        }
     };
 
-    match process_downloaded_announce_candidate(state, cached, torrent_bytes, now_ms, shutdown)
-        .await
+    match process_downloaded_announce_candidate(
+        state,
+        cached,
+        torrent_bytes,
+        now_ms,
+        attempt_count,
+        jitter_key,
+        outcome_config,
+        shutdown,
+    )
+    .await
     {
         Ok(outcome) => outcome,
-        Err(error) => retryable_worker_outcome("announce", error, now_ms),
+        Err(error) => retryable_worker_outcome(
+            "announce",
+            error,
+            now_ms,
+            attempt_count,
+            jitter_key,
+            outcome_config,
+        ),
     }
 }
 
@@ -1285,6 +1348,9 @@ async fn process_downloaded_announce_candidate(
     cached: CachedCandidateTorrent,
     torrent_bytes: Vec<u8>,
     now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
+    outcome_config: AnnounceOutcomeConfig,
     shutdown: ShutdownSignal,
 ) -> Result<AnnounceWorkOutcome, String> {
     let config = ReverseLookupConfig::default();
@@ -1383,7 +1449,13 @@ async fn process_downloaded_announce_candidate(
             state
                 .metrics
                 .record_action(injection_metric_outcome(result.outcome));
-            return Ok(classify_injection_result(&result, now_ms, outcome_config()));
+            return Ok(classify_injection_result(
+                &result,
+                now_ms,
+                attempt_count,
+                jitter_key,
+                outcome_config,
+            ));
         }
         best_failure = Some(ReverseLookupOutcome::BestFailure {
             local_item: lookup.local_item,
@@ -1396,10 +1468,20 @@ async fn process_downloaded_announce_candidate(
             classify_reverse_lookup_outcome(
                 &ReverseLookupOutcome::NoCandidates,
                 now_ms,
-                outcome_config(),
+                attempt_count,
+                jitter_key,
+                outcome_config,
             )
         },
-        |outcome| classify_reverse_lookup_outcome(&outcome, now_ms, outcome_config()),
+        |outcome| {
+            classify_reverse_lookup_outcome(
+                &outcome,
+                now_ms,
+                attempt_count,
+                jitter_key,
+                outcome_config,
+            )
+        },
     ))
 }
 
@@ -1407,6 +1489,7 @@ async fn process_downloaded_announce_candidate(
 struct RuntimeAnnounceCandidate {
     candidate: RemoteCandidate,
     cookie_or_fetch: Option<RuntimeAnnounceFetch>,
+    attempt_count: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -1420,7 +1503,7 @@ async fn load_announce_candidate(
 ) -> Result<Option<RuntimeAnnounceCandidate>, DatabaseError> {
     let row = sqlx::query(
         r#"
-        SELECT title, tracker, guid, info_hash, size, download_url, cookie
+        SELECT title, tracker, guid, info_hash, size, download_url, cookie, attempt_count
         FROM announce_work
         WHERE id = ?
         "#,
@@ -1472,6 +1555,10 @@ async fn load_announce_candidate(
     Ok(Some(RuntimeAnnounceCandidate {
         candidate,
         cookie_or_fetch,
+        attempt_count: row
+            .get::<i64, _>("attempt_count")
+            .try_into()
+            .unwrap_or(u16::MAX),
     }))
 }
 
@@ -1503,9 +1590,17 @@ fn actionable_assessment(
     }
 }
 
-fn classify_reverse_lookup_error(error: ReverseLookupError, now_ms: i64) -> AnnounceWorkOutcome {
+fn classify_reverse_lookup_error(
+    error: ReverseLookupError,
+    now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
+    config: AnnounceOutcomeConfig,
+) -> AnnounceWorkOutcome {
     match error {
-        ReverseLookupError::Database { source } => retryable_database_outcome(source, now_ms),
+        ReverseLookupError::Database { source } => {
+            retryable_database_outcome(source, now_ms, attempt_count, jitter_key, config)
+        }
         ReverseLookupError::Assessment { source } => AnnounceWorkOutcome::TerminalFailed {
             reason: AnnounceReason::InvalidTorrentMetadata,
             redacted_message: format!("{source:?}"),
@@ -1516,6 +1611,9 @@ fn classify_reverse_lookup_error(error: ReverseLookupError, now_ms: i64) -> Anno
 fn classify_candidate_download_error(
     error: CandidateDownloadError,
     now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
+    config: AnnounceOutcomeConfig,
 ) -> AnnounceWorkOutcome {
     match error {
         CandidateDownloadError::RateLimited { retry_after } => AnnounceWorkOutcome::Retryable {
@@ -1523,7 +1621,7 @@ fn classify_candidate_download_error(
             next_attempt_at_ms: retry_after
                 .map(|retry_after| retry_after.deadline_ms(now_ms))
                 .unwrap_or_else(|| {
-                    fixed_retry_deadline_ms(now_ms, outcome_config().retry_delay_ms, None)
+                    config.retry_deadline_ms(now_ms, attempt_count, None, jitter_key)
                 }),
             error_class: "candidate_download".to_owned(),
             redacted_message: "candidate download is rate limited".to_owned(),
@@ -1540,10 +1638,11 @@ fn classify_candidate_download_error(
         CandidateDownloadError::HttpStatus { status, .. } if status >= 500 => {
             AnnounceWorkOutcome::Retryable {
                 reason: AnnounceReason::TransientDependencyFailure,
-                next_attempt_at_ms: fixed_retry_deadline_ms(
+                next_attempt_at_ms: config.retry_deadline_ms(
                     now_ms,
-                    outcome_config().retry_delay_ms,
+                    attempt_count,
                     None,
+                    jitter_key,
                 ),
                 error_class: "candidate_download".to_owned(),
                 redacted_message: format!("candidate download returned HTTP status {status}"),
@@ -1552,10 +1651,11 @@ fn classify_candidate_download_error(
         CandidateDownloadError::Timeout | CandidateDownloadError::Request { .. } => {
             AnnounceWorkOutcome::Retryable {
                 reason: AnnounceReason::TransientDependencyFailure,
-                next_attempt_at_ms: fixed_retry_deadline_ms(
+                next_attempt_at_ms: config.retry_deadline_ms(
                     now_ms,
-                    outcome_config().retry_delay_ms,
+                    attempt_count,
                     None,
+                    jitter_key,
                 ),
                 error_class: "candidate_download".to_owned(),
                 redacted_message: error.to_string(),
@@ -1580,41 +1680,53 @@ fn classify_candidate_download_error(
         },
         CandidateDownloadError::CacheWrite { .. } => AnnounceWorkOutcome::Retryable {
             reason: AnnounceReason::TransientDependencyFailure,
-            next_attempt_at_ms: fixed_retry_deadline_ms(
-                now_ms,
-                outcome_config().retry_delay_ms,
-                None,
-            ),
+            next_attempt_at_ms: config.retry_deadline_ms(now_ms, attempt_count, None, jitter_key),
             error_class: "candidate_cache".to_owned(),
             redacted_message: error.to_string(),
         },
     }
 }
 
-fn retryable_database_outcome(error: DatabaseError, now_ms: i64) -> AnnounceWorkOutcome {
+fn retryable_database_outcome(
+    error: DatabaseError,
+    now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
+    config: AnnounceOutcomeConfig,
+) -> AnnounceWorkOutcome {
     AnnounceWorkOutcome::Retryable {
         reason: AnnounceReason::TransientDependencyFailure,
-        next_attempt_at_ms: fixed_retry_deadline_ms(
+        next_attempt_at_ms: config.retry_deadline_ms(
             now_ms,
-            outcome_config().retry_delay_ms,
-            error.retry_after_ms(),
+            attempt_count,
+            error
+                .retry_after_ms()
+                .filter(|retry_after| *retry_after > now_ms),
+            jitter_key,
         ),
         error_class: "database".to_owned(),
         redacted_message: error.to_string(),
     }
 }
 
-fn retryable_worker_outcome(dependency: &str, message: String, now_ms: i64) -> AnnounceWorkOutcome {
+fn retryable_worker_outcome(
+    dependency: &str,
+    message: String,
+    now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
+    config: AnnounceOutcomeConfig,
+) -> AnnounceWorkOutcome {
     AnnounceWorkOutcome::Retryable {
         reason: AnnounceReason::TransientDependencyFailure,
-        next_attempt_at_ms: fixed_retry_deadline_ms(now_ms, outcome_config().retry_delay_ms, None),
+        next_attempt_at_ms: config.retry_deadline_ms(now_ms, attempt_count, None, jitter_key),
         error_class: dependency.to_owned(),
         redacted_message: message,
     }
 }
 
-fn outcome_config() -> AnnounceOutcomeConfig {
-    AnnounceOutcomeConfig::default()
+fn announce_outcome_config(config: &crate::announce::AnnounceQueueConfig) -> AnnounceOutcomeConfig {
+    AnnounceOutcomeConfig::from_queue_config(config)
 }
 
 fn domain_database_error(error: crate::domain::DomainError) -> DatabaseError {
@@ -2498,6 +2610,67 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn announce_retry_uses_configured_backoff_in_daemon_path() {
+        let root = unique_temp_dir("daemon-announce-configured-backoff");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let download_url =
+            spawn_daemon_torrent_status_server(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        config.announce.retry_initial_delay_secs = 5;
+        config.announce.retry_max_delay_secs = 20;
+        config.announce.retry_jitter_ratio = 0.0;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        let id = AnnounceWorkId::new("ann_configured_backoff").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-configured-backoff",
+            "tracker.example",
+            &download_url,
+        )
+        .await;
+        sqlx::query("UPDATE announce_work SET attempt_count = 4 WHERE id = ?")
+            .bind(id.as_str())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let before_ms = unix_time_ms();
+        let result = process_announce_work(
+            runtime.state.clone(),
+            id.clone(),
+            runtime.state.shutdown_signal.clone(),
+        )
+        .await;
+        let after_ms = unix_time_ms();
+
+        let AnnounceWorkOutcome::Retryable {
+            next_attempt_at_ms, ..
+        } = result
+        else {
+            panic!("expected retryable outcome");
+        };
+        assert!(
+            next_attempt_at_ms >= before_ms.saturating_add(20_000),
+            "retry deadline should include configured max delay"
+        );
+        assert!(
+            next_attempt_at_ms <= after_ms.saturating_add(20_000),
+            "retry deadline should come from the current processing time"
+        );
+    }
+
     #[test]
     fn candidate_download_retry_after_zero_stays_due_now() {
         let outcome = classify_candidate_download_error(
@@ -2505,6 +2678,9 @@ mod tests {
                 retry_after: Some(RetryAfter::DelayMs(0)),
             },
             1_000,
+            1,
+            "ann-rate-limited",
+            AnnounceOutcomeConfig::default(),
         );
 
         assert!(matches!(

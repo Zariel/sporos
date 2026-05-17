@@ -10,7 +10,7 @@ use crate::domain::{DecisionReason, InjectionOutcome, MatchDecision, ReasonText}
 use crate::errors::{ClassifyFailure, DatabaseError, FailureClass, WorkerError};
 use crate::matching::{PersistedCandidateAssessment, ReverseLookupOutcome};
 use crate::persistence::repository::{AnnounceRetryUpdate, Repository};
-use crate::runtime::backoff::fixed_retry_deadline_ms;
+use crate::runtime::backoff::stable_jitter_ms;
 use crate::runtime::injection_worker::InjectionWorkResult;
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 
@@ -91,11 +91,13 @@ pub enum AnnounceWorkOutcome {
     },
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnnounceOutcomeConfig {
     pub source_wait_ms: i64,
     pub candidate_download_wait_ms: i64,
-    pub retry_delay_ms: i64,
+    pub retry_initial_delay_ms: i64,
+    pub retry_max_delay_ms: i64,
+    pub retry_jitter_ratio: f64,
 }
 
 impl Default for AnnounceOutcomeConfig {
@@ -103,8 +105,54 @@ impl Default for AnnounceOutcomeConfig {
         Self {
             source_wait_ms: 5 * 60 * 1_000,
             candidate_download_wait_ms: 30 * 1_000,
-            retry_delay_ms: 60 * 1_000,
+            retry_initial_delay_ms: 60 * 1_000,
+            retry_max_delay_ms: 60 * 1_000,
+            retry_jitter_ratio: 0.0,
         }
+    }
+}
+
+impl AnnounceOutcomeConfig {
+    pub fn from_queue_config(config: &AnnounceQueueConfig) -> Self {
+        Self {
+            retry_initial_delay_ms: seconds_to_millis(config.retry_initial_delay_secs),
+            retry_max_delay_ms: seconds_to_millis(config.retry_max_delay_secs),
+            retry_jitter_ratio: config.retry_jitter_ratio,
+            ..Self::default()
+        }
+    }
+
+    pub fn retry_deadline_ms(
+        self,
+        now_ms: i64,
+        attempt_count: u16,
+        explicit_retry_after_ms: Option<i64>,
+        jitter_key: &str,
+    ) -> i64 {
+        if let Some(retry_after_ms) =
+            explicit_retry_after_ms.filter(|retry_after| *retry_after > now_ms)
+        {
+            return retry_after_ms;
+        }
+        now_ms.saturating_add(self.retry_delay_ms(attempt_count, jitter_key))
+    }
+
+    fn retry_delay_ms(self, attempt_count: u16, jitter_key: &str) -> i64 {
+        let retry_index = attempt_count.saturating_sub(1);
+        let shift = u32::from(retry_index).min(62);
+        let multiplier = 1_i64.checked_shl(shift).unwrap_or(i64::MAX);
+        let delay = self
+            .retry_initial_delay_ms
+            .max(1)
+            .saturating_mul(multiplier)
+            .min(self.retry_max_delay_ms.max(1));
+        delay
+            .saturating_add(stable_jitter_ms(
+                jitter_key,
+                retry_index,
+                jitter_ms(delay, self.retry_jitter_ratio),
+            ))
+            .min(self.retry_max_delay_ms.max(1))
     }
 }
 
@@ -144,6 +192,8 @@ pub enum AnnounceWorkerError {
 pub fn classify_announce_result(
     result: AnnounceWorkflowResult,
     now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
     config: AnnounceOutcomeConfig,
 ) -> AnnounceWorkOutcome {
     match result {
@@ -177,10 +227,11 @@ pub fn classify_announce_result(
             reason: retry_after_ms.map_or(AnnounceReason::DependencyBackoff, |_| {
                 AnnounceReason::RetryAfter
             }),
-            next_attempt_at_ms: fixed_retry_deadline_ms(
+            next_attempt_at_ms: config.retry_deadline_ms(
                 now_ms,
-                config.retry_delay_ms,
+                attempt_count,
                 retry_after_ms,
+                jitter_key,
             ),
             dependency: Some((dependency_kind, dependency_name)),
         },
@@ -197,10 +248,11 @@ pub fn classify_announce_result(
             reason: retry_after_ms.map_or(AnnounceReason::TransientDependencyFailure, |_| {
                 AnnounceReason::RetryAfter
             }),
-            next_attempt_at_ms: fixed_retry_deadline_ms(
+            next_attempt_at_ms: config.retry_deadline_ms(
                 now_ms,
-                config.retry_delay_ms,
+                attempt_count,
                 retry_after_ms,
+                jitter_key,
             ),
             error_class,
             redacted_message,
@@ -222,6 +274,8 @@ pub fn classify_announce_result(
 pub fn classify_injection_result(
     result: &InjectionWorkResult,
     now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
     config: AnnounceOutcomeConfig,
 ) -> AnnounceWorkOutcome {
     let workflow = match result.outcome {
@@ -250,12 +304,14 @@ pub fn classify_injection_result(
             redacted_message: "torrent client injection failed before side effects".to_owned(),
         },
     };
-    classify_announce_result(workflow, now_ms, config)
+    classify_announce_result(workflow, now_ms, attempt_count, jitter_key, config)
 }
 
 pub fn classify_reverse_lookup_outcome(
     outcome: &ReverseLookupOutcome,
     now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
     config: AnnounceOutcomeConfig,
 ) -> AnnounceWorkOutcome {
     let workflow = match outcome {
@@ -269,12 +325,14 @@ pub fn classify_reverse_lookup_outcome(
         }
         ReverseLookupOutcome::Matched { assessment, .. } => classify_matched_assessment(assessment),
     };
-    classify_announce_result(workflow, now_ms, config)
+    classify_announce_result(workflow, now_ms, attempt_count, jitter_key, config)
 }
 
 pub fn classify_worker_error(
     error: &WorkerError,
     now_ms: i64,
+    attempt_count: u16,
+    jitter_key: &str,
     config: AnnounceOutcomeConfig,
 ) -> AnnounceWorkOutcome {
     let workflow = match error.failure_class() {
@@ -296,7 +354,7 @@ pub fn classify_worker_error(
             redacted_message: error.to_string(),
         },
     };
-    classify_announce_result(workflow, now_ms, config)
+    classify_announce_result(workflow, now_ms, attempt_count, jitter_key, config)
 }
 
 fn classify_matched_assessment(
@@ -737,6 +795,19 @@ pub fn unix_time_ms() -> i64 {
 
 fn duration_ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn seconds_to_millis(seconds: u64) -> i64 {
+    i64::try_from(u128::from(seconds).saturating_mul(1_000)).unwrap_or(i64::MAX)
+}
+
+fn jitter_ms(delay_ms: i64, jitter_ratio: f64) -> i64 {
+    if jitter_ratio <= 0.0 || !jitter_ratio.is_finite() {
+        return 0;
+    }
+    (delay_ms.max(0) as f64 * jitter_ratio)
+        .round()
+        .clamp(0.0, i64::MAX as f64) as i64
 }
 
 fn retention_cleanup_batch_size(queue_config: &AnnounceQueueConfig) -> u16 {
@@ -1311,7 +1382,9 @@ mod tests {
         let config = AnnounceOutcomeConfig {
             source_wait_ms: 10,
             candidate_download_wait_ms: 20,
-            retry_delay_ms: 30,
+            retry_initial_delay_ms: 30,
+            retry_max_delay_ms: 30,
+            retry_jitter_ratio: 0.0,
         };
 
         assert_eq!(
@@ -1319,7 +1392,7 @@ mod tests {
                 reason: AnnounceReason::Injected,
                 outcome: "injected".to_owned(),
             },
-            classify_announce_result(AnnounceWorkflowResult::Injected, 100, config)
+            classify_announce_result(AnnounceWorkflowResult::Injected, 100, 1, "ann-1", config)
         );
         assert_eq!(
             AnnounceWorkOutcome::Waiting {
@@ -1332,6 +1405,8 @@ mod tests {
                     dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
                 },
                 100,
+                1,
+                "ann-1",
                 config,
             )
         );
@@ -1348,6 +1423,8 @@ mod tests {
                     retry_after_ms: Some(500),
                 },
                 100,
+                1,
+                "ann-1",
                 config,
             )
         );
@@ -1365,6 +1442,8 @@ mod tests {
                     redacted_message: "timeout".to_owned(),
                 },
                 100,
+                1,
+                "ann-1",
                 config,
             )
         );
@@ -1374,7 +1453,99 @@ mod tests {
                 next_attempt_at_ms: 110,
                 dependency: None,
             },
-            classify_announce_result(AnnounceWorkflowResult::NoMatch, 100, config)
+            classify_announce_result(AnnounceWorkflowResult::NoMatch, 100, 1, "ann-1", config)
+        );
+    }
+
+    #[test]
+    fn classifier_uses_configured_retry_backoff_and_preserves_retry_after() {
+        let config = AnnounceOutcomeConfig {
+            source_wait_ms: 10,
+            candidate_download_wait_ms: 20,
+            retry_initial_delay_ms: 5_000,
+            retry_max_delay_ms: 20_000,
+            retry_jitter_ratio: 0.0,
+        };
+
+        assert_eq!(
+            AnnounceWorkOutcome::Retryable {
+                reason: AnnounceReason::TransientDependencyFailure,
+                next_attempt_at_ms: 6_000,
+                error_class: "indexer".to_owned(),
+                redacted_message: "timeout".to_owned(),
+            },
+            classify_announce_result(
+                AnnounceWorkflowResult::RetryableDependency {
+                    retry_after_ms: None,
+                    error_class: "indexer".to_owned(),
+                    redacted_message: "timeout".to_owned(),
+                },
+                1_000,
+                1,
+                "ann-backoff",
+                config,
+            )
+        );
+        assert_eq!(
+            AnnounceWorkOutcome::Retryable {
+                reason: AnnounceReason::TransientDependencyFailure,
+                next_attempt_at_ms: 21_000,
+                error_class: "indexer".to_owned(),
+                redacted_message: "timeout".to_owned(),
+            },
+            classify_announce_result(
+                AnnounceWorkflowResult::RetryableDependency {
+                    retry_after_ms: None,
+                    error_class: "indexer".to_owned(),
+                    redacted_message: "timeout".to_owned(),
+                },
+                1_000,
+                4,
+                "ann-backoff",
+                config,
+            )
+        );
+        assert_eq!(
+            AnnounceWorkOutcome::Retryable {
+                reason: AnnounceReason::RetryAfter,
+                next_attempt_at_ms: 1_500,
+                error_class: "indexer".to_owned(),
+                redacted_message: "timeout".to_owned(),
+            },
+            classify_announce_result(
+                AnnounceWorkflowResult::RetryableDependency {
+                    retry_after_ms: Some(1_500),
+                    error_class: "indexer".to_owned(),
+                    redacted_message: "timeout".to_owned(),
+                },
+                1_000,
+                4,
+                "ann-backoff",
+                config,
+            )
+        );
+        let default_config = AnnounceOutcomeConfig::from_queue_config(&AnnounceQueueConfig {
+            retry_jitter_ratio: 0.0,
+            ..AnnounceQueueConfig::default()
+        });
+        assert_eq!(
+            AnnounceWorkOutcome::Retryable {
+                reason: AnnounceReason::TransientDependencyFailure,
+                next_attempt_at_ms: 3_601_000,
+                error_class: "indexer".to_owned(),
+                redacted_message: "timeout".to_owned(),
+            },
+            classify_announce_result(
+                AnnounceWorkflowResult::RetryableDependency {
+                    retry_after_ms: None,
+                    error_class: "indexer".to_owned(),
+                    redacted_message: "timeout".to_owned(),
+                },
+                1_000,
+                8,
+                "ann-backoff",
+                default_config,
+            )
         );
     }
 
@@ -1383,7 +1554,9 @@ mod tests {
         let config = AnnounceOutcomeConfig {
             source_wait_ms: 10,
             candidate_download_wait_ms: 20,
-            retry_delay_ms: 30,
+            retry_initial_delay_ms: 30,
+            retry_max_delay_ms: 30,
+            retry_jitter_ratio: 0.0,
         };
         let local_item = classified_local_item();
         let source_incomplete = ReverseLookupOutcome::BestFailure {
@@ -1413,14 +1586,14 @@ mod tests {
                 next_attempt_at_ms: 110,
                 dependency: None,
             },
-            classify_reverse_lookup_outcome(&source_incomplete, 100, config)
+            classify_reverse_lookup_outcome(&source_incomplete, 100, 1, "ann-1", config)
         );
         assert_eq!(
             AnnounceWorkOutcome::TerminalFailed {
                 reason: AnnounceReason::InvalidRequest,
                 redacted_message: "candidate rejected: BlockedRelease".to_owned(),
             },
-            classify_reverse_lookup_outcome(&rejected, 100, config)
+            classify_reverse_lookup_outcome(&rejected, 100, 1, "ann-1", config)
         );
         assert_eq!(
             AnnounceWorkOutcome::Waiting {
@@ -1428,7 +1601,7 @@ mod tests {
                 next_attempt_at_ms: 110,
                 dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
             },
-            classify_injection_result(&injection, 100, config)
+            classify_injection_result(&injection, 100, 1, "ann-1", config)
         );
 
         let ambiguous_failure = crate::runtime::injection_worker::InjectionWorkResult {
@@ -1444,7 +1617,7 @@ mod tests {
                 next_attempt_at_ms: 130,
                 dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
             },
-            classify_injection_result(&ambiguous_failure, 100, config)
+            classify_injection_result(&ambiguous_failure, 100, 1, "ann-1", config)
         );
     }
 
