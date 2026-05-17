@@ -128,16 +128,24 @@ where
         if shutdown.is_some_and(|signal| signal.state().phase != ShutdownPhase::Running) {
             return RetryOutcome::Shutdown;
         }
-        match make_future(attempt).await {
+        let result = if let Some(shutdown) = shutdown {
+            let mut attempt_shutdown = shutdown.clone();
+            tokio::select! {
+                biased;
+                _state = attempt_shutdown.cancelled() => return RetryOutcome::Shutdown,
+                result = make_future(attempt) => result,
+            }
+        } else {
+            make_future(attempt).await
+        };
+
+        match result {
             Ok(value) => return RetryOutcome::Completed(Ok(value)),
             Err(error) if !should_retry(&error) || attempt == attempts => {
                 return RetryOutcome::Completed(Err(error));
             }
             Err(_) => {
-                let delay = Duration::from_millis(
-                    u64::try_from(policy.delay_ms(u16::from(attempt), jitter_key).max(0))
-                        .unwrap_or_default(),
-                );
+                let delay = retry_delay_after_attempt(policy, attempt, jitter_key);
                 if delay.is_zero() {
                     continue;
                 }
@@ -155,6 +163,21 @@ where
         }
     }
     RetryOutcome::Exhausted
+}
+
+fn retry_delay_after_attempt(
+    policy: JitteredBackoffPolicy,
+    failed_attempt: u8,
+    jitter_key: &str,
+) -> Duration {
+    Duration::from_millis(
+        u64::try_from(
+            policy
+                .delay_ms(u16::from(failed_attempt.saturating_sub(1)), jitter_key)
+                .max(0),
+        )
+        .unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]
@@ -229,5 +252,71 @@ mod tests {
         .await;
 
         assert_eq!(RetryOutcome::Shutdown, result);
+    }
+
+    #[tokio::test]
+    async fn retry_with_backoff_stops_in_flight_attempt_on_shutdown() {
+        let (controller, signal) = shutdown_channel();
+        let (attempt_started, attempt_observed) = tokio::sync::oneshot::channel();
+        let attempt_started = std::sync::Arc::new(std::sync::Mutex::new(Some(attempt_started)));
+        let policy = JitteredBackoffPolicy {
+            base_delay_ms: 1_000,
+            max_delay_ms: 1_000,
+            jitter_ms: 0,
+        };
+
+        let handle = tokio::spawn({
+            let attempt_started = std::sync::Arc::clone(&attempt_started);
+            async move {
+                retry_with_backoff(
+                    3,
+                    policy,
+                    "test",
+                    Some(&signal),
+                    move |_attempt| {
+                        let attempt_started = std::sync::Arc::clone(&attempt_started);
+                        async move {
+                            if let Some(sender) = attempt_started
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take()
+                            {
+                                let _ = sender.send(());
+                            }
+                            std::future::pending::<Result<(), &str>>().await
+                        }
+                    },
+                    |_| true,
+                )
+                .await
+            }
+        });
+
+        attempt_observed.await.unwrap();
+        controller.cancel_now("test shutdown").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(RetryOutcome::Shutdown, result);
+    }
+
+    #[test]
+    fn retry_delay_after_first_failure_uses_base_delay() {
+        let policy = JitteredBackoffPolicy {
+            base_delay_ms: 50,
+            max_delay_ms: 1_000,
+            jitter_ms: 0,
+        };
+
+        assert_eq!(
+            Duration::from_millis(50),
+            retry_delay_after_attempt(policy, 1, "notification-main")
+        );
+        assert_eq!(
+            Duration::from_millis(100),
+            retry_delay_after_attempt(policy, 2, "notification-main")
+        );
     }
 }

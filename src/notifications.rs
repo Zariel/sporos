@@ -448,19 +448,39 @@ pub fn notification_queue(
 pub async fn run_notification_worker(
     worker: NotificationWorker,
     mut receiver: WorkReceiver<NotificationJob>,
+    mut shutdown: ShutdownSignal,
 ) {
-    while let Some(job) = receiver.recv().await {
-        let report = worker.deliver(&job).await;
-        if !report.succeeded() {
-            warn!(
-                endpoint = %job.endpoint.name,
-                url = %job.endpoint.sanitized_url(),
-                outcome = ?report.final_outcome,
-                attempts = report.attempts.len(),
-                "notification delivery failed after bounded retries"
-            );
+    loop {
+        tokio::select! {
+            biased;
+            _state = shutdown.cancelled() => {
+                receiver.close();
+                release_queued_notifications(&mut receiver).await;
+                break;
+            }
+            job = receiver.recv() => {
+                let Some(job) = job else {
+                    break;
+                };
+                let report = worker.deliver_until_shutdown(&job, Some(&shutdown)).await;
+                if !report.succeeded() {
+                    warn!(
+                        endpoint = %job.endpoint.name,
+                        url = %job.endpoint.sanitized_url(),
+                        outcome = ?report.final_outcome,
+                        attempts = report.attempts.len(),
+                        "notification delivery failed after bounded retries"
+                    );
+                }
+                receiver.mark_completed();
+            }
         }
-        receiver.mark_completed();
+    }
+}
+
+async fn release_queued_notifications(receiver: &mut WorkReceiver<NotificationJob>) {
+    while receiver.recv().await.is_some() {
+        receiver.mark_cancelled();
     }
 }
 
@@ -598,7 +618,8 @@ mod tests {
         queue.try_enqueue(job).unwrap();
         drop(queue);
 
-        run_notification_worker(worker, receiver).await;
+        let (_controller, signal) = shutdown_channel();
+        run_notification_worker(worker, receiver, signal).await;
 
         assert_eq!(2, server.requests().len());
     }
@@ -633,6 +654,41 @@ mod tests {
 
         assert_eq!(1, report.attempts.len());
         assert_eq!(1, server.requests().len());
+    }
+
+    #[tokio::test]
+    async fn worker_stops_retrying_delivery_on_shutdown() {
+        let server = TestServer::new(TestBehavior::Status(StatusCode::SERVICE_UNAVAILABLE)).await;
+        let health = HealthRegistry::new();
+        let worker = NotificationWorker::with_config(
+            health,
+            MetricsRegistry::new(),
+            Duration::from_secs(2),
+            NotificationRetryPolicy {
+                max_attempts: NonZeroU8::new(2).unwrap_or(NonZeroU8::MIN),
+                initial_delay: Duration::from_secs(60),
+                max_delay: Duration::from_secs(60),
+            },
+        );
+        let (queue, receiver) =
+            notification_queue(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN));
+        let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
+        queue.try_enqueue(job).unwrap();
+        let (controller, signal) = shutdown_channel();
+
+        let handle = tokio::spawn(run_notification_worker(worker, receiver, signal));
+        while server.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        controller.cancel_now("test shutdown").unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(1, server.requests().len());
+        assert_eq!(0, queue.stats().depth);
+        assert_eq!(1, queue.stats().completed);
     }
 
     #[test]

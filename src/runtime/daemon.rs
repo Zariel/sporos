@@ -191,6 +191,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         tokio::spawn(run_notification_worker(
             NotificationWorker::new(runtime.state.health.clone(), runtime.state.metrics.clone()),
             notifications,
+            runtime.state.shutdown_signal.clone(),
         )),
         BackgroundShutdownPolicy::AbortOnTimeout,
     ));
