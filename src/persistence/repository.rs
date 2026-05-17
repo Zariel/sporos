@@ -1412,6 +1412,29 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn record_running_jobs_waiting_on_shutdown(
+        &self,
+        now_ms: i64,
+    ) -> Result<u64, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET state = 'waiting',
+                last_finished_at = ?,
+                next_run_at = ?,
+                last_error = 'shutdown before job completed'
+            WHERE state = 'running'
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record running jobs waiting on shutdown", error))?;
+
+        Ok(result.rows_affected())
+    }
+
     pub async fn ready_jobs(&self, now_ms: i64, limit: u16) -> Result<Vec<JobName>, DatabaseError> {
         let rows = sqlx::query(
             r#"

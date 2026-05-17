@@ -2,9 +2,9 @@ use std::fmt;
 
 use tokio::sync::watch;
 
-use crate::domain::{JobState, ReasonText};
+use crate::domain::ReasonText;
 use crate::errors::DatabaseError;
-use crate::persistence::repository::{JobStateUpdate, Repository};
+use crate::persistence::repository::Repository;
 use crate::runtime::queue::WorkReceiver;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -144,26 +144,12 @@ pub async fn record_safe_job_shutdown(
     repository: &Repository,
     now_ms: i64,
 ) -> Result<ShutdownPersistenceSummary, ShutdownError> {
-    let jobs = repository.job_status_snapshot(1_000).await?;
-    let mut waiting_jobs = 0;
-
-    for job in jobs.iter().filter(|job| job.state == "running") {
-        repository
-            .record_job_status(
-                &job.name,
-                JobStateUpdate {
-                    state: JobState::Waiting,
-                    last_started_at_ms: None,
-                    last_finished_at_ms: Some(now_ms),
-                    next_run_at_ms: Some(now_ms),
-                    last_error: Some("shutdown before job completed"),
-                },
-            )
-            .await?;
-        waiting_jobs += 1;
-    }
-
-    Ok(ShutdownPersistenceSummary { waiting_jobs })
+    let waiting_jobs = repository
+        .record_running_jobs_waiting_on_shutdown(now_ms)
+        .await?;
+    Ok(ShutdownPersistenceSummary {
+        waiting_jobs: usize::try_from(waiting_jobs).unwrap_or(usize::MAX),
+    })
 }
 
 impl From<DatabaseError> for ShutdownError {

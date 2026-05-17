@@ -42,10 +42,13 @@ use crate::runtime::injection_worker::{
     InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
 use crate::runtime::scheduler::{ImmediateRunOutcome, ScheduledJobRun, parse_interval_ms};
-use crate::runtime::shutdown::{ShutdownController, ShutdownPhase, ShutdownSignal};
+use crate::runtime::shutdown::{
+    ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
+};
 use crate::torrent::parse_metafile;
 
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKGROUND_ABORT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 const ANNOUNCE_IDLE_SLEEP: Duration = Duration::from_millis(500);
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
@@ -109,6 +112,7 @@ struct BackgroundTask {
     name: &'static str,
     handle: JoinHandle<()>,
     shutdown_policy: BackgroundShutdownPolicy,
+    deadline_finalizer: Option<BackgroundDeadlineFinalizer>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -117,6 +121,15 @@ enum BackgroundShutdownPolicy {
     // Use for workers that may own external side effects and must record a
     // durable outcome instead of being dropped mid-operation.
     AwaitInFlight,
+}
+
+#[derive(Debug, Clone)]
+enum BackgroundDeadlineFinalizer {
+    SafeJobShutdown {
+        repository: Repository,
+    },
+    #[cfg(test)]
+    Pending,
 }
 
 impl BackgroundTask {
@@ -129,6 +142,7 @@ impl BackgroundTask {
             name,
             handle,
             shutdown_policy,
+            deadline_finalizer: None,
         }
     }
 
@@ -137,6 +151,11 @@ impl BackgroundTask {
             self.shutdown_policy,
             BackgroundShutdownPolicy::AbortOnTimeout
         )
+    }
+
+    fn with_deadline_finalizer(mut self, finalizer: BackgroundDeadlineFinalizer) -> Self {
+        self.deadline_finalizer = Some(finalizer);
+        self
     }
 }
 
@@ -256,24 +275,34 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         )),
         BackgroundShutdownPolicy::AwaitInFlight,
     ));
-    handles.push(BackgroundTask::new(
-        "scheduler-tick",
-        tokio::spawn(run_scheduler_tick_loop(
-            runtime.state.clone(),
-            SCHEDULER_TICK_INTERVAL,
-            runtime.state.shutdown_signal.clone(),
-        )),
-        BackgroundShutdownPolicy::AbortOnTimeout,
-    ));
-    handles.push(BackgroundTask::new(
-        "scheduler-receiver",
-        tokio::spawn(run_scheduler_receiver(
-            runtime.state.clone(),
-            scheduler,
-            runtime.state.shutdown_signal.clone(),
-        )),
-        BackgroundShutdownPolicy::AwaitInFlight,
-    ));
+    handles.push(
+        BackgroundTask::new(
+            "scheduler-tick",
+            tokio::spawn(run_scheduler_tick_loop(
+                runtime.state.clone(),
+                SCHEDULER_TICK_INTERVAL,
+                runtime.state.shutdown_signal.clone(),
+            )),
+            BackgroundShutdownPolicy::AbortOnTimeout,
+        )
+        .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
+            repository: runtime.state.repository.clone(),
+        }),
+    );
+    handles.push(
+        BackgroundTask::new(
+            "scheduler-receiver",
+            tokio::spawn(run_scheduler_receiver(
+                runtime.state.clone(),
+                scheduler,
+                runtime.state.shutdown_signal.clone(),
+            )),
+            BackgroundShutdownPolicy::AwaitInFlight,
+        )
+        .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
+            repository: runtime.state.repository.clone(),
+        }),
+    );
 
     Ok(handles)
 }
@@ -1928,71 +1957,114 @@ async fn stop_background_tasks(handles: Vec<BackgroundTask>) {
 }
 
 async fn stop_background_tasks_with_timeout(mut handles: Vec<BackgroundTask>, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+    let abort_cleanup_timeout = Duration::from_millis(
+        (timeout.as_millis() / 4).min(BACKGROUND_ABORT_CLEANUP_TIMEOUT.as_millis()) as u64,
+    );
+    let deadline = Instant::now() + timeout.saturating_sub(abort_cleanup_timeout);
     while !handles.is_empty() && Instant::now() < deadline {
         let mut index = 0;
         while index < handles.len() {
             if handles[index].handle.is_finished() {
                 let task = handles.swap_remove(index);
-                match task.handle.await {
-                    Ok(()) => {}
-                    Err(error) if error.is_cancelled() => {}
-                    Err(error) => {
-                        error!(
-                            task = task.name,
-                            error = %error,
-                            "background task failed during shutdown"
-                        );
-                    }
-                }
+                await_background_task(task).await;
             } else {
                 index += 1;
             }
         }
         if !handles.is_empty() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
         }
     }
 
-    let mut await_in_flight = Vec::new();
-    for task in handles {
+    let mut timed_out = handles;
+    for task in &timed_out {
         if task.should_abort_on_timeout() {
-            task.handle.abort();
             warn!(
                 task = task.name,
                 "background task did not stop before shutdown timeout; aborted"
             );
-            match task.handle.await {
-                Ok(()) => {}
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => {
-                    error!(
-                        task = task.name,
-                        error = %error,
-                        "background task failed during shutdown"
-                    );
-                }
-            }
         } else {
-            await_in_flight.push(task);
+            warn!(
+                task = task.name,
+                "background task did not finish in-flight work before shutdown deadline; aborted"
+            );
         }
     }
-
-    for task in await_in_flight {
-        warn!(
-            task = task.name,
-            "background task did not stop before shutdown timeout; waiting for in-flight work"
-        );
-        match task.handle.await {
-            Ok(()) => {}
-            Err(error) if error.is_cancelled() => {}
-            Err(error) => {
-                error!(
-                    task = task.name,
-                    error = %error,
-                    "background task failed during shutdown"
-                );
+    for task in &timed_out {
+        task.handle.abort();
+    }
+    let finalizer_timeout = abort_cleanup_timeout / 2;
+    let join_timeout = abort_cleanup_timeout.saturating_sub(finalizer_timeout);
+    let finalizer_result = tokio::time::timeout(finalizer_timeout, async {
+        for task in &timed_out {
+            if let Some(finalizer) = task.deadline_finalizer.as_ref() {
+                finalizer.run(task.name).await;
             }
+        }
+    })
+    .await;
+    if finalizer_result.is_err() {
+        warn!(
+            timeout_ms = finalizer_timeout.as_millis(),
+            "background task shutdown finalizers did not finish before shutdown deadline"
+        );
+    }
+    let join_result = tokio::time::timeout(join_timeout, async move {
+        while let Some(task) = timed_out.pop() {
+            await_background_task(task).await;
+        }
+    })
+    .await;
+    if join_result.is_err() {
+        warn!(
+            timeout_ms = join_timeout.as_millis(),
+            "aborted background tasks did not finish cleanup before shutdown deadline"
+        );
+    }
+}
+
+impl BackgroundDeadlineFinalizer {
+    async fn run(&self, task_name: &'static str) {
+        match self {
+            Self::SafeJobShutdown { repository } => {
+                match record_safe_job_shutdown(repository, unix_time_ms()).await {
+                    Ok(summary) => {
+                        if summary.waiting_jobs > 0 {
+                            warn!(
+                                task = task_name,
+                                waiting_jobs = summary.waiting_jobs,
+                                "recorded running jobs as waiting before shutdown abort"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            task = task_name,
+                            error = %error,
+                            "failed to record safe job shutdown before shutdown abort"
+                        );
+                    }
+                }
+            }
+            #[cfg(test)]
+            Self::Pending => {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+async fn await_background_task(task: BackgroundTask) {
+    match task.handle.await {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => {
+            error!(
+                task = task.name,
+                error = %error,
+                "background task failed during shutdown"
+            );
         }
     }
 }
@@ -2036,11 +2108,11 @@ mod tests {
     };
     use crate::domain::{
         ByteSize, CandidateGuid, DependencyName, DisplayName, DownloadUrl, FileIndex, IndexerId,
-        InfoHash, ItemTitle, LocalFile, LocalItem, LocalItemSource, MediaType, ReasonText,
-        RemoteCandidate, TrackerName,
+        InfoHash, ItemTitle, JobName, JobState, LocalFile, LocalItem, LocalItemSource, MediaType,
+        ReasonText, RemoteCandidate, TrackerName,
     };
     use crate::indexers::{CategoryCaps, RetryAfter, SearchCaps, TorznabCaps, TorznabLimits};
-    use crate::persistence::repository::Repository;
+    use crate::persistence::repository::{JobStateUpdate, Repository};
     use crate::secrets::ApiKey;
     use axum::body::Body;
     use axum::http::{
@@ -3307,9 +3379,10 @@ mod tests {
         ];
         let started = tokio::time::Instant::now();
 
-        stop_background_tasks_with_timeout(handles, Duration::from_millis(50)).await;
+        let timeout = Duration::from_millis(50);
+        stop_background_tasks_with_timeout(handles, timeout).await;
 
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(started.elapsed() < timeout + Duration::from_millis(40));
     }
 
     #[tokio::test]
@@ -3331,25 +3404,222 @@ mod tests {
             BackgroundShutdownPolicy::AbortOnTimeout,
         )];
 
-        stop_background_tasks_with_timeout(handles, Duration::from_millis(10)).await;
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(50)).await;
 
         assert_eq!(1, cleaned_up.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
-    async fn non_abort_background_task_is_awaited_after_timeout() {
+    async fn in_flight_background_task_finishes_within_shutdown_deadline() {
         let handles = vec![BackgroundTask::new(
             "finishes-late",
             tokio::spawn(async {
-                tokio::time::sleep(Duration::from_millis(75)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }),
             BackgroundShutdownPolicy::AwaitInFlight,
         )];
         let started = tokio::time::Instant::now();
 
-        stop_background_tasks_with_timeout(handles, Duration::from_millis(10)).await;
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(100)).await;
 
-        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn in_flight_background_tasks_are_aborted_at_shutdown_deadline() {
+        let cleaned_up = Arc::new(AtomicUsize::new(0));
+        struct CleanupCounter(Arc<AtomicUsize>);
+        impl Drop for CleanupCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let first_cleanup = CleanupCounter(cleaned_up.clone());
+        let second_cleanup = CleanupCounter(cleaned_up.clone());
+        let handles = vec![
+            BackgroundTask::new(
+                "stuck-in-flight-a",
+                tokio::spawn(async move {
+                    let _cleanup = first_cleanup;
+                    std::future::pending::<()>().await;
+                }),
+                BackgroundShutdownPolicy::AwaitInFlight,
+            ),
+            BackgroundTask::new(
+                "stuck-in-flight-b",
+                tokio::spawn(async move {
+                    let _cleanup = second_cleanup;
+                    std::future::pending::<()>().await;
+                }),
+                BackgroundShutdownPolicy::AwaitInFlight,
+            ),
+        ];
+        let started = tokio::time::Instant::now();
+
+        let timeout = Duration::from_millis(50);
+        stop_background_tasks_with_timeout(handles, timeout).await;
+
+        assert!(started.elapsed() < timeout + Duration::from_millis(40));
+        assert_eq!(2, cleaned_up.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_bounds_pending_finalizers() {
+        let handles = vec![
+            BackgroundTask::new(
+                "stuck-finalizer",
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+                BackgroundShutdownPolicy::AwaitInFlight,
+            )
+            .with_deadline_finalizer(BackgroundDeadlineFinalizer::Pending),
+        ];
+        let started = tokio::time::Instant::now();
+
+        let timeout = Duration::from_millis(80);
+        stop_background_tasks_with_timeout(handles, timeout).await;
+
+        assert!(started.elapsed() < timeout + Duration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_records_running_jobs_before_abort() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let job = JobName::new("indexer_caps").unwrap();
+        repository
+            .record_job_status(
+                &job,
+                JobStateUpdate {
+                    state: JobState::Running,
+                    last_started_at_ms: Some(100),
+                    last_finished_at_ms: None,
+                    next_run_at_ms: None,
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let handles = vec![
+            BackgroundTask::new(
+                "scheduler-receiver",
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+                BackgroundShutdownPolicy::AwaitInFlight,
+            )
+            .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
+                repository: repository.clone(),
+            }),
+        ];
+
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(200)).await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let job = jobs
+            .iter()
+            .find(|snapshot| snapshot.name.as_str() == "indexer_caps")
+            .unwrap();
+        assert_eq!("waiting", job.state);
+        assert_eq!(
+            Some("shutdown before job completed".to_owned()),
+            job.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_recovers_running_job_from_scheduler_tick_abort() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let job = JobName::new("indexer_caps").unwrap();
+        repository
+            .record_job_status(
+                &job,
+                JobStateUpdate {
+                    state: JobState::Running,
+                    last_started_at_ms: Some(100),
+                    last_finished_at_ms: None,
+                    next_run_at_ms: None,
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let handles = vec![
+            BackgroundTask::new(
+                "scheduler-receiver",
+                tokio::spawn(async {}),
+                BackgroundShutdownPolicy::AwaitInFlight,
+            )
+            .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
+                repository: repository.clone(),
+            }),
+            BackgroundTask::new(
+                "scheduler-tick",
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+                BackgroundShutdownPolicy::AbortOnTimeout,
+            )
+            .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
+                repository: repository.clone(),
+            }),
+        ];
+
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(200)).await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let job = jobs
+            .iter()
+            .find(|snapshot| snapshot.name.as_str() == "indexer_caps")
+            .unwrap();
+        assert_eq!("waiting", job.state);
+        assert_eq!(
+            Some("shutdown before job completed".to_owned()),
+            job.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_does_not_overwrite_finished_jobs() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let job = JobName::new("indexer_caps").unwrap();
+        repository
+            .record_job_status(
+                &job,
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: Some(100),
+                    last_finished_at_ms: Some(150),
+                    next_run_at_ms: Some(1_000),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let handles = vec![
+            BackgroundTask::new(
+                "scheduler-receiver",
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+                BackgroundShutdownPolicy::AwaitInFlight,
+            )
+            .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
+                repository: repository.clone(),
+            }),
+        ];
+
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(200)).await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let job = jobs
+            .iter()
+            .find(|snapshot| snapshot.name.as_str() == "indexer_caps")
+            .unwrap();
+        assert_eq!("succeeded", job.state);
+        assert_eq!(Some(1_000), job.next_run_at_ms);
+        assert_eq!(None, job.last_error);
     }
 
     #[tokio::test]
@@ -3364,7 +3634,7 @@ mod tests {
                 }
             }
         }
-        let (release_in_flight, wait_in_flight) = tokio::sync::oneshot::channel::<()>();
+        let (_release_in_flight, wait_in_flight) = tokio::sync::oneshot::channel::<()>();
         let (abort_seen, abort_seen_receiver) = tokio::sync::oneshot::channel::<()>();
         let abort_cleanup = CleanupCounter(cleaned_up.clone(), Some(abort_seen));
         let handles = vec![
@@ -3391,7 +3661,6 @@ mod tests {
         abort_seen_receiver.await.unwrap();
         assert_eq!(1, cleaned_up.load(Ordering::SeqCst));
 
-        release_in_flight.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), shutdown)
             .await
             .unwrap()
