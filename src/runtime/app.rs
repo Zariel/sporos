@@ -747,6 +747,24 @@ pub struct RuntimeReceivers {
     pub notifications: WorkReceiver<NotificationJob>,
 }
 
+struct RuntimeConfigParts {
+    indexers: TorznabRegistry,
+    torznab_indexers: BTreeMap<DependencyName, ConfiguredTorznabIndexer>,
+    prowlarr_sources: BTreeMap<DependencyName, RuntimeProwlarrSource>,
+    arr: ArrRegistry,
+    clients: TorrentClientRegistry,
+    injection_clients: Vec<Arc<dyn InjectionClient>>,
+    scheduler_config: SchedulerConfig,
+    http_jobs: BTreeSet<crate::domain::JobName>,
+    saved_retry_interval: Duration,
+}
+
+pub fn validate_runtime_config(config: &SporosConfig) -> Result<(), DatabaseError> {
+    let metrics = MetricsRegistry::new();
+    let now_ms = crate::runtime::announce_worker::unix_time_ms();
+    build_runtime_config(config, &metrics, now_ms).map(|_| ())
+}
+
 impl AppRuntime {
     pub async fn build(config: SporosConfig) -> Result<Self, DatabaseError> {
         let repository = Repository::connect(&config.paths.database).await?;
@@ -759,38 +777,11 @@ impl AppRuntime {
     ) -> Result<Self, DatabaseError> {
         let health = HealthRegistry::new();
         let metrics = MetricsRegistry::new();
-        let indexers = TorznabRegistry::from_config(&config.indexers).map_err(|error| {
-            DatabaseError::Unavailable {
-                operation: "build Torznab indexer registry".to_owned(),
-                message: error.to_string(),
-            }
-        })?;
-        let torznab_indexers = indexers
-            .indexers()
-            .iter()
-            .cloned()
-            .map(|indexer| (indexer.name.clone(), indexer))
-            .collect::<BTreeMap<_, _>>();
         let now_ms = crate::runtime::announce_worker::unix_time_ms();
-        let prowlarr_sources = runtime_prowlarr_sources(&config, now_ms)?;
+        let runtime_config = build_runtime_config(&config, &metrics, now_ms)?;
         repository
-            .sync_torznab_indexers(indexers.indexers(), now_ms)
+            .sync_torznab_indexers(runtime_config.indexers.indexers(), now_ms)
             .await?;
-        let arr = ArrRegistry::from_config(&config.indexers.arr).map_err(|error| {
-            DatabaseError::Unavailable {
-                operation: "build Arr registry".to_owned(),
-                message: error.to_string(),
-            }
-        })?;
-        let clients =
-            TorrentClientRegistry::from_config(&config.torrent_clients).map_err(|error| {
-                DatabaseError::Unavailable {
-                    operation: "build torrent client registry".to_owned(),
-                    message: error.to_string(),
-                }
-            })?;
-        let injection_clients =
-            build_injection_clients(&config.torrent_clients, &clients, &metrics)?;
         let queue_config = RuntimeQueueConfig::default();
         let (workflow, workflow_receivers) = workflow_queues(queue_config);
         let (scheduler_queue, scheduler_receiver) = scheduler_queue(queue_config.indexing_limit);
@@ -798,31 +789,6 @@ impl AppRuntime {
             inventory_refresh_queue(queue_config.indexing_limit);
         let (notification_queue, notification_receiver) =
             notification_queue(queue_config.notification_limit);
-        let scheduler_config = SchedulerConfig::from_scheduling_config(&config.scheduling)
-            .map_err(|error| DatabaseError::Unavailable {
-                operation: "build scheduler config".to_owned(),
-                message: error.to_string(),
-            })?;
-        let scheduler_config = daemon_scheduler_config(scheduler_config);
-        let http_jobs = http_supported_jobs(&scheduler_config);
-        parse_interval_ms(&config.scheduling.client_inventory_interval).map_err(|error| {
-            DatabaseError::Unavailable {
-                operation: "build client inventory interval".to_owned(),
-                message: error.to_string(),
-            }
-        })?;
-        let saved_retry_interval_ms = parse_interval_ms(&config.scheduling.saved_retry_interval)
-            .map_err(|error| DatabaseError::Unavailable {
-                operation: "build saved retry interval".to_owned(),
-                message: error.to_string(),
-            })?;
-        let saved_retry_interval =
-            Duration::from_millis(u64::try_from(saved_retry_interval_ms).map_err(|error| {
-                DatabaseError::Unavailable {
-                    operation: "build saved retry interval".to_owned(),
-                    message: error.to_string(),
-                }
-            })?);
         let announce_worker = AnnounceWorker::new(
             repository.clone(),
             "sporos-announce-worker",
@@ -835,7 +801,7 @@ impl AppRuntime {
         let scheduler = PersistedScheduler::new(
             repository.clone(),
             scheduler_queue.clone(),
-            scheduler_config,
+            runtime_config.scheduler_config,
         );
         let inventory_refresh = InventoryRefreshWorker::new(
             repository.clone(),
@@ -844,8 +810,10 @@ impl AppRuntime {
             },
         )
         .with_season_from_episodes(config.matching.season_from_episodes);
-        let injection_worker = InjectionWorker::new(repository.clone(), injection_clients);
-        let mut arr_endpoints = arr
+        let injection_worker =
+            InjectionWorker::new(repository.clone(), runtime_config.injection_clients);
+        let mut arr_endpoints = runtime_config
+            .arr
             .instances()
             .iter()
             .map(ArrEndpoint::from_configured)
@@ -872,7 +840,7 @@ impl AppRuntime {
             .with_metrics(metrics.clone())
             .with_search_queue(workflow.searches.clone())
             .with_job_queue(workflow.jobs.clone())
-            .with_allowed_jobs(http_jobs)
+            .with_allowed_jobs(runtime_config.http_jobs)
             .with_announce_acceptor(repository.clone(), config.announce.clone());
         if let Some(api_token) = config.server.api_token.as_ref() {
             http = http.with_api_token(api_token.expose_secret());
@@ -881,7 +849,7 @@ impl AppRuntime {
         let state = AppState {
             config,
             repository,
-            clients,
+            clients: runtime_config.clients,
             health,
             metrics,
             http,
@@ -891,11 +859,11 @@ impl AppRuntime {
             inventory_refresh,
             injection_worker,
             search_planner,
-            torznab_indexers,
-            prowlarr_sources,
+            torznab_indexers: runtime_config.torznab_indexers,
+            prowlarr_sources: runtime_config.prowlarr_sources,
             torznab_client: TorznabHttpClient::new(Duration::from_secs(120)),
             prowlarr_client: ProwlarrHttpClient::new(Duration::from_secs(30)),
-            saved_retry_interval,
+            saved_retry_interval: runtime_config.saved_retry_interval,
             shutdown,
             shutdown_signal,
         };
@@ -913,6 +881,78 @@ impl AppRuntime {
             },
         })
     }
+}
+
+fn build_runtime_config(
+    config: &SporosConfig,
+    metrics: &MetricsRegistry,
+    now_ms: i64,
+) -> Result<RuntimeConfigParts, DatabaseError> {
+    let indexers = TorznabRegistry::from_config(&config.indexers).map_err(|error| {
+        DatabaseError::Unavailable {
+            operation: "build Torznab indexer registry".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let torznab_indexers = indexers
+        .indexers()
+        .iter()
+        .cloned()
+        .map(|indexer| (indexer.name.clone(), indexer))
+        .collect::<BTreeMap<_, _>>();
+    let prowlarr_sources = runtime_prowlarr_sources(config, now_ms)?;
+    let arr = ArrRegistry::from_config(&config.indexers.arr).map_err(|error| {
+        DatabaseError::Unavailable {
+            operation: "build Arr registry".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let clients = TorrentClientRegistry::from_config(&config.torrent_clients).map_err(|error| {
+        DatabaseError::Unavailable {
+            operation: "build torrent client registry".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let injection_clients = build_injection_clients(&config.torrent_clients, &clients, metrics)?;
+    let scheduler_config =
+        SchedulerConfig::from_scheduling_config(&config.scheduling).map_err(|error| {
+            DatabaseError::Unavailable {
+                operation: "build scheduler config".to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+    let scheduler_config = daemon_scheduler_config(scheduler_config);
+    let http_jobs = http_supported_jobs(&scheduler_config);
+    parse_interval_ms(&config.scheduling.client_inventory_interval).map_err(|error| {
+        DatabaseError::Unavailable {
+            operation: "build client inventory interval".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let saved_retry_interval_ms = parse_interval_ms(&config.scheduling.saved_retry_interval)
+        .map_err(|error| DatabaseError::Unavailable {
+            operation: "build saved retry interval".to_owned(),
+            message: error.to_string(),
+        })?;
+    let saved_retry_interval =
+        Duration::from_millis(u64::try_from(saved_retry_interval_ms).map_err(|error| {
+            DatabaseError::Unavailable {
+                operation: "build saved retry interval".to_owned(),
+                message: error.to_string(),
+            }
+        })?);
+
+    Ok(RuntimeConfigParts {
+        indexers,
+        torznab_indexers,
+        prowlarr_sources,
+        arr,
+        clients,
+        injection_clients,
+        scheduler_config,
+        http_jobs,
+        saved_retry_interval,
+    })
 }
 
 fn search_workflow_item(title: ItemTitle) -> Result<LocalItem, DatabaseError> {

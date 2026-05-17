@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::config::{CONFIG_SCHEMA, DEFAULT_CONFIG_PATH, load_config};
+use crate::runtime::app::validate_runtime_config;
 use crate::runtime::daemon;
 
 #[derive(Debug, Parser)]
@@ -42,7 +43,8 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
             Ok(String::new())
         }
         Command::CheckConfig { config } => {
-            load_config(&config).map_err(|error| error.to_string())?;
+            let loaded = load_config(&config).map_err(|error| error.to_string())?;
+            validate_runtime_config(&loaded).map_err(|error| error.to_string())?;
             Ok(format!("sporos config ok: {}", config.display()))
         }
         Command::PrintConfigSchema => Ok(CONFIG_SCHEMA.to_owned()),
@@ -149,6 +151,76 @@ mod tests {
         assert!(arr_error.contains("indexers.arr.sonarr.api_key"));
         remove_temp_config(prowlarr_config);
         remove_temp_config(arr_config);
+    }
+
+    #[test]
+    fn check_config_rejects_duplicate_torznab_urls() {
+        let config_path = write_temp_config(
+            r#"
+            [indexers.torznab.one]
+            url = "https://indexer.example/api?t=caps"
+
+            [indexers.torznab.two]
+            url = "https://indexer.example/api"
+            "#,
+        );
+
+        let error = run([
+            OsString::from("sporos"),
+            OsString::from("check-config"),
+            OsString::from("--config"),
+            config_path.clone().into_os_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("duplicate Torznab URL"));
+        remove_temp_config(config_path);
+    }
+
+    #[test]
+    fn check_config_rejects_rtorrent_auth_fields() {
+        let config_path = write_temp_config(
+            r#"
+            [torrent_clients.rtorrent]
+            kind = "rtorrent"
+            url = "http://rtorrent:5000/RPC2"
+            username = "sporos"
+            default_save_path = "/downloads"
+            label_field = "custom1"
+            "#,
+        );
+
+        let error = run([
+            OsString::from("sporos"),
+            OsString::from("check-config"),
+            OsString::from("--config"),
+            config_path.clone().into_os_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("does not support configured auth"));
+        remove_temp_config(config_path);
+    }
+
+    #[test]
+    fn check_config_rejects_runtime_intervals() {
+        let config_path = write_temp_config(
+            r#"
+            [scheduling]
+            client_inventory_interval = "0s"
+            "#,
+        );
+
+        let error = run([
+            OsString::from("sporos"),
+            OsString::from("check-config"),
+            OsString::from("--config"),
+            config_path.clone().into_os_string(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("client inventory interval"));
+        remove_temp_config(config_path);
     }
 
     #[test]
