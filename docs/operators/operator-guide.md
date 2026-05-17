@@ -44,7 +44,7 @@ crate to cache dependency artifacts, then builds the real `sporos` binary with
 network access disabled. Release builds keep line-level debug information and
 the runtime image enables Rust backtraces by default, so operator issue reports
 can include useful stack frames. Runtime image contents are limited to the
-binary, Debian CA certificates, and the service user.
+binary, Debian CA certificates, a minimal init process, and the service user.
 
 Run the container with operator-owned config, state, cache, output, media, and
 secret mounts:
@@ -52,8 +52,13 @@ secret mounts:
 ```bash
 docker run --rm \
   --name sporos \
+  --stop-timeout 60 \
   -p 2468:2468 \
   -v ./config.toml:/etc/sporos/config.toml:ro \
+  -v ./secrets/sporos-api-token:/var/run/secrets/sporos-api-token:ro \
+  -v ./secrets/qbit-password:/var/run/secrets/qbit-password:ro \
+  -v ./secrets/indexer-api-key:/var/run/secrets/indexer-api-key:ro \
+  -v ./secrets/prowlarr-api-key:/var/run/secrets/prowlarr-api-key:ro \
   -v sporos-state:/data/state \
   -v sporos-cache:/data/cache/torrents \
   -v sporos-output:/data/output \
@@ -64,10 +69,14 @@ docker run --rm \
 The image runs as UID/GID `10001`. Mounted writable paths for
 `paths.database`, `paths.torrent_cache_dir`, and `paths.output_dir` must be
 writable by that identity, or by a runtime user override chosen by the operator.
+Container defaults place those three paths under `/data` even when the mounted
+config omits them.
 Mount secret files read-only and point config fields such as
 `server.api_token_file`, torrent-client password files, and indexer API key
-files at those paths. Deployment topology, orchestration, resource requests,
-and restart policy are intentionally left to the operator.
+files at those paths. Use a stop timeout long enough for graceful shutdown to
+drain in-flight work; 60 seconds is a conservative starting point for Docker.
+Deployment topology, orchestration, resource requests, and restart policy are
+intentionally left to the operator.
 
 ## Configuration
 

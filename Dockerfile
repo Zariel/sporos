@@ -53,11 +53,11 @@ RUN --network=none \
 FROM debian:${RUNTIME_DEBIAN_VERSION}-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 sporos \
     && useradd --system --uid 10001 --gid sporos --home-dir /var/lib/sporos sporos \
-    && mkdir -p /data/state /data/cache/torrents /data/output /etc/sporos /var/lib/sporos \
+    && mkdir -p /data/state /data/cache/torrents /data/output /etc/sporos /var/lib/sporos /var/run/secrets \
     && chown -R sporos:sporos /data /var/lib/sporos
 
 COPY --from=build /workspace/target/release/sporos /usr/local/bin/sporos
@@ -67,7 +67,10 @@ LABEL org.opencontainers.image.title="Sporos" \
       org.opencontainers.image.licenses="MIT"
 
 ENV RUST_BACKTRACE=1 \
-    RUST_LIB_BACKTRACE=1
+    RUST_LIB_BACKTRACE=1 \
+    SPOROS__PATHS__DATABASE=/data/state/sporos.db \
+    SPOROS__PATHS__TORRENT_CACHE_DIR=/data/cache/torrents \
+    SPOROS__PATHS__OUTPUT_DIR=/data/output
 
 USER 10001:10001
 WORKDIR /var/lib/sporos
@@ -75,5 +78,5 @@ WORKDIR /var/lib/sporos
 EXPOSE 2468
 VOLUME ["/data/state", "/data/cache/torrents", "/data/output"]
 
-ENTRYPOINT ["sporos"]
+ENTRYPOINT ["/usr/bin/tini", "--", "sporos"]
 CMD ["serve", "--config", "/etc/sporos/config.toml"]
