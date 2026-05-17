@@ -29,6 +29,46 @@ Startup failures are written to stderr. Runtime logs are expected on stdout or
 stderr; do not rely on file logging or hidden state outside the configured
 paths.
 
+## Container Image
+
+Build the image with BuildKit enabled so dependency and registry cache mounts
+are used:
+
+```bash
+DOCKER_BUILDKIT=1 docker build --pull -t sporos:local .
+```
+
+The Dockerfile uses a multi-stage Rust build. It copies `Cargo.toml` and
+`Cargo.lock` before source files, runs `cargo fetch --locked`, compiles a dummy
+crate to cache dependency artifacts, then builds the real `sporos` binary with
+network access disabled. Release builds keep line-level debug information and
+the runtime image enables Rust backtraces by default, so operator issue reports
+can include useful stack frames. Runtime image contents are limited to the
+binary, Debian CA certificates, and the service user.
+
+Run the container with operator-owned config, state, cache, output, media, and
+secret mounts:
+
+```bash
+docker run --rm \
+  --name sporos \
+  -p 2468:2468 \
+  -v ./config.toml:/etc/sporos/config.toml:ro \
+  -v sporos-state:/data/state \
+  -v sporos-cache:/data/cache/torrents \
+  -v sporos-output:/data/output \
+  -v /srv/media:/media:ro \
+  sporos:local
+```
+
+The image runs as UID/GID `10001`. Mounted writable paths for
+`paths.database`, `paths.torrent_cache_dir`, and `paths.output_dir` must be
+writable by that identity, or by a runtime user override chosen by the operator.
+Mount secret files read-only and point config fields such as
+`server.api_token_file`, torrent-client password files, and indexer API key
+files at those paths. Deployment topology, orchestration, resource requests,
+and restart policy are intentionally left to the operator.
+
 ## Configuration
 
 Use TOML as the source of truth. Operator-supplied filesystem paths must be
