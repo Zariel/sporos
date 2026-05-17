@@ -577,6 +577,7 @@ impl Repository {
         insert_staged_retained_keys(&mut transaction).await?;
         let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
 
+        clear_staged_local_inventory_in_transaction(&mut transaction).await?;
         clear_retained_keys(&mut transaction).await?;
         transaction
             .commit()
@@ -4200,12 +4201,27 @@ async fn initialize_staged_local_inventory(
 async fn clear_staged_local_inventory(
     connection: &mut sqlx::pool::PoolConnection<Sqlite>,
 ) -> Result<(), DatabaseError> {
-    for statement in [
-        "DELETE FROM staged_local_inventory_files",
-        "DELETE FROM staged_local_inventory_items",
-    ] {
+    for statement in STAGED_LOCAL_INVENTORY_CLEAR_STATEMENTS {
         sqlx::query(statement)
             .execute(&mut **connection)
+            .await
+            .map_err(|error| db_error("clear staged local inventory", error))?;
+    }
+
+    Ok(())
+}
+
+const STAGED_LOCAL_INVENTORY_CLEAR_STATEMENTS: [&str; 2] = [
+    "DELETE FROM staged_local_inventory_files",
+    "DELETE FROM staged_local_inventory_items",
+];
+
+async fn clear_staged_local_inventory_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DatabaseError> {
+    for statement in STAGED_LOCAL_INVENTORY_CLEAR_STATEMENTS {
+        sqlx::query(statement)
+            .execute(&mut **transaction)
             .await
             .map_err(|error| db_error("clear staged local inventory", error))?;
     }
@@ -5997,6 +6013,62 @@ mod tests {
         assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
         assert_eq!("Original", title);
         assert_eq!(1, file_count);
+    }
+
+    #[tokio::test]
+    async fn successful_owned_inventory_stream_clears_staged_rows() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut item = test_local_item("Complete");
+        item.source = LocalItemSource::DataRoot {
+            path: PathBuf::from("/media/complete"),
+        };
+        item.info_hash = None;
+        item.path = Some(PathBuf::from("/media/complete"));
+        let file = LocalFile::new(
+            None,
+            PathBuf::from("complete.mkv"),
+            ByteSize::new(20),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                item,
+                files: vec![file],
+            }))
+            .await
+            .unwrap();
+        sender
+            .send(OwnedLocalInventoryMessage::Finished)
+            .await
+            .unwrap();
+        drop(sender);
+
+        let summary = repository
+            .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver)
+            .await
+            .unwrap();
+        let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let staged_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM temp.staged_local_inventory_items")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let staged_file_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM temp.staged_local_inventory_files")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(1, summary.upserted);
+        assert_eq!(0, summary.pruned);
+        assert_eq!(1, local_count);
+        assert_eq!(0, staged_count);
+        assert_eq!(0, staged_file_count);
     }
 
     #[tokio::test]
