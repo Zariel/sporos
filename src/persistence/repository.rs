@@ -2,6 +2,7 @@ use std::cmp::Ordering as CompareOrdering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Acquire, Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
@@ -528,7 +529,17 @@ impl Repository {
     pub async fn replace_local_inventory_owned_receiver(
         &self,
         scope: LocalInventoryScope,
+        items: mpsc::Receiver<OwnedLocalInventoryMessage>,
+    ) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
+        self.replace_local_inventory_owned_receiver_with_staging_signal(scope, items, None)
+            .await
+    }
+
+    pub(crate) async fn replace_local_inventory_owned_receiver_with_staging_signal(
+        &self,
+        scope: LocalInventoryScope,
         mut items: mpsc::Receiver<OwnedLocalInventoryMessage>,
+        staging_started: Option<Arc<AtomicBool>>,
     ) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
         let _span = info_span!("inventory.replace", source_type = scope.source_type());
         let mut connection = self
@@ -537,6 +548,9 @@ impl Repository {
             .await
             .map_err(|error| db_error("acquire local inventory connection", error))?;
         initialize_staged_local_inventory(&mut connection).await?;
+        if let Some(staging_started) = staging_started {
+            staging_started.store(true, Ordering::Release);
+        }
 
         let mut upserted = 0usize;
         let mut finished = false;

@@ -248,9 +248,14 @@ impl InventoryRefreshWorker {
             }
             report
         });
+        let staging_started = Arc::new(AtomicBool::new(false));
         let mut replace = Box::pin(
             self.repository
-                .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver),
+                .replace_local_inventory_owned_receiver_with_staging_signal(
+                    LocalInventoryScope::DataRoot,
+                    receiver,
+                    Some(staging_started.clone()),
+                ),
         );
         let replace_result = if let Some(shutdown) = shutdown.as_mut() {
             let mut cancelled_by_shutdown = false;
@@ -263,6 +268,17 @@ impl InventoryRefreshWorker {
             };
             if cancelled_by_shutdown {
                 cancelled.store(true, Ordering::Relaxed);
+                if !staging_started.load(Ordering::Acquire) {
+                    drop(replace);
+                    scan_task
+                        .await
+                        .map_err(|error| InventoryRefreshError::ScanWorkerFailed {
+                            message: error.to_string(),
+                        })?;
+                    return Err(InventoryRefreshError::Cancelled {
+                        message: "shutdown requested".to_owned(),
+                    });
+                }
                 let replace_result = replace.await;
                 scan_task
                     .await
@@ -1677,6 +1693,58 @@ mod tests {
         assert_eq!(0, staged_count);
         assert_eq!(0, staged_file_count);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_until_shutdown_cancels_before_staging_connection() {
+        let root = unique_temp_dir("shutdown-before-staging");
+        for index in 0..128 {
+            let release = root.join(format!("Movie.{index:03}.2026.1080p"));
+            fs::create_dir_all(&release).unwrap();
+            write_file(&release.join("movie.mkv"), 10);
+        }
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let mut held_connections = Vec::new();
+        for _ in 0..5 {
+            held_connections.push(repository.pool().acquire().await.unwrap());
+        }
+        let send_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default())
+                .with_data_root_scan_send_attempts(send_attempts.clone());
+        let (shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
+        let scan_root = root.clone();
+        let refresh = tokio::spawn(async move {
+            worker
+                .refresh_data_dirs_until_shutdown(
+                    InventoryRefreshRequest {
+                        media_dirs: vec![scan_root],
+                    },
+                    signal,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while send_attempts.load(Ordering::SeqCst) <= DATA_ROOT_SCAN_BUFFER {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel_now("test shutdown").unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(error, InventoryRefreshError::Cancelled { .. }));
+
+        drop(held_connections);
         fs::remove_dir_all(root).unwrap();
     }
 
