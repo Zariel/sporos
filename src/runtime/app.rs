@@ -3724,6 +3724,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_qbittorrent_adapter_pauses_for_recheck() {
+        let add_body = Arc::new(Mutex::new(None::<String>));
+        let seen_add_body = add_body.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/v2/auth/login",
+                post(|| async { ([(axum::http::header::SET_COOKIE, "SID=ok")], "Ok") }),
+            )
+            .route("/api/v2/app/version", get(|| async { "4.6.0" }))
+            .route(
+                "/api/v2/torrents/createTags",
+                post(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/api/v2/torrents/add",
+                post(move |request: Request<Body>| {
+                    let seen_add_body = seen_add_body.clone();
+                    async move {
+                        let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        *seen_add_body.lock().unwrap() = Some(body);
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await });
+        let descriptor = TorrentClientDescriptor {
+            name: DisplayName::new("qbit").unwrap(),
+            kind: TorrentClientKind::Qbittorrent,
+            host: ClientHost::new(address.to_string()).unwrap(),
+            url: format!("http://{address}"),
+            default_save_path: "/downloads".into(),
+            readonly: false,
+            capabilities: TorrentClientCapabilities::for_kind(TorrentClientKind::Qbittorrent),
+        };
+        let config = TorrentClientConfig {
+            kind: ConfigTorrentClientKind::Qbittorrent,
+            url: format!("http://{address}"),
+            username: None,
+            password: None,
+            password_file: None,
+            password_env: None,
+            default_save_path: "/downloads".into(),
+            label_field: None,
+        };
+        let client =
+            RuntimeInjectionClient::new("qbit", &config, descriptor, MetricsRegistry::new());
+        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+
+        client
+            .inject(ClientInjectionRequest {
+                info_hash: &info_hash,
+                torrent_bytes: b"torrent bytes",
+                save_path: None,
+                pause_for_recheck: true,
+            })
+            .await
+            .unwrap();
+
+        handle.abort();
+        let body = add_body.lock().unwrap().clone().unwrap();
+        assert!(body.contains("name=\"paused\"\r\n\r\ntrue"));
+        assert!(body.contains("name=\"skip_checking\"\r\n\r\nfalse"));
+    }
+
+    #[tokio::test]
+    async fn runtime_rtorrent_adapter_pauses_for_recheck() {
+        let inject_body = Arc::new(Mutex::new(None::<String>));
+        let seen_inject_body = inject_body.clone();
+        let app = axum::Router::new().route(
+            "/RPC2",
+            post(move |request: Request<Body>| {
+                let seen_inject_body = seen_inject_body.clone();
+                async move {
+                    let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+                    let body = String::from_utf8(body.to_vec()).unwrap();
+                    *seen_inject_body.lock().unwrap() = Some(body);
+                    (StatusCode::OK, xml_response("<i8>0</i8>"))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await });
+        let descriptor = TorrentClientDescriptor {
+            name: DisplayName::new("rtorrent").unwrap(),
+            kind: TorrentClientKind::Rtorrent,
+            host: ClientHost::new(address.to_string()).unwrap(),
+            url: format!("http://{address}/RPC2"),
+            default_save_path: "/downloads".into(),
+            readonly: false,
+            capabilities: TorrentClientCapabilities::for_kind(TorrentClientKind::Rtorrent),
+        };
+        let config = TorrentClientConfig {
+            kind: ConfigTorrentClientKind::Rtorrent,
+            url: format!("http://{address}/RPC2"),
+            username: None,
+            password: None,
+            password_file: None,
+            password_env: None,
+            default_save_path: "/downloads".into(),
+            label_field: None,
+        };
+        let client =
+            RuntimeInjectionClient::new("rtorrent", &config, descriptor, MetricsRegistry::new());
+        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+
+        client
+            .inject(ClientInjectionRequest {
+                info_hash: &info_hash,
+                torrent_bytes: b"torrent bytes",
+                save_path: None,
+                pause_for_recheck: true,
+            })
+            .await
+            .unwrap();
+
+        handle.abort();
+        let body = inject_body.lock().unwrap().clone().unwrap();
+        assert!(body.contains("<methodName>load.raw</methodName>"));
+        assert!(!body.contains("<methodName>load.raw_start</methodName>"));
+    }
+
+    #[tokio::test]
     async fn runtime_qbittorrent_adapter_records_oversized_metrics() {
         let app = axum::Router::new()
             .route(

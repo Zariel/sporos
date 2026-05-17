@@ -187,7 +187,7 @@ pub struct RecheckResumeConfig {
 impl Default for RecheckResumeConfig {
     fn default() -> Self {
         Self {
-            skip_recheck: true,
+            skip_recheck: false,
             auto_resume_max_download: ByteSize::new(0),
             ignore_non_relevant_files_to_resume: false,
             poll_interval_ms: 5_000,
@@ -349,7 +349,8 @@ impl InjectionWorker {
         &self,
         request: InjectionRequest,
     ) -> Result<InjectionWorkResult, InjectionWorkerError> {
-        self.process_inner(request, &mut || false, None).await
+        self.process_inner(request, &mut || false, None, false)
+            .await
     }
 
     pub async fn process_until_shutdown(
@@ -362,6 +363,7 @@ impl InjectionWorker {
             request,
             &mut || stop_signal.state().phase != ShutdownPhase::Running,
             Some(&shutdown),
+            false,
         )
         .await
     }
@@ -371,6 +373,7 @@ impl InjectionWorker {
         request: InjectionRequest,
         should_stop: &mut F,
         shutdown: Option<&ShutdownSignal>,
+        from_saved_retry: bool,
     ) -> Result<InjectionWorkResult, InjectionWorkerError>
     where
         F: FnMut() -> bool,
@@ -539,7 +542,7 @@ impl InjectionWorker {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
                 let mut saved_for_retry = false;
-                if linked_files > 0 {
+                if linked_files > 0 || (from_saved_retry && recheck_plan.should_recheck) {
                     let recheck_plan = RecheckResumePlan {
                         should_recheck: true,
                         ..recheck_plan
@@ -547,9 +550,7 @@ impl InjectionWorker {
                     let resume_outcome = self
                         .run_recheck_resume(target.as_ref(), &request, recheck_plan, shutdown)
                         .await?;
-                    if resume_outcome == ResumeLoopOutcome::StillChecking
-                        && shutdown_requested(shutdown)
-                    {
+                    if resume_outcome == ResumeLoopOutcome::StillChecking {
                         self.save_for_retry(&request).await?;
                         saved_for_retry = true;
                     }
@@ -565,10 +566,12 @@ impl InjectionWorker {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
                 if recheck_plan.should_recheck {
-                    let _ = self
+                    let save_result = self.save_for_retry(&request).await;
+                    let resume_result = self
                         .run_recheck_resume(target.as_ref(), &request, recheck_plan, shutdown)
-                        .await?;
-                    self.save_for_retry(&request).await?;
+                        .await;
+                    save_result?;
+                    resume_result?;
                 }
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Injected,
@@ -773,7 +776,10 @@ impl InjectionWorker {
                 flat_linking: config.flat_linking,
                 recheck: config.recheck,
             };
-            let result = match self.process_inner(request, should_stop, shutdown).await {
+            let result = match self
+                .process_inner(request, should_stop, shutdown, true)
+                .await
+            {
                 Ok(result) => result,
                 Err(error) if saved_retry_can_continue_after_error(&error) => {
                     summary.failed += 1;
@@ -2005,6 +2011,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_rechecks_exact_match_by_default_before_resume() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-default-recheck");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let request = request(local, candidate, candidate_id, &root);
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Injected, result.outcome);
+        assert!(result.saved_for_retry);
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(true), target.last_pause_for_recheck());
+        assert_eq!(1, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn worker_saves_paused_inject_when_recheck_fails() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-recheck-fails");
+        let target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_recheck_errors(1));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let request = request(local, candidate, candidate_id, &root);
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let error = worker.process(request).await.unwrap_err();
+
+        assert!(matches!(error, InjectionWorkerError::Client(_)));
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(true), target.last_pause_for_recheck());
+        assert_eq!(1, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn worker_rechecks_paused_inject_when_retry_save_fails() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-save-fails");
+        fs::write(root.join("output"), b"not a directory").unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let request = request(local, candidate, candidate_id, &root);
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let error = worker.process(request).await.unwrap_err();
+
+        assert!(matches!(error, InjectionWorkerError::Save(_)));
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(true), target.last_pause_for_recheck());
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_recheck_existing_target_without_saved_retry() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-existing-target");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")).with_existing(true));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let request = request(local, candidate, candidate_id, &root);
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::AlreadyExists, result.outcome);
+        assert!(!result.saved_for_retry);
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn saved_retry_resumes_prior_paused_inject_without_links() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-retry-paused");
+        let initial_target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_checking_true(1));
+        let (local, mut candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        repository
+            .upsert_local_item_with_files(&local, &[local_file()])
+            .await
+            .unwrap();
+        let parsed = parse_metafile(test_torrent_bytes()).unwrap();
+        candidate.info_hash = Some(parsed.metafile.info_hash().clone());
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.metafile = parsed.metafile;
+        request.torrent_bytes = test_torrent_bytes().to_vec();
+        request.recheck = RecheckResumeConfig {
+            poll_interval_ms: 0,
+            max_resume_wait_ms: 0,
+            ..RecheckResumeConfig::default()
+        };
+        let worker = InjectionWorker::new(
+            repository.clone(),
+            vec![initial_target.clone() as Arc<dyn InjectionClient>],
+        );
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Injected, result.outcome);
+        assert!(result.saved_for_retry);
+        assert_eq!(1, initial_target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, initial_target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(1, saved_torrent_count(&root.join("output")));
+
+        let retry_target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_existing(true));
+        let retry_worker = InjectionWorker::new(
+            repository,
+            vec![retry_target.clone() as Arc<dyn InjectionClient>],
+        );
+        let summary = retry_worker
+            .retry_saved_torrents(SavedTorrentRetryConfig {
+                directories: vec![root.join("output")],
+                recheck: RecheckResumeConfig {
+                    poll_interval_ms: 0,
+                    max_resume_wait_ms: 0,
+                    ..RecheckResumeConfig::default()
+                },
+                assessed_at_ms: 1_700_000_000_000,
+                ..SavedTorrentRetryConfig::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.attempted);
+        assert_eq!(1, summary.already_exists);
+        assert_eq!(1, summary.deleted);
+        assert_eq!(1, retry_target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, retry_target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, retry_target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, retry_target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(0, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
     async fn worker_process_until_shutdown_stops_pending_has_torrent() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("injection-shutdown-has");
@@ -2267,6 +2418,7 @@ mod tests {
         let summary = worker
             .retry_saved_torrents(SavedTorrentRetryConfig {
                 directories: vec![output_dir.clone()],
+                recheck: skip_recheck_config(),
                 assessed_at_ms: 1_700_000_000_000,
                 ..SavedTorrentRetryConfig::default()
             })
@@ -2311,6 +2463,7 @@ mod tests {
                 directories: vec![output_dir.clone()],
                 link_dirs: vec![link_dir],
                 link_type: Some(LinkType::Hardlink),
+                recheck: skip_recheck_config(),
                 assessed_at_ms: 1_700_000_000_000,
                 ..SavedTorrentRetryConfig::default()
             })
@@ -2452,6 +2605,7 @@ mod tests {
         let summary = worker
             .retry_saved_torrents(SavedTorrentRetryConfig {
                 directories: vec![output_dir.clone()],
+                recheck: skip_recheck_config(),
                 assessed_at_ms: 1_700_000_000_000,
                 ..SavedTorrentRetryConfig::default()
             })
@@ -2495,6 +2649,7 @@ mod tests {
         let summary = worker
             .retry_saved_torrents(SavedTorrentRetryConfig {
                 directories: vec![output_dir.clone()],
+                recheck: skip_recheck_config(),
                 assessed_at_ms: 1_700_000_000_000,
                 ..SavedTorrentRetryConfig::default()
             })
@@ -2708,6 +2863,7 @@ mod tests {
         let summary = worker
             .retry_saved_torrents(SavedTorrentRetryConfig {
                 directories: vec![output_dir.clone()],
+                recheck: skip_recheck_config(),
                 assessed_at_ms: 1_700_000_000_000,
                 ..SavedTorrentRetryConfig::default()
             })
@@ -2899,6 +3055,7 @@ mod tests {
         let summary = worker
             .retry_saved_torrents(SavedTorrentRetryConfig {
                 directories: vec![output_dir.clone()],
+                recheck: skip_recheck_config(),
                 assessed_at_ms: 1_700_000_000_000,
                 ..SavedTorrentRetryConfig::default()
             })
@@ -2932,7 +3089,18 @@ mod tests {
         let disc = metafile_with_files(&[("BDMV/STREAM/00001.m2ts", 10)]);
 
         assert!(
-            !recheck_resume_plan(&normal, &exact, RecheckResumeConfig::default()).should_recheck
+            recheck_resume_plan(&normal, &exact, RecheckResumeConfig::default()).should_recheck
+        );
+        assert!(
+            !recheck_resume_plan(
+                &normal,
+                &exact,
+                RecheckResumeConfig {
+                    skip_recheck: true,
+                    ..RecheckResumeConfig::default()
+                }
+            )
+            .should_recheck
         );
         assert!(
             recheck_resume_plan(
@@ -3114,6 +3282,8 @@ mod tests {
         inject_pending: bool,
         resume_pending: bool,
         has_errors_remaining: AtomicUsize,
+        recheck_errors_remaining: AtomicUsize,
+        checking_true_remaining: AtomicUsize,
         completion_errors_remaining: AtomicUsize,
         inject_calls: AtomicUsize,
         has_calls: AtomicUsize,
@@ -3261,6 +3431,8 @@ mod tests {
                 inject_pending: false,
                 resume_pending: false,
                 has_errors_remaining: AtomicUsize::new(0),
+                recheck_errors_remaining: AtomicUsize::new(0),
+                checking_true_remaining: AtomicUsize::new(0),
                 completion_errors_remaining: AtomicUsize::new(0),
                 inject_calls: AtomicUsize::new(0),
                 has_calls: AtomicUsize::new(0),
@@ -3301,6 +3473,16 @@ mod tests {
 
         fn with_has_errors(self, count: usize) -> Self {
             self.has_errors_remaining.store(count, Ordering::SeqCst);
+            self
+        }
+
+        fn with_recheck_errors(self, count: usize) -> Self {
+            self.recheck_errors_remaining.store(count, Ordering::SeqCst);
+            self
+        }
+
+        fn with_checking_true(self, count: usize) -> Self {
+            self.checking_true_remaining.store(count, Ordering::SeqCst);
             self
         }
 
@@ -3382,12 +3564,35 @@ mod tests {
 
         fn recheck<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()> {
             self.recheck_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(()) })
+            let error = self
+                .recheck_errors_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_sub(1)
+                })
+                .is_ok()
+                .then(|| TorrentClientError::Unavailable {
+                    client: self.descriptor.name.as_str().to_owned(),
+                    retry_after_ms: Some(1_000),
+                    message: "recheck unavailable".to_owned(),
+                });
+            Box::pin(async move {
+                if let Some(error) = error {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
+            })
         }
 
         fn is_checking<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
             self.checking_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(false) })
+            let checking = self
+                .checking_true_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_sub(1)
+                })
+                .is_ok();
+            Box::pin(async move { Ok(checking) })
         }
 
         fn remaining_bytes<'a>(
@@ -3541,6 +3746,13 @@ mod tests {
             link_type: None,
             flat_linking: false,
             recheck: RecheckResumeConfig::default(),
+        }
+    }
+
+    fn skip_recheck_config() -> RecheckResumeConfig {
+        RecheckResumeConfig {
+            skip_recheck: true,
+            ..RecheckResumeConfig::default()
         }
     }
 

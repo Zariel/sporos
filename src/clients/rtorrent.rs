@@ -1137,6 +1137,24 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn client_injects_paused_for_recheck() {
+        let endpoint = spawn_rtorrent_server(|request| async move {
+            let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            if body.contains("<methodName>load.raw</methodName>")
+                && !body.contains("<methodName>load.raw_start</methodName>")
+            {
+                return (AxumStatusCode::OK, xml_response("<i8>0</i8>"));
+            }
+            (AxumStatusCode::BAD_REQUEST, body)
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        client.inject(b"torrent", None, false).await.unwrap();
+    }
+
     fn assert_xml_order(xml: &str, needles: &[&str]) {
         assert!(
             xml_contains_order(xml, needles),

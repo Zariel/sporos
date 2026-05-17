@@ -1000,6 +1000,8 @@ mod tests {
                     assert!(body.contains("contentLayout"));
                     assert!(body.contains("Original"));
                     assert!(body.contains("paused"));
+                    assert!(body.contains("name=\"paused\"\r\n\r\ntrue"));
+                    assert!(body.contains("name=\"skip_checking\"\r\n\r\nfalse"));
                     (AxumStatusCode::OK, "").into_response()
                 }
                 _ => (AxumStatusCode::NOT_FOUND, path).into_response(),
