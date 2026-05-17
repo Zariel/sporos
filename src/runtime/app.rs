@@ -1,3 +1,10 @@
+#![expect(
+    clippy::map_err_ignore,
+    clippy::too_many_arguments,
+    clippy::unwrap_used,
+    reason = "mechanical clippy gate enablement leaves runtime app lint classes to linked cleanup beads"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;

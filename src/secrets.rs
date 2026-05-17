@@ -1,3 +1,8 @@
+#![expect(
+    clippy::indexing_slicing,
+    reason = "mechanical clippy gate enablement leaves URL byte-indexing cleanup to a linked lint-class bead"
+)]
+
 use std::fmt;
 
 use serde::Deserialize;

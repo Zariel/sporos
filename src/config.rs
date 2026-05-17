@@ -467,43 +467,40 @@ fn resolve_secret_env(
     config: &mut SporosConfig,
     env: &BTreeMap<String, String>,
 ) -> Result<(), ConfigError> {
-    if config.server.api_token.is_none() {
-        if let Some(env_name) = nonempty_secret_env(
+    if config.server.api_token.is_none()
+        && let Some(env_name) = nonempty_secret_env(
             "server.api_token_env",
             "server",
             &config.server.api_token_env,
-        )? {
-            let value = secret_env_value(env, env_name, "server.api_token_env", "server")?;
-            config.server.api_token = Some(
-                ApiToken::new(value.clone())
+        )?
+    {
+        let value = secret_env_value(env, env_name, "server.api_token_env", "server")?;
+        config.server.api_token = Some(
+            ApiToken::new(value.clone()).map_err(|source| ConfigError::InvalidSecret { source })?,
+        );
+    }
+    for (name, client) in &mut config.torrent_clients {
+        if client.password.is_none()
+            && let Some(env_name) =
+                nonempty_secret_env("torrent_clients.password_env", name, &client.password_env)?
+        {
+            let value = secret_env_value(env, env_name, "torrent_clients.password_env", name)?;
+            client.password = Some(
+                Password::new(value.clone())
                     .map_err(|source| ConfigError::InvalidSecret { source })?,
             );
         }
     }
-    for (name, client) in &mut config.torrent_clients {
-        if client.password.is_none() {
-            if let Some(env_name) =
-                nonempty_secret_env("torrent_clients.password_env", name, &client.password_env)?
-            {
-                let value = secret_env_value(env, env_name, "torrent_clients.password_env", name)?;
-                client.password = Some(
-                    Password::new(value.clone())
-                        .map_err(|source| ConfigError::InvalidSecret { source })?,
-                );
-            }
-        }
-    }
     for (name, indexer) in &mut config.indexers.torznab {
-        if indexer.api_key.is_none() {
-            if let Some(env_name) =
+        if indexer.api_key.is_none()
+            && let Some(env_name) =
                 nonempty_secret_env("indexers.torznab.api_key_env", name, &indexer.api_key_env)?
-            {
-                let value = secret_env_value(env, env_name, "indexers.torznab.api_key_env", name)?;
-                indexer.api_key = Some(
-                    ApiKey::new(value.clone())
-                        .map_err(|source| ConfigError::InvalidSecret { source })?,
-                );
-            }
+        {
+            let value = secret_env_value(env, env_name, "indexers.torznab.api_key_env", name)?;
+            indexer.api_key = Some(
+                ApiKey::new(value.clone())
+                    .map_err(|source| ConfigError::InvalidSecret { source })?,
+            );
         }
     }
     for (name, source) in &mut config.indexers.prowlarr {
@@ -536,31 +533,29 @@ fn resolve_secret_env(
 }
 
 fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
-    if config.server.api_token.is_none() {
-        if let Some(path) = &config.server.api_token_file {
-            let value = secret_file_value("server.api_token_file", "server", path)?;
-            config.server.api_token =
-                Some(ApiToken::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
-        }
+    if config.server.api_token.is_none()
+        && let Some(path) = &config.server.api_token_file
+    {
+        let value = secret_file_value("server.api_token_file", "server", path)?;
+        config.server.api_token =
+            Some(ApiToken::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
     }
     for (name, client) in &mut config.torrent_clients {
-        if client.password.is_none() {
-            if let Some(path) = &client.password_file {
-                let value = secret_file_value("torrent_clients.password_file", name, path)?;
-                client.password = Some(
-                    Password::new(value).map_err(|source| ConfigError::InvalidSecret { source })?,
-                );
-            }
+        if client.password.is_none()
+            && let Some(path) = &client.password_file
+        {
+            let value = secret_file_value("torrent_clients.password_file", name, path)?;
+            client.password =
+                Some(Password::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
         }
     }
     for (name, indexer) in &mut config.indexers.torznab {
-        if indexer.api_key.is_none() {
-            if let Some(path) = &indexer.api_key_file {
-                let value = secret_file_value("indexers.torznab.api_key_file", name, path)?;
-                indexer.api_key = Some(
-                    ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?,
-                );
-            }
+        if indexer.api_key.is_none()
+            && let Some(path) = &indexer.api_key_file
+        {
+            let value = secret_file_value("indexers.torznab.api_key_file", name, path)?;
+            indexer.api_key =
+                Some(ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
         }
     }
     for (name, source) in &mut config.indexers.prowlarr {

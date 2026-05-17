@@ -769,21 +769,20 @@ fn parse_release_group(value: &str) -> Option<String> {
 }
 
 fn strip_release_group(value: &str) -> &str {
-    if let Some(captures) = bracketed_group_regex().captures(value) {
-        if let (Some(match_), Some(group)) = (captures.get(0), captures.name("group")) {
-            if match_.start() == 0 && !is_bad_group(group.as_str()) {
-                return value.get(match_.end()..).unwrap_or(value).trim_start();
-            }
-        }
+    if let Some(captures) = bracketed_group_regex().captures(value)
+        && let (Some(match_), Some(group)) = (captures.get(0), captures.name("group"))
+        && match_.start() == 0
+        && !is_bad_group(group.as_str())
+    {
+        return value.get(match_.end()..).unwrap_or(value).trim_start();
     }
 
-    if let Some(captures) = scene_group_regex().captures(value) {
-        if let (Some(match_), Some(group)) = (captures.get(0), captures.name("group"))
-            && match_.start() == 0
-            && !is_bad_group(group.as_str())
-        {
-            return value.get(match_.end()..).unwrap_or(value).trim_start();
-        }
+    if let Some(captures) = scene_group_regex().captures(value)
+        && let (Some(match_), Some(group)) = (captures.get(0), captures.name("group"))
+        && match_.start() == 0
+        && !is_bad_group(group.as_str())
+    {
+        return value.get(match_.end()..).unwrap_or(value).trim_start();
     }
 
     value
@@ -1030,17 +1029,18 @@ where
 
         if metadata.is_file() {
             collect_one_file(root, &path, &metadata, files, report);
-        } else if metadata.is_dir() && remaining_depth > 0 {
-            if !collect_video_files_until(
+        } else if metadata.is_dir()
+            && remaining_depth > 0
+            && !collect_video_files_until(
                 root,
                 &path,
                 remaining_depth - 1,
                 files,
                 report,
                 should_continue,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
     }
     true

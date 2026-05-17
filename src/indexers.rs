@@ -1,3 +1,15 @@
+#![expect(
+    clippy::let_underscore_must_use,
+    reason = "mechanical clippy gate enablement leaves explicit cache cleanup handling to a linked lint-class bead"
+)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::needless_update,
+        reason = "exhaustive fixture literals are tracked for follow-up cleanup"
+    )
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -2039,17 +2051,15 @@ fn parse_search_caps(
         QName(b"audio-search") => caps.search.audio_search = available,
         _ => {}
     }
-    if available {
-        if let Some(params) = attribute_value(reader, element, b"supportedParams")? {
-            for param in params
-                .split(',')
-                .map(str::trim)
-                .filter(|param| !param.is_empty())
-            {
-                caps.search
-                    .supported_id_params
-                    .insert(param.to_ascii_lowercase());
-            }
+    if available && let Some(params) = attribute_value(reader, element, b"supportedParams")? {
+        for param in params
+            .split(',')
+            .map(str::trim)
+            .filter(|param| !param.is_empty())
+        {
+            caps.search
+                .supported_id_params
+                .insert(param.to_ascii_lowercase());
         }
     }
     Ok(())

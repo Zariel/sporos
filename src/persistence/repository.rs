@@ -1,3 +1,16 @@
+#![expect(
+    clippy::large_enum_variant,
+    clippy::string_slice,
+    reason = "mechanical clippy gate enablement leaves repository lint classes to linked cleanup beads"
+)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::cloned_ref_to_slice_refs,
+        reason = "repository single-row test fixtures are tracked for cleanup"
+    )
+)]
+
 use std::cmp::Ordering as CompareOrdering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -4585,13 +4598,13 @@ fn announce_dependency_schedule_action(
 ) -> AnnounceDependencyScheduleAction {
     match row.dependency_state.as_deref() {
         Some("degraded" | "unavailable") => {
-            if let Some(retry_after_ms) = row.retry_after_ms {
-                if retry_after_ms > now_ms {
-                    return AnnounceDependencyScheduleAction::Wait {
-                        reason: AnnounceReason::RetryAfter,
-                        next_attempt_at_ms: retry_after_ms.max(row.next_attempt_at_ms),
-                    };
-                }
+            if let Some(retry_after_ms) = row.retry_after_ms
+                && retry_after_ms > now_ms
+            {
+                return AnnounceDependencyScheduleAction::Wait {
+                    reason: AnnounceReason::RetryAfter,
+                    next_attempt_at_ms: retry_after_ms.max(row.next_attempt_at_ms),
+                };
             }
 
             if row.status == "waiting" {

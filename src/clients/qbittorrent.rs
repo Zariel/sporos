@@ -1,3 +1,11 @@
+#![cfg_attr(
+    test,
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "test HTTP fixture only drains enough bytes to observe the request"
+    )
+)]
+
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;

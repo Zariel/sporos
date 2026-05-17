@@ -134,12 +134,10 @@ Pre-commit quality gates must run in this exact order and all must pass:
 1. `cargo fmt --check`
 2. `cargo build`
 3. `cargo check`
-4. `cargo test`
+4. `cargo clippy --all-targets -- -D warnings`
+5. `cargo test`
 
-CI enforces the same cargo gate order.
-
-If clippy is run by CI, requested by the ticket, or useful for the change, it
-must pass with no warnings.
+CI and local pre-commit checks must enforce the same cargo gate order.
 
 ## Architecture Overview
 

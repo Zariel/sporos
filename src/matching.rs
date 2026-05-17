@@ -1,3 +1,20 @@
+#![expect(
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing,
+    clippy::too_many_arguments,
+    clippy::unnecessary_sort_by,
+    clippy::unreachable,
+    reason = "mechanical clippy gate enablement leaves matching lint classes to linked cleanup beads"
+)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::cloned_ref_to_slice_refs,
+        clippy::field_reassign_with_default,
+        reason = "test fixture cleanup is tracked separately from enabling the gate"
+    )
+)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -83,7 +100,7 @@ pub struct FileTreeAssessment {
     pub matched_ratio: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CandidateAssessmentConfig {
     pub precheck: CandidatePrecheckConfig,
     pub file_tree: FileTreeMatchConfig,
@@ -162,15 +179,6 @@ impl From<DatabaseError> for ReverseLookupError {
 impl From<CandidateAssessmentError> for ReverseLookupError {
     fn from(source: CandidateAssessmentError) -> Self {
         Self::Assessment { source }
-    }
-}
-
-impl Default for CandidateAssessmentConfig {
-    fn default() -> Self {
-        Self {
-            precheck: CandidatePrecheckConfig::default(),
-            file_tree: FileTreeMatchConfig::default(),
-        }
     }
 }
 
@@ -335,9 +343,9 @@ pub fn precheck_candidate(
         return reject(CandidatePrecheckReason::FuzzySizeMismatch);
     }
 
-    if !candidate
+    if candidate
         .download_url
-        .is_some_and(|url| !url.trim().is_empty())
+        .is_none_or(|url| url.trim().is_empty())
     {
         return reject(CandidatePrecheckReason::MissingDownloadLink);
     }

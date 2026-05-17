@@ -1,3 +1,11 @@
+#![cfg_attr(
+    test,
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "test synchronization sends are best-effort and tracked for cleanup"
+    )
+)]
+
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -1058,7 +1066,7 @@ mod tests {
 
         let result = worker.cleanup_retained(100_000, false).await;
 
-        assert!(result.is_err());
+        result.unwrap_err();
         assert_eq!(
             i64::MIN,
             worker

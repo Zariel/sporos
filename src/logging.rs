@@ -1,3 +1,11 @@
+#![cfg_attr(
+    test,
+    expect(
+        clippy::unwrap_in_result,
+        reason = "test writer mutex poisoning behavior is tracked for cleanup"
+    )
+)]
+
 use std::io;
 
 use tracing_subscriber::EnvFilter;

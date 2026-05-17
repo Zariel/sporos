@@ -1,3 +1,8 @@
+#![expect(
+    clippy::unreachable,
+    reason = "mechanical clippy gate enablement leaves state-machine assertion cleanup to a linked lint-class bead"
+)]
+
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -332,10 +337,10 @@ impl InjectionWorker {
                 }
             }
         }
-        if summaries.is_empty() {
-            if let Some(error) = last_error {
-                return Err(error);
-            }
+        if summaries.is_empty()
+            && let Some(error) = last_error
+        {
+            return Err(error);
         }
         if !summaries.is_empty() {
             worker

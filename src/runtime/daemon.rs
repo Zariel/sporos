@@ -1,3 +1,11 @@
+#![expect(
+    clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::let_underscore_must_use,
+    clippy::too_many_arguments,
+    reason = "mechanical clippy gate enablement leaves daemon lint classes to linked cleanup beads"
+)]
+
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
@@ -1671,7 +1679,7 @@ fn actionable_assessment(
             MatchDecision::Exact | MatchDecision::SizeOnly | MatchDecision::Partial
         ) =>
         {
-            Some((*candidate_id, assessment.clone()))
+            Some((*candidate_id, *assessment))
         }
         PersistedCandidateAssessment::Assessed { .. }
         | PersistedCandidateAssessment::Rejected { .. }
@@ -2224,7 +2232,7 @@ mod tests {
 
         assert_eq!(200, response);
         assert_eq!(200, ready);
-        assert!(result.is_ok());
+        result.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

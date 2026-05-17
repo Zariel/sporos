@@ -1,3 +1,17 @@
+#![expect(
+    clippy::let_underscore_must_use,
+    reason = "mechanical clippy gate enablement leaves explicit send/health handling to a linked lint-class bead"
+)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::cast_sign_loss,
+        clippy::cloned_ref_to_slice_refs,
+        clippy::unreachable,
+        reason = "test fixture simplifications are tracked for follow-up cleanup"
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -1156,7 +1170,7 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
-        let items = vec![
+        let items = [
             data_root_item(
                 "Example Show S01E01",
                 MediaType::Episode,
@@ -1234,7 +1248,7 @@ mod tests {
                     MediaType::Episode,
                     &format!("paged-{season_index:04}-e{episode:02}.mkv"),
                     u64::try_from(episode).unwrap(),
-                    100 + i64::try_from(episode).unwrap(),
+                    100 + i64::from(episode),
                 ));
             }
             items.push(data_root_item(
@@ -1292,7 +1306,7 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
-        let items = vec![
+        let items = [
             data_root_item(
                 "Example Show S01E01",
                 MediaType::Episode,
@@ -1529,7 +1543,7 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
-        let items = vec![
+        let items = [
             data_root_item(
                 "Æther Show S01E01",
                 MediaType::Episode,
@@ -1800,7 +1814,7 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
-        let existing = vec![
+        let existing = [
             data_root_item("First.2026.1080p", MediaType::Movie, "first.mkv", 10, 100),
             data_root_item(
                 "Example Show S01E01",

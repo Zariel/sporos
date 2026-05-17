@@ -1,3 +1,8 @@
+#![expect(
+    clippy::result_large_err,
+    reason = "mechanical clippy gate enablement leaves HTTP error-shape cleanup to a linked lint-class bead"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;

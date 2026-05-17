@@ -1,3 +1,17 @@
+#![expect(
+    clippy::indexing_slicing,
+    reason = "mechanical clippy gate enablement leaves checked parser field access to linked lint-class beads"
+)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::cloned_ref_to_slice_refs,
+        clippy::let_underscore_must_use,
+        clippy::string_slice,
+        reason = "test fixtures prefer direct request drains and owned single-item slices for clarity"
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;

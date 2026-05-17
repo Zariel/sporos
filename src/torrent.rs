@@ -1,3 +1,8 @@
+#![expect(
+    clippy::map_err_ignore,
+    reason = "mechanical clippy gate enablement leaves torrent parse error-source cleanup to a linked lint-class bead"
+)]
+
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::str;
@@ -156,7 +161,7 @@ fn parse_info(bytes: &[u8]) -> Result<(String, Vec<TorrentFile>, ByteSize), Torr
 }
 
 fn parse_pieces(pieces: &[u8]) -> Result<usize, TorrentParseError> {
-    if pieces.len() % 20 != 0 {
+    if !pieces.len().is_multiple_of(20) {
         return Err(unsupported_layout(
             "torrent pieces field must contain 20-byte SHA-1 hashes",
         ));

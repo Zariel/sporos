@@ -1,3 +1,16 @@
+#![expect(
+    clippy::indexing_slicing,
+    clippy::let_underscore_must_use,
+    reason = "mechanical clippy gate enablement leaves existing action safety cleanup to linked lint-class beads"
+)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::cloned_ref_to_slice_refs,
+        reason = "test fixture cleanup is lower risk than the production clippy gate fix"
+    )
+)]
+
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, FileTimes, OpenOptions};
@@ -530,7 +543,7 @@ fn select_link_dir_by_device(
         let Some(device) = device_id(link_dir)? else {
             return Ok(None);
         };
-        if devices.iter().any(|seen| *seen == device) {
+        if devices.contains(&device) {
             return Ok(None);
         }
         devices.push(device);
