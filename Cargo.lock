@@ -1504,6 +1504,7 @@ dependencies = [
  "base64",
  "bendy",
  "clap",
+ "futures-util",
  "httpdate",
  "libc",
  "prometheus",

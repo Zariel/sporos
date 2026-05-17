@@ -20,7 +20,7 @@ use crate::domain::{
 };
 use crate::errors::{DatabaseError, TorrentClientError};
 use crate::http::{
-    AnnouncementWorkflowRequest, HttpState, JobRunWorkflowRequest, ReadinessState,
+    AnnouncementWorkflowRequest, HttpState, JobRunWorkflowRequest, ReadinessPaths, ReadinessState,
     SearchWorkflowRequest, WorkflowQueues,
 };
 use crate::indexers::{
@@ -837,6 +837,14 @@ impl AppRuntime {
         let mut readiness = ReadinessState::ready();
         readiness.workers_running = false;
         let mut http = HttpState::new(readiness, health.clone())
+            .with_live_readiness(
+                repository.clone(),
+                ReadinessPaths::new(
+                    &config.paths.database,
+                    &config.paths.torrent_cache_dir,
+                    &config.paths.output_dir,
+                ),
+            )
             .with_metrics(metrics.clone())
             .with_search_queue(workflow.searches.clone())
             .with_job_queue(workflow.jobs.clone())
@@ -1789,9 +1797,12 @@ fn workflow_queues(queue_config: RuntimeQueueConfig) -> (WorkflowQueues, Workflo
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
     use std::future::{Future, pending};
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::clients::TorrentClientCapabilities;
@@ -3567,7 +3578,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_accepts_durable_workflows() {
-        let config = SporosConfig::default();
+        let root = unique_temp_dir("app-durable-workflows");
+        let config = runtime_test_config(&root);
         let repository = Repository::connect_in_memory().await.unwrap();
         let runtime = AppRuntime::from_repository(config, repository)
             .await
@@ -3655,6 +3667,7 @@ mod tests {
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());
         assert_eq!(true, status_json["readiness"]["accepting_work"]);
         assert_eq!(false, status_json["readiness"]["processing_ready"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -4526,5 +4539,27 @@ mod tests {
             builder = builder.header("authorization", auth);
         }
         builder.body(Body::from(r#"{"query":"Example"}"#)).unwrap()
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("sporos-{label}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn runtime_test_config(root: &Path) -> SporosConfig {
+        let mut config = SporosConfig::default();
+        config.paths.database = root.join("state/sporos.db");
+        config.paths.torrent_cache_dir = root.join("cache/torrents");
+        config.paths.output_dir = root.join("output");
+        fs::create_dir_all(config.paths.database.parent().unwrap()).unwrap();
+        fs::create_dir_all(&config.paths.torrent_cache_dir).unwrap();
+        fs::create_dir_all(&config.paths.output_dir).unwrap();
+        config
     }
 }

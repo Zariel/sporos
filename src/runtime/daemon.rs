@@ -1,7 +1,9 @@
 use std::fmt;
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use sqlx::Row;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -86,10 +88,8 @@ pub async fn serve_with_listener(
     let shutdown_signal = runtime.state.shutdown_signal.clone();
     let http = runtime.state.http.clone();
     let app = router(http.clone());
+    http.set_workers_running(true);
     let background = start_background_tasks(runtime).await?;
-    let mut readiness = http.readiness();
-    readiness.workers_running = true;
-    http.set_readiness(readiness);
     let signal_task = tokio::spawn(process_shutdown_signal(shutdown.clone()));
 
     let serve_result = axum::serve(listener, app)
@@ -100,9 +100,7 @@ pub async fn serve_with_listener(
         });
     signal_task.abort();
     let _ = shutdown.cancel_now("server stopping");
-    let mut readiness = http.readiness();
-    readiness.workers_running = false;
-    http.set_readiness(readiness);
+    http.set_workers_running(false);
     stop_background_tasks(background).await;
     serve_result
 }
@@ -189,100 +187,140 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         .map_err(|source| DaemonError::AnnounceStartup { source })?;
         handles.push(BackgroundTask::new(
             "announce-worker",
-            tokio::spawn(run_announce_worker_loop(
-                runtime.state.clone(),
-                announce_worker,
-                runtime.state.shutdown_signal.clone(),
-            )),
+            spawn_supervised_background(
+                "announce-worker",
+                &runtime.state,
+                run_announce_worker_loop(
+                    runtime.state.clone(),
+                    announce_worker,
+                    runtime.state.shutdown_signal.clone(),
+                ),
+            ),
             BackgroundShutdownPolicy::AwaitInFlight,
         ));
     }
     handles.push(BackgroundTask::new(
         "inventory-refresh",
-        tokio::spawn(run_inventory_refresh_worker(
-            runtime.state.inventory_refresh.clone(),
-            inventory_refresh,
-            runtime.state.shutdown_signal.clone(),
-        )),
+        spawn_supervised_background(
+            "inventory-refresh",
+            &runtime.state,
+            run_inventory_refresh_worker(
+                runtime.state.inventory_refresh.clone(),
+                inventory_refresh,
+                runtime.state.shutdown_signal.clone(),
+            ),
+        ),
         BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "notifications",
-        tokio::spawn(run_notification_worker(
-            NotificationWorker::new(runtime.state.health.clone(), runtime.state.metrics.clone()),
-            notifications,
-            runtime.state.shutdown_signal.clone(),
-        )),
+        spawn_supervised_background(
+            "notifications",
+            &runtime.state,
+            run_notification_worker(
+                NotificationWorker::new(
+                    runtime.state.health.clone(),
+                    runtime.state.metrics.clone(),
+                ),
+                notifications,
+                runtime.state.shutdown_signal.clone(),
+            ),
+        ),
         BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "saved-torrent-retry",
-        tokio::spawn(run_saved_retry_loop(
-            runtime.state.injection_worker.clone(),
-            SavedTorrentRetryConfig {
-                directories: vec![runtime.state.config.paths.output_dir.clone()],
-                ..SavedTorrentRetryConfig::default()
-            },
-            runtime.state.saved_retry_interval,
-            runtime.state.shutdown_signal.clone(),
-        )),
+        spawn_supervised_background(
+            "saved-torrent-retry",
+            &runtime.state,
+            run_saved_retry_loop(
+                runtime.state.injection_worker.clone(),
+                SavedTorrentRetryConfig {
+                    directories: vec![runtime.state.config.paths.output_dir.clone()],
+                    ..SavedTorrentRetryConfig::default()
+                },
+                runtime.state.saved_retry_interval,
+                runtime.state.shutdown_signal.clone(),
+            ),
+        ),
         BackgroundShutdownPolicy::AwaitInFlight,
     ));
     let client_inventory_interval = runtime_client_inventory_interval(&runtime.state);
     handles.push(BackgroundTask::new(
         "client-inventory-refresh",
-        tokio::spawn(run_client_inventory_refresh_loop(
-            runtime.state.clone(),
-            client_inventory_interval,
-            runtime.state.shutdown_signal.clone(),
-        )),
+        spawn_supervised_background(
+            "client-inventory-refresh",
+            &runtime.state,
+            run_client_inventory_refresh_loop(
+                runtime.state.clone(),
+                client_inventory_interval,
+                runtime.state.shutdown_signal.clone(),
+            ),
+        ),
         BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     if let Some(interval) = runtime_prowlarr_refresh_interval(&runtime.state) {
         handles.push(BackgroundTask::new(
             "prowlarr-refresh",
-            tokio::spawn(run_prowlarr_refresh_loop(
-                runtime.state.clone(),
-                interval,
-                runtime.state.shutdown_signal.clone(),
-            )),
+            spawn_supervised_background(
+                "prowlarr-refresh",
+                &runtime.state,
+                run_prowlarr_refresh_loop(
+                    runtime.state.clone(),
+                    interval,
+                    runtime.state.shutdown_signal.clone(),
+                ),
+            ),
             BackgroundShutdownPolicy::AbortOnTimeout,
         ));
     }
     handles.push(BackgroundTask::new(
         "announcements-receiver",
-        tokio::spawn(hold_receiver_open(
-            announcements,
-            runtime.state.shutdown_signal.clone(),
-        )),
+        spawn_supervised_background(
+            "announcements-receiver",
+            &runtime.state,
+            hold_receiver_open(announcements, runtime.state.shutdown_signal.clone()),
+        ),
         BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     handles.push(BackgroundTask::new(
         "searches-receiver",
-        tokio::spawn(run_search_receiver(
-            runtime.state.clone(),
-            searches,
-            runtime.state.shutdown_signal.clone(),
-        )),
+        spawn_supervised_background(
+            "searches-receiver",
+            &runtime.state,
+            run_search_receiver(
+                runtime.state.clone(),
+                searches,
+                runtime.state.shutdown_signal.clone(),
+            ),
+        ),
         BackgroundShutdownPolicy::AwaitInFlight,
     ));
     handles.push(BackgroundTask::new(
         "jobs-receiver",
-        tokio::spawn(run_job_receiver(
-            runtime.state.clone(),
-            jobs,
-            runtime.state.shutdown_signal.clone(),
-        )),
+        spawn_supervised_background(
+            "jobs-receiver",
+            &runtime.state,
+            run_job_receiver(
+                runtime.state.clone(),
+                jobs,
+                runtime.state.shutdown_signal.clone(),
+            ),
+        ),
         BackgroundShutdownPolicy::AwaitInFlight,
     ));
     handles.push(
         BackgroundTask::new(
             "scheduler-tick",
-            tokio::spawn(run_scheduler_tick_loop(
-                runtime.state.clone(),
-                SCHEDULER_TICK_INTERVAL,
-                runtime.state.shutdown_signal.clone(),
-            )),
+            spawn_supervised_background(
+                "scheduler-tick",
+                &runtime.state,
+                run_scheduler_tick_loop(
+                    runtime.state.clone(),
+                    SCHEDULER_TICK_INTERVAL,
+                    runtime.state.shutdown_signal.clone(),
+                ),
+            ),
             BackgroundShutdownPolicy::AbortOnTimeout,
         )
         .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
@@ -292,11 +330,15 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     handles.push(
         BackgroundTask::new(
             "scheduler-receiver",
-            tokio::spawn(run_scheduler_receiver(
-                runtime.state.clone(),
-                scheduler,
-                runtime.state.shutdown_signal.clone(),
-            )),
+            spawn_supervised_background(
+                "scheduler-receiver",
+                &runtime.state,
+                run_scheduler_receiver(
+                    runtime.state.clone(),
+                    scheduler,
+                    runtime.state.shutdown_signal.clone(),
+                ),
+            ),
             BackgroundShutdownPolicy::AwaitInFlight,
         )
         .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
@@ -305,6 +347,24 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     );
 
     Ok(handles)
+}
+
+fn spawn_supervised_background<F>(name: &'static str, state: &AppState, future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let http = state.http.clone();
+    let shutdown = state.shutdown_signal.clone();
+    tokio::spawn(async move {
+        let outcome = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+        if shutdown.state().phase == ShutdownPhase::Running {
+            match outcome {
+                Ok(()) => error!(task = name, "background task exited before shutdown"),
+                Err(_) => error!(task = name, "background task panicked before shutdown"),
+            }
+            http.record_worker_failure();
+        }
+    })
 }
 
 async fn run_scheduler_tick_loop(
@@ -2143,7 +2203,8 @@ mod tests {
 
     #[tokio::test]
     async fn serve_runtime_stops_on_shutdown_signal() {
-        let config = SporosConfig::default();
+        let root = unique_temp_dir("daemon-serve-shutdown");
+        let config = readiness_config(&root);
         let repository = Repository::connect_in_memory().await.unwrap();
         let runtime = AppRuntime::from_repository(config, repository)
             .await
@@ -2164,6 +2225,105 @@ mod tests {
         assert_eq!(200, response);
         assert_eq!(200, ready);
         assert!(result.is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readyz_rechecks_database_live() {
+        let root = unique_temp_dir("daemon-readyz-db");
+        let config = readiness_config(&root);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        runtime.state.http.set_workers_running(true);
+        repository.pool().close().await;
+
+        let (status, json) = readyz_json(runtime.state.http.clone()).await;
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["database_available"]);
+        assert_eq!(false, json["checks"]["schema_initialized"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readyz_rechecks_state_paths_live() {
+        let root = unique_temp_dir("daemon-readyz-paths");
+        let config = readiness_config(&root);
+        let output_dir = config.paths.output_dir.clone();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        runtime.state.http.set_workers_running(true);
+        fs::remove_dir_all(output_dir).unwrap();
+
+        let (status, json) = readyz_json(runtime.state.http.clone()).await;
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["state_paths_writable"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervised_worker_exit_makes_readyz_not_ready() {
+        let root = unique_temp_dir("daemon-readyz-worker");
+        let config = readiness_config(&root);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        runtime.state.http.set_workers_running(true);
+
+        let handle = spawn_supervised_background("test-worker", &runtime.state, async {});
+        handle.await.unwrap();
+        let (status, json) = readyz_json(runtime.state.http.clone()).await;
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["workers_running"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervised_worker_panic_makes_readyz_not_ready() {
+        let root = unique_temp_dir("daemon-readyz-worker-panic");
+        let config = readiness_config(&root);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        runtime.state.http.set_workers_running(true);
+
+        let handle = spawn_supervised_background("test-worker", &runtime.state, async {
+            panic!("test worker panic");
+        });
+        handle.await.unwrap();
+        let (status, json) = readyz_json(runtime.state.http.clone()).await;
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["workers_running"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn early_worker_exit_is_not_overwritten_ready() {
+        let root = unique_temp_dir("daemon-readyz-worker-early");
+        let config = readiness_config(&root);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        runtime.state.http.set_workers_running(true);
+
+        let handle = spawn_supervised_background("test-worker", &runtime.state, async {});
+        handle.await.unwrap();
+        runtime.state.http.set_workers_running(true);
+        let (status, json) = readyz_json(runtime.state.http.clone()).await;
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["workers_running"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -3685,18 +3845,26 @@ mod tests {
 
     async fn wait_for_readyz(address: std::net::SocketAddr) -> u16 {
         let url = format!("http://{address}/readyz");
-        wait_for_status(&url).await
+        wait_for_status_code(&url, 200).await
     }
 
     async fn wait_for_status(url: &str) -> u16 {
+        wait_for_status_code(url, 0).await
+    }
+
+    async fn wait_for_status_code(url: &str, expected: u16) -> u16 {
+        let mut last_status = 0;
         for _attempt in 0..20 {
             if let Ok(response) = reqwest::get(url).await {
-                return response.status().as_u16();
+                last_status = response.status().as_u16();
+                if expected == 0 || last_status == expected {
+                    return last_status;
+                }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        0
+        last_status
     }
 
     async fn wait_for_local_item_count(repository: &Repository, expected: i64) {
@@ -4274,6 +4442,34 @@ mod tests {
             std::env::temp_dir().join(format!("sporos-{label}-{}-{unique}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn readiness_config(root: &Path) -> SporosConfig {
+        let mut config = SporosConfig::default();
+        config.paths.database = root.join("state/sporos.db");
+        config.paths.torrent_cache_dir = root.join("cache/torrents");
+        config.paths.output_dir = root.join("output");
+        fs::create_dir_all(config.paths.database.parent().unwrap()).unwrap();
+        fs::create_dir_all(&config.paths.torrent_cache_dir).unwrap();
+        fs::create_dir_all(&config.paths.output_dir).unwrap();
+        config
+    }
+
+    async fn readyz_json(http: crate::http::HttpState) -> (StatusCode, Value) {
+        let response = router(http)
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
     }
 
     fn saved_torrent_count(path: &Path) -> usize {

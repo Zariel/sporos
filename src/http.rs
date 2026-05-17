@@ -3,7 +3,10 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -29,12 +32,16 @@ use crate::metrics::{
     HttpMethod, HttpRoute, MetricsRegistry, MetricsSnapshot, WorkflowMetric, WorkflowOutcome,
 };
 use crate::persistence::repository::{AnnounceInsertResult, AnnounceQueueSnapshot, Repository};
+use crate::persistence::schema::REQUIRED_TABLES;
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
 use crate::secrets::CookieSecret;
 
 const WORKFLOW_BODY_LIMIT_BYTES: usize = 16 * 1024;
+const READINESS_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
+
+static READINESS_WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type ResolveDownloadUrlFuture = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
 type ResolveDownloadUrlHost =
@@ -90,6 +97,8 @@ impl AnnounceDownloadUrlResolver {
 #[derive(Debug, Clone)]
 pub struct HttpState {
     readiness: Arc<RwLock<ReadinessState>>,
+    worker_failure_observed: Arc<AtomicBool>,
+    live_readiness: Option<LiveReadinessChecks>,
     health: HealthRegistry,
     workflow_queues: Option<WorkflowQueues>,
     search_queue: Option<BoundedWorkQueue<SearchWorkflowRequest>>,
@@ -106,6 +115,8 @@ impl HttpState {
     pub fn new(readiness: ReadinessState, health: HealthRegistry) -> Self {
         Self {
             readiness: Arc::new(RwLock::new(readiness)),
+            worker_failure_observed: Arc::new(AtomicBool::new(false)),
+            live_readiness: None,
             health,
             workflow_queues: None,
             search_queue: None,
@@ -117,6 +128,15 @@ impl HttpState {
             request_timeout: Duration::from_secs(5),
             metrics: MetricsRegistry::new(),
         }
+    }
+
+    pub fn with_live_readiness(mut self, repository: Repository, paths: ReadinessPaths) -> Self {
+        self.live_readiness = Some(LiveReadinessChecks {
+            repository,
+            paths,
+            timeout: READINESS_CHECK_TIMEOUT,
+        });
+        self
     }
 
     pub fn with_workflow_queues(mut self, workflow_queues: WorkflowQueues) -> Self {
@@ -182,11 +202,33 @@ impl HttpState {
         *current = readiness;
     }
 
+    pub fn set_workers_running(&self, workers_running: bool) {
+        let mut current = self
+            .readiness
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.workers_running =
+            workers_running && !self.worker_failure_observed.load(Ordering::Relaxed);
+    }
+
+    pub fn record_worker_failure(&self) {
+        self.worker_failure_observed.store(true, Ordering::Relaxed);
+        self.set_workers_running(false);
+    }
+
     pub(crate) fn readiness(&self) -> ReadinessState {
         self.readiness
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    async fn current_readiness(&self) -> ReadinessState {
+        let mut readiness = self.readiness();
+        if let Some(live_readiness) = &self.live_readiness {
+            live_readiness.apply(&mut readiness).await;
+        }
+        readiness
     }
 
     fn dependency_health(&self) -> DependencyHealthSnapshot {
@@ -232,6 +274,111 @@ impl HttpState {
         }
         queues
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadinessPaths {
+    database_parent: PathBuf,
+    torrent_cache_dir: PathBuf,
+    output_dir: PathBuf,
+}
+
+impl ReadinessPaths {
+    pub fn new(database: &FsPath, torrent_cache_dir: &FsPath, output_dir: &FsPath) -> Self {
+        Self {
+            database_parent: database
+                .parent()
+                .map(FsPath::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            torrent_cache_dir: torrent_cache_dir.to_path_buf(),
+            output_dir: output_dir.to_path_buf(),
+        }
+    }
+
+    fn ensure_writable(&self) -> io::Result<()> {
+        ensure_writable_directory(&self.database_parent)?;
+        ensure_writable_directory(&self.torrent_cache_dir)?;
+        ensure_writable_directory(&self.output_dir)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveReadinessChecks {
+    repository: Repository,
+    paths: ReadinessPaths,
+    timeout: Duration,
+}
+
+impl LiveReadinessChecks {
+    async fn apply(&self, readiness: &mut ReadinessState) {
+        let database_available = self.database_available().await;
+        readiness.database_available = database_available;
+        readiness.schema_initialized = database_available && self.schema_initialized().await;
+        readiness.state_paths_writable = self.state_paths_writable().await;
+    }
+
+    async fn database_available(&self) -> bool {
+        matches!(
+            tokio::time::timeout(
+                self.timeout,
+                sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(self.repository.pool())
+            )
+            .await,
+            Ok(Ok(1))
+        )
+    }
+
+    async fn schema_initialized(&self) -> bool {
+        let repository = self.repository.clone();
+        matches!(
+            tokio::time::timeout(self.timeout, async move {
+                for table in REQUIRED_TABLES {
+                    let found: Option<String> = sqlx::query_scalar(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    )
+                    .bind(table)
+                    .fetch_optional(repository.pool())
+                    .await?;
+                    if found.is_none() {
+                        return Ok::<_, sqlx::Error>(false);
+                    }
+                }
+                Ok(true)
+            })
+            .await,
+            Ok(Ok(true))
+        )
+    }
+
+    async fn state_paths_writable(&self) -> bool {
+        let paths = self.paths.clone();
+        matches!(
+            tokio::time::timeout(
+                self.timeout,
+                tokio::task::spawn_blocking(move || paths.ensure_writable())
+            )
+            .await,
+            Ok(Ok(Ok(())))
+        )
+    }
+}
+
+fn ensure_writable_directory(path: &FsPath) -> io::Result<()> {
+    let metadata = path.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+
+    let probe_id = READINESS_WRITE_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let probe = path.join(format!(
+        "sporos-readiness-write-test-{}-{probe_id}",
+        std::process::id()
+    ));
+    std::fs::write(&probe, b"")?;
+    std::fs::remove_file(probe)
 }
 
 #[derive(Debug, Clone)]
@@ -710,7 +857,7 @@ async fn livez(State(state): State<HttpState>) -> impl IntoResponse {
 }
 
 async fn readyz(State(state): State<HttpState>) -> impl IntoResponse {
-    let readiness = readiness_response(&state);
+    let readiness = readiness_response(&state).await;
     let status = if readiness.status == "ready" {
         StatusCode::OK
     } else {
@@ -739,7 +886,7 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
 }
 
 async fn status(State(state): State<HttpState>) -> impl IntoResponse {
-    let readiness = readiness_response(&state);
+    let readiness = readiness_response(&state).await;
     let (announce_queue, announce_queue_error) = announce_queue_status(&state).await;
     state
         .metrics
@@ -1259,8 +1406,8 @@ fn announce_queue_status_response(
     }
 }
 
-fn readiness_response(state: &HttpState) -> ReadinessResponse {
-    let readiness = state.readiness();
+async fn readiness_response(state: &HttpState) -> ReadinessResponse {
+    let readiness = state.current_readiness().await;
     let local_ready = readiness.config_loaded
         && readiness.database_available
         && readiness.schema_initialized
