@@ -1,5 +1,7 @@
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug_span, info_span};
 
@@ -16,6 +18,22 @@ use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 pub struct AnnounceWorker {
     repository: Repository,
     config: AnnounceWorkerConfig,
+    retention_cleanup: AnnounceRetentionCleanup,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnounceRetentionCleanup {
+    last_cleanup_ms: Arc<AtomicI64>,
+}
+
+const RETENTION_CLEANUP_IN_PROGRESS_MS: i64 = i64::MAX;
+
+impl Default for AnnounceRetentionCleanup {
+    fn default() -> Self {
+        Self {
+            last_cleanup_ms: Arc::new(AtomicI64::new(i64::MIN)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -25,6 +43,11 @@ pub struct AnnounceWorkerConfig {
     pub lease_duration: Duration,
     pub lease_renewal: Duration,
     pub dependency_recovery_probe_interval: Duration,
+    pub success_retention: Duration,
+    pub failure_retention: Duration,
+    pub retention_cleanup_interval: Duration,
+    pub retention_cleanup_batch_size: u16,
+    pub retention_cleanup_max_batches: u16,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -388,9 +411,27 @@ impl AnnounceWorker {
             dependency_recovery_probe_interval: Duration::from_secs(
                 queue_config.retry_initial_delay_secs,
             ),
+            success_retention: Duration::from_secs(queue_config.success_retention_secs),
+            failure_retention: Duration::from_secs(queue_config.failure_retention_secs),
+            retention_cleanup_interval: Duration::from_secs(60),
+            retention_cleanup_batch_size: retention_cleanup_batch_size(queue_config),
+            retention_cleanup_max_batches: 4,
         };
 
-        Ok(Self { repository, config })
+        Ok(Self {
+            repository,
+            config,
+            retention_cleanup: AnnounceRetentionCleanup::default(),
+        })
+    }
+
+    pub fn with_retention_cleanup(mut self, retention_cleanup: AnnounceRetentionCleanup) -> Self {
+        self.retention_cleanup = retention_cleanup;
+        self
+    }
+
+    pub fn retention_cleanup(&self) -> AnnounceRetentionCleanup {
+        self.retention_cleanup.clone()
     }
 
     pub const fn config(&self) -> &AnnounceWorkerConfig {
@@ -403,6 +444,7 @@ impl AnnounceWorker {
     ) -> Result<AnnounceStartupSummary, AnnounceWorkerError> {
         let _span = info_span!("announce.recover_startup", now_ms);
         let expired = self.repository.expire_announce_work(now_ms).await?;
+        self.cleanup_retained(now_ms, true).await?;
         let recovered_leases = self
             .repository
             .recover_stale_announce_leases(now_ms)
@@ -421,6 +463,7 @@ impl AnnounceWorker {
         let lease_until_ms = now_ms.saturating_add(duration_ms(self.config.lease_duration));
         let reconcile_limit = self.config.claim_batch_size.saturating_mul(4).max(1);
         self.repository.expire_announce_work(now_ms).await?;
+        self.cleanup_retained(now_ms, false).await?;
         self.repository
             .recover_stale_announce_leases(now_ms)
             .await?;
@@ -443,6 +486,77 @@ impl AnnounceWorker {
             )
             .await
             .map_err(AnnounceWorkerError::from)
+    }
+
+    async fn cleanup_retained(&self, now_ms: i64, force: bool) -> Result<u64, AnnounceWorkerError> {
+        let Some(previous_cleanup_ms) = self.start_retention_cleanup(now_ms, force) else {
+            return Ok(0);
+        };
+        let success_cutoff_ms = now_ms.saturating_sub(duration_ms(self.config.success_retention));
+        let failure_cutoff_ms = now_ms.saturating_sub(duration_ms(self.config.failure_retention));
+        let mut deleted = 0_u64;
+        let batch_size = self.config.retention_cleanup_batch_size;
+        let max_batches = self.config.retention_cleanup_max_batches.max(1);
+        for _ in 0..max_batches {
+            let batch_deleted = match self
+                .repository
+                .cleanup_terminal_announce_work(success_cutoff_ms, failure_cutoff_ms, batch_size)
+                .await
+            {
+                Ok(batch_deleted) => batch_deleted,
+                Err(error) => {
+                    self.retention_cleanup
+                        .last_cleanup_ms
+                        .store(previous_cleanup_ms, Ordering::Release);
+                    return Err(AnnounceWorkerError::from(error));
+                }
+            };
+            deleted = deleted.saturating_add(batch_deleted);
+            if batch_deleted < u64::from(batch_size) {
+                break;
+            }
+        }
+        self.retention_cleanup
+            .last_cleanup_ms
+            .store(now_ms, Ordering::Release);
+
+        Ok(deleted)
+    }
+
+    fn start_retention_cleanup(&self, now_ms: i64, force: bool) -> Option<i64> {
+        if force {
+            let previous_cleanup_ms = self
+                .retention_cleanup
+                .last_cleanup_ms
+                .swap(RETENTION_CLEANUP_IN_PROGRESS_MS, Ordering::AcqRel);
+            return Some(previous_cleanup_ms);
+        }
+        let interval_ms = duration_ms(self.config.retention_cleanup_interval);
+        loop {
+            let last_ms = self
+                .retention_cleanup
+                .last_cleanup_ms
+                .load(Ordering::Acquire);
+            if last_ms == RETENTION_CLEANUP_IN_PROGRESS_MS {
+                return None;
+            }
+            if last_ms != i64::MIN && now_ms.saturating_sub(last_ms) < interval_ms {
+                return None;
+            }
+            if self
+                .retention_cleanup
+                .last_cleanup_ms
+                .compare_exchange(
+                    last_ms,
+                    RETENTION_CLEANUP_IN_PROGRESS_MS,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(last_ms);
+            }
+        }
     }
 
     pub async fn renew_lease(
@@ -625,6 +739,13 @@ fn duration_ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+fn retention_cleanup_batch_size(queue_config: &AnnounceQueueConfig) -> u16 {
+    let per_minute_claim_capacity = u32::from(queue_config.claim_batch_size)
+        .saturating_mul(u32::from(queue_config.worker_concurrency))
+        .saturating_mul(120);
+    u16::try_from(per_minute_claim_capacity.max(1)).unwrap_or(u16::MAX)
+}
+
 impl From<DatabaseError> for AnnounceWorkerError {
     fn from(source: DatabaseError) -> Self {
         Self::Database { source }
@@ -723,6 +844,156 @@ mod tests {
                 ("queued".to_owned(), "accepted".to_owned())
             ],
             status_rows(&repository).await
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_cleans_terminal_work_using_retention_config() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut config = test_config();
+        config.success_retention_secs = 10;
+        config.failure_retention_secs = 20;
+        for (id, guid, status, reason, finished_at_ms) in [
+            (
+                "ann_failed_old",
+                "guid-failed-old",
+                AnnounceStatus::TerminalFailed,
+                AnnounceReason::NoMatchTerminal,
+                79_000,
+            ),
+            (
+                "ann_failed_retained",
+                "guid-failed-retained",
+                AnnounceStatus::TerminalFailed,
+                AnnounceReason::NoMatchTerminal,
+                81_000,
+            ),
+            (
+                "ann_success_old",
+                "guid-success-old",
+                AnnounceStatus::Succeeded,
+                AnnounceReason::Saved,
+                89_000,
+            ),
+            (
+                "ann_success_retained",
+                "guid-success-retained",
+                AnnounceStatus::Succeeded,
+                AnnounceReason::Saved,
+                91_000,
+            ),
+        ] {
+            insert_terminal_work(&repository, id, guid, status, reason, finished_at_ms).await;
+        }
+        insert_work(&repository, "ann_queued_old", "guid-queued", 1).await;
+        sqlx::query("UPDATE announce_work SET expires_at = ? WHERE id = 'ann_queued_old'")
+            .bind(10_000_000_i64)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let startup_worker =
+            AnnounceWorker::new(repository.clone(), "startup-worker", &config).unwrap();
+
+        let summary = startup_worker.recover_startup(100_000).await.unwrap();
+        insert_terminal_work(
+            &repository,
+            "ann_success_after_cleanup",
+            "guid-success-after-cleanup",
+            AnnounceStatus::Succeeded,
+            AnnounceReason::Saved,
+            80_000,
+        )
+        .await;
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &config)
+            .unwrap()
+            .with_retention_cleanup(startup_worker.retention_cleanup());
+        let early_claim = worker.claim_ready(100_001).await.unwrap();
+        let after_early_claim = announce_ids(&repository).await;
+        let later_claim = worker.claim_ready(100_000 + 60 * 1_000 + 1).await.unwrap();
+
+        assert_eq!(
+            AnnounceStartupSummary {
+                expired: 0,
+                recovered_leases: 0
+            },
+            summary
+        );
+        assert_eq!(
+            vec!["ann_queued_old"],
+            early_claim
+                .iter()
+                .map(AnnounceWorkId::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec![
+                "ann_failed_retained".to_owned(),
+                "ann_queued_old".to_owned(),
+                "ann_success_after_cleanup".to_owned(),
+                "ann_success_retained".to_owned(),
+            ],
+            after_early_claim
+        );
+        assert_eq!(
+            vec!["ann_queued_old"],
+            later_claim
+                .iter()
+                .map(AnnounceWorkId::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["ann_queued_old".to_owned()],
+            announce_ids(&repository).await
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_drains_multiple_retention_batches_per_cleanup() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut config = test_config();
+        config.success_retention_secs = 10;
+        for index in 0..5 {
+            insert_terminal_work(
+                &repository,
+                &format!("ann_success_old_{index}"),
+                &format!("guid-success-old-{index}"),
+                AnnounceStatus::Succeeded,
+                AnnounceReason::Saved,
+                89_000,
+            )
+            .await;
+        }
+        let mut worker = AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        worker.config.retention_cleanup_batch_size = 2;
+        worker.config.retention_cleanup_max_batches = 3;
+
+        let summary = worker.recover_startup(100_000).await.unwrap();
+
+        assert_eq!(
+            AnnounceStartupSummary {
+                expired: 0,
+                recovered_leases: 0
+            },
+            summary
+        );
+        assert!(announce_ids(&repository).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retention_cleanup_failure_does_not_advance_cadence() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+        repository.pool().close().await;
+
+        let result = worker.cleanup_retained(100_000, false).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            i64::MIN,
+            worker
+                .retention_cleanup
+                .last_cleanup_ms
+                .load(Ordering::Acquire)
         );
     }
 
@@ -1302,6 +1573,31 @@ mod tests {
         );
     }
 
+    async fn insert_terminal_work(
+        repository: &Repository,
+        id: &str,
+        guid: &str,
+        status: AnnounceStatus,
+        reason: AnnounceReason,
+        finished_at_ms: i64,
+    ) {
+        let mut work = test_work(id, guid, 1);
+        work.status = status;
+        work.reason = reason;
+        work.updated_at_ms = finished_at_ms;
+        work.finished_at_ms = Some(finished_at_ms);
+        let result = repository
+            .insert_or_dedupe_announce_work(&work, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            AnnounceInsertResult::Inserted {
+                id: work.id.clone()
+            },
+            result
+        );
+    }
+
     fn test_work(id: &str, guid: &str, received_at_ms: i64) -> AnnounceWorkItem {
         let tracker = TrackerName::new("tracker.example").unwrap();
         let guid = CandidateGuid::new(guid).unwrap();
@@ -1376,6 +1672,13 @@ mod tests {
             .into_iter()
             .map(|row| (row.get("status"), row.get("reason")))
             .collect()
+    }
+
+    async fn announce_ids(repository: &Repository) -> Vec<String> {
+        sqlx::query_scalar("SELECT id FROM announce_work ORDER BY id")
+            .fetch_all(repository.pool())
+            .await
+            .unwrap()
     }
 
     async fn dependency_rows(

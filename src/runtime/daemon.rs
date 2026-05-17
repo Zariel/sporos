@@ -149,6 +149,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         .await
         .map_err(|source| DaemonError::AnnounceStartup { source })?;
     let announce_owner_prefix = announce_worker_owner_prefix();
+    let announce_retention_cleanup = runtime.state.announce_worker.retention_cleanup();
 
     let RuntimeReceivers {
         announcements,
@@ -166,6 +167,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             &format!("{announce_owner_prefix}-{worker_index}"),
             &runtime.state.config.announce,
         )
+        .map(|worker| worker.with_retention_cleanup(announce_retention_cleanup.clone()))
         .map_err(|source| DaemonError::AnnounceStartup { source })?;
         handles.push(BackgroundTask::new(
             "announce-worker",

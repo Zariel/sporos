@@ -2995,6 +2995,96 @@ impl Repository {
         Ok(result.rows_affected())
     }
 
+    pub async fn cleanup_terminal_announce_work(
+        &self,
+        success_cutoff_ms: i64,
+        failure_cutoff_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let success = sqlx::query(
+            r#"
+            DELETE FROM announce_work
+            WHERE id IN (
+                SELECT id
+                FROM announce_work
+                WHERE status = 'succeeded'
+                  AND finished_at IS NOT NULL
+                  AND finished_at <= ?
+                ORDER BY finished_at, id
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(success_cutoff_ms)
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("cleanup succeeded announce work", error))?;
+        let terminal_failed = self
+            .cleanup_terminal_announce_status("terminal_failed", failure_cutoff_ms, limit)
+            .await?;
+        let expired = self
+            .cleanup_terminal_announce_status("expired", failure_cutoff_ms, limit)
+            .await?;
+
+        Ok(success
+            .rows_affected()
+            .saturating_add(terminal_failed)
+            .saturating_add(expired))
+    }
+
+    async fn cleanup_terminal_announce_status(
+        &self,
+        status: &str,
+        cutoff_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let query = match status {
+            "terminal_failed" => {
+                r#"
+            DELETE FROM announce_work
+            WHERE id IN (
+                SELECT id
+                FROM announce_work
+                WHERE status = 'terminal_failed'
+                  AND finished_at IS NOT NULL
+                  AND finished_at <= ?
+                ORDER BY finished_at, id
+                LIMIT ?
+            )
+            "#
+            }
+            "expired" => {
+                r#"
+            DELETE FROM announce_work
+            WHERE id IN (
+                SELECT id
+                FROM announce_work
+                WHERE status = 'expired'
+                  AND finished_at IS NOT NULL
+                  AND finished_at <= ?
+                ORDER BY finished_at, id
+                LIMIT ?
+            )
+            "#
+            }
+            _ => {
+                return Err(DatabaseError::QueryFailed {
+                    operation: "cleanup terminal announce status".to_owned(),
+                    message: format!("unsupported terminal status {status}"),
+                });
+            }
+        };
+        let result = sqlx::query(query)
+            .bind(cutoff_ms)
+            .bind(i64::from(limit))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| db_error("cleanup terminal announce status", error))?;
+
+        Ok(result.rows_affected())
+    }
+
     pub async fn recover_stale_announce_leases(&self, now_ms: i64) -> Result<u64, DatabaseError> {
         let result = sqlx::query(
             r#"
@@ -7937,6 +8027,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_announce_cleanup_uses_success_and_failure_retention() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (id, guid, status, finished_at_ms) in [
+            (
+                "ann_success_old",
+                "guid-success-old",
+                AnnounceStatus::Succeeded,
+                999,
+            ),
+            (
+                "ann_success_retained",
+                "guid-success-retained",
+                AnnounceStatus::Succeeded,
+                1001,
+            ),
+            (
+                "ann_failed_old",
+                "guid-failed-old",
+                AnnounceStatus::TerminalFailed,
+                1999,
+            ),
+            (
+                "ann_failed_retained",
+                "guid-failed-retained",
+                AnnounceStatus::TerminalFailed,
+                2001,
+            ),
+            (
+                "ann_expired_old",
+                "guid-expired-old",
+                AnnounceStatus::Expired,
+                1999,
+            ),
+            (
+                "ann_expired_retained",
+                "guid-expired-retained",
+                AnnounceStatus::Expired,
+                2001,
+            ),
+        ] {
+            let mut work = test_announce_work(id, guid, 1);
+            work.status = status;
+            work.finished_at_ms = Some(finished_at_ms);
+            work.updated_at_ms = finished_at_ms;
+            repository
+                .insert_or_dedupe_announce_work(&work, 10)
+                .await
+                .unwrap();
+        }
+        repository
+            .insert_or_dedupe_announce_work(
+                &test_announce_work("ann_queued_old", "guid-queued", 1),
+                10,
+            )
+            .await
+            .unwrap();
+
+        let deleted = repository
+            .cleanup_terminal_announce_work(1_000, 2_000, 10)
+            .await
+            .unwrap();
+        let remaining: Vec<String> = sqlx::query_scalar("SELECT id FROM announce_work ORDER BY id")
+            .fetch_all(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(3, deleted);
+        assert_eq!(
+            vec![
+                "ann_expired_retained".to_owned(),
+                "ann_failed_retained".to_owned(),
+                "ann_queued_old".to_owned(),
+                "ann_success_retained".to_owned(),
+            ],
+            remaining
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_announce_cleanup_uses_retention_indexes() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (query, index_name) in [
+            (
+                r#"
+            SELECT id
+            FROM announce_work
+            WHERE status = 'succeeded'
+              AND finished_at IS NOT NULL
+              AND finished_at <= ?
+            ORDER BY finished_at, id
+            LIMIT ?
+            "#,
+                "idx_announce_work_succeeded_retention",
+            ),
+            (
+                r#"
+            SELECT id
+            FROM announce_work
+            WHERE status = 'terminal_failed'
+              AND finished_at IS NOT NULL
+              AND finished_at <= ?
+            ORDER BY finished_at, id
+            LIMIT ?
+            "#,
+                "idx_announce_work_terminal_failed_retention",
+            ),
+            (
+                r#"
+            SELECT id
+            FROM announce_work
+            WHERE status = 'expired'
+              AND finished_at IS NOT NULL
+              AND finished_at <= ?
+            ORDER BY finished_at, id
+            LIMIT ?
+            "#,
+                "idx_announce_work_expired_retention",
+            ),
+        ] {
+            let plan = explain_query_plan(&repository, query, 10_000, 100).await;
+
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("SCAN announce_work")),
+                "retention cleanup should not scan announce_work: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+                "retention cleanup should not sort with a temp b-tree: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(index_name)),
+                "retention cleanup should use a retention index: {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn announce_wakeups_make_matching_waits_claimable() {
         let repository = Repository::connect_in_memory().await.unwrap();
         for (id, guid) in [
@@ -8258,6 +8487,23 @@ mod tests {
             .await
             .unwrap()
             .map(|row| (row.get("status"), row.get("reason")))
+    }
+
+    async fn explain_query_plan(
+        repository: &Repository,
+        query: &str,
+        cutoff_ms: i64,
+        limit: u16,
+    ) -> Vec<String> {
+        sqlx::query(&format!("EXPLAIN QUERY PLAN {query}"))
+            .bind(cutoff_ms)
+            .bind(i64::from(limit))
+            .fetch_all(repository.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("detail"))
+            .collect()
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
