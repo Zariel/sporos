@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -14,6 +14,12 @@ use crate::runtime::queue::{
 use tokio::sync::Mutex;
 use tracing::{debug_span, info_span};
 
+pub const INDEXER_CAPS_JOB_NAME: &str = "indexer_caps";
+
+pub fn scheduled_job_has_executor(job_name: &JobName) -> bool {
+    job_name.as_str() == INDEXER_CAPS_JOB_NAME
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SchedulerConfig {
     pub jobs: Vec<ScheduledJob>,
@@ -23,12 +29,13 @@ pub struct SchedulerConfig {
 
 impl SchedulerConfig {
     pub fn from_scheduling_config(config: &SchedulingConfig) -> Result<Self, SchedulerError> {
+        parse_interval_ms(&config.rss_interval)?;
+        parse_interval_ms(&config.cleanup_interval)?;
         Ok(Self {
-            jobs: vec![
-                ScheduledJob::new("rss", &config.rss_interval)?,
-                ScheduledJob::new("indexer_caps", &config.indexer_caps_interval)?,
-                ScheduledJob::new("cleanup", &config.cleanup_interval)?,
-            ],
+            jobs: vec![ScheduledJob::new(
+                INDEXER_CAPS_JOB_NAME,
+                &config.indexer_caps_interval,
+            )?],
             claim_limit: 16,
             failure_backoff_ms: 60_000,
         })
@@ -119,32 +126,70 @@ impl PersistedScheduler {
     }
 
     pub async fn seed_jobs(&self, now_ms: i64) -> Result<usize, SchedulerError> {
-        let existing = self
-            .repository
-            .job_status_snapshot(1_000)
-            .await?
-            .into_iter()
-            .map(|snapshot| snapshot.name)
-            .collect::<BTreeSet<_>>();
-        let mut seeded = 0;
+        let snapshots = self.repository.job_status_snapshot(1_000).await?;
+        self.disable_unsupported_jobs(&snapshots).await?;
+        self.seed_supported_jobs(&snapshots, now_ms).await
+    }
 
-        for job in self.jobs.values() {
-            if existing.contains(&job.name) {
+    async fn disable_unsupported_jobs(
+        &self,
+        snapshots: &[crate::persistence::repository::JobStatusSnapshot],
+    ) -> Result<usize, SchedulerError> {
+        let mut disabled = 0;
+        for snapshot in snapshots {
+            if self.jobs.contains_key(&snapshot.name) || snapshot.state == "disabled" {
                 continue;
             }
             self.repository
                 .record_job_status(
-                    &job.name,
+                    &snapshot.name,
                     JobStateUpdate {
-                        state: JobState::Pending,
+                        state: JobState::Disabled,
                         last_started_at_ms: None,
                         last_finished_at_ms: None,
-                        next_run_at_ms: Some(now_ms),
+                        next_run_at_ms: None,
                         last_error: None,
                     },
                 )
                 .await?;
-            seeded += 1;
+            disabled += 1;
+        }
+        Ok(disabled)
+    }
+
+    async fn seed_supported_jobs(
+        &self,
+        snapshots: &[crate::persistence::repository::JobStatusSnapshot],
+        now_ms: i64,
+    ) -> Result<usize, SchedulerError> {
+        let mut seeded = 0;
+
+        for job in self.jobs.values() {
+            match snapshots.iter().find(|snapshot| snapshot.name == job.name) {
+                Some(snapshot) if snapshot.state == "disabled" => {
+                    self.repository
+                        .upsert_job_state(&job.name, JobState::Pending, Some(now_ms), None)
+                        .await?;
+                }
+                Some(_) => {
+                    continue;
+                }
+                None => {
+                    self.repository
+                        .record_job_status(
+                            &job.name,
+                            JobStateUpdate {
+                                state: JobState::Pending,
+                                last_started_at_ms: None,
+                                last_finished_at_ms: None,
+                                next_run_at_ms: Some(now_ms),
+                                last_error: None,
+                            },
+                        )
+                        .await?;
+                    seeded += 1;
+                }
+            }
         }
 
         Ok(seeded)
@@ -598,20 +643,133 @@ mod tests {
         assert!(jobs.iter().any(|job| job.state == "waiting"));
     }
 
+    #[tokio::test]
+    async fn scheduler_disables_unsupported_persisted_jobs() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .record_job_status(
+                &JobName::new("rss").unwrap(),
+                JobStateUpdate {
+                    state: JobState::Failed,
+                    last_started_at_ms: Some(10),
+                    last_finished_at_ms: Some(20),
+                    next_run_at_ms: Some(100),
+                    last_error: Some("scheduled job rss does not have an executor yet"),
+                },
+            )
+            .await
+            .unwrap();
+        repository
+            .record_job_status(
+                &JobName::new("cleanup").unwrap(),
+                JobStateUpdate {
+                    state: JobState::Waiting,
+                    last_started_at_ms: Some(30),
+                    last_finished_at_ms: Some(40),
+                    next_run_at_ms: Some(100),
+                    last_error: Some("scheduled job cleanup does not have an executor yet"),
+                },
+            )
+            .await
+            .unwrap();
+        let (queue, mut receiver) = scheduler_queue(nonzero(4));
+        let scheduler = PersistedScheduler::new(
+            repository.clone(),
+            queue,
+            SchedulerConfig::from_scheduling_config(&SchedulingConfig::default()).unwrap(),
+        );
+
+        let summary = scheduler.tick(100).await.unwrap();
+        let run = receiver.recv().await.unwrap();
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let rss = jobs.iter().find(|job| job.name.as_str() == "rss").unwrap();
+        let cleanup = jobs
+            .iter()
+            .find(|job| job.name.as_str() == "cleanup")
+            .unwrap();
+
+        assert_eq!(1, summary.seeded);
+        assert_eq!(1, summary.enqueued);
+        assert_eq!(INDEXER_CAPS_JOB_NAME, run.job_name.as_str());
+        assert_eq!("disabled", rss.state);
+        assert_eq!(None, rss.next_run_at_ms);
+        assert_eq!(None, rss.last_error);
+        assert_eq!("disabled", cleanup.state);
+        assert_eq!(None, cleanup.next_run_at_ms);
+        assert_eq!(None, cleanup.last_error);
+    }
+
+    #[tokio::test]
+    async fn scheduler_reactivates_supported_disabled_jobs() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let indexer_caps = JobName::new(INDEXER_CAPS_JOB_NAME).unwrap();
+        repository
+            .record_job_status(
+                &indexer_caps,
+                JobStateUpdate {
+                    state: JobState::Disabled,
+                    last_started_at_ms: Some(10),
+                    last_finished_at_ms: Some(20),
+                    next_run_at_ms: None,
+                    last_error: Some("job disabled while unsupported"),
+                },
+            )
+            .await
+            .unwrap();
+        let (queue, mut receiver) = scheduler_queue(nonzero(4));
+        let scheduler = PersistedScheduler::new(
+            repository.clone(),
+            queue,
+            SchedulerConfig::from_scheduling_config(&SchedulingConfig::default()).unwrap(),
+        );
+
+        let summary = scheduler.tick(100).await.unwrap();
+        let run = receiver.recv().await.unwrap();
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let job = jobs.iter().find(|job| job.name == indexer_caps).unwrap();
+
+        assert_eq!(0, summary.seeded);
+        assert_eq!(1, summary.enqueued);
+        assert_eq!(INDEXER_CAPS_JOB_NAME, run.job_name.as_str());
+        assert_eq!("running", job.state);
+        assert_eq!(None, job.next_run_at_ms);
+        assert_eq!(None, job.last_error);
+    }
+
     #[test]
-    fn scheduler_parses_config_intervals() {
+    fn default_scheduler_jobs_are_executable() {
         let config = SchedulerConfig::from_scheduling_config(&SchedulingConfig::default()).unwrap();
 
-        assert_eq!(3, config.jobs.len());
-        assert_eq!(1_800_000, config.jobs[0].interval_ms);
+        assert_eq!(1, config.jobs.len());
+        assert_eq!(INDEXER_CAPS_JOB_NAME, config.jobs[0].name.as_str());
+        assert_eq!(86_400_000, config.jobs[0].interval_ms);
         assert!(
             config
                 .jobs
                 .iter()
-                .all(|job| !matches!(job.name.as_str(), "search" | "saved_retry"))
+                .all(|job| scheduled_job_has_executor(&job.name))
         );
+    }
+
+    #[test]
+    fn scheduler_parses_config_intervals() {
         ScheduledJob::new("bad", "0s").unwrap_err();
         ScheduledJob::new("bad", "1w").unwrap_err();
+    }
+
+    #[test]
+    fn scheduler_validates_inactive_config_intervals() {
+        let rss = SchedulingConfig {
+            rss_interval: "0s".to_owned(),
+            ..SchedulingConfig::default()
+        };
+        let cleanup = SchedulingConfig {
+            cleanup_interval: "1w".to_owned(),
+            ..SchedulingConfig::default()
+        };
+
+        SchedulerConfig::from_scheduling_config(&rss).unwrap_err();
+        SchedulerConfig::from_scheduling_config(&cleanup).unwrap_err();
     }
 
     fn test_config() -> SchedulerConfig {

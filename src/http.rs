@@ -2044,7 +2044,11 @@ mod tests {
             .await
             .unwrap();
         let job = app
-            .oneshot(json_post("/v1/jobs/rss/runs", serde_json::json!({}), None))
+            .oneshot(json_post(
+                "/v1/jobs/indexer_caps/runs",
+                serde_json::json!({}),
+                None,
+            ))
             .await
             .unwrap();
         let search_work = searches.recv().await.unwrap();
@@ -2053,7 +2057,7 @@ mod tests {
         assert_eq!(StatusCode::ACCEPTED, search.status());
         assert_eq!("Example Movie 2026", search_work.query.as_str());
         assert_eq!(StatusCode::ACCEPTED, job.status());
-        assert_eq!("rss", job_work.job_name.as_str());
+        assert_eq!("indexer_caps", job_work.job_name.as_str());
     }
 
     #[tokio::test]

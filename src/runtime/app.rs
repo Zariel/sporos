@@ -52,7 +52,8 @@ use crate::runtime::injection_worker::{
 };
 use crate::runtime::queue::{QueueKind, RuntimeQueueConfig, WorkReceiver, bounded_work_queue};
 use crate::runtime::scheduler::{
-    PersistedScheduler, ScheduledJobRun, SchedulerConfig, parse_interval_ms, scheduler_queue,
+    PersistedScheduler, ScheduledJobRun, SchedulerConfig, parse_interval_ms,
+    scheduled_job_has_executor, scheduler_queue,
 };
 use crate::runtime::search::{
     RuntimeSearchPlanner, RuntimeTorznabSearchPlan, plan_runtime_torznab_search,
@@ -1153,7 +1154,7 @@ fn http_supported_jobs(config: &SchedulerConfig) -> BTreeSet<crate::domain::JobN
     config
         .jobs
         .iter()
-        .filter(|job| job.name.as_str() == "indexer_caps")
+        .filter(|job| scheduled_job_has_executor(&job.name))
         .map(|job| job.name.clone())
         .collect()
 }
@@ -1161,7 +1162,7 @@ fn http_supported_jobs(config: &SchedulerConfig) -> BTreeSet<crate::domain::JobN
 fn daemon_scheduler_config(mut config: SchedulerConfig) -> SchedulerConfig {
     config
         .jobs
-        .retain(|job| matches!(job.name.as_str(), "indexer_caps"));
+        .retain(|job| scheduled_job_has_executor(&job.name));
     config
 }
 

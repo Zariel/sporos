@@ -51,7 +51,9 @@ use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
     InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
-use crate::runtime::scheduler::{ImmediateRunOutcome, ScheduledJobRun, parse_interval_ms};
+use crate::runtime::scheduler::{
+    INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome, ScheduledJobRun, parse_interval_ms,
+};
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
 };
@@ -1196,7 +1198,7 @@ async fn execute_scheduled_job(
     }
 
     match job_name.as_str() {
-        "indexer_caps" => {
+        INDEXER_CAPS_JOB_NAME => {
             let summary = tokio::select! {
                 _state = shutdown.cancelled() => {
                     return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
