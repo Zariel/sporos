@@ -30,6 +30,7 @@ use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
 #[derive(Debug, Clone)]
 pub struct Repository {
     pool: SqlitePool,
+    inventory_staging_pool: SqlitePool,
     prowlarr_sync_lock: Arc<Mutex<()>>,
 }
 
@@ -366,14 +367,18 @@ impl Repository {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+        let pool = sqlite_pool_options(5)
+            .connect_with(options.clone())
+            .await
+            .map_err(|error| db_error("connect sqlite database", error))?;
+        let inventory_staging_pool = sqlite_pool_options(1)
             .connect_with(options)
             .await
             .map_err(|error| db_error("connect sqlite database", error))?;
 
         let repository = Self {
             pool,
+            inventory_staging_pool,
             prowlarr_sync_lock: Arc::new(Mutex::new(())),
         };
         repository.initialize().await?;
@@ -382,13 +387,13 @@ impl Repository {
 
     pub async fn connect_in_memory() -> Result<Self, DatabaseError> {
         let _span = info_span!("sqlite.connect", database_path = ":memory:");
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+        let pool = sqlite_pool_options(1)
             .connect("sqlite::memory:")
             .await
             .map_err(|error| db_error("connect in-memory sqlite database", error))?;
 
         let repository = Self {
+            inventory_staging_pool: pool.clone(),
             pool,
             prowlarr_sync_lock: Arc::new(Mutex::new(())),
         };
@@ -543,7 +548,7 @@ impl Repository {
     ) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
         let _span = info_span!("inventory.replace", source_type = scope.source_type());
         let mut connection = self
-            .pool
+            .inventory_staging_pool
             .acquire()
             .await
             .map_err(|error| db_error("acquire local inventory connection", error))?;
@@ -5347,6 +5352,19 @@ impl SnakeCase for str {
     }
 }
 
+fn sqlite_pool_options(max_connections: u32) -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                for pragma in CONNECTION_PRAGMAS {
+                    connection.execute(*pragma).await?;
+                }
+                Ok(())
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5366,7 +5384,7 @@ mod tests {
     use crate::secrets::ApiKey;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
     async fn file_backed_repository_initializes_schema_and_connection_pragmas() {
@@ -6099,6 +6117,78 @@ mod tests {
         assert_eq!(1, local_count);
         assert_eq!(0, staged_count);
         assert_eq!(0, staged_file_count);
+    }
+
+    #[tokio::test]
+    async fn stalled_owned_inventory_stream_does_not_starve_main_pool() {
+        let root = unique_temp_dir("sqlite-inventory-staging-pool");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+        repository
+            .inventory_staging_pool
+            .acquire()
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        let staging_foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys;")
+            .fetch_one(&repository.inventory_staging_pool)
+            .await
+            .unwrap();
+        let staging_busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout;")
+            .fetch_one(&repository.inventory_staging_pool)
+            .await
+            .unwrap();
+        let mut held_connections = Vec::new();
+        for _ in 0..4 {
+            held_connections.push(repository.pool().acquire().await.unwrap());
+        }
+        let (sender, receiver) = mpsc::channel(1);
+        let staging_started = Arc::new(AtomicBool::new(false));
+        let refresh_repository = repository.clone();
+        let refresh_started = Arc::clone(&staging_started);
+        let refresh_task = tokio::spawn(async move {
+            refresh_repository
+                .replace_local_inventory_owned_receiver_with_staging_signal(
+                    LocalInventoryScope::DataRoot,
+                    receiver,
+                    Some(refresh_started),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !staging_started.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let still_available: i64 = tokio::time::timeout(Duration::from_millis(100), async {
+            sqlx::query_scalar("SELECT 1")
+                .fetch_one(repository.pool())
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        sender
+            .send(OwnedLocalInventoryMessage::Finished)
+            .await
+            .unwrap();
+        let summary = refresh_task.await.unwrap().unwrap();
+        drop(held_connections);
+        repository.inventory_staging_pool.close().await;
+        repository.pool().close().await;
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(1, staging_foreign_keys);
+        assert_eq!(i64::from(BUSY_TIMEOUT_MS), staging_busy_timeout);
+        assert_eq!(1, still_available);
+        assert_eq!(0, summary.upserted);
+        assert_eq!(0, summary.pruned);
     }
 
     #[tokio::test]
