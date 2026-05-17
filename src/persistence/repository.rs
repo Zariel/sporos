@@ -557,6 +557,7 @@ impl Repository {
             upserted = upserted.saturating_add(1);
         }
         if !finished {
+            clear_staged_local_inventory(&mut connection).await?;
             return Err(DatabaseError::IncompleteStream {
                 operation: "replace local inventory stream".to_owned(),
                 message: "inventory stream ended before completion marker".to_owned(),
@@ -4196,6 +4197,22 @@ async fn initialize_staged_local_inventory(
     Ok(())
 }
 
+async fn clear_staged_local_inventory(
+    connection: &mut sqlx::pool::PoolConnection<Sqlite>,
+) -> Result<(), DatabaseError> {
+    for statement in [
+        "DELETE FROM staged_local_inventory_files",
+        "DELETE FROM staged_local_inventory_items",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut **connection)
+            .await
+            .map_err(|error| db_error("clear staged local inventory", error))?;
+    }
+
+    Ok(())
+}
+
 async fn stage_local_item_with_files(
     connection: &mut sqlx::pool::PoolConnection<Sqlite>,
     item: &LocalItem,
@@ -6041,6 +6058,16 @@ mod tests {
                 .fetch_one(repository.pool())
                 .await
                 .unwrap();
+        let staged_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM temp.staged_local_inventory_items")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let staged_file_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM temp.staged_local_inventory_files")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
 
         assert!(matches!(
             result,
@@ -6048,6 +6075,8 @@ mod tests {
         ));
         assert_eq!(1, existing_count);
         assert_eq!(0, partial_count);
+        assert_eq!(0, staged_count);
+        assert_eq!(0, staged_file_count);
     }
 
     #[tokio::test]
