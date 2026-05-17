@@ -243,7 +243,7 @@ impl InventoryRefreshWorker {
                         .is_ok()
                 },
             );
-            if !scanner_cancelled.load(Ordering::Relaxed) {
+            if !scanner_cancelled.load(Ordering::Relaxed) && report.failures.is_empty() {
                 let _ = sender.blocking_send(OwnedLocalInventoryMessage::Finished);
             }
             report
@@ -280,7 +280,22 @@ impl InventoryRefreshWorker {
             Ok(summary) => summary,
             Err(error) => {
                 cancelled.store(true, Ordering::Relaxed);
-                let _ = scan_task.await;
+                let scan_report =
+                    scan_task
+                        .await
+                        .map_err(|error| InventoryRefreshError::ScanWorkerFailed {
+                            message: error.to_string(),
+                        })?;
+                if !scan_report.failures.is_empty()
+                    && matches!(error, DatabaseError::IncompleteStream { .. })
+                {
+                    return Ok(InventoryRefreshSummary {
+                        scanned_items: scan_report.scanned_items,
+                        persisted_items: 0,
+                        pruned_items: 0,
+                        scan_failures: scan_report.failures,
+                    });
+                }
                 return Err(error.into());
             }
         };
@@ -1688,6 +1703,99 @@ mod tests {
         assert_eq!(1, local_count);
         assert_eq!("Second.2026.1080p", display_name);
         assert_eq!(20, total_size);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_retains_existing_rows_after_scan_failure() {
+        let root = unique_temp_dir("partial-failure");
+        let first_root = root.join("mounted-a");
+        let second_root = root.join("mounted-b");
+        let second = second_root.join("Second.2026.1080p");
+        fs::create_dir_all(&second).unwrap();
+        write_file(&second.join("second.mkv"), 20);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let existing = vec![
+            data_root_item("First.2026.1080p", MediaType::Movie, "first.mkv", 10, 100),
+            data_root_item(
+                "Example Show S01E01",
+                MediaType::Episode,
+                "episode-a.mkv",
+                10,
+                100,
+            ),
+            data_root_item(
+                "Example Show S01E02",
+                MediaType::Episode,
+                "episode-b.mkv",
+                20,
+                200,
+            ),
+            data_root_item(
+                "Example Show S01E03",
+                MediaType::Episode,
+                "episode-c.mkv",
+                30,
+                300,
+            ),
+            data_root_item("Second.2026.1080p", MediaType::Movie, "second.mkv", 20, 100),
+        ];
+        repository
+            .replace_local_inventory_stream(
+                LocalInventoryScope::DataRoot,
+                existing.iter().map(local_item_file_batch),
+            )
+            .await
+            .unwrap();
+        let request = InventoryRefreshRequest {
+            media_dirs: vec![first_root.clone(), second_root.clone()],
+        };
+
+        worker
+            .refresh_virtual_seasons(VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS + 1_000)
+            .await
+            .unwrap();
+        let second_summary = worker.refresh_data_dirs(request).await.unwrap();
+
+        let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT display_name FROM local_items ORDER BY display_name",
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+        let virtual_seasons = repository
+            .local_items_by_media_type(MediaType::SeasonPack, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| matches!(item.source, LocalItemSource::Virtual { .. }))
+            .collect::<Vec<_>>();
+
+        assert_eq!(1, second_summary.scanned_items);
+        assert_eq!(0, second_summary.persisted_items);
+        assert_eq!(0, second_summary.pruned_items);
+        assert_eq!(1, second_summary.scan_failures.len());
+        assert_eq!(6, local_count);
+        assert_eq!(
+            vec![
+                "Example Show S01",
+                "Example Show S01E01",
+                "Example Show S01E02",
+                "Example Show S01E03",
+                "First.2026.1080p",
+                "Second.2026.1080p",
+            ],
+            names
+        );
+        assert_eq!(1, virtual_seasons.len());
+        assert_eq!("Example Show S01", virtual_seasons[0].title.as_str());
 
         fs::remove_dir_all(root).unwrap();
     }

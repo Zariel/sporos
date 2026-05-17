@@ -130,6 +130,10 @@ pub enum DatabaseError {
         operation: String,
         message: String,
     },
+    IncompleteStream {
+        operation: String,
+        message: String,
+    },
     SchemaInitialization {
         message: String,
     },
@@ -143,9 +147,9 @@ impl ClassifyFailure for DatabaseError {
     fn failure_class(&self) -> FailureClass {
         match self {
             Self::Busy { .. } | Self::Unavailable { .. } => FailureClass::RetryableDependency,
-            Self::QueryFailed { .. } | Self::SchemaInitialization { .. } => {
-                FailureClass::FatalLocal
-            }
+            Self::QueryFailed { .. }
+            | Self::IncompleteStream { .. }
+            | Self::SchemaInitialization { .. } => FailureClass::FatalLocal,
         }
     }
 }
@@ -155,6 +159,7 @@ impl DatabaseError {
         match self {
             Self::Busy { retry_after_ms, .. } => *retry_after_ms,
             Self::QueryFailed { .. }
+            | Self::IncompleteStream { .. }
             | Self::SchemaInitialization { .. }
             | Self::Unavailable { .. } => None,
         }
@@ -171,6 +176,12 @@ impl fmt::Display for DatabaseError {
                 write!(
                     formatter,
                     "database query failed during {operation}: {message}"
+                )
+            }
+            Self::IncompleteStream { operation, message } => {
+                write!(
+                    formatter,
+                    "database stream ended before completion during {operation}: {message}"
                 )
             }
             Self::SchemaInitialization { message } => {

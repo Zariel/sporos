@@ -557,7 +557,7 @@ impl Repository {
             upserted = upserted.saturating_add(1);
         }
         if !finished {
-            return Err(DatabaseError::QueryFailed {
+            return Err(DatabaseError::IncompleteStream {
                 operation: "replace local inventory stream".to_owned(),
                 message: "inventory stream ended before completion marker".to_owned(),
             });
@@ -6042,7 +6042,10 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(DatabaseError::IncompleteStream { .. })
+        ));
         assert_eq!(1, existing_count);
         assert_eq!(0, partial_count);
     }
