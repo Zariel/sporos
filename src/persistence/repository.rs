@@ -547,13 +547,19 @@ impl Repository {
             };
             let (source_type, source_key) = local_source(&batch.item.source);
             if !scope.accepts(&source_type, &source_key) {
+                let _cleanup_result = clear_staged_local_inventory(&mut connection).await;
                 return Err(DatabaseError::QueryFailed {
                     operation: "validate local inventory refresh scope".to_owned(),
                     message: format!("item source {source_type}:{source_key} is outside {scope:?}"),
                 });
             }
 
-            stage_local_item_with_files(&mut connection, &batch.item, &batch.files).await?;
+            if let Err(error) =
+                stage_local_item_with_files(&mut connection, &batch.item, &batch.files).await
+            {
+                let _cleanup_result = clear_staged_local_inventory(&mut connection).await;
+                return Err(error);
+            }
             upserted = upserted.saturating_add(1);
         }
         if !finished {
@@ -564,27 +570,37 @@ impl Repository {
             });
         }
 
-        let mut transaction = connection
-            .begin()
-            .await
-            .map_err(|error| db_error("begin local inventory transaction", error))?;
+        let replace_result = async {
+            let mut transaction = connection
+                .begin()
+                .await
+                .map_err(|error| db_error("begin local inventory transaction", error))?;
 
-        if let LocalInventoryScope::Client { client_host } = &scope {
-            normalize_client_source_keys(&mut transaction, client_host).await?;
+            if let LocalInventoryScope::Client { client_host } = &scope {
+                normalize_client_source_keys(&mut transaction, client_host).await?;
+            }
+            initialize_retained_keys(&mut transaction).await?;
+            upsert_staged_local_inventory(&mut transaction).await?;
+            insert_staged_retained_keys(&mut transaction).await?;
+            let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
+
+            clear_staged_local_inventory_in_transaction(&mut transaction).await?;
+            clear_retained_keys(&mut transaction).await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|error| db_error("commit local inventory transaction", error))?;
+
+            Ok(pruned)
         }
-        initialize_retained_keys(&mut transaction).await?;
-        upsert_staged_local_inventory(&mut transaction).await?;
-        insert_staged_retained_keys(&mut transaction).await?;
-        let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
-
-        clear_staged_local_inventory_in_transaction(&mut transaction).await?;
-        clear_retained_keys(&mut transaction).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| db_error("commit local inventory transaction", error))?;
-
-        Ok(LocalInventoryReplaceSummary { upserted, pruned })
+        .await;
+        match replace_result {
+            Ok(pruned) => Ok(LocalInventoryReplaceSummary { upserted, pruned }),
+            Err(error) => {
+                let _cleanup_result = clear_staged_local_inventory(&mut connection).await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn local_items_by_info_hash(
@@ -6072,6 +6088,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_owned_inventory_scope_clears_staged_rows() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut valid = test_local_item("Valid");
+        valid.source = LocalItemSource::DataRoot {
+            path: PathBuf::from("/media/valid"),
+        };
+        valid.info_hash = None;
+        valid.path = Some(PathBuf::from("/media/valid"));
+        let valid_file = LocalFile::new(
+            None,
+            PathBuf::from("valid.mkv"),
+            ByteSize::new(20),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let invalid = test_local_item("Invalid");
+        let invalid_file = LocalFile::new(
+            None,
+            PathBuf::from("invalid.mkv"),
+            ByteSize::new(30),
+            FileIndex::new(0),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(3);
+        sender
+            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                item: valid,
+                files: vec![valid_file],
+            }))
+            .await
+            .unwrap();
+        sender
+            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                item: invalid,
+                files: vec![invalid_file],
+            }))
+            .await
+            .unwrap();
+        sender
+            .send(OwnedLocalInventoryMessage::Finished)
+            .await
+            .unwrap();
+        drop(sender);
+
+        let result = repository
+            .replace_local_inventory_owned_receiver(LocalInventoryScope::DataRoot, receiver)
+            .await;
+        let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let (staged_count, staged_file_count) = staged_inventory_counts(&repository).await;
+
+        assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
+        assert_eq!(0, local_count);
+        assert_eq!(0, staged_count);
+        assert_eq!(0, staged_file_count);
+    }
+
+    #[tokio::test]
     async fn unfinished_owned_inventory_stream_rolls_back_partial_refresh() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let mut existing = test_local_item("Existing");
@@ -6235,6 +6311,7 @@ mod tests {
                 .fetch_one(repository.pool())
                 .await
                 .unwrap();
+        let (staged_count, staged_file_count) = staged_inventory_counts(&repository).await;
 
         assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
         assert_eq!("Original", title);
@@ -6244,6 +6321,8 @@ mod tests {
             existing_files[0].relative_path
         );
         assert_eq!(1, prunable_count);
+        assert_eq!(0, staged_count);
+        assert_eq!(0, staged_file_count);
     }
 
     #[tokio::test]
@@ -6336,6 +6415,7 @@ mod tests {
                 .fetch_one(repository.pool())
                 .await
                 .unwrap();
+        let (staged_count, staged_file_count) = staged_inventory_counts(&repository).await;
 
         assert!(matches!(result, Err(DatabaseError::QueryFailed { .. })));
         assert_eq!("Original", title);
@@ -6345,6 +6425,8 @@ mod tests {
             existing_files[0].relative_path
         );
         assert_eq!(1, prunable_count);
+        assert_eq!(0, staged_count);
+        assert_eq!(0, staged_file_count);
     }
 
     #[tokio::test]
@@ -7937,6 +8019,21 @@ mod tests {
             total_size: ByteSize::new(30),
             mtime_ms: Some(1_700_000_000_000),
         }
+    }
+
+    async fn staged_inventory_counts(repository: &Repository) -> (i64, i64) {
+        let staged_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM temp.staged_local_inventory_items")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let staged_file_count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM temp.staged_local_inventory_files")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        (staged_count, staged_file_count)
     }
 
     fn test_remote_candidate(guid: &str, title: &str) -> RemoteCandidate {
