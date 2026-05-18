@@ -21,8 +21,8 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracing::warn;
 
 use crate::actions::{
-    CreatedLink, LinkActionError, LinkDirOptions, LinkFilesOptions, LinkType, PreparedLink,
-    SaveTorrentError, candidate_output_metadata, cleanup_created_links_and_roots,
+    CreatedLink, CreatedRoot, LinkActionError, LinkDirOptions, LinkFilesOptions, LinkType,
+    PreparedLink, SaveTorrentError, candidate_output_metadata, cleanup_created_links_and_roots,
     link_destination_dir, link_metafile_files, save_candidate_torrent, select_link_dir_pinned,
     validate_prepared_links,
 };
@@ -1263,7 +1263,7 @@ fn shutdown_requested(shutdown: Option<&ShutdownSignal>) -> bool {
     shutdown.is_some_and(|signal| signal.state().phase != ShutdownPhase::Running)
 }
 
-fn cleanup_prepared_links(links: &[CreatedLink], roots: &[PathBuf]) -> bool {
+fn cleanup_prepared_links(links: &[CreatedLink], roots: &[CreatedRoot]) -> bool {
     if let Err(error) = cleanup_created_links_and_roots(links, roots) {
         warn!(
             link_count = links.len(),
@@ -1640,7 +1640,7 @@ enum LinkPreparation {
         save_path: Option<PathBuf>,
         created_links: Vec<CreatedLink>,
         prepared_links: Vec<PreparedLink>,
-        created_roots: Vec<PathBuf>,
+        created_roots: Vec<CreatedRoot>,
         linked_files: usize,
     },
     SourceIncomplete,
@@ -2051,9 +2051,9 @@ mod tests {
 
         assert_eq!(InjectionOutcome::Failed, result.outcome);
         assert!(result.saved_for_retry);
-        assert!(result.prepared_link_cleanup_incomplete);
+        assert!(!result.prepared_link_cleanup_incomplete);
         assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
-        assert!(root.join("links/tracker.example/movie.mkv").exists());
+        assert!(!root.join("links/tracker.example/movie.mkv").exists());
         assert_eq!(1, saved_torrent_count(&root.join("output")));
         assert_eq!("degraded", health[0].state);
     }
@@ -2419,9 +2419,9 @@ mod tests {
         assert_eq!(InjectionOutcome::Saved, result.outcome);
         assert!(result.saved_for_retry);
         assert_eq!(1, result.linked_files);
-        assert!(result.prepared_link_cleanup_incomplete);
+        assert!(!result.prepared_link_cleanup_incomplete);
         assert_eq!(1, saved_torrent_count(&output_dir));
-        assert!(root.join("links/tracker.example/movie.mkv").exists());
+        assert!(!root.join("links/tracker.example/movie.mkv").exists());
     }
 
     #[tokio::test]

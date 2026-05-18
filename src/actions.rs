@@ -11,6 +11,8 @@
     )
 )]
 
+#[cfg(unix)]
+use std::collections::BTreeMap;
 use std::error::Error;
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -20,8 +22,12 @@ use std::fs::DirBuilder;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -41,6 +47,10 @@ use crate::persistence::torrent_cache::{
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const DEFAULT_LINK_SCAN_LIMIT: usize = 10_000;
 const LINK_COMPARE_BUFFER_SIZE: usize = 64 * 1024;
+#[cfg(not(test))]
+const MAX_PREPARED_CLEANUP_FDS: usize = 512;
+#[cfg(test)]
+const MAX_PREPARED_CLEANUP_FDS: usize = 32;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LinkType {
@@ -91,6 +101,25 @@ impl LinkFilesOptions {
 pub struct CreatedLink {
     pub source: PathBuf,
     pub destination: PathBuf,
+    #[cfg(unix)]
+    basename: PathBuf,
+    #[cfg(unix)]
+    parent_fd: Arc<OwnedFd>,
+    #[cfg(unix)]
+    identity: FileIdentity,
+    #[cfg(unix)]
+    symlink_target: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct CreatedRoot {
+    pub path: PathBuf,
+    #[cfg(unix)]
+    basename: PathBuf,
+    #[cfg(unix)]
+    parent_fd: OwnedFd,
+    #[cfg(unix)]
+    identity: FileIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +137,7 @@ pub struct PreparedLink {
 pub struct LinkFilesOutcome {
     pub created_links: Vec<CreatedLink>,
     pub prepared_links: Vec<PreparedLink>,
-    pub created_roots: Vec<PathBuf>,
+    pub created_roots: Vec<CreatedRoot>,
     pub missing_sources: Vec<PathBuf>,
     pub already_existing: bool,
 }
@@ -598,22 +627,48 @@ pub fn link_metafile_files(
         });
     }
 
+    #[cfg(unix)]
+    let mut cleanup_parent_fds: BTreeMap<(PathBuf, FileIdentity), Arc<OwnedFd>> = BTreeMap::new();
     for pair in pending_links {
-        let root = destination_root(destination_dir, &pair.destination_relative_path)?;
-        let root_preexisted = root_exists(&root)?;
-        let parent = match prepare_destination_parent(
+        #[cfg(unix)]
+        let retained_cleanup_handles = outcome.created_roots.len() + cleanup_parent_fds.len();
+        let mut parent = match prepare_destination_parent_with_retained_cleanup_handles(
             destination_dir,
             &pair.destination_relative_path,
             true,
             options.link_root.as_ref(),
+            #[cfg(unix)]
+            retained_cleanup_handles,
         ) {
             Ok(parent) => parent,
             Err(error) => {
                 return Err(cleanup_created_links_and_roots_before_error(
-                    &outcome, None, error,
+                    &outcome,
+                    &[],
+                    error,
                 ));
             }
         };
+        let created_roots = std::mem::take(&mut parent.created_roots);
+        #[cfg(unix)]
+        if cleanup_handle_count(
+            outcome.created_roots.len() + created_roots.len(),
+            cleanup_parent_fds.len(),
+            0,
+        )
+        .is_err()
+        {
+            let error = LinkActionError::Io {
+                operation: "retain prepared link cleanup handles",
+                path: parent.path.clone(),
+                source: io::Error::other("too many prepared link cleanup handles"),
+            };
+            return Err(cleanup_created_links_and_roots_before_error(
+                &outcome,
+                &created_roots,
+                error,
+            ));
+        }
         let mut source_file = match verified_source_file(&pair.source, options.link_type) {
             Ok(source_file) => source_file,
             Err(source) => {
@@ -623,14 +678,18 @@ pub fn link_metafile_files(
                     source,
                 };
                 return Err(cleanup_created_links_and_roots_before_error(
-                    &outcome, None, error,
+                    &outcome,
+                    &created_roots,
+                    error,
                 ));
             }
         };
 
         if let Err(error) = ensure_destination_parent_matches_path(&parent) {
             return Err(cleanup_created_links_and_roots_before_error(
-                &outcome, None, error,
+                &outcome,
+                &created_roots,
+                error,
             ));
         }
 
@@ -665,7 +724,9 @@ pub fn link_metafile_files(
                                             source,
                                         };
                                         return Err(cleanup_created_links_and_roots_before_error(
-                                            &outcome, None, error,
+                                            &outcome,
+                                            &created_roots,
+                                            error,
                                         ));
                                     }
                                 };
@@ -684,7 +745,9 @@ pub fn link_metafile_files(
                                         source,
                                     );
                                     return Err(cleanup_created_links_and_roots_before_error(
-                                        &outcome, None, error,
+                                        &outcome,
+                                        &created_roots,
+                                        error,
                                     ));
                                 }
                             }
@@ -692,7 +755,7 @@ pub fn link_metafile_files(
                         Err(error) => {
                             return Err(cleanup_created_links_and_roots_before_error(
                                 &outcome,
-                                (!root_preexisted).then_some(root.as_path()),
+                                &created_roots,
                                 error,
                             ));
                         }
@@ -706,7 +769,9 @@ pub fn link_metafile_files(
                         source,
                     );
                     return Err(cleanup_created_links_and_roots_before_error(
-                        &outcome, None, error,
+                        &outcome,
+                        &created_roots,
+                        error,
                     ));
                 }
             };
@@ -715,7 +780,7 @@ pub fn link_metafile_files(
                 &outcome,
                 &parent,
                 &created_entry,
-                (!root_preexisted).then_some(root.as_path()),
+                &created_roots,
                 error,
             ));
         }
@@ -736,7 +801,7 @@ pub fn link_metafile_files(
                     &outcome,
                     &parent,
                     &created_entry,
-                    (!root_preexisted).then_some(root.as_path()),
+                    &created_roots,
                     error,
                 ));
             }
@@ -755,62 +820,85 @@ pub fn link_metafile_files(
                     &outcome,
                     &parent,
                     &created_entry,
-                    (!root_preexisted).then_some(root.as_path()),
+                    &created_roots,
                     error,
                 ));
             }
         }
-        outcome.created_links.push(CreatedLink {
-            source: pair.source.clone(),
-            destination: pair.destination.clone(),
-        });
-        outcome.prepared_links.push(prepared_link_manifest(
-            pair.source,
-            pair.destination,
-            options.link_type,
+        #[cfg(unix)]
+        let cleanup_parent_fd = match cleanup_parent_fd(
             &parent,
-        )?);
-        if !root_preexisted && !outcome.created_roots.contains(&root) {
-            outcome.created_roots.push(root);
-        }
+            &mut cleanup_parent_fds,
+            outcome.created_roots.len() + created_roots.len(),
+        ) {
+            Ok(fd) => fd,
+            Err(error) => {
+                return Err(cleanup_created_entry_and_roots_before_error(
+                    &outcome,
+                    &parent,
+                    &created_entry,
+                    &created_roots,
+                    error,
+                ));
+            }
+        };
+        let created_link = match created_link(
+            pair.source.clone(),
+            pair.destination.clone(),
+            &parent,
+            &created_entry,
+            #[cfg(unix)]
+            cleanup_parent_fd,
+        ) {
+            Ok(link) => link,
+            Err(error) => {
+                return Err(cleanup_created_entry_and_roots_before_error(
+                    &outcome,
+                    &parent,
+                    &created_entry,
+                    &created_roots,
+                    error,
+                ));
+            }
+        };
+        let prepared_link =
+            match prepared_link_manifest(pair.source, pair.destination, options.link_type, &parent)
+            {
+                Ok(link) => link,
+                Err(error) => {
+                    return Err(cleanup_created_entry_and_roots_before_error(
+                        &outcome,
+                        &parent,
+                        &created_entry,
+                        &created_roots,
+                        error,
+                    ));
+                }
+            };
+        outcome.created_links.push(created_link);
+        outcome.prepared_links.push(prepared_link);
+        outcome.created_roots.extend(created_roots);
     }
 
     Ok(outcome)
 }
 
-pub fn cleanup_created_roots(roots: &[PathBuf]) -> Result<(), LinkActionError> {
-    for root in roots {
-        match fs::symlink_metadata(root) {
-            Ok(_) => {
-                return Err(LinkActionError::Io {
-                    operation: "clean prepared link root",
-                    path: root.clone(),
-                    source: io::Error::other("refusing path-based cleanup of prepared link root"),
-                });
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(LinkActionError::Io {
-                    operation: "inspect prepared link root for cleanup",
-                    path: root.clone(),
-                    source,
-                });
-            }
-        }
+pub fn cleanup_created_roots(roots: &[CreatedRoot]) -> Result<(), LinkActionError> {
+    for root in roots.iter().rev() {
+        cleanup_created_root(root)?;
     }
     Ok(())
 }
 
 fn cleanup_created_links_and_roots_before_error(
     outcome: &LinkFilesOutcome,
-    extra_root: Option<&Path>,
+    extra_roots: &[CreatedRoot],
     error: LinkActionError,
 ) -> LinkActionError {
-    match cleanup_created_links_and_roots(&outcome.created_links, &outcome.created_roots).and_then(
-        |()| match extra_root {
-            Some(root) => cleanup_created_roots(&[root.to_path_buf()]),
-            None => Ok(()),
-        },
+    match cleanup_created_links_and_roots_with_extra(
+        &outcome.created_links,
+        &outcome.created_roots,
+        extra_roots,
     ) {
         Ok(()) => error,
         Err(cleanup_error) => LinkActionError::CleanupIncomplete {
@@ -824,15 +912,14 @@ fn cleanup_created_entry_and_roots_before_error(
     outcome: &LinkFilesOutcome,
     parent: &DestinationParent,
     entry: &CreatedEntry,
-    extra_root: Option<&Path>,
+    extra_roots: &[CreatedRoot],
     error: LinkActionError,
 ) -> LinkActionError {
     match cleanup_created_entry_at(parent, entry).and_then(|()| {
-        cleanup_created_links_and_roots(&outcome.created_links, &outcome.created_roots).and_then(
-            |()| match extra_root {
-                Some(root) => cleanup_created_roots(&[root.to_path_buf()]),
-                None => Ok(()),
-            },
+        cleanup_created_links_and_roots_with_extra(
+            &outcome.created_links,
+            &outcome.created_roots,
+            extra_roots,
         )
     }) {
         Ok(()) => error,
@@ -874,29 +961,20 @@ fn destination_exists(destination: &Path) -> bool {
 
 pub fn cleanup_created_links_and_roots(
     links: &[CreatedLink],
-    roots: &[PathBuf],
+    roots: &[CreatedRoot],
+) -> Result<(), LinkActionError> {
+    cleanup_created_links_and_roots_with_extra(links, roots, &[])
+}
+
+fn cleanup_created_links_and_roots_with_extra(
+    links: &[CreatedLink],
+    roots: &[CreatedRoot],
+    extra_roots: &[CreatedRoot],
 ) -> Result<(), LinkActionError> {
     for link in links {
-        match fs::symlink_metadata(&link.destination) {
-            Ok(_) => {
-                return Err(LinkActionError::Io {
-                    operation: "clean prepared link",
-                    path: link.destination.clone(),
-                    source: io::Error::other(
-                        "refusing path-based cleanup of prepared link destination",
-                    ),
-                });
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(LinkActionError::Io {
-                    operation: "inspect prepared link for cleanup",
-                    path: link.destination.clone(),
-                    source,
-                });
-            }
-        }
+        cleanup_created_link(link)?;
     }
+    cleanup_created_roots(extra_roots)?;
     cleanup_created_roots(roots)
 }
 
@@ -978,7 +1056,7 @@ struct VerifiedSourceFile {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct FileIdentity {
     dev: u64,
     ino: u64,
@@ -1239,6 +1317,7 @@ fn test_link_compatibility_at(
     let parent = DestinationParent {
         path: link_dir.to_path_buf(),
         basename: PathBuf::new(),
+        created_roots: Vec::new(),
         fd: open_directory_path(link_dir, false).map_err(|source| LinkActionError::Io {
             operation: "open link compatibility directory",
             path: link_dir.to_path_buf(),
@@ -1682,6 +1761,7 @@ fn copy_file_contents(source: &mut File, destination: &mut File) -> io::Result<u
 struct DestinationParent {
     path: PathBuf,
     basename: PathBuf,
+    created_roots: Vec<CreatedRoot>,
     #[cfg(unix)]
     fd: OwnedFd,
 }
@@ -1690,6 +1770,8 @@ struct DestinationParent {
 struct CreatedEntry {
     #[cfg(unix)]
     identity: FileIdentity,
+    #[cfg(unix)]
+    symlink_target: Option<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -1704,6 +1786,23 @@ fn prepare_destination_parent(
     relative_path: &Path,
     create_missing: bool,
     link_root: Option<&SelectedLinkDir>,
+) -> Result<DestinationParent, LinkActionError> {
+    prepare_destination_parent_with_retained_cleanup_handles(
+        destination_dir,
+        relative_path,
+        create_missing,
+        link_root,
+        #[cfg(unix)]
+        0,
+    )
+}
+
+fn prepare_destination_parent_with_retained_cleanup_handles(
+    destination_dir: &Path,
+    relative_path: &Path,
+    create_missing: bool,
+    link_root: Option<&SelectedLinkDir>,
+    #[cfg(unix)] retained_cleanup_handles: usize,
 ) -> Result<DestinationParent, LinkActionError> {
     validate_relative_path(relative_path)?;
     let mut components: Vec<PathBuf> = relative_path
@@ -1724,14 +1823,20 @@ fn prepare_destination_parent(
 
     #[cfg(unix)]
     {
-        let fd = match link_root {
+        let (fd, created_roots) = match link_root {
             Some(link_root) => open_destination_parent_in_selected_root(
                 link_root,
                 destination_dir,
                 &components,
                 create_missing,
+                retained_cleanup_handles,
             ),
-            None => open_destination_parent_at(destination_dir, &components, create_missing),
+            None => open_destination_parent_at(
+                destination_dir,
+                &components,
+                create_missing,
+                retained_cleanup_handles,
+            ),
         }
         .map_err(|source| LinkActionError::Io {
             operation: "open link destination directory",
@@ -1741,6 +1846,7 @@ fn prepare_destination_parent(
         Ok(DestinationParent {
             path: parent_path,
             basename,
+            created_roots,
             fd,
         })
     }
@@ -1766,6 +1872,7 @@ fn prepare_destination_parent(
         Ok(DestinationParent {
             path: parent_path,
             basename,
+            created_roots: Vec::new(),
         })
     }
 }
@@ -1879,13 +1986,161 @@ fn cleanup_created_entry_at(
     }
 }
 
+fn created_link(
+    source: PathBuf,
+    destination: PathBuf,
+    parent: &DestinationParent,
+    entry: &CreatedEntry,
+    #[cfg(unix)] parent_fd: Arc<OwnedFd>,
+) -> Result<CreatedLink, LinkActionError> {
+    #[cfg(unix)]
+    {
+        Ok(CreatedLink {
+            source,
+            destination,
+            basename: parent.basename.clone(),
+            parent_fd,
+            identity: entry.identity,
+            symlink_target: entry.symlink_target.clone(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        let _ = entry;
+        Ok(CreatedLink {
+            source,
+            destination,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn created_root_at(path: &Path, parent_fd: &OwnedFd, basename: &Path) -> io::Result<CreatedRoot> {
+    Ok(CreatedRoot {
+        path: path.to_path_buf(),
+        basename: basename.to_path_buf(),
+        parent_fd: duplicate_directory_fd_from(parent_fd)?,
+        identity: entry_identity_in_fd(parent_fd, basename)?,
+    })
+}
+
+fn cleanup_created_link(link: &CreatedLink) -> Result<(), LinkActionError> {
+    #[cfg(unix)]
+    {
+        cleanup_created_entry_in_fd(
+            &link.parent_fd,
+            &link.basename,
+            link.identity,
+            link.symlink_target.as_deref(),
+            &link.destination,
+            "prepared link",
+            AtFlags::empty(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        match fs::symlink_metadata(&link.destination) {
+            Ok(_) => Err(LinkActionError::Io {
+                operation: "clean prepared link",
+                path: link.destination.clone(),
+                source: io::Error::other(
+                    "refusing path-based cleanup of prepared link destination",
+                ),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(LinkActionError::Io {
+                operation: "inspect prepared link for cleanup",
+                path: link.destination.clone(),
+                source,
+            }),
+        }
+    }
+}
+
+fn cleanup_created_root(root: &CreatedRoot) -> Result<(), LinkActionError> {
+    #[cfg(unix)]
+    {
+        cleanup_created_entry_in_fd(
+            &root.parent_fd,
+            &root.basename,
+            root.identity,
+            None,
+            &root.path,
+            "prepared link root",
+            AtFlags::REMOVEDIR,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        match fs::symlink_metadata(&root.path) {
+            Ok(_) => Err(LinkActionError::Io {
+                operation: "clean prepared link root",
+                path: root.path.clone(),
+                source: io::Error::other("refusing path-based cleanup of prepared link root"),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(LinkActionError::Io {
+                operation: "inspect prepared link root for cleanup",
+                path: root.path.clone(),
+                source,
+            }),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_created_entry_in_fd(
+    parent_fd: &OwnedFd,
+    basename: &Path,
+    identity: FileIdentity,
+    symlink_target: Option<&Path>,
+    display_path: &Path,
+    label: &'static str,
+    unlink_flags: AtFlags,
+) -> Result<(), LinkActionError> {
+    // The retained directory fd pins the parent we created in, and the identity
+    // check prevents stale or replaced entries from being removed. POSIX does
+    // not provide an atomic "unlink only if this inode still matches" operation,
+    // so another writer with access to the same directory could still swap the
+    // basename between this check and unlinkat.
+    match entry_matches_cleanup_identity(parent_fd, basename, identity, symlink_target) {
+        Ok(true) => rustix::fs::unlinkat(parent_fd, basename, unlink_flags).map_err(|source| {
+            LinkActionError::Io {
+                operation: "clean prepared link entry",
+                path: display_path.to_path_buf(),
+                source: io::Error::from(source),
+            }
+        }),
+        Ok(false) => Err(LinkActionError::Io {
+            operation: "verify prepared link entry before cleanup",
+            path: display_path.to_path_buf(),
+            source: io::Error::other(format!("{label} was replaced before cleanup")),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(LinkActionError::Io {
+            operation: "inspect prepared link entry for cleanup",
+            path: display_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 #[cfg(unix)]
 fn cleanup_created_entry_at_io(parent: &DestinationParent, entry: &CreatedEntry) -> io::Result<()> {
-    if entry_identity_at(parent, &parent.basename)? == entry.identity {
+    if entry_matches_cleanup_identity(
+        &parent.fd,
+        &parent.basename,
+        entry.identity,
+        entry.symlink_target.as_deref(),
+    )? {
         rustix::fs::unlinkat(&parent.fd, &parent.basename, AtFlags::empty())
-            .map_err(io::Error::from)?;
+            .map_err(io::Error::from)
+    } else {
+        Err(io::Error::other(
+            "fd-created link was replaced before cleanup",
+        ))
     }
-    Ok(())
 }
 
 fn prepared_link_manifest(
@@ -1931,6 +2186,48 @@ fn directory_identity_from_parent(
 }
 
 #[cfg(unix)]
+fn cleanup_parent_fd(
+    parent: &DestinationParent,
+    cache: &mut BTreeMap<(PathBuf, FileIdentity), Arc<OwnedFd>>,
+    retained_root_fds: usize,
+) -> Result<Arc<OwnedFd>, LinkActionError> {
+    let identity = directory_identity_from_parent(parent)?;
+    let key = (parent.path.clone(), identity);
+    if let Some(fd) = cache.get(&key) {
+        return Ok(Arc::clone(fd));
+    }
+    cleanup_handle_count(retained_root_fds, cache.len(), 1).map_err(|source| {
+        LinkActionError::Io {
+            operation: "retain prepared link cleanup handle",
+            path: parent.path.clone(),
+            source,
+        }
+    })?;
+    let fd = Arc::new(
+        duplicate_directory_fd(parent).map_err(|source| LinkActionError::Io {
+            operation: "duplicate prepared link parent handle",
+            path: parent.path.clone(),
+            source,
+        })?,
+    );
+    cache.insert(key, Arc::clone(&fd));
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn cleanup_handle_count(root_fds: usize, parent_fds: usize, additional: usize) -> io::Result<()> {
+    let count = root_fds
+        .checked_add(parent_fds)
+        .and_then(|count| count.checked_add(additional))
+        .ok_or_else(|| io::Error::other("prepared link cleanup handle count overflow"))?;
+    if count > MAX_PREPARED_CLEANUP_FDS {
+        Err(io::Error::other("too many prepared link cleanup handles"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, LinkActionError> {
     Ok(FileIdentity {
         dev: metadata.dev(),
@@ -1939,9 +2236,9 @@ fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, LinkActionErro
 }
 
 #[cfg(unix)]
-fn entry_identity_at(parent: &DestinationParent, path: &Path) -> io::Result<FileIdentity> {
+fn entry_identity_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<FileIdentity> {
     let stat =
-        rustix::fs::statat(&parent.fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        rustix::fs::statat(parent_fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     Ok(FileIdentity {
         dev: u64::try_from(stat.st_dev).map_err(io::Error::other)?,
         ino: stat.st_ino,
@@ -1949,28 +2246,162 @@ fn entry_identity_at(parent: &DestinationParent, path: &Path) -> io::Result<File
 }
 
 #[cfg(unix)]
+fn entry_matches_cleanup_identity(
+    parent_fd: &OwnedFd,
+    path: &Path,
+    identity: FileIdentity,
+    symlink_target: Option<&Path>,
+) -> io::Result<bool> {
+    if entry_identity_in_fd(parent_fd, path)? != identity {
+        return Ok(false);
+    }
+    if let Some(expected) = symlink_target {
+        return read_symlink_target_in_fd(parent_fd, path).map(|actual| actual == expected);
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn read_symlink_target_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<PathBuf> {
+    let target = rustix::fs::readlinkat(parent_fd, path, Vec::new()).map_err(io::Error::from)?;
+    Ok(PathBuf::from(OsString::from_vec(target.into_bytes())))
+}
+
+#[cfg(unix)]
+fn duplicate_directory_fd(parent: &DestinationParent) -> io::Result<OwnedFd> {
+    duplicate_directory_fd_from(&parent.fd)
+}
+
+#[cfg(unix)]
+fn duplicate_directory_fd_from(parent_fd: &OwnedFd) -> io::Result<OwnedFd> {
+    rustix::fs::openat(
+        parent_fd,
+        Path::new("."),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn clean_new_directory_after_open_error(
+    parent_fd: &OwnedFd,
+    basename: &Path,
+    path: &Path,
+    earlier_roots: &[CreatedRoot],
+    error: io::Error,
+) -> io::Error {
+    let remove_new =
+        rustix::fs::unlinkat(parent_fd, basename, AtFlags::REMOVEDIR).map_err(io::Error::from);
+    let cleanup_earlier = cleanup_created_roots(earlier_roots);
+    match (remove_new, cleanup_earlier) {
+        (Ok(()), Ok(())) => error,
+        (remove_result, cleanup_result) => io::Error::other(format!(
+            "failed to clean created link directory {} after open error: {}; new directory cleanup: {}; earlier root cleanup: {}",
+            path.display(),
+            error,
+            cleanup_io_result_description(remove_result),
+            cleanup_link_result_description(cleanup_result),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn clean_created_roots_after_open_error(roots: &[CreatedRoot], error: io::Error) -> io::Error {
+    match cleanup_created_roots(roots) {
+        Ok(()) => error,
+        Err(cleanup_error) => io::Error::other(format!(
+            "failed to clean created link roots after open error: {error}; cleanup error: {cleanup_error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_io_result_description(result: io::Result<()>) -> String {
+    result
+        .map(|()| "completed".to_string())
+        .unwrap_or_else(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn cleanup_link_result_description(result: Result<(), LinkActionError>) -> String {
+    result
+        .map(|()| "completed".to_string())
+        .unwrap_or_else(|error| error.to_string())
+}
+
+#[cfg(unix)]
 fn open_destination_parent_at(
     destination_dir: &Path,
     components: &[PathBuf],
     create_missing: bool,
-) -> io::Result<OwnedFd> {
+    retained_cleanup_handles: usize,
+) -> io::Result<(OwnedFd, Vec<CreatedRoot>)> {
     let mut current = if create_missing {
         open_or_create_directory_path(destination_dir)?
     } else {
         open_directory_path(destination_dir, false)?
     };
+    let mut created_roots = Vec::new();
+    let mut current_path = destination_dir.to_path_buf();
     for component in components {
         match open_child_directory(&current, component) {
             Ok(next) => current = next,
             Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
-                rustix::fs::mkdirat(&current, component, Mode::from_raw_mode(0o777))
-                    .map_err(io::Error::from)?;
-                current = open_child_directory(&current, component)?;
+                if let Err(error) =
+                    rustix::fs::mkdirat(&current, component, Mode::from_raw_mode(0o777))
+                        .map_err(io::Error::from)
+                {
+                    return if created_roots.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(clean_created_roots_after_open_error(&created_roots, error))
+                    };
+                }
+                current_path.push(component);
+                if let Err(error) =
+                    cleanup_handle_count(created_roots.len(), retained_cleanup_handles, 1)
+                {
+                    return Err(clean_new_directory_after_open_error(
+                        &current,
+                        component,
+                        &current_path,
+                        &created_roots,
+                        error,
+                    ));
+                }
+                let root = match created_root_at(&current_path, &current, component) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        return Err(clean_new_directory_after_open_error(
+                            &current,
+                            component,
+                            &current_path,
+                            &created_roots,
+                            error,
+                        ));
+                    }
+                };
+                created_roots.push(root);
+                current = match open_child_directory(&current, component) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        return Err(clean_created_roots_after_open_error(&created_roots, error));
+                    }
+                };
+                continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return if created_roots.is_empty() {
+                    Err(error)
+                } else {
+                    Err(clean_created_roots_after_open_error(&created_roots, error))
+                };
+            }
         }
+        current_path.push(component);
     }
-    Ok(current)
+    Ok((current, created_roots))
 }
 
 #[cfg(unix)]
@@ -1979,7 +2410,8 @@ fn open_destination_parent_in_selected_root(
     destination_dir: &Path,
     components: &[PathBuf],
     create_missing: bool,
-) -> io::Result<OwnedFd> {
+    retained_cleanup_handles: usize,
+) -> io::Result<(OwnedFd, Vec<CreatedRoot>)> {
     let mut relative_components: Vec<PathBuf> = destination_dir
         .strip_prefix(&link_root.path)
         .map_err(|error| {
@@ -2025,27 +2457,83 @@ fn open_destination_parent_in_selected_root(
         ));
     }
 
-    open_child_directories_at(root, &relative_components, create_missing)
+    open_child_directories_at(
+        root,
+        &link_root.path,
+        &relative_components,
+        create_missing,
+        retained_cleanup_handles,
+    )
 }
 
 #[cfg(unix)]
 fn open_child_directories_at(
     mut current: OwnedFd,
+    base_path: &Path,
     components: &[PathBuf],
     create_missing: bool,
-) -> io::Result<OwnedFd> {
+    retained_cleanup_handles: usize,
+) -> io::Result<(OwnedFd, Vec<CreatedRoot>)> {
+    let mut created_roots = Vec::new();
+    let mut current_path = base_path.to_path_buf();
     for component in components {
         match open_child_directory(&current, component) {
             Ok(next) => current = next,
             Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
-                rustix::fs::mkdirat(&current, component, Mode::from_raw_mode(0o777))
-                    .map_err(io::Error::from)?;
-                current = open_child_directory(&current, component)?;
+                if let Err(error) =
+                    rustix::fs::mkdirat(&current, component, Mode::from_raw_mode(0o777))
+                        .map_err(io::Error::from)
+                {
+                    return if created_roots.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(clean_created_roots_after_open_error(&created_roots, error))
+                    };
+                }
+                current_path.push(component);
+                if let Err(error) =
+                    cleanup_handle_count(created_roots.len(), retained_cleanup_handles, 1)
+                {
+                    return Err(clean_new_directory_after_open_error(
+                        &current,
+                        component,
+                        &current_path,
+                        &created_roots,
+                        error,
+                    ));
+                }
+                let root = match created_root_at(&current_path, &current, component) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        return Err(clean_new_directory_after_open_error(
+                            &current,
+                            component,
+                            &current_path,
+                            &created_roots,
+                            error,
+                        ));
+                    }
+                };
+                created_roots.push(root);
+                current = match open_child_directory(&current, component) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        return Err(clean_created_roots_after_open_error(&created_roots, error));
+                    }
+                };
+                continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return if created_roots.is_empty() {
+                    Err(error)
+                } else {
+                    Err(clean_created_roots_after_open_error(&created_roots, error))
+                };
+            }
         }
+        current_path.push(component);
     }
-    Ok(current)
+    Ok((current, created_roots))
 }
 
 #[cfg(unix)]
@@ -2180,6 +2668,7 @@ fn create_symlink_staged_at(
             "symlink source changed before link publication",
         ));
     }
+    let identity = entry_identity_in_fd(&stage.fd, staged)?;
     rustix::fs::renameat_with(
         &stage.fd,
         staged,
@@ -2188,12 +2677,20 @@ fn create_symlink_staged_at(
         RenameFlags::NOREPLACE,
     )
     .map_err(io::Error::from)?;
-    let identity = entry_identity_at(parent, &parent.basename)?;
     remove_empty_stage_dir_at(parent, &stage).or_else(|error| {
-        cleanup_created_entry_at_io(parent, &CreatedEntry { identity })?;
+        cleanup_created_entry_at_io(
+            parent,
+            &CreatedEntry {
+                identity,
+                symlink_target: Some(source.to_path_buf()),
+            },
+        )?;
         Err(error)
     })?;
-    Ok(CreatedEntry { identity })
+    Ok(CreatedEntry {
+        identity,
+        symlink_target: Some(source.to_path_buf()),
+    })
 }
 
 #[cfg(unix)]
@@ -2333,6 +2830,7 @@ fn publish_staged_entry(
     stage: &PrivateStageDir,
     staged: &Path,
 ) -> io::Result<CreatedEntry> {
+    let identity = entry_identity_in_fd(&stage.fd, staged)?;
     rustix::fs::linkat(
         &stage.fd,
         staged,
@@ -2341,12 +2839,20 @@ fn publish_staged_entry(
         AtFlags::empty(),
     )
     .map_err(io::Error::from)?;
-    let identity = entry_identity_at(parent, &parent.basename)?;
     remove_stage_dir_entry_at(parent, stage, staged).or_else(|error| {
-        cleanup_created_entry_at_io(parent, &CreatedEntry { identity })?;
+        cleanup_created_entry_at_io(
+            parent,
+            &CreatedEntry {
+                identity,
+                symlink_target: None,
+            },
+        )?;
         Err(error)
     })?;
-    Ok(CreatedEntry { identity })
+    Ok(CreatedEntry {
+        identity,
+        symlink_target: None,
+    })
 }
 
 #[cfg(unix)]
@@ -2501,33 +3007,6 @@ fn safe_destination_path(
             destination_dir: destination_dir.to_path_buf(),
             relative_path: relative_path.to_path_buf(),
         })
-    }
-}
-
-fn destination_root(
-    destination_dir: &Path,
-    relative_path: &Path,
-) -> Result<PathBuf, LinkActionError> {
-    validate_relative_path(relative_path)?;
-    let mut components = relative_path.components();
-    let Some(first) = components.next() else {
-        return Err(LinkActionError::InvalidDestinationPath {
-            destination_dir: destination_dir.to_path_buf(),
-            relative_path: relative_path.to_path_buf(),
-        });
-    };
-    Ok(destination_dir.join(first.as_os_str()))
-}
-
-fn root_exists(root: &Path) -> Result<bool, LinkActionError> {
-    match fs::symlink_metadata(root) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(LinkActionError::Io {
-            operation: "inspect link root",
-            path: root.to_path_buf(),
-            source,
-        }),
     }
 }
 
@@ -3018,7 +3497,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(1, outcome.created_links.len());
-        assert_eq!(vec![destination.join("Show")], outcome.created_roots);
+        assert_eq!(1, outcome.created_roots.len());
+        assert_eq!(destination.join("Show"), outcome.created_roots[0].path);
         assert_eq!(
             fs::metadata(source.join("Show/Episode.mkv")).unwrap().len(),
             fs::metadata(destination.join("Show/Episode.mkv"))
@@ -3026,11 +3506,160 @@ mod tests {
                 .len()
         );
 
-        let cleanup_error =
-            cleanup_created_links_and_roots(&outcome.created_links, &outcome.created_roots)
-                .unwrap_err();
-        assert!(matches!(cleanup_error, LinkActionError::Io { .. }));
-        assert!(destination.join("Show/Episode.mkv").exists());
+        cleanup_created_links_and_roots(&outcome.created_links, &outcome.created_roots).unwrap();
+        assert!(!destination.join("Show/Episode.mkv").exists());
+        assert!(!destination.join("Show").exists());
+        remove_temp_dir(&root);
+    }
+
+    #[test]
+    fn link_action_cleans_nested_roots_bottom_up() {
+        let root = unique_temp_dir("link-nested-roots");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("Show/Season")).unwrap();
+        fs::write(source.join("Show/Season/Episode.mkv"), b"episode").unwrap();
+
+        let outcome = link_metafile_files(
+            &source,
+            &[local_file("Show/Season/Episode.mkv", 7, 0)],
+            &[torrent_file("Show/Season/Episode.mkv", 7, 0)],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::Hardlink),
+        )
+        .unwrap();
+
+        assert_eq!(2, outcome.created_roots.len());
+        assert_eq!(destination.join("Show"), outcome.created_roots[0].path);
+        assert_eq!(
+            destination.join("Show/Season"),
+            outcome.created_roots[1].path
+        );
+
+        cleanup_created_links_and_roots(&outcome.created_links, &outcome.created_roots).unwrap();
+        assert!(!destination.join("Show/Season/Episode.mkv").exists());
+        assert!(!destination.join("Show/Season").exists());
+        assert!(!destination.join("Show").exists());
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_created_roots_keeps_same_path_latest_identity() {
+        let root = unique_temp_dir("link-root-recreated");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination).unwrap();
+        let parent_fd = open_directory_path(&destination, false).unwrap();
+        rustix::fs::mkdirat(&parent_fd, Path::new("Show"), Mode::from_raw_mode(0o777)).unwrap();
+        let first =
+            created_root_at(&destination.join("Show"), &parent_fd, Path::new("Show")).unwrap();
+        rustix::fs::unlinkat(&parent_fd, Path::new("Show"), AtFlags::REMOVEDIR).unwrap();
+        rustix::fs::mkdirat(&parent_fd, Path::new("Show"), Mode::from_raw_mode(0o777)).unwrap();
+        let second =
+            created_root_at(&destination.join("Show"), &parent_fd, Path::new("Show")).unwrap();
+
+        cleanup_created_roots(&[first, second]).unwrap();
+
+        assert!(!destination.join("Show").exists());
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_action_shares_cleanup_parent_handles() {
+        let root = unique_temp_dir("link-shared-cleanup-parent");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("Show")).unwrap();
+        fs::write(source.join("Show/First.mkv"), b"first").unwrap();
+        fs::write(source.join("Show/Second.mkv"), b"second").unwrap();
+
+        let outcome = link_metafile_files(
+            &source,
+            &[
+                local_file("Show/First.mkv", 5, 0),
+                local_file("Show/Second.mkv", 6, 1),
+            ],
+            &[
+                torrent_file("Show/First.mkv", 5, 0),
+                torrent_file("Show/Second.mkv", 6, 1),
+            ],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::Hardlink),
+        )
+        .unwrap();
+
+        assert_eq!(2, outcome.created_links.len());
+        assert!(Arc::ptr_eq(
+            &outcome.created_links[0].parent_fd,
+            &outcome.created_links[1].parent_fd
+        ));
+
+        cleanup_created_links_and_roots(&outcome.created_links, &outcome.created_roots).unwrap();
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_action_caps_retained_cleanup_handles() {
+        let root = unique_temp_dir("link-cleanup-handle-cap");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let mut local_files = Vec::new();
+        let mut torrent_files = Vec::new();
+        for index in 0..(MAX_PREPARED_CLEANUP_FDS + 1) {
+            let path = format!("Dir{index}/Episode.mkv");
+            fs::create_dir_all(source.join(format!("Dir{index}"))).unwrap();
+            fs::write(source.join(&path), b"episode").unwrap();
+            let index = u32::try_from(index).unwrap();
+            local_files.push(local_file(&path, 7, index));
+            torrent_files.push(torrent_file(&path, 7, index));
+        }
+
+        let error = link_metafile_files(
+            &source,
+            &local_files,
+            &torrent_files,
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::Hardlink),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert_eq!(0, fs::read_dir(&destination).unwrap().count());
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_action_caps_deep_retained_cleanup_handles() {
+        let root = unique_temp_dir("link-deep-cleanup-handle-cap");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let mut relative = PathBuf::new();
+        for index in 0..(MAX_PREPARED_CLEANUP_FDS + 1) {
+            relative.push(format!("Dir{index}"));
+        }
+        relative.push("Episode.mkv");
+        fs::create_dir_all(source.join(relative.parent().unwrap())).unwrap();
+        fs::write(source.join(&relative), b"episode").unwrap();
+        let path = relative.to_string_lossy();
+
+        let error = link_metafile_files(
+            &source,
+            &[local_file(&path, 7, 0)],
+            &[torrent_file(&path, 7, 0)],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::Hardlink),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert_eq!(0, fs::read_dir(&destination).unwrap().count());
         remove_temp_dir(&root);
     }
 
@@ -3081,6 +3710,35 @@ mod tests {
         assert!(matches!(error, LinkActionError::Io { .. }));
         assert_eq!(0, fs::read_dir(&destination).unwrap().count());
         assert_eq!(0, fs::read_dir(&old_destination).unwrap().count());
+
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_created_link_cleanup_reports_replaced_entry() {
+        let root = unique_temp_dir("link-created-entry-replaced");
+        let source = root.join("source.mkv");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let source_file = verified_source_file(&source, LinkType::Hardlink).unwrap();
+        let parent =
+            prepare_destination_parent(&destination, Path::new("Episode.mkv"), true, None).unwrap();
+        let created =
+            create_link_in_parent(&source, &source_file, &parent, LinkType::Hardlink).unwrap();
+        fs::remove_file(destination.join("Episode.mkv")).unwrap();
+        fs::write(destination.join("Episode.mkv"), b"replacement").unwrap();
+
+        let error = cleanup_created_entry_at(&parent, &created).unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert_eq!(
+            b"replacement",
+            fs::read(destination.join("Episode.mkv"))
+                .unwrap()
+                .as_slice()
+        );
 
         remove_temp_dir(&root);
     }
