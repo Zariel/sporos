@@ -1586,6 +1586,7 @@ mod tests {
             target_client: Some(DependencyName::new("qbit.local").unwrap()),
             saved_for_retry: true,
             linked_files: 0,
+            prepared_link_cleanup_incomplete: false,
         };
 
         assert_eq!(
@@ -1617,6 +1618,7 @@ mod tests {
             target_client: Some(DependencyName::new("qbit.local").unwrap()),
             saved_for_retry: true,
             linked_files: 1,
+            prepared_link_cleanup_incomplete: false,
         };
 
         assert_eq!(

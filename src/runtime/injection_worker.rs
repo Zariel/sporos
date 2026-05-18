@@ -21,9 +21,10 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracing::warn;
 
 use crate::actions::{
-    LinkActionError, LinkDirOptions, LinkFilesOptions, LinkType, SaveTorrentError,
-    candidate_output_metadata, cleanup_created_roots, link_destination_dir, link_metafile_files,
-    save_candidate_torrent, select_link_dir,
+    CreatedLink, LinkActionError, LinkDirOptions, LinkFilesOptions, LinkType, PreparedLink,
+    SaveTorrentError, candidate_output_metadata, cleanup_created_links_and_roots,
+    link_destination_dir, link_metafile_files, save_candidate_torrent, select_link_dir,
+    validate_prepared_links,
 };
 use crate::clients::TorrentClientDescriptor;
 use crate::domain::{
@@ -112,6 +113,7 @@ pub struct InjectionWorkResult {
     pub target_client: Option<DependencyName>,
     pub saved_for_retry: bool,
     pub linked_files: usize,
+    pub prepared_link_cleanup_incomplete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +174,10 @@ pub enum InjectionWorkerError {
     Save(SaveTorrentError),
     Link(LinkActionError),
     Client(TorrentClientError),
+    ClientWithPreparedLinkCleanup {
+        source: TorrentClientError,
+        prepared_link_cleanup_incomplete: bool,
+    },
     TorrentParse(TorrentParseError),
     Io {
         operation: &'static str,
@@ -407,6 +413,7 @@ impl InjectionWorker {
                 target_client: Some(target_name),
                 saved_for_retry: true,
                 linked_files: 0,
+                prepared_link_cleanup_incomplete: false,
             });
         }
         let existing = self
@@ -431,6 +438,7 @@ impl InjectionWorker {
                     target_client: Some(dependency_name(existing_client.descriptor())?),
                     saved_for_retry: false,
                     linked_files: 0,
+                    prepared_link_cleanup_incomplete: false,
                 });
             }
             ExistingClientLookup::NotFound => {}
@@ -441,6 +449,7 @@ impl InjectionWorker {
                     target_client: Some(target_name),
                     saved_for_retry: true,
                     linked_files: 0,
+                    prepared_link_cleanup_incomplete: false,
                 });
             }
         }
@@ -452,6 +461,7 @@ impl InjectionWorker {
                 target_client: Some(target_name),
                 saved_for_retry: true,
                 linked_files: 0,
+                prepared_link_cleanup_incomplete: false,
             });
         }
 
@@ -463,10 +473,13 @@ impl InjectionWorker {
                 target_client: Some(target_name),
                 saved_for_retry: true,
                 linked_files: 0,
+                prepared_link_cleanup_incomplete: false,
             });
         }
         let LinkPreparation::Ready {
             save_path,
+            created_links,
+            prepared_links,
             created_roots,
             linked_files,
         } = link_result
@@ -476,26 +489,35 @@ impl InjectionWorker {
 
         let recheck_plan =
             recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
-        let pause_for_recheck = recheck_plan.should_recheck;
+        let has_prepared_links = !prepared_links.is_empty();
+        let recheck_after_linking = RecheckResumePlan {
+            should_recheck: true,
+            ..recheck_plan
+        };
+        let pause_for_recheck = recheck_plan.should_recheck || has_prepared_links;
         if should_stop() {
             self.save_for_retry(&request).await?;
-            cleanup_prepared_roots(&created_roots)?;
+            let prepared_link_cleanup_incomplete =
+                cleanup_prepared_links(&created_links, &created_roots);
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
                 saved_for_retry: true,
                 linked_files,
+                prepared_link_cleanup_incomplete,
             });
         }
         let mutation_result = {
             let Some(_guard) = lock_until_shutdown(&self.mutation_lock, shutdown).await else {
                 self.save_for_retry(&request).await?;
-                cleanup_prepared_roots(&created_roots)?;
+                let prepared_link_cleanup_incomplete =
+                    cleanup_prepared_links(&created_links, &created_roots);
                 return Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
                     saved_for_retry: true,
                     linked_files,
+                    prepared_link_cleanup_incomplete,
                 });
             };
             if should_stop() {
@@ -507,22 +529,30 @@ impl InjectionWorker {
                 .await
                 {
                     ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
-                    ClientCall::Completed(Ok(true)) => InjectionMutationResult::AlreadyExists,
+                    ClientCall::Completed(Ok(true)) => {
+                        match validate_prepared_links_for_inject(&prepared_links).await {
+                            Ok(()) => InjectionMutationResult::AlreadyExists,
+                            Err(error) => InjectionMutationResult::PreparedLinksInvalid(error),
+                        }
+                    }
                     ClientCall::Completed(Ok(false)) => {
-                        match client_call_until_shutdown(shutdown, || {
-                            target.inject(ClientInjectionRequest {
-                                info_hash: request.metafile.info_hash(),
-                                torrent_bytes: &request.torrent_bytes,
-                                save_path: save_path.as_deref(),
-                                pause_for_recheck,
+                        match validate_prepared_links_for_inject(&prepared_links).await {
+                            Ok(()) => match client_call_until_shutdown(shutdown, || {
+                                target.inject(ClientInjectionRequest {
+                                    info_hash: request.metafile.info_hash(),
+                                    torrent_bytes: &request.torrent_bytes,
+                                    save_path: save_path.as_deref(),
+                                    pause_for_recheck,
+                                })
                             })
-                        })
-                        .await
-                        {
-                            ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
-                            ClientCall::Completed(result) => {
-                                InjectionMutationResult::Injected(result)
-                            }
+                            .await
+                            {
+                                ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
+                                ClientCall::Completed(result) => {
+                                    InjectionMutationResult::Injected(result)
+                                }
+                            },
+                            Err(error) => InjectionMutationResult::PreparedLinksInvalid(error),
                         }
                     }
                     ClientCall::Completed(Err(error)) => {
@@ -535,25 +565,32 @@ impl InjectionWorker {
         match mutation_result {
             InjectionMutationResult::SavedForShutdown => {
                 self.save_for_retry(&request).await?;
-                cleanup_prepared_roots(&created_roots)?;
+                let prepared_link_cleanup_incomplete =
+                    cleanup_prepared_links(&created_links, &created_roots);
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
                     saved_for_retry: true,
                     linked_files,
+                    prepared_link_cleanup_incomplete,
                 })
             }
             InjectionMutationResult::AlreadyExists => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
                 let mut saved_for_retry = false;
-                if linked_files > 0 || (from_saved_retry && recheck_plan.should_recheck) {
-                    let recheck_plan = RecheckResumePlan {
-                        should_recheck: true,
-                        ..recheck_plan
-                    };
+                if has_prepared_links || (from_saved_retry && recheck_plan.should_recheck) {
                     let resume_outcome = self
-                        .run_recheck_resume(target.as_ref(), &request, recheck_plan, shutdown)
+                        .run_recheck_resume(
+                            target.as_ref(),
+                            &request,
+                            if has_prepared_links {
+                                recheck_after_linking
+                            } else {
+                                recheck_plan
+                            },
+                            shutdown,
+                        )
                         .await?;
                     if resume_outcome == ResumeLoopOutcome::StillChecking {
                         self.save_for_retry(&request).await?;
@@ -565,15 +602,25 @@ impl InjectionWorker {
                     target_client: Some(target_name),
                     saved_for_retry,
                     linked_files,
+                    prepared_link_cleanup_incomplete: false,
                 })
             }
             InjectionMutationResult::Injected(Ok(())) => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
-                if recheck_plan.should_recheck {
+                if pause_for_recheck {
                     let save_result = self.save_for_retry(&request).await;
                     let resume_result = self
-                        .run_recheck_resume(target.as_ref(), &request, recheck_plan, shutdown)
+                        .run_recheck_resume(
+                            target.as_ref(),
+                            &request,
+                            if has_prepared_links {
+                                recheck_after_linking
+                            } else {
+                                recheck_plan
+                            },
+                            shutdown,
+                        )
                         .await;
                     save_result?;
                     resume_result?;
@@ -583,11 +630,13 @@ impl InjectionWorker {
                     target_client: Some(target_name),
                     saved_for_retry: pause_for_recheck,
                     linked_files,
+                    prepared_link_cleanup_incomplete: false,
                 })
             }
             InjectionMutationResult::Injected(Err(error)) => {
                 self.save_for_retry(&request).await?;
-                let cleanup_result = cleanup_prepared_roots(&created_roots);
+                let prepared_link_cleanup_incomplete =
+                    cleanup_prepared_links(&created_links, &created_roots);
                 self.record_client_health(
                     target.descriptor(),
                     false,
@@ -595,16 +644,36 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
-                cleanup_result?;
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Failed,
                     target_client: Some(target_name),
                     saved_for_retry: true,
                     linked_files,
+                    prepared_link_cleanup_incomplete,
                 })
             }
+            InjectionMutationResult::PreparedLinksInvalid(error) => {
+                self.save_for_retry(&request).await?;
+                let prepared_link_cleanup_incomplete =
+                    cleanup_prepared_links(&created_links, &created_roots);
+                if prepared_link_cleanup_incomplete {
+                    Err(InjectionWorkerError::Link(
+                        LinkActionError::CleanupIncomplete {
+                            primary: Box::new(error),
+                            cleanup: Box::new(LinkActionError::Io {
+                                operation: "clean prepared links after revalidation failure",
+                                path: save_path.clone().unwrap_or_default(),
+                                source: std::io::Error::other("prepared link cleanup incomplete"),
+                            }),
+                        },
+                    ))
+                } else {
+                    Err(error.into())
+                }
+            }
             InjectionMutationResult::PrecheckFailed(error) => {
-                let cleanup_result = cleanup_prepared_roots(&created_roots);
+                let prepared_link_cleanup_incomplete =
+                    cleanup_prepared_links(&created_links, &created_roots);
                 self.record_client_health(
                     target.descriptor(),
                     false,
@@ -612,8 +681,14 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
-                cleanup_result?;
-                Err(error.into())
+                if prepared_link_cleanup_incomplete {
+                    Err(InjectionWorkerError::ClientWithPreparedLinkCleanup {
+                        source: error,
+                        prepared_link_cleanup_incomplete,
+                    })
+                } else {
+                    Err(error.into())
+                }
             }
         }
     }
@@ -893,6 +968,8 @@ impl InjectionWorker {
         let Some(link_type) = request.link_type else {
             return Ok(LinkPreparation::Ready {
                 save_path: source_root(&request.local_item).map(Path::to_path_buf),
+                created_links: Vec::new(),
+                prepared_links: Vec::new(),
                 created_roots: Vec::new(),
                 linked_files: 0,
             });
@@ -900,6 +977,8 @@ impl InjectionWorker {
         if request.link_dirs.is_empty() {
             return Ok(LinkPreparation::Ready {
                 save_path: source_root(&request.local_item).map(Path::to_path_buf),
+                created_links: Vec::new(),
+                prepared_links: Vec::new(),
                 created_roots: Vec::new(),
                 linked_files: 0,
             });
@@ -938,6 +1017,8 @@ impl InjectionWorker {
             Ok(LinkPreparation::Ready {
                 save_path: Some(destination_dir),
                 linked_files: outcome.created_links.len(),
+                created_links: outcome.created_links,
+                prepared_links: outcome.prepared_links,
                 created_roots: outcome.created_roots,
             })
         })
@@ -1182,15 +1263,32 @@ fn shutdown_requested(shutdown: Option<&ShutdownSignal>) -> bool {
     shutdown.is_some_and(|signal| signal.state().phase != ShutdownPhase::Running)
 }
 
-fn cleanup_prepared_roots(roots: &[PathBuf]) -> Result<(), InjectionWorkerError> {
-    cleanup_created_roots(roots).map_err(|error| {
+fn cleanup_prepared_links(links: &[CreatedLink], roots: &[PathBuf]) -> bool {
+    if let Err(error) = cleanup_created_links_and_roots(links, roots) {
         warn!(
+            link_count = links.len(),
             root_count = roots.len(),
             error = %error,
-            "failed to clean prepared injection links"
+            "left prepared injection links in place after cleanup was unsafe"
         );
-        InjectionWorkerError::Link(error)
-    })
+        true
+    } else {
+        false
+    }
+}
+
+async fn validate_prepared_links_for_inject(links: &[PreparedLink]) -> Result<(), LinkActionError> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    let links = links.to_vec();
+    tokio::task::spawn_blocking(move || validate_prepared_links(&links))
+        .await
+        .map_err(|error| LinkActionError::Io {
+            operation: "join prepared link revalidation task",
+            path: PathBuf::new(),
+            source: std::io::Error::other(error.to_string()),
+        })?
 }
 
 enum ClientCall<T> {
@@ -1498,6 +1596,7 @@ fn saved_retry_can_continue_after_error(error: &InjectionWorkerError) -> bool {
     matches!(
         error,
         InjectionWorkerError::Client(_)
+            | InjectionWorkerError::ClientWithPreparedLinkCleanup { .. }
             | InjectionWorkerError::TorrentParse(_)
             | InjectionWorkerError::Save(_)
             | InjectionWorkerError::Link(_)
@@ -1539,6 +1638,8 @@ fn saved_retry_domain_error(error: crate::domain::DomainError) -> InjectionWorke
 enum LinkPreparation {
     Ready {
         save_path: Option<PathBuf>,
+        created_links: Vec<CreatedLink>,
+        prepared_links: Vec<PreparedLink>,
         created_roots: Vec<PathBuf>,
         linked_files: usize,
     },
@@ -1549,6 +1650,7 @@ enum InjectionMutationResult {
     SavedForShutdown,
     AlreadyExists,
     Injected(Result<(), TorrentClientError>),
+    PreparedLinksInvalid(LinkActionError),
     PrecheckFailed(TorrentClientError),
 }
 
@@ -1949,10 +2051,80 @@ mod tests {
 
         assert_eq!(InjectionOutcome::Failed, result.outcome);
         assert!(result.saved_for_retry);
+        assert!(result.prepared_link_cleanup_incomplete);
         assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
-        assert!(!root.join("links/tracker.example/movie.mkv").exists());
+        assert!(root.join("links/tracker.example/movie.mkv").exists());
         assert_eq!(1, saved_torrent_count(&root.join("output")));
         assert_eq!("degraded", health[0].state);
+    }
+
+    #[tokio::test]
+    async fn worker_revalidates_prepared_links_before_injecting() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-link-replaced-before-inject");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let stale_destination = root.join("links/tracker.example/movie.mkv");
+        let target = Arc::new(
+            FakeClient::new(descriptor("target", "target"))
+                .with_replace_save_path_file_on_has(stale_destination.clone(), b"stale".to_vec()),
+        );
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("links")];
+        fs::create_dir_all(&request.link_dirs[0]).unwrap();
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let error = worker.process(request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            InjectionWorkerError::Link(
+                LinkActionError::ExistingDestinationMismatch { .. }
+                    | LinkActionError::CleanupIncomplete { .. }
+            )
+        ));
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, saved_torrent_count(&root.join("output")));
+        assert_eq!(b"stale", fs::read(stale_destination).unwrap().as_slice());
+    }
+
+    #[tokio::test]
+    async fn worker_revalidates_prepared_links_before_existing_recheck() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-existing-link-replaced");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let stale_destination = root.join("links/tracker.example/movie.mkv");
+        let target = Arc::new(
+            FakeClient::new(descriptor("target", "target"))
+                .with_existing(true)
+                .with_replace_save_path_file_on_has(stale_destination.clone(), b"stale".to_vec()),
+        );
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("links")];
+        fs::create_dir_all(&request.link_dirs[0]).unwrap();
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let error = worker.process(request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            InjectionWorkerError::Link(
+                LinkActionError::ExistingDestinationMismatch { .. }
+                    | LinkActionError::CleanupIncomplete { .. }
+            )
+        ));
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(1, saved_torrent_count(&root.join("output")));
+        assert_eq!(b"stale", fs::read(stale_destination).unwrap().as_slice());
     }
 
     #[tokio::test]
@@ -2247,8 +2419,9 @@ mod tests {
         assert_eq!(InjectionOutcome::Saved, result.outcome);
         assert!(result.saved_for_retry);
         assert_eq!(1, result.linked_files);
+        assert!(result.prepared_link_cleanup_incomplete);
         assert_eq!(1, saved_torrent_count(&output_dir));
-        assert!(!root.join("links/tracker.example/movie.mkv").exists());
+        assert!(root.join("links/tracker.example/movie.mkv").exists());
     }
 
     #[tokio::test]
@@ -2375,6 +2548,7 @@ mod tests {
             target_client: Some(DependencyName::new("target").unwrap()),
             saved_for_retry: false,
             linked_files: 0,
+            prepared_link_cleanup_incomplete: false,
         };
         let (shutdown, signal) = shutdown_channel();
         shutdown.cancel_now("test shutdown").unwrap();
@@ -2478,10 +2652,11 @@ mod tests {
         assert_eq!(1, summary.scanned);
         assert_eq!(1, summary.attempted);
         assert_eq!(1, summary.injected);
-        assert_eq!(1, summary.deleted);
-        assert_eq!(0, saved_torrent_count(&output_dir));
+        assert_eq!(0, summary.deleted);
+        assert_eq!(1, saved_torrent_count(&output_dir));
         assert!(root.join("links/tracker.example/movie.mkv").exists());
         assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(true), target.last_pause_for_recheck());
         assert_eq!(
             Some(root.join("links/tracker.example")),
             target.last_save_path()
@@ -3297,6 +3472,7 @@ mod tests {
         remaining_calls: AtomicUsize,
         resume_calls: AtomicUsize,
         save_path_file_exists_at_inject: AtomicUsize,
+        replace_save_path_file_on_has: StdMutex<Option<(PathBuf, Vec<u8>)>>,
         last_pause_for_recheck: StdMutex<Option<bool>>,
         last_save_path: StdMutex<Option<PathBuf>>,
     }
@@ -3446,6 +3622,7 @@ mod tests {
                 remaining_calls: AtomicUsize::new(0),
                 resume_calls: AtomicUsize::new(0),
                 save_path_file_exists_at_inject: AtomicUsize::new(0),
+                replace_save_path_file_on_has: StdMutex::new(None),
                 last_pause_for_recheck: StdMutex::new(None),
                 last_save_path: StdMutex::new(None),
             }
@@ -3497,6 +3674,11 @@ mod tests {
             self
         }
 
+        fn with_replace_save_path_file_on_has(self, path: PathBuf, contents: Vec<u8>) -> Self {
+            *self.replace_save_path_file_on_has.lock().unwrap() = Some((path, contents));
+            self
+        }
+
         fn last_pause_for_recheck(&self) -> Option<bool> {
             *self.last_pause_for_recheck.lock().unwrap()
         }
@@ -3513,6 +3695,16 @@ mod tests {
 
         fn has_torrent<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
             self.has_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((path, contents)) =
+                self.replace_save_path_file_on_has.lock().unwrap().take()
+            {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("remove prepared link before test replacement: {error}"),
+                }
+                std::fs::write(path, contents).unwrap();
+            }
             if self.has_pending {
                 return Box::pin(
                     async move { pending::<Result<bool, TorrentClientError>>().await },
@@ -3867,8 +4059,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("sporos-{label}-{}-{unique}", std::process::id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("sporos-{label}-{}-{unique}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         path
     }
