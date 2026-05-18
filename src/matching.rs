@@ -10,7 +10,6 @@
     test,
     expect(
         clippy::cloned_ref_to_slice_refs,
-        clippy::field_reassign_with_default,
         reason = "test fixture cleanup is tracked separately from enabling the gate"
     )
 )]
@@ -3200,9 +3199,14 @@ mod tests {
         insert_local(&repository, &data, &files).await;
         insert_local(&repository, &duplicate_data, &files).await;
         insert_local(&repository, &blocked, &files).await;
-        let mut config = ReverseLookupConfig::default();
-        config.content_filter.include_single_episodes = true;
-        config.content_filter.blocklist = vec![BlocklistRule::NameSubstring("Blocked".to_owned())];
+        let config = ReverseLookupConfig {
+            content_filter: ContentFilterConfig {
+                include_single_episodes: true,
+                blocklist: vec![BlocklistRule::NameSubstring("Blocked".to_owned())],
+                ..ContentFilterConfig::default()
+            },
+            ..ReverseLookupConfig::default()
+        };
         let candidate =
             remote_candidate("guid-reverse", "Example.Show.S01E02.1080p.WEB-DL-GRP", None);
 
@@ -3298,12 +3302,14 @@ mod tests {
         insert_local(&repository, &blocked, &files).await;
         insert_local(&repository, &valid, &files).await;
         let candidate = remote_candidate("guid-backfill", "Example Movie", None);
-        let mut config = ReverseLookupConfig {
+        let config = ReverseLookupConfig {
             max_local_candidates: 1,
+            content_filter: ContentFilterConfig {
+                blocklist: vec![BlocklistRule::FolderSubstring("/blocked".to_owned())],
+                ..ContentFilterConfig::default()
+            },
             ..ReverseLookupConfig::default()
         };
-        config.content_filter.blocklist =
-            vec![BlocklistRule::FolderSubstring("/blocked".to_owned())];
 
         let matches = reverse_lookup_candidates(
             &repository,
@@ -3528,8 +3534,10 @@ mod tests {
         )
         .await;
         let candidate = remote_candidate("guid-truncated", "Example", Some(cache_path));
-        let mut config = ReverseLookupConfig::default();
-        config.max_files_per_item = 1;
+        let config = ReverseLookupConfig {
+            max_files_per_item: 1,
+            ..ReverseLookupConfig::default()
+        };
 
         let outcome = reverse_lookup_and_assess_candidate(
             &repository,
@@ -3577,8 +3585,10 @@ mod tests {
         )
         .await;
         let candidate = remote_candidate("guid-truncated-filter", "Example", Some(cache_path));
-        let mut config = ReverseLookupConfig::default();
-        config.max_files_per_item = 1;
+        let config = ReverseLookupConfig {
+            max_files_per_item: 1,
+            ..ReverseLookupConfig::default()
+        };
 
         let outcome = reverse_lookup_and_assess_candidate(
             &repository,
@@ -3630,9 +3640,14 @@ mod tests {
         )
         .await;
         let candidate = remote_candidate("guid-blocked-truncated", "Blocked Example", None);
-        let mut config = ReverseLookupConfig::default();
-        config.max_files_per_item = 1;
-        config.content_filter.blocklist = vec![BlocklistRule::NameSubstring("Blocked".to_owned())];
+        let config = ReverseLookupConfig {
+            max_files_per_item: 1,
+            content_filter: ContentFilterConfig {
+                blocklist: vec![BlocklistRule::NameSubstring("Blocked".to_owned())],
+                ..ContentFilterConfig::default()
+            },
+            ..ReverseLookupConfig::default()
+        };
 
         let outcome = reverse_lookup_and_assess_candidate(
             &repository,
