@@ -1,10 +1,10 @@
 #![expect(
-    clippy::cast_sign_loss,
     clippy::indexing_slicing,
     clippy::too_many_arguments,
     clippy::unreachable,
     reason = "mechanical clippy gate enablement leaves matching lint classes to linked cleanup beads"
 )]
+use std::cmp::Ordering as CompareOrdering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -31,6 +31,7 @@ use crate::torrent::parse_metafile;
 const CACHED_TORRENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const REVERSE_LOOKUP_SCAN_PAGE_MULTIPLIER: u16 = 16;
 const REVERSE_LOOKUP_MAX_TITLE_TOKEN_PROBES: usize = 4;
+const FAILURE_RATIO_BUCKET_SCALE: f64 = 1_000_000.0;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FileTreeMatchMode {
@@ -1189,17 +1190,95 @@ fn better_failure(
     }
 }
 
-fn assessment_failure_rank(assessment: &PersistedCandidateAssessment) -> (u8, u64) {
+#[derive(Debug, Clone, Copy)]
+struct FailureRank {
+    decision: u8,
+    ratio: FailureRatioRank,
+}
+
+impl PartialEq for FailureRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CompareOrdering::Equal
+    }
+}
+
+impl Eq for FailureRank {}
+
+impl Ord for FailureRank {
+    fn cmp(&self, other: &Self) -> CompareOrdering {
+        self.decision
+            .cmp(&other.decision)
+            .then_with(|| self.ratio.cmp(&other.ratio))
+    }
+}
+
+impl PartialOrd for FailureRank {
+    fn partial_cmp(&self, other: &Self) -> Option<CompareOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FailureRatioRank {
+    NeedsTorrentDownload,
+    Assessed(Option<MatchRatio>),
+}
+
+impl PartialEq for FailureRatioRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CompareOrdering::Equal
+    }
+}
+
+impl Eq for FailureRatioRank {}
+
+impl Ord for FailureRatioRank {
+    fn cmp(&self, other: &Self) -> CompareOrdering {
+        match (self, other) {
+            (Self::NeedsTorrentDownload, Self::NeedsTorrentDownload) => CompareOrdering::Equal,
+            (Self::NeedsTorrentDownload, Self::Assessed(_)) => CompareOrdering::Less,
+            (Self::Assessed(_), Self::NeedsTorrentDownload) => CompareOrdering::Greater,
+            (Self::Assessed(left), Self::Assessed(right)) => {
+                let left = failure_ratio_bucket(*left);
+                let right = failure_ratio_bucket(*right);
+                right.total_cmp(&left)
+            }
+        }
+    }
+}
+
+impl PartialOrd for FailureRatioRank {
+    fn partial_cmp(&self, other: &Self) -> Option<CompareOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn failure_ratio_bucket(ratio: Option<MatchRatio>) -> f64 {
+    let bucket = ratio
+        .map(|ratio| ratio.get() * FAILURE_RATIO_BUCKET_SCALE)
+        .unwrap_or(0.0)
+        .trunc();
+    if bucket == 0.0 { 0.0 } else { bucket }
+}
+
+fn assessment_failure_rank(assessment: &PersistedCandidateAssessment) -> FailureRank {
     match assessment {
         PersistedCandidateAssessment::Assessed { assessment, .. }
         | PersistedCandidateAssessment::Rejected { assessment, .. } => {
             let ratio = assessment
                 .matched_ratio
-                .map(|ratio| (ratio.get() * 1_000_000.0) as u64)
-                .unwrap_or(0);
-            (decision_failure_rank(assessment.decision), u64::MAX - ratio)
+                .map(Some)
+                .map(FailureRatioRank::Assessed)
+                .unwrap_or(FailureRatioRank::Assessed(None));
+            FailureRank {
+                decision: decision_failure_rank(assessment.decision),
+                ratio,
+            }
         }
-        PersistedCandidateAssessment::NeedsTorrentDownload { .. } => (0, 0),
+        PersistedCandidateAssessment::NeedsTorrentDownload { .. } => FailureRank {
+            decision: 0,
+            ratio: FailureRatioRank::NeedsTorrentDownload,
+        },
     }
 }
 
@@ -2282,6 +2361,55 @@ mod tests {
     };
     use crate::indexers::{CategoryCaps, SearchCaps, TorznabLimits};
     use crate::persistence::repository::Repository;
+
+    #[test]
+    fn failure_rank_preserves_ratio_bucket_ordering() {
+        let needs_torrent = PersistedCandidateAssessment::NeedsTorrentDownload {
+            candidate_id: RemoteCandidateId::new(1).unwrap(),
+            cache_status: CandidateCacheStatus::NotAvailable,
+        };
+        let no_ratio = persisted_assessment(MatchDecision::Exact, None);
+        let zero_ratio = persisted_assessment(MatchDecision::Exact, Some(0.0));
+        let negative_zero_ratio = persisted_assessment(MatchDecision::Exact, Some(-0.0));
+        let lower_ratio = persisted_assessment(MatchDecision::NoMatch, Some(0.5));
+        let higher_ratio = persisted_assessment(MatchDecision::NoMatch, Some(0.75));
+        let same_bucket_a = persisted_assessment(MatchDecision::NoMatch, Some(0.500_000_1));
+        let same_bucket_b = persisted_assessment(MatchDecision::NoMatch, Some(0.500_000_2));
+
+        assert!(assessment_failure_rank(&needs_torrent) < assessment_failure_rank(&no_ratio));
+        assert_eq!(
+            assessment_failure_rank(&no_ratio),
+            assessment_failure_rank(&zero_ratio)
+        );
+        assert_eq!(
+            assessment_failure_rank(&zero_ratio),
+            assessment_failure_rank(&negative_zero_ratio)
+        );
+        assert!(assessment_failure_rank(&higher_ratio) < assessment_failure_rank(&lower_ratio));
+        assert_eq!(
+            assessment_failure_rank(&same_bucket_a),
+            assessment_failure_rank(&same_bucket_b)
+        );
+    }
+
+    #[test]
+    fn better_failure_keeps_existing_failure_for_same_ratio_bucket() {
+        let current_item = search_item("current", MediaType::Movie);
+        let candidate_item = search_item("candidate", MediaType::Movie);
+        let current_assessment = persisted_assessment(MatchDecision::NoMatch, Some(0.500_000_1));
+        let candidate_assessment = persisted_assessment(MatchDecision::NoMatch, Some(0.500_000_2));
+
+        let Some((selected_item, selected_assessment)) = better_failure(
+            Some((current_item.clone(), current_assessment.clone())),
+            candidate_item,
+            candidate_assessment,
+        ) else {
+            panic!("expected retained failure");
+        };
+
+        assert_eq!(current_item, selected_item);
+        assert_eq!(current_assessment, selected_assessment);
+    }
 
     #[test]
     fn query_grouping_deduplicates_titles_and_keeps_distinct_ids() {
@@ -3951,6 +4079,22 @@ mod tests {
             save_path: None,
             total_size: ByteSize::new(10),
             mtime_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    fn persisted_assessment(
+        decision: MatchDecision,
+        matched_ratio: Option<f64>,
+    ) -> PersistedCandidateAssessment {
+        PersistedCandidateAssessment::Assessed {
+            candidate_id: RemoteCandidateId::new(1).unwrap(),
+            assessment: CandidateAssessment {
+                decision,
+                reason: DecisionReason::NameMismatch,
+                matched_size: None,
+                matched_ratio: matched_ratio.map(|ratio| MatchRatio::new(ratio).unwrap()),
+            },
+            cache_status: CandidateCacheStatus::Reused,
         }
     }
 

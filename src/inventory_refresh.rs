@@ -5,7 +5,6 @@
 #![cfg_attr(
     test,
     expect(
-        clippy::cast_sign_loss,
         clippy::unreachable,
         reason = "test fixture simplifications are tracked for follow-up cleanup"
     )
@@ -2500,7 +2499,7 @@ mod tests {
                     &format!("{:040x}", index + 1),
                     &format!("Large {index}"),
                     &format!("Large/file-{index:04}.mkv"),
-                    index as u64 + 1,
+                    u64::try_from(index).unwrap() + 1,
                 )
             })
             .collect::<Vec<_>>();
