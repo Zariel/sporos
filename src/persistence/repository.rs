@@ -3,14 +3,6 @@
     clippy::string_slice,
     reason = "mechanical clippy gate enablement leaves repository lint classes to linked cleanup beads"
 )]
-#![cfg_attr(
-    test,
-    expect(
-        clippy::cloned_ref_to_slice_refs,
-        reason = "repository single-row test fixtures are tracked for cleanup"
-    )
-)]
-
 use std::cmp::Ordering as CompareOrdering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -7101,7 +7093,7 @@ mod tests {
         let removed = repository
             .sync_prowlarr_indexers_with_summary(
                 &source,
-                &[first.clone()],
+                std::slice::from_ref(&first),
                 ProwlarrRemovePolicy::Deactivate,
                 200,
             )
@@ -7119,7 +7111,7 @@ mod tests {
         let unchanged = repository
             .sync_prowlarr_indexers_with_summary(
                 &source,
-                &[first.clone()],
+                std::slice::from_ref(&first),
                 ProwlarrRemovePolicy::Deactivate,
                 250,
             )
@@ -7314,7 +7306,7 @@ mod tests {
         let imported_rows = repository
             .sync_prowlarr_indexers(
                 &source,
-                &[imported.clone()],
+                std::slice::from_ref(&imported),
                 ProwlarrRemovePolicy::Deactivate,
                 100,
             )
@@ -7375,7 +7367,7 @@ mod tests {
         repository
             .sync_prowlarr_indexers(
                 &source,
-                &[imported.clone()],
+                std::slice::from_ref(&imported),
                 ProwlarrRemovePolicy::Deactivate,
                 100,
             )

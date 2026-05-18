@@ -6,7 +6,6 @@
     test,
     expect(
         clippy::cast_sign_loss,
-        clippy::cloned_ref_to_slice_refs,
         clippy::unreachable,
         reason = "test fixture simplifications are tracked for follow-up cleanup"
     )
@@ -2427,7 +2426,7 @@ mod tests {
         );
 
         worker
-            .refresh_client_items(host_base.clone(), &[base_item.clone()])
+            .refresh_client_items(host_base.clone(), std::slice::from_ref(&base_item))
             .await
             .unwrap();
         worker

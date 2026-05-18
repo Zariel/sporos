@@ -6,14 +6,6 @@
     clippy::unreachable,
     reason = "mechanical clippy gate enablement leaves matching lint classes to linked cleanup beads"
 )]
-#![cfg_attr(
-    test,
-    expect(
-        clippy::cloned_ref_to_slice_refs,
-        reason = "test fixture cleanup is tracked separately from enabling the gate"
-    )
-)]
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -2819,7 +2811,7 @@ mod tests {
                     info_hash: Some(&same_hash),
                     ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
                 },
-                &[owned_hash.clone()],
+                std::slice::from_ref(&owned_hash),
                 &CandidatePrecheckConfig::default(),
             ))
         );
@@ -2831,7 +2823,7 @@ mod tests {
                     info_hash: Some(&owned_hash),
                     ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
                 },
-                &[owned_hash.clone()],
+                std::slice::from_ref(&owned_hash),
                 &CandidatePrecheckConfig::default(),
             ))
         );

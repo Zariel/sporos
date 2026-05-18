@@ -3,14 +3,6 @@
     clippy::let_underscore_must_use,
     reason = "mechanical clippy gate enablement leaves existing action safety cleanup to linked lint-class beads"
 )]
-#![cfg_attr(
-    test,
-    expect(
-        clippy::cloned_ref_to_slice_refs,
-        reason = "test fixture cleanup is lower risk than the production clippy gate fix"
-    )
-)]
-
 #[cfg(unix)]
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -3547,7 +3539,7 @@ mod tests {
 
         let selected = select_virtual_link_dir(
             &[one, two],
-            &[link_dir.clone()],
+            std::slice::from_ref(&link_dir),
             LinkDirOptions::new(LinkType::Hardlink),
         )
         .unwrap();

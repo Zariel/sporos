@@ -5,7 +5,6 @@
 #![cfg_attr(
     test,
     expect(
-        clippy::cloned_ref_to_slice_refs,
         clippy::let_underscore_must_use,
         clippy::string_slice,
         reason = "test fixtures prefer direct request drains and owned single-item slices for clarity"
@@ -1242,7 +1241,8 @@ mod tests {
             row(XmlRpcValue::String("sporos".to_owned())),
         ]);
 
-        let downloads = parse_inventory_response("rtorrent", &[hash.clone()], &rows).unwrap();
+        let downloads =
+            parse_inventory_response("rtorrent", std::slice::from_ref(&hash), &rows).unwrap();
 
         assert_eq!(hash, downloads[0].info_hash);
         assert_eq!("Example", downloads[0].name.as_str());
