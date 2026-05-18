@@ -1,6 +1,5 @@
 #![expect(
     clippy::indexing_slicing,
-    clippy::large_futures,
     clippy::let_underscore_must_use,
     clippy::too_many_arguments,
     reason = "mechanical clippy gate enablement leaves daemon lint classes to linked cleanup beads"
@@ -439,7 +438,13 @@ async fn run_search_receiver(
                     release_queued_search_requests(&mut receiver).await;
                     break;
                 }
-                match process_search_workflow(state.clone(), request, shutdown.clone()).await {
+                match Box::pin(process_search_workflow(
+                    state.clone(),
+                    request,
+                    shutdown.clone(),
+                ))
+                .await
+                {
                     Ok(summary) => {
                         state
                             .metrics
@@ -1240,11 +1245,12 @@ async fn run_announce_worker_loop(
             break;
         }
 
-        let batch = worker
-            .run_batch(unix_time_ms(), shutdown.clone(), |id, shutdown| {
+        let batch = Box::pin(
+            worker.run_batch(unix_time_ms(), shutdown.clone(), |id, shutdown| {
                 process_announce_work(state.clone(), id, shutdown)
-            })
-            .await;
+            }),
+        )
+        .await;
         match batch {
             Ok(summary) => {
                 if summary.claimed > 0 {
@@ -3469,11 +3475,11 @@ mod tests {
             })
             .unwrap();
         state.shutdown.cancel_now("test shutdown").unwrap();
-        run_search_receiver(
+        Box::pin(run_search_receiver(
             state.clone(),
             runtime.receivers.searches,
             state.shutdown_signal.clone(),
-        )
+        ))
         .await;
 
         assert_eq!(0, search_queue.stats().depth);
