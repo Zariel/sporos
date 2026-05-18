@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Acquire, Executor, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+#[cfg(test)]
+use tokio::sync::Barrier;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug_span, info_span};
@@ -45,6 +47,8 @@ pub struct Repository {
     pool: SqlitePool,
     inventory_staging_pool: SqlitePool,
     prowlarr_sync_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    announce_insert_barrier: Option<Arc<Barrier>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -393,6 +397,8 @@ impl Repository {
             pool,
             inventory_staging_pool,
             prowlarr_sync_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            announce_insert_barrier: None,
         };
         repository.initialize().await?;
         Ok(repository)
@@ -409,6 +415,8 @@ impl Repository {
             inventory_staging_pool: pool.clone(),
             pool,
             prowlarr_sync_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            announce_insert_barrier: None,
         };
         repository.initialize().await?;
         Ok(repository)
@@ -416,6 +424,24 @@ impl Repository {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    #[cfg(test)]
+    fn with_announce_insert_barrier(mut self, barrier: Arc<Barrier>) -> Self {
+        self.announce_insert_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(not(test))]
+    async fn wait_before_announce_insert_attempt(&self, _attempt: u8) {}
+
+    #[cfg(test)]
+    async fn wait_before_announce_insert_attempt(&self, attempt: u8) {
+        if attempt == 0
+            && let Some(barrier) = &self.announce_insert_barrier
+        {
+            barrier.wait().await;
+        }
     }
 
     pub async fn begin_local_inventory_replace_transaction(
@@ -2393,43 +2419,57 @@ impl Repository {
                 .map(info_hash_prefix)
                 .unwrap_or_default()
         );
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| db_error("begin announce insert transaction", error))?;
+        for attempt in 0..2 {
+            if let Some(id) = select_active_announce_id(&self.pool, &work.dedupe_hash).await? {
+                return Ok(AnnounceInsertResult::Deduplicated { id });
+            }
 
-        if let Some(id) = select_active_announce_id(&mut transaction, &work.dedupe_hash).await? {
-            transaction
-                .commit()
-                .await
-                .map_err(|error| db_error("commit announce dedupe transaction", error))?;
-            return Ok(AnnounceInsertResult::Deduplicated { id });
-        }
+            self.wait_before_announce_insert_attempt(attempt).await;
+            let result =
+                insert_announce_work_if_below_capacity(&self.pool, work, max_pending).await;
+            let rows_affected = match result {
+                Ok(result) => result.rows_affected(),
+                Err(AnnounceInsertAttemptError::DuplicateActiveDedupe) => {
+                    if let Some(id) =
+                        select_active_announce_id(&self.pool, &work.dedupe_hash).await?
+                    {
+                        return Ok(AnnounceInsertResult::Deduplicated { id });
+                    }
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(DatabaseError::Busy {
+                        operation: "accept announce work".to_owned(),
+                        retry_after_ms: None,
+                    });
+                }
+                Err(AnnounceInsertAttemptError::Database(error)) => return Err(error),
+            };
 
-        let active_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM announce_work WHERE status IN ('queued', 'running', 'waiting', 'retryable')",
-        )
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|error| db_error("count active announce work", error))?;
+            if rows_affected > 0 {
+                return Ok(AnnounceInsertResult::Inserted {
+                    id: work.id.clone(),
+                });
+            }
 
-        if active_count >= i64::from(max_pending) {
+            if let Some(id) = select_active_announce_id(&self.pool, &work.dedupe_hash).await? {
+                return Ok(AnnounceInsertResult::Deduplicated { id });
+            }
+
             return Err(DatabaseError::Busy {
                 operation: "accept announce work".to_owned(),
                 retry_after_ms: None,
             });
         }
 
-        insert_announce_work(&mut transaction, work).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| db_error("commit announce insert transaction", error))?;
-
-        Ok(AnnounceInsertResult::Inserted {
-            id: work.id.clone(),
-        })
+        if let Some(id) = select_active_announce_id(&self.pool, &work.dedupe_hash).await? {
+            Ok(AnnounceInsertResult::Deduplicated { id })
+        } else {
+            Err(DatabaseError::Busy {
+                operation: "accept announce work".to_owned(),
+                retry_after_ms: None,
+            })
+        }
     }
 
     pub async fn claim_announce_work(
@@ -3850,7 +3890,7 @@ impl<'a> LocalInventoryReplaceTransaction<'a> {
 }
 
 async fn select_active_announce_id(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pool: &SqlitePool,
     dedupe_hash: &AnnounceDedupeHash,
 ) -> Result<Option<AnnounceWorkId>, DatabaseError> {
     let row = sqlx::query(
@@ -3860,10 +3900,10 @@ async fn select_active_announce_id(
           AND status IN ('queued', 'running', 'waiting', 'retryable')
         ORDER BY received_at
         LIMIT 1
-        "#,
+    "#,
     )
     .bind(dedupe_hash.as_str())
-    .fetch_optional(&mut **transaction)
+    .fetch_optional(pool)
     .await
     .map_err(|error| db_error("select active announce dedupe", error))?;
 
@@ -3875,10 +3915,18 @@ async fn select_active_announce_id(
         })
 }
 
-async fn insert_announce_work(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+async fn insert_announce_work_if_below_capacity(
+    pool: &SqlitePool,
     work: &AnnounceWorkItem,
-) -> Result<(), DatabaseError> {
+    max_pending: u32,
+) -> Result<sqlx::sqlite::SqliteQueryResult, AnnounceInsertAttemptError> {
+    let size = work
+        .size
+        .map(ByteSize::get)
+        .map(|size| i64_from_u64(size, "announce size"))
+        .transpose()
+        .map_err(AnnounceInsertAttemptError::Database)?;
+
     sqlx::query(
         r#"
         INSERT INTO announce_work (
@@ -3908,7 +3956,11 @@ async fn insert_announce_work(
             last_error_class,
             last_error_message
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE (
+            SELECT COUNT(*) FROM announce_work
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+        ) < ?
         "#,
     )
     .bind(work.id.as_str())
@@ -3921,12 +3973,7 @@ async fn insert_announce_work(
     .bind(work.guid.as_ref().map(CandidateGuid::as_str))
     .bind(work.info_hash.as_ref().map(InfoHash::as_str))
     .bind(work.title.as_str())
-    .bind(
-        work.size
-            .map(ByteSize::get)
-            .map(|size| i64_from_u64(size, "announce size"))
-            .transpose()?,
-    )
+    .bind(size)
     .bind(
         work.fetch
             .as_ref()
@@ -3954,11 +4001,31 @@ async fn insert_announce_work(
     .bind(work.last_dependency_name.as_ref().map(ReasonText::as_str))
     .bind(work.last_error_class.as_ref().map(ReasonText::as_str))
     .bind(work.last_redacted_message.as_ref().map(ReasonText::as_str))
-    .execute(&mut **transaction)
+    .bind(i64::from(max_pending))
+    .execute(pool)
     .await
-    .map_err(|error| db_error("insert announce work", error))?;
+    .map_err(|error| {
+        if is_announce_dedupe_constraint(&error) {
+            AnnounceInsertAttemptError::DuplicateActiveDedupe
+        } else {
+            AnnounceInsertAttemptError::Database(db_error("insert announce work", error))
+        }
+    })
+}
 
-    Ok(())
+#[derive(Debug)]
+enum AnnounceInsertAttemptError {
+    DuplicateActiveDedupe,
+    Database(DatabaseError),
+}
+
+fn is_announce_dedupe_constraint(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|database_error| {
+        database_error.constraint() == Some("idx_announce_work_active_dedupe")
+            || database_error
+                .message()
+                .contains("announce_work.dedupe_hash")
+    })
 }
 
 fn local_source(source: &LocalItemSource) -> (String, String) {
@@ -7790,6 +7857,93 @@ mod tests {
             deduped
         );
         assert!(matches!(full, Err(DatabaseError::Busy { .. })));
+    }
+
+    #[tokio::test]
+    async fn concurrent_announce_inserts_enforce_capacity_atomically() {
+        let root = unique_temp_dir("announce-atomic-insert");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+        let first_work = test_announce_work("ann_atomic_insert_1", "guid-atomic-insert-1", 1);
+        let second_work = test_announce_work("ann_atomic_insert_2", "guid-atomic-insert-2", 2);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let first_repository = repository
+            .clone()
+            .with_announce_insert_barrier(barrier.clone());
+        let second_repository = repository
+            .clone()
+            .with_announce_insert_barrier(barrier.clone());
+        let (first, second) = tokio::join!(
+            first_repository.insert_or_dedupe_announce_work(&first_work, 1),
+            second_repository.insert_or_dedupe_announce_work(&second_work, 1)
+        );
+
+        let mut inserted = 0;
+        let mut rejected = 0;
+        for result in [first, second] {
+            match result {
+                Ok(AnnounceInsertResult::Inserted { .. }) => inserted += 1,
+                Ok(AnnounceInsertResult::Deduplicated { id }) => {
+                    panic!("distinct announce work deduplicated unexpectedly: {id}");
+                }
+                Err(DatabaseError::Busy { operation, .. }) => {
+                    assert_eq!("accept announce work", operation);
+                    rejected += 1;
+                }
+                Err(error) => panic!("unexpected announce insert error: {error}"),
+            }
+        }
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM announce_work")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(1, inserted);
+        assert_eq!(1, rejected);
+        assert_eq!(1, stored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_announce_inserts_dedupe() {
+        let root = unique_temp_dir("announce-atomic-dedupe");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+        let first_work = test_announce_work("ann_atomic_dedupe_1", "guid-atomic-dedupe", 1);
+        let second_work = test_announce_work("ann_atomic_dedupe_2", "guid-atomic-dedupe", 2);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let first_repository = repository
+            .clone()
+            .with_announce_insert_barrier(barrier.clone());
+        let second_repository = repository
+            .clone()
+            .with_announce_insert_barrier(barrier.clone());
+        let (first, second) = tokio::join!(
+            first_repository.insert_or_dedupe_announce_work(&first_work, 1),
+            second_repository.insert_or_dedupe_announce_work(&second_work, 1)
+        );
+
+        let mut inserted_id = None;
+        let mut deduped_id = None;
+        for result in [first, second] {
+            match result {
+                Ok(AnnounceInsertResult::Inserted { id }) => inserted_id = Some(id),
+                Ok(AnnounceInsertResult::Deduplicated { id }) => deduped_id = Some(id),
+                Err(error) => panic!("unexpected announce insert error: {error}"),
+            }
+        }
+        let inserted_id = inserted_id.expect("one insert should win");
+        let deduped_id = deduped_id.expect("one duplicate should dedupe");
+        let stored: Vec<String> = sqlx::query_scalar("SELECT id FROM announce_work ORDER BY id")
+            .fetch_all(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(inserted_id, deduped_id);
+        assert_eq!(vec![inserted_id.as_str().to_owned()], stored);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
