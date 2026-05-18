@@ -1,8 +1,3 @@
-#![expect(
-    clippy::result_large_err,
-    reason = "mechanical clippy gate enablement leaves HTTP error-shape cleanup to a linked lint-class bead"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -913,7 +908,7 @@ async fn post_announcement(
 ) -> Response {
     let Json(request) = match workflow_json(request, &state, HttpRoute::Announcements) {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let request = match request
         .try_into_workflow(&state.announce_download_resolver)
@@ -1085,7 +1080,7 @@ async fn post_search(
 ) -> Response {
     let Json(request) = match workflow_json(request, &state, HttpRoute::Searches) {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let request = match request.try_into_workflow() {
         Ok(request) => request,
@@ -1238,7 +1233,7 @@ fn workflow_json<T>(
     request: Result<Json<T>, JsonRejection>,
     state: &HttpState,
     route: HttpRoute,
-) -> Result<Json<T>, Response> {
+) -> Result<Json<T>, Box<Response>> {
     request.map_err(|rejection| {
         if let Some(metric) = workflow_metric(route) {
             state
@@ -1248,7 +1243,10 @@ fn workflow_json<T>(
         state
             .metrics
             .record_http_request(HttpMethod::Post, route, rejection.status().as_u16());
-        ApiErrorResponse::invalid_body(rejection.status(), rejection.body_text()).into_response()
+        Box::new(
+            ApiErrorResponse::invalid_body(rejection.status(), rejection.body_text())
+                .into_response(),
+        )
     })
 }
 
