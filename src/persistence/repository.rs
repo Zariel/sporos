@@ -1,7 +1,3 @@
-#![expect(
-    clippy::large_enum_variant,
-    reason = "mechanical clippy gate enablement leaves repository lint classes to linked cleanup beads"
-)]
 use std::cmp::Ordering as CompareOrdering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -93,8 +89,14 @@ pub struct OwnedLocalItemFileBatch {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum OwnedLocalInventoryMessage {
-    Item(OwnedLocalItemFileBatch),
+    Item(Box<OwnedLocalItemFileBatch>),
     Finished,
+}
+
+impl OwnedLocalInventoryMessage {
+    pub fn item(batch: OwnedLocalItemFileBatch) -> Self {
+        Self::Item(Box::new(batch))
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -6266,7 +6268,7 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::channel(2);
         sender
-            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+            .send(OwnedLocalInventoryMessage::item(OwnedLocalItemFileBatch {
                 item,
                 files: vec![file],
             }))
@@ -6402,14 +6404,14 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::channel(3);
         sender
-            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+            .send(OwnedLocalInventoryMessage::item(OwnedLocalItemFileBatch {
                 item: valid,
                 files: vec![valid_file],
             }))
             .await
             .unwrap();
         sender
-            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+            .send(OwnedLocalInventoryMessage::item(OwnedLocalItemFileBatch {
                 item: invalid,
                 files: vec![invalid_file],
             }))
@@ -6472,7 +6474,7 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::channel(1);
         sender
-            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+            .send(OwnedLocalInventoryMessage::item(OwnedLocalItemFileBatch {
                 item: partial,
                 files: vec![partial_file],
             }))
@@ -6573,7 +6575,7 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::channel(2);
         sender
-            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+            .send(OwnedLocalInventoryMessage::item(OwnedLocalItemFileBatch {
                 item: staged,
                 files: vec![duplicate_a, duplicate_b],
             }))
@@ -6677,7 +6679,7 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::channel(2);
         sender
-            .send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+            .send(OwnedLocalInventoryMessage::item(OwnedLocalItemFileBatch {
                 item: staged,
                 files: vec![staged_file],
             }))

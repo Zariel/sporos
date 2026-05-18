@@ -249,7 +249,7 @@ impl InventoryRefreshWorker {
                         send_attempts.fetch_add(1, Ordering::SeqCst);
                     }
                     sender
-                        .blocking_send(OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                        .blocking_send(OwnedLocalInventoryMessage::item(OwnedLocalItemFileBatch {
                             item: scanned.item,
                             files: scanned.files,
                         }))
@@ -415,7 +415,7 @@ impl InventoryRefreshWorker {
                     });
                 }
                 let scanned = item.into_scanned()?;
-                let message = OwnedLocalInventoryMessage::Item(OwnedLocalItemFileBatch {
+                let message = OwnedLocalInventoryMessage::item(OwnedLocalItemFileBatch {
                     item: scanned.item,
                     files: scanned.files,
                 });
@@ -670,7 +670,7 @@ impl InventoryRefreshWorker {
                 continue;
             };
             sender
-                .send(OwnedLocalInventoryMessage::Item(item))
+                .send(OwnedLocalInventoryMessage::item(item))
                 .await
                 .map_err(|error| InventoryRefreshError::InvalidClientInventory {
                     message: format!("stage virtual season inventory: {error}"),
