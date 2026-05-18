@@ -2,7 +2,6 @@
     clippy::cast_sign_loss,
     clippy::indexing_slicing,
     clippy::too_many_arguments,
-    clippy::unnecessary_sort_by,
     clippy::unreachable,
     reason = "mechanical clippy gate enablement leaves matching lint classes to linked cleanup beads"
 )]
@@ -687,7 +686,7 @@ impl ReverseLookupKey {
                 tokens.push(token);
             }
         }
-        tokens.sort_by(|left, right| right.len().cmp(&left.len()));
+        tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
         tokens
     }
 
