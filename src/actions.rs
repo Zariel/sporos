@@ -15,10 +15,12 @@ use std::error::Error;
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, DirBuilder, File, FileTimes, OpenOptions};
+#[cfg(not(unix))]
+use std::fs::DirBuilder;
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -26,7 +28,7 @@ use std::time::SystemTime;
 #[cfg(unix)]
 use rustix::fd::OwnedFd;
 #[cfg(unix)]
-use rustix::fs::{AtFlags, CWD, Mode, OFlags};
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, RenameFlags};
 
 use crate::domain::{
     ByteSize, LocalFile, MatchDecision, MediaType, RemoteCandidate, TorrentFile, TorrentMetafile,
@@ -67,6 +69,7 @@ impl LinkDirOptions {
 pub struct LinkFilesOptions {
     pub link_type: LinkType,
     pub ignore_missing: bool,
+    link_root: Option<SelectedLinkDir>,
 }
 
 impl LinkFilesOptions {
@@ -74,7 +77,13 @@ impl LinkFilesOptions {
         Self {
             link_type,
             ignore_missing: false,
+            link_root: None,
         }
+    }
+
+    pub fn with_link_root(mut self, link_root: SelectedLinkDir) -> Self {
+        self.link_root = Some(link_root);
+        self
     }
 }
 
@@ -102,6 +111,23 @@ pub struct LinkFilesOutcome {
     pub created_roots: Vec<PathBuf>,
     pub missing_sources: Vec<PathBuf>,
     pub already_existing: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SelectedLinkDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    identity: FileIdentity,
+}
+
+impl SelectedLinkDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
 }
 
 impl LinkFilesOutcome {
@@ -386,25 +412,34 @@ pub fn save_candidate_torrent(
     }
 }
 
-pub fn select_link_dir(
+#[cfg(test)]
+fn select_link_dir(
     source_path: &Path,
     link_dirs: &[PathBuf],
     options: LinkDirOptions,
 ) -> Result<PathBuf, LinkActionError> {
+    select_link_dir_pinned(source_path, link_dirs, options).map(SelectedLinkDir::into_path)
+}
+
+pub fn select_link_dir_pinned(
+    source_path: &Path,
+    link_dirs: &[PathBuf],
+    options: LinkDirOptions,
+) -> Result<SelectedLinkDir, LinkActionError> {
     if link_dirs.is_empty() {
         return Err(LinkActionError::EmptyLinkDirs);
     }
     validate_link_dirs(link_dirs)?;
 
     if let Some(selected) = select_link_dir_by_device(source_path, link_dirs)? {
-        return Ok(selected);
+        return selected_link_dir(selected);
     }
 
     let representative = representative_source_file(source_path, options.max_directory_entries)?;
     for link_dir in link_dirs {
         if test_link_compatibility(&representative.path, link_dir, options.link_type)? {
             representative.cleanup()?;
-            return Ok(link_dir.clone());
+            return selected_link_dir(link_dir.clone());
         }
     }
     representative.cleanup()?;
@@ -415,7 +450,7 @@ pub fn select_link_dir(
             link_dir = %link_dirs[0].display(),
             "using first symlink directory after compatibility tests failed"
         );
-        return Ok(link_dirs[0].clone());
+        return selected_link_dir(link_dirs[0].clone());
     }
 
     Err(LinkActionError::NoCompatibleLinkDir {
@@ -423,7 +458,29 @@ pub fn select_link_dir(
     })
 }
 
-pub fn select_virtual_link_dir(
+fn selected_link_dir(path: PathBuf) -> Result<SelectedLinkDir, LinkActionError> {
+    #[cfg(unix)]
+    {
+        let file = open_existing_directory(&path).map_err(|source| LinkActionError::Io {
+            operation: "open selected link directory",
+            path: path.clone(),
+            source,
+        })?;
+        let identity = file_identity(&file.metadata().map_err(|source| LinkActionError::Io {
+            operation: "record selected link directory identity",
+            path: path.clone(),
+            source,
+        })?)?;
+        Ok(SelectedLinkDir { path, identity })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(SelectedLinkDir { path })
+    }
+}
+
+#[cfg(test)]
+fn select_virtual_link_dir(
     source_files: &[PathBuf],
     link_dirs: &[PathBuf],
     options: LinkDirOptions,
@@ -515,6 +572,7 @@ pub fn link_metafile_files(
                 destination_dir,
                 &pair.destination_relative_path,
                 false,
+                options.link_root.as_ref(),
             )?;
             if existing_link_destination_matches(
                 &pair.source,
@@ -547,6 +605,7 @@ pub fn link_metafile_files(
             destination_dir,
             &pair.destination_relative_path,
             true,
+            options.link_root.as_ref(),
         ) {
             Ok(parent) => parent,
             Err(error) => {
@@ -575,79 +634,90 @@ pub fn link_metafile_files(
             ));
         }
 
-        match create_link_in_parent(&pair.source, &source_file, &parent, options.link_type) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                match existing_link_destination_matches(
-                    &pair.source,
-                    &source_file,
-                    &pair.destination,
-                    options.link_type,
-                ) {
-                    Ok(true) => {
-                        outcome.already_existing = true;
-                        outcome.prepared_links.push(prepared_link_manifest(
-                            pair.source,
-                            pair.destination,
-                            options.link_type,
-                            &parent,
-                        )?);
-                        continue;
-                    }
-                    Ok(false) => {
-                        source_file = match verified_source_file(&pair.source, options.link_type) {
-                            Ok(source_file) => source_file,
-                            Err(source) => {
-                                let error = LinkActionError::Io {
-                                    operation: "open source file for link creation retry",
-                                    path: pair.source.clone(),
-                                    source,
+        let created_entry =
+            match create_link_in_parent(&pair.source, &source_file, &parent, options.link_type) {
+                Ok(created_entry) => created_entry,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    match existing_link_destination_matches(
+                        &pair.source,
+                        &source_file,
+                        &pair.destination,
+                        options.link_type,
+                    ) {
+                        Ok(true) => {
+                            outcome.already_existing = true;
+                            outcome.prepared_links.push(prepared_link_manifest(
+                                pair.source,
+                                pair.destination,
+                                options.link_type,
+                                &parent,
+                            )?);
+                            continue;
+                        }
+                        Ok(false) => {
+                            source_file =
+                                match verified_source_file(&pair.source, options.link_type) {
+                                    Ok(source_file) => source_file,
+                                    Err(source) => {
+                                        let error = LinkActionError::Io {
+                                            operation: "open source file for link creation retry",
+                                            path: pair.source.clone(),
+                                            source,
+                                        };
+                                        return Err(cleanup_created_links_and_roots_before_error(
+                                            &outcome, None, error,
+                                        ));
+                                    }
                                 };
-                                return Err(cleanup_created_links_and_roots_before_error(
-                                    &outcome, None, error,
-                                ));
-                            }
-                        };
-                        match create_link_in_parent(
-                            &pair.source,
-                            &source_file,
-                            &parent,
-                            options.link_type,
-                        ) {
-                            Ok(()) => {}
-                            Err(source) => {
-                                let error = link_creation_error(
-                                    &pair.source,
-                                    &pair.destination,
-                                    "create linked file",
-                                    source,
-                                );
-                                return Err(cleanup_created_links_and_roots_before_error(
-                                    &outcome, None, error,
-                                ));
+                            match create_link_in_parent(
+                                &pair.source,
+                                &source_file,
+                                &parent,
+                                options.link_type,
+                            ) {
+                                Ok(created_entry) => created_entry,
+                                Err(source) => {
+                                    let error = link_creation_error(
+                                        &pair.source,
+                                        &pair.destination,
+                                        "create linked file",
+                                        source,
+                                    );
+                                    return Err(cleanup_created_links_and_roots_before_error(
+                                        &outcome, None, error,
+                                    ));
+                                }
                             }
                         }
-                    }
-                    Err(error) => {
-                        return Err(cleanup_created_links_and_roots_before_error(
-                            &outcome,
-                            (!root_preexisted).then_some(root.as_path()),
-                            error,
-                        ));
+                        Err(error) => {
+                            return Err(cleanup_created_links_and_roots_before_error(
+                                &outcome,
+                                (!root_preexisted).then_some(root.as_path()),
+                                error,
+                            ));
+                        }
                     }
                 }
-            }
-            Err(source) => {
-                let error = link_creation_error(
-                    &pair.source,
-                    &pair.destination,
-                    "create linked file",
-                    source,
-                );
-                return Err(cleanup_created_links_and_roots_before_error(
-                    &outcome, None, error,
-                ));
-            }
+                Err(source) => {
+                    let error = link_creation_error(
+                        &pair.source,
+                        &pair.destination,
+                        "create linked file",
+                        source,
+                    );
+                    return Err(cleanup_created_links_and_roots_before_error(
+                        &outcome, None, error,
+                    ));
+                }
+            };
+        if let Err(error) = verify_created_entry_path(&parent, &created_entry, &pair.destination) {
+            return Err(cleanup_created_entry_and_roots_before_error(
+                &outcome,
+                &parent,
+                &created_entry,
+                (!root_preexisted).then_some(root.as_path()),
+                error,
+            ));
         }
         match existing_link_destination_matches(
             &pair.source,
@@ -662,8 +732,12 @@ pub fn link_metafile_files(
                     destination: pair.destination.clone(),
                     reason: "post-create verification did not match the requested source",
                 };
-                return Err(cleanup_created_links_and_roots_before_error(
-                    &outcome, None, error,
+                return Err(cleanup_created_entry_and_roots_before_error(
+                    &outcome,
+                    &parent,
+                    &created_entry,
+                    (!root_preexisted).then_some(root.as_path()),
+                    error,
                 ));
             }
             Err(error) => {
@@ -677,8 +751,12 @@ pub fn link_metafile_files(
                         _ => "post-create verification failed",
                     },
                 };
-                return Err(cleanup_created_links_and_roots_before_error(
-                    &outcome, None, error,
+                return Err(cleanup_created_entry_and_roots_before_error(
+                    &outcome,
+                    &parent,
+                    &created_entry,
+                    (!root_preexisted).then_some(root.as_path()),
+                    error,
                 ));
             }
         }
@@ -734,6 +812,29 @@ fn cleanup_created_links_and_roots_before_error(
             None => Ok(()),
         },
     ) {
+        Ok(()) => error,
+        Err(cleanup_error) => LinkActionError::CleanupIncomplete {
+            primary: Box::new(error),
+            cleanup: Box::new(cleanup_error),
+        },
+    }
+}
+
+fn cleanup_created_entry_and_roots_before_error(
+    outcome: &LinkFilesOutcome,
+    parent: &DestinationParent,
+    entry: &CreatedEntry,
+    extra_root: Option<&Path>,
+    error: LinkActionError,
+) -> LinkActionError {
+    match cleanup_created_entry_at(parent, entry).and_then(|()| {
+        cleanup_created_links_and_roots(&outcome.created_links, &outcome.created_roots).and_then(
+            |()| match extra_root {
+                Some(root) => cleanup_created_roots(&[root.to_path_buf()]),
+                None => Ok(()),
+            },
+        )
+    }) {
         Ok(()) => error,
         Err(cleanup_error) => LinkActionError::CleanupIncomplete {
             primary: Box::new(error),
@@ -900,16 +1001,33 @@ impl RepresentativeSourceFile {
 
 fn validate_link_dirs(link_dirs: &[PathBuf]) -> Result<(), LinkActionError> {
     for link_dir in link_dirs {
-        let metadata = fs::symlink_metadata(link_dir).map_err(|source| LinkActionError::Io {
-            operation: "inspect link directory",
-            path: link_dir.clone(),
+        validate_link_dir(link_dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_link_dir(link_dir: &Path) -> Result<(), LinkActionError> {
+    open_existing_directory(link_dir)
+        .map(|_| ())
+        .map_err(|source| LinkActionError::Io {
+            operation: "open link directory",
+            path: link_dir.to_path_buf(),
             source,
-        })?;
-        if !metadata.file_type().is_dir() {
-            return Err(LinkActionError::InvalidLinkDir {
-                path: link_dir.clone(),
-            });
-        }
+        })
+}
+
+#[cfg(not(unix))]
+fn validate_link_dir(link_dir: &Path) -> Result<(), LinkActionError> {
+    let metadata = fs::symlink_metadata(link_dir).map_err(|source| LinkActionError::Io {
+        operation: "inspect link directory",
+        path: link_dir.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(LinkActionError::InvalidLinkDir {
+            path: link_dir.to_path_buf(),
+        });
     }
     Ok(())
 }
@@ -924,7 +1042,7 @@ fn select_link_dir_by_device(
 
     let mut devices = Vec::with_capacity(link_dirs.len());
     for link_dir in link_dirs {
-        let Some(device) = device_id(link_dir)? else {
+        let Some(device) = link_dir_device_id(link_dir)? else {
             return Ok(None);
         };
         if devices.contains(&device) {
@@ -937,6 +1055,23 @@ fn select_link_dir_by_device(
         .iter()
         .zip(devices)
         .find_map(|(link_dir, device)| (device == source_device).then(|| link_dir.clone())))
+}
+
+#[cfg(unix)]
+fn link_dir_device_id(path: &Path) -> Result<Option<u64>, LinkActionError> {
+    open_existing_directory(path)
+        .and_then(|directory| directory.metadata())
+        .map(|metadata| Some(metadata.dev()))
+        .map_err(|source| LinkActionError::Io {
+            operation: "inspect link directory filesystem device",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn link_dir_device_id(path: &Path) -> Result<Option<u64>, LinkActionError> {
+    device_id(path)
 }
 
 #[cfg(unix)]
@@ -1043,24 +1178,106 @@ fn test_link_compatibility(
     link_dir: &Path,
     link_type: LinkType,
 ) -> Result<bool, LinkActionError> {
-    let stage_dir =
-        create_private_stage_dir(link_dir, "link-test").map_err(|source| LinkActionError::Io {
+    #[cfg(unix)]
+    {
+        test_link_compatibility_at(source_file, link_dir, link_type)
+    }
+    #[cfg(not(unix))]
+    {
+        let stage_dir = create_private_stage_dir(link_dir, "link-test").map_err(|source| {
+            LinkActionError::Io {
+                operation: "create link compatibility staging directory",
+                path: link_dir.to_path_buf(),
+                source,
+            }
+        })?;
+        let destination = stage_dir.join("probe");
+        let result = match link_type {
+            LinkType::Hardlink | LinkType::Symlink => fs::hard_link(source_file, &destination),
+            LinkType::Reflink => reflink_copy::reflink(source_file, &destination),
+            LinkType::ReflinkOrCopy => {
+                create_reflink_or_copy_no_overwrite(source_file, &destination)
+            }
+        };
+        match result {
+            Ok(()) => {
+                remove_stage_dir(&stage_dir).map_err(|source| LinkActionError::Io {
+                    operation: "remove link compatibility staging directory",
+                    path: stage_dir,
+                    source,
+                })?;
+                Ok(true)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::CrossesDevices
+                        | io::ErrorKind::Unsupported
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::InvalidInput
+                        | io::ErrorKind::Other
+                ) =>
+            {
+                let _ = remove_stage_dir(&stage_dir);
+                Ok(false)
+            }
+            Err(source) => Err(LinkActionError::Io {
+                operation: "test link compatibility",
+                path: destination,
+                source,
+            }),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn test_link_compatibility_at(
+    source_file: &Path,
+    link_dir: &Path,
+    link_type: LinkType,
+) -> Result<bool, LinkActionError> {
+    let parent = DestinationParent {
+        path: link_dir.to_path_buf(),
+        basename: PathBuf::new(),
+        fd: open_directory_path(link_dir, false).map_err(|source| LinkActionError::Io {
+            operation: "open link compatibility directory",
+            path: link_dir.to_path_buf(),
+            source,
+        })?,
+    };
+    let stage = create_private_stage_dir_at(&parent, "link-test").map_err(|source| {
+        LinkActionError::Io {
             operation: "create link compatibility staging directory",
             path: link_dir.to_path_buf(),
             source,
-        })?;
-    let destination = stage_dir.join("probe");
+        }
+    })?;
+    let destination = Path::new("probe");
     let result = match link_type {
-        LinkType::Hardlink | LinkType::Symlink => fs::hard_link(source_file, &destination),
-        LinkType::Reflink => reflink_copy::reflink(source_file, &destination),
-        LinkType::ReflinkOrCopy => create_reflink_or_copy_no_overwrite(source_file, &destination),
+        LinkType::Hardlink | LinkType::Symlink => verified_source_file(source_file, link_type)
+            .and_then(|source| create_staged_hardlink(source_file, &source, &stage, destination)),
+        LinkType::Reflink => verified_source_file(source_file, link_type)
+            .and_then(|source| create_staged_reflink(&source, &stage, destination)),
+        LinkType::ReflinkOrCopy => {
+            verified_source_file(source_file, link_type).and_then(|source| {
+                create_staged_reflink(&source, &stage, destination).or_else(|error| {
+                    if should_fallback_to_copy(error.kind()) {
+                        copy_file_to_stage(&source, &stage, destination).map(|_| ())
+                    } else {
+                        Err(error)
+                    }
+                })
+            })
+        }
     };
     match result {
         Ok(()) => {
-            remove_stage_dir(&stage_dir).map_err(|source| LinkActionError::Io {
-                operation: "remove link compatibility staging directory",
-                path: stage_dir,
-                source,
+            remove_stage_dir_entry_at(&parent, &stage, destination).map_err(|source| {
+                LinkActionError::Io {
+                    operation: "remove link compatibility staging directory",
+                    path: link_dir.to_path_buf(),
+                    source,
+                }
             })?;
             Ok(true)
         }
@@ -1074,14 +1291,17 @@ fn test_link_compatibility(
                     | io::ErrorKind::Other
             ) =>
         {
-            let _ = remove_stage_dir(&stage_dir);
+            let _ = remove_stage_dir_entry_at(&parent, &stage, destination);
             Ok(false)
         }
-        Err(source) => Err(LinkActionError::Io {
-            operation: "test link compatibility",
-            path: destination,
-            source,
-        }),
+        Err(source) => {
+            let _ = remove_stage_dir_entry_at(&parent, &stage, destination);
+            Err(LinkActionError::Io {
+                operation: "test link compatibility",
+                path: link_dir.join(destination),
+                source,
+            })
+        }
     }
 }
 
@@ -1396,6 +1616,16 @@ fn path_matches_file_identity(
 }
 
 #[cfg(unix)]
+fn source_path_matches_identity(path: &Path, identity: &same_file::Handle) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let file = open_existing_regular_file(path)?;
+    same_file::Handle::from_file(file).map(|current| &current == identity)
+}
+
+#[cfg(unix)]
 fn open_existing_regular_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -1411,6 +1641,7 @@ fn open_existing_regular_file(_path: &Path) -> io::Result<File> {
     ))
 }
 
+#[cfg(any(not(unix), test))]
 fn copy_file_no_overwrite(source: &Path, destination: &Path) -> io::Result<u64> {
     let mut source_file = open_existing_regular_file(source)?;
     let mut destination_file = OpenOptions::new()
@@ -1455,6 +1686,12 @@ struct DestinationParent {
     fd: OwnedFd,
 }
 
+#[derive(Debug)]
+struct CreatedEntry {
+    #[cfg(unix)]
+    identity: FileIdentity,
+}
+
 #[cfg(unix)]
 #[derive(Debug)]
 struct PrivateStageDir {
@@ -1466,6 +1703,7 @@ fn prepare_destination_parent(
     destination_dir: &Path,
     relative_path: &Path,
     create_missing: bool,
+    link_root: Option<&SelectedLinkDir>,
 ) -> Result<DestinationParent, LinkActionError> {
     validate_relative_path(relative_path)?;
     let mut components: Vec<PathBuf> = relative_path
@@ -1486,13 +1724,20 @@ fn prepare_destination_parent(
 
     #[cfg(unix)]
     {
-        let fd = open_destination_parent_at(destination_dir, &components, create_missing).map_err(
-            |source| LinkActionError::Io {
-                operation: "open link destination directory",
-                path: parent_path.clone(),
-                source,
-            },
-        )?;
+        let fd = match link_root {
+            Some(link_root) => open_destination_parent_in_selected_root(
+                link_root,
+                destination_dir,
+                &components,
+                create_missing,
+            ),
+            None => open_destination_parent_at(destination_dir, &components, create_missing),
+        }
+        .map_err(|source| LinkActionError::Io {
+            operation: "open link destination directory",
+            path: parent_path.clone(),
+            source,
+        })?;
         Ok(DestinationParent {
             path: parent_path,
             basename,
@@ -1501,6 +1746,7 @@ fn prepare_destination_parent(
     }
     #[cfg(not(unix))]
     {
+        let _ = link_root;
         if create_missing {
             fs::create_dir_all(&parent_path).map_err(|source| LinkActionError::Io {
                 operation: "create link destination directory",
@@ -1580,6 +1826,68 @@ fn ensure_destination_parent_matches_path(
     }
 }
 
+fn verify_created_entry_path(
+    parent: &DestinationParent,
+    entry: &CreatedEntry,
+    destination: &Path,
+) -> Result<(), LinkActionError> {
+    #[cfg(unix)]
+    {
+        ensure_destination_parent_matches_path(parent)?;
+        let metadata = fs::symlink_metadata(destination).map_err(|source| LinkActionError::Io {
+            operation: "inspect published link path identity",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        let path_identity = file_identity(&metadata)?;
+        if path_identity == entry.identity {
+            Ok(())
+        } else {
+            Err(LinkActionError::Io {
+                operation: "verify published link path identity",
+                path: destination.to_path_buf(),
+                source: io::Error::other("published path does not match fd-created link"),
+            })
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        let _ = entry;
+        let _ = destination;
+        Ok(())
+    }
+}
+
+fn cleanup_created_entry_at(
+    parent: &DestinationParent,
+    entry: &CreatedEntry,
+) -> Result<(), LinkActionError> {
+    #[cfg(unix)]
+    {
+        cleanup_created_entry_at_io(parent, entry).map_err(|source| LinkActionError::Io {
+            operation: "remove fd-created link after verification failure",
+            path: parent.path.join(&parent.basename),
+            source,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        let _ = entry;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_created_entry_at_io(parent: &DestinationParent, entry: &CreatedEntry) -> io::Result<()> {
+    if entry_identity_at(parent, &parent.basename)? == entry.identity {
+        rustix::fs::unlinkat(&parent.fd, &parent.basename, AtFlags::empty())
+            .map_err(io::Error::from)?;
+    }
+    Ok(())
+}
+
 fn prepared_link_manifest(
     source: PathBuf,
     destination: PathBuf,
@@ -1631,6 +1939,16 @@ fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, LinkActionErro
 }
 
 #[cfg(unix)]
+fn entry_identity_at(parent: &DestinationParent, path: &Path) -> io::Result<FileIdentity> {
+    let stat =
+        rustix::fs::statat(&parent.fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    Ok(FileIdentity {
+        dev: u64::try_from(stat.st_dev).map_err(io::Error::other)?,
+        ino: stat.st_ino,
+    })
+}
+
+#[cfg(unix)]
 fn open_destination_parent_at(
     destination_dir: &Path,
     components: &[PathBuf],
@@ -1641,6 +1959,81 @@ fn open_destination_parent_at(
     } else {
         open_directory_path(destination_dir, false)?
     };
+    for component in components {
+        match open_child_directory(&current, component) {
+            Ok(next) => current = next,
+            Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
+                rustix::fs::mkdirat(&current, component, Mode::from_raw_mode(0o777))
+                    .map_err(io::Error::from)?;
+                current = open_child_directory(&current, component)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn open_destination_parent_in_selected_root(
+    link_root: &SelectedLinkDir,
+    destination_dir: &Path,
+    components: &[PathBuf],
+    create_missing: bool,
+) -> io::Result<OwnedFd> {
+    let mut relative_components: Vec<PathBuf> = destination_dir
+        .strip_prefix(&link_root.path)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("destination directory is outside the selected link root: {error}"),
+            )
+        })?
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(PathBuf::from(name)),
+            std::path::Component::CurDir => Ok(PathBuf::new()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination directory contains unsafe component",
+            )),
+        })
+        .filter(|component| match component {
+            Ok(component) => !component.as_os_str().is_empty(),
+            Err(_) => true,
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    relative_components.extend_from_slice(components);
+
+    let root = open_directory_path(&link_root.path, false)?;
+    let root_file = File::from(
+        rustix::fs::openat(
+            &root,
+            Path::new("."),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
+    let metadata = root_file.metadata()?;
+    let root_identity = FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
+    if root_identity != link_root.identity {
+        return Err(io::Error::other(
+            "selected link root changed before link preparation",
+        ));
+    }
+
+    open_child_directories_at(root, &relative_components, create_missing)
+}
+
+#[cfg(unix)]
+fn open_child_directories_at(
+    mut current: OwnedFd,
+    components: &[PathBuf],
+    create_missing: bool,
+) -> io::Result<OwnedFd> {
     for component in components {
         match open_child_directory(&current, component) {
             Ok(next) => current = next,
@@ -1736,17 +2129,12 @@ fn create_link_in_parent(
     source_file: &VerifiedSourceFile,
     parent: &DestinationParent,
     link_type: LinkType,
-) -> io::Result<()> {
+) -> io::Result<CreatedEntry> {
     #[cfg(unix)]
     {
         match link_type {
-            LinkType::Hardlink => {
-                rustix::fs::linkat(CWD, source, &parent.fd, &parent.basename, AtFlags::empty())
-                    .map_err(io::Error::from)
-            }
-            LinkType::Symlink => {
-                rustix::fs::symlinkat(source, &parent.fd, &parent.basename).map_err(io::Error::from)
-            }
+            LinkType::Hardlink => create_hardlink_staged_at(source, source_file, parent),
+            LinkType::Symlink => create_symlink_staged_at(source, source_file, parent),
             LinkType::Reflink => create_reflink_staged_at(source_file, parent, false),
             LinkType::ReflinkOrCopy => create_reflink_staged_at(source_file, parent, true),
         }
@@ -1754,8 +2142,58 @@ fn create_link_in_parent(
     #[cfg(not(unix))]
     {
         let _ = source_file;
-        create_link(source, &parent.path.join(&parent.basename), link_type)
+        create_link(source, &parent.path.join(&parent.basename), link_type)?;
+        Ok(CreatedEntry {})
     }
+}
+
+#[cfg(unix)]
+fn create_hardlink_staged_at(
+    source: &Path,
+    source_file: &VerifiedSourceFile,
+    parent: &DestinationParent,
+) -> io::Result<CreatedEntry> {
+    let stage = create_private_stage_dir_at(parent, "link-create")?;
+    let staged = Path::new("data");
+    if let Err(error) = create_staged_hardlink(source, source_file, &stage, staged) {
+        let _ = remove_stage_dir_entry_at(parent, &stage, staged);
+        return Err(error);
+    }
+    publish_staged_entry(parent, &stage, staged)
+}
+
+#[cfg(unix)]
+fn create_symlink_staged_at(
+    source: &Path,
+    source_file: &VerifiedSourceFile,
+    parent: &DestinationParent,
+) -> io::Result<CreatedEntry> {
+    let stage = create_private_stage_dir_at(parent, "link-create")?;
+    let staged = Path::new("data");
+    if let Err(error) = rustix::fs::symlinkat(source, &stage.fd, staged).map_err(io::Error::from) {
+        let _ = remove_stage_dir_entry_at(parent, &stage, staged);
+        return Err(error);
+    }
+    if !source_path_matches_identity(source, &source_file.identity)? {
+        let _ = remove_stage_dir_entry_at(parent, &stage, staged);
+        return Err(io::Error::other(
+            "symlink source changed before link publication",
+        ));
+    }
+    rustix::fs::renameat_with(
+        &stage.fd,
+        staged,
+        &parent.fd,
+        &parent.basename,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)?;
+    let identity = entry_identity_at(parent, &parent.basename)?;
+    remove_empty_stage_dir_at(parent, &stage).or_else(|error| {
+        cleanup_created_entry_at_io(parent, &CreatedEntry { identity })?;
+        Err(error)
+    })?;
+    Ok(CreatedEntry { identity })
 }
 
 #[cfg(unix)]
@@ -1763,29 +2201,21 @@ fn create_reflink_staged_at(
     source_file: &VerifiedSourceFile,
     parent: &DestinationParent,
     copy_fallback: bool,
-) -> io::Result<()> {
+) -> io::Result<CreatedEntry> {
     let stage = create_private_stage_dir_at(parent, "link-create")?;
     let staged = Path::new("data");
-    let create_result = create_staged_reflink(source_file, &stage, staged).or_else(|error| {
+    if let Err(error) = create_staged_reflink(source_file, &stage, staged).or_else(|error| {
         if copy_fallback && should_fallback_to_copy(error.kind()) {
             copy_file_to_stage(source_file, &stage, staged).map(|_| ())
         } else {
             Err(error)
         }
-    });
+    }) {
+        let _ = remove_stage_dir_entry_at(parent, &stage, staged);
+        return Err(error);
+    }
 
-    let publish_result = create_result.and_then(|()| {
-        rustix::fs::linkat(
-            &stage.fd,
-            staged,
-            &parent.fd,
-            &parent.basename,
-            AtFlags::empty(),
-        )
-        .map_err(io::Error::from)
-    });
-    let cleanup_result = remove_stage_dir_at(parent, &stage);
-    publish_result.and(cleanup_result)
+    publish_staged_entry(parent, &stage, staged)
 }
 
 #[cfg(all(
@@ -1870,6 +2300,56 @@ fn should_fallback_to_copy(kind: io::ErrorKind) -> bool {
 }
 
 #[cfg(unix)]
+fn create_staged_hardlink(
+    source: &Path,
+    source_file: &VerifiedSourceFile,
+    stage: &PrivateStageDir,
+    staged: &Path,
+) -> io::Result<()> {
+    rustix::fs::linkat(CWD, source, &stage.fd, staged, AtFlags::empty())
+        .map_err(io::Error::from)?;
+    let staged_file = File::from(
+        rustix::fs::openat(
+            &stage.fd,
+            staged,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
+    let staged_identity = same_file::Handle::from_file(staged_file)?;
+    if staged_identity == source_file.identity {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "staged hardlink did not match verified source",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn publish_staged_entry(
+    parent: &DestinationParent,
+    stage: &PrivateStageDir,
+    staged: &Path,
+) -> io::Result<CreatedEntry> {
+    rustix::fs::linkat(
+        &stage.fd,
+        staged,
+        &parent.fd,
+        &parent.basename,
+        AtFlags::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let identity = entry_identity_at(parent, &parent.basename)?;
+    remove_stage_dir_entry_at(parent, stage, staged).or_else(|error| {
+        cleanup_created_entry_at_io(parent, &CreatedEntry { identity })?;
+        Err(error)
+    })?;
+    Ok(CreatedEntry { identity })
+}
+
+#[cfg(unix)]
 fn create_private_stage_dir_at(
     parent: &DestinationParent,
     label: &str,
@@ -1898,15 +2378,28 @@ fn create_private_stage_dir_at(
 }
 
 #[cfg(unix)]
-fn remove_stage_dir_at(parent: &DestinationParent, stage: &PrivateStageDir) -> io::Result<()> {
-    match rustix::fs::unlinkat(&stage.fd, "data", AtFlags::empty()) {
+fn remove_empty_stage_dir_at(
+    parent: &DestinationParent,
+    stage: &PrivateStageDir,
+) -> io::Result<()> {
+    rustix::fs::unlinkat(&parent.fd, &stage.name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn remove_stage_dir_entry_at(
+    parent: &DestinationParent,
+    stage: &PrivateStageDir,
+    entry: &Path,
+) -> io::Result<()> {
+    match rustix::fs::unlinkat(&stage.fd, entry, AtFlags::empty()) {
         Ok(()) => {}
         Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(io::Error::from(error)),
     }
-    rustix::fs::unlinkat(&parent.fd, &stage.name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+    remove_empty_stage_dir_at(parent, stage)
 }
 
+#[cfg(not(unix))]
 fn create_reflink_staged(source: &Path, destination: &Path, copy_fallback: bool) -> io::Result<()> {
     let parent = destination
         .parent()
@@ -1941,6 +2434,7 @@ fn create_reflink_staged(source: &Path, destination: &Path, copy_fallback: bool)
     }
 }
 
+#[cfg(not(unix))]
 fn create_reflink_or_copy_no_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
     create_reflink_staged(source, destination, true)
 }
@@ -1955,6 +2449,7 @@ fn create_link(source: &Path, destination: &Path, link_type: LinkType) -> io::Re
     }
 }
 
+#[cfg(not(unix))]
 fn create_private_stage_dir(parent: &Path, label: &str) -> io::Result<PathBuf> {
     for _ in 0..16 {
         let path = parent.join(format!(
@@ -1974,18 +2469,12 @@ fn create_private_stage_dir(parent: &Path, label: &str) -> io::Result<PathBuf> {
     ))
 }
 
-#[cfg(unix)]
-fn create_private_dir(path: &Path) -> io::Result<()> {
-    let mut builder = DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(path)
-}
-
 #[cfg(not(unix))]
 fn create_private_dir(path: &Path) -> io::Result<()> {
     DirBuilder::new().create(path)
 }
 
+#[cfg(not(unix))]
 fn remove_stage_dir(path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -2423,6 +2912,71 @@ mod tests {
         remove_temp_dir(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn link_dir_selection_rejects_symlink_root_component() {
+        let root = unique_temp_dir("link-dir-symlink-root");
+        let source_dir = root.join("source");
+        let outside = root.join("outside");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(outside.join("links")).unwrap();
+        fs::write(source_dir.join("episode.mkv"), b"data").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("redirect")).unwrap();
+
+        let error = select_link_dir(
+            &source_dir,
+            &[root.join("redirect/links")],
+            LinkDirOptions {
+                link_type: LinkType::Hardlink,
+                max_directory_entries: 16,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert_eq!(0, fs::read_dir(outside.join("links")).unwrap().count());
+
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_action_rejects_selected_root_replacement() {
+        let root = unique_temp_dir("link-root-replaced");
+        let source = root.join("source");
+        let link_root = root.join("links");
+        let old_link_root = root.join("links-old");
+        fs::create_dir_all(source.join("Show")).unwrap();
+        fs::create_dir_all(&link_root).unwrap();
+        fs::write(source.join("Show/Episode.mkv"), b"source").unwrap();
+
+        let selected = select_link_dir_pinned(
+            &source,
+            std::slice::from_ref(&link_root),
+            LinkDirOptions::new(LinkType::Hardlink),
+        )
+        .unwrap();
+        let destination = link_destination_dir(selected.path(), "tracker", false).unwrap();
+        fs::rename(&link_root, &old_link_root).unwrap();
+        fs::create_dir_all(&link_root).unwrap();
+
+        let error = link_metafile_files(
+            &source,
+            &[local_file("Show/Episode.mkv", 6, 0)],
+            &[torrent_file("Show/Episode.mkv", 6, 0)],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::Hardlink).with_link_root(selected),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert!(!link_root.join("tracker/Show/Episode.mkv").exists());
+        assert!(!old_link_root.join("tracker/Show/Episode.mkv").exists());
+
+        remove_temp_dir(&root);
+    }
+
     #[test]
     fn virtual_link_dir_requires_consistent_source_resolution() {
         let root = unique_temp_dir("virtual-link-dir");
@@ -2477,6 +3031,114 @@ mod tests {
                 .unwrap_err();
         assert!(matches!(cleanup_error, LinkActionError::Io { .. }));
         assert!(destination.join("Show/Episode.mkv").exists());
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_hardlink_rejects_source_swap_before_publish() {
+        let root = unique_temp_dir("link-hardlink-source-swap");
+        let source = root.join("source.mkv");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let source_file = verified_source_file(&source, LinkType::Hardlink).unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+        let parent =
+            prepare_destination_parent(&destination, Path::new("Episode.mkv"), true, None).unwrap();
+
+        let error = create_hardlink_staged_at(&source, &source_file, &parent).unwrap_err();
+
+        assert_eq!(io::ErrorKind::Other, error.kind());
+        assert!(!destination.join("Episode.mkv").exists());
+        assert_eq!(0, fs::read_dir(&destination).unwrap().count());
+
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_created_link_cleanup_handles_parent_path_replacement() {
+        let root = unique_temp_dir("link-parent-swap-cleanup");
+        let source = root.join("source.mkv");
+        let destination = root.join("destination");
+        let old_destination = root.join("destination-old");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let source_file = verified_source_file(&source, LinkType::Hardlink).unwrap();
+        let parent =
+            prepare_destination_parent(&destination, Path::new("Episode.mkv"), true, None).unwrap();
+        fs::rename(&destination, &old_destination).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let created =
+            create_link_in_parent(&source, &source_file, &parent, LinkType::Hardlink).unwrap();
+        let error = verify_created_entry_path(&parent, &created, &destination.join("Episode.mkv"))
+            .unwrap_err();
+        cleanup_created_entry_at(&parent, &created).unwrap();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert_eq!(0, fs::read_dir(&destination).unwrap().count());
+        assert_eq!(0, fs::read_dir(&old_destination).unwrap().count());
+
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_symlink_rejects_source_swap_before_publish() {
+        let root = unique_temp_dir("link-symlink-source-swap");
+        let source = root.join("source.mkv");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let source_file = verified_source_file(&source, LinkType::Symlink).unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+        let parent =
+            prepare_destination_parent(&destination, Path::new("Episode.mkv"), true, None).unwrap();
+
+        let error =
+            create_link_in_parent(&source, &source_file, &parent, LinkType::Symlink).unwrap_err();
+
+        assert_eq!(io::ErrorKind::Other, error.kind());
+        assert!(!destination.join("Episode.mkv").exists());
+        assert_eq!(0, fs::read_dir(&destination).unwrap().count());
+
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_symlink_cleanup_handles_source_swap_after_publish() {
+        let root = unique_temp_dir("link-symlink-post-publish-swap");
+        let source = root.join("source.mkv");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let source_file = verified_source_file(&source, LinkType::Symlink).unwrap();
+        let parent =
+            prepare_destination_parent(&destination, Path::new("Episode.mkv"), true, None).unwrap();
+        let created =
+            create_link_in_parent(&source, &source_file, &parent, LinkType::Symlink).unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+
+        let error = existing_link_destination_matches(
+            &source,
+            &source_file,
+            &destination.join("Episode.mkv"),
+            LinkType::Symlink,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LinkActionError::ExistingDestinationMismatch { .. }
+        ));
+        cleanup_created_entry_at(&parent, &created).unwrap();
+        assert!(!destination.join("Episode.mkv").exists());
+
         remove_temp_dir(&root);
     }
 

@@ -23,7 +23,7 @@ use tracing::warn;
 use crate::actions::{
     CreatedLink, LinkActionError, LinkDirOptions, LinkFilesOptions, LinkType, PreparedLink,
     SaveTorrentError, candidate_output_metadata, cleanup_created_links_and_roots,
-    link_destination_dir, link_metafile_files, save_candidate_torrent, select_link_dir,
+    link_destination_dir, link_metafile_files, save_candidate_torrent, select_link_dir_pinned,
     validate_prepared_links,
 };
 use crate::clients::TorrentClientDescriptor;
@@ -996,15 +996,15 @@ impl InjectionWorker {
         let join_error_path = source_root.clone();
         tokio::task::spawn_blocking(move || {
             let link_dir =
-                select_link_dir(&source_root, &link_dirs, LinkDirOptions::new(link_type))?;
-            let destination_dir = link_destination_dir(&link_dir, &tracker, flat_linking)?;
+                select_link_dir_pinned(&source_root, &link_dirs, LinkDirOptions::new(link_type))?;
+            let destination_dir = link_destination_dir(link_dir.path(), &tracker, flat_linking)?;
             let outcome = match link_metafile_files(
                 &source_root,
                 &local_files,
                 &metafile_files,
                 decision,
                 &destination_dir,
-                LinkFilesOptions::new(link_type),
+                LinkFilesOptions::new(link_type).with_link_root(link_dir),
             ) {
                 Ok(outcome) => outcome,
                 Err(LinkActionError::MissingSource { .. })
