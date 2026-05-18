@@ -35,8 +35,9 @@ use crate::inventory_refresh::{
     InventoryRefreshError, InventoryRefreshSummary, InventoryRefreshWorker,
 };
 use crate::matching::{
-    CandidateAssessmentConfig, FileTreeMatchConfig, PersistedCandidateAssessment,
-    ReverseLookupConfig, assess_and_persist_candidate, reverse_lookup_candidates_for_media_types,
+    CandidateAssessmentConfig, CandidateAssessmentInput, FileTreeMatchConfig,
+    PersistedCandidateAssessment, ReverseLookupConfig, assess_and_persist_candidate,
+    reverse_lookup_candidates_for_media_types,
 };
 use crate::persistence::repository::Repository;
 use crate::persistence::torrent_cache::{TorrentOutputMetadata, parse_torrent_output_filename};
@@ -823,13 +824,15 @@ impl InjectionWorker {
             }
             let assessment = assess_and_persist_candidate(
                 &self.repository,
-                &lookup.local_item,
-                &lookup.local_files,
-                lookup.local_files_truncated,
-                &candidate,
-                &[],
-                config.assessed_at_ms,
-                &config.reverse_lookup.assessment,
+                CandidateAssessmentInput {
+                    local_item: &lookup.local_item,
+                    local_files: &lookup.local_files,
+                    local_files_truncated: lookup.local_files_truncated,
+                    candidate: &candidate,
+                    owned_info_hashes: &[],
+                    assessed_at_ms: config.assessed_at_ms,
+                    config: &config.reverse_lookup.assessment,
+                },
             )
             .await
             .map_err(saved_retry_assessment_error)?;

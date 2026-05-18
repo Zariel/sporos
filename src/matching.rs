@@ -1,6 +1,5 @@
 #![expect(
     clippy::indexing_slicing,
-    clippy::too_many_arguments,
     reason = "mechanical clippy gate enablement leaves matching lint classes to linked cleanup beads"
 )]
 use std::cmp::Ordering as CompareOrdering;
@@ -298,6 +297,17 @@ impl CandidatePrecheckReason {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateAssessmentInput<'a> {
+    pub local_item: &'a LocalItem,
+    pub local_files: &'a [LocalFile],
+    pub local_files_truncated: bool,
+    pub candidate: &'a RemoteCandidate,
+    pub owned_info_hashes: &'a [InfoHash],
+    pub assessed_at_ms: i64,
+    pub config: &'a CandidateAssessmentConfig,
+}
+
 pub fn precheck_candidate(
     local_item: &LocalItem,
     candidate: CandidatePrecheckInput<'_>,
@@ -380,14 +390,17 @@ pub fn precheck_candidate(
 
 pub async fn assess_and_persist_candidate(
     repository: &Repository,
-    local_item: &LocalItem,
-    local_files: &[LocalFile],
-    local_files_truncated: bool,
-    candidate: &RemoteCandidate,
-    owned_info_hashes: &[InfoHash],
-    assessed_at_ms: i64,
-    config: &CandidateAssessmentConfig,
+    input: CandidateAssessmentInput<'_>,
 ) -> Result<PersistedCandidateAssessment, CandidateAssessmentError> {
+    let CandidateAssessmentInput {
+        local_item,
+        local_files,
+        local_files_truncated,
+        candidate,
+        owned_info_hashes,
+        assessed_at_ms,
+        config,
+    } = input;
     let local_item_id = local_item
         .id
         .ok_or(CandidateAssessmentError::MissingLocalItemId)?;
@@ -519,12 +532,14 @@ pub async fn reverse_lookup_candidates_for_media_types(
             )
             .await?;
         add_lookup_items(
-            repository,
-            items,
-            ReverseLookupSource::InfoHash,
-            0,
-            context,
-            config,
+            LookupItemsInput {
+                repository,
+                items,
+                source: ReverseLookupSource::InfoHash,
+                distance: 0,
+                context,
+                config,
+            },
             &mut seen,
             &mut accepted_signature_indexes,
             &mut lookup,
@@ -550,12 +565,14 @@ pub async fn reverse_lookup_candidates_for_media_types(
                 break;
             }
             add_lookup_items(
-                repository,
-                vec![scored_item.item],
-                scored_item.source,
-                scored_item.distance,
-                context,
-                config,
+                LookupItemsInput {
+                    repository,
+                    items: vec![scored_item.item],
+                    source: scored_item.source,
+                    distance: scored_item.distance,
+                    context,
+                    config,
+                },
                 &mut seen,
                 &mut accepted_signature_indexes,
                 &mut lookup,
@@ -589,13 +606,15 @@ pub async fn reverse_lookup_and_assess_candidate(
     for lookup in matches {
         let assessment = assess_and_persist_candidate(
             repository,
-            &lookup.local_item,
-            &lookup.local_files,
-            lookup.local_files_truncated,
-            candidate,
-            owned_info_hashes,
-            assessed_at_ms,
-            &config.assessment,
+            CandidateAssessmentInput {
+                local_item: &lookup.local_item,
+                local_files: &lookup.local_files,
+                local_files_truncated: lookup.local_files_truncated,
+                candidate,
+                owned_info_hashes,
+                assessed_at_ms,
+                config: &config.assessment,
+            },
         )
         .await?;
 
@@ -705,12 +724,14 @@ async fn scored_lookup_items(
 
     if title_tokens.is_empty() {
         score_lookup_pages(
-            repository,
-            media_type,
-            key,
-            config,
-            page_size,
-            scan_limit,
+            LookupPageScan {
+                repository,
+                media_type,
+                key,
+                config,
+                page_size,
+                scan_limit,
+            },
             LookupPageFilter::MediaType,
             &mut seen,
             &mut scored,
@@ -718,12 +739,14 @@ async fn scored_lookup_items(
         .await?;
     } else {
         score_lookup_pages(
-            repository,
-            media_type,
-            key,
-            config,
-            page_size,
-            scan_limit,
+            LookupPageScan {
+                repository,
+                media_type,
+                key,
+                config,
+                page_size,
+                scan_limit,
+            },
             LookupPageFilter::AllTitleTokens(&title_tokens, key.primary_title_key()),
             &mut seen,
             &mut scored,
@@ -735,12 +758,14 @@ async fn scored_lookup_items(
             .take(REVERSE_LOOKUP_MAX_TITLE_TOKEN_PROBES)
         {
             score_lookup_pages(
-                repository,
-                media_type,
-                key,
-                config,
-                page_size,
-                scan_limit,
+                LookupPageScan {
+                    repository,
+                    media_type,
+                    key,
+                    config,
+                    page_size,
+                    scan_limit,
+                },
                 LookupPageFilter::TitleToken(title_token),
                 &mut seen,
                 &mut scored,
@@ -760,17 +785,30 @@ enum LookupPageFilter<'a> {
     TitleToken(&'a str),
 }
 
-async fn score_lookup_pages(
-    repository: &Repository,
+#[derive(Debug, Clone, Copy)]
+struct LookupPageScan<'a> {
+    repository: &'a Repository,
     media_type: MediaType,
-    key: &ReverseLookupKey,
-    config: &ReverseLookupConfig,
+    key: &'a ReverseLookupKey,
+    config: &'a ReverseLookupConfig,
     page_size: u16,
     scan_limit: u16,
+}
+
+async fn score_lookup_pages(
+    scan: LookupPageScan<'_>,
     filter: LookupPageFilter<'_>,
     seen: &mut HashSet<LocalItemId>,
     scored: &mut Vec<ScoredLookupItem>,
 ) -> Result<(), ReverseLookupError> {
+    let LookupPageScan {
+        repository,
+        media_type,
+        key,
+        config,
+        page_size,
+        scan_limit,
+    } = scan;
     let mut offset = 0_u32;
 
     while offset < u32::from(scan_limit) {
@@ -826,17 +864,29 @@ async fn score_lookup_pages(
     Ok(())
 }
 
-async fn add_lookup_items(
-    repository: &Repository,
+struct LookupItemsInput<'a> {
+    repository: &'a Repository,
     items: Vec<LocalItem>,
     source: ReverseLookupSource,
     distance: usize,
     context: ContentFilterContext,
-    config: &ReverseLookupConfig,
+    config: &'a ReverseLookupConfig,
+}
+
+async fn add_lookup_items(
+    input: LookupItemsInput<'_>,
     seen: &mut HashSet<LocalItemId>,
     accepted_signature_indexes: &mut HashMap<String, usize>,
     lookup: &mut Vec<ReverseLookupCandidate>,
 ) -> Result<(), ReverseLookupError> {
+    let LookupItemsInput {
+        repository,
+        items,
+        source,
+        distance,
+        context,
+        config,
+    } = input;
     for item in items {
         let Some(item_id) = item.id else {
             continue;
@@ -3012,13 +3062,15 @@ mod tests {
 
         let outcome = assess_and_persist_candidate(
             &repository,
-            &local,
-            &local_files,
-            false,
-            &candidate,
-            &[],
-            123,
-            &CandidateAssessmentConfig::default(),
+            CandidateAssessmentInput {
+                local_item: &local,
+                local_files: &local_files,
+                local_files_truncated: false,
+                candidate: &candidate,
+                owned_info_hashes: &[],
+                assessed_at_ms: 123,
+                config: &CandidateAssessmentConfig::default(),
+            },
         )
         .await
         .unwrap();
@@ -3068,13 +3120,15 @@ mod tests {
 
         let outcome = assess_and_persist_candidate(
             &repository,
-            &local,
-            &[],
-            false,
-            &candidate,
-            &[],
-            456,
-            &CandidateAssessmentConfig::default(),
+            CandidateAssessmentInput {
+                local_item: &local,
+                local_files: &[],
+                local_files_truncated: false,
+                candidate: &candidate,
+                owned_info_hashes: &[],
+                assessed_at_ms: 456,
+                config: &CandidateAssessmentConfig::default(),
+            },
         )
         .await
         .unwrap();
@@ -3117,13 +3171,15 @@ mod tests {
 
         let outcome = assess_and_persist_candidate(
             &repository,
-            &local,
-            &[],
-            false,
-            &candidate,
-            std::slice::from_ref(parsed.info_hash()),
-            789,
-            &CandidateAssessmentConfig::default(),
+            CandidateAssessmentInput {
+                local_item: &local,
+                local_files: &[],
+                local_files_truncated: false,
+                candidate: &candidate,
+                owned_info_hashes: std::slice::from_ref(parsed.info_hash()),
+                assessed_at_ms: 789,
+                config: &CandidateAssessmentConfig::default(),
+            },
         )
         .await
         .unwrap();
@@ -3168,25 +3224,29 @@ mod tests {
 
         let invalid = assess_and_persist_candidate(
             &repository,
-            &local,
-            &[],
-            false,
-            &invalid_candidate,
-            &[],
-            1,
-            &CandidateAssessmentConfig::default(),
+            CandidateAssessmentInput {
+                local_item: &local,
+                local_files: &[],
+                local_files_truncated: false,
+                candidate: &invalid_candidate,
+                owned_info_hashes: &[],
+                assessed_at_ms: 1,
+                config: &CandidateAssessmentConfig::default(),
+            },
         )
         .await
         .unwrap();
         let mismatched = assess_and_persist_candidate(
             &repository,
-            &local,
-            &[],
-            false,
-            &mismatched_candidate,
-            &[],
-            2,
-            &CandidateAssessmentConfig::default(),
+            CandidateAssessmentInput {
+                local_item: &local,
+                local_files: &[],
+                local_files_truncated: false,
+                candidate: &mismatched_candidate,
+                owned_info_hashes: &[],
+                assessed_at_ms: 2,
+                config: &CandidateAssessmentConfig::default(),
+            },
         )
         .await
         .unwrap();
@@ -3241,13 +3301,15 @@ mod tests {
 
         let outcome = assess_and_persist_candidate(
             &repository,
-            &local,
-            &[],
-            false,
-            &candidate,
-            &[],
-            2,
-            &CandidateAssessmentConfig::default(),
+            CandidateAssessmentInput {
+                local_item: &local,
+                local_files: &[],
+                local_files_truncated: false,
+                candidate: &candidate,
+                owned_info_hashes: &[],
+                assessed_at_ms: 2,
+                config: &CandidateAssessmentConfig::default(),
+            },
         )
         .await
         .unwrap();

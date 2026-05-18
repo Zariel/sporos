@@ -1,8 +1,3 @@
-#![expect(
-    clippy::too_many_arguments,
-    reason = "mechanical clippy gate enablement leaves runtime app lint classes to linked cleanup beads"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -127,6 +122,16 @@ struct ProwlarrRefreshResult {
 enum ProwlarrRefreshError {
     Local(DatabaseError),
     Remote(DatabaseError),
+}
+
+struct IndexerEndpointInput<'a> {
+    indexer_id: IndexerId,
+    name: &'a DependencyName,
+    url: &'a str,
+    source_kind: &'a str,
+    source_name: &'a str,
+    caps: TorznabCaps,
+    retry_after_ms: Option<i64>,
 }
 
 impl ProwlarrRefreshError {
@@ -438,15 +443,15 @@ impl AppState {
         &self,
         row: &IndexerSearchCapsRow,
     ) -> Result<Option<TorznabEndpoint>, DatabaseError> {
-        self.indexer_endpoint(
-            row.indexer_id,
-            &row.name,
-            &row.url,
-            &row.source_kind,
-            &row.source_name,
-            row.caps.clone(),
-            row.retry_after_ms,
-        )
+        self.indexer_endpoint(IndexerEndpointInput {
+            indexer_id: row.indexer_id,
+            name: &row.name,
+            url: &row.url,
+            source_kind: &row.source_kind,
+            source_name: &row.source_name,
+            caps: row.caps.clone(),
+            retry_after_ms: row.retry_after_ms,
+        })
     }
 
     fn registry_endpoint(
@@ -458,27 +463,30 @@ impl AppState {
             operation: "build runtime indexer id".to_owned(),
             message: error.to_string(),
         })?;
-        self.indexer_endpoint(
+        self.indexer_endpoint(IndexerEndpointInput {
             indexer_id,
-            &row.name,
-            &row.url,
-            &row.source_kind,
-            &row.source_name,
+            name: &row.name,
+            url: &row.url,
+            source_kind: &row.source_kind,
+            source_name: &row.source_name,
             caps,
-            row.retry_after_ms,
-        )
+            retry_after_ms: row.retry_after_ms,
+        })
     }
 
     fn indexer_endpoint(
         &self,
-        indexer_id: IndexerId,
-        name: &DependencyName,
-        url: &str,
-        source_kind: &str,
-        source_name: &str,
-        caps: TorznabCaps,
-        retry_after_ms: Option<i64>,
+        input: IndexerEndpointInput<'_>,
     ) -> Result<Option<TorznabEndpoint>, DatabaseError> {
+        let IndexerEndpointInput {
+            indexer_id,
+            name,
+            url,
+            source_kind,
+            source_name,
+            caps,
+            retry_after_ms,
+        } = input;
         if source_kind == "static" {
             let Some(configured) = self.torznab_indexers.get(name) else {
                 return Ok(None);

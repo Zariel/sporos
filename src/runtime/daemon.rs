@@ -1,7 +1,6 @@
 #![expect(
     clippy::indexing_slicing,
     clippy::let_underscore_must_use,
-    clippy::too_many_arguments,
     reason = "mechanical clippy gate enablement leaves daemon lint classes to linked cleanup beads"
 )]
 
@@ -33,8 +32,9 @@ use crate::indexers::{
 };
 use crate::inventory_refresh::run_inventory_refresh_worker;
 use crate::matching::{
-    PersistedCandidateAssessment, ReverseLookupConfig, ReverseLookupError, ReverseLookupOutcome,
-    assess_and_persist_candidate, reverse_lookup_and_assess_candidate, reverse_lookup_candidates,
+    CandidateAssessmentInput, PersistedCandidateAssessment, ReverseLookupConfig,
+    ReverseLookupError, ReverseLookupOutcome, assess_and_persist_candidate,
+    reverse_lookup_and_assess_candidate, reverse_lookup_candidates,
 };
 use crate::metrics::{
     ActionOutcome, DecisionOutcome, ExternalOperation, ExternalOutcome, SearchOutcome,
@@ -762,13 +762,15 @@ async fn process_downloaded_search_candidate(
         }
         let assessment = assess_and_persist_candidate(
             &state.repository,
-            &lookup.local_item,
-            &lookup.local_files,
-            lookup.local_files_truncated,
-            &cached.candidate,
-            &[],
-            now_ms,
-            &config.assessment,
+            CandidateAssessmentInput {
+                local_item: &lookup.local_item,
+                local_files: &lookup.local_files,
+                local_files_truncated: lookup.local_files_truncated,
+                candidate: &cached.candidate,
+                owned_info_hashes: &[],
+                assessed_at_ms: now_ms,
+                config: &config.assessment,
+            },
         )
         .await
         .map_err(|error| format!("{error:?}"))?;
@@ -1424,7 +1426,7 @@ async fn process_announce_work(
         }
     };
 
-    match process_downloaded_announce_candidate(
+    match process_downloaded_announce_candidate(DownloadedAnnounceCandidate {
         state,
         cached,
         torrent_bytes,
@@ -1433,7 +1435,7 @@ async fn process_announce_work(
         jitter_key,
         outcome_config,
         shutdown,
-    )
+    })
     .await
     {
         Ok(outcome) => outcome,
@@ -1448,16 +1450,30 @@ async fn process_announce_work(
     }
 }
 
-async fn process_downloaded_announce_candidate(
+struct DownloadedAnnounceCandidate<'a> {
     state: AppState,
     cached: CachedCandidateTorrent,
     torrent_bytes: Vec<u8>,
     now_ms: i64,
     attempt_count: u16,
-    jitter_key: &str,
+    jitter_key: &'a str,
     outcome_config: AnnounceOutcomeConfig,
     shutdown: ShutdownSignal,
+}
+
+async fn process_downloaded_announce_candidate(
+    input: DownloadedAnnounceCandidate<'_>,
 ) -> Result<AnnounceWorkOutcome, String> {
+    let DownloadedAnnounceCandidate {
+        state,
+        cached,
+        torrent_bytes,
+        now_ms,
+        attempt_count,
+        jitter_key,
+        outcome_config,
+        shutdown,
+    } = input;
     let config = ReverseLookupConfig::default();
     let lookups = reverse_lookup_candidates(
         &state.repository,
@@ -1478,13 +1494,15 @@ async fn process_downloaded_announce_candidate(
         }
         let assessment = assess_and_persist_candidate(
             &state.repository,
-            &lookup.local_item,
-            &lookup.local_files,
-            lookup.local_files_truncated,
-            &cached.candidate,
-            &[],
-            now_ms,
-            &config.assessment,
+            CandidateAssessmentInput {
+                local_item: &lookup.local_item,
+                local_files: &lookup.local_files,
+                local_files_truncated: lookup.local_files_truncated,
+                candidate: &cached.candidate,
+                owned_info_hashes: &[],
+                assessed_at_ms: now_ms,
+                config: &config.assessment,
+            },
         )
         .await
         .map_err(|error| format!("{error:?}"))?;
