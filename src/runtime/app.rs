@@ -1,6 +1,5 @@
 #![expect(
     clippy::too_many_arguments,
-    clippy::unwrap_used,
     reason = "mechanical clippy gate enablement leaves runtime app lint classes to linked cleanup beads"
 )]
 
@@ -383,7 +382,8 @@ impl AppState {
                     now_ms,
                     failure_count,
                     source.source.name.as_str(),
-                );
+                )
+                .map_err(ProwlarrRefreshError::Local)?;
                 self.record_prowlarr_health(&source.source.name, state.clone(), now_ms)
                     .await
                     .map_err(ProwlarrRefreshError::Local)?;
@@ -592,8 +592,11 @@ impl AppState {
                             "Torznab search failed"
                         );
                         let message = error.to_string();
-                        let reason = health_reason(Some(&message), "search failed")
-                            .unwrap_or_else(|| ReasonText::new("search failed").unwrap());
+                        let reason = required_health_reason(
+                            Some(&message),
+                            "search failed",
+                            "build indexer search health reason",
+                        )?;
                         let failure_count = self
                             .repository
                             .dependency_failure_count("indexer", &endpoint.name)
@@ -677,8 +680,11 @@ impl AppState {
                             elapsed_ms(started),
                         );
                         let message = error.to_string();
-                        let reason = health_reason(Some(&message), "caps failed")
-                            .unwrap_or_else(|| ReasonText::new("caps failed").unwrap());
+                        let reason = required_health_reason(
+                            Some(&message),
+                            "caps failed",
+                            "build indexer caps health reason",
+                        )?;
                         let failure_count = self
                             .repository
                             .dependency_failure_count("indexer", &row.name)
@@ -1149,6 +1155,17 @@ fn health_reason(value: Option<&str>, fallback: &'static str) -> Option<ReasonTe
         .or_else(|| ReasonText::new(fallback).ok())
 }
 
+fn required_health_reason(
+    value: Option<&str>,
+    fallback: &'static str,
+    operation: &'static str,
+) -> Result<ReasonText, DatabaseError> {
+    health_reason(value, fallback).ok_or_else(|| DatabaseError::QueryFailed {
+        operation: operation.to_owned(),
+        message: format!("fallback dependency health reason `{fallback}` is invalid"),
+    })
+}
+
 fn http_supported_jobs(config: &SchedulerConfig) -> BTreeSet<crate::domain::JobName> {
     config
         .jobs
@@ -1197,16 +1214,20 @@ fn prowlarr_error_dependency_state(
     now_ms: i64,
     consecutive_failures: u16,
     jitter_key: &str,
-) -> DependencyState {
-    let reason = health_reason(Some(&error.to_string()), "Prowlarr refresh failed")
-        .unwrap_or_else(|| ReasonText::new("Prowlarr refresh failed").unwrap());
+) -> Result<DependencyState, DatabaseError> {
+    let message = error.to_string();
+    let reason = required_health_reason(
+        Some(&message),
+        "Prowlarr refresh failed",
+        "build Prowlarr health reason",
+    )?;
     let retry_after_ms = Some(prowlarr_error_retry_after(
         error,
         now_ms,
         consecutive_failures,
         jitter_key,
     ));
-    match error {
+    let state = match error {
         ProwlarrRequestError::HttpStatus { status, .. } if *status == 401 || *status == 403 => {
             DependencyState::Unavailable {
                 reason,
@@ -1225,7 +1246,8 @@ fn prowlarr_error_dependency_state(
             reason,
             retry_after_ms,
         },
-    }
+    };
+    Ok(state)
 }
 
 fn prowlarr_refresh_outcome(error: &ProwlarrRequestError) -> ProwlarrRefreshOutcome {
