@@ -229,6 +229,8 @@ CREATE INDEX IF NOT EXISTS idx_announce_work_lease_until
     WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS idx_announce_work_status_reason
     ON announce_work (status, reason);
+CREATE INDEX IF NOT EXISTS idx_announce_work_active_dependency
+    ON announce_work (status, last_dependency_kind, last_dependency_name);
 CREATE INDEX IF NOT EXISTS idx_announce_work_succeeded_retention
     ON announce_work (status, finished_at, id)
     WHERE status = 'succeeded'
@@ -321,6 +323,7 @@ mod tests {
             "idx_announce_work_expires_at",
             "idx_announce_work_lease_until",
             "idx_announce_work_status_reason",
+            "idx_announce_work_active_dependency",
             "idx_announce_work_succeeded_retention",
             "idx_announce_work_terminal_failed_retention",
             "idx_announce_work_expired_retention",

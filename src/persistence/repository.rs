@@ -1,5 +1,5 @@
 use std::cmp::Ordering as CompareOrdering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,6 +118,13 @@ pub struct LocalInventoryReplaceTransaction<'a> {
     transaction: Transaction<'a, Sqlite>,
     upserted: usize,
 }
+
+const ACTIVE_ANNOUNCE_STATUSES: [AnnounceStatus; 4] = [
+    AnnounceStatus::Queued,
+    AnnounceStatus::Running,
+    AnnounceStatus::Waiting,
+    AnnounceStatus::Retryable,
+];
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StagedVirtualEpisodeCandidate {
@@ -3252,28 +3259,38 @@ impl Repository {
         &self,
         limit: u16,
     ) -> Result<Vec<AnnounceStatusCount>, DatabaseError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT status, reason, COUNT(*) AS count
-            FROM announce_work
-            GROUP BY status, reason
-            ORDER BY count DESC, status, reason
-            LIMIT ?
-            "#,
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| db_error("read announce status counts", error))?;
+        let mut counts = Vec::new();
+        for status in ACTIVE_ANNOUNCE_STATUSES {
+            let status = announce_status_key(status);
+            let rows = sqlx::query(
+                r#"
+                SELECT status, reason, COUNT(*) AS count
+                FROM announce_work
+                WHERE status = ?
+                GROUP BY status, reason
+                ORDER BY status, reason
+                "#,
+            )
+            .bind(status)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("read announce status counts", error))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| AnnounceStatusCount {
+            counts.extend(rows.into_iter().map(|row| AnnounceStatusCount {
                 status: row.get("status"),
                 reason: row.get("reason"),
                 count: row.get("count"),
-            })
-            .collect())
+            }));
+        }
+        counts.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.status.cmp(&right.status))
+                .then_with(|| left.reason.cmp(&right.reason))
+        });
+        counts.truncate(usize::from(limit));
+        Ok(counts)
     }
 
     pub async fn announce_queue_snapshot(
@@ -3310,38 +3327,8 @@ impl Repository {
         let next_retry_delay_ms =
             next_attempt_at.map(|next_attempt| next_attempt.saturating_sub(now_ms).max(0));
 
-        let attempt_rows = sqlx::query(
-            r#"
-            SELECT
-                COALESCE(last_error_class, last_action_outcome, reason, status) AS outcome_class,
-                SUM(attempt_count) AS attempts
-            FROM announce_work
-            WHERE attempt_count > 0
-            GROUP BY outcome_class
-            ORDER BY attempts DESC, outcome_class
-            LIMIT ?
-            "#,
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| db_error("read announce attempt counts", error))?;
-        let dependency_rows = sqlx::query(
-            r#"
-            SELECT last_dependency_kind, last_dependency_name, COUNT(*) AS count
-            FROM announce_work
-            WHERE last_dependency_kind IS NOT NULL
-              AND last_dependency_name IS NOT NULL
-              AND status IN ('queued', 'running', 'waiting', 'retryable')
-            GROUP BY last_dependency_kind, last_dependency_name
-            ORDER BY count DESC, last_dependency_kind, last_dependency_name
-            LIMIT ?
-            "#,
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| db_error("read announce dependency wait counts", error))?;
+        let attempt_counts = self.active_announce_attempt_counts(limit).await?;
+        let dependency_wait_counts = self.active_announce_dependency_wait_counts(limit).await?;
 
         Ok(AnnounceQueueSnapshot {
             active_count,
@@ -3349,22 +3336,115 @@ impl Repository {
             next_retry_delay_ms,
             running_leases,
             status_counts: self.announce_status_counts(limit).await?,
-            attempt_counts: attempt_rows
-                .into_iter()
-                .map(|row| AnnounceAttemptCount {
-                    outcome_class: row.get("outcome_class"),
-                    attempts: row.get("attempts"),
-                })
-                .collect(),
-            dependency_wait_counts: dependency_rows
-                .into_iter()
-                .map(|row| AnnounceDependencyWaitCount {
-                    dependency_kind: row.get("last_dependency_kind"),
-                    dependency_name: row.get("last_dependency_name"),
-                    count: row.get("count"),
-                })
-                .collect(),
+            attempt_counts,
+            dependency_wait_counts,
         })
+    }
+
+    async fn active_announce_attempt_counts(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<AnnounceAttemptCount>, DatabaseError> {
+        let mut counts = BTreeMap::<String, i64>::new();
+        for status in ACTIVE_ANNOUNCE_STATUSES {
+            let status = announce_status_key(status);
+            let rows = sqlx::query(
+                r#"
+                SELECT last_error_class, last_action_outcome, reason, status, attempt_count
+                FROM announce_work
+                WHERE status = ?
+                  AND attempt_count > 0
+                "#,
+            )
+            .bind(status)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("read announce attempt counts", error))?;
+            for row in rows {
+                let outcome_class = row
+                    .get::<Option<String>, _>("last_error_class")
+                    .or_else(|| row.get::<Option<String>, _>("last_action_outcome"))
+                    .unwrap_or_else(|| {
+                        let reason: String = row.get("reason");
+                        if reason.is_empty() {
+                            row.get("status")
+                        } else {
+                            reason
+                        }
+                    });
+                let attempts = row.get::<i64, _>("attempt_count");
+                counts
+                    .entry(outcome_class)
+                    .and_modify(|count| *count = count.saturating_add(attempts))
+                    .or_insert(attempts);
+            }
+        }
+        let mut counts = counts
+            .into_iter()
+            .map(|(outcome_class, attempts)| AnnounceAttemptCount {
+                outcome_class,
+                attempts,
+            })
+            .collect::<Vec<_>>();
+        counts.sort_by(|left, right| {
+            right
+                .attempts
+                .cmp(&left.attempts)
+                .then_with(|| left.outcome_class.cmp(&right.outcome_class))
+        });
+        counts.truncate(usize::from(limit));
+        Ok(counts)
+    }
+
+    async fn active_announce_dependency_wait_counts(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<AnnounceDependencyWaitCount>, DatabaseError> {
+        let mut counts = BTreeMap::<(String, String), i64>::new();
+        for status in ACTIVE_ANNOUNCE_STATUSES {
+            let status = announce_status_key(status);
+            let rows = sqlx::query(
+                r#"
+                SELECT last_dependency_kind, last_dependency_name
+                FROM announce_work
+                WHERE status = ?
+                  AND last_dependency_kind IS NOT NULL
+                  AND last_dependency_name IS NOT NULL
+                ORDER BY last_dependency_kind, last_dependency_name
+                "#,
+            )
+            .bind(status)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("read announce dependency wait counts", error))?;
+            for row in rows {
+                let dependency_kind = row.get::<String, _>("last_dependency_kind");
+                let dependency_name = row.get::<String, _>("last_dependency_name");
+                counts
+                    .entry((dependency_kind, dependency_name))
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+            }
+        }
+        let mut counts = counts
+            .into_iter()
+            .map(
+                |((dependency_kind, dependency_name), count)| AnnounceDependencyWaitCount {
+                    dependency_kind,
+                    dependency_name,
+                    count,
+                },
+            )
+            .collect::<Vec<_>>();
+        counts.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.dependency_kind.cmp(&right.dependency_kind))
+                .then_with(|| left.dependency_name.cmp(&right.dependency_name))
+        });
+        counts.truncate(usize::from(limit));
+        Ok(counts)
     }
 
     async fn transition_leased(
@@ -8524,9 +8604,8 @@ mod tests {
         let stats = repository.announce_status_counts(10).await.unwrap();
 
         assert!(
-            stats
-                .iter()
-                .any(|count| count.status == "expired" && count.count == 1)
+            stats.iter().all(|count| count.status != "expired"),
+            "hot announce status counts should exclude retained terminal rows: {stats:?}"
         );
         assert!(
             stats
@@ -8672,6 +8751,116 @@ mod tests {
                 "retention cleanup should use a retention index: {plan:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn announce_queue_snapshot_queries_avoid_retained_table_scans() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (label, query) in [
+            (
+                "active queue summary",
+                r#"
+                SELECT
+                    COUNT(*) AS active_count,
+                    MIN(received_at) AS oldest_received_at,
+                    MIN(CASE
+                        WHEN status IN ('queued', 'retryable', 'waiting')
+                        THEN next_attempt_at
+                    END) AS next_attempt_at,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'running' AND lease_owner IS NOT NULL
+                        THEN 1 ELSE 0
+                    END), 0) AS running_leases
+                FROM announce_work
+                WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+                "#,
+            ),
+            (
+                "active status counts",
+                r#"
+                SELECT status, reason, COUNT(*) AS count
+                FROM announce_work
+                WHERE status = 'queued'
+                GROUP BY status, reason
+                ORDER BY status, reason
+                LIMIT 100
+                "#,
+            ),
+            (
+                "active attempt rows",
+                r#"
+                SELECT last_error_class, last_action_outcome, reason, status, attempt_count
+                FROM announce_work
+                WHERE status = 'retryable'
+                  AND attempt_count > 0
+                "#,
+            ),
+            (
+                "active dependency rows",
+                r#"
+                SELECT last_dependency_kind, last_dependency_name
+                FROM announce_work
+                WHERE status = 'waiting'
+                  AND last_dependency_kind IS NOT NULL
+                  AND last_dependency_name IS NOT NULL
+                ORDER BY last_dependency_kind, last_dependency_name
+                "#,
+            ),
+        ] {
+            let plan = explain_query_plan_raw(&repository, query).await;
+
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("SCAN announce_work")),
+                "{label} should not scan retained announce_work rows: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+                "{label} should not sort with a temp b-tree: {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_announce_status_counts_keep_global_top_limit() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for index in 0..3 {
+            repository
+                .insert_or_dedupe_announce_work(
+                    &test_announce_work(
+                        &format!("ann_accepted_{index}"),
+                        &format!("guid-a-{index}"),
+                        1,
+                    ),
+                    10,
+                )
+                .await
+                .unwrap();
+        }
+        for index in 0..5 {
+            let mut work = test_announce_work(
+                &format!("ann_waiting_{index}"),
+                &format!("guid-z-{index}"),
+                1,
+            );
+            work.reason = AnnounceReason::RetryAfter;
+            repository
+                .insert_or_dedupe_announce_work(&work, 10)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE announce_work SET status = 'waiting' WHERE id LIKE 'ann_waiting_%'")
+            .execute(repository.pool())
+            .await
+            .unwrap();
+
+        let counts = repository.announce_status_counts(1).await.unwrap();
+
+        assert_eq!(1, counts.len());
+        assert_eq!("waiting", counts[0].status);
+        assert_eq!("retry_after", counts[0].reason);
+        assert_eq!(5, counts[0].count);
     }
 
     #[tokio::test]
@@ -9148,6 +9337,16 @@ mod tests {
         sqlx::query(&format!("EXPLAIN QUERY PLAN {query}"))
             .bind(cutoff_ms)
             .bind(i64::from(limit))
+            .fetch_all(repository.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("detail"))
+            .collect()
+    }
+
+    async fn explain_query_plan_raw(repository: &Repository, query: &str) -> Vec<String> {
+        sqlx::query(&format!("EXPLAIN QUERY PLAN {query}"))
             .fetch_all(repository.pool())
             .await
             .unwrap()
