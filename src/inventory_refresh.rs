@@ -2,14 +2,6 @@
     clippy::let_underscore_must_use,
     reason = "mechanical clippy gate enablement leaves explicit send/health handling to a linked lint-class bead"
 )]
-#![cfg_attr(
-    test,
-    expect(
-        clippy::unreachable,
-        reason = "test fixture simplifications are tracked for follow-up cleanup"
-    )
-)]
-
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -2745,9 +2737,24 @@ mod tests {
 
     fn announce_reason_key(reason: AnnounceReason) -> &'static str {
         match reason {
+            AnnounceReason::Accepted => "accepted",
+            AnnounceReason::Deduplicated => "deduplicated",
             AnnounceReason::SourceIncomplete => "source_incomplete",
+            AnnounceReason::InventoryRefreshing => "inventory_refreshing",
+            AnnounceReason::DependencyBackoff => "dependency_backoff",
+            AnnounceReason::CandidateDownloading => "candidate_downloading",
             AnnounceReason::ClientChecking => "client_checking",
-            _ => unreachable!("unsupported inventory refresh wake test reason"),
+            AnnounceReason::RetryAfter => "retry_after",
+            AnnounceReason::TransientDependencyFailure => "transient_dependency_failure",
+            AnnounceReason::Saved => "saved",
+            AnnounceReason::Injected => "injected",
+            AnnounceReason::AlreadyExists => "already_exists",
+            AnnounceReason::NoMatchTerminal => "no_match_terminal",
+            AnnounceReason::InvalidRequest => "invalid_request",
+            AnnounceReason::UnsupportedShape => "unsupported_shape",
+            AnnounceReason::UnsafePath => "unsafe_path",
+            AnnounceReason::InvalidTorrentMetadata => "invalid_torrent_metadata",
+            AnnounceReason::Expired => "expired",
         }
     }
 

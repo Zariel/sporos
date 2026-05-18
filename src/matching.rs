@@ -1,7 +1,6 @@
 #![expect(
     clippy::indexing_slicing,
     clippy::too_many_arguments,
-    clippy::unreachable,
     reason = "mechanical clippy gate enablement leaves matching lint classes to linked cleanup beads"
 )]
 use std::cmp::Ordering as CompareOrdering;
@@ -600,12 +599,8 @@ pub async fn reverse_lookup_and_assess_candidate(
         )
         .await?;
 
-        if assessment_needs_torrent_download(&assessment) {
-            let PersistedCandidateAssessment::NeedsTorrentDownload { candidate_id, .. } =
-                assessment
-            else {
-                unreachable!("checked needs torrent download");
-            };
+        if let PersistedCandidateAssessment::NeedsTorrentDownload { candidate_id, .. } = assessment
+        {
             return Ok(ReverseLookupOutcome::NeedsTorrentDownload {
                 local_item: lookup.local_item,
                 candidate_id,
@@ -1140,13 +1135,6 @@ fn levenshtein(left: &str, right: &str) -> usize {
     }
 
     previous[right_chars.len()]
-}
-
-fn assessment_needs_torrent_download(assessment: &PersistedCandidateAssessment) -> bool {
-    matches!(
-        assessment,
-        PersistedCandidateAssessment::NeedsTorrentDownload { .. }
-    )
 }
 
 fn assessment_is_already_present(assessment: &PersistedCandidateAssessment) -> bool {

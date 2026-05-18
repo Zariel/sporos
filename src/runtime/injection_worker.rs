@@ -1,8 +1,3 @@
-#![expect(
-    clippy::unreachable,
-    reason = "mechanical clippy gate enablement leaves state-machine assertion cleanup to a linked lint-class bead"
-)]
-
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -466,26 +461,32 @@ impl InjectionWorker {
         }
 
         let link_result = self.prepare_links(&request).await?;
-        if matches!(link_result, LinkPreparation::SourceIncomplete) {
-            self.save_for_retry(&request).await?;
-            return Ok(InjectionWorkResult {
-                outcome: InjectionOutcome::SourceIncomplete,
-                target_client: Some(target_name),
-                saved_for_retry: true,
-                linked_files: 0,
-                prepared_link_cleanup_incomplete: false,
-            });
-        }
-        let LinkPreparation::Ready {
-            save_path,
-            created_links,
-            prepared_links,
-            created_roots,
-            linked_files,
-        } = link_result
-        else {
-            unreachable!("source incomplete handled above");
-        };
+        let (save_path, created_links, prepared_links, created_roots, linked_files) =
+            match link_result {
+                LinkPreparation::Ready {
+                    save_path,
+                    created_links,
+                    prepared_links,
+                    created_roots,
+                    linked_files,
+                } => (
+                    save_path,
+                    created_links,
+                    prepared_links,
+                    created_roots,
+                    linked_files,
+                ),
+                LinkPreparation::SourceIncomplete => {
+                    self.save_for_retry(&request).await?;
+                    return Ok(InjectionWorkResult {
+                        outcome: InjectionOutcome::SourceIncomplete,
+                        target_client: Some(target_name),
+                        saved_for_retry: true,
+                        linked_files: 0,
+                        prepared_link_cleanup_incomplete: false,
+                    });
+                }
+            };
 
         let recheck_plan =
             recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
