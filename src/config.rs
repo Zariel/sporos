@@ -336,6 +336,7 @@ where
             field: "announce",
             reason: error.to_string(),
         })?;
+    validate_secret_source_counts(&config)?;
     validate_prowlarr_sources(&config, &raw)?;
     validate_arr_secret_source_counts(&config)?;
     resolve_secret_env(&mut config, &env)?;
@@ -640,9 +641,11 @@ fn validate_prowlarr_sources(config: &SporosConfig, raw: &Value) -> Result<(), C
         validate_secret_source_count(
             "indexers.prowlarr.api_key",
             name,
-            source.api_key.is_some(),
-            source.api_key_file.is_some(),
-            source.api_key_env.is_some(),
+            [
+                ("api_key", source.api_key.is_some()),
+                ("api_key_file", source.api_key_file.is_some()),
+                ("api_key_env", source.api_key_env.is_some()),
+            ],
         )?;
         for tag in &source.tags {
             if tag.trim().is_empty() {
@@ -671,6 +674,42 @@ fn validate_integration_api_keys(config: &SporosConfig) -> Result<(), ConfigErro
     Ok(())
 }
 
+fn validate_secret_source_counts(config: &SporosConfig) -> Result<(), ConfigError> {
+    validate_secret_source_count(
+        "server.api_token",
+        "server",
+        [
+            ("api_token", config.server.api_token.is_some()),
+            ("api_token_file", config.server.api_token_file.is_some()),
+            ("api_token_env", config.server.api_token_env.is_some()),
+        ],
+    )?;
+    for (name, client) in &config.torrent_clients {
+        validate_secret_source_count(
+            "torrent_clients.password",
+            name,
+            [
+                ("password", client.password.is_some()),
+                ("password_file", client.password_file.is_some()),
+                ("password_env", client.password_env.is_some()),
+            ],
+        )?;
+    }
+    for (name, indexer) in &config.indexers.torznab {
+        validate_secret_source_count(
+            "indexers.torznab.api_key",
+            name,
+            [
+                ("api_key", indexer.api_key.is_some()),
+                ("api_key_file", indexer.api_key_file.is_some()),
+                ("api_key_env", indexer.api_key_env.is_some()),
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn validate_arr_secret_source_counts(config: &SporosConfig) -> Result<(), ConfigError> {
     validate_arr_secret_source_count("indexers.arr.sonarr.api_key", &config.indexers.arr.sonarr)?;
     validate_arr_secret_source_count("indexers.arr.radarr.api_key", &config.indexers.arr.radarr)
@@ -684,9 +723,11 @@ fn validate_arr_secret_source_count(
         validate_secret_source_count(
             field,
             name,
-            instance.api_key.is_some(),
-            instance.api_key_file.is_some(),
-            instance.api_key_env.is_some(),
+            [
+                ("api_key", instance.api_key.is_some()),
+                ("api_key_file", instance.api_key_file.is_some()),
+                ("api_key_env", instance.api_key_env.is_some()),
+            ],
         )?;
     }
 
@@ -847,18 +888,20 @@ fn validate_interval(field: &'static str, name: &str, value: &str) -> Result<(),
 fn validate_secret_source_count(
     field: &'static str,
     name: &str,
-    direct: bool,
-    file: bool,
-    env: bool,
+    sources: [(&str, bool); 3],
 ) -> Result<(), ConfigError> {
-    let count = usize::from(direct) + usize::from(file) + usize::from(env);
+    let count = sources
+        .iter()
+        .filter(|(_source, configured)| *configured)
+        .count();
     if count <= 1 {
         return Ok(());
     }
+    let names = sources.map(|(source, _configured)| source).join(", or ");
 
     Err(ConfigError::InvalidField {
         field,
-        reason: format!("{name} must use only one of api_key, api_key_file, or api_key_env"),
+        reason: format!("{name} must use only one of {names}"),
     })
 }
 
@@ -2066,6 +2109,58 @@ mod tests {
                 .contains("indexers.arr.radarr.api_key")
         );
         assert!(duplicate.to_string().contains("only one"));
+    }
+
+    #[test]
+    fn server_rejects_duplicate_api_token_sources() {
+        let error = parse_config(
+            r#"
+            [server]
+            api_token = "direct"
+            api_token_file = "/var/run/secrets/sporos-api-token"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("server.api_token"));
+        assert!(error.to_string().contains("only one"));
+        assert!(error.to_string().contains("api_token_env"));
+    }
+
+    #[test]
+    fn torrent_clients_reject_duplicate_password_sources() {
+        let error = parse_config(
+            r#"
+            [torrent_clients.qbit_main]
+            kind = "qbittorrent"
+            url = "http://qbittorrent:8080"
+            password = "direct"
+            password_env = "QBIT_PASSWORD"
+            default_save_path = "/downloads"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("torrent_clients.password"));
+        assert!(error.to_string().contains("only one"));
+        assert!(error.to_string().contains("password_file"));
+    }
+
+    #[test]
+    fn torznab_indexers_reject_duplicate_api_key_sources() {
+        let error = parse_config(
+            r#"
+            [indexers.torznab.example]
+            url = "https://indexer.example/api"
+            api_key = "direct"
+            api_key_file = "/var/run/secrets/indexer-api-key"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("indexers.torznab.api_key"));
+        assert!(error.to_string().contains("only one"));
+        assert!(error.to_string().contains("api_key_env"));
     }
 
     #[test]
