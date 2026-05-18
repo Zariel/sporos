@@ -1,8 +1,3 @@
-#![expect(
-    clippy::map_err_ignore,
-    reason = "mechanical clippy gate enablement leaves torrent parse error-source cleanup to a linked lint-class bead"
-)]
-
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::str;
@@ -179,8 +174,11 @@ fn validate_piece_count(
         checked_file_total(files.iter().map(|file| file.size), "torrent metafile total")
             .map_err(|source| TorrentParseError::InvalidMetafile { source })?;
     let expected = total_size.get().div_ceil(piece_length.get());
-    let actual = u64::try_from(piece_count)
-        .map_err(|_| unsupported_layout("torrent pieces field contains too many SHA-1 hashes"))?;
+    let actual = u64::try_from(piece_count).map_err(|error| {
+        unsupported_layout(format!(
+            "torrent pieces field contains too many SHA-1 hashes: {error}"
+        ))
+    })?;
     if actual != expected {
         return Err(unsupported_layout(
             "torrent pieces field does not match total size and piece length",

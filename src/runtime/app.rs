@@ -1,5 +1,4 @@
 #![expect(
-    clippy::map_err_ignore,
     clippy::too_many_arguments,
     clippy::unwrap_used,
     reason = "mechanical clippy gate enablement leaves runtime app lint classes to linked cleanup beads"
@@ -1454,8 +1453,10 @@ impl RuntimeInjectionClient {
             sender
                 .send(ClientInventoryMessage::Finished)
                 .await
-                .map_err(|_| InventoryRefreshError::InvalidClientInventory {
-                    message: "client inventory receiver closed before completion".to_owned(),
+                .map_err(|send_error| InventoryRefreshError::InvalidClientInventory {
+                    message: format!(
+                        "client inventory receiver closed before completion: {send_error}"
+                    ),
                 })
         };
         let (refresh_result, stream_result) = tokio::join!(refresh, stream);
@@ -1737,8 +1738,10 @@ async fn send_client_inventory_item(
     sender
         .send(ClientInventoryMessage::Item(item))
         .await
-        .map_err(|_| InventoryRefreshError::InvalidClientInventory {
-            message: "client inventory receiver closed before item was persisted".to_owned(),
+        .map_err(|send_error| InventoryRefreshError::InvalidClientInventory {
+            message: format!(
+                "client inventory receiver closed before item was persisted: {send_error}"
+            ),
         })
 }
 
