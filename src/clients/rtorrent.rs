@@ -6,7 +6,6 @@
     test,
     expect(
         clippy::let_underscore_must_use,
-        clippy::string_slice,
         reason = "test fixtures prefer direct request drains and owned single-item slices for clarity"
     )
 )]
@@ -1176,12 +1175,16 @@ mod tests {
     }
 
     fn xml_contains_order(xml: &str, needles: &[&str]) -> bool {
-        let mut cursor = 0;
+        let mut remaining = xml;
         for needle in needles {
-            let Some(index) = xml[cursor..].find(needle) else {
+            let Some(index) = remaining.find(needle) else {
                 return false;
             };
-            cursor += index + needle.len();
+            let next_index = index + needle.len();
+            let Some(next_remaining) = remaining.get(next_index..) else {
+                return false;
+            };
+            remaining = next_remaining;
         }
         true
     }
@@ -1559,12 +1562,12 @@ mod tests {
     }
 
     fn write_chunked_body(stream: &mut std::net::TcpStream, length: u64) {
-        let chunk = vec![b'x'; 8192];
         let mut remaining = length;
         while remaining > 0 {
-            let size = usize::try_from(remaining.min(chunk.len() as u64)).unwrap();
+            let size = usize::try_from(remaining.min(8192)).unwrap();
+            let chunk = vec![b'x'; size];
             write!(stream, "{size:x}\r\n").unwrap();
-            stream.write_all(&chunk[..size]).unwrap();
+            stream.write_all(&chunk).unwrap();
             stream.write_all(b"\r\n").unwrap();
             remaining -= u64::try_from(size).unwrap();
         }

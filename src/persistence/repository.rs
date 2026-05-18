@@ -1,6 +1,5 @@
 #![expect(
     clippy::large_enum_variant,
-    clippy::string_slice,
     reason = "mechanical clippy gate enablement leaves repository lint classes to linked cleanup beads"
 )]
 use std::cmp::Ordering as CompareOrdering;
@@ -5209,7 +5208,8 @@ fn next_text_prefix(prefix: &str) -> Option<String> {
     while next_codepoint <= 0x10ffff {
         if let Some(next_char) = char::from_u32(next_codepoint) {
             let mut end = String::with_capacity(last_index + next_char.len_utf8());
-            end.push_str(&prefix[..last_index]);
+            let prefix_without_last = prefix.get(..last_index)?;
+            end.push_str(prefix_without_last);
             end.push(next_char);
             return Some(end);
         }
