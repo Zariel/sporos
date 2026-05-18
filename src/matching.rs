@@ -747,6 +747,20 @@ async fn scored_lookup_items(
                 page_size,
                 scan_limit,
             },
+            LookupPageFilter::TitleKey(key.primary_title_key()),
+            &mut seen,
+            &mut scored,
+        )
+        .await?;
+        score_lookup_pages(
+            LookupPageScan {
+                repository,
+                media_type,
+                key,
+                config,
+                page_size,
+                scan_limit,
+            },
             LookupPageFilter::AllTitleTokens(&title_tokens, key.primary_title_key()),
             &mut seen,
             &mut scored,
@@ -781,6 +795,7 @@ async fn scored_lookup_items(
 #[derive(Debug, Clone, Copy)]
 enum LookupPageFilter<'a> {
     MediaType,
+    TitleKey(&'a str),
     AllTitleTokens(&'a [&'a str], &'a str),
     TitleToken(&'a str),
 }
@@ -818,6 +833,13 @@ async fn score_lookup_pages(
             LookupPageFilter::MediaType => {
                 repository
                     .local_items_by_media_type_page(media_type, limit, offset)
+                    .await?
+            }
+            LookupPageFilter::TitleKey(title_key) => {
+                repository
+                    .local_items_by_media_type_and_title_key_page(
+                        media_type, title_key, limit, offset,
+                    )
                     .await?
             }
             LookupPageFilter::AllTitleTokens(title_tokens, preferred_title) => {

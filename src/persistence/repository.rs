@@ -812,25 +812,43 @@ impl Repository {
         limit: u16,
         offset: u32,
     ) -> Result<Vec<LocalItem>, DatabaseError> {
-        let rows = sqlx::query(
+        let title_grams = title_token_grams(title_token);
+        let Some((seed_gram, remaining_grams)) = title_grams.split_first() else {
+            return Ok(Vec::new());
+        };
+        let mut query = QueryBuilder::<Sqlite>::new(
             r#"
-            SELECT id, source_type, source_key, title, display_name, media_type,
-                   info_hash, path, save_path, total_size, mtime_ms
-            FROM local_items
-            WHERE media_type = ?
-              AND title LIKE '%' || ? || '%'
-            ORDER BY title, source_type, source_key
-            LIMIT ?
-            OFFSET ?
+            SELECT local_items.id, local_items.source_type, local_items.source_key,
+                   local_items.title, local_items.display_name, local_items.media_type,
+                   local_items.info_hash, local_items.path, local_items.save_path,
+                   local_items.total_size, local_items.mtime_ms
+            FROM local_item_title_grams title_match
+            INNER JOIN local_items
+                ON local_items.id = title_match.item_id
+            WHERE title_match.media_type =
             "#,
-        )
-        .bind(media_type_key(media_type))
-        .bind(title_token)
-        .bind(i64::from(limit))
-        .bind(i64::from(offset))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| db_error("lookup local items by media type and title", error))?;
+        );
+        query
+            .push_bind(media_type_key(media_type))
+            .push(" AND title_match.gram = ")
+            .push_bind(seed_gram);
+        push_title_gram_exists(&mut query, remaining_grams);
+        query
+            .push(
+                r#"
+            ORDER BY title_match.title, title_match.source_type, title_match.source_key
+            LIMIT
+            "#,
+            )
+            .push_bind(i64::from(limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(offset));
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("lookup local items by media type and title", error))?;
 
         rows.into_iter().map(local_item_from_row).collect()
     }
@@ -839,31 +857,46 @@ impl Repository {
         &self,
         media_type: MediaType,
         title_tokens: &[&str],
-        preferred_title: &str,
+        _preferred_title: &str,
         limit: u16,
         offset: u32,
     ) -> Result<Vec<LocalItem>, DatabaseError> {
+        let title_grams = title_tokens
+            .iter()
+            .flat_map(|token| title_token_grams(token))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let Some((seed_gram, remaining_grams)) = title_grams.split_first() else {
+            return self
+                .local_items_by_media_type_page(media_type, limit, offset)
+                .await;
+        };
+
         let mut query = QueryBuilder::<Sqlite>::new(
             r#"
-            SELECT id, source_type, source_key, title, display_name, media_type,
-                   info_hash, path, save_path, total_size, mtime_ms
-            FROM local_items
-            WHERE media_type =
+            SELECT local_items.id, local_items.source_type, local_items.source_key,
+                   local_items.title, local_items.display_name, local_items.media_type,
+                   local_items.info_hash, local_items.path, local_items.save_path,
+                   local_items.total_size, local_items.mtime_ms
+            FROM local_item_title_grams title_match
+            INNER JOIN local_items
+                ON local_items.id = title_match.item_id
+            WHERE title_match.media_type =
             "#,
         );
-        query.push_bind(media_type_key(media_type));
-        for title_token in title_tokens {
-            query
-                .push(" AND title LIKE '%' || ")
-                .push_bind(*title_token)
-                .push(" || '%'");
-        }
         query
-            .push(" ORDER BY CASE WHEN lower(title) = ")
-            .push_bind(preferred_title)
-            .push(" OR lower(display_name) = ")
-            .push_bind(preferred_title)
-            .push(" THEN 0 ELSE 1 END, length(title), title, source_type, source_key LIMIT ")
+            .push_bind(media_type_key(media_type))
+            .push(" AND title_match.gram = ")
+            .push_bind(seed_gram);
+        push_title_gram_exists(&mut query, remaining_grams);
+        query
+            .push(
+                r#"
+            ORDER BY title_match.title, title_match.source_type, title_match.source_key
+            LIMIT
+            "#,
+            )
             .push_bind(i64::from(limit))
             .push(" OFFSET ")
             .push_bind(i64::from(offset));
@@ -871,6 +904,46 @@ impl Repository {
         let rows = query.build().fetch_all(&self.pool).await.map_err(|error| {
             db_error("lookup local items by media type and title tokens", error)
         })?;
+
+        rows.into_iter().map(local_item_from_row).collect()
+    }
+
+    pub async fn local_items_by_media_type_and_title_key_page(
+        &self,
+        media_type: MediaType,
+        title_key: &str,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<LocalItem>, DatabaseError> {
+        let title_grams = title_token_grams(title_key);
+        let Some(seed_gram) = title_grams.first() else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            r#"
+            SELECT local_items.id, local_items.source_type, local_items.source_key,
+                   local_items.title, local_items.display_name, local_items.media_type,
+                   local_items.info_hash, local_items.path, local_items.save_path,
+                   local_items.total_size, local_items.mtime_ms
+            FROM local_item_title_grams title_match
+            INNER JOIN local_items
+                ON local_items.id = title_match.item_id
+            WHERE title_match.media_type = ?
+              AND title_match.gram = ?
+              AND title_match.normalized_title = ?
+            ORDER BY title_match.title, title_match.source_type, title_match.source_key
+            LIMIT ?
+            OFFSET ?
+            "#,
+        )
+        .bind(media_type_key(media_type))
+        .bind(seed_gram)
+        .bind(title_key)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("lookup local items by media type and title key", error))?;
 
         rows.into_iter().map(local_item_from_row).collect()
     }
@@ -4038,6 +4111,155 @@ fn local_source(source: &LocalItemSource) -> (String, String) {
     }
 }
 
+fn title_token_grams(title_token: &str) -> Vec<String> {
+    let normalized = title_token
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    token_grams(&normalized)
+}
+
+fn normalized_lookup_title(value: &str) -> String {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| !is_lookup_noise_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn push_title_gram_exists<'a>(query: &mut QueryBuilder<'a, Sqlite>, grams: &'a [String]) {
+    for gram in grams {
+        query
+            .push(
+                r#"
+                AND EXISTS (
+                    SELECT 1
+                    FROM local_item_title_grams required_match
+                    WHERE required_match.item_id = title_match.item_id
+                      AND required_match.gram =
+                "#,
+            )
+            .push_bind(gram)
+            .push(")");
+    }
+}
+
+fn local_item_title_grams(title: &str) -> BTreeSet<String> {
+    normalized_lookup_title(title)
+        .split_whitespace()
+        .flat_map(token_grams)
+        .collect()
+}
+
+fn token_grams(token: &str) -> Vec<String> {
+    if token.len() < 3 {
+        return Vec::new();
+    }
+    token
+        .as_bytes()
+        .windows(3)
+        .filter_map(|gram| std::str::from_utf8(gram).ok())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn is_lookup_noise_token(token: &str) -> bool {
+    matches!(
+        token,
+        "480p"
+            | "576p"
+            | "720p"
+            | "1080p"
+            | "2160p"
+            | "web"
+            | "webdl"
+            | "webrip"
+            | "bluray"
+            | "bdrip"
+            | "brrip"
+            | "hdtv"
+            | "dvdrip"
+            | "remux"
+            | "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "av1"
+            | "aac"
+            | "dts"
+            | "proper"
+            | "repack"
+    )
+}
+
+async fn replace_local_item_title_grams(
+    transaction: &mut Transaction<'_, Sqlite>,
+    item_id: LocalItemId,
+    item: &LocalItem,
+    source_type: &str,
+    source_key: &str,
+) -> Result<(), DatabaseError> {
+    let item_id = i64_from_u64(item_id.get(), "local item id")?;
+    sqlx::query("DELETE FROM local_item_title_grams WHERE item_id = ?")
+        .bind(item_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| db_error("replace local item title grams", error))?;
+
+    insert_local_item_title_grams(
+        transaction,
+        item_id,
+        media_type_key(item.media_type),
+        item.title.as_str(),
+        source_type,
+        source_key,
+    )
+    .await
+}
+
+async fn insert_local_item_title_grams(
+    transaction: &mut Transaction<'_, Sqlite>,
+    item_id: i64,
+    media_type: &str,
+    title: &str,
+    source_type: &str,
+    source_key: &str,
+) -> Result<(), DatabaseError> {
+    let normalized_title = normalized_lookup_title(title);
+    for gram in local_item_title_grams(title) {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO local_item_title_grams (
+                item_id,
+                media_type,
+                gram,
+                normalized_title,
+                title,
+                source_type,
+                source_key
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(item_id)
+        .bind(media_type)
+        .bind(gram)
+        .bind(normalized_title.as_str())
+        .bind(title)
+        .bind(source_type)
+        .bind(source_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| db_error("insert local item title grams", error))?;
+    }
+
+    Ok(())
+}
+
 async fn upsert_local_item_with_files_in_transaction(
     transaction: &mut Transaction<'_, Sqlite>,
     item: &LocalItem,
@@ -4097,6 +4319,7 @@ async fn upsert_local_item_with_files_in_transaction(
         .await
         .map_err(|error| db_error("select local item id", error))?;
     let item_id = id_from_i64(row.get::<i64, _>("id"), "local item id")?;
+    replace_local_item_title_grams(transaction, item_id, item, &source_type, &source_key).await?;
 
     sqlx::query("DELETE FROM local_files WHERE item_id = ?")
         .bind(i64_from_u64(item_id.get(), "local item id")?)
@@ -4379,6 +4602,7 @@ async fn initialize_staged_local_inventory(
     for statement in [
         "DROP TABLE IF EXISTS staged_local_inventory_items",
         "DROP TABLE IF EXISTS staged_local_inventory_files",
+        "DROP TABLE IF EXISTS staged_local_inventory_title_grams",
         r#"
         CREATE TEMP TABLE staged_local_inventory_items (
             source_type TEXT NOT NULL,
@@ -4406,8 +4630,22 @@ async fn initialize_staged_local_inventory(
         )
         "#,
         r#"
+        CREATE TEMP TABLE staged_local_inventory_title_grams (
+            source_type TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            gram TEXT NOT NULL,
+            normalized_title TEXT NOT NULL,
+            title TEXT NOT NULL
+        )
+        "#,
+        r#"
         CREATE INDEX staged_local_inventory_files_item_idx
             ON staged_local_inventory_files (source_type, source_key)
+        "#,
+        r#"
+        CREATE INDEX staged_local_inventory_title_grams_item_idx
+            ON staged_local_inventory_title_grams (source_type, source_key)
         "#,
     ] {
         sqlx::query(statement)
@@ -4432,8 +4670,9 @@ async fn clear_staged_local_inventory(
     Ok(())
 }
 
-const STAGED_LOCAL_INVENTORY_CLEAR_STATEMENTS: [&str; 2] = [
+const STAGED_LOCAL_INVENTORY_CLEAR_STATEMENTS: [&str; 3] = [
     "DELETE FROM staged_local_inventory_files",
+    "DELETE FROM staged_local_inventory_title_grams",
     "DELETE FROM staged_local_inventory_items",
 ];
 
@@ -4507,6 +4746,41 @@ async fn stage_local_item_with_files(
     .execute(&mut **connection)
     .await
     .map_err(|error| db_error("replace staged local files", error))?;
+
+    sqlx::query(
+        "DELETE FROM staged_local_inventory_title_grams WHERE source_type = ? AND source_key = ?",
+    )
+    .bind(&source_type)
+    .bind(&source_key)
+    .execute(&mut **connection)
+    .await
+    .map_err(|error| db_error("replace staged local title grams", error))?;
+
+    let normalized_title = normalized_lookup_title(item.title.as_str());
+    for gram in local_item_title_grams(item.title.as_str()) {
+        sqlx::query(
+            r#"
+            INSERT INTO staged_local_inventory_title_grams (
+                source_type,
+                source_key,
+                media_type,
+                gram,
+                normalized_title,
+                title
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&source_type)
+        .bind(&source_key)
+        .bind(media_type_key(item.media_type))
+        .bind(gram)
+        .bind(normalized_title.as_str())
+        .bind(item.title.as_str())
+        .execute(&mut **connection)
+        .await
+        .map_err(|error| db_error("stage local title gram", error))?;
+    }
 
     for file in files {
         sqlx::query(
@@ -4630,6 +4904,51 @@ async fn upsert_staged_local_inventory(
     .execute(&mut **transaction)
     .await
     .map_err(|error| db_error("insert staged local files", error))?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM local_item_title_grams
+        WHERE item_id IN (
+            SELECT local_items.id
+            FROM local_items
+            INNER JOIN staged_local_inventory_items staged
+                ON staged.source_type = local_items.source_type
+               AND staged.source_key = local_items.source_key
+        )
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("replace staged local title grams", error))?;
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO local_item_title_grams (
+            item_id,
+            media_type,
+            gram,
+            normalized_title,
+            title,
+            source_type,
+            source_key
+        )
+        SELECT
+            local_items.id,
+            staged_grams.media_type,
+            staged_grams.gram,
+            staged_grams.normalized_title,
+            staged_grams.title,
+            staged_grams.source_type,
+            staged_grams.source_key
+        FROM staged_local_inventory_title_grams staged_grams
+        INNER JOIN local_items
+            ON local_items.source_type = staged_grams.source_type
+           AND local_items.source_key = staged_grams.source_key
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("insert staged local title grams", error))?;
 
     Ok(())
 }
@@ -4826,11 +5145,17 @@ async fn normalize_client_source_keys(
                 .map_err(|error| db_error("delete duplicate legacy client inventory", error))?;
         } else {
             sqlx::query("UPDATE local_items SET source_key = ? WHERE id = ?")
-                .bind(new_source_key)
+                .bind(&new_source_key)
                 .bind(id)
                 .execute(&mut **transaction)
                 .await
                 .map_err(|error| db_error("normalize legacy client inventory source key", error))?;
+            sqlx::query("UPDATE local_item_title_grams SET source_key = ? WHERE item_id = ?")
+                .bind(new_source_key)
+                .bind(id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|error| db_error("normalize legacy client title gram key", error))?;
         }
     }
 
@@ -8347,6 +8672,147 @@ mod tests {
                 "retention cleanup should use a retention index: {plan:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn local_title_token_lookup_uses_title_gram_index_without_local_item_scan() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT local_items.id
+            FROM local_item_title_grams title_match
+            INNER JOIN local_items
+                ON local_items.id = title_match.item_id
+            WHERE title_match.media_type = 'movie'
+              AND title_match.gram = 'amp'
+            ORDER BY title_match.title, title_match.source_type, title_match.source_key
+            LIMIT 16
+            "#,
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+        let plan = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN local_items")),
+            "title token lookup should not scan local_items: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+            "title token lookup should not sort with a temp b-tree: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_local_item_title_grams_lookup")),
+            "title token lookup should use the title gram index: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_title_tokens_lookup_uses_title_gram_index_without_temp_sort() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT local_items.id
+            FROM local_item_title_grams title_match
+            INNER JOIN local_items
+                ON local_items.id = title_match.item_id
+            WHERE title_match.media_type = 'movie'
+              AND title_match.gram = 'exa'
+              AND EXISTS (
+                    SELECT 1
+                    FROM local_item_title_grams required_match
+                    WHERE required_match.item_id = title_match.item_id
+                      AND required_match.gram = 'mmo'
+                )
+            ORDER BY title_match.title, title_match.source_type, title_match.source_key
+            LIMIT 16
+            "#,
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+        let plan = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN local_items")),
+            "multi-token lookup should not scan local_items: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+            "multi-token lookup should not sort with a temp b-tree: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_local_item_title_grams_lookup")),
+            "multi-token lookup should use the title gram index: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_title_token_lookup_keeps_substring_candidates() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let item = test_local_item("Examples Movie");
+        repository
+            .upsert_local_item_with_files(&item, &[])
+            .await
+            .unwrap();
+
+        let found = repository
+            .local_items_by_media_type_and_title_token(MediaType::Movie, "ample", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(1, found.len());
+        assert_eq!("Examples Movie", found[0].title.as_str());
+    }
+
+    #[tokio::test]
+    async fn local_item_upsert_populates_title_grams_with_normalized_title() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let item = test_local_item("Examples Movie 1080p");
+        let item_id = repository
+            .upsert_local_item_with_files(&item, &[])
+            .await
+            .unwrap();
+
+        let rows = sqlx::query(
+            r#"
+            SELECT gram, normalized_title
+            FROM local_item_title_grams
+            WHERE item_id = ?
+            ORDER BY gram
+            "#,
+        )
+        .bind(i64_from_u64(item_id.get(), "local item id").unwrap())
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+        let grams = rows
+            .iter()
+            .map(|row| row.get::<String, _>("gram"))
+            .collect::<Vec<_>>();
+
+        assert!(grams.contains(&"exa".to_owned()));
+        assert!(grams.contains(&"ovi".to_owned()));
+        assert!(!grams.contains(&"108".to_owned()));
+        assert!(
+            rows.iter()
+                .all(|row| row.get::<String, _>("normalized_title") == "examples movie")
+        );
     }
 
     #[tokio::test]

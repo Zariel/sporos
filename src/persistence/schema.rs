@@ -38,6 +38,22 @@ CREATE INDEX IF NOT EXISTS idx_local_items_media_title_source
 CREATE INDEX IF NOT EXISTS idx_local_items_updated_at
     ON local_items (updated_at);
 
+CREATE TABLE IF NOT EXISTS local_item_title_grams (
+    item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE,
+    media_type TEXT NOT NULL,
+    gram TEXT NOT NULL,
+    normalized_title TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    PRIMARY KEY (item_id, gram)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_local_item_title_grams_lookup
+    ON local_item_title_grams (media_type, gram, title, source_type, source_key, normalized_title, item_id);
+CREATE INDEX IF NOT EXISTS idx_local_item_title_grams_title_key
+    ON local_item_title_grams (media_type, gram, normalized_title, title, source_type, source_key, item_id);
+
 CREATE TABLE IF NOT EXISTS local_files (
     item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE,
     relative_path TEXT NOT NULL,
@@ -229,6 +245,7 @@ CREATE INDEX IF NOT EXISTS idx_announce_work_expired_retention
 
 pub const REQUIRED_TABLES: &[&str] = &[
     "local_items",
+    "local_item_title_grams",
     "local_files",
     "remote_candidates",
     "match_decisions",
@@ -293,6 +310,8 @@ mod tests {
             "failure_count INTEGER NOT NULL DEFAULT 0",
             "idx_local_files_item_size",
             "idx_local_items_media_title_source",
+            "idx_local_item_title_grams_lookup",
+            "idx_local_item_title_grams_title_key",
             "idx_local_files_size_name",
             "idx_local_files_relative_path",
             "idx_jobs_next_run_at",
