@@ -1,11 +1,3 @@
-#![cfg_attr(
-    test,
-    expect(
-        clippy::unwrap_in_result,
-        reason = "test writer mutex poisoning behavior is tracked for cleanup"
-    )
-)]
-
 use std::io;
 
 use tracing_subscriber::EnvFilter;
@@ -81,7 +73,10 @@ mod tests {
 
     impl Write for SharedWriteGuard {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.captured.lock().unwrap().extend_from_slice(buf);
+            self.captured
+                .lock()
+                .map_err(|_poisoned| io::Error::other("captured log buffer mutex poisoned"))?
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
 
