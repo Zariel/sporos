@@ -127,6 +127,9 @@ pub struct PreparedLink {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub link_type: LinkType,
+    expected_size: ByteSize,
+    #[cfg(unix)]
+    source_identity: FileIdentity,
     parent: PathBuf,
     basename: PathBuf,
     #[cfg(unix)]
@@ -576,26 +579,27 @@ pub fn link_metafile_files(
                 });
             }
         };
-        let source_file = match verified_source_file(&pair.source, options.link_type) {
-            Ok(source_file) => source_file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound && options.ignore_missing => {
-                outcome.missing_sources.push(pair.source);
-                continue;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(LinkActionError::MissingSource { path: pair.source });
-            }
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
-                return Err(LinkActionError::InvalidSourcePath { path: pair.source });
-            }
-            Err(source) => {
-                return Err(LinkActionError::Io {
-                    operation: "inspect source file",
-                    path: pair.source,
-                    source,
-                });
-            }
-        };
+        let source_file =
+            match verified_source_file(&pair.source, pair.expected_size, options.link_type) {
+                Ok(source_file) => source_file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && options.ignore_missing => {
+                    outcome.missing_sources.push(pair.source);
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(LinkActionError::MissingSource { path: pair.source });
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    return Err(LinkActionError::InvalidSourcePath { path: pair.source });
+                }
+                Err(source) => {
+                    return Err(LinkActionError::Io {
+                        operation: "inspect source file",
+                        path: pair.source,
+                        source,
+                    });
+                }
+            };
         if existing_destination {
             let parent = prepare_destination_parent(
                 destination_dir,
@@ -614,6 +618,8 @@ pub fn link_metafile_files(
                     pair.source,
                     destination,
                     options.link_type,
+                    pair.expected_size,
+                    &source_file,
                     &parent,
                 )?);
                 continue;
@@ -624,6 +630,7 @@ pub fn link_metafile_files(
             source: pair.source,
             destination,
             destination_relative_path: pair.destination_relative_path,
+            expected_size: pair.expected_size,
         });
     }
 
@@ -669,21 +676,22 @@ pub fn link_metafile_files(
                 error,
             ));
         }
-        let mut source_file = match verified_source_file(&pair.source, options.link_type) {
-            Ok(source_file) => source_file,
-            Err(source) => {
-                let error = LinkActionError::Io {
-                    operation: "open source file for link creation",
-                    path: pair.source.clone(),
-                    source,
-                };
-                return Err(cleanup_created_links_and_roots_before_error(
-                    &outcome,
-                    &created_roots,
-                    error,
-                ));
-            }
-        };
+        let mut source_file =
+            match verified_source_file(&pair.source, pair.expected_size, options.link_type) {
+                Ok(source_file) => source_file,
+                Err(source) => {
+                    let error = LinkActionError::Io {
+                        operation: "open source file for link creation",
+                        path: pair.source.clone(),
+                        source,
+                    };
+                    return Err(cleanup_created_links_and_roots_before_error(
+                        &outcome,
+                        &created_roots,
+                        error,
+                    ));
+                }
+            };
 
         if let Err(error) = ensure_destination_parent_matches_path(&parent) {
             return Err(cleanup_created_links_and_roots_before_error(
@@ -709,27 +717,32 @@ pub fn link_metafile_files(
                                 pair.source,
                                 pair.destination,
                                 options.link_type,
+                                pair.expected_size,
+                                &source_file,
                                 &parent,
                             )?);
                             continue;
                         }
                         Ok(false) => {
-                            source_file =
-                                match verified_source_file(&pair.source, options.link_type) {
-                                    Ok(source_file) => source_file,
-                                    Err(source) => {
-                                        let error = LinkActionError::Io {
-                                            operation: "open source file for link creation retry",
-                                            path: pair.source.clone(),
-                                            source,
-                                        };
-                                        return Err(cleanup_created_links_and_roots_before_error(
-                                            &outcome,
-                                            &created_roots,
-                                            error,
-                                        ));
-                                    }
-                                };
+                            source_file = match verified_source_file(
+                                &pair.source,
+                                pair.expected_size,
+                                options.link_type,
+                            ) {
+                                Ok(source_file) => source_file,
+                                Err(source) => {
+                                    let error = LinkActionError::Io {
+                                        operation: "open source file for link creation retry",
+                                        path: pair.source.clone(),
+                                        source,
+                                    };
+                                    return Err(cleanup_created_links_and_roots_before_error(
+                                        &outcome,
+                                        &created_roots,
+                                        error,
+                                    ));
+                                }
+                            };
                             match create_link_in_parent(
                                 &pair.source,
                                 &source_file,
@@ -861,20 +874,25 @@ pub fn link_metafile_files(
                 ));
             }
         };
-        let prepared_link =
-            match prepared_link_manifest(pair.source, pair.destination, options.link_type, &parent)
-            {
-                Ok(link) => link,
-                Err(error) => {
-                    return Err(cleanup_created_entry_and_roots_before_error(
-                        &outcome,
-                        &parent,
-                        &created_entry,
-                        &created_roots,
-                        error,
-                    ));
-                }
-            };
+        let prepared_link = match prepared_link_manifest(
+            pair.source,
+            pair.destination,
+            options.link_type,
+            pair.expected_size,
+            &source_file,
+            &parent,
+        ) {
+            Ok(link) => link,
+            Err(error) => {
+                return Err(cleanup_created_entry_and_roots_before_error(
+                    &outcome,
+                    &parent,
+                    &created_entry,
+                    &created_roots,
+                    error,
+                ));
+            }
+        };
         outcome.created_links.push(created_link);
         outcome.prepared_links.push(prepared_link);
         outcome.created_roots.extend(created_roots);
@@ -981,13 +999,20 @@ fn cleanup_created_links_and_roots_with_extra(
 pub fn validate_prepared_links(links: &[PreparedLink]) -> Result<(), LinkActionError> {
     for link in links {
         validate_prepared_link_parent(link)?;
-        let source_file = verified_source_file(&link.source, link.link_type).map_err(|source| {
-            LinkActionError::Io {
+        let source_file = verified_source_file(&link.source, link.expected_size, link.link_type)
+            .map_err(|source| LinkActionError::Io {
                 operation: "open prepared link source for revalidation",
                 path: link.source.clone(),
                 source,
-            }
-        })?;
+            })?;
+        #[cfg(unix)]
+        if metadata_identity(&source_file.metadata) != link.source_identity {
+            return Err(LinkActionError::Io {
+                operation: "verify prepared link source identity",
+                path: link.source.clone(),
+                source: io::Error::other("prepared link source changed before injection"),
+            });
+        }
         let destination = link.parent.join(&link.basename);
         if !existing_link_destination_matches(
             &link.source,
@@ -1039,6 +1064,7 @@ fn validate_prepared_link_parent(link: &PreparedLink) -> Result<(), LinkActionEr
 struct LinkPair {
     source: PathBuf,
     destination_relative_path: PathBuf,
+    expected_size: ByteSize,
 }
 
 #[derive(Debug)]
@@ -1046,6 +1072,7 @@ struct VerifiedLinkPair {
     source: PathBuf,
     destination: PathBuf,
     destination_relative_path: PathBuf,
+    expected_size: ByteSize,
 }
 
 #[derive(Debug)]
@@ -1333,12 +1360,15 @@ fn test_link_compatibility_at(
     })?;
     let destination = Path::new("probe");
     let result = match link_type {
-        LinkType::Hardlink | LinkType::Symlink => verified_source_file(source_file, link_type)
-            .and_then(|source| create_staged_hardlink(source_file, &source, &stage, destination)),
-        LinkType::Reflink => verified_source_file(source_file, link_type)
+        LinkType::Hardlink | LinkType::Symlink => {
+            verified_source_file_without_expected_size(source_file, link_type).and_then(|source| {
+                create_staged_hardlink(source_file, &source, &stage, destination)
+            })
+        }
+        LinkType::Reflink => verified_source_file_without_expected_size(source_file, link_type)
             .and_then(|source| create_staged_reflink(&source, &stage, destination)),
         LinkType::ReflinkOrCopy => {
-            verified_source_file(source_file, link_type).and_then(|source| {
+            verified_source_file_without_expected_size(source_file, link_type).and_then(|source| {
                 create_staged_reflink(&source, &stage, destination).or_else(|error| {
                     if should_fallback_to_copy(error.kind()) {
                         copy_file_to_stage(&source, &stage, destination).map(|_| ())
@@ -1398,6 +1428,7 @@ fn pair_link_files(
                 Ok(LinkPair {
                     source: source_root.join(&candidate.relative_path),
                     destination_relative_path: candidate.relative_path.clone(),
+                    expected_size: candidate.size,
                 })
             })
             .collect();
@@ -1419,6 +1450,7 @@ fn pair_link_files(
         pairs.push(LinkPair {
             source: source_root.join(&source.relative_path),
             destination_relative_path: candidate.relative_path.clone(),
+            expected_size: candidate.size,
         });
     }
     Ok(pairs)
@@ -1440,7 +1472,30 @@ fn best_source_match(
         .map(|(index, _)| index)
 }
 
-fn verified_source_file(path: &Path, _link_type: LinkType) -> io::Result<VerifiedSourceFile> {
+fn verified_source_file(
+    path: &Path,
+    expected_size: ByteSize,
+    _link_type: LinkType,
+) -> io::Result<VerifiedSourceFile> {
+    let source_file = verified_source_file_without_expected_size(path, _link_type)?;
+    if source_file.metadata.len() == expected_size.get() {
+        Ok(source_file)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source file size {} did not match expected size {}",
+                source_file.metadata.len(),
+                expected_size.get()
+            ),
+        ))
+    }
+}
+
+fn verified_source_file_without_expected_size(
+    path: &Path,
+    _link_type: LinkType,
+) -> io::Result<VerifiedSourceFile> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -1457,12 +1512,26 @@ fn verified_source_file(path: &Path, _link_type: LinkType) -> io::Result<Verifie
             "source handle is not a regular file",
         ));
     }
+    #[cfg(unix)]
+    if metadata_identity(&metadata) != metadata_identity(&opened_metadata) {
+        return Err(io::Error::other(
+            "source path changed while opening source file",
+        ));
+    }
     let identity = same_file::Handle::from_file(file.try_clone()?)?;
     Ok(VerifiedSourceFile {
         metadata: opened_metadata,
         identity,
         file,
     })
+}
+
+#[cfg(unix)]
+fn metadata_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    }
 }
 
 fn existing_link_destination_matches(
@@ -2147,12 +2216,17 @@ fn prepared_link_manifest(
     source: PathBuf,
     destination: PathBuf,
     link_type: LinkType,
+    expected_size: ByteSize,
+    source_file: &VerifiedSourceFile,
     parent: &DestinationParent,
 ) -> Result<PreparedLink, LinkActionError> {
     Ok(PreparedLink {
         source,
         destination,
         link_type,
+        expected_size,
+        #[cfg(unix)]
+        source_identity: metadata_identity(&source_file.metadata),
         parent: parent.path.clone(),
         basename: parent.basename.clone(),
         #[cfg(unix)]
@@ -2658,6 +2732,9 @@ fn create_symlink_staged_at(
 ) -> io::Result<CreatedEntry> {
     let stage = create_private_stage_dir_at(parent, "link-create")?;
     let staged = Path::new("data");
+    // Symlinks are necessarily path-based. Preparation and later revalidation
+    // pin the source size and identity, but the client can still observe a
+    // source path mutation that happens after revalidation.
     if let Err(error) = rustix::fs::symlinkat(source, &stage.fd, staged).map_err(io::Error::from) {
         let _ = remove_stage_dir_entry_at(parent, &stage, staged);
         return Err(error);
@@ -2803,6 +2880,8 @@ fn create_staged_hardlink(
     stage: &PrivateStageDir,
     staged: &Path,
 ) -> io::Result<()> {
+    // POSIX hardlink creation is path-based here; immediately verify that the
+    // staged link landed on the source handle accepted by source verification.
     rustix::fs::linkat(CWD, source, &stage.fd, staged, AtFlags::empty())
         .map_err(io::Error::from)?;
     let staged_file = File::from(
@@ -3671,7 +3750,8 @@ mod tests {
         let destination = root.join("destination");
         fs::create_dir_all(&destination).unwrap();
         fs::write(&source, b"source").unwrap();
-        let source_file = verified_source_file(&source, LinkType::Hardlink).unwrap();
+        let source_file =
+            verified_source_file_without_expected_size(&source, LinkType::Hardlink).unwrap();
         fs::remove_file(&source).unwrap();
         fs::write(&source, b"replacement").unwrap();
         let parent =
@@ -3695,7 +3775,8 @@ mod tests {
         let old_destination = root.join("destination-old");
         fs::create_dir_all(&destination).unwrap();
         fs::write(&source, b"source").unwrap();
-        let source_file = verified_source_file(&source, LinkType::Hardlink).unwrap();
+        let source_file =
+            verified_source_file_without_expected_size(&source, LinkType::Hardlink).unwrap();
         let parent =
             prepare_destination_parent(&destination, Path::new("Episode.mkv"), true, None).unwrap();
         fs::rename(&destination, &old_destination).unwrap();
@@ -3722,7 +3803,8 @@ mod tests {
         let destination = root.join("destination");
         fs::create_dir_all(&destination).unwrap();
         fs::write(&source, b"source").unwrap();
-        let source_file = verified_source_file(&source, LinkType::Hardlink).unwrap();
+        let source_file =
+            verified_source_file_without_expected_size(&source, LinkType::Hardlink).unwrap();
         let parent =
             prepare_destination_parent(&destination, Path::new("Episode.mkv"), true, None).unwrap();
         let created =
@@ -3751,7 +3833,8 @@ mod tests {
         let destination = root.join("destination");
         fs::create_dir_all(&destination).unwrap();
         fs::write(&source, b"source").unwrap();
-        let source_file = verified_source_file(&source, LinkType::Symlink).unwrap();
+        let source_file =
+            verified_source_file_without_expected_size(&source, LinkType::Symlink).unwrap();
         fs::remove_file(&source).unwrap();
         fs::write(&source, b"replacement").unwrap();
         let parent =
@@ -3775,7 +3858,8 @@ mod tests {
         let destination = root.join("destination");
         fs::create_dir_all(&destination).unwrap();
         fs::write(&source, b"source").unwrap();
-        let source_file = verified_source_file(&source, LinkType::Symlink).unwrap();
+        let source_file =
+            verified_source_file_without_expected_size(&source, LinkType::Symlink).unwrap();
         let parent =
             prepare_destination_parent(&destination, Path::new("Episode.mkv"), true, None).unwrap();
         let created =
@@ -3869,6 +3953,29 @@ mod tests {
                 .as_slice()
         );
 
+        remove_temp_dir(&root);
+    }
+
+    #[test]
+    fn link_action_rejects_source_size_mismatch_before_creating_destination() {
+        let root = unique_temp_dir("link-source-size-mismatch");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("Show")).unwrap();
+        fs::write(source.join("Show/Episode.mkv"), b"too-large").unwrap();
+
+        let error = link_metafile_files(
+            &source,
+            &[local_file("Show/Episode.mkv", 6, 0)],
+            &[torrent_file("Show/Episode.mkv", 6, 0)],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::Hardlink),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert!(!destination.exists());
         remove_temp_dir(&root);
     }
 
@@ -4081,6 +4188,34 @@ mod tests {
         assert!(outcome.created_links.is_empty());
         assert!(outcome.already_existing);
 
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_symlink_revalidation_rejects_same_size_source_replacement() {
+        let root = unique_temp_dir("link-symlink-source-replaced");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("Show")).unwrap();
+        fs::write(source.join("Show/Episode.mkv"), b"source").unwrap();
+
+        let outcome = link_metafile_files(
+            &source,
+            &[local_file("Show/Episode.mkv", 6, 0)],
+            &[torrent_file("Show/Episode.mkv", 6, 0)],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::Symlink),
+        )
+        .unwrap();
+        fs::remove_file(source.join("Show/Episode.mkv")).unwrap();
+        fs::write(source.join("Show/Episode.mkv"), b"change").unwrap();
+
+        let error = validate_prepared_links(&outcome.prepared_links).unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        cleanup_created_links_and_roots(&outcome.created_links, &outcome.created_roots).unwrap();
         remove_temp_dir(&root);
     }
 
