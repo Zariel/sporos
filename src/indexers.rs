@@ -2,14 +2,6 @@
     clippy::let_underscore_must_use,
     reason = "mechanical clippy gate enablement leaves explicit cache cleanup handling to a linked lint-class bead"
 )]
-#![cfg_attr(
-    test,
-    expect(
-        clippy::needless_update,
-        reason = "exhaustive fixture literals are tracked for follow-up cleanup"
-    )
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -3562,13 +3554,15 @@ mod tests {
                 movie_search: true,
                 audio_search: true,
                 supported_id_params: ["tvdbid".to_owned()].into_iter().collect(),
-                ..SearchCaps::default()
             },
             categories: CategoryCaps {
                 tv: true,
                 movie: true,
+                anime: false,
+                xxx: false,
                 audio: true,
-                ..CategoryCaps::default()
+                book: false,
+                additional: false,
             },
             limits: TorznabLimits {
                 default: 50,
