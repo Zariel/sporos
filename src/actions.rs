@@ -122,6 +122,7 @@ pub struct PreparedLink {
     expected_size: ByteSize,
     #[cfg(unix)]
     source_identity: FileIdentity,
+    destination_match_mode: DestinationMatchMode,
     parent: PathBuf,
     basename: PathBuf,
     #[cfg(unix)]
@@ -604,6 +605,7 @@ pub fn link_metafile_files(
                 &source_file,
                 &destination,
                 options.link_type,
+                DestinationMatchMode::ReuseExisting,
             )? {
                 outcome.already_existing = true;
                 outcome.prepared_links.push(prepared_link_manifest(
@@ -613,6 +615,7 @@ pub fn link_metafile_files(
                     pair.expected_size,
                     &source_file,
                     &parent,
+                    DestinationMatchMode::ReuseExisting,
                 )?);
                 continue;
             }
@@ -702,6 +705,7 @@ pub fn link_metafile_files(
                         &source_file,
                         &pair.destination,
                         options.link_type,
+                        DestinationMatchMode::ReuseExisting,
                     ) {
                         Ok(true) => {
                             outcome.already_existing = true;
@@ -712,6 +716,7 @@ pub fn link_metafile_files(
                                 pair.expected_size,
                                 &source_file,
                                 &parent,
+                                DestinationMatchMode::ReuseExisting,
                             )?);
                             continue;
                         }
@@ -794,6 +799,7 @@ pub fn link_metafile_files(
             &source_file,
             &pair.destination,
             options.link_type,
+            DestinationMatchMode::VerifyPrepared,
         ) {
             Ok(true) => {}
             Ok(false) => {
@@ -873,6 +879,7 @@ pub fn link_metafile_files(
             pair.expected_size,
             &source_file,
             &parent,
+            DestinationMatchMode::VerifyPrepared,
         ) {
             Ok(link) => link,
             Err(error) => {
@@ -1011,6 +1018,7 @@ pub fn validate_prepared_links(links: &[PreparedLink]) -> Result<(), LinkActionE
             &source_file,
             &destination,
             link.link_type,
+            link.destination_match_mode,
         )? {
             return Err(LinkActionError::ExistingDestinationMismatch {
                 source: link.source.clone(),
@@ -1531,6 +1539,7 @@ fn existing_link_destination_matches(
     source_file: &VerifiedSourceFile,
     destination: &Path,
     link_type: LinkType,
+    mode: DestinationMatchMode,
 ) -> Result<bool, LinkActionError> {
     let destination_metadata = match fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
@@ -1547,6 +1556,7 @@ fn existing_link_destination_matches(
         destination,
         &destination_metadata,
         link_type,
+        mode,
     )? {
         return Err(LinkActionError::ExistingDestinationMismatch {
             source: source.to_path_buf(),
@@ -1556,12 +1566,19 @@ fn existing_link_destination_matches(
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DestinationMatchMode {
+    ReuseExisting,
+    VerifyPrepared,
+}
+
 fn destination_matches_source(
     source: &Path,
     source_file: &VerifiedSourceFile,
     destination: &Path,
     destination_metadata: &fs::Metadata,
     link_type: LinkType,
+    mode: DestinationMatchMode,
 ) -> Result<bool, LinkActionError> {
     match link_type {
         LinkType::Hardlink => {
@@ -1576,10 +1593,35 @@ fn destination_matches_source(
             }
             destination_symlink_matches_source(source, source_file, destination)
         }
-        LinkType::Reflink | LinkType::ReflinkOrCopy => {
-            file_contents_match(source, source_file, destination, destination_metadata)
-        }
+        LinkType::Reflink | LinkType::ReflinkOrCopy => match mode {
+            DestinationMatchMode::ReuseExisting => existing_destination_has_source_identity(
+                source,
+                source_file,
+                destination_metadata,
+                destination,
+            ),
+            DestinationMatchMode::VerifyPrepared => {
+                file_contents_match(source, source_file, destination, destination_metadata)
+            }
+        },
     }
+}
+
+fn existing_destination_has_source_identity(
+    source: &Path,
+    source_file: &VerifiedSourceFile,
+    destination_metadata: &fs::Metadata,
+    destination: &Path,
+) -> Result<bool, LinkActionError> {
+    if destination_metadata.file_type().is_symlink() {
+        return destination_symlink_matches_source(source, source_file, destination);
+    }
+    if !destination_metadata.file_type().is_file()
+        || destination_metadata.len() != source_file.metadata.len()
+    {
+        return Ok(false);
+    }
+    destination_matches_source_identity(source_file, destination)
 }
 
 fn file_contents_match(
@@ -2211,6 +2253,7 @@ fn prepared_link_manifest(
     expected_size: ByteSize,
     source_file: &VerifiedSourceFile,
     parent: &DestinationParent,
+    destination_match_mode: DestinationMatchMode,
 ) -> Result<PreparedLink, LinkActionError> {
     Ok(PreparedLink {
         source,
@@ -2219,6 +2262,7 @@ fn prepared_link_manifest(
         expected_size,
         #[cfg(unix)]
         source_identity: metadata_identity(&source_file.metadata),
+        destination_match_mode,
         parent: parent.path.clone(),
         basename: parent.basename.clone(),
         #[cfg(unix)]
@@ -3864,6 +3908,7 @@ mod tests {
             &source_file,
             &destination.join("Episode.mkv"),
             LinkType::Symlink,
+            DestinationMatchMode::VerifyPrepared,
         )
         .unwrap_err();
         assert!(matches!(
@@ -4006,14 +4051,51 @@ mod tests {
     }
 
     #[test]
-    fn link_action_accepts_matching_reflink_or_copy_destinations() {
+    fn link_action_rejects_matching_plain_reflink_or_copy_destinations() {
         let root = unique_temp_dir("link-matching-copy-existing");
         let source = root.join("source");
         let destination = root.join("destination");
         fs::create_dir_all(source.join("Show")).unwrap();
         fs::create_dir_all(destination.join("Show")).unwrap();
+        let bytes = vec![b'x'; LINK_COMPARE_BUFFER_SIZE * 2 + 17];
+        fs::write(source.join("Show/Episode.mkv"), &bytes).unwrap();
+        fs::write(destination.join("Show/Episode.mkv"), &bytes).unwrap();
+
+        let error = link_metafile_files(
+            &source,
+            &[local_file("Show/Episode.mkv", bytes.len() as u64, 0)],
+            &[torrent_file("Show/Episode.mkv", bytes.len() as u64, 0)],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::ReflinkOrCopy),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LinkActionError::ExistingDestinationMismatch { .. }
+        ));
+        assert_eq!(
+            bytes,
+            fs::read(destination.join("Show/Episode.mkv")).unwrap()
+        );
+
+        remove_temp_dir(&root);
+    }
+
+    #[test]
+    fn link_action_accepts_existing_hardlink_in_reflink_or_copy_mode() {
+        let root = unique_temp_dir("link-hardlinked-copy-existing");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("Show")).unwrap();
+        fs::create_dir_all(destination.join("Show")).unwrap();
         fs::write(source.join("Show/Episode.mkv"), b"source").unwrap();
-        fs::write(destination.join("Show/Episode.mkv"), b"source").unwrap();
+        fs::hard_link(
+            source.join("Show/Episode.mkv"),
+            destination.join("Show/Episode.mkv"),
+        )
+        .unwrap();
 
         let outcome = link_metafile_files(
             &source,
@@ -4028,6 +4110,78 @@ mod tests {
         assert!(outcome.created_links.is_empty());
         assert!(outcome.already_existing);
 
+        remove_temp_dir(&root);
+    }
+
+    #[test]
+    fn prepared_reflink_or_copy_revalidation_rejects_replaced_reused_hardlink() {
+        let root = unique_temp_dir("link-reused-hardlink-replaced");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("Show")).unwrap();
+        fs::create_dir_all(destination.join("Show")).unwrap();
+        fs::write(source.join("Show/Episode.mkv"), b"source").unwrap();
+        fs::hard_link(
+            source.join("Show/Episode.mkv"),
+            destination.join("Show/Episode.mkv"),
+        )
+        .unwrap();
+        let outcome = link_metafile_files(
+            &source,
+            &[local_file("Show/Episode.mkv", 6, 0)],
+            &[torrent_file("Show/Episode.mkv", 6, 0)],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::ReflinkOrCopy),
+        )
+        .unwrap();
+        assert!(outcome.created_links.is_empty());
+        fs::remove_file(destination.join("Show/Episode.mkv")).unwrap();
+        fs::write(destination.join("Show/Episode.mkv"), b"source").unwrap();
+
+        let error = validate_prepared_links(&outcome.prepared_links).unwrap_err();
+
+        assert!(matches!(
+            error,
+            LinkActionError::ExistingDestinationMismatch { .. }
+        ));
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_reflink_or_copy_accepts_existing_symlink_and_rejects_replacement() {
+        let root = unique_temp_dir("link-reused-symlink-replaced");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("Show")).unwrap();
+        fs::create_dir_all(destination.join("Show")).unwrap();
+        fs::write(source.join("Show/Episode.mkv"), b"source").unwrap();
+        std::os::unix::fs::symlink(
+            source.join("Show/Episode.mkv"),
+            destination.join("Show/Episode.mkv"),
+        )
+        .unwrap();
+        let outcome = link_metafile_files(
+            &source,
+            &[local_file("Show/Episode.mkv", 6, 0)],
+            &[torrent_file("Show/Episode.mkv", 6, 0)],
+            MatchDecision::Exact,
+            &destination,
+            LinkFilesOptions::new(LinkType::ReflinkOrCopy),
+        )
+        .unwrap();
+        assert!(outcome.created_links.is_empty());
+        validate_prepared_links(&outcome.prepared_links).unwrap();
+        fs::remove_file(destination.join("Show/Episode.mkv")).unwrap();
+        fs::write(destination.join("Show/Episode.mkv"), b"source").unwrap();
+
+        let error = validate_prepared_links(&outcome.prepared_links).unwrap_err();
+
+        assert!(matches!(
+            error,
+            LinkActionError::ExistingDestinationMismatch { .. }
+        ));
         remove_temp_dir(&root);
     }
 
