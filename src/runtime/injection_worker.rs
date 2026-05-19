@@ -5,6 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -12,7 +13,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, mpsc};
 use tracing::warn;
 
 use crate::actions::{
@@ -46,6 +47,7 @@ use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal, shutdown_channel};
 use crate::torrent::parse_metafile;
 
 const MAX_SAVED_TORRENT_BYTES: u64 = 32 * 1024 * 1024;
+const SAVED_TORRENT_SCAN_BATCH: usize = 32;
 
 pub type ClientResultFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, TorrentClientError>> + Send + 'a>>;
@@ -735,23 +737,37 @@ impl InjectionWorker {
             if should_stop() {
                 return Ok(summary);
             }
-            let paths =
-                saved_torrent_paths(directory, config.max_saved_torrents - summary.scanned).await?;
-            for path in paths {
+            let mut scan =
+                saved_torrent_path_scan(directory, config.max_saved_torrents - summary.scanned);
+            while let Some(path) = scan.next_path_until_stop(&mut should_stop).await? {
                 if summary.scanned >= config.max_saved_torrents || should_stop() {
+                    scan.cancel();
+                    scan.finish().await?;
                     return Ok(summary);
                 }
                 summary.scanned += 1;
-                self.retry_saved_torrent(
-                    directory,
-                    &path,
-                    &config,
-                    &mut summary,
-                    &mut should_stop,
-                    shutdown,
-                )
-                .await?;
+                if let Err(error) = self
+                    .retry_saved_torrent(
+                        directory,
+                        &path,
+                        &config,
+                        &mut summary,
+                        &mut should_stop,
+                        shutdown,
+                    )
+                    .await
+                {
+                    scan.cancel();
+                    scan.finish().await?;
+                    return Err(error);
+                }
             }
+            if should_stop() {
+                scan.cancel();
+                scan.finish().await?;
+                return Ok(summary);
+            }
+            scan.finish().await?;
         }
 
         Ok(summary)
@@ -1306,51 +1322,159 @@ enum ExistingClientLookup {
     Shutdown,
 }
 
-async fn saved_torrent_paths(
-    directory: &Path,
-    limit: usize,
-) -> Result<Vec<PathBuf>, InjectionWorkerError> {
-    if limit == 0 {
-        return Ok(Vec::new());
+struct SavedTorrentPathScan {
+    directory: PathBuf,
+    receiver: mpsc::Receiver<Result<PathBuf, InjectionWorkerError>>,
+    join: Option<tokio::task::JoinHandle<()>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SavedTorrentPathScan {
+    #[cfg(test)]
+    async fn next_path(&mut self) -> Result<Option<PathBuf>, InjectionWorkerError> {
+        let message = self.receiver.recv().await;
+        self.handle_scan_message(message).await
     }
+
+    async fn next_path_until_stop<F>(
+        &mut self,
+        should_stop: &mut F,
+    ) -> Result<Option<PathBuf>, InjectionWorkerError>
+    where
+        F: FnMut() -> bool,
+    {
+        loop {
+            if should_stop() {
+                self.cancel();
+                self.finish().await?;
+                return Ok(None);
+            }
+            tokio::select! {
+                message = self.receiver.recv() => {
+                    return self.handle_scan_message(message).await;
+                }
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    }
+
+    async fn handle_scan_message(
+        &mut self,
+        message: Option<Result<PathBuf, InjectionWorkerError>>,
+    ) -> Result<Option<PathBuf>, InjectionWorkerError> {
+        match message {
+            Some(Ok(path)) => Ok(Some(path)),
+            Some(Err(error)) => {
+                self.finish().await?;
+                Err(error)
+            }
+            None => {
+                self.finish().await?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.receiver.close();
+    }
+
+    async fn finish(&mut self) -> Result<(), InjectionWorkerError> {
+        if let Some(join) = self.join.take() {
+            join.await.map_err(|source| InjectionWorkerError::Io {
+                operation: "join saved torrent scan",
+                path: self.directory.clone(),
+                source: std::io::Error::other(source),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn saved_torrent_path_scan(directory: &Path, limit: usize) -> SavedTorrentPathScan {
     let directory = directory.to_path_buf();
     let blocking_directory = directory.clone();
-    tokio::task::spawn_blocking(move || {
+    let (sender, receiver) = mpsc::channel(SAVED_TORRENT_SCAN_BATCH);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let blocking_cancelled = Arc::clone(&cancelled);
+    let join = tokio::task::spawn_blocking(move || {
+        if limit == 0 {
+            return;
+        }
         let entries = match std::fs::read_dir(&blocking_directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(source) => {
-                return Err(InjectionWorkerError::Io {
+                drop(sender.blocking_send(Err(InjectionWorkerError::Io {
                     operation: "read saved torrent directory",
                     path: blocking_directory,
                     source,
-                });
+                })));
+                return;
             }
         };
-        let mut paths = Vec::new();
+        let mut batch = Vec::with_capacity(SAVED_TORRENT_SCAN_BATCH);
+        let mut sent = 0_usize;
         for entry in entries {
-            let entry = entry.map_err(|source| InjectionWorkerError::Io {
-                operation: "read saved torrent directory entry",
-                path: blocking_directory.clone(),
-                source,
-            })?;
+            if blocking_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(source) => {
+                    drop(sender.blocking_send(Err(InjectionWorkerError::Io {
+                        operation: "read saved torrent directory entry",
+                        path: blocking_directory.clone(),
+                        source,
+                    })));
+                    return;
+                }
+            };
             let path = entry.path();
             if is_direct_saved_torrent_file(&blocking_directory, &path) {
-                paths.push(path);
-                if paths.len() >= limit {
+                batch.push(path);
+                if batch.len() >= SAVED_TORRENT_SCAN_BATCH {
+                    if !send_saved_torrent_scan_batch(&sender, &mut batch, limit, &mut sent) {
+                        return;
+                    }
+                    if blocking_cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                if sent + batch.len() >= limit {
                     break;
                 }
             }
         }
-        paths.sort();
-        Ok(paths)
-    })
-    .await
-    .map_err(|source| InjectionWorkerError::Io {
-        operation: "join saved torrent scan",
-        path: directory.to_path_buf(),
-        source: std::io::Error::other(source),
-    })?
+        let _ = send_saved_torrent_scan_batch(&sender, &mut batch, limit, &mut sent);
+    });
+
+    SavedTorrentPathScan {
+        directory,
+        receiver,
+        join: Some(join),
+        cancelled,
+    }
+}
+
+fn send_saved_torrent_scan_batch(
+    sender: &mpsc::Sender<Result<PathBuf, InjectionWorkerError>>,
+    batch: &mut Vec<PathBuf>,
+    limit: usize,
+    sent: &mut usize,
+) -> bool {
+    batch.sort();
+    for path in batch.drain(..) {
+        if *sent >= limit {
+            return true;
+        }
+        if sender.blocking_send(Ok(path)).is_err() {
+            return false;
+        }
+        *sent += 1;
+    }
+    true
 }
 
 async fn read_saved_torrent(path: &Path) -> Result<SavedTorrentFile, InjectionWorkerError> {
@@ -2713,6 +2837,100 @@ mod tests {
         assert_eq!(0, summary.scanned);
         assert_eq!(1, saved_torrent_count(&output_dir));
         assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_scan_streams_limited_sorted_paths() {
+        let root = unique_temp_dir("saved-retry-stream-scan");
+        let output_dir = root.join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+        let limit = SAVED_TORRENT_SCAN_BATCH + 5;
+        for index in 0..limit {
+            fs::write(
+                output_dir.join(format!("manual-{index}.torrent")),
+                test_torrent_bytes(),
+            )
+            .unwrap();
+            save_test_torrent(
+                &output_dir,
+                &format!("movie-{index}.mkv"),
+                test_torrent_bytes(),
+                MediaType::Movie,
+            );
+        }
+
+        let mut scan = saved_torrent_path_scan(&output_dir, limit);
+        let mut paths = Vec::new();
+        while let Some(path) = scan.next_path().await.unwrap() {
+            paths.push(path);
+        }
+        scan.finish().await.unwrap();
+
+        assert_eq!(limit, paths.len());
+        for chunk in paths.chunks(SAVED_TORRENT_SCAN_BATCH) {
+            let mut sorted = chunk.to_vec();
+            sorted.sort();
+            assert_eq!(sorted, chunk);
+        }
+        assert!(
+            paths
+                .iter()
+                .all(|path| is_direct_saved_torrent_file(&output_dir, path))
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_scan_can_cancel_before_full_directory_walk() {
+        let root = unique_temp_dir("saved-retry-stream-cancel");
+        let output_dir = root.join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+        for index in 0..2_000 {
+            fs::write(
+                output_dir.join(format!("manual-{index}.torrent")),
+                test_torrent_bytes(),
+            )
+            .unwrap();
+        }
+        let mut scan = saved_torrent_path_scan(&output_dir, 1);
+        let mut checks = 0;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            scan.next_path_until_stop(&mut || {
+                checks += 1;
+                checks >= 2
+            })
+            .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(None, result);
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_scan_cancel_unblocks_full_channel_sender() {
+        let root = unique_temp_dir("saved-retry-stream-cancel-full");
+        let output_dir = root.join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+        for index in 0..(SAVED_TORRENT_SCAN_BATCH * 4) {
+            save_test_torrent(
+                &output_dir,
+                &format!("movie-{index}.mkv"),
+                test_torrent_bytes(),
+                MediaType::Movie,
+            );
+        }
+        let mut scan = saved_torrent_path_scan(&output_dir, SAVED_TORRENT_SCAN_BATCH * 4);
+
+        assert!(scan.next_path().await.unwrap().is_some());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        scan.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), scan.finish())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
