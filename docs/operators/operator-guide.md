@@ -391,15 +391,24 @@ retention, retry, restart, and single-writer details.
 
 ## Optional Diagnostics
 
-Use diagnostics that do not mutate state first:
+Use read-only diagnostics first:
 
-- `sporos check-config --config /etc/sporos/config.toml`
 - `sporos print-config-schema`
 - `GET /livez`
 - `GET /readyz`
 - `GET /v1/status`
 - `GET /metrics`
-- `POST /v1/jobs/indexer_caps/runs`
+
+Use side-effecting diagnostics when you want to validate writable state or
+trigger daemon work:
+
+- `sporos check-config --config /etc/sporos/config.toml`: parses and validates
+  config, creates required local state directories, and probes writable state
+  paths.
+- `POST /v1/jobs/indexer_caps/runs`: queues durable scheduler work and updates
+  job/dependency state.
+- `POST /v1/jobs/cleanup/runs`: queues durable cleanup work and updates job
+  state while applying announce TTL, retention, and stale lease maintenance.
 
 For dependency issues, compare readiness dependency summaries with metric
 outcome counters. For queued announcement issues, compare `/v1/status`
