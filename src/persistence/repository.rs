@@ -2123,34 +2123,60 @@ impl Repository {
         after_name: Option<&DependencyName>,
         limit: u16,
     ) -> Result<Vec<IndexerRegistryRow>, DatabaseError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id,
-                name,
-                url,
-                source_kind,
-                source_name,
-                source_indexer_id,
-                api_key_source,
-                enabled,
-                state,
-                retry_after,
-                last_caps_refresh_at
-            FROM indexers
-            WHERE enabled != 0
-              AND (retry_after IS NULL OR retry_after <= ?)
-              AND (? IS NULL OR name > ?)
-            ORDER BY name
-            LIMIT ?
-            "#,
-        )
-        .bind(now_ms)
-        .bind(after_name.map(DependencyName::as_str))
-        .bind(after_name.map(DependencyName::as_str))
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
+        self.clear_due_indexer_backoffs(now_ms).await?;
+        let rows = if let Some(after_name) = after_name {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    name,
+                    url,
+                    source_kind,
+                    source_name,
+                    source_indexer_id,
+                    api_key_source,
+                    enabled,
+                    state,
+                    retry_after,
+                    last_caps_refresh_at
+                FROM indexers INDEXED BY idx_indexers_due_page
+                WHERE enabled = 1
+                  AND name > ?
+                  AND retry_after IS NULL
+                ORDER BY name
+                LIMIT ?
+                "#,
+            )
+            .bind(after_name.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    name,
+                    url,
+                    source_kind,
+                    source_name,
+                    source_indexer_id,
+                    api_key_source,
+                    enabled,
+                    state,
+                    retry_after,
+                    last_caps_refresh_at
+                FROM indexers INDEXED BY idx_indexers_due_page
+                WHERE enabled = 1
+                  AND retry_after IS NULL
+                ORDER BY name
+                LIMIT ?
+                "#,
+            )
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        }
         .map_err(|error| db_error("read due indexer registry page", error))?;
 
         rows.into_iter()
@@ -2181,6 +2207,24 @@ impl Repository {
             }
         })?;
         Ok((count, row.get("next_retry_after")))
+    }
+
+    async fn clear_due_indexer_backoffs(&self, now_ms: i64) -> Result<(), DatabaseError> {
+        sqlx::query(
+            r#"
+            UPDATE indexers
+            SET retry_after = NULL
+            WHERE enabled = 1
+              AND retry_after IS NOT NULL
+              AND retry_after <= ?
+            "#,
+        )
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("clear due indexer backoffs", error))?;
+
+        Ok(())
     }
 
     pub async fn record_indexer_caps_success(
@@ -2297,34 +2341,60 @@ impl Repository {
         after_name: Option<&DependencyName>,
         limit: u16,
     ) -> Result<Vec<IndexerSearchCapsRow>, DatabaseError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id,
-                name,
-                url,
-                source_kind,
-                source_name,
-                source_indexer_id,
-                api_key_source,
-                enabled,
-                retry_after,
-                capabilities_json
-            FROM indexers
-            WHERE enabled != 0
-              AND last_caps_refresh_at IS NOT NULL
-              AND (retry_after IS NULL OR retry_after <= ?)
-              AND (? IS NULL OR name > ?)
-            ORDER BY name
-            LIMIT ?
-            "#,
-        )
-        .bind(now_ms)
-        .bind(after_name.map(DependencyName::as_str))
-        .bind(after_name.map(DependencyName::as_str))
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
+        self.clear_due_indexer_backoffs(now_ms).await?;
+        let rows = if let Some(after_name) = after_name {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    name,
+                    url,
+                    source_kind,
+                    source_name,
+                    source_indexer_id,
+                    api_key_source,
+                    enabled,
+                    retry_after,
+                    capabilities_json
+                FROM indexers INDEXED BY idx_indexers_search_ready_page
+                WHERE enabled = 1
+                  AND name > ?
+                  AND last_caps_refresh_at IS NOT NULL
+                  AND retry_after IS NULL
+                ORDER BY name
+                LIMIT ?
+                "#,
+            )
+            .bind(after_name.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    name,
+                    url,
+                    source_kind,
+                    source_name,
+                    source_indexer_id,
+                    api_key_source,
+                    enabled,
+                    retry_after,
+                    capabilities_json
+                FROM indexers INDEXED BY idx_indexers_search_ready_page
+                WHERE enabled = 1
+                  AND last_caps_refresh_at IS NOT NULL
+                  AND retry_after IS NULL
+                ORDER BY name
+                LIMIT ?
+                "#,
+            )
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        }
         .map_err(|error| db_error("read ready indexer search caps page", error))?;
 
         rows.into_iter()
@@ -8900,6 +8970,90 @@ mod tests {
                     .iter()
                     .any(|detail| detail.contains("idx_announce_work_status_reason")),
                 "{label} should not fall back to the broad status/reason index: {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_indexer_pages_use_targeted_indexes() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (label, query, index_name, expected_search) in [
+            (
+                "due caps first page",
+                r#"
+                SELECT id, name, retry_after, last_caps_refresh_at
+                FROM indexers INDEXED BY idx_indexers_due_page
+                WHERE enabled = 1
+                  AND retry_after IS NULL
+                ORDER BY name
+                LIMIT 512
+                "#,
+                "idx_indexers_due_page",
+                "enabled=? AND retry_after=?",
+            ),
+            (
+                "due caps keyset page",
+                r#"
+                SELECT id, name, retry_after, last_caps_refresh_at
+                FROM indexers INDEXED BY idx_indexers_due_page
+                WHERE enabled = 1
+                  AND retry_after IS NULL
+                  AND name > 'main'
+                ORDER BY name
+                LIMIT 512
+                "#,
+                "idx_indexers_due_page",
+                "enabled=? AND retry_after=? AND name>?",
+            ),
+            (
+                "search-ready first page",
+                r#"
+                SELECT id, name, retry_after, capabilities_json
+                FROM indexers INDEXED BY idx_indexers_search_ready_page
+                WHERE enabled = 1
+                  AND retry_after IS NULL
+                  AND last_caps_refresh_at IS NOT NULL
+                ORDER BY name
+                LIMIT 512
+                "#,
+                "idx_indexers_search_ready_page",
+                "enabled=? AND retry_after=?",
+            ),
+            (
+                "search-ready keyset page",
+                r#"
+                SELECT id, name, retry_after, capabilities_json
+                FROM indexers INDEXED BY idx_indexers_search_ready_page
+                WHERE enabled = 1
+                  AND retry_after IS NULL
+                  AND name > 'main'
+                  AND last_caps_refresh_at IS NOT NULL
+                ORDER BY name
+                LIMIT 512
+                "#,
+                "idx_indexers_search_ready_page",
+                "enabled=? AND retry_after=? AND name>?",
+            ),
+        ] {
+            let plan = explain_query_plan_raw(&repository, query).await;
+
+            assert!(
+                !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+                "{label} should not sort with a temp b-tree: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(index_name)),
+                "{label} should use {index_name}: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(expected_search)),
+                "{label} should constrain the targeted index search with {expected_search}: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("sqlite_autoindex_indexers")),
+                "{label} should not scan the unique name index: {plan:?}"
             );
         }
     }

@@ -137,6 +137,11 @@ CREATE INDEX IF NOT EXISTS idx_indexers_enabled_name
     ON indexers (enabled, name);
 CREATE INDEX IF NOT EXISTS idx_indexers_search_ready
     ON indexers (enabled, last_caps_refresh_at, retry_after, name);
+CREATE INDEX IF NOT EXISTS idx_indexers_due_page
+    ON indexers (enabled, retry_after, name);
+CREATE INDEX IF NOT EXISTS idx_indexers_search_ready_page
+    ON indexers (enabled, retry_after, name)
+    WHERE last_caps_refresh_at IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_indexers_active_url_unique
     ON indexers (url)
     WHERE enabled != 0;
@@ -322,6 +327,8 @@ mod tests {
             "UNIQUE (source_kind, source_name, source_indexer_id)",
             "idx_indexers_enabled_name",
             "idx_indexers_search_ready",
+            "idx_indexers_due_page",
+            "idx_indexers_search_ready_page",
             "idx_indexers_active_url_unique",
             "idx_indexers_url",
             "api_key_source TEXT NOT NULL",
