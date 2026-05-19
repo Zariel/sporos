@@ -2702,7 +2702,7 @@ impl Repository {
                 work.next_attempt_at,
                 health.state AS dependency_state,
                 health.retry_after
-            FROM announce_work work
+            FROM announce_work AS work INDEXED BY idx_announce_work_dependency_schedule
             LEFT JOIN dependency_health health
               ON health.dependency_type = work.last_dependency_kind
              AND health.dependency_name = work.last_dependency_name
@@ -2760,7 +2760,7 @@ impl Repository {
                 next_attempt_at = ?,
                 updated_at = ?
             WHERE id IN (
-                SELECT id FROM announce_work
+                SELECT id FROM announce_work INDEXED BY idx_announce_work_inventory_wakeup
                 WHERE status = 'waiting'
                   AND expires_at > ?
                   AND reason IN ('source_incomplete', 'inventory_refreshing')
@@ -2852,7 +2852,7 @@ impl Repository {
                 last_dependency_kind = NULL,
                 last_dependency_name = NULL
             WHERE id IN (
-                SELECT id FROM announce_work
+                SELECT id FROM announce_work INDEXED BY idx_announce_work_waiting_dependency_due
                 WHERE status = 'waiting'
                   AND expires_at > ?
                   AND last_dependency_kind = ?
@@ -2936,7 +2936,7 @@ impl Repository {
                 next_attempt_at = ?,
                 updated_at = ?
             WHERE id IN (
-                SELECT id FROM announce_work
+                SELECT id FROM announce_work INDEXED BY idx_announce_work_waiting_due
                 WHERE status = 'waiting'
                   AND next_attempt_at <= ?
                   AND expires_at > ?
@@ -8818,6 +8818,88 @@ mod tests {
             assert!(
                 !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
                 "{label} should not sort with a temp b-tree: {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn announce_maintenance_queries_use_ordered_indexes() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (label, query, index_name) in [
+            (
+                "dependency scheduler",
+                r#"
+                SELECT work.id
+                FROM announce_work AS work INDEXED BY idx_announce_work_dependency_schedule
+                LEFT JOIN dependency_health health
+                  ON health.dependency_type = work.last_dependency_kind
+                 AND health.dependency_name = work.last_dependency_name
+                WHERE work.status IN ('queued', 'retryable', 'waiting')
+                  AND work.expires_at > 100
+                  AND work.last_dependency_kind IS NOT NULL
+                  AND work.last_dependency_name IS NOT NULL
+                ORDER BY work.next_attempt_at, work.received_at
+                LIMIT 100
+                "#,
+                "idx_announce_work_dependency_schedule",
+            ),
+            (
+                "inventory wakeup",
+                r#"
+                SELECT id FROM announce_work INDEXED BY idx_announce_work_inventory_wakeup
+                WHERE status = 'waiting'
+                  AND expires_at > 100
+                  AND reason IN ('source_incomplete', 'inventory_refreshing')
+                  AND last_dependency_kind IS NULL
+                  AND last_dependency_name IS NULL
+                ORDER BY next_attempt_at, received_at
+                LIMIT 100
+                "#,
+                "idx_announce_work_inventory_wakeup",
+            ),
+            (
+                "due waiting wakeup",
+                r#"
+                SELECT id FROM announce_work INDEXED BY idx_announce_work_waiting_due
+                WHERE status = 'waiting'
+                  AND next_attempt_at <= 100
+                  AND expires_at > 100
+                  AND last_dependency_kind IS NULL
+                  AND last_dependency_name IS NULL
+                ORDER BY next_attempt_at, received_at
+                LIMIT 100
+                "#,
+                "idx_announce_work_waiting_due",
+            ),
+            (
+                "dependency wakeup",
+                r#"
+                SELECT id FROM announce_work INDEXED BY idx_announce_work_waiting_dependency_due
+                WHERE status = 'waiting'
+                  AND expires_at > 100
+                  AND last_dependency_kind = 'indexer'
+                  AND last_dependency_name = 'main'
+                ORDER BY next_attempt_at, received_at
+                LIMIT 100
+                "#,
+                "idx_announce_work_waiting_dependency_due",
+            ),
+        ] {
+            let plan = explain_query_plan_raw(&repository, query).await;
+
+            assert!(
+                !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+                "{label} should not sort with a temp b-tree: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(index_name)),
+                "{label} should use {index_name}: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("idx_announce_work_status_reason")),
+                "{label} should not fall back to the broad status/reason index: {plan:?}"
             );
         }
     }
