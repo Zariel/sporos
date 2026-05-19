@@ -89,6 +89,13 @@ pub struct AirDate {
 }
 
 pub fn parse_media_title(name: &str, file_paths: &[PathBuf]) -> ParsedMediaTitle {
+    parse_media_title_from_paths(name, file_paths.iter().map(PathBuf::as_path))
+}
+
+fn parse_media_title_from_paths<'a>(
+    name: &str,
+    file_paths: impl IntoIterator<Item = &'a Path>,
+) -> ParsedMediaTitle {
     let release_group = parse_release_group(name);
     let normalized = normalize_title_input(strip_release_group(name));
 
@@ -149,7 +156,7 @@ pub fn parse_media_title(name: &str, file_paths: &[PathBuf]) -> ParsedMediaTitle
         };
     }
 
-    let media_type = classify_media_type_from_name(name, file_paths);
+    let media_type = classify_media_type_from_paths(name, file_paths);
     let year = parse_movie_year(&normalized);
     let anime_episode = parse_anime_episode(&normalized, release_group.as_deref());
     let search_title = match (media_type, year, anime_episode) {
@@ -179,6 +186,13 @@ pub fn parse_media_title(name: &str, file_paths: &[PathBuf]) -> ParsedMediaTitle
 }
 
 pub fn classify_media_type_from_name(name: &str, file_paths: &[PathBuf]) -> MediaType {
+    classify_media_type_from_paths(name, file_paths.iter().map(PathBuf::as_path))
+}
+
+fn classify_media_type_from_paths<'a>(
+    name: &str,
+    file_paths: impl IntoIterator<Item = &'a Path>,
+) -> MediaType {
     let normalized = normalize_title_input(strip_release_group(name));
     if parse_numbered_episode(&normalized).is_some() || parse_dated_episode(&normalized).is_some() {
         return MediaType::Episode;
@@ -610,11 +624,10 @@ impl InventoryScanner {
 
         let total_size = total_size(&files, root, report)?;
         let newest_mtime = files.iter().filter_map(|file| file.mtime_ms).max();
-        let file_paths = files
-            .iter()
-            .map(|file| file.relative_path.clone())
-            .collect::<Vec<_>>();
-        let parsed_title = parse_media_title(display_name, &file_paths);
+        let parsed_title = parse_media_title_from_paths(
+            display_name,
+            files.iter().map(|file| file.relative_path.as_path()),
+        );
         let item = LocalItem {
             id: None,
             source: LocalItemSource::DataRoot {
@@ -672,7 +685,7 @@ struct FileExtensions {
 }
 
 impl FileExtensions {
-    fn from_paths(file_paths: &[PathBuf]) -> Self {
+    fn from_paths<'a>(file_paths: impl IntoIterator<Item = &'a Path>) -> Self {
         let mut extensions = Self::default();
         for path in file_paths {
             let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
@@ -1577,6 +1590,7 @@ mod tests {
         assert_eq!(1, report.items.len());
         assert_eq!(300, report.items[0].files.len());
         assert_eq!(ByteSize::new(300), report.items[0].item.total_size);
+        assert_eq!(MediaType::Video, report.items[0].item.media_type);
 
         fs::remove_dir_all(root).unwrap();
     }
