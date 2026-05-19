@@ -228,9 +228,10 @@ CREATE INDEX IF NOT EXISTS idx_announce_work_claimable
     ON announce_work (status, next_attempt_at)
     WHERE status IN ('queued', 'retryable');
 CREATE INDEX IF NOT EXISTS idx_announce_work_expires_at
-    ON announce_work (expires_at);
+    ON announce_work (expires_at, id)
+    WHERE status IN ('queued', 'running', 'waiting', 'retryable');
 CREATE INDEX IF NOT EXISTS idx_announce_work_lease_until
-    ON announce_work (lease_until)
+    ON announce_work (lease_until, id)
     WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS idx_announce_work_status_reason
     ON announce_work (status, reason);

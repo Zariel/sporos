@@ -3189,6 +3189,24 @@ impl Repository {
     }
 
     pub async fn expire_announce_work(&self, now_ms: i64) -> Result<u64, DatabaseError> {
+        self.expire_announce_work_batch_limit(now_ms, i64::MAX)
+            .await
+    }
+
+    pub async fn expire_announce_work_batch(
+        &self,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        self.expire_announce_work_batch_limit(now_ms, i64::from(limit))
+            .await
+    }
+
+    async fn expire_announce_work_batch_limit(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<u64, DatabaseError> {
         let result = sqlx::query(
             r#"
             UPDATE announce_work
@@ -3200,13 +3218,20 @@ impl Repository {
                 cookie = NULL,
                 lease_owner = NULL,
                 lease_until = NULL
-            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
-              AND expires_at <= ?
+            WHERE id IN (
+                SELECT id
+                FROM announce_work INDEXED BY idx_announce_work_expires_at
+                WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+                  AND expires_at <= ?
+                ORDER BY expires_at, id
+                LIMIT ?
+            )
             "#,
         )
         .bind(now_ms)
         .bind(now_ms)
         .bind(now_ms)
+        .bind(limit)
         .execute(&self.pool)
         .await
         .map_err(|error| db_error("expire announce work", error))?;
@@ -3305,6 +3330,24 @@ impl Repository {
     }
 
     pub async fn recover_stale_announce_leases(&self, now_ms: i64) -> Result<u64, DatabaseError> {
+        self.recover_stale_announce_leases_batch_limit(now_ms, i64::MAX)
+            .await
+    }
+
+    pub async fn recover_stale_announce_leases_batch(
+        &self,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        self.recover_stale_announce_leases_batch_limit(now_ms, i64::from(limit))
+            .await
+    }
+
+    async fn recover_stale_announce_leases_batch_limit(
+        &self,
+        now_ms: i64,
+        limit: i64,
+    ) -> Result<u64, DatabaseError> {
         let result = sqlx::query(
             r#"
             UPDATE announce_work
@@ -3313,11 +3356,21 @@ impl Repository {
                 updated_at = ?,
                 lease_owner = NULL,
                 lease_until = NULL
-            WHERE status = 'running' AND lease_until <= ?
+            WHERE id IN (
+                SELECT id
+                FROM announce_work INDEXED BY idx_announce_work_lease_until
+                WHERE status = 'running'
+                  AND lease_until <= ?
+                  AND expires_at > ?
+                ORDER BY lease_until, id
+                LIMIT ?
+            )
             "#,
         )
         .bind(now_ms)
         .bind(now_ms)
+        .bind(now_ms)
+        .bind(limit)
         .execute(&self.pool)
         .await
         .map_err(|error| db_error("recover stale announce leases", error))?;
@@ -8591,6 +8644,91 @@ mod tests {
         assert_announce_fetch_columns_cleared(&repository, work.id.as_str()).await;
     }
 
+    #[tokio::test]
+    async fn announce_expiry_and_lease_recovery_batches_are_bounded() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for index in 0..3 {
+            let mut expired = test_announce_work(
+                &format!("ann_expired_{index}"),
+                &format!("guid-expired-{index}"),
+                index,
+            );
+            expired.expires_at_ms = 10;
+            repository
+                .insert_or_dedupe_announce_work(&expired, 10)
+                .await
+                .unwrap();
+
+            let running = test_announce_work(
+                &format!("ann_running_{index}"),
+                &format!("guid-running-{index}"),
+                index + 10,
+            );
+            repository
+                .insert_or_dedupe_announce_work(&running, 10)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'running',
+                lease_owner = 'worker-1',
+                lease_until = 10,
+                expires_at = CASE
+                    WHEN id = 'ann_running_0' THEN 10
+                    ELSE 20
+                END
+            WHERE id LIKE 'ann_running_%'
+            "#,
+        )
+        .execute(repository.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            2,
+            repository.expire_announce_work_batch(10, 2).await.unwrap()
+        );
+        assert_eq!(
+            2,
+            repository
+                .recover_stale_announce_leases_batch(10, 2)
+                .await
+                .unwrap()
+        );
+        let status_counts =
+            sqlx::query("SELECT status, COUNT(*) AS count FROM announce_work GROUP BY status")
+                .fetch_all(repository.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get::<String, _>("status"), row.get::<i64, _>("count")))
+                .collect::<Vec<_>>();
+
+        assert_eq!(
+            Some(3),
+            status_counts
+                .iter()
+                .find(|(status, _count)| status == "queued")
+                .map(|(_status, count)| *count)
+        );
+        assert_eq!(
+            Some(2),
+            status_counts
+                .iter()
+                .find(|(status, _count)| status == "expired")
+                .map(|(_status, count)| *count)
+        );
+        assert_eq!(
+            Some(1),
+            status_counts
+                .iter()
+                .find(|(status, _count)| status == "running")
+                .map(|(_status, count)| *count)
+        );
+    }
+
     async fn assert_announce_fetch_columns_cleared(repository: &Repository, id: &str) {
         let (download_url, cookie): (Option<String>, Option<String>) =
             sqlx::query_as("SELECT download_url, cookie FROM announce_work WHERE id = ?")
@@ -8896,6 +9034,31 @@ mod tests {
     async fn announce_maintenance_queries_use_ordered_indexes() {
         let repository = Repository::connect_in_memory().await.unwrap();
         for (label, query, index_name) in [
+            (
+                "expiry batch",
+                r#"
+                SELECT id
+                FROM announce_work INDEXED BY idx_announce_work_expires_at
+                WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+                  AND expires_at <= 100
+                ORDER BY expires_at, id
+                LIMIT 100
+                "#,
+                "idx_announce_work_expires_at",
+            ),
+            (
+                "stale lease recovery batch",
+                r#"
+                SELECT id
+                FROM announce_work INDEXED BY idx_announce_work_lease_until
+                WHERE status = 'running'
+                  AND lease_until <= 100
+                  AND expires_at > 100
+                ORDER BY lease_until, id
+                LIMIT 100
+                "#,
+                "idx_announce_work_lease_until",
+            ),
             (
                 "dependency scheduler",
                 r#"

@@ -14,7 +14,7 @@ use sqlx::Row;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::actions::{candidate_output_metadata, save_candidate_torrent};
 use crate::announce::{AnnounceReason, AnnounceWorkId};
@@ -1230,13 +1230,27 @@ async fn execute_scheduled_job(
                     .unwrap_or_else(|| "indexer caps refresh failed".to_owned()))
             }
         }
-        CLEANUP_JOB_NAME => run_scheduled_cleanup_job(&mut shutdown).await,
+        CLEANUP_JOB_NAME => run_scheduled_cleanup_job(state, &shutdown).await,
         other => Err(format!("unknown scheduled job {other}")),
     }
 }
 
-async fn run_scheduled_cleanup_job(shutdown: &mut ShutdownSignal) -> Result<(), String> {
+async fn run_scheduled_cleanup_job(
+    state: &AppState,
+    shutdown: &ShutdownSignal,
+) -> Result<(), String> {
     if shutdown.state().phase == ShutdownPhase::Running {
+        let summary = state
+            .announce_worker
+            .run_scheduled_cleanup(unix_time_ms(), shutdown)
+            .await
+            .map_err(|error| error.to_string())?;
+        info!(
+            expired = summary.expired,
+            retained_deleted = summary.retained_deleted,
+            recovered_leases = summary.recovered_leases,
+            "scheduled cleanup completed"
+        );
         Ok(())
     } else {
         Err(SCHEDULER_SHUTDOWN_ERROR.to_owned())
@@ -3181,6 +3195,7 @@ mod tests {
         let runtime = AppRuntime::from_repository(config, repository.clone())
             .await
             .unwrap();
+        insert_cleanup_fixture_rows(&repository).await;
         let shutdown = runtime.state.shutdown.clone();
         let job_queue = runtime.state.queues.workflow.jobs.clone();
         let scheduler_queue = runtime.state.queues.scheduler.clone();
@@ -3215,6 +3230,27 @@ mod tests {
         assert!(cleanup.last_finished_at_ms.is_some());
         assert!(cleanup.next_run_at_ms.is_some());
         assert_eq!(None, cleanup.last_error);
+        let rows = sqlx::query("SELECT id, status, reason FROM announce_work ORDER BY id")
+            .fetch_all(repository.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("id"),
+                    row.get::<String, _>("status"),
+                    row.get::<String, _>("reason"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![(
+                "ann_running".to_owned(),
+                "queued".to_owned(),
+                "dependency_backoff".to_owned()
+            )],
+            rows
+        );
         assert_eq!(0, job_queue.stats().depth);
         assert_eq!(0, scheduler_queue.stats().depth);
     }
@@ -4481,6 +4517,76 @@ mod tests {
         .bind(download_url)
         .bind(now_ms)
         .bind(expires_at_ms)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn insert_cleanup_fixture_rows(repository: &Repository) {
+        insert_announce_row(
+            repository,
+            &AnnounceWorkId::new("ann_expired").unwrap(),
+            "guid-expired",
+            "tracker.example",
+            "https://indexer.example/download/guid-expired",
+        )
+        .await;
+        insert_announce_row(
+            repository,
+            &AnnounceWorkId::new("ann_running").unwrap(),
+            "guid-running",
+            "tracker.example",
+            "https://indexer.example/download/guid-running",
+        )
+        .await;
+        insert_announce_row(
+            repository,
+            &AnnounceWorkId::new("ann_success_old").unwrap(),
+            "guid-success-old",
+            "tracker.example",
+            "https://indexer.example/download/guid-success-old",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'expired',
+                reason = 'expired',
+                finished_at = 0,
+                expires_at = 0
+            WHERE id = 'ann_expired'
+            "#,
+        )
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'running',
+                reason = 'accepted',
+                lease_owner = 'old-worker',
+                lease_until = 0,
+                next_attempt_at = ?,
+                expires_at = ?
+            WHERE id = 'ann_running'
+            "#,
+        )
+        .bind(unix_time_ms().saturating_add(100_000))
+        .bind(unix_time_ms().saturating_add(100_000))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'succeeded',
+                reason = 'saved',
+                finished_at = 0,
+                expires_at = 0
+            WHERE id = 'ann_success_old'
+            "#,
+        )
         .execute(repository.pool())
         .await
         .unwrap();

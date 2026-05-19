@@ -65,6 +65,13 @@ pub struct AnnounceStartupSummary {
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct AnnounceMaintenanceSummary {
+    pub expired: u64,
+    pub retained_deleted: u64,
+    pub recovered_leases: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct AnnounceWorkerSummary {
     pub claimed: usize,
     pub completed: usize,
@@ -194,6 +201,7 @@ pub enum AnnounceWorkflowResult {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AnnounceWorkerError {
     InvalidConfig { message: String },
+    Shutdown,
     Database { source: DatabaseError },
 }
 
@@ -522,6 +530,64 @@ impl AnnounceWorker {
         })
     }
 
+    pub async fn run_scheduled_cleanup(
+        &self,
+        now_ms: i64,
+        shutdown: &ShutdownSignal,
+    ) -> Result<AnnounceMaintenanceSummary, AnnounceWorkerError> {
+        let _span = info_span!("announce.scheduled_cleanup", now_ms);
+        let batch_size = self.config.retention_cleanup_batch_size;
+        let max_batches = self.config.retention_cleanup_max_batches.max(1);
+        ensure_cleanup_running(shutdown)?;
+        let expired = self
+            .run_batched_cleanup(shutdown, batch_size, max_batches, || {
+                self.repository
+                    .expire_announce_work_batch(now_ms, batch_size)
+            })
+            .await?;
+        ensure_cleanup_running(shutdown)?;
+        let retained_deleted = self
+            .cleanup_retained_until_shutdown(now_ms, true, shutdown)
+            .await?;
+        ensure_cleanup_running(shutdown)?;
+        let recovered_leases = self
+            .run_batched_cleanup(shutdown, batch_size, max_batches, || {
+                self.repository
+                    .recover_stale_announce_leases_batch(now_ms, batch_size)
+            })
+            .await?;
+
+        Ok(AnnounceMaintenanceSummary {
+            expired,
+            retained_deleted,
+            recovered_leases,
+        })
+    }
+
+    async fn run_batched_cleanup<F, Fut>(
+        &self,
+        shutdown: &ShutdownSignal,
+        batch_size: u16,
+        max_batches: u16,
+        mut cleanup: F,
+    ) -> Result<u64, AnnounceWorkerError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<u64, DatabaseError>>,
+    {
+        let mut affected = 0_u64;
+        for _ in 0..max_batches {
+            ensure_cleanup_running(shutdown)?;
+            let batch_affected = cleanup().await?;
+            affected = affected.saturating_add(batch_affected);
+            if batch_affected < u64::from(batch_size) {
+                break;
+            }
+        }
+
+        Ok(affected)
+    }
+
     pub async fn claim_ready(
         &self,
         now_ms: i64,
@@ -555,15 +621,50 @@ impl AnnounceWorker {
     }
 
     async fn cleanup_retained(&self, now_ms: i64, force: bool) -> Result<u64, AnnounceWorkerError> {
+        self.cleanup_retained_inner(now_ms, force, None).await
+    }
+
+    async fn cleanup_retained_until_shutdown(
+        &self,
+        now_ms: i64,
+        force: bool,
+        shutdown: &ShutdownSignal,
+    ) -> Result<u64, AnnounceWorkerError> {
+        self.cleanup_retained_inner(now_ms, force, Some(shutdown))
+            .await
+    }
+
+    async fn cleanup_retained_inner(
+        &self,
+        now_ms: i64,
+        force: bool,
+        shutdown: Option<&ShutdownSignal>,
+    ) -> Result<u64, AnnounceWorkerError> {
         let Some(previous_cleanup_ms) = self.start_retention_cleanup(now_ms, force) else {
             return Ok(0);
         };
+        if let Some(shutdown) = shutdown
+            && let Err(error) = ensure_cleanup_running(shutdown)
+        {
+            self.retention_cleanup
+                .last_cleanup_ms
+                .store(previous_cleanup_ms, Ordering::Release);
+            return Err(error);
+        }
         let success_cutoff_ms = now_ms.saturating_sub(duration_ms(self.config.success_retention));
         let failure_cutoff_ms = now_ms.saturating_sub(duration_ms(self.config.failure_retention));
         let mut deleted = 0_u64;
         let batch_size = self.config.retention_cleanup_batch_size;
         let max_batches = self.config.retention_cleanup_max_batches.max(1);
         for _ in 0..max_batches {
+            if let Some(shutdown) = shutdown
+                && let Err(error) = ensure_cleanup_running(shutdown)
+            {
+                self.retention_cleanup
+                    .last_cleanup_ms
+                    .store(previous_cleanup_ms, Ordering::Release);
+                return Err(error);
+            }
             let batch_deleted = match self
                 .repository
                 .cleanup_terminal_announce_work(success_cutoff_ms, failure_cutoff_ms, batch_size)
@@ -837,12 +938,21 @@ impl fmt::Display for AnnounceWorkerError {
             Self::InvalidConfig { message } => {
                 write!(formatter, "invalid announce worker config: {message}")
             }
+            Self::Shutdown => formatter.write_str("scheduler is shutting down"),
             Self::Database { source } => write!(formatter, "{source}"),
         }
     }
 }
 
 impl std::error::Error for AnnounceWorkerError {}
+
+fn ensure_cleanup_running(shutdown: &ShutdownSignal) -> Result<(), AnnounceWorkerError> {
+    if shutdown.state().phase == ShutdownPhase::Running {
+        Ok(())
+    } else {
+        Err(AnnounceWorkerError::Shutdown)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1056,6 +1166,74 @@ mod tests {
             summary
         );
         assert!(announce_ids(&repository).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_cleanup_expires_recovers_and_deletes_retained_work() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut config = test_config();
+        config.success_retention_secs = 10;
+        config.failure_retention_secs = 20;
+        insert_work(&repository, "ann_expired", "guid-expired", 1).await;
+        insert_work(&repository, "ann_running", "guid-running", 1).await;
+        repository
+            .claim_announce_work("old-worker", 2, 3, 2)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE announce_work SET expires_at = ? WHERE id = 'ann_running'")
+            .bind(200_000_i64)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        insert_terminal_work(
+            &repository,
+            "ann_success_old",
+            "guid-success-old",
+            AnnounceStatus::Succeeded,
+            AnnounceReason::Saved,
+            89_000,
+        )
+        .await;
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        let (_controller, signal) = shutdown_channel();
+
+        let summary = worker
+            .run_scheduled_cleanup(100_000, &signal)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            AnnounceMaintenanceSummary {
+                expired: 1,
+                retained_deleted: 1,
+                recovered_leases: 1,
+            },
+            summary
+        );
+        assert_eq!(
+            vec![
+                ("expired".to_owned(), "expired".to_owned()),
+                ("queued".to_owned(), "dependency_backoff".to_owned()),
+            ],
+            status_rows(&repository).await
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_cleanup_reports_shutdown_before_work() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_expired", "guid-expired", 1).await;
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+        let (controller, signal) = shutdown_channel();
+        controller.cancel_now("test shutdown").unwrap();
+
+        let result = worker.run_scheduled_cleanup(100_000, &signal).await;
+
+        assert!(matches!(result, Err(AnnounceWorkerError::Shutdown)));
+        assert_eq!(
+            vec![("queued".to_owned(), "accepted".to_owned())],
+            status_rows(&repository).await
+        );
     }
 
     #[tokio::test]
