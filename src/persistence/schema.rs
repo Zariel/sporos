@@ -89,6 +89,9 @@ CREATE TABLE IF NOT EXISTS remote_candidates (
 
 CREATE INDEX IF NOT EXISTS idx_remote_candidates_info_hash
     ON remote_candidates (info_hash);
+CREATE INDEX IF NOT EXISTS idx_remote_candidates_info_hash_seen
+    ON remote_candidates (info_hash, last_seen_at DESC, id)
+    WHERE info_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_remote_candidates_last_seen_at
     ON remote_candidates (last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_remote_candidates_title
@@ -111,6 +114,8 @@ CREATE INDEX IF NOT EXISTS idx_match_decisions_decision_assessed_at
     ON match_decisions (decision, assessed_at);
 CREATE INDEX IF NOT EXISTS idx_match_decisions_candidate_id
     ON match_decisions (candidate_id);
+CREATE INDEX IF NOT EXISTS idx_match_decisions_local_assessed
+    ON match_decisions (local_item_id, assessed_at DESC, candidate_id);
 
 CREATE TABLE IF NOT EXISTS indexers (
     id INTEGER PRIMARY KEY,
@@ -323,7 +328,9 @@ mod tests {
             "PRIMARY KEY (item_id, file_index)",
             "UNIQUE (indexer_id, guid)",
             "redacted_download_url TEXT NOT NULL",
+            "idx_remote_candidates_info_hash_seen",
             "PRIMARY KEY (local_item_id, candidate_id)",
+            "idx_match_decisions_local_assessed",
             "UNIQUE (name)",
             "UNIQUE (source_kind, source_name, source_indexer_id)",
             "idx_indexers_enabled_name",

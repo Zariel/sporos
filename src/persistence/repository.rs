@@ -9222,6 +9222,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_and_decision_history_queries_use_ordered_indexes() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (label, query, index_name, expected_search) in [
+            (
+                "candidate info-hash history",
+                r#"
+                SELECT id, indexer_id, guid, redacted_download_url, title, info_hash, torrent_cache_path
+                FROM remote_candidates
+                WHERE info_hash = '0123456789abcdef0123456789abcdef01234567'
+                ORDER BY last_seen_at DESC, id
+                LIMIT 100
+                "#,
+                "idx_remote_candidates_info_hash_seen",
+                "info_hash=?",
+            ),
+            (
+                "local match-decision history",
+                r#"
+                SELECT candidate_id, decision, matched_size, matched_ratio, reason_code, assessed_at
+                FROM match_decisions
+                WHERE local_item_id = 1
+                ORDER BY assessed_at DESC, candidate_id
+                LIMIT 100
+                "#,
+                "idx_match_decisions_local_assessed",
+                "local_item_id=?",
+            ),
+        ] {
+            let plan = explain_query_plan_raw(&repository, query).await;
+
+            assert!(
+                !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+                "{label} should not sort with a temp b-tree: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(index_name)),
+                "{label} should use {index_name}: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(expected_search)),
+                "{label} should constrain the targeted index with {expected_search}: {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn active_announce_status_counts_keep_global_top_limit() {
         let repository = Repository::connect_in_memory().await.unwrap();
         for index in 0..3 {
