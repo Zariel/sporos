@@ -35,7 +35,9 @@ use crate::inventory_refresh::{
 };
 use crate::metrics::{ExternalOperation, ExternalOutcome, MetricsRegistry, ProwlarrRefreshOutcome};
 use crate::notifications::{NotificationJob, notification_queue};
-use crate::persistence::repository::{IndexerRegistryRow, IndexerSearchCapsRow, Repository};
+use crate::persistence::repository::{
+    DependencyHealthSnapshot, IndexerRegistryRow, IndexerSearchCapsRow, Repository,
+};
 use crate::runtime::announce_worker::AnnounceWorker;
 use crate::runtime::backoff::stable_jitter_seed;
 use crate::runtime::health::{DependencyKind, HealthRegistry};
@@ -181,7 +183,15 @@ impl AppState {
         &self,
         now_ms: i64,
     ) -> Result<ProwlarrRefreshSummary, DatabaseError> {
-        let persisted = self.repository.dependency_health_snapshot(1_000).await?;
+        let source_names = self
+            .prowlarr_sources
+            .values()
+            .map(|source| source.source.name.clone())
+            .collect::<Vec<_>>();
+        let persisted = self
+            .repository
+            .dependency_health_for_type_names("prowlarr", &source_names)
+            .await?;
         let mut sources = Vec::new();
         let mut summary = ProwlarrRefreshSummary::default();
         for source in self.prowlarr_sources.values() {
@@ -839,7 +849,24 @@ impl AppRuntime {
             .iter()
             .map(ArrEndpoint::from_configured)
             .collect::<Vec<_>>();
-        let persisted_health = repository.dependency_health_snapshot(1_000).await?;
+        let arr_names = arr_endpoints
+            .iter()
+            .map(|endpoint| endpoint.name.clone())
+            .collect::<Vec<_>>();
+        let prowlarr_names = runtime_config
+            .prowlarr_sources
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut persisted_health = repository
+            .dependency_health_for_type_names("arr", &arr_names)
+            .await?;
+        persisted_health.extend(
+            repository
+                .dependency_health_for_type_names("prowlarr", &prowlarr_names)
+                .await?,
+        );
+        persisted_health.extend(repository.dependency_health_for_indexer_registry().await?);
         seed_runtime_health(&health, &persisted_health);
         seed_arr_endpoint_backoff(&mut arr_endpoints, &persisted_health, now_ms);
         let search_planner = RuntimeSearchPlanner::new(
@@ -1118,10 +1145,7 @@ fn looks_like_season_token(token: &str) -> bool {
         && chars.all(|character| character.is_ascii_digit())
 }
 
-fn seed_runtime_health(
-    health: &HealthRegistry,
-    rows: &[crate::persistence::repository::DependencyHealthSnapshot],
-) {
+fn seed_runtime_health(health: &HealthRegistry, rows: &[DependencyHealthSnapshot]) {
     for row in rows {
         let kind = match row.dependency_type.as_str() {
             "arr" => DependencyKind::Arr,
@@ -1853,8 +1877,8 @@ mod tests {
     };
     use crate::http::router;
     use crate::indexers::{
-        ApiKeySource, CategoryCaps, ProwlarrIndexer, SanitizedTorznabUrl, SearchCaps, TorznabCaps,
-        TorznabLimits,
+        ApiKeySource, CategoryCaps, ConfiguredTorznabIndexer, ProwlarrIndexer, SanitizedTorznabUrl,
+        SearchCaps, TorznabCaps, TorznabLimits,
     };
     use crate::metrics::ExternalOutcome;
     use crate::secrets::{ApiKey, ApiToken};
@@ -2155,6 +2179,155 @@ mod tests {
         assert_eq!(1, backed_off.skipped_backoff);
         assert_eq!(1, retried.refreshed);
         assert_eq!(1, requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn runtime_periodic_prowlarr_refresh_targets_health_after_many_rows() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let prowlarr_url = spawn_runtime_prowlarr_server(
+            Arc::clone(&requests),
+            StatusCode::OK,
+            prowlarr_catalog(),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config(prowlarr_url, false, false, "24h"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for index in 0..1_001 {
+            let name = DependencyName::new(format!("arr{index:04}")).unwrap();
+            repository
+                .record_dependency_health(
+                    "arr",
+                    &name,
+                    &DependencyState::Degraded {
+                        reason: ReasonText::new("down").unwrap(),
+                        retry_after_ms: Some(60_000),
+                    },
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        let source = DependencyName::new("main").unwrap();
+        repository
+            .record_dependency_health(
+                "prowlarr",
+                &source,
+                &DependencyState::Unavailable {
+                    reason: ReasonText::new("down").unwrap(),
+                    retry_after_ms: Some(1_000),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let backed_off = runtime
+            .state
+            .refresh_due_prowlarr_sources(999)
+            .await
+            .unwrap();
+
+        assert_eq!(1, backed_off.skipped_backoff);
+        assert_eq!(0, requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_seeds_only_configured_dependency_health() {
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: "https://indexer.example/api".to_owned(),
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        config.indexers.arr.radarr.insert(
+            "main".to_owned(),
+            ArrInstanceConfig {
+                url: "https://radarr.example".to_owned(),
+                api_key: Some(ApiKey::new("arr-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut disabled_indexers = Vec::new();
+        for index in 0..1_001 {
+            let name = DependencyName::new(format!("indexer{index:04}")).unwrap();
+            disabled_indexers.push(ConfiguredTorznabIndexer {
+                name: name.clone(),
+                url: SanitizedTorznabUrl::new(format!("https://indexer{index:04}.example/api"))
+                    .unwrap(),
+                api_key: None,
+                api_key_source: ApiKeySource::Missing,
+                enabled: false,
+            });
+            repository
+                .record_dependency_health(
+                    "indexer",
+                    &name,
+                    &DependencyState::Unavailable {
+                        reason: ReasonText::new("stale").unwrap(),
+                        retry_after_ms: Some(60_000),
+                    },
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        repository
+            .sync_torznab_indexers(&disabled_indexers, 100)
+            .await
+            .unwrap();
+        repository
+            .record_dependency_health(
+                "arr",
+                &DependencyName::new("radarr-main").unwrap(),
+                &DependencyState::Degraded {
+                    reason: ReasonText::new("rate limited").unwrap(),
+                    retry_after_ms: Some(1_000),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        repository
+            .record_dependency_health(
+                "indexer",
+                &DependencyName::new("main").unwrap(),
+                &DependencyState::Degraded {
+                    reason: ReasonText::new("indexer backoff").unwrap(),
+                    retry_after_ms: Some(2_000),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let health = runtime.state.health.snapshot();
+
+        assert_eq!(2, health.entries.len());
+        assert!(health.entries.iter().any(|entry| {
+            entry.key.kind == DependencyKind::Arr && entry.key.name.as_str() == "radarr-main"
+        }));
+        assert!(health.entries.iter().any(|entry| {
+            entry.key.kind == DependencyKind::Indexer && entry.key.name.as_str() == "main"
+        }));
+        assert!(!health.entries.iter().any(|entry| {
+            entry.key.kind == DependencyKind::Indexer && entry.key.name.as_str() == "indexer0000"
+        }));
     }
 
     #[tokio::test]

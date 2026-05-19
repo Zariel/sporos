@@ -1786,21 +1786,77 @@ impl Repository {
         .map_err(|error| db_error("read dependency health snapshot", error))?;
 
         rows.into_iter()
-            .map(|row| {
-                Ok(DependencyHealthSnapshot {
-                    dependency_type: row.get("dependency_type"),
-                    dependency_name: DependencyName::new(row.get::<String, _>("dependency_name"))
-                        .map_err(|error| DatabaseError::QueryFailed {
-                        operation: "read dependency name".to_owned(),
-                        message: error.to_string(),
-                    })?,
-                    state: row.get("state"),
-                    reason: row.get("reason"),
-                    retry_after_ms: row.get("retry_after"),
-                    failure_count: failure_count_from_i64(row.get("failure_count"))?,
-                    checked_at_ms: row.get("checked_at"),
-                })
-            })
+            .map(dependency_health_snapshot_from_row)
+            .collect()
+    }
+
+    pub async fn dependency_health_for_type_names(
+        &self,
+        dependency_type: &str,
+        dependency_names: &[DependencyName],
+    ) -> Result<Vec<DependencyHealthSnapshot>, DatabaseError> {
+        if dependency_names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::new(
+            r#"
+            SELECT dependency_type, dependency_name, state, reason, retry_after, failure_count,
+                   checked_at
+            FROM dependency_health
+            WHERE dependency_type = 
+            "#,
+        );
+        query.push_bind(dependency_type);
+        query.push(" AND dependency_name IN (");
+        let mut separated = query.separated(", ");
+        for dependency_name in dependency_names {
+            separated.push_bind(dependency_name.as_str());
+        }
+        separated.push_unseparated(
+            r#")
+            ORDER BY dependency_type, dependency_name
+            "#,
+        );
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("read dependency health by names", error))?;
+
+        rows.into_iter()
+            .map(dependency_health_snapshot_from_row)
+            .collect()
+    }
+
+    pub async fn dependency_health_for_indexer_registry(
+        &self,
+    ) -> Result<Vec<DependencyHealthSnapshot>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                health.dependency_type,
+                health.dependency_name,
+                health.state,
+                health.reason,
+                health.retry_after,
+                health.failure_count,
+                health.checked_at
+            FROM indexers INDEXED BY idx_indexers_enabled_name
+            INNER JOIN dependency_health AS health
+                ON health.dependency_type = 'indexer'
+               AND health.dependency_name = indexers.name
+            WHERE indexers.enabled = 1
+            ORDER BY indexers.name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read indexer registry dependency health", error))?;
+
+        rows.into_iter()
+            .map(dependency_health_snapshot_from_row)
             .collect()
     }
 
@@ -5531,6 +5587,25 @@ fn failure_count_from_i64(value: i64) -> Result<u16, DatabaseError> {
     u16::try_from(value).map_err(|error| DatabaseError::QueryFailed {
         operation: "read dependency failure count".to_owned(),
         message: error.to_string(),
+    })
+}
+
+fn dependency_health_snapshot_from_row(
+    row: SqliteRow,
+) -> Result<DependencyHealthSnapshot, DatabaseError> {
+    Ok(DependencyHealthSnapshot {
+        dependency_type: row.get("dependency_type"),
+        dependency_name: DependencyName::new(row.get::<String, _>("dependency_name")).map_err(
+            |error| DatabaseError::QueryFailed {
+                operation: "read dependency name".to_owned(),
+                message: error.to_string(),
+            },
+        )?,
+        state: row.get("state"),
+        reason: row.get("reason"),
+        retry_after_ms: row.get("retry_after"),
+        failure_count: failure_count_from_i64(row.get("failure_count"))?,
+        checked_at_ms: row.get("checked_at"),
     })
 }
 
@@ -9265,6 +9340,49 @@ mod tests {
                 "{label} should constrain the targeted index with {expected_search}: {plan:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn startup_indexer_health_query_uses_enabled_registry_index() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let query = r#"
+            SELECT
+                health.dependency_type,
+                health.dependency_name,
+                health.state,
+                health.reason,
+                health.retry_after,
+                health.failure_count,
+                health.checked_at
+            FROM indexers INDEXED BY idx_indexers_enabled_name
+            INNER JOIN dependency_health AS health
+                ON health.dependency_type = 'indexer'
+               AND health.dependency_name = indexers.name
+            WHERE indexers.enabled = 1
+            ORDER BY indexers.name
+            "#;
+        let plan = explain_query_plan_raw(&repository, query).await;
+
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN dependency_health")),
+            "startup indexer health should not scan dependency_health: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+            "startup indexer health should not sort with a temp b-tree: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_indexers_enabled_name")),
+            "startup indexer health should start from enabled indexers: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("sqlite_autoindex_dependency_health_1")),
+            "startup indexer health should probe dependency_health by primary key: {plan:?}"
+        );
     }
 
     #[tokio::test]
