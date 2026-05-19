@@ -100,5 +100,4 @@ by the workflow before any client mutation is attempted again.
 
 Sporos uses SQLite as the durable local state store. Run one writer instance for
 the same database file. In Kubernetes, mount the state database on persistent
-storage and avoid running multiple replicas against the same SQLite file unless
-a future release explicitly documents that deployment mode.
+storage and avoid running multiple replicas against the same SQLite file.
