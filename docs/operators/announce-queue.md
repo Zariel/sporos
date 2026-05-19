@@ -65,6 +65,13 @@ retained for `announce.failure_retention_secs`. Retention is for operator
 visibility and dedupe history. It is not a source of retry behavior after a
 terminal state.
 
+The scheduled `cleanup` job applies these bounds. It recovers stale running
+leases whose lease deadline has passed, expires active work past its TTL, and
+removes retained terminal work after the configured retention window. The job is
+bounded per run so cleanup cannot monopolize the daemon. Configure its cadence
+with `[scheduling].cleanup_interval`, which defaults to `24h`, or queue an
+immediate run with `POST /v1/jobs/cleanup/runs`.
+
 ## Retry And Waiting Reasons
 
 Workers distinguish waiting from retryable failures:

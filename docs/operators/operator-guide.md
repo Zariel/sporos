@@ -1,9 +1,8 @@
 # Sporos Operator Guide
 
-This guide covers the supported Rust-native operator surface: TOML
-configuration, `SPOROS__` environment overrides, local state paths, HTTP probes,
-metrics, and day-two operation. It does not require compatibility with earlier
-source layouts or configuration formats.
+This guide covers the supported operator surface: TOML configuration,
+`SPOROS__` environment overrides, local state paths, HTTP probes, metrics, and
+day-two operation.
 
 ## Commands
 
@@ -157,8 +156,7 @@ success_retention_secs = 604800
 failure_retention_secs = 1209600
 ```
 
-Supported torrent clients are qBittorrent and rTorrent. Transmission and
-Deluge are outside the initial Rust rewrite scope.
+Supported torrent clients are qBittorrent and rTorrent.
 
 Supported indexers are Torznab-compatible endpoints. Put API keys in
 `api_key_file`, `api_key_env`, or development-only `api_key`; do not put API
@@ -207,13 +205,14 @@ daemon refresh waits for the configured interval plus deterministic jitter.
 `required = false` records the source as degraded and lets Sporos continue so
 operators can fix Prowlarr without restarting the service.
 
-Only enabled Prowlarr indexers whose protocol is `torrent` and which support RSS
-or search are imported. Tag filters apply before import. With `tags = []`, all
+Only enabled Prowlarr indexers whose protocol is `torrent` and which support
+search are imported. Tag filters apply before import. With `tags = []`, all
 tagged indexers are imported and `include_untagged` decides whether untagged
-indexers are also imported. With configured tags, `tag_match = "any"` imports an
-indexer that has at least one configured tag, while `tag_match = "all"` requires
-every configured tag. Prowlarr may return numeric tag IDs; Sporos resolves tag
-labels when needed, and numeric tag IDs can also be configured directly.
+indexers are also imported. With configured tags, `tag_match = "any"` imports
+an indexer that has at least one configured tag, while `tag_match = "all"`
+requires every configured tag. Prowlarr may return numeric tag IDs; Sporos
+resolves tag labels when needed, and numeric tag IDs can also be configured
+directly.
 
 Imported indexers keep a stable source identity from the Prowlarr source name
 and Prowlarr indexer id, so Prowlarr renames update the existing Sporos row
@@ -227,6 +226,30 @@ Prowlarr outages are dependency degradation unless the source is required at
 startup. Failed refreshes update health and retry/backoff state; previously
 imported indexers remain in their last synced state until a later successful
 refresh applies additions, updates, or deactivations.
+
+## Scheduling
+
+The daemon persists supported scheduler jobs in SQLite and enqueues due runs
+through bounded in-memory queues. Supported scheduled jobs are:
+
+- `cleanup`: runs local maintenance for durable announce work, including stale
+  lease recovery, TTL expiry, and retained terminal row cleanup.
+- `indexer_caps`: refreshes imported indexer capability metadata.
+
+`[scheduling].cleanup_interval` controls how often the cleanup job is due. The
+default is `24h`, which is usually enough for low-volume deployments. Shorten
+it when operators need expired or retained announce work removed more quickly;
+lengthen it when status history should remain visible longer and the queue is
+not growing.
+
+`[scheduling].indexer_caps_interval` controls periodic indexer capability
+refresh. `client_inventory_interval` and `saved_retry_interval` control their
+own daemon maintenance loops and are documented in the printed config schema.
+
+Operators can queue an immediate supported job run with
+`POST /v1/jobs/{job_name}/runs`, for example
+`POST /v1/jobs/cleanup/runs`. A posted run updates durable job state and should
+be treated as a mutating operation.
 
 ## Environment Overrides
 
@@ -296,7 +319,7 @@ The service exposes:
   work.
 - `POST /v1/searches`: queues an explicit search workflow.
 - `POST /v1/jobs/{job_name}/runs`: queues a supported scheduler job run.
-  `indexer_caps` is currently the supported daemon job.
+  Supported jobs are `cleanup` and `indexer_caps`.
 
 Workflow endpoints require bearer auth when an API token is configured. Startup
 rejects externally reachable binds without a configured token.
@@ -351,6 +374,11 @@ Labels are intentionally bounded. Do not expect raw titles, request bodies,
 cookies, API keys, or full secret-bearing URLs in metrics.
 
 ## Announce Queue Operations
+
+Sporos is centered on announce/event ingestion, matching, and injection.
+External automation can submit candidate events through
+`POST /v1/announcements`; the daemon then owns matching, retry timing, torrent
+download, saving, and torrent-client injection.
 
 The durable announce API and worker run in the daemon runtime.
 `POST /v1/announcements` validates the request, persists accepted work in
