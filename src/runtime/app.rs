@@ -3639,12 +3639,23 @@ mod tests {
             )
             .await
             .unwrap();
-        let unavailable_job = app
+        let unsupported_rss_job = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/v1/jobs/rss/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cleanup_job_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/cleanup/runs")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3702,7 +3713,8 @@ mod tests {
 
         assert_eq!(StatusCode::ACCEPTED, search.status());
         assert_eq!(StatusCode::ACCEPTED, job_run.status());
-        assert_eq!(StatusCode::NOT_FOUND, unavailable_job.status());
+        assert_eq!(StatusCode::NOT_FOUND, unsupported_rss_job.status());
+        assert_eq!(StatusCode::ACCEPTED, cleanup_job_run.status());
         assert_eq!(StatusCode::NOT_FOUND, unsupported_search_job.status());
         assert_eq!(StatusCode::ACCEPTED, announcement.status());
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());

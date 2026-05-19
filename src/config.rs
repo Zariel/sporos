@@ -241,7 +241,6 @@ impl Default for InventoryConfig {
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulingConfig {
-    pub rss_interval: String,
     pub client_inventory_interval: String,
     pub indexer_caps_interval: String,
     pub saved_retry_interval: String,
@@ -251,7 +250,6 @@ pub struct SchedulingConfig {
 impl Default for SchedulingConfig {
     fn default() -> Self {
         Self {
-            rss_interval: "30m".to_owned(),
             client_inventory_interval: "24h".to_owned(),
             indexer_caps_interval: "24h".to_owned(),
             saved_retry_interval: "30m".to_owned(),
@@ -1261,7 +1259,6 @@ first_search_window_secs = 604800
 media_scan_max_depth = 3
 
 [scheduling]
-rss_interval = "30m"
 client_inventory_interval = "24h"
 indexer_caps_interval = "24h"
 saved_retry_interval = "30m"
@@ -1343,6 +1340,20 @@ mod tests {
 
         assert!(error.to_string().contains("unknown field"));
         assert!(error.to_string().contains("base_dir"));
+    }
+
+    #[test]
+    fn rejects_removed_rss_interval() {
+        let error = parse_config(
+            r#"
+            [scheduling]
+            rss_interval = "30m"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("rss_interval"));
     }
 
     #[test]
@@ -1717,6 +1728,7 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("[indexers.torznab.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[indexers.prowlarr.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[inventory]"));
+        assert!(!CONFIG_SCHEMA.contains("rss_interval"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE"));

@@ -139,7 +139,6 @@ first_search_window_secs = 604800
 media_scan_max_depth = 3
 
 [scheduling]
-rss_interval = "30m"
 client_inventory_interval = "24h"
 indexer_caps_interval = "24h"
 cleanup_interval = "24h"

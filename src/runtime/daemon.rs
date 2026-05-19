@@ -51,7 +51,8 @@ use crate::runtime::injection_worker::{
     InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
 use crate::runtime::scheduler::{
-    INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome, ScheduledJobRun, parse_interval_ms,
+    CLEANUP_JOB_NAME, INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome, ScheduledJobRun,
+    parse_interval_ms,
 };
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
@@ -1229,11 +1230,16 @@ async fn execute_scheduled_job(
                     .unwrap_or_else(|| "indexer caps refresh failed".to_owned()))
             }
         }
-        "rss" | "cleanup" => Err(format!(
-            "scheduled job {} does not have an executor yet",
-            job_name.as_str()
-        )),
+        CLEANUP_JOB_NAME => run_scheduled_cleanup_job(&mut shutdown).await,
         other => Err(format!("unknown scheduled job {other}")),
+    }
+}
+
+async fn run_scheduled_cleanup_job(shutdown: &mut ShutdownSignal) -> Result<(), String> {
+    if shutdown.state().phase == ShutdownPhase::Running {
+        Ok(())
+    } else {
+        Err(SCHEDULER_SHUTDOWN_ERROR.to_owned())
     }
 }
 
@@ -3169,6 +3175,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_tasks_process_posted_cleanup_job_runs() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+        let job_queue = runtime.state.queues.workflow.jobs.clone();
+        let scheduler_queue = runtime.state.queues.scheduler.clone();
+        let app = router(runtime.state.http.clone());
+        let handles = start_background_tasks(runtime).await.unwrap();
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/cleanup/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::ACCEPTED, accepted.status());
+        wait_for_job_state(&repository, CLEANUP_JOB_NAME, "succeeded").await;
+        wait_for_queue_completed(&job_queue, 1).await;
+        wait_for_queue_completed(&scheduler_queue, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let cleanup = jobs
+            .iter()
+            .find(|job| job.name.as_str() == CLEANUP_JOB_NAME)
+            .unwrap();
+        assert_eq!("succeeded", cleanup.state);
+        assert!(cleanup.last_started_at_ms.is_some());
+        assert!(cleanup.last_finished_at_ms.is_some());
+        assert!(cleanup.next_run_at_ms.is_some());
+        assert_eq!(None, cleanup.last_error);
+        assert_eq!(0, job_queue.stats().depth);
+        assert_eq!(0, scheduler_queue.stats().depth);
+    }
+
+    #[tokio::test]
     async fn scheduled_indexer_caps_stops_on_shutdown() {
         let caps_requests = Arc::new(AtomicUsize::new(0));
         let indexer_url =
@@ -3201,6 +3252,43 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+
+        assert_eq!(Err("scheduler is shutting down".to_owned()), result);
+    }
+
+    #[tokio::test]
+    async fn scheduled_cleanup_has_executor() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let result = execute_scheduled_job(
+            &runtime.state,
+            &JobName::new(CLEANUP_JOB_NAME).unwrap(),
+            runtime.state.shutdown_signal.clone(),
+        )
+        .await;
+
+        assert_eq!(Ok(()), result);
+    }
+
+    #[tokio::test]
+    async fn scheduled_cleanup_stops_on_shutdown() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        runtime.state.shutdown.cancel_now("test shutdown").unwrap();
+
+        let result = execute_scheduled_job(
+            &runtime.state,
+            &JobName::new(CLEANUP_JOB_NAME).unwrap(),
+            runtime.state.shutdown_signal.clone(),
+        )
+        .await;
 
         assert_eq!(Err("scheduler is shutting down".to_owned()), result);
     }

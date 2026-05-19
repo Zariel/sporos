@@ -15,9 +15,10 @@ use tokio::sync::Mutex;
 use tracing::{debug_span, info_span};
 
 pub const INDEXER_CAPS_JOB_NAME: &str = "indexer_caps";
+pub const CLEANUP_JOB_NAME: &str = "cleanup";
 
 pub fn scheduled_job_has_executor(job_name: &JobName) -> bool {
-    job_name.as_str() == INDEXER_CAPS_JOB_NAME
+    matches!(job_name.as_str(), INDEXER_CAPS_JOB_NAME | CLEANUP_JOB_NAME)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -29,13 +30,11 @@ pub struct SchedulerConfig {
 
 impl SchedulerConfig {
     pub fn from_scheduling_config(config: &SchedulingConfig) -> Result<Self, SchedulerError> {
-        parse_interval_ms(&config.rss_interval)?;
-        parse_interval_ms(&config.cleanup_interval)?;
         Ok(Self {
-            jobs: vec![ScheduledJob::new(
-                INDEXER_CAPS_JOB_NAME,
-                &config.indexer_caps_interval,
-            )?],
+            jobs: vec![
+                ScheduledJob::new(CLEANUP_JOB_NAME, &config.cleanup_interval)?,
+                ScheduledJob::new(INDEXER_CAPS_JOB_NAME, &config.indexer_caps_interval)?,
+            ],
             claim_limit: 16,
             failure_backoff_ms: 60_000,
         })
@@ -494,7 +493,7 @@ mod tests {
         assert_eq!(2, summary.seeded);
         assert_eq!(2, summary.enqueued);
         assert_eq!("cleanup", first.job_name.as_str());
-        assert_eq!("rss", second.job_name.as_str());
+        assert_eq!(INDEXER_CAPS_JOB_NAME, second.job_name.as_str());
         assert!(jobs.iter().all(|job| job.state == "running"));
     }
 
@@ -522,21 +521,24 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let (queue, _receiver) = scheduler_queue(nonzero(4));
         let scheduler = PersistedScheduler::new(repository.clone(), queue, test_config());
-        let rss = JobName::new("rss").unwrap();
+        let indexer_caps = JobName::new(INDEXER_CAPS_JOB_NAME).unwrap();
         let cleanup = JobName::new("cleanup").unwrap();
 
         scheduler.tick(100).await.unwrap();
-        scheduler.complete_success(&rss, 200).await.unwrap();
+        scheduler
+            .complete_success(&indexer_caps, 200)
+            .await
+            .unwrap();
         scheduler
             .complete_failure(&cleanup, 250, "temporary failure")
             .await
             .unwrap();
         let jobs = repository.job_status_snapshot(10).await.unwrap();
-        let rss_job = jobs.iter().find(|job| job.name == rss).unwrap();
+        let indexer_caps_job = jobs.iter().find(|job| job.name == indexer_caps).unwrap();
         let cleanup_job = jobs.iter().find(|job| job.name == cleanup).unwrap();
 
-        assert_eq!("succeeded", rss_job.state);
-        assert_eq!(Some(1_200), rss_job.next_run_at_ms);
+        assert_eq!("succeeded", indexer_caps_job.state);
+        assert_eq!(Some(1_200), indexer_caps_job.next_run_at_ms);
         assert_eq!("failed", cleanup_job.state);
         assert_eq!(Some(60_250), cleanup_job.next_run_at_ms);
         assert_eq!(Some("temporary failure".to_owned()), cleanup_job.last_error);
@@ -547,12 +549,12 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let (queue, _receiver) = scheduler_queue(nonzero(4));
         let scheduler = PersistedScheduler::new(repository, queue, test_config());
-        let rss = JobName::new("rss").unwrap();
+        let cleanup = JobName::new(CLEANUP_JOB_NAME).unwrap();
 
-        assert!(scheduler.trigger_now(&rss, 100).await.unwrap());
-        assert!(!scheduler.trigger_now(&rss, 100).await.unwrap());
+        assert!(scheduler.trigger_now(&cleanup, 100).await.unwrap());
+        assert!(!scheduler.trigger_now(&cleanup, 100).await.unwrap());
         scheduler.tick(100).await.unwrap();
-        assert!(!scheduler.trigger_now(&rss, 100).await.unwrap());
+        assert!(!scheduler.trigger_now(&cleanup, 100).await.unwrap());
     }
 
     #[tokio::test]
@@ -560,14 +562,17 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let (queue, mut receiver) = scheduler_queue(nonzero(4));
         let scheduler = PersistedScheduler::new(repository.clone(), queue, test_config());
-        let rss = JobName::new("rss").unwrap();
+        let cleanup = JobName::new(CLEANUP_JOB_NAME).unwrap();
 
-        let outcome = scheduler.enqueue_immediate_run(&rss, 100).await.unwrap();
+        let outcome = scheduler
+            .enqueue_immediate_run(&cleanup, 100)
+            .await
+            .unwrap();
         let run = receiver.recv().await.unwrap();
         let jobs = repository.job_status_snapshot(10).await.unwrap();
 
         assert_eq!(ImmediateRunOutcome::Queued, outcome);
-        assert_eq!("rss", run.job_name.as_str());
+        assert_eq!(CLEANUP_JOB_NAME, run.job_name.as_str());
         assert_eq!(1, jobs.len());
         assert_eq!("running", jobs[0].state);
     }
@@ -580,16 +585,16 @@ mod tests {
             repository.clone(),
             queue.clone(),
             SchedulerConfig {
-                jobs: vec![ScheduledJob::new("rss", "1s").unwrap()],
+                jobs: vec![ScheduledJob::new(CLEANUP_JOB_NAME, "1s").unwrap()],
                 claim_limit: 10,
                 failure_backoff_ms: 60_000,
             },
         );
-        let rss = JobName::new("rss").unwrap();
+        let cleanup = JobName::new(CLEANUP_JOB_NAME).unwrap();
 
         let (tick, immediate) = tokio::join!(
             scheduler.tick(100),
-            scheduler.enqueue_immediate_run(&rss, 100)
+            scheduler.enqueue_immediate_run(&cleanup, 100)
         );
         let tick = tick.unwrap();
         let immediate = immediate.unwrap();
@@ -609,10 +614,13 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let (queue, _receiver) = scheduler_queue(nonzero(1));
         let scheduler = PersistedScheduler::new(repository.clone(), queue, test_config());
-        let rss = JobName::new("rss").unwrap();
+        let indexer_caps = JobName::new(INDEXER_CAPS_JOB_NAME).unwrap();
         let cleanup = JobName::new("cleanup").unwrap();
 
-        scheduler.enqueue_immediate_run(&rss, 100).await.unwrap();
+        scheduler
+            .enqueue_immediate_run(&indexer_caps, 100)
+            .await
+            .unwrap();
         let outcome = scheduler
             .enqueue_immediate_run(&cleanup, 150)
             .await
@@ -644,11 +652,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_disables_unsupported_persisted_jobs() {
+    async fn scheduler_disables_persisted_rss_and_reactivates_cleanup() {
         let repository = Repository::connect_in_memory().await.unwrap();
+        let rss = JobName::new("rss").unwrap();
+        let cleanup = JobName::new(CLEANUP_JOB_NAME).unwrap();
         repository
             .record_job_status(
-                &JobName::new("rss").unwrap(),
+                &rss,
                 JobStateUpdate {
                     state: JobState::Failed,
                     last_started_at_ms: Some(10),
@@ -661,7 +671,7 @@ mod tests {
             .unwrap();
         repository
             .record_job_status(
-                &JobName::new("cleanup").unwrap(),
+                &cleanup,
                 JobStateUpdate {
                     state: JobState::Waiting,
                     last_started_at_ms: Some(30),
@@ -680,23 +690,56 @@ mod tests {
         );
 
         let summary = scheduler.tick(100).await.unwrap();
-        let run = receiver.recv().await.unwrap();
+        let first = receiver.recv().await.unwrap();
+        let second = receiver.recv().await.unwrap();
         let jobs = repository.job_status_snapshot(10).await.unwrap();
-        let rss = jobs.iter().find(|job| job.name.as_str() == "rss").unwrap();
-        let cleanup = jobs
-            .iter()
-            .find(|job| job.name.as_str() == "cleanup")
-            .unwrap();
+        let rss_job = jobs.iter().find(|job| job.name == rss).unwrap();
+        let cleanup_job = jobs.iter().find(|job| job.name == cleanup).unwrap();
 
         assert_eq!(1, summary.seeded);
-        assert_eq!(1, summary.enqueued);
-        assert_eq!(INDEXER_CAPS_JOB_NAME, run.job_name.as_str());
-        assert_eq!("disabled", rss.state);
-        assert_eq!(None, rss.next_run_at_ms);
-        assert_eq!(None, rss.last_error);
-        assert_eq!("disabled", cleanup.state);
-        assert_eq!(None, cleanup.next_run_at_ms);
-        assert_eq!(None, cleanup.last_error);
+        assert_eq!(2, summary.enqueued);
+        assert_eq!(CLEANUP_JOB_NAME, first.job_name.as_str());
+        assert_eq!(INDEXER_CAPS_JOB_NAME, second.job_name.as_str());
+        assert_eq!("disabled", rss_job.state);
+        assert_eq!(None, rss_job.next_run_at_ms);
+        assert_eq!(None, rss_job.last_error);
+        assert_eq!("running", cleanup_job.state);
+        assert_eq!(None, cleanup_job.next_run_at_ms);
+        assert_eq!(None, cleanup_job.last_error);
+    }
+
+    #[tokio::test]
+    async fn scheduler_disables_unknown_persisted_jobs() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let stale = JobName::new("stale_job").unwrap();
+        repository
+            .record_job_status(
+                &stale,
+                JobStateUpdate {
+                    state: JobState::Failed,
+                    last_started_at_ms: Some(10),
+                    last_finished_at_ms: Some(20),
+                    next_run_at_ms: Some(100),
+                    last_error: Some("obsolete job"),
+                },
+            )
+            .await
+            .unwrap();
+        let (queue, _receiver) = scheduler_queue(nonzero(4));
+        let scheduler = PersistedScheduler::new(
+            repository.clone(),
+            queue,
+            SchedulerConfig::from_scheduling_config(&SchedulingConfig::default()).unwrap(),
+        );
+
+        let summary = scheduler.tick(100).await.unwrap();
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let stale_job = jobs.iter().find(|job| job.name == stale).unwrap();
+
+        assert_eq!(2, summary.seeded);
+        assert_eq!("disabled", stale_job.state);
+        assert_eq!(None, stale_job.next_run_at_ms);
+        assert_eq!(None, stale_job.last_error);
     }
 
     #[tokio::test]
@@ -724,13 +767,19 @@ mod tests {
         );
 
         let summary = scheduler.tick(100).await.unwrap();
-        let run = receiver.recv().await.unwrap();
+        let runs = [
+            receiver.recv().await.unwrap(),
+            receiver.recv().await.unwrap(),
+        ];
         let jobs = repository.job_status_snapshot(10).await.unwrap();
         let job = jobs.iter().find(|job| job.name == indexer_caps).unwrap();
 
-        assert_eq!(0, summary.seeded);
-        assert_eq!(1, summary.enqueued);
-        assert_eq!(INDEXER_CAPS_JOB_NAME, run.job_name.as_str());
+        assert_eq!(1, summary.seeded);
+        assert_eq!(2, summary.enqueued);
+        assert!(
+            runs.iter()
+                .any(|run| run.job_name.as_str() == INDEXER_CAPS_JOB_NAME)
+        );
         assert_eq!("running", job.state);
         assert_eq!(None, job.next_run_at_ms);
         assert_eq!(None, job.last_error);
@@ -740,9 +789,11 @@ mod tests {
     fn default_scheduler_jobs_are_executable() {
         let config = SchedulerConfig::from_scheduling_config(&SchedulingConfig::default()).unwrap();
 
-        assert_eq!(1, config.jobs.len());
-        assert_eq!(INDEXER_CAPS_JOB_NAME, config.jobs[0].name.as_str());
+        assert_eq!(2, config.jobs.len());
+        assert_eq!(CLEANUP_JOB_NAME, config.jobs[0].name.as_str());
         assert_eq!(86_400_000, config.jobs[0].interval_ms);
+        assert_eq!(INDEXER_CAPS_JOB_NAME, config.jobs[1].name.as_str());
+        assert_eq!(86_400_000, config.jobs[1].interval_ms);
         assert!(
             config
                 .jobs
@@ -759,16 +810,11 @@ mod tests {
 
     #[test]
     fn scheduler_validates_inactive_config_intervals() {
-        let rss = SchedulingConfig {
-            rss_interval: "0s".to_owned(),
-            ..SchedulingConfig::default()
-        };
         let cleanup = SchedulingConfig {
             cleanup_interval: "1w".to_owned(),
             ..SchedulingConfig::default()
         };
 
-        SchedulerConfig::from_scheduling_config(&rss).unwrap_err();
         SchedulerConfig::from_scheduling_config(&cleanup).unwrap_err();
     }
 
@@ -776,7 +822,7 @@ mod tests {
         SchedulerConfig {
             jobs: vec![
                 ScheduledJob::new("cleanup", "1s").unwrap(),
-                ScheduledJob::new("rss", "1s").unwrap(),
+                ScheduledJob::new(INDEXER_CAPS_JOB_NAME, "1s").unwrap(),
             ],
             claim_limit: 10,
             failure_backoff_ms: 60_000,
