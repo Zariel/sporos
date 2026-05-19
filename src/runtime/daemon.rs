@@ -1,8 +1,3 @@
-#![expect(
-    clippy::indexing_slicing,
-    reason = "mechanical clippy gate enablement leaves daemon indexing cleanup to a linked cleanup bead"
-)]
-
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
@@ -2079,7 +2074,10 @@ async fn stop_background_tasks_with_timeout(mut handles: Vec<BackgroundTask>, ti
     while !handles.is_empty() && Instant::now() < deadline {
         let mut index = 0;
         while index < handles.len() {
-            if handles[index].handle.is_finished() {
+            if handles
+                .get(index)
+                .is_some_and(|task| task.handle.is_finished())
+            {
                 let task = handles.swap_remove(index);
                 await_background_task(task).await;
             } else {

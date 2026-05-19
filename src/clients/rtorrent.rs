@@ -1,7 +1,3 @@
-#![expect(
-    clippy::indexing_slicing,
-    reason = "mechanical clippy gate enablement leaves checked parser field access to linked lint-class beads"
-)]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -564,20 +560,36 @@ pub fn parse_inventory_response(
     for (hash_index, info_hash) in hashes.iter().enumerate() {
         let offset = hash_index.saturating_mul(INVENTORY_METHODS.len());
         let fields = multicall_fields(client, values, offset, INVENTORY_METHODS.len())?;
+        let [
+            name,
+            directory,
+            left_bytes,
+            hashing,
+            complete,
+            is_multi_file,
+            is_active,
+            label,
+        ] = fields.as_slice()
+        else {
+            return Err(bad_response(
+                client,
+                "inventory multicall field count mismatch",
+            ));
+        };
         downloads.push(RtorrentDownload {
             info_hash: info_hash.clone(),
-            name: DisplayName::new(fields[0].as_string(client, "d.name")?)
+            name: DisplayName::new(name.as_string(client, "d.name")?)
                 .map_err(|error| bad_response(client, error.to_string()))?,
-            directory: PathBuf::from(fields[1].as_string(client, "d.directory")?),
+            directory: PathBuf::from(directory.as_string(client, "d.directory")?),
             left_bytes: ByteSize::new(nonnegative_u64(
                 client,
-                fields[2].as_i64(client, "d.left_bytes")?,
+                left_bytes.as_i64(client, "d.left_bytes")?,
             )?),
-            hashing: fields[3].as_bool(client, "d.hashing")?,
-            complete: fields[4].as_bool(client, "d.complete")?,
-            is_multi_file: fields[5].as_bool(client, "d.is_multi_file")?,
-            is_active: fields[6].as_bool(client, "d.is_active")?,
-            label: nonempty_string(fields[7].as_string(client, "d.custom1")?),
+            hashing: hashing.as_bool(client, "d.hashing")?,
+            complete: complete.as_bool(client, "d.complete")?,
+            is_multi_file: is_multi_file.as_bool(client, "d.is_multi_file")?,
+            is_active: is_active.as_bool(client, "d.is_active")?,
+            label: nonempty_string(label.as_string(client, "d.custom1")?),
         });
     }
     Ok(downloads)
@@ -625,11 +637,17 @@ pub fn parse_files_response(
                     "f.multicall row has fewer than two fields",
                 ));
             }
+            let [path, size, ..] = fields else {
+                return Err(bad_response(
+                    client,
+                    "f.multicall row has fewer than two fields",
+                ));
+            };
             TorrentFile::new(
-                PathBuf::from(fields[0].as_string(client, "f.path")?),
+                PathBuf::from(path.as_string(client, "f.path")?),
                 ByteSize::new(nonnegative_u64(
                     client,
-                    fields[1].as_i64(client, "f.size_bytes")?,
+                    size.as_i64(client, "f.size_bytes")?,
                 )?),
                 FileIndex::new(
                     u32::try_from(index)
@@ -655,9 +673,15 @@ pub fn parse_trackers_response(
                     "t.multicall row has fewer than two fields",
                 ));
             }
+            let [url, group, ..] = fields else {
+                return Err(bad_response(
+                    client,
+                    "t.multicall row has fewer than two fields",
+                ));
+            };
             Ok(RtorrentTracker {
-                url: fields[0].as_string(client, "t.url")?.to_owned(),
-                group: fields[1].as_string(client, "t.group")?.to_owned(),
+                url: url.as_string(client, "t.url")?.to_owned(),
+                group: group.as_string(client, "t.group")?.to_owned(),
             })
         })
         .collect()

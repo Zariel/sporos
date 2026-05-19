@@ -1,7 +1,3 @@
-#![expect(
-    clippy::indexing_slicing,
-    reason = "mechanical clippy gate enablement leaves existing action indexing cleanup to a linked lint-class bead"
-)]
 #[cfg(unix)]
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -469,12 +465,15 @@ pub fn select_link_dir_pinned(
     representative.cleanup()?;
 
     if options.link_type == LinkType::Symlink {
+        let Some(first_link_dir) = link_dirs.first() else {
+            return Err(LinkActionError::EmptyLinkDirs);
+        };
         tracing::warn!(
             source = %source_path.display(),
-            link_dir = %link_dirs[0].display(),
+            link_dir = %first_link_dir.display(),
             "using first symlink directory after compatibility tests failed"
         );
-        return selected_link_dir(link_dirs[0].clone());
+        return selected_link_dir(first_link_dir.clone());
     }
 
     Err(LinkActionError::NoCompatibleLinkDir {
@@ -1443,8 +1442,19 @@ fn pair_link_files(
                 size: candidate.size,
             }
         })?;
-        used[index] = true;
-        let source = &local_files[index];
+        let Some(is_used) = used.get_mut(index) else {
+            return Err(LinkActionError::NoSourceMatch {
+                candidate: candidate.relative_path.clone(),
+                size: candidate.size,
+            });
+        };
+        *is_used = true;
+        let Some(source) = local_files.get(index) else {
+            return Err(LinkActionError::NoSourceMatch {
+                candidate: candidate.relative_path.clone(),
+                size: candidate.size,
+            });
+        };
         validate_relative_path(&source.relative_path)?;
         pairs.push(LinkPair {
             source: source_root.join(&source.relative_path),
@@ -1463,7 +1473,9 @@ fn best_source_match(
     local_files
         .iter()
         .enumerate()
-        .filter(|(index, file)| !used[*index] && file.size == candidate.size)
+        .filter(|(index, file)| {
+            !used.get(*index).copied().unwrap_or(true) && file.size == candidate.size
+        })
         .min_by_key(|(_, file)| {
             let same_name = file.file_name.as_str() == candidate.file_name.as_str();
             (!same_name, file.relative_path.as_path())
@@ -1700,7 +1712,13 @@ fn file_contents_match(
                 "open existing link destination after comparison",
             );
         }
-        if source_buffer[..source_len] != destination_buffer[..destination_len] {
+        let Some(source_chunk) = source_buffer.get(..source_len) else {
+            return Ok(false);
+        };
+        let Some(destination_chunk) = destination_buffer.get(..destination_len) else {
+            return Ok(false);
+        };
+        if source_chunk != destination_chunk {
             return Ok(false);
         }
     }
@@ -1852,7 +1870,10 @@ fn copy_file_contents(source: &mut File, destination: &mut File) -> io::Result<u
         if read == 0 {
             return Ok(written);
         }
-        destination.write_all(&buffer[..read])?;
+        let chunk = buffer
+            .get(..read)
+            .ok_or_else(|| io::Error::other("copy buffer read length out of bounds"))?;
+        destination.write_all(chunk)?;
         written = written
             .checked_add(u64::try_from(read).map_err(io::Error::other)?)
             .ok_or_else(|| io::Error::other("copied byte count overflow"))?;

@@ -1,8 +1,3 @@
-#![expect(
-    clippy::indexing_slicing,
-    reason = "mechanical clippy gate enablement leaves URL byte-indexing cleanup to a linked lint-class bead"
-)]
-
 use std::fmt;
 
 use serde::Deserialize;
@@ -253,22 +248,24 @@ fn normalized_query_key(key: &str) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        let byte = if bytes[index] == b'%' && index + 2 < bytes.len() {
-            match (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
+        let current = bytes.get(index).copied().unwrap_or_default();
+        let byte = if current == b'%' && index + 2 < bytes.len() {
+            match (
+                bytes.get(index + 1).copied().and_then(hex_value),
+                bytes.get(index + 2).copied().and_then(hex_value),
+            ) {
                 (Some(high), Some(low)) => {
                     index += 3;
                     high * 16 + low
                 }
                 _ => {
-                    let byte = bytes[index];
                     index += 1;
-                    byte
+                    current
                 }
             }
         } else {
-            let byte = bytes[index];
             index += 1;
-            byte
+            current
         };
         if byte.is_ascii_alphanumeric() {
             normalized.push(byte.to_ascii_lowercase());

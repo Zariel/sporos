@@ -1,7 +1,3 @@
-#![expect(
-    clippy::indexing_slicing,
-    reason = "mechanical clippy gate enablement leaves matching lint classes to linked cleanup beads"
-)]
 use std::cmp::Ordering as CompareOrdering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
@@ -939,8 +935,10 @@ async fn add_lookup_items(
         };
         let signature = reverse_lookup_signature(&candidate);
         if let Some(index) = accepted_signature_indexes.get(&signature).copied() {
-            if reverse_lookup_order(&candidate, &lookup[index]).is_lt() {
-                lookup[index] = candidate;
+            if let Some(existing) = lookup.get_mut(index)
+                && reverse_lookup_order(&candidate, existing).is_lt()
+            {
+                *existing = candidate;
             }
             continue;
         }
@@ -1196,17 +1194,26 @@ fn levenshtein(left: &str, right: &str) -> usize {
     let mut current = vec![0; right_chars.len() + 1];
 
     for (left_index, left_char) in left.chars().enumerate() {
-        current[0] = left_index + 1;
+        if let Some(first) = current.first_mut() {
+            *first = left_index + 1;
+        }
         for (right_index, right_char) in right_chars.iter().enumerate() {
-            let substitution = previous[right_index] + usize::from(left_char != *right_char);
-            let insertion = current[right_index] + 1;
-            let deletion = previous[right_index + 1] + 1;
-            current[right_index + 1] = substitution.min(insertion).min(deletion);
+            let substitution = previous.get(right_index).copied().unwrap_or(usize::MAX - 1)
+                + usize::from(left_char != *right_char);
+            let insertion = current.get(right_index).copied().unwrap_or(usize::MAX - 1) + 1;
+            let deletion = previous
+                .get(right_index + 1)
+                .copied()
+                .unwrap_or(usize::MAX - 1)
+                + 1;
+            if let Some(cell) = current.get_mut(right_index + 1) {
+                *cell = substitution.min(insertion).min(deletion);
+            }
         }
         std::mem::swap(&mut previous, &mut current);
     }
 
-    previous[right_chars.len()]
+    previous.get(right_chars.len()).copied().unwrap_or_default()
 }
 
 fn assessment_is_already_present(assessment: &PersistedCandidateAssessment) -> bool {
