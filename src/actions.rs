@@ -1,7 +1,6 @@
 #![expect(
     clippy::indexing_slicing,
-    clippy::let_underscore_must_use,
-    reason = "mechanical clippy gate enablement leaves existing action safety cleanup to linked lint-class beads"
+    reason = "mechanical clippy gate enablement leaves existing action indexing cleanup to a linked lint-class bead"
 )]
 #[cfg(unix)]
 use std::collections::BTreeMap;
@@ -1323,7 +1322,7 @@ fn test_link_compatibility(
                         | io::ErrorKind::Other
                 ) =>
             {
-                let _ = remove_stage_dir(&stage_dir);
+                drop(remove_stage_dir(&stage_dir));
                 Ok(false)
             }
             Err(source) => Err(LinkActionError::Io {
@@ -1400,11 +1399,11 @@ fn test_link_compatibility_at(
                     | io::ErrorKind::Other
             ) =>
         {
-            let _ = remove_stage_dir_entry_at(&parent, &stage, destination);
+            drop(remove_stage_dir_entry_at(&parent, &stage, destination));
             Ok(false)
         }
         Err(source) => {
-            let _ = remove_stage_dir_entry_at(&parent, &stage, destination);
+            drop(remove_stage_dir_entry_at(&parent, &stage, destination));
             Err(LinkActionError::Io {
                 operation: "test link compatibility",
                 path: link_dir.join(destination),
@@ -2754,7 +2753,7 @@ fn create_hardlink_staged_at(
     let stage = create_private_stage_dir_at(parent, "link-create")?;
     let staged = Path::new("data");
     if let Err(error) = create_staged_hardlink(source, source_file, &stage, staged) {
-        let _ = remove_stage_dir_entry_at(parent, &stage, staged);
+        drop(remove_stage_dir_entry_at(parent, &stage, staged));
         return Err(error);
     }
     publish_staged_entry(parent, &stage, staged)
@@ -2772,11 +2771,11 @@ fn create_symlink_staged_at(
     // pin the source size and identity, but the client can still observe a
     // source path mutation that happens after revalidation.
     if let Err(error) = rustix::fs::symlinkat(source, &stage.fd, staged).map_err(io::Error::from) {
-        let _ = remove_stage_dir_entry_at(parent, &stage, staged);
+        drop(remove_stage_dir_entry_at(parent, &stage, staged));
         return Err(error);
     }
     if !source_path_matches_identity(source, &source_file.identity)? {
-        let _ = remove_stage_dir_entry_at(parent, &stage, staged);
+        drop(remove_stage_dir_entry_at(parent, &stage, staged));
         return Err(io::Error::other(
             "symlink source changed before link publication",
         ));
@@ -2821,7 +2820,7 @@ fn create_reflink_staged_at(
             Err(error)
         }
     }) {
-        let _ = remove_stage_dir_entry_at(parent, &stage, staged);
+        drop(remove_stage_dir_entry_at(parent, &stage, staged));
         return Err(error);
     }
 
@@ -3045,11 +3044,11 @@ fn create_reflink_staged(source: &Path, destination: &Path, copy_fallback: bool)
 
     match create_result.and_then(|()| fs::hard_link(&staged, destination)) {
         Ok(()) => {
-            let _ = remove_stage_dir(&stage_dir);
+            drop(remove_stage_dir(&stage_dir));
             Ok(())
         }
         Err(error) => {
-            let _ = remove_stage_dir(&stage_dir);
+            drop(remove_stage_dir(&stage_dir));
             Err(error)
         }
     }

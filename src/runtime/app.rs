@@ -1782,7 +1782,7 @@ fn cancelled_client_inventory(descriptor: &TorrentClientDescriptor) -> TorrentCl
 }
 
 async fn wait_for_inventory_shutdown(mut shutdown: ShutdownSignal) {
-    let _ = shutdown.cancelled().await;
+    shutdown.cancelled().await;
 }
 
 async fn send_client_inventory_item(

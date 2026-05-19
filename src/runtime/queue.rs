@@ -1,8 +1,3 @@
-#![expect(
-    clippy::let_underscore_must_use,
-    reason = "mechanical clippy gate enablement leaves explicit queue depth handling to a linked lint-class bead"
-)]
-
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -189,9 +184,12 @@ impl<T> WorkReceiver<T> {
 }
 
 fn decrement_depth(depth: &AtomicUsize) {
-    let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        current.checked_sub(1)
-    });
+    if depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(1)
+        })
+        .is_err()
+    {}
 }
 
 pub fn bounded_work_queue<T>(

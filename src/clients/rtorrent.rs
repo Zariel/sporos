@@ -2,14 +2,6 @@
     clippy::indexing_slicing,
     reason = "mechanical clippy gate enablement leaves checked parser field access to linked lint-class beads"
 )]
-#![cfg_attr(
-    test,
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "test fixtures prefer direct request drains and owned single-item slices for clarity"
-    )
-)]
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -1480,7 +1472,7 @@ mod tests {
                 || {
                     let mut signal = signal.clone();
                     async move {
-                        let _ = signal.cancelled().await;
+                        signal.cancelled().await;
                     }
                 },
                 |_chunk| async { Ok(()) },
@@ -1550,7 +1542,7 @@ mod tests {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            drop(stream.read(&mut request));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",

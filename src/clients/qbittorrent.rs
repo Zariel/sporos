@@ -1,11 +1,3 @@
-#![cfg_attr(
-    test,
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "test HTTP fixture only drains enough bytes to observe the request"
-    )
-)]
-
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -1164,7 +1156,7 @@ mod tests {
                 || {
                     let mut signal = signal.clone();
                     async move {
-                        let _ = signal.cancelled().await;
+                        signal.cancelled().await;
                     }
                 },
                 |_page| async { Ok(()) },
@@ -1207,7 +1199,7 @@ mod tests {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            drop(stream.read(&mut request));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",

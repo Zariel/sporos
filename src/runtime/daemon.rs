@@ -1,7 +1,6 @@
 #![expect(
     clippy::indexing_slicing,
-    clippy::let_underscore_must_use,
-    reason = "mechanical clippy gate enablement leaves daemon lint classes to linked cleanup beads"
+    reason = "mechanical clippy gate enablement leaves daemon indexing cleanup to a linked cleanup bead"
 )]
 
 use std::fmt;
@@ -109,7 +108,9 @@ pub async fn serve_with_listener(
             message: error.to_string(),
         });
     signal_task.abort();
-    let _ = shutdown.cancel_now("server stopping");
+    if let Err(error) = shutdown.cancel_now("server stopping") {
+        warn!(error = %error, "failed to publish server shutdown signal");
+    }
     http.set_workers_running(false);
     stop_background_tasks(background).await;
     serve_result
@@ -2032,7 +2033,7 @@ async fn hold_receiver_open<T>(
 }
 
 async fn wait_for_shutdown(mut shutdown: ShutdownSignal) {
-    let _ = shutdown.cancelled().await;
+    shutdown.cancelled().await;
 }
 
 async fn process_shutdown_signal(shutdown: ShutdownController) {
@@ -2054,14 +2055,14 @@ async fn process_shutdown_reason() -> &'static str {
             }
             Err(error) => {
                 warn!(error = %error, "failed to install sigterm handler");
-                let _ = tokio::signal::ctrl_c().await;
+                drop(tokio::signal::ctrl_c().await);
                 "ctrl-c"
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        drop(tokio::signal::ctrl_c().await);
         "ctrl-c"
     }
 }
@@ -3948,7 +3949,9 @@ mod tests {
             fn drop(&mut self) {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 if let Some(sender) = self.1.take() {
-                    let _ = sender.send(());
+                    match sender.send(()) {
+                        Ok(()) | Err(()) => {}
+                    }
                 }
             }
         }
@@ -3959,7 +3962,7 @@ mod tests {
             BackgroundTask::new(
                 "await-first",
                 tokio::spawn(async {
-                    let _ = wait_in_flight.await;
+                    drop(wait_in_flight.await);
                 }),
                 BackgroundShutdownPolicy::AwaitInFlight,
             ),

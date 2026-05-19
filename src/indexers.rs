@@ -1,7 +1,3 @@
-#![expect(
-    clippy::let_underscore_must_use,
-    reason = "mechanical clippy gate enablement leaves explicit cache cleanup handling to a linked lint-class bead"
-)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -1658,7 +1654,7 @@ fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownlo
 
     let (mut temporary_file, temporary) = create_cache_temp_file(path)?;
     if let Err(error) = temporary_file.write_all(bytes) {
-        let _ = fs::remove_file(&temporary);
+        drop(fs::remove_file(&temporary));
         return Err(CandidateDownloadError::CacheWrite {
             path: temporary,
             message: error.to_string(),
@@ -1668,11 +1664,11 @@ fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownlo
     match fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_file() => {
-            let _ = fs::remove_file(&temporary);
+            drop(fs::remove_file(&temporary));
             Ok(())
         }
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
+            drop(fs::remove_file(&temporary));
             Err(CandidateDownloadError::CacheWrite {
                 path: path.to_path_buf(),
                 message: error.to_string(),
@@ -3689,7 +3685,7 @@ mod tests {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            drop(stream.read(&mut request));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",

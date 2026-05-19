@@ -1,7 +1,3 @@
-#![expect(
-    clippy::let_underscore_must_use,
-    reason = "mechanical clippy gate enablement leaves explicit send/health handling to a linked lint-class bead"
-)]
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -248,7 +244,7 @@ impl InventoryRefreshWorker {
                 },
             );
             if !scanner_cancelled.load(Ordering::Relaxed) && report.failures.is_empty() {
-                let _ = sender.blocking_send(OwnedLocalInventoryMessage::Finished);
+                drop(sender.blocking_send(OwnedLocalInventoryMessage::Finished));
             }
             report
         });
@@ -393,7 +389,7 @@ impl InventoryRefreshWorker {
             let mut scanned_items = 0usize;
             while let Some(message) = items.recv().await {
                 let ClientInventoryMessage::Item(item) = message else {
-                    let _ = sender.send(OwnedLocalInventoryMessage::Finished).await;
+                    drop(sender.send(OwnedLocalInventoryMessage::Finished).await);
                     return Ok(scanned_items);
                 };
                 if item.client_host != transform_host {
@@ -1024,7 +1020,7 @@ async fn record_inventory_refresh_health(
     } else {
         DependencyState::Healthy { checked_at_ms }
     };
-    let _ = worker
+    if let Err(error) = worker
         .repository
         .record_dependency_health(
             DependencyKind::LocalState.as_str(),
@@ -1032,7 +1028,10 @@ async fn record_inventory_refresh_health(
             &state,
             checked_at_ms,
         )
-        .await;
+        .await
+    {
+        warn!(error = ?error, "failed to record local inventory dependency health");
+    }
 }
 
 fn scan_failure_reason(failures: &[InventoryScanFailure]) -> String {
@@ -2011,7 +2010,7 @@ mod tests {
 
         assert_eq!(0, queue.stats().completed);
         handle.abort();
-        let _ = handle.await;
+        drop(handle.await);
 
         fs::remove_dir_all(root).unwrap();
     }

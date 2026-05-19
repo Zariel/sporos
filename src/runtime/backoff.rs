@@ -1,11 +1,3 @@
-#![cfg_attr(
-    test,
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "test synchronization sends are best-effort and tracked for cleanup"
-    )
-)]
-
 use std::future::Future;
 use std::time::Duration;
 
@@ -289,7 +281,9 @@ mod tests {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .take()
                             {
-                                let _ = sender.send(());
+                                match sender.send(()) {
+                                    Ok(()) | Err(()) => {}
+                                }
                             }
                             std::future::pending::<Result<(), &str>>().await
                         }

@@ -1,11 +1,3 @@
-#![cfg_attr(
-    test,
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "test server teardown intentionally ignores post-test join outcome"
-    )
-)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -512,7 +504,7 @@ mod tests {
         );
         let server = axum::serve(listener, app);
         tokio::spawn(async move {
-            let _ = server.await;
+            drop(server.await);
         });
 
         format!("http://{address}")

@@ -65,12 +65,11 @@ pub trait InjectionClient: Send + Sync {
     fn resume<'a>(&'a self, info_hash: &'a InfoHash) -> ClientResultFuture<'a, ()>;
     fn refresh_inventory<'a>(
         &'a self,
-        worker: &'a InventoryRefreshWorker,
-        shutdown: ShutdownSignal,
+        _worker: &'a InventoryRefreshWorker,
+        _shutdown: ShutdownSignal,
     ) -> ClientInventoryRefreshFuture<'a> {
         Box::pin(async move {
             let descriptor = self.descriptor();
-            let _ = (worker, shutdown);
             Err(TorrentClientError::UnsupportedCapability {
                 client: descriptor.name.as_str().to_owned(),
                 capability: "refresh inventory".to_owned(),
@@ -1447,7 +1446,7 @@ fn saved_torrent_path_scan(directory: &Path, limit: usize) -> SavedTorrentPathSc
                 }
             }
         }
-        let _ = send_saved_torrent_scan_batch(&sender, &mut batch, limit, &mut sent);
+        send_saved_torrent_scan_batch(&sender, &mut batch, limit, &mut sent);
     });
 
     SavedTorrentPathScan {
@@ -1573,7 +1572,7 @@ impl SavedTorrentIdentity {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = metadata;
+            let _metadata = metadata;
             true
         }
     }
