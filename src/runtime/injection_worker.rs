@@ -183,11 +183,15 @@ pub enum InjectionWorkerError {
     },
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecheckResumeConfig {
     pub skip_recheck: bool,
     pub auto_resume_max_download: ByteSize,
+    pub min_completion_percent: Option<f64>,
+    pub max_remaining_percent: Option<f64>,
     pub ignore_non_relevant_files_to_resume: bool,
+    pub non_relevant_max_remaining: ByteSize,
+    pub piece_slack_multiplier: u64,
     pub poll_interval_ms: u64,
     pub max_resume_wait_ms: u64,
 }
@@ -197,17 +201,39 @@ impl Default for RecheckResumeConfig {
         Self {
             skip_recheck: false,
             auto_resume_max_download: ByteSize::new(0),
+            min_completion_percent: None,
+            max_remaining_percent: None,
             ignore_non_relevant_files_to_resume: false,
+            non_relevant_max_remaining: ByteSize::new(200 * 1024 * 1024),
+            piece_slack_multiplier: 2,
             poll_interval_ms: 5_000,
             max_resume_wait_ms: 60 * 60 * 1_000,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+impl From<&crate::config::AutoResumePolicyConfig> for RecheckResumeConfig {
+    fn from(config: &crate::config::AutoResumePolicyConfig) -> Self {
+        Self {
+            skip_recheck: config.skip_recheck,
+            auto_resume_max_download: ByteSize::new(config.max_remaining_bytes),
+            min_completion_percent: config.min_completion_percent,
+            max_remaining_percent: config.max_remaining_percent,
+            ignore_non_relevant_files_to_resume: config.ignore_non_relevant_files_to_resume,
+            non_relevant_max_remaining: ByteSize::new(config.non_relevant_max_remaining_bytes),
+            piece_slack_multiplier: config.piece_slack_multiplier,
+            poll_interval_ms: config.poll_interval_ms,
+            max_resume_wait_ms: config.max_resume_wait_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecheckResumePlan {
     pub should_recheck: bool,
     pub max_remaining_bytes: ByteSize,
+    pub min_completion_percent: Option<f64>,
+    pub max_remaining_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1811,6 +1837,12 @@ pub fn recheck_resume_plan(
     RecheckResumePlan {
         should_recheck,
         max_remaining_bytes,
+        min_completion_percent: (partial && !video_disc)
+            .then_some(config.min_completion_percent)
+            .flatten(),
+        max_remaining_percent: (partial && !video_disc)
+            .then_some(config.max_remaining_percent)
+            .flatten(),
     }
 }
 
@@ -1824,10 +1856,13 @@ pub fn can_resume_with_remaining(
     if remaining.get() <= plan.max_remaining_bytes.get() {
         return true;
     }
+    if can_resume_with_percentage(metafile.total_size(), remaining, plan) {
+        return true;
+    }
     if !config.ignore_non_relevant_files_to_resume
         || assessment.decision != MatchDecision::Partial
         || has_video_disc_files(metafile)
-        || remaining.get() > 200 * 1024 * 1024
+        || remaining.get() > config.non_relevant_max_remaining.get()
     {
         return false;
     }
@@ -1836,7 +1871,7 @@ pub fn can_resume_with_remaining(
         .piece_length()
         .unwrap_or(ByteSize::new(0))
         .get()
-        .checked_mul(2)
+        .checked_mul(config.piece_slack_multiplier)
     else {
         return false;
     };
@@ -1847,6 +1882,28 @@ pub fn can_resume_with_remaining(
         return false;
     };
     remaining.get() <= allowed_slack
+}
+
+fn can_resume_with_percentage(
+    total_size: ByteSize,
+    remaining: ByteSize,
+    plan: RecheckResumePlan,
+) -> bool {
+    if plan.min_completion_percent.is_none() && plan.max_remaining_percent.is_none() {
+        return false;
+    }
+    if total_size.get() == 0 {
+        return remaining.get() == 0;
+    }
+
+    let remaining_percent = remaining.get() as f64 * 100.0 / total_size.get() as f64;
+    let completion_percent = 100.0 - remaining_percent;
+
+    plan.min_completion_percent
+        .is_some_and(|minimum| completion_percent >= minimum)
+        || plan
+            .max_remaining_percent
+            .is_some_and(|maximum| remaining_percent <= maximum)
 }
 
 fn has_video_disc_files(metafile: &TorrentMetafile) -> bool {
@@ -3533,6 +3590,198 @@ mod tests {
     }
 
     #[test]
+    fn resume_policy_does_not_apply_partial_thresholds_to_exact_or_video_disc_matches() {
+        let exact = CandidateAssessment {
+            decision: MatchDecision::Exact,
+            reason: crate::domain::DecisionReason::FileTreeMatched,
+            matched_size: Some(ByteSize::new(1_000)),
+            matched_ratio: Some(MatchRatio::new(1.0).unwrap()),
+        };
+        let partial = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(850)),
+            matched_ratio: Some(MatchRatio::new(0.85).unwrap()),
+        };
+        let normal = metafile_with_files(&[("movie.mkv", 1_000)]);
+        let disc = metafile_with_files(&[("BDMV/STREAM/00001.m2ts", 1_000)]);
+        let config = RecheckResumeConfig {
+            auto_resume_max_download: ByteSize::new(100),
+            min_completion_percent: Some(85.0),
+            max_remaining_percent: Some(15.0),
+            ..RecheckResumeConfig::default()
+        };
+
+        let exact_plan = recheck_resume_plan(&normal, &exact, config);
+        assert_eq!(ByteSize::new(0), exact_plan.max_remaining_bytes);
+        assert_eq!(None, exact_plan.min_completion_percent);
+        assert_eq!(None, exact_plan.max_remaining_percent);
+        assert!(!can_resume_with_remaining(
+            &normal,
+            &exact,
+            config,
+            exact_plan,
+            ByteSize::new(1)
+        ));
+
+        let disc_plan = recheck_resume_plan(&disc, &partial, config);
+        assert_eq!(ByteSize::new(0), disc_plan.max_remaining_bytes);
+        assert_eq!(None, disc_plan.min_completion_percent);
+        assert_eq!(None, disc_plan.max_remaining_percent);
+        assert!(!can_resume_with_remaining(
+            &disc,
+            &partial,
+            config,
+            disc_plan,
+            ByteSize::new(1)
+        ));
+    }
+
+    #[test]
+    fn resume_policy_uses_configured_percentage_thresholds() {
+        let metafile = metafile_with_files(&[("movie.mkv", 1_000)]);
+        let assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(850)),
+            matched_ratio: Some(MatchRatio::new(0.85).unwrap()),
+        };
+        let config = RecheckResumeConfig {
+            auto_resume_max_download: ByteSize::new(100),
+            min_completion_percent: Some(85.5),
+            max_remaining_percent: Some(20.0),
+            ..RecheckResumeConfig::default()
+        };
+        let plan = recheck_resume_plan(&metafile, &assessment, config);
+
+        assert_eq!(ByteSize::new(100), plan.max_remaining_bytes);
+        assert_eq!(Some(85.5), plan.min_completion_percent);
+        assert_eq!(Some(20.0), plan.max_remaining_percent);
+        assert!(can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(200)
+        ));
+        assert!(!can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(201)
+        ));
+    }
+
+    #[test]
+    fn resume_policy_uses_minimum_completion_threshold() {
+        let metafile = metafile_with_files(&[("movie.mkv", 1_000)]);
+        let assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(850)),
+            matched_ratio: Some(MatchRatio::new(0.85).unwrap()),
+        };
+        let config = RecheckResumeConfig {
+            min_completion_percent: Some(85.5),
+            ..RecheckResumeConfig::default()
+        };
+        let plan = recheck_resume_plan(&metafile, &assessment, config);
+
+        assert!(can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(145)
+        ));
+        assert!(!can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(146)
+        ));
+    }
+
+    #[test]
+    fn resume_policy_treats_zero_size_percentage_thresholds_as_complete_only() {
+        let metafile = TorrentMetafile::new_unchecked_for_test(
+            InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            DisplayName::new("empty").unwrap(),
+            vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("empty.mkv"),
+                    ByteSize::new(0),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+            ],
+            ByteSize::new(0),
+            None,
+        );
+        let assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(0)),
+            matched_ratio: Some(MatchRatio::new(0.0).unwrap()),
+        };
+        let config = RecheckResumeConfig {
+            min_completion_percent: Some(85.0),
+            max_remaining_percent: Some(15.0),
+            ..RecheckResumeConfig::default()
+        };
+        let plan = recheck_resume_plan(&metafile, &assessment, config);
+
+        assert_eq!(ByteSize::new(0), plan.max_remaining_bytes);
+        assert!(can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(0)
+        ));
+        assert!(!can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(1)
+        ));
+    }
+
+    #[test]
+    fn recheck_config_converts_from_typed_auto_resume_config() {
+        let config = crate::config::AutoResumePolicyConfig {
+            skip_recheck: true,
+            max_remaining_bytes: 123,
+            min_completion_percent: Some(85.0),
+            max_remaining_percent: Some(15.0),
+            ignore_non_relevant_files_to_resume: true,
+            non_relevant_max_remaining_bytes: 456,
+            piece_slack_multiplier: 3,
+            poll_interval_ms: 250,
+            max_resume_wait_ms: 500,
+            below_threshold_action: crate::config::BelowThresholdActionConfig::InjectPaused,
+        };
+
+        assert_eq!(
+            RecheckResumeConfig {
+                skip_recheck: true,
+                auto_resume_max_download: ByteSize::new(123),
+                min_completion_percent: Some(85.0),
+                max_remaining_percent: Some(15.0),
+                ignore_non_relevant_files_to_resume: true,
+                non_relevant_max_remaining: ByteSize::new(456),
+                piece_slack_multiplier: 3,
+                poll_interval_ms: 250,
+                max_resume_wait_ms: 500,
+            },
+            RecheckResumeConfig::from(&config)
+        );
+    }
+
+    #[test]
     fn resume_policy_allows_irrelevant_file_slack_for_partial_matches() {
         let metafile = TorrentMetafile::new_with_piece_length(
             InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
@@ -3580,6 +3829,58 @@ mod tests {
             config,
             plan,
             ByteSize::new(31)
+        ));
+    }
+
+    #[test]
+    fn resume_policy_uses_configured_irrelevant_file_cap_and_piece_slack() {
+        let metafile = TorrentMetafile::new_with_piece_length(
+            InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            DisplayName::new("movie").unwrap(),
+            vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("movie.mkv"),
+                    ByteSize::new(1_000),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("extras/sample.nfo"),
+                    ByteSize::new(20),
+                    FileIndex::new(1),
+                )
+                .unwrap(),
+            ],
+            Some(ByteSize::new(5)),
+        )
+        .unwrap();
+        let assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(1_000)),
+            matched_ratio: Some(MatchRatio::new(0.98).unwrap()),
+        };
+        let config = RecheckResumeConfig {
+            ignore_non_relevant_files_to_resume: true,
+            non_relevant_max_remaining: ByteSize::new(35),
+            piece_slack_multiplier: 3,
+            ..RecheckResumeConfig::default()
+        };
+        let plan = recheck_resume_plan(&metafile, &assessment, config);
+
+        assert!(can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(35)
+        ));
+        assert!(!can_resume_with_remaining(
+            &metafile,
+            &assessment,
+            config,
+            plan,
+            ByteSize::new(36)
         ));
     }
 
