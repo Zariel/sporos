@@ -2553,6 +2553,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_configured_byte_threshold_resumes_partial_match_default_leaves_paused() {
+        let default_repository = Repository::connect_in_memory().await.unwrap();
+        let default_root = unique_temp_dir("injection-default-threshold");
+        let default_target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_remaining_bytes(10));
+        let (local, candidate, candidate_id) =
+            persisted_inputs(&default_repository, &default_root).await;
+        let mut default_request = request(local, candidate, candidate_id, &default_root);
+        default_request.metafile = metafile_with_files(&[("movie.mkv", 20)]);
+        default_request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        let default_worker = InjectionWorker::new(
+            default_repository,
+            vec![default_target.clone() as Arc<dyn InjectionClient>],
+        );
+
+        let default_result = default_worker.process(default_request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Injected, default_result.outcome);
+        assert!(!default_result.saved_for_retry);
+        assert_eq!(1, default_target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, default_target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, default_target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(true), default_target.last_pause_for_recheck());
+
+        let configured_repository = Repository::connect_in_memory().await.unwrap();
+        let configured_root = unique_temp_dir("injection-configured-threshold");
+        let configured_target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_remaining_bytes(10));
+        let (local, candidate, candidate_id) =
+            persisted_inputs(&configured_repository, &configured_root).await;
+        let mut configured_request = request(local, candidate, candidate_id, &configured_root);
+        configured_request.metafile = metafile_with_files(&[("movie.mkv", 20)]);
+        configured_request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        configured_request.recheck = RecheckResumeConfig {
+            auto_resume_max_download: ByteSize::new(10),
+            poll_interval_ms: 0,
+            ..RecheckResumeConfig::default()
+        };
+        let configured_worker = InjectionWorker::new(
+            configured_repository,
+            vec![configured_target.clone() as Arc<dyn InjectionClient>],
+        );
+
+        let configured_result = configured_worker.process(configured_request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Injected, configured_result.outcome);
+        assert!(configured_result.saved_for_retry);
+        assert_eq!(1, configured_target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, configured_target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, configured_target.remaining_calls.load(Ordering::SeqCst));
+        assert_eq!(1, configured_target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(true), configured_target.last_pause_for_recheck());
+    }
+
+    #[tokio::test]
+    async fn worker_configured_thresholds_do_not_auto_resume_exact_size_only_or_video_disc() {
+        for (name, decision, reason, metafile) in [
+            (
+                "exact",
+                MatchDecision::Exact,
+                crate::domain::DecisionReason::FileTreeMatched,
+                metafile_with_files(&[("movie.mkv", 20)]),
+            ),
+            (
+                "size-only",
+                MatchDecision::SizeOnly,
+                crate::domain::DecisionReason::SizeMatched,
+                metafile_with_files(&[("movie.mkv", 20)]),
+            ),
+            (
+                "video-disc",
+                MatchDecision::Partial,
+                crate::domain::DecisionReason::PartialOverlap,
+                metafile_with_files(&[("BDMV/STREAM/00001.m2ts", 20)]),
+            ),
+        ] {
+            let repository = Repository::connect_in_memory().await.unwrap();
+            let root = unique_temp_dir(&format!("injection-{name}-threshold"));
+            let target =
+                Arc::new(FakeClient::new(descriptor("target", "target")).with_remaining_bytes(10));
+            let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+            let mut request = request(local, candidate, candidate_id, &root);
+            request.metafile = metafile;
+            request.assessment = CandidateAssessment {
+                decision,
+                reason,
+                matched_size: Some(ByteSize::new(10)),
+                matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+            };
+            request.recheck = RecheckResumeConfig {
+                auto_resume_max_download: ByteSize::new(10),
+                min_completion_percent: Some(50.0),
+                max_remaining_percent: Some(50.0),
+                poll_interval_ms: 0,
+                ..RecheckResumeConfig::default()
+            };
+            let worker =
+                InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+            let result = worker.process(request).await.unwrap();
+
+            assert_eq!(InjectionOutcome::Injected, result.outcome);
+            assert!(result.saved_for_retry, "{name} should stay saved for retry");
+            assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+            assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+            assert_eq!(1, target.remaining_calls.load(Ordering::SeqCst));
+            assert_eq!(
+                0,
+                target.resume_calls.load(Ordering::SeqCst),
+                "{name} should not resume"
+            );
+            assert_eq!(Some(true), target.last_pause_for_recheck());
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_configured_non_relevant_slack_resumes_partial_match() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-non-relevant-threshold");
+        let target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_remaining_bytes(30));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.metafile = TorrentMetafile::new_with_piece_length(
+            InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            DisplayName::new("movie").unwrap(),
+            vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("movie.mkv"),
+                    ByteSize::new(100),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+                crate::domain::TorrentFile::new(
+                    PathBuf::from("extras/sample.nfo"),
+                    ByteSize::new(20),
+                    FileIndex::new(1),
+                )
+                .unwrap(),
+            ],
+            Some(ByteSize::new(5)),
+        )
+        .unwrap();
+        request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(100)),
+            matched_ratio: Some(MatchRatio::new(0.83).unwrap()),
+        };
+        request.recheck = RecheckResumeConfig {
+            ignore_non_relevant_files_to_resume: true,
+            poll_interval_ms: 0,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Injected, result.outcome);
+        assert!(result.saved_for_retry);
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.remaining_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(true), target.last_pause_for_recheck());
+    }
+
+    #[tokio::test]
     async fn worker_rechecks_exact_match_by_default_before_resume() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("injection-default-recheck");
@@ -4210,6 +4389,7 @@ mod tests {
         recheck_calls: AtomicUsize,
         checking_calls: AtomicUsize,
         remaining_calls: AtomicUsize,
+        remaining_bytes: AtomicUsize,
         resume_calls: AtomicUsize,
         save_path_file_exists_at_inject: AtomicUsize,
         replace_save_path_file_on_has: StdMutex<Option<(PathBuf, Vec<u8>)>>,
@@ -4360,6 +4540,7 @@ mod tests {
                 recheck_calls: AtomicUsize::new(0),
                 checking_calls: AtomicUsize::new(0),
                 remaining_calls: AtomicUsize::new(0),
+                remaining_bytes: AtomicUsize::new(0),
                 resume_calls: AtomicUsize::new(0),
                 save_path_file_exists_at_inject: AtomicUsize::new(0),
                 replace_save_path_file_on_has: StdMutex::new(None),
@@ -4411,6 +4592,11 @@ mod tests {
         fn with_completion_errors(self, count: usize) -> Self {
             self.completion_errors_remaining
                 .store(count, Ordering::SeqCst);
+            self
+        }
+
+        fn with_remaining_bytes(self, bytes: usize) -> Self {
+            self.remaining_bytes.store(bytes, Ordering::SeqCst);
             self
         }
 
@@ -4552,7 +4738,9 @@ mod tests {
                 if let Some(error) = error {
                     Err(error)
                 } else {
-                    Ok(ByteSize::new(0))
+                    Ok(ByteSize::new(
+                        u64::try_from(self.remaining_bytes.load(Ordering::SeqCst)).unwrap(),
+                    ))
                 }
             })
         }
