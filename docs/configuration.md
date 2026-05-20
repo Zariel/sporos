@@ -32,6 +32,8 @@ url = "http://qbittorrent:8080"
 username = "sporos"
 password_file = "/var/run/secrets/qbit-password"
 default_save_path = "/downloads"
+default_category = "cross-seed"
+default_tags = ["cross-seed", "sporos"]
 
 [indexers.torznab.main]
 url = "https://indexer.example/api"
@@ -107,6 +109,8 @@ url = "http://qbittorrent:8080"
 username = "sporos"
 password_file = "/var/run/secrets/qbit-password"
 default_save_path = "/downloads"
+default_category = "cross-seed"
+default_tags = ["cross-seed", "sporos"]
 ```
 
 rTorrent uses an HTTP RPC endpoint. Put authentication in a reverse proxy or
@@ -117,8 +121,24 @@ private network path:
 kind = "rtorrent"
 url = "http://rtorrent:5000/RPC2"
 default_save_path = "/downloads/archive"
+default_label = "cross-seed"
 label_field = "custom1"
 ```
+
+Injected torrents get client metadata from these optional fields:
+
+- `default_category` is the qBittorrent category to create and send with new
+  injections. Omit it to inject without a category.
+- `default_tags` are qBittorrent tags to create and send with new injections.
+  The default is `["sporos"]`, preserving the current Rust-native behavior.
+- `default_label` is the rTorrent `custom1` value used in `load.raw*` and
+  `d.custom1.set` calls. The default is `"sporos"`.
+
+Use `cross-seed` values when matching an existing cross-seed-oriented client
+layout. The built-in `sporos` defaults are intentionally conservative for this
+unreleased Rust service and keep Sporos-owned injections easy to distinguish.
+qBittorrent uses category and tags; rTorrent uses only `default_label` with
+`label_field = "custom1"`.
 
 ## Indexers
 
@@ -171,10 +191,14 @@ SPOROS__SERVER__BIND='"0.0.0.0:2468"'
 SPOROS__PATHS__DATABASE='"/data/state/sporos.db"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-password"'
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS='"cross-seed,sporos"'
+SPOROS__TORRENT_CLIENTS__RTORRENT_ARCHIVE__DEFAULT_LABEL='"cross-seed"'
 SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_FILE='"/var/run/secrets/indexer-api-key"'
 ```
 
-Arrays such as `paths.media_dirs` should be set in TOML.
+Arrays such as `paths.media_dirs` should be set in TOML. `default_tags` can be
+overridden as a comma-separated scalar environment value.
 
 ## Secrets
 

@@ -99,11 +99,14 @@ url = "http://qbittorrent:8080"
 username = "sporos"
 password_file = "/var/run/secrets/qbit-password"
 default_save_path = "/downloads"
+default_category = "cross-seed"
+default_tags = ["cross-seed", "sporos"]
 
 [torrent_clients.rtorrent_archive]
 kind = "rtorrent"
 url = "http://rtorrent:5000/RPC2"
 default_save_path = "/downloads/archive"
+default_label = "cross-seed"
 label_field = "custom1"
 
 [indexers.default_timeouts]
@@ -157,6 +160,19 @@ failure_retention_secs = 1209600
 ```
 
 Supported torrent clients are qBittorrent and rTorrent.
+
+Injected torrent metadata is configurable per client. qBittorrent supports
+`default_category` and `default_tags`; Sporos creates the configured category
+and tags before the first injection and sends them with each add request. Omit
+`default_category` to inject without a qBittorrent category. rTorrent supports
+`default_label`, written to `custom1` through `load.raw*` and `d.custom1.set`;
+`label_field` must remain `custom1`.
+
+The built-in qBittorrent tag and rTorrent label default is `sporos`, preserving
+the Rust service's existing behavior. Configure `cross-seed` metadata when
+matching an existing client layout or automation that expects cross-seed-style
+labels. Client-specific fields are ignored by clients that do not support that
+metadata type.
 
 Supported indexers are Torznab-compatible endpoints. Put API keys in
 `api_key_file`, `api_key_env`, or development-only `api_key`; do not put API
@@ -264,12 +280,17 @@ SPOROS__PATHS__DATABASE='"/data/state/sporos.db"'
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD='0.02'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-password"'
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS='"cross-seed,sporos"'
+SPOROS__TORRENT_CLIENTS__RTORRENT_ARCHIVE__DEFAULT_LABEL='"cross-seed"'
 SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_FILE='"/var/run/secrets/indexer-api-key"'
 SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE='"/var/run/secrets/prowlarr-api-key"'
 ```
 
 Override values are parsed as TOML scalars first. Quote string values when the
-shell value should be interpreted as a TOML string.
+shell value should be interpreted as a TOML string. `default_tags` is the only
+array-like client metadata value that can be overridden as a scalar; use a
+comma-separated value such as `"cross-seed,sporos"`.
 
 ## Secrets
 
