@@ -156,6 +156,7 @@ below_threshold_action = "inject_paused"
 client_inventory_interval = "24h"
 indexer_caps_interval = "24h"
 cleanup_interval = "24h"
+saved_retry_interval = "30m"
 
 [announce]
 max_pending = 1000
@@ -180,11 +181,11 @@ and tags before the first injection and sends them with each add request. Omit
 `default_label`, written to `custom1` through `load.raw*` and `d.custom1.set`;
 `label_field` must remain `custom1`.
 
-The built-in qBittorrent tag and rTorrent label default is `sporos`, preserving
-the Rust service's existing behavior. Configure `cross-seed` metadata when
-matching an existing client layout or automation that expects cross-seed-style
-labels. Client-specific fields are ignored by clients that do not support that
-metadata type.
+The built-in qBittorrent tag and rTorrent label default is `sporos`, keeping
+Sporos-owned injections easy to distinguish. Configure `cross-seed` metadata
+when matching an existing client layout or automation that expects
+cross-seed-style labels. Client-specific fields are ignored by clients that do
+not support that metadata type.
 
 Auto-resume tuning lives under `[injection.recheck]`. Keep the defaults when
 you want Sporos to add matches paused and only resume partial matches when there

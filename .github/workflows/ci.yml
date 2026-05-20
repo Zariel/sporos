@@ -48,11 +48,11 @@ jobs:
       - name: Cargo check
         run: cargo check --workspace --locked
 
-      - name: Cargo test
-        run: cargo test --workspace --locked
-
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --workspace --locked
 
   image:
     needs:
@@ -71,7 +71,7 @@ jobs:
         run: docker image inspect sporos-ci:test
 
       - name: Check image entrypoint
-        run: docker run --rm --entrypoint /usr/local/bin/sporos sporos-ci:test --help
+        run: docker run --rm sporos-ci:test --help
 
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

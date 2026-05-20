@@ -12,6 +12,7 @@ use quick_xml::events::{BytesCData, BytesRef, BytesText, Event};
 use quick_xml::name::QName;
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
+use reqwest::redirect::Policy;
 
 use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
 use crate::errors::TorrentClientError;
@@ -56,11 +57,12 @@ impl RtorrentClient {
         endpoint: impl Into<String>,
         timeout: Duration,
     ) -> Self {
+        let client_name = client_name.into();
         Self {
-            client_name: client_name.into(),
+            client_name: client_name.clone(),
             endpoint: endpoint.into(),
             timeout,
-            client: reqwest::Client::new(),
+            client: torrent_client_http_client(),
         }
     }
 
@@ -299,7 +301,7 @@ impl RtorrentClient {
             .body(build_method_call(method, &params))
             .send()
             .await
-            .map_err(|error| unavailable(&self.client_name, error.to_string()))?;
+            .map_err(|error| unavailable(&self.client_name, request_error_message(error)))?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(TorrentClientError::Unauthorized {
@@ -1045,7 +1047,7 @@ async fn read_client_text(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| unavailable(client, error.to_string()))?
+        .map_err(|error| unavailable(client, request_error_message(error)))?
     {
         let next_len = body.len().saturating_add(chunk.len());
         if u64::try_from(next_len).unwrap_or(u64::MAX) > limit {
@@ -1066,6 +1068,18 @@ fn unavailable(client: &str, message: String) -> TorrentClientError {
         retry_after_ms: None,
         message,
     }
+}
+
+fn request_error_message(error: reqwest::Error) -> String {
+    sanitize_url_for_logging(error.to_string()).to_string()
+}
+
+fn torrent_client_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()
+        .expect("static rTorrent HTTP client policy should build")
 }
 
 fn cancelled_error(client: &str) -> TorrentClientError {
@@ -1091,7 +1105,10 @@ mod tests {
 
     use axum::Router;
     use axum::body::{Body, to_bytes};
-    use axum::http::{HeaderValue, Request, StatusCode as AxumStatusCode, header::CONTENT_LENGTH};
+    use axum::http::{
+        HeaderValue, Request, StatusCode as AxumStatusCode,
+        header::{CONTENT_LENGTH, LOCATION},
+    };
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use tokio::net::TcpListener;
@@ -1127,6 +1144,25 @@ mod tests {
         assert!(xml.contains("<name>methodName</name><value><string>d.name</string></value>"));
         assert!(xml.contains("<string>d.custom1</string>"));
         assert!(xml.contains(SHA1));
+    }
+
+    #[tokio::test]
+    async fn client_does_not_follow_rpc_redirects() {
+        let endpoint = spawn_rtorrent_server(|_request| async move {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = AxumStatusCode::FOUND;
+            response.headers_mut().insert(
+                LOCATION,
+                HeaderValue::from_static("http://127.0.0.1:1/leaked"),
+            );
+            response
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        let error = client.validate().await.unwrap_err();
+
+        assert!(error.to_string().contains("HTTP 302"));
     }
 
     #[test]

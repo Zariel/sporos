@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, not implemented.
+Accepted and implemented for v0.1.0.
 
 ## Date
 

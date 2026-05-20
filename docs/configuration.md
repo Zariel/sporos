@@ -147,10 +147,9 @@ Injected torrents get client metadata from these optional fields:
   `d.custom1.set` calls. The default is `"sporos"`.
 
 Use `cross-seed` values when matching an existing cross-seed-oriented client
-layout. The built-in `sporos` defaults are intentionally conservative for this
-unreleased Rust service and keep Sporos-owned injections easy to distinguish.
-qBittorrent uses category and tags; rTorrent uses only `default_label` with
-`label_field = "custom1"`.
+layout. The built-in `sporos` defaults are intentionally conservative and keep
+Sporos-owned injections easy to distinguish. qBittorrent uses category and
+tags; rTorrent uses only `default_label` with `label_field = "custom1"`.
 
 ## Injection Recheck And Auto-Resume
 

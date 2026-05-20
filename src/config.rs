@@ -758,6 +758,7 @@ fn validate_prowlarr_sources(config: &SporosConfig, raw: &Value) -> Result<(), C
 
 fn validate_torrent_clients(config: &SporosConfig) -> Result<(), ConfigError> {
     for (name, client) in &config.torrent_clients {
+        validate_http_url("torrent_clients.url", name, &client.url)?;
         if let Some(category) = &client.default_category {
             validate_injection_metadata_value(
                 "torrent_clients.default_category",
@@ -2681,6 +2682,34 @@ mod tests {
         assert!(error.to_string().contains("torrent_clients.password"));
         assert!(error.to_string().contains("only one"));
         assert!(error.to_string().contains("password_file"));
+    }
+
+    #[test]
+    fn torrent_clients_reject_secret_bearing_urls() {
+        for (url, expected) in [
+            ("file:///var/lib/qbittorrent", "http or https"),
+            (
+                "http://user:pass@qbittorrent:8080",
+                "userinfo is not supported",
+            ),
+            ("http://qbittorrent:8080?token=secret", "query parameters"),
+            ("http://qbittorrent:8080#token=secret", "fragments"),
+        ] {
+            let error = parse_config(&format!(
+                r#"
+                [torrent_clients.qbit_main]
+                kind = "qbittorrent"
+                url = "{url}"
+                default_save_path = "/downloads"
+                "#
+            ))
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{error} did not contain {expected}"
+            );
+        }
     }
 
     #[test]
