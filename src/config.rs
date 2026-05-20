@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use toml::Value;
 
 use crate::announce::AnnounceQueueConfig;
@@ -12,6 +12,7 @@ use crate::errors::ConfigError;
 use crate::secrets::{ApiKey, ApiToken, Password};
 
 pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
+pub const DEFAULT_INJECTION_METADATA: &str = "sporos";
 const ENV_PREFIX: &str = "SPOROS__";
 static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -78,6 +79,15 @@ pub struct TorrentClientConfig {
     pub password_file: Option<PathBuf>,
     pub password_env: Option<String>,
     pub default_save_path: PathBuf,
+    #[serde(default)]
+    pub default_category: Option<String>,
+    #[serde(
+        default = "default_injection_tags",
+        deserialize_with = "deserialize_string_list"
+    )]
+    pub default_tags: Vec<String>,
+    #[serde(default = "default_injection_label")]
+    pub default_label: String,
     pub label_field: Option<String>,
 }
 
@@ -335,12 +345,40 @@ where
             reason: error.to_string(),
         })?;
     validate_secret_source_counts(&config)?;
+    validate_torrent_clients(&config)?;
     validate_prowlarr_sources(&config, &raw)?;
     validate_arr_secret_source_counts(&config)?;
     resolve_secret_env(&mut config, &env)?;
     validate_integration_api_keys(&config)?;
 
     Ok((config, raw))
+}
+
+fn default_injection_label() -> String {
+    DEFAULT_INJECTION_METADATA.to_owned()
+}
+
+fn default_injection_tags() -> Vec<String> {
+    vec![DEFAULT_INJECTION_METADATA.to_owned()]
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringList {
+        String(String),
+        List(Vec<String>),
+    }
+
+    match StringList::deserialize(deserializer)? {
+        StringList::String(value) => {
+            Ok(value.split(',').map(str::trim).map(str::to_owned).collect())
+        }
+        StringList::List(values) => Ok(values),
+    }
 }
 
 fn parse_raw_config(contents: &str) -> Result<Value, ConfigError> {
@@ -362,7 +400,7 @@ fn apply_env_overrides(raw: &mut Value, env: &BTreeMap<String, String>) -> Resul
         let path = env_key_path(key, suffix)?;
         reject_array_env_path(key, &path)?;
         let value = parse_env_scalar(key, value)?;
-        insert_env_value(raw, &path, value, key)?;
+        insert_env_value(raw, &path, &path, value, key)?;
     }
 
     Ok(())
@@ -428,6 +466,7 @@ fn parse_env_scalar(key: &str, value: &str) -> Result<Value, ConfigError> {
 fn insert_env_value(
     current: &mut Value,
     path: &[String],
+    full_path: &[String],
     value: Value,
     key: &str,
 ) -> Result<(), ConfigError> {
@@ -442,7 +481,9 @@ fn insert_env_value(
     };
 
     if rest.is_empty() {
-        if matches!(table.get(segment), Some(Value::Array(_))) {
+        if matches!(table.get(segment), Some(Value::Array(_)))
+            && !is_torrent_client_default_tags_path(full_path)
+        {
             return Err(env_error(
                 key,
                 "array config values are not settable through env",
@@ -459,7 +500,15 @@ fn insert_env_value(
         return Err(env_error(key, "indexed env overrides are not supported"));
     }
 
-    insert_env_value(child, rest, value, key)
+    insert_env_value(child, rest, full_path, value, key)
+}
+
+fn is_torrent_client_default_tags_path(path: &[String]) -> bool {
+    matches!(
+        path,
+        [section, _client_name, field]
+            if section == "torrent_clients" && field == "default_tags"
+    )
 }
 
 fn resolve_secret_env(
@@ -653,6 +702,67 @@ fn validate_prowlarr_sources(config: &SporosConfig, raw: &Value) -> Result<(), C
                 });
             }
         }
+    }
+
+    Ok(())
+}
+
+fn validate_torrent_clients(config: &SporosConfig) -> Result<(), ConfigError> {
+    for (name, client) in &config.torrent_clients {
+        if let Some(category) = &client.default_category {
+            validate_injection_metadata_value(
+                "torrent_clients.default_category",
+                name,
+                "category",
+                category,
+                false,
+            )?;
+        }
+        validate_injection_metadata_value(
+            "torrent_clients.default_label",
+            name,
+            "label",
+            &client.default_label,
+            false,
+        )?;
+        for tag in &client.default_tags {
+            validate_injection_metadata_value(
+                "torrent_clients.default_tags",
+                name,
+                "tag",
+                tag,
+                true,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_injection_metadata_value(
+    field: &'static str,
+    client_name: &str,
+    value_name: &str,
+    value: &str,
+    reject_comma: bool,
+) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{client_name} contains an empty {value_name}"),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{client_name} {value_name} contains a control character"),
+        });
+    }
+    if reject_comma && value.contains(',') {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: format!("{client_name} {value_name} must not contain commas"),
+        });
     }
 
     Ok(())
@@ -1197,6 +1307,9 @@ password = "optional local-development secret"
 password_file = "optional path"
 password_env = "optional env var containing password"
 default_save_path = "path"
+default_category = "optional qbittorrent category"
+default_tags = ["sporos"]
+default_label = "sporos"
 label_field = "optional rtorrent custom field"
 
 [indexers.default_timeouts]
@@ -1242,6 +1355,9 @@ SPOROS__PATHS__DATABASE = "/data/state/sporos.db"
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE = "/var/run/secrets/qbit-password"
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY = "cross-seed"
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS = "cross-seed,sporos"
+SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL = "cross-seed"
 SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY_FILE = "/var/run/secrets/indexer-api-key"
 SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE = "/var/run/secrets/prowlarr-api-key"
 SPOROS__INDEXERS__ARR__SONARR__MAIN__API_KEY_FILE = "/var/run/secrets/sonarr-api-key"
@@ -1326,6 +1442,97 @@ mod tests {
                 .and_then(|client| client.password_file.as_deref())
                 .and_then(Path::to_str)
         );
+        let client = &config.torrent_clients["qbit_main"];
+        assert_eq!(None, client.default_category);
+        assert_eq!(
+            vec![DEFAULT_INJECTION_METADATA.to_owned()],
+            client.default_tags
+        );
+        assert_eq!(DEFAULT_INJECTION_METADATA, client.default_label);
+    }
+
+    #[test]
+    fn parses_injection_metadata_settings() {
+        let config = parse_config(
+            r#"
+            [torrent_clients.qbit_main]
+            kind = "qbittorrent"
+            url = "http://qbittorrent:8080"
+            default_save_path = "/downloads"
+            default_category = "cross-seed"
+            default_tags = ["cross-seed", "sporos"]
+
+            [torrent_clients.rtorrent_main]
+            kind = "rtorrent"
+            url = "http://rtorrent:5000/RPC2"
+            default_save_path = "/downloads"
+            default_label = "cross-seed"
+            label_field = "custom1"
+            "#,
+        )
+        .unwrap();
+        let qbit = &config.torrent_clients["qbit_main"];
+        let rtorrent = &config.torrent_clients["rtorrent_main"];
+
+        assert_eq!(Some("cross-seed"), qbit.default_category.as_deref());
+        assert_eq!(
+            vec!["cross-seed".to_owned(), "sporos".to_owned()],
+            qbit.default_tags
+        );
+        assert_eq!("cross-seed", rtorrent.default_label);
+    }
+
+    #[test]
+    fn rejects_invalid_injection_metadata_settings() {
+        for (contents, expected) in [
+            (
+                r#"
+                [torrent_clients.qbit_main]
+                kind = "qbittorrent"
+                url = "http://qbittorrent:8080"
+                default_save_path = "/downloads"
+                default_category = " "
+                "#,
+                "empty category",
+            ),
+            (
+                r#"
+                [torrent_clients.qbit_main]
+                kind = "qbittorrent"
+                url = "http://qbittorrent:8080"
+                default_save_path = "/downloads"
+                default_tags = ["cross-seed", ""]
+                "#,
+                "empty tag",
+            ),
+            (
+                r#"
+                [torrent_clients.qbit_main]
+                kind = "qbittorrent"
+                url = "http://qbittorrent:8080"
+                default_save_path = "/downloads"
+                default_tags = ["bad,tag"]
+                "#,
+                "commas",
+            ),
+            (
+                r#"
+                [torrent_clients.rtorrent_main]
+                kind = "rtorrent"
+                url = "http://rtorrent:5000/RPC2"
+                default_save_path = "/downloads"
+                default_label = ""
+                "#,
+                "empty label",
+            ),
+        ] {
+            let error = parse_config(contents).unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{error} did not contain {expected}"
+            );
+        }
     }
 
     #[test]
@@ -1729,8 +1936,11 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("[indexers.prowlarr.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[inventory]"));
         assert!(!CONFIG_SCHEMA.contains("rss_interval"));
+        assert!(CONFIG_SCHEMA.contains("default_tags = [\"sporos\"]"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE"));
     }
 
@@ -1819,6 +2029,14 @@ mod tests {
                     "http://qbittorrent:8080".to_owned(),
                 ),
                 (
+                    "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY".to_owned(),
+                    "cross-seed".to_owned(),
+                ),
+                (
+                    "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS".to_owned(),
+                    "cross-seed,sporos".to_owned(),
+                ),
+                (
                     "SPOROS__INDEXERS__TORZNAB__EXAMPLE__URL".to_owned(),
                     "https://indexer.example/api".to_owned(),
                 ),
@@ -1843,6 +2061,11 @@ mod tests {
         let radarr = &config.indexers.arr.radarr["main"];
 
         assert_eq!("http://qbittorrent:8080", client.url);
+        assert_eq!(Some("cross-seed"), client.default_category.as_deref());
+        assert_eq!(
+            vec!["cross-seed".to_owned(), "sporos".to_owned()],
+            client.default_tags
+        );
         assert_eq!(
             Some("super-secret"),
             client.password.as_ref().map(Password::expose_secret)
@@ -1865,6 +2088,30 @@ mod tests {
         assert_eq!(
             Some("radarr-secret"),
             radarr.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+    }
+
+    #[test]
+    fn environment_overrides_default_tags_array_with_comma_list() {
+        let config = parse_config_with_env(
+            r#"
+            [torrent_clients.qbit_main]
+            kind = "qbittorrent"
+            url = "http://qbittorrent:8080"
+            default_save_path = "/downloads"
+            default_tags = ["sporos"]
+            "#,
+            vec![(
+                "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS".to_owned(),
+                "cross-seed,sporos".to_owned(),
+            )],
+        )
+        .unwrap();
+        let client = &config.torrent_clients["qbit_main"];
+
+        assert_eq!(
+            vec!["cross-seed".to_owned(), "sporos".to_owned()],
+            client.default_tags
         );
     }
 

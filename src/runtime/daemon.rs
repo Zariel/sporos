@@ -2394,6 +2394,9 @@ mod tests {
                 password_file: None,
                 password_env: None,
                 default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
                 label_field: None,
             },
         );
