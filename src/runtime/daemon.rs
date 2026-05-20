@@ -241,10 +241,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             &runtime.state,
             run_saved_retry_loop(
                 runtime.state.injection_worker.clone(),
-                SavedTorrentRetryConfig {
-                    directories: vec![runtime.state.config.paths.output_dir.clone()],
-                    ..SavedTorrentRetryConfig::default()
-                },
+                saved_torrent_retry_config(&runtime.state.config),
                 runtime.state.saved_retry_interval,
                 runtime.state.shutdown_signal.clone(),
             ),
@@ -353,6 +350,18 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     );
 
     Ok(handles)
+}
+
+fn runtime_recheck_resume_config(config: &SporosConfig) -> RecheckResumeConfig {
+    RecheckResumeConfig::from(&config.injection.recheck)
+}
+
+fn saved_torrent_retry_config(config: &SporosConfig) -> SavedTorrentRetryConfig {
+    SavedTorrentRetryConfig {
+        directories: vec![config.paths.output_dir.clone()],
+        recheck: runtime_recheck_resume_config(config),
+        ..SavedTorrentRetryConfig::default()
+    }
 }
 
 fn spawn_supervised_background<F>(name: &'static str, state: &AppState, future: F) -> JoinHandle<()>
@@ -795,6 +804,7 @@ async fn process_downloaded_search_candidate(
                 }
                 return Ok(SearchCandidateOutcome::Saved);
             }
+            let recheck = runtime_recheck_resume_config(&state.config);
             let result = state
                 .injection_worker
                 .process_until_shutdown(
@@ -811,7 +821,7 @@ async fn process_downloaded_search_candidate(
                         link_dirs: Vec::new(),
                         link_type: None,
                         flat_linking: false,
-                        recheck: RecheckResumeConfig::default(),
+                        recheck,
                     },
                     shutdown.clone(),
                 )
@@ -830,9 +840,9 @@ async fn process_downloaded_search_candidate(
                 InjectionOutcome::Injected => SearchCandidateOutcome::Injected,
                 InjectionOutcome::Saved => SearchCandidateOutcome::Saved,
                 InjectionOutcome::AlreadyExists => SearchCandidateOutcome::AlreadyPresent,
-                InjectionOutcome::SourceIncomplete | InjectionOutcome::Failed => {
-                    SearchCandidateOutcome::Rejected
-                }
+                InjectionOutcome::SourceIncomplete
+                | InjectionOutcome::Rejected
+                | InjectionOutcome::Failed => SearchCandidateOutcome::Rejected,
             });
         }
         best_failure = Some(assessment);
@@ -874,6 +884,7 @@ fn injection_metric_outcome(outcome: InjectionOutcome) -> ActionOutcome {
         InjectionOutcome::Injected => ActionOutcome::Injected,
         InjectionOutcome::Saved => ActionOutcome::Saved,
         InjectionOutcome::AlreadyExists => ActionOutcome::AlreadyExisting,
+        InjectionOutcome::Rejected => ActionOutcome::Rejected,
         InjectionOutcome::SourceIncomplete | InjectionOutcome::Failed => ActionOutcome::Failed,
     }
 }
@@ -1557,6 +1568,7 @@ async fn process_downloaded_announce_candidate(
                     next_attempt_at_ms: now_ms,
                 });
             }
+            let recheck = runtime_recheck_resume_config(&state.config);
             let result = state
                 .injection_worker
                 .process_until_shutdown(
@@ -1573,7 +1585,7 @@ async fn process_downloaded_announce_candidate(
                         link_dirs: Vec::new(),
                         link_type: None,
                         flat_linking: false,
-                        recheck: RecheckResumeConfig::default(),
+                        recheck,
                     },
                     shutdown.clone(),
                 )
@@ -2236,6 +2248,45 @@ mod tests {
     use axum::routing::{get, post};
     use serde_json::Value;
     use tower::ServiceExt;
+
+    #[test]
+    fn runtime_recheck_config_uses_auto_resume_settings() {
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = PathBuf::from("/tmp/sporos-output");
+        config.injection.recheck.skip_recheck = true;
+        config.injection.recheck.max_remaining_bytes = 123;
+        config.injection.recheck.min_completion_percent = Some(85.0);
+        config.injection.recheck.max_remaining_percent = Some(15.0);
+        config.injection.recheck.ignore_non_relevant_files_to_resume = true;
+        config.injection.recheck.non_relevant_max_remaining_bytes = 456;
+        config.injection.recheck.piece_slack_multiplier = 3;
+        config.injection.recheck.poll_interval_ms = 250;
+        config.injection.recheck.max_resume_wait_ms = 500;
+        config.injection.recheck.below_threshold_action =
+            crate::config::BelowThresholdActionConfig::RejectWithoutInjecting;
+
+        let recheck = runtime_recheck_resume_config(&config);
+        let saved_retry = saved_torrent_retry_config(&config);
+
+        assert!(recheck.skip_recheck);
+        assert_eq!(ByteSize::new(123), recheck.auto_resume_max_download);
+        assert_eq!(Some(85.0), recheck.min_completion_percent);
+        assert_eq!(Some(15.0), recheck.max_remaining_percent);
+        assert!(recheck.ignore_non_relevant_files_to_resume);
+        assert_eq!(ByteSize::new(456), recheck.non_relevant_max_remaining);
+        assert_eq!(3, recheck.piece_slack_multiplier);
+        assert_eq!(250, recheck.poll_interval_ms);
+        assert_eq!(500, recheck.max_resume_wait_ms);
+        assert_eq!(
+            crate::runtime::injection_worker::BelowThresholdAction::RejectWithoutInjecting,
+            recheck.below_threshold_action
+        );
+        assert_eq!(
+            vec![PathBuf::from("/tmp/sporos-output")],
+            saved_retry.directories
+        );
+        assert_eq!(recheck, saved_retry.recheck);
+    }
 
     #[tokio::test]
     async fn serve_runtime_listens_until_aborted() {

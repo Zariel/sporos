@@ -227,6 +227,7 @@ pub enum ActionOutcome {
     Saved,
     Injected,
     AlreadyExisting,
+    Rejected,
     Failed,
 }
 
@@ -236,6 +237,7 @@ impl ActionOutcome {
             Self::Saved => "saved",
             Self::Injected => "injected",
             Self::AlreadyExisting => "already_existing",
+            Self::Rejected => "rejected",
             Self::Failed => "failed",
         }
     }

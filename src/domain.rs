@@ -503,6 +503,7 @@ pub enum InjectionOutcome {
     Saved,
     AlreadyExists,
     SourceIncomplete,
+    Rejected,
     Failed,
 }
 

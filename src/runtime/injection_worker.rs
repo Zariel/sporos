@@ -194,6 +194,7 @@ pub struct RecheckResumeConfig {
     pub piece_slack_multiplier: u64,
     pub poll_interval_ms: u64,
     pub max_resume_wait_ms: u64,
+    pub below_threshold_action: BelowThresholdAction,
 }
 
 impl Default for RecheckResumeConfig {
@@ -208,8 +209,17 @@ impl Default for RecheckResumeConfig {
             piece_slack_multiplier: 2,
             poll_interval_ms: 5_000,
             max_resume_wait_ms: 60 * 60 * 1_000,
+            below_threshold_action: BelowThresholdAction::InjectPaused,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum BelowThresholdAction {
+    InjectAndStart,
+    #[default]
+    InjectPaused,
+    RejectWithoutInjecting,
 }
 
 impl From<&crate::config::AutoResumePolicyConfig> for RecheckResumeConfig {
@@ -224,6 +234,19 @@ impl From<&crate::config::AutoResumePolicyConfig> for RecheckResumeConfig {
             piece_slack_multiplier: config.piece_slack_multiplier,
             poll_interval_ms: config.poll_interval_ms,
             max_resume_wait_ms: config.max_resume_wait_ms,
+            below_threshold_action: BelowThresholdAction::from(config.below_threshold_action),
+        }
+    }
+}
+
+impl From<crate::config::BelowThresholdActionConfig> for BelowThresholdAction {
+    fn from(config: crate::config::BelowThresholdActionConfig) -> Self {
+        match config {
+            crate::config::BelowThresholdActionConfig::InjectAndStart => Self::InjectAndStart,
+            crate::config::BelowThresholdActionConfig::InjectPaused => Self::InjectPaused,
+            crate::config::BelowThresholdActionConfig::RejectWithoutInjecting => {
+                Self::RejectWithoutInjecting
+            }
         }
     }
 }
@@ -488,6 +511,27 @@ impl InjectionWorker {
             });
         }
 
+        let recheck_plan =
+            recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
+        let below_threshold = is_below_resume_threshold(
+            &request.metafile,
+            &request.assessment,
+            request.recheck,
+            recheck_plan,
+        );
+        if below_threshold
+            && request.recheck.below_threshold_action
+                == BelowThresholdAction::RejectWithoutInjecting
+        {
+            return Ok(InjectionWorkResult {
+                outcome: InjectionOutcome::Rejected,
+                target_client: Some(target_name),
+                saved_for_retry: false,
+                linked_files: 0,
+                prepared_link_cleanup_incomplete: false,
+            });
+        }
+
         let link_result = self.prepare_links(&request).await?;
         let (save_path, created_links, prepared_links, created_roots, linked_files) =
             match link_result {
@@ -516,14 +560,19 @@ impl InjectionWorker {
                 }
             };
 
-        let recheck_plan =
-            recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
         let has_prepared_links = !prepared_links.is_empty();
         let recheck_after_linking = RecheckResumePlan {
             should_recheck: true,
             ..recheck_plan
         };
-        let pause_for_recheck = recheck_plan.should_recheck || has_prepared_links;
+        let pause_for_recheck = has_prepared_links
+            || (recheck_plan.should_recheck
+                && !(below_threshold
+                    && request.recheck.below_threshold_action
+                        == BelowThresholdAction::InjectAndStart));
+        let run_resume_after_inject = pause_for_recheck
+            && !(below_threshold
+                && request.recheck.below_threshold_action == BelowThresholdAction::InjectPaused);
         if should_stop() {
             self.save_for_retry(&request).await?;
             let prepared_link_cleanup_incomplete =
@@ -637,7 +686,7 @@ impl InjectionWorker {
             InjectionMutationResult::Injected(Ok(())) => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
-                if pause_for_recheck {
+                if run_resume_after_inject {
                     let save_result = self.save_for_retry(&request).await;
                     let resume_result = self
                         .run_recheck_resume(
@@ -657,7 +706,7 @@ impl InjectionWorker {
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Injected,
                     target_client: Some(target_name),
-                    saved_for_retry: pause_for_recheck,
+                    saved_for_retry: run_resume_after_inject,
                     linked_files,
                     prepared_link_cleanup_incomplete: false,
                 })
@@ -931,6 +980,18 @@ impl InjectionWorker {
                         )
                         .await
                     {
+                        Ok(true) => summary.deleted += 1,
+                        Ok(false) => summary.kept += 1,
+                        Err(error) if saved_retry_can_continue_after_error(&error) => {
+                            summary.failed += 1;
+                            summary.kept += 1;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    return Ok(());
+                }
+                InjectionOutcome::Rejected => {
+                    match delete_saved_torrent(path, saved.identity).await {
                         Ok(true) => summary.deleted += 1,
                         Ok(false) => summary.kept += 1,
                         Err(error) if saved_retry_can_continue_after_error(&error) => {
@@ -1740,6 +1801,7 @@ fn record_saved_retry_result(outcome: InjectionOutcome, summary: &mut SavedTorre
         InjectionOutcome::Injected => summary.injected += 1,
         InjectionOutcome::AlreadyExists => summary.already_exists += 1,
         InjectionOutcome::SourceIncomplete => summary.source_incomplete += 1,
+        InjectionOutcome::Rejected => summary.no_match += 1,
         InjectionOutcome::Failed => summary.failed += 1,
         InjectionOutcome::Saved => summary.kept += 1,
     }
@@ -1882,6 +1944,28 @@ pub fn can_resume_with_remaining(
         return false;
     };
     remaining.get() <= allowed_slack
+}
+
+fn is_below_resume_threshold(
+    metafile: &TorrentMetafile,
+    assessment: &CandidateAssessment,
+    config: RecheckResumeConfig,
+    plan: RecheckResumePlan,
+) -> bool {
+    if assessment.decision != MatchDecision::Partial || has_video_disc_files(metafile) {
+        return false;
+    }
+
+    let Some(matched_size) = assessment.matched_size else {
+        return true;
+    };
+    let remaining = ByteSize::new(
+        metafile
+            .total_size()
+            .get()
+            .saturating_sub(matched_size.get()),
+    );
+    !can_resume_with_remaining(metafile, assessment, config, plan, remaining)
 }
 
 fn can_resume_with_percentage(
@@ -2372,6 +2456,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_rejects_below_threshold_without_client_mutation() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-reject-below-threshold");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.metafile = metafile_with_files(&[("movie.mkv", 20)]);
+        request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        request.recheck = RecheckResumeConfig {
+            below_threshold_action: BelowThresholdAction::RejectWithoutInjecting,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Rejected, result.outcome);
+        assert!(!result.saved_for_retry);
+        assert_eq!(0, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(0, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn worker_injects_and_starts_below_threshold_when_configured() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-start-below-threshold");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.metafile = metafile_with_files(&[("movie.mkv", 20)]);
+        request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        request.recheck = RecheckResumeConfig {
+            below_threshold_action: BelowThresholdAction::InjectAndStart,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Injected, result.outcome);
+        assert!(!result.saved_for_retry);
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(false), target.last_pause_for_recheck());
+        assert_eq!(0, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn worker_injects_paused_below_threshold_without_auto_resume() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-paused-below-threshold");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.metafile = metafile_with_files(&[("movie.mkv", 20)]);
+        request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        request.recheck = RecheckResumeConfig {
+            below_threshold_action: BelowThresholdAction::InjectPaused,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Injected, result.outcome);
+        assert!(!result.saved_for_retry);
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.remaining_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(true), target.last_pause_for_recheck());
+        assert_eq!(0, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
     async fn worker_rechecks_exact_match_by_default_before_resume() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("injection-default-recheck");
@@ -2794,6 +2975,41 @@ mod tests {
         assert_eq!(1, summary.deleted);
         assert_eq!(0, saved_torrent_count(&output_dir));
         assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn saved_retry_rejects_below_threshold_without_client_mutation() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-rejected");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.metafile = metafile_with_files(&[("movie.mkv", 20)]);
+        request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        request.recheck = RecheckResumeConfig {
+            below_threshold_action: BelowThresholdAction::RejectWithoutInjecting,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let mut should_stop = || false;
+
+        let result = worker
+            .process_inner(request, &mut should_stop, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(InjectionOutcome::Rejected, result.outcome);
+        assert!(!result.saved_for_retry);
+        assert_eq!(0, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -3762,7 +3978,8 @@ mod tests {
             piece_slack_multiplier: 3,
             poll_interval_ms: 250,
             max_resume_wait_ms: 500,
-            below_threshold_action: crate::config::BelowThresholdActionConfig::InjectPaused,
+            below_threshold_action:
+                crate::config::BelowThresholdActionConfig::RejectWithoutInjecting,
         };
 
         assert_eq!(
@@ -3776,6 +3993,7 @@ mod tests {
                 piece_slack_multiplier: 3,
                 poll_interval_ms: 250,
                 max_resume_wait_ms: 500,
+                below_threshold_action: BelowThresholdAction::RejectWithoutInjecting,
             },
             RecheckResumeConfig::from(&config)
         );

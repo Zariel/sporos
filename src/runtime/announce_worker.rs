@@ -290,6 +290,10 @@ pub fn classify_injection_result(
         InjectionOutcome::Injected => AnnounceWorkflowResult::Injected,
         InjectionOutcome::Saved => AnnounceWorkflowResult::Saved,
         InjectionOutcome::AlreadyExists => AnnounceWorkflowResult::AlreadyExists,
+        InjectionOutcome::Rejected => AnnounceWorkflowResult::TerminalFailure {
+            reason: AnnounceReason::NoMatchTerminal,
+            redacted_message: "candidate rejected by auto-resume policy".to_owned(),
+        },
         InjectionOutcome::SourceIncomplete => AnnounceWorkflowResult::SourceIncomplete {
             dependency: result
                 .target_client
