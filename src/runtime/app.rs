@@ -1361,6 +1361,8 @@ struct RuntimeInjectionClient {
     descriptor: TorrentClientDescriptor,
     inner: RuntimeInjectionClientInner,
     qbit_validated: AsyncMutex<bool>,
+    qbit_default_category: Option<String>,
+    qbit_default_tags: Vec<String>,
     metrics: MetricsRegistry,
 }
 
@@ -1394,6 +1396,8 @@ impl RuntimeInjectionClient {
             descriptor,
             inner,
             qbit_validated: AsyncMutex::new(false),
+            qbit_default_category: config.default_category.clone(),
+            qbit_default_tags: config.default_tags.clone(),
             metrics,
         }
     }
@@ -1405,6 +1409,14 @@ impl RuntimeInjectionClient {
         let mut validated = self.qbit_validated.lock().await;
         if !*validated {
             client.validate().await?;
+            for tag in &self.qbit_default_tags {
+                client.create_tag(tag).await?;
+            }
+            if let Some(category) = &self.qbit_default_category {
+                client
+                    .create_category(category, Some(&self.descriptor.default_save_path))
+                    .await?;
+            }
             *validated = true;
         }
         Ok(())
@@ -1565,7 +1577,8 @@ impl InjectionClient for RuntimeInjectionClient {
                                 .inject(QbitAddTorrent {
                                     torrent_bytes: request.torrent_bytes,
                                     save_path: save_path.as_ref(),
-                                    category: None,
+                                    category: self.qbit_default_category.as_deref(),
+                                    tags: &self.qbit_default_tags,
                                     pause_for_recheck: request.pause_for_recheck,
                                     content_layout: QbitContentLayout::Original,
                                 })
@@ -4030,6 +4043,10 @@ mod tests {
     async fn runtime_qbittorrent_adapter_pauses_for_recheck() {
         let add_body = Arc::new(Mutex::new(None::<String>));
         let seen_add_body = add_body.clone();
+        let create_tag_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_create_tag_bodies = create_tag_bodies.clone();
+        let create_category_body = Arc::new(Mutex::new(None::<String>));
+        let seen_create_category_body = create_category_body.clone();
         let app = axum::Router::new()
             .route(
                 "/api/v2/auth/login",
@@ -4038,7 +4055,27 @@ mod tests {
             .route("/api/v2/app/version", get(|| async { "4.6.0" }))
             .route(
                 "/api/v2/torrents/createTags",
-                post(|| async { StatusCode::OK }),
+                post(move |request: Request<Body>| {
+                    let seen_create_tag_bodies = seen_create_tag_bodies.clone();
+                    async move {
+                        let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        seen_create_tag_bodies.lock().unwrap().push(body);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/api/v2/torrents/createCategory",
+                post(move |request: Request<Body>| {
+                    let seen_create_category_body = seen_create_category_body.clone();
+                    async move {
+                        let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        *seen_create_category_body.lock().unwrap() = Some(body);
+                        StatusCode::OK
+                    }
+                }),
             )
             .route(
                 "/api/v2/torrents/add",
@@ -4072,8 +4109,8 @@ mod tests {
             password_file: None,
             password_env: None,
             default_save_path: "/downloads".into(),
-            default_category: None,
-            default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+            default_category: Some("movies".to_owned()),
+            default_tags: vec!["cross-seed".to_owned(), "sporos".to_owned()],
             default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
             label_field: None,
         };
@@ -4093,6 +4130,14 @@ mod tests {
 
         handle.abort();
         let body = add_body.lock().unwrap().clone().unwrap();
+        let tag_bodies = create_tag_bodies.lock().unwrap().join("\n");
+        let category_body = create_category_body.lock().unwrap().clone().unwrap();
+        assert!(tag_bodies.contains("tags=cross-seed"));
+        assert!(tag_bodies.contains("tags=sporos"));
+        assert!(category_body.contains("category=movies"));
+        assert!(category_body.contains("savePath=%2Fdownloads"));
+        assert!(body.contains("name=\"tags\"\r\n\r\ncross-seed,sporos"));
+        assert!(body.contains("name=\"category\"\r\n\r\nmovies"));
         assert!(body.contains("name=\"paused\"\r\n\r\ntrue"));
         assert!(body.contains("name=\"skip_checking\"\r\n\r\nfalse"));
     }

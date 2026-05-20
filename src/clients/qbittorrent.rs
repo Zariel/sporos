@@ -13,7 +13,6 @@ use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
 use crate::errors::TorrentClientError;
 use crate::secrets::sanitize_url_for_logging;
 
-const SPOROS_TAG: &str = "sporos";
 const MIN_QBIT_VERSION: QbitVersion = QbitVersion {
     major: 4,
     minor: 3,
@@ -78,7 +77,6 @@ impl QbittorrentClient {
                 capability: format!("qBittorrent >= {MIN_QBIT_VERSION}"),
             });
         }
-        self.create_tag(SPOROS_TAG).await?;
         Ok(version)
     }
 
@@ -283,6 +281,7 @@ impl QbittorrentClient {
         let torrent_bytes = request.torrent_bytes.to_vec();
         let save_path = request.save_path.map(|path| path.display().to_string());
         let category = request.category.map(str::to_owned);
+        let tags = request.tags.to_vec();
         let pause_for_recheck = request.pause_for_recheck;
         let content_layout = request.content_layout;
         self.post_multipart("/api/v2/torrents/add", || {
@@ -293,6 +292,7 @@ impl QbittorrentClient {
                 content_layout,
                 save_path.as_deref(),
                 category.as_deref(),
+                &tags,
             )
         })
         .await
@@ -514,6 +514,7 @@ pub struct QbitAddTorrent<'a> {
     pub torrent_bytes: &'a [u8],
     pub save_path: Option<&'a PathBuf>,
     pub category: Option<&'a str>,
+    pub tags: &'a [String],
     pub pause_for_recheck: bool,
     pub content_layout: QbitContentLayout,
 }
@@ -634,6 +635,7 @@ fn add_torrent_form(
     content_layout: QbitContentLayout,
     save_path: Option<&str>,
     category: Option<&str>,
+    tags: &[String],
 ) -> Form {
     let mut form = Form::new()
         .part(
@@ -642,8 +644,10 @@ fn add_torrent_form(
         )
         .text(paused_field.to_owned(), pause_for_recheck.to_string())
         .text("skip_checking", (!pause_for_recheck).to_string())
-        .text("tags", SPOROS_TAG.to_owned())
         .text("contentLayout", content_layout.as_str().to_owned());
+    if !tags.is_empty() {
+        form = form.text("tags", tags.join(","));
+    }
     if let Some(save_path) = save_path {
         form = form.text("savepath", save_path.to_owned());
     }
@@ -994,6 +998,7 @@ mod tests {
                     let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
                     let body = String::from_utf8_lossy(&body);
                     assert!(body.contains("candidate.torrent"));
+                    assert!(body.contains("cross-seed,sporos"));
                     assert!(body.contains("sporos"));
                     assert!(body.contains("category"));
                     assert!(body.contains("movies"));
@@ -1010,13 +1015,48 @@ mod tests {
         .await;
         let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
         let save_path = PathBuf::from("/downloads");
+        let tags = vec!["cross-seed".to_owned(), "sporos".to_owned()];
 
         client
             .inject(QbitAddTorrent {
                 torrent_bytes: b"torrent-bytes",
                 save_path: Some(&save_path),
                 category: Some("movies"),
+                tags: &tags,
                 pause_for_recheck: true,
+                content_layout: QbitContentLayout::Original,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_injects_without_category_or_tags_when_unconfigured() {
+        let endpoint = spawn_qbit_server(|request| async move {
+            let path = request.uri().path().to_owned();
+            match path.as_str() {
+                "/api/v2/auth/login" => response_with_cookie(AxumStatusCode::OK, "Ok.", "SID=ok"),
+                "/api/v2/app/version" => (AxumStatusCode::OK, "4.6.0").into_response(),
+                "/api/v2/torrents/add" => {
+                    let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
+                    let body = String::from_utf8_lossy(&body);
+                    assert!(!body.contains("name=\"category\""));
+                    assert!(!body.contains("name=\"tags\""));
+                    (AxumStatusCode::OK, "").into_response()
+                }
+                _ => (AxumStatusCode::NOT_FOUND, path).into_response(),
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+
+        client
+            .inject(QbitAddTorrent {
+                torrent_bytes: b"torrent-bytes",
+                save_path: None,
+                category: None,
+                tags: &[],
+                pause_for_recheck: false,
                 content_layout: QbitContentLayout::Original,
             })
             .await
