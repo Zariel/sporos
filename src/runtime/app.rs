@@ -1363,6 +1363,7 @@ struct RuntimeInjectionClient {
     qbit_validated: AsyncMutex<bool>,
     qbit_default_category: Option<String>,
     qbit_default_tags: Vec<String>,
+    default_label: String,
     metrics: MetricsRegistry,
 }
 
@@ -1398,6 +1399,7 @@ impl RuntimeInjectionClient {
             qbit_validated: AsyncMutex::new(false),
             qbit_default_category: config.default_category.clone(),
             qbit_default_tags: config.default_tags.clone(),
+            default_label: config.default_label.clone(),
             metrics,
         }
     }
@@ -1592,6 +1594,7 @@ impl InjectionClient for RuntimeInjectionClient {
                         .inject(
                             request.torrent_bytes,
                             request.save_path,
+                            &self.default_label,
                             !request.pause_for_recheck,
                         )
                         .await
@@ -4180,7 +4183,7 @@ mod tests {
             default_save_path: "/downloads".into(),
             default_category: None,
             default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
-            default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+            default_label: "cross-seed".to_owned(),
             label_field: None,
         };
         let client =
@@ -4201,6 +4204,7 @@ mod tests {
         let body = inject_body.lock().unwrap().clone().unwrap();
         assert!(body.contains("<methodName>load.raw</methodName>"));
         assert!(!body.contains("<methodName>load.raw_start</methodName>"));
+        assert!(body.contains("<string>d.custom1.set=cross-seed</string>"));
     }
 
     #[tokio::test]

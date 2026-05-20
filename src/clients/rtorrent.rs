@@ -17,7 +17,6 @@ use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
 use crate::errors::TorrentClientError;
 use crate::secrets::sanitize_url_for_logging;
 
-const RTORRENT_LABEL: &str = "sporos";
 const RTORRENT_RESPONSE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const INVENTORY_METHODS: &[&str] = &[
     "d.name",
@@ -226,20 +225,25 @@ impl RtorrentClient {
         &self,
         torrent_bytes: &[u8],
         save_path: Option<&Path>,
+        label: &str,
         start: bool,
     ) -> Result<(), TorrentClientError> {
         let method = if start { "load.raw_start" } else { "load.raw" };
-        self.call(method, injection_params(torrent_bytes, save_path))
+        self.call(method, injection_params(torrent_bytes, save_path, label))
             .await
             .map(|_| ())
     }
 
-    pub async fn set_label(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
+    pub async fn set_label(
+        &self,
+        info_hash: &InfoHash,
+        label: &str,
+    ) -> Result<(), TorrentClientError> {
         self.call(
             "d.custom1.set",
             vec![
                 XmlRpcValue::String(info_hash.as_str().to_owned()),
-                XmlRpcValue::String(RTORRENT_LABEL.to_owned()),
+                XmlRpcValue::String(label.to_owned()),
             ],
         )
         .await
@@ -392,9 +396,14 @@ pub fn build_inventory_multicall(hashes: &[InfoHash]) -> String {
     build_method_call("system.multicall", &[inventory_multicall_param(hashes)])
 }
 
-pub fn build_injection_call(torrent_bytes: &[u8], save_path: Option<&Path>, start: bool) -> String {
+pub fn build_injection_call(
+    torrent_bytes: &[u8],
+    save_path: Option<&Path>,
+    label: &str,
+    start: bool,
+) -> String {
     let method = if start { "load.raw_start" } else { "load.raw" };
-    build_method_call(method, &injection_params(torrent_bytes, save_path))
+    build_method_call(method, &injection_params(torrent_bytes, save_path, label))
 }
 
 pub fn parse_method_response(client: &str, xml: &str) -> Result<XmlRpcValue, TorrentClientError> {
@@ -709,11 +718,15 @@ fn inventory_multicall_param(hashes: &[InfoHash]) -> XmlRpcValue {
     )
 }
 
-fn injection_params(torrent_bytes: &[u8], save_path: Option<&Path>) -> Vec<XmlRpcValue> {
+fn injection_params(
+    torrent_bytes: &[u8],
+    save_path: Option<&Path>,
+    label: &str,
+) -> Vec<XmlRpcValue> {
     let mut params = vec![
         XmlRpcValue::String(String::new()),
         XmlRpcValue::Base64(torrent_bytes.to_vec()),
-        XmlRpcValue::String(format!("d.custom1.set={RTORRENT_LABEL}")),
+        XmlRpcValue::String(format!("d.custom1.set={label}")),
     ];
     if let Some(save_path) = save_path {
         params.push(XmlRpcValue::String(format!(
@@ -1119,8 +1132,8 @@ mod tests {
     #[test]
     fn injection_payload_uses_raw_methods_and_sets_label() {
         let save_path = PathBuf::from("/downloads/prepared");
-        let stopped = build_injection_call(b"torrent", Some(&save_path), false);
-        let started = build_injection_call(b"torrent", Some(&save_path), true);
+        let stopped = build_injection_call(b"torrent", Some(&save_path), "cross-seed", false);
+        let started = build_injection_call(b"torrent", Some(&save_path), "cross-seed", true);
 
         assert!(stopped.contains("<methodName>load.raw</methodName>"));
         assert!(started.contains("<methodName>load.raw_start</methodName>"));
@@ -1129,7 +1142,7 @@ mod tests {
             &[
                 "<string></string>",
                 "<base64>dG9ycmVudA==</base64>",
-                "<string>d.custom1.set=sporos</string>",
+                "<string>d.custom1.set=cross-seed</string>",
                 "<string>d.directory.set=/downloads/prepared</string>",
             ],
         );
@@ -1146,7 +1159,7 @@ mod tests {
                     &[
                         "<string></string>",
                         "<base64>dG9ycmVudA==</base64>",
-                        "<string>d.custom1.set=sporos</string>",
+                        "<string>d.custom1.set=cross-seed</string>",
                         "<string>d.directory.set=/downloads/prepared</string>",
                     ],
                 )
@@ -1160,7 +1173,7 @@ mod tests {
         let save_path = PathBuf::from("/downloads/prepared");
 
         client
-            .inject(b"torrent", Some(&save_path), true)
+            .inject(b"torrent", Some(&save_path), "cross-seed", true)
             .await
             .unwrap();
     }
@@ -1180,7 +1193,10 @@ mod tests {
         .await;
         let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
 
-        client.inject(b"torrent", None, false).await.unwrap();
+        client
+            .inject(b"torrent", None, "sporos", false)
+            .await
+            .unwrap();
     }
 
     fn assert_xml_order(xml: &str, needles: &[&str]) {
@@ -1513,7 +1529,11 @@ mod tests {
         let endpoint = spawn_rtorrent_server(|request| async move {
             let body = to_bytes(request.into_body(), 65_536).await.unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
-            for method in ["d.custom1.set", "d.check_hash", "d.pause", "d.resume"] {
+            if body.contains("<methodName>d.custom1.set</methodName>") {
+                assert!(body.contains("<string>cross-seed</string>"));
+                return (AxumStatusCode::OK, xml_response("<i8>0</i8>"));
+            }
+            for method in ["d.check_hash", "d.pause", "d.resume"] {
                 if body.contains(&format!("<methodName>{method}</methodName>")) {
                     return (AxumStatusCode::OK, xml_response("<i8>0</i8>"));
                 }
@@ -1524,7 +1544,7 @@ mod tests {
         let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
         let hash = InfoHash::new(SHA1).unwrap();
 
-        client.set_label(&hash).await.unwrap();
+        client.set_label(&hash, "cross-seed").await.unwrap();
         client.recheck(&hash).await.unwrap();
         client.pause(&hash).await.unwrap();
         client.resume(&hash).await.unwrap();
