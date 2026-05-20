@@ -25,6 +25,7 @@ pub struct SporosConfig {
     pub indexers: IndexersConfig,
     pub matching: MatchingConfig,
     pub inventory: InventoryConfig,
+    pub injection: InjectionConfig,
     pub scheduling: SchedulingConfig,
     pub announce: AnnounceQueueConfig,
 }
@@ -248,6 +249,53 @@ impl Default for InventoryConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InjectionConfig {
+    pub recheck: AutoResumePolicyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoResumePolicyConfig {
+    pub skip_recheck: bool,
+    pub max_remaining_bytes: u64,
+    pub min_completion_percent: Option<f64>,
+    pub max_remaining_percent: Option<f64>,
+    pub ignore_non_relevant_files_to_resume: bool,
+    pub non_relevant_max_remaining_bytes: u64,
+    pub piece_slack_multiplier: u64,
+    pub poll_interval_ms: u64,
+    pub max_resume_wait_ms: u64,
+    pub below_threshold_action: BelowThresholdActionConfig,
+}
+
+impl Default for AutoResumePolicyConfig {
+    fn default() -> Self {
+        Self {
+            skip_recheck: false,
+            max_remaining_bytes: 0,
+            min_completion_percent: None,
+            max_remaining_percent: None,
+            ignore_non_relevant_files_to_resume: false,
+            non_relevant_max_remaining_bytes: 200 * 1024 * 1024,
+            piece_slack_multiplier: 2,
+            poll_interval_ms: 5_000,
+            max_resume_wait_ms: 60 * 60 * 1_000,
+            below_threshold_action: BelowThresholdActionConfig::InjectPaused,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BelowThresholdActionConfig {
+    InjectAndStart,
+    #[default]
+    InjectPaused,
+    RejectWithoutInjecting,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulingConfig {
@@ -346,6 +394,7 @@ where
         })?;
     validate_secret_source_counts(&config)?;
     validate_torrent_clients(&config)?;
+    validate_injection_config(&config)?;
     validate_prowlarr_sources(&config, &raw)?;
     validate_arr_secret_source_counts(&config)?;
     resolve_secret_env(&mut config, &env)?;
@@ -737,6 +786,71 @@ fn validate_torrent_clients(config: &SporosConfig) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+fn validate_injection_config(config: &SporosConfig) -> Result<(), ConfigError> {
+    let recheck = &config.injection.recheck;
+    validate_percent(
+        "injection.recheck.min_completion_percent",
+        "min_completion_percent",
+        recheck.min_completion_percent,
+        false,
+    )?;
+    validate_percent(
+        "injection.recheck.max_remaining_percent",
+        "max_remaining_percent",
+        recheck.max_remaining_percent,
+        true,
+    )?;
+    if recheck.poll_interval_ms == 0 {
+        return Err(ConfigError::InvalidField {
+            field: "injection.recheck.poll_interval_ms",
+            reason: "poll_interval_ms must be positive".to_owned(),
+        });
+    }
+    if recheck.piece_slack_multiplier == 0 {
+        return Err(ConfigError::InvalidField {
+            field: "injection.recheck.piece_slack_multiplier",
+            reason: "piece_slack_multiplier must be positive".to_owned(),
+        });
+    }
+    if recheck.max_resume_wait_ms == 0 {
+        return Err(ConfigError::InvalidField {
+            field: "injection.recheck.max_resume_wait_ms",
+            reason: "max_resume_wait_ms must be positive".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_percent(
+    field: &'static str,
+    name: &str,
+    value: Option<f64>,
+    allow_zero: bool,
+) -> Result<(), ConfigError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let lower_bound_valid = if allow_zero {
+        value >= 0.0
+    } else {
+        value > 0.0
+    };
+    if value.is_finite() && lower_bound_valid && value <= 100.0 {
+        return Ok(());
+    }
+
+    let lower_bound = if allow_zero {
+        "at least 0"
+    } else {
+        "greater than 0"
+    };
+    Err(ConfigError::InvalidField {
+        field,
+        reason: format!("{name} must be {lower_bound} and at most 100"),
+    })
 }
 
 fn validate_injection_metadata_value(
@@ -1353,6 +1467,16 @@ SPOROS__SERVER__BIND = "0.0.0.0:2468"
 SPOROS__SERVER__API_TOKEN_FILE = "/var/run/secrets/sporos-api-token"
 SPOROS__PATHS__DATABASE = "/data/state/sporos.db"
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
+SPOROS__INJECTION__RECHECK__SKIP_RECHECK = "false"
+SPOROS__INJECTION__RECHECK__MAX_REMAINING_BYTES = "104857600"
+SPOROS__INJECTION__RECHECK__MIN_COMPLETION_PERCENT = "85.0"
+SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT = "15.0"
+SPOROS__INJECTION__RECHECK__IGNORE_NON_RELEVANT_FILES_TO_RESUME = "true"
+SPOROS__INJECTION__RECHECK__NON_RELEVANT_MAX_REMAINING_BYTES = "209715200"
+SPOROS__INJECTION__RECHECK__PIECE_SLACK_MULTIPLIER = "2"
+SPOROS__INJECTION__RECHECK__POLL_INTERVAL_MS = "5000"
+SPOROS__INJECTION__RECHECK__MAX_RESUME_WAIT_MS = "3600000"
+SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION = "inject_paused"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE = "/var/run/secrets/qbit-password"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY = "cross-seed"
@@ -1373,6 +1497,18 @@ first_search_window_secs = 604800
 
 [inventory]
 media_scan_max_depth = 3
+
+[injection.recheck]
+skip_recheck = false
+max_remaining_bytes = 0
+min_completion_percent = "optional 0-100"
+max_remaining_percent = "optional 0-100"
+ignore_non_relevant_files_to_resume = false
+non_relevant_max_remaining_bytes = 209715200
+piece_slack_multiplier = 2
+poll_interval_ms = 5000
+max_resume_wait_ms = 3600000
+below_threshold_action = "inject_and_start|inject_paused|reject_without_injecting"
 
 [scheduling]
 client_inventory_interval = "24h"
@@ -1449,6 +1585,127 @@ mod tests {
             client.default_tags
         );
         assert_eq!(DEFAULT_INJECTION_METADATA, client.default_label);
+        assert!(!config.injection.recheck.skip_recheck);
+        assert_eq!(0, config.injection.recheck.max_remaining_bytes);
+        assert_eq!(None, config.injection.recheck.min_completion_percent);
+        assert_eq!(None, config.injection.recheck.max_remaining_percent);
+        assert_eq!(
+            200 * 1024 * 1024,
+            config.injection.recheck.non_relevant_max_remaining_bytes
+        );
+        assert_eq!(2, config.injection.recheck.piece_slack_multiplier);
+        assert_eq!(5_000, config.injection.recheck.poll_interval_ms);
+        assert_eq!(60 * 60 * 1_000, config.injection.recheck.max_resume_wait_ms);
+        assert_eq!(
+            BelowThresholdActionConfig::InjectPaused,
+            config.injection.recheck.below_threshold_action
+        );
+    }
+
+    #[test]
+    fn parses_auto_resume_policy_settings() {
+        let config = parse_config(
+            r#"
+            [injection.recheck]
+            skip_recheck = true
+            max_remaining_bytes = 104857600
+            min_completion_percent = 85.5
+            max_remaining_percent = 15.0
+            ignore_non_relevant_files_to_resume = true
+            non_relevant_max_remaining_bytes = 10485760
+            piece_slack_multiplier = 3
+            poll_interval_ms = 2500
+            max_resume_wait_ms = 120000
+            below_threshold_action = "reject_without_injecting"
+            "#,
+        )
+        .unwrap();
+        let policy = &config.injection.recheck;
+
+        assert!(policy.skip_recheck);
+        assert_eq!(104_857_600, policy.max_remaining_bytes);
+        assert_eq!(Some(85.5), policy.min_completion_percent);
+        assert_eq!(Some(15.0), policy.max_remaining_percent);
+        assert!(policy.ignore_non_relevant_files_to_resume);
+        assert_eq!(10_485_760, policy.non_relevant_max_remaining_bytes);
+        assert_eq!(3, policy.piece_slack_multiplier);
+        assert_eq!(2_500, policy.poll_interval_ms);
+        assert_eq!(120_000, policy.max_resume_wait_ms);
+        assert_eq!(
+            BelowThresholdActionConfig::RejectWithoutInjecting,
+            policy.below_threshold_action
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_auto_resume_policy_settings() {
+        for (contents, expected) in [
+            (
+                r#"
+                [injection.recheck]
+                min_completion_percent = 0.0
+                "#,
+                "min_completion_percent",
+            ),
+            (
+                r#"
+                [injection.recheck]
+                max_remaining_percent = -0.1
+                "#,
+                "max_remaining_percent",
+            ),
+            (
+                r#"
+                [injection.recheck]
+                poll_interval_ms = 0
+                "#,
+                "poll_interval_ms",
+            ),
+            (
+                r#"
+                [injection.recheck]
+                piece_slack_multiplier = 0
+                "#,
+                "piece_slack_multiplier",
+            ),
+            (
+                r#"
+                [injection.recheck]
+                max_resume_wait_ms = 0
+                "#,
+                "max_resume_wait_ms",
+            ),
+            (
+                r#"
+                [injection.recheck]
+                below_threshold_action = "maybe"
+                "#,
+                "below_threshold_action",
+            ),
+        ] {
+            let error = parse_config(contents).unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{error} did not contain {expected}"
+            );
+        }
+
+        let zero_remaining_percent = parse_config(
+            r#"
+            [injection.recheck]
+            max_remaining_percent = 0.0
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Some(0.0),
+            zero_remaining_percent
+                .injection
+                .recheck
+                .max_remaining_percent
+        );
     }
 
     #[test]
@@ -1935,9 +2192,17 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("[indexers.torznab.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[indexers.prowlarr.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[inventory]"));
+        assert!(CONFIG_SCHEMA.contains("[injection.recheck]"));
         assert!(!CONFIG_SCHEMA.contains("rss_interval"));
         assert!(CONFIG_SCHEMA.contains("default_tags = [\"sporos\"]"));
+        assert!(CONFIG_SCHEMA.contains("below_threshold_action"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__SKIP_RECHECK"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__MIN_COMPLETION_PERCENT"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__POLL_INTERVAL_MS"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__MAX_RESUME_WAIT_MS"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL"));
@@ -1977,6 +2242,14 @@ mod tests {
                     "SPOROS__MATCHING__RECENT_SEARCH_COOLDOWN_SECS".to_owned(),
                     "86400".to_owned(),
                 ),
+                (
+                    "SPOROS__INJECTION__RECHECK__MIN_COMPLETION_PERCENT".to_owned(),
+                    "85.0".to_owned(),
+                ),
+                (
+                    "SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION".to_owned(),
+                    "reject_without_injecting".to_owned(),
+                ),
                 ("SPOROS__ANNOUNCE__MAX_PENDING".to_owned(), "42".to_owned()),
                 ("SPOROS_API_TOKEN".to_owned(), "api-token".to_owned()),
             ],
@@ -1990,6 +2263,11 @@ mod tests {
         assert!((config.matching.fuzzy_size_threshold - 0.05).abs() < f64::EPSILON);
         assert!(config.matching.include_non_video);
         assert_eq!(Some(86_400), config.matching.recent_search_cooldown_secs);
+        assert_eq!(Some(85.0), config.injection.recheck.min_completion_percent);
+        assert_eq!(
+            BelowThresholdActionConfig::RejectWithoutInjecting,
+            config.injection.recheck.below_threshold_action
+        );
         assert_eq!(42, config.announce.max_pending);
         assert_eq!(
             Some("api-token"),
