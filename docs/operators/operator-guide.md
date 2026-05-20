@@ -140,6 +140,18 @@ first_search_window_secs = 604800
 [inventory]
 media_scan_max_depth = 3
 
+[injection.recheck]
+skip_recheck = false
+max_remaining_bytes = 0
+min_completion_percent = 85.0
+max_remaining_percent = 15.0
+ignore_non_relevant_files_to_resume = false
+non_relevant_max_remaining_bytes = 209715200
+piece_slack_multiplier = 2
+poll_interval_ms = 5000
+max_resume_wait_ms = 3600000
+below_threshold_action = "inject_paused"
+
 [scheduling]
 client_inventory_interval = "24h"
 indexer_caps_interval = "24h"
@@ -173,6 +185,35 @@ the Rust service's existing behavior. Configure `cross-seed` metadata when
 matching an existing client layout or automation that expects cross-seed-style
 labels. Client-specific fields are ignored by clients that do not support that
 metadata type.
+
+Auto-resume tuning lives under `[injection.recheck]`. Keep the defaults when
+you want Sporos to add matches paused and only resume partial matches when there
+is no remaining download. To accept lower-completion partial matches, set one
+or more thresholds:
+
+- `max_remaining_bytes` resumes when the client reports no more than that many
+  missing bytes.
+- `min_completion_percent` resumes when the candidate is at least that complete.
+- `max_remaining_percent` resumes when the remaining bytes are at most that
+  percentage of the candidate torrent size.
+
+The byte and percentage checks are permissive: a partial, non-video-disc match
+can resume when any configured threshold passes. Exact, size-only, and
+video-disc matches keep stricter recheck behavior and do not use these partial
+thresholds.
+
+For partial matches that differ only by release extras, set
+`ignore_non_relevant_files_to_resume = true`. Sporos then compares remaining
+bytes with files such as samples, trailers, subtitles, `.nfo`, and `.srr`,
+bounded by `non_relevant_max_remaining_bytes` and a piece-size allowance from
+`piece_slack_multiplier`.
+
+Use `below_threshold_action` for candidates that match but fail the auto-resume
+thresholds. `inject_paused` adds the torrent paused and stops there.
+`inject_and_start` adds it unpaused. `reject_without_injecting` avoids
+torrent-client mutation and records a rejected search or terminal announcement
+outcome, which is useful when external automation should handle low-completion
+candidates outside Sporos.
 
 Supported indexers are Torznab-compatible endpoints. Put API keys in
 `api_key_file`, `api_key_env`, or development-only `api_key`; do not put API

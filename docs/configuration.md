@@ -45,6 +45,18 @@ fuzzy_size_threshold = 0.02
 include_single_episodes = false
 include_non_video = false
 
+[injection.recheck]
+skip_recheck = false
+max_remaining_bytes = 0
+min_completion_percent = 85.0
+max_remaining_percent = 15.0
+ignore_non_relevant_files_to_resume = false
+non_relevant_max_remaining_bytes = 209715200
+piece_slack_multiplier = 2
+poll_interval_ms = 5000
+max_resume_wait_ms = 3600000
+below_threshold_action = "inject_paused"
+
 [scheduling]
 client_inventory_interval = "24h"
 indexer_caps_interval = "24h"
@@ -140,6 +152,63 @@ unreleased Rust service and keep Sporos-owned injections easy to distinguish.
 qBittorrent uses category and tags; rTorrent uses only `default_label` with
 `label_field = "custom1"`.
 
+## Injection Recheck And Auto-Resume
+
+`[injection.recheck]` controls how Sporos adds a matched torrent, waits for the
+client recheck, and decides whether to resume it. The defaults keep the current
+conservative behavior: exact, size-only, partial, and video-disc matches are
+added paused for recheck; partial matches are not auto-resumed unless a byte,
+percentage, or non-relevant-file allowance says the remaining download is
+acceptable.
+
+```toml
+[injection.recheck]
+skip_recheck = false
+max_remaining_bytes = 0
+min_completion_percent = 85.0
+max_remaining_percent = 15.0
+ignore_non_relevant_files_to_resume = false
+non_relevant_max_remaining_bytes = 209715200
+piece_slack_multiplier = 2
+poll_interval_ms = 5000
+max_resume_wait_ms = 3600000
+below_threshold_action = "inject_paused"
+```
+
+`skip_recheck = true` skips the initial recheck for exact and size-only
+matches, but partial matches and video-disc layouts still recheck. Auto-resume
+thresholds apply only to partial, non-video-disc matches. Exact, size-only, and
+video-disc matches keep their stricter behavior even when thresholds are set.
+
+`max_remaining_bytes` allows auto-resume when the client reports at most that
+many bytes still missing after recheck. `min_completion_percent` and
+`max_remaining_percent` evaluate the same client-reported remaining bytes
+against the candidate torrent's total size. The checks are permissive: a partial
+match may resume when any configured byte or percentage threshold passes. Leave
+the percentage fields unset to use byte-only behavior.
+
+When `ignore_non_relevant_files_to_resume = true`, Sporos may also resume a
+partial match when the remaining bytes can be explained by files such as
+samples, trailers, subtitles, `.nfo`, `.srr`, or other explicitly non-relevant
+release extras. `non_relevant_max_remaining_bytes` is a hard cap for this path,
+and `piece_slack_multiplier` allows a small piece-size margin around the
+non-relevant file total.
+
+`poll_interval_ms` and `max_resume_wait_ms` bound how long Sporos waits for a
+client recheck to finish before leaving the torrent paused and saving the
+candidate for retry. Use a short poll interval only for test environments; in
+normal operation the default five-second poll is intentionally quiet.
+
+`below_threshold_action` decides what happens when a partial match is acceptable
+but does not satisfy any auto-resume threshold:
+
+- `inject_paused` adds the torrent paused and does not auto-resume it.
+- `inject_and_start` adds the torrent unpaused so the client can start it even
+  though the threshold did not pass.
+- `reject_without_injecting` rejects the candidate before torrent-client
+  mutation. Announcement workflows finish with a terminal rejected outcome, and
+  search workflows count the candidate as rejected.
+
 ## Indexers
 
 Direct Torznab indexers live under `[indexers.torznab.<name>]`:
@@ -194,6 +263,8 @@ SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-passwo
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS='"cross-seed,sporos"'
 SPOROS__TORRENT_CLIENTS__RTORRENT_ARCHIVE__DEFAULT_LABEL='"cross-seed"'
+SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT='15.0'
+SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION='"inject_paused"'
 SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_FILE='"/var/run/secrets/indexer-api-key"'
 ```
 
