@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -14,6 +15,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::fs::MetadataExt;
 
 use tokio::sync::{Mutex, MutexGuard, mpsc};
+use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::actions::{
@@ -24,9 +26,9 @@ use crate::actions::{
 };
 use crate::clients::TorrentClientDescriptor;
 use crate::domain::{
-    ByteSize, CandidateAssessment, CandidateGuid, DependencyName, DependencyState, DownloadUrl,
-    IndexerId, InfoHash, InjectionOutcome, ItemTitle, LocalFile, LocalItem, MatchDecision,
-    ReasonText, RemoteCandidate, RemoteCandidateId, TorrentMetafile, TrackerName,
+    ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyName, DependencyState,
+    DownloadUrl, IndexerId, InfoHash, InjectionOutcome, ItemTitle, LocalFile, LocalItem,
+    MatchDecision, ReasonText, RemoteCandidate, RemoteCandidateId, TorrentMetafile, TrackerName,
     checked_file_total,
 };
 use crate::errors::{
@@ -48,6 +50,7 @@ use crate::torrent::parse_metafile;
 
 const MAX_SAVED_TORRENT_BYTES: u64 = 32 * 1024 * 1024;
 const SAVED_TORRENT_SCAN_BATCH: usize = 32;
+const CLIENT_INVENTORY_REFRESH_CONCURRENCY: usize = 4;
 
 pub type ClientResultFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, TorrentClientError>> + Send + 'a>>;
@@ -313,6 +316,47 @@ impl fmt::Debug for InjectionWorker {
     }
 }
 
+async fn refresh_client_inventory_task(
+    index: usize,
+    client: Arc<dyn InjectionClient>,
+    worker: InventoryRefreshWorker,
+    shutdown: ShutdownSignal,
+) -> (
+    usize,
+    String,
+    ClientHost,
+    Result<InventoryRefreshSummary, InventoryRefreshError>,
+) {
+    let name = client.descriptor().name.as_str().to_owned();
+    let host = client.descriptor().host.clone();
+    let result = client.refresh_inventory(&worker, shutdown).await;
+    (index, name, host, result)
+}
+
+fn spawn_client_inventory_refreshes(
+    refreshes: &mut JoinSet<(
+        usize,
+        String,
+        ClientHost,
+        Result<InventoryRefreshSummary, InventoryRefreshError>,
+    )>,
+    pending_clients: &mut VecDeque<(usize, Arc<dyn InjectionClient>)>,
+    worker: &InventoryRefreshWorker,
+    shutdown: &ShutdownSignal,
+) {
+    while refreshes.len() < CLIENT_INVENTORY_REFRESH_CONCURRENCY {
+        let Some((index, client)) = pending_clients.pop_front() else {
+            break;
+        };
+        refreshes.spawn(refresh_client_inventory_task(
+            index,
+            client,
+            worker.clone(),
+            shutdown.clone(),
+        ));
+    }
+}
+
 impl InjectionWorker {
     pub fn new(repository: Repository, clients: Vec<Arc<dyn InjectionClient>>) -> Self {
         Self {
@@ -340,64 +384,112 @@ impl InjectionWorker {
         worker: &InventoryRefreshWorker,
         shutdown: ShutdownSignal,
     ) -> Result<Vec<InventoryRefreshSummary>, InventoryRefreshError> {
-        let mut summaries = Vec::with_capacity(self.clients.len());
+        let mut summaries_by_index = Vec::with_capacity(self.clients.len());
+        summaries_by_index.resize_with(self.clients.len(), || None);
         let mut refreshed_client_hosts = Vec::with_capacity(self.clients.len());
         let mut last_error = None;
+        let mut cancellation_error = None;
         let client_worker = worker.without_client_post_refresh_work();
-        for client in &self.clients {
-            if shutdown.state().phase != ShutdownPhase::Running {
-                let error = InventoryRefreshError::Client {
-                    source: TorrentClientError::Cancelled {
-                        client: client.descriptor().name.as_str().to_owned(),
-                        message: "shutdown requested".to_owned(),
-                    },
-                };
-                if !refreshed_client_hosts.is_empty() {
-                    worker
-                        .refresh_virtual_seasons_after_client_batch(&refreshed_client_hosts)
-                        .await?;
-                }
-                return Err(error);
-            }
-            match client
-                .refresh_inventory(&client_worker, shutdown.clone())
-                .await
-            {
+        if self.clients.is_empty() {
+            return Ok(Vec::new());
+        }
+        if shutdown.state().phase != ShutdownPhase::Running {
+            let Some(client) = self.clients.first() else {
+                return Ok(Vec::new());
+            };
+            return Err(InventoryRefreshError::Client {
+                source: TorrentClientError::Cancelled {
+                    client: client.descriptor().name.as_str().to_owned(),
+                    message: "shutdown requested".to_owned(),
+                },
+            });
+        }
+
+        let mut pending_clients = self
+            .clients
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect::<VecDeque<_>>();
+        let mut refreshes = JoinSet::new();
+        spawn_client_inventory_refreshes(
+            &mut refreshes,
+            &mut pending_clients,
+            &client_worker,
+            &shutdown,
+        );
+
+        while let Some(result) = refreshes.join_next().await {
+            let (index, client_name, client_host, result) =
+                result.map_err(|error| InventoryRefreshError::ScanWorkerFailed {
+                    message: error.to_string(),
+                })?;
+            match result {
                 Ok(summary) => {
-                    summaries.push(summary);
-                    refreshed_client_hosts.push(client.descriptor().host.clone());
+                    let summary_slot = summaries_by_index.get_mut(index).ok_or_else(|| {
+                        InventoryRefreshError::ScanWorkerFailed {
+                            message: format!(
+                                "client inventory refresh task returned out-of-range index {index}"
+                            ),
+                        }
+                    })?;
+                    *summary_slot = Some(summary);
+                    refreshed_client_hosts.push(client_host);
                 }
                 Err(
                     error @ InventoryRefreshError::Client {
                         source: TorrentClientError::Cancelled { .. },
                     },
                 ) => {
-                    if !refreshed_client_hosts.is_empty() {
-                        worker
-                            .refresh_virtual_seasons_after_client_batch(&refreshed_client_hosts)
-                            .await?;
-                    }
-                    return Err(error);
+                    cancellation_error = Some(error);
+                    pending_clients.clear();
                 }
                 Err(error) => {
                     warn!(
-                        client = %client.descriptor().name,
+                        client = %client_name,
                         error = %error,
                         "client inventory refresh failed"
                     );
                     last_error = Some(error);
                 }
             }
+            if cancellation_error.is_none() {
+                if shutdown.state().phase == ShutdownPhase::Running {
+                    spawn_client_inventory_refreshes(
+                        &mut refreshes,
+                        &mut pending_clients,
+                        &client_worker,
+                        &shutdown,
+                    );
+                } else if !pending_clients.is_empty() {
+                    let skipped_client = pending_clients
+                        .front()
+                        .map(|(_, client)| client.descriptor().name.as_str().to_owned())
+                        .unwrap_or(client_name);
+                    pending_clients.clear();
+                    cancellation_error = Some(InventoryRefreshError::Client {
+                        source: TorrentClientError::Cancelled {
+                            client: skipped_client,
+                            message: "shutdown requested".to_owned(),
+                        },
+                    });
+                }
+            }
+        }
+
+        let summaries = summaries_by_index.into_iter().flatten().collect::<Vec<_>>();
+        if !refreshed_client_hosts.is_empty() {
+            worker
+                .refresh_virtual_seasons_after_client_batch(&refreshed_client_hosts)
+                .await?;
+        }
+        if let Some(error) = cancellation_error {
+            return Err(error);
         }
         if summaries.is_empty()
             && let Some(error) = last_error
         {
             return Err(error);
-        }
-        if !summaries.is_empty() {
-            worker
-                .refresh_virtual_seasons_after_client_batch(&refreshed_client_hosts)
-                .await?;
         }
         Ok(summaries)
     }
@@ -2083,7 +2175,9 @@ mod tests {
         LocalItemSource, MatchRatio, MediaType, TrackerName,
     };
     use crate::inventory::{InventoryScanOptions, ScannedLocalItem};
+    use crate::inventory_refresh::{ClientInventoryItem, ClientInventoryMessage};
     use crate::persistence::repository::Repository;
+    use crate::runtime::shutdown::ShutdownController;
 
     #[tokio::test]
     async fn worker_checks_other_clients_before_mutating_target() {
@@ -2163,6 +2257,182 @@ mod tests {
         assert_eq!(2, summaries[0].persisted_items);
         assert_eq!(1, failing.calls.load(Ordering::SeqCst));
         assert_eq!(1, successful.calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn client_inventory_refreshes_multiple_clients_with_bounded_concurrency() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let refresh_worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let first = Arc::new(
+            FakeRefreshClient::delayed_successful(
+                descriptor("first", "first"),
+                1,
+                Duration::from_millis(100),
+            )
+            .with_in_flight_tracking(in_flight.clone(), max_in_flight.clone()),
+        );
+        let second = Arc::new(
+            FakeRefreshClient::delayed_successful(
+                descriptor("second", "second"),
+                2,
+                Duration::from_millis(100),
+            )
+            .with_in_flight_tracking(in_flight.clone(), max_in_flight.clone()),
+        );
+        let worker = InjectionWorker::new(
+            repository,
+            vec![
+                first.clone() as Arc<dyn InjectionClient>,
+                second.clone() as Arc<dyn InjectionClient>,
+            ],
+        );
+
+        let summaries = worker
+            .refresh_client_inventories(&refresh_worker)
+            .await
+            .unwrap();
+
+        assert_eq!(2, summaries.len());
+        assert_eq!(1, summaries[0].persisted_items);
+        assert_eq!(2, summaries[1].persisted_items);
+        assert_eq!(1, first.calls.load(Ordering::SeqCst));
+        assert_eq!(1, second.calls.load(Ordering::SeqCst));
+        assert_eq!(2, max_in_flight.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn client_inventory_refresh_streams_multiple_clients_through_staging_pool() {
+        let root = unique_temp_dir("client-inventory-concurrent-staging");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+        let virtual_refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh_worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default())
+                .with_virtual_refresh_attempts(virtual_refreshes.clone());
+        let first_host = ClientHost::new("first").unwrap();
+        let second_host = ClientHost::new("second").unwrap();
+        let first = Arc::new(FakeRefreshClient::streaming(
+            descriptor("first", first_host.as_str()),
+            client_inventory_items(first_host.clone(), "1", 80),
+        ));
+        let second = Arc::new(FakeRefreshClient::streaming(
+            descriptor("second", second_host.as_str()),
+            client_inventory_items(second_host.clone(), "2", 80),
+        ));
+        let worker = InjectionWorker::new(
+            repository.clone(),
+            vec![
+                first.clone() as Arc<dyn InjectionClient>,
+                second.clone() as Arc<dyn InjectionClient>,
+            ],
+        );
+
+        let summaries = tokio::time::timeout(
+            Duration::from_secs(2),
+            worker.refresh_client_inventories(&refresh_worker),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let first_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_items WHERE source_key LIKE ?")
+                .bind("%:first:%")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        let second_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM local_items WHERE source_key LIKE ?")
+                .bind("%:second:%")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(2, summaries.len());
+        assert_eq!(80, summaries[0].persisted_items);
+        assert_eq!(80, summaries[1].persisted_items);
+        assert_eq!(1, virtual_refreshes.load(Ordering::SeqCst));
+        assert_eq!(80, first_count);
+        assert_eq!(80, second_count);
+        repository.pool().close().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_inventory_refresh_does_not_start_more_clients_after_shutdown() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let refresh_worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let clients = (0..(CLIENT_INVENTORY_REFRESH_CONCURRENCY + 1))
+            .map(|index| {
+                Arc::new(FakeRefreshClient::delayed_successful(
+                    descriptor(&format!("client-{index}"), &format!("client-{index}")),
+                    1,
+                    Duration::from_millis(100),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let worker = InjectionWorker::new(
+            repository,
+            clients
+                .iter()
+                .cloned()
+                .map(|client| client as Arc<dyn InjectionClient>)
+                .collect(),
+        );
+        let (controller, shutdown) = shutdown_channel();
+        let refresh = tokio::spawn(async move {
+            worker
+                .refresh_client_inventories_until_shutdown(&refresh_worker, shutdown)
+                .await
+        });
+
+        wait_for_calls(&clients[CLIENT_INVENTORY_REFRESH_CONCURRENCY - 1].calls, 1).await;
+        controller.cancel_now("test shutdown").unwrap();
+        let error = refresh.await.unwrap().unwrap_err();
+
+        let InventoryRefreshError::Client {
+            source: TorrentClientError::Cancelled { client, .. },
+        } = error
+        else {
+            panic!("expected client cancellation error");
+        };
+        assert_eq!(
+            format!("client-{CLIENT_INVENTORY_REFRESH_CONCURRENCY}"),
+            client
+        );
+        assert_eq!(
+            0,
+            clients[CLIENT_INVENTORY_REFRESH_CONCURRENCY]
+                .calls
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn client_inventory_refresh_completed_batch_stays_successful_after_shutdown() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let refresh_worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let (controller, shutdown) = shutdown_channel();
+        let client = Arc::new(
+            FakeRefreshClient::successful(descriptor("client", "client"), 1)
+                .with_completion_shutdown(controller),
+        );
+        let worker =
+            InjectionWorker::new(repository, vec![client.clone() as Arc<dyn InjectionClient>]);
+
+        let summaries = worker
+            .refresh_client_inventories_until_shutdown(&refresh_worker, shutdown)
+            .await
+            .unwrap();
+
+        assert_eq!(1, summaries.len());
+        assert_eq!(1, summaries[0].persisted_items);
+        assert_eq!(1, client.calls.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -4402,7 +4672,12 @@ mod tests {
         calls: AtomicUsize,
         summary: Option<InventoryRefreshSummary>,
         items: Vec<ScannedLocalItem>,
+        stream_items: Vec<ClientInventoryItem>,
         cancel: bool,
+        delay: Duration,
+        completion_shutdown: Option<ShutdownController>,
+        in_flight: Option<Arc<AtomicUsize>>,
+        max_in_flight: Option<Arc<AtomicUsize>>,
     }
 
     impl FakeRefreshClient {
@@ -4417,8 +4692,39 @@ mod tests {
                     scan_failures: Vec::new(),
                 }),
                 items: Vec::new(),
+                stream_items: Vec::new(),
                 cancel: false,
+                delay: Duration::ZERO,
+                completion_shutdown: None,
+                in_flight: None,
+                max_in_flight: None,
             }
+        }
+
+        fn delayed_successful(
+            descriptor: TorrentClientDescriptor,
+            persisted_items: usize,
+            delay: Duration,
+        ) -> Self {
+            Self {
+                delay,
+                ..Self::successful(descriptor, persisted_items)
+            }
+        }
+
+        fn with_completion_shutdown(mut self, controller: ShutdownController) -> Self {
+            self.completion_shutdown = Some(controller);
+            self
+        }
+
+        fn with_in_flight_tracking(
+            mut self,
+            in_flight: Arc<AtomicUsize>,
+            max_in_flight: Arc<AtomicUsize>,
+        ) -> Self {
+            self.in_flight = Some(in_flight);
+            self.max_in_flight = Some(max_in_flight);
+            self
         }
 
         fn failing(descriptor: TorrentClientDescriptor) -> Self {
@@ -4427,7 +4733,30 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 summary: None,
                 items: Vec::new(),
+                stream_items: Vec::new(),
                 cancel: false,
+                delay: Duration::ZERO,
+                completion_shutdown: None,
+                in_flight: None,
+                max_in_flight: None,
+            }
+        }
+
+        fn streaming(
+            descriptor: TorrentClientDescriptor,
+            stream_items: Vec<ClientInventoryItem>,
+        ) -> Self {
+            Self {
+                descriptor,
+                calls: AtomicUsize::new(0),
+                summary: None,
+                items: Vec::new(),
+                stream_items,
+                cancel: false,
+                delay: Duration::ZERO,
+                completion_shutdown: None,
+                in_flight: None,
+                max_in_flight: None,
             }
         }
 
@@ -4437,7 +4766,12 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 summary: None,
                 items: Vec::new(),
+                stream_items: Vec::new(),
                 cancel: true,
+                delay: Duration::ZERO,
+                completion_shutdown: None,
+                in_flight: None,
+                max_in_flight: None,
             }
         }
 
@@ -4447,7 +4781,12 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 summary: None,
                 items,
+                stream_items: Vec::new(),
                 cancel: false,
+                delay: Duration::ZERO,
+                completion_shutdown: None,
+                in_flight: None,
+                max_in_flight: None,
             }
         }
     }
@@ -4497,8 +4836,28 @@ mod tests {
             let client = self.descriptor.name.as_str().to_owned();
             let host = self.descriptor.host.clone();
             let items = self.items.clone();
+            let stream_items = self.stream_items.clone();
             let cancel = self.cancel;
+            let delay = self.delay;
+            let completion_shutdown = self.completion_shutdown.clone();
+            let in_flight = self.in_flight.clone();
+            let max_in_flight = self.max_in_flight.clone();
             Box::pin(async move {
+                let active = in_flight.as_ref().map(|in_flight| {
+                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some(max_in_flight) = &max_in_flight {
+                        update_max_atomic(max_in_flight, active);
+                    }
+                    active
+                });
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                if active.is_some()
+                    && let Some(in_flight) = &in_flight
+                {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
                 if cancel {
                     return Err(InventoryRefreshError::Client {
                         source: TorrentClientError::Cancelled {
@@ -4509,6 +4868,27 @@ mod tests {
                 }
                 if !items.is_empty() {
                     return worker.refresh_client_items(host, &items).await;
+                }
+                if !stream_items.is_empty() {
+                    let (sender, receiver) = mpsc::channel(1);
+                    let send = async move {
+                        for item in stream_items {
+                            if sender
+                                .send(ClientInventoryMessage::Item(item))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        drop(sender.send(ClientInventoryMessage::Finished).await);
+                    };
+                    let refresh = worker.refresh_client_inventory_receiver(host, receiver);
+                    let ((), result) = tokio::join!(send, refresh);
+                    return result;
+                }
+                if let Some(controller) = completion_shutdown {
+                    controller.cancel_now("test shutdown").unwrap();
                 }
                 summary.ok_or_else(|| {
                     TorrentClientError::Unavailable {
@@ -4790,6 +5170,56 @@ mod tests {
         }
         .into_scanned()
         .unwrap()
+    }
+
+    fn client_inventory_items(
+        client_host: ClientHost,
+        hash_prefix: &str,
+        count: usize,
+    ) -> Vec<ClientInventoryItem> {
+        (1..=count)
+            .map(|index| {
+                client_inventory_item(
+                    client_host.clone(),
+                    &format!("{hash_prefix}{index:039x}"),
+                    &format!("Client Movie {hash_prefix}-{index}"),
+                    &format!("client-{hash_prefix}-{index}.mkv"),
+                )
+            })
+            .collect()
+    }
+
+    fn client_inventory_item(
+        client_host: ClientHost,
+        hash: &str,
+        title: &str,
+        relative_path: &str,
+    ) -> ClientInventoryItem {
+        ClientInventoryItem {
+            client_host,
+            info_hash: InfoHash::new(hash).unwrap(),
+            display_name: DisplayName::new(title).unwrap(),
+            media_type: MediaType::Movie,
+            save_path: PathBuf::from("/downloads"),
+            files: vec![
+                crate::domain::TorrentFile::new(
+                    PathBuf::from(relative_path),
+                    ByteSize::new(10),
+                    FileIndex::new(0),
+                )
+                .unwrap(),
+            ],
+        }
+    }
+
+    fn update_max_atomic(max: &AtomicUsize, candidate: usize) {
+        let mut observed = max.load(Ordering::SeqCst);
+        while candidate > observed {
+            match max.compare_exchange(observed, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
     }
 
     async fn assert_virtual_season(repository: &Repository, title: &str, files: usize) {

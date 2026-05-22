@@ -29,10 +29,13 @@ use crate::secrets::{CookieSecret, sanitize_url_for_logging};
 
 use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
 
+const INVENTORY_STAGING_POOL_MAX_CONNECTIONS: u32 = 4;
+
 #[derive(Debug, Clone)]
 pub struct Repository {
     pool: SqlitePool,
     inventory_staging_pool: SqlitePool,
+    inventory_commit_lock: Arc<Mutex<()>>,
     prowlarr_sync_lock: Arc<Mutex<()>>,
     #[cfg(test)]
     announce_insert_barrier: Option<Arc<Barrier>>,
@@ -388,7 +391,7 @@ impl Repository {
             .connect_with(options.clone())
             .await
             .map_err(|error| db_error("connect sqlite database", error))?;
-        let inventory_staging_pool = sqlite_pool_options(1)
+        let inventory_staging_pool = sqlite_pool_options(INVENTORY_STAGING_POOL_MAX_CONNECTIONS)
             .connect_with(options)
             .await
             .map_err(|error| db_error("connect sqlite database", error))?;
@@ -396,6 +399,7 @@ impl Repository {
         let repository = Self {
             pool,
             inventory_staging_pool,
+            inventory_commit_lock: Arc::new(Mutex::new(())),
             prowlarr_sync_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             announce_insert_barrier: None,
@@ -414,6 +418,7 @@ impl Repository {
         let repository = Self {
             inventory_staging_pool: pool.clone(),
             pool,
+            inventory_commit_lock: Arc::new(Mutex::new(())),
             prowlarr_sync_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             announce_insert_barrier: None,
@@ -628,6 +633,7 @@ impl Repository {
             });
         }
 
+        let _commit_guard = self.inventory_commit_lock.lock().await;
         let replace_result = async {
             let mut transaction = connection
                 .begin()
@@ -6979,6 +6985,28 @@ mod tests {
         assert_eq!(1, still_available);
         assert_eq!(0, summary.upserted);
         assert_eq!(0, summary.pruned);
+    }
+
+    #[tokio::test]
+    async fn inventory_staging_pool_allows_parallel_staging_connections() {
+        let root = unique_temp_dir("sqlite-inventory-parallel-staging-pool");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+
+        let first = repository.inventory_staging_pool.acquire().await.unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_millis(100),
+            repository.inventory_staging_pool.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        drop(second);
+        drop(first);
+        repository.inventory_staging_pool.close().await;
+        repository.pool().close().await;
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
