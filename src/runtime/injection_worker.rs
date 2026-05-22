@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -1368,6 +1368,9 @@ impl InjectionWorker {
             }
         }
         let max_polls = max_resume_polls(request.recheck);
+        let resume_deadline = Instant::now()
+            .checked_add(Duration::from_millis(request.recheck.max_resume_wait_ms))
+            .unwrap_or_else(Instant::now);
         for _ in 0..max_polls {
             let checking = match client_call_until_shutdown(shutdown, || {
                 client.is_checking(request.metafile.info_hash())
@@ -1378,7 +1381,10 @@ impl InjectionWorker {
                 ClientCall::Completed(result) => result?,
             };
             if checking {
-                if sleep_between_resume_polls(request.recheck, shutdown).await {
+                if Instant::now() >= resume_deadline {
+                    return Ok(ResumeLoopOutcome::StillChecking);
+                }
+                if sleep_between_resume_polls(request.recheck, resume_deadline, shutdown).await {
                     return Ok(ResumeLoopOutcome::StillChecking);
                 }
                 continue;
@@ -2132,12 +2138,13 @@ fn max_resume_polls(config: RecheckResumeConfig) -> u64 {
 
 async fn sleep_between_resume_polls(
     config: RecheckResumeConfig,
+    deadline: Instant,
     shutdown: Option<&ShutdownSignal>,
 ) -> bool {
-    if config.poll_interval_ms == 0 {
+    let Some(sleep_duration) = resume_poll_sleep_duration(config, Instant::now(), deadline) else {
         return false;
-    }
-    let sleep = tokio::time::sleep(Duration::from_millis(config.poll_interval_ms));
+    };
+    let sleep = tokio::time::sleep(sleep_duration);
     let Some(shutdown) = shutdown else {
         sleep.await;
         return false;
@@ -2147,6 +2154,21 @@ async fn sleep_between_resume_polls(
         () = sleep => false,
         _ = shutdown.cancelled() => true,
     }
+}
+
+fn resume_poll_sleep_duration(
+    config: RecheckResumeConfig,
+    now: Instant,
+    deadline: Instant,
+) -> Option<Duration> {
+    if config.poll_interval_ms == 0 {
+        return None;
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(Duration::from_millis(config.poll_interval_ms).min(remaining))
 }
 
 fn dependency_name(
@@ -3020,6 +3042,67 @@ mod tests {
         assert_eq!(1, target.resume_calls.load(Ordering::SeqCst));
         assert_eq!(Some(true), target.last_pause_for_recheck());
         assert_eq!(1, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn recheck_resume_clamps_final_poll_sleep_to_deadline() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-resume-deadline");
+        let target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_checking_true(10));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.recheck = RecheckResumeConfig {
+            poll_interval_ms: 100,
+            max_resume_wait_ms: 15,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+        let plan = recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
+
+        let started = Instant::now();
+        let outcome = worker
+            .run_recheck_resume(target.as_ref(), &request, plan, None)
+            .await
+            .unwrap();
+
+        assert_eq!(ResumeLoopOutcome::StillChecking, outcome);
+        assert!(started.elapsed() < Duration::from_millis(80));
+        assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(1, target.checking_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn resume_poll_sleep_duration_clamps_to_deadline() {
+        let now = Instant::now();
+        let config = RecheckResumeConfig {
+            poll_interval_ms: 100,
+            max_resume_wait_ms: 1_000,
+            ..RecheckResumeConfig::default()
+        };
+
+        assert_eq!(
+            Some(Duration::from_millis(100)),
+            resume_poll_sleep_duration(config, now, now + Duration::from_millis(250))
+        );
+        assert_eq!(
+            Some(Duration::from_millis(15)),
+            resume_poll_sleep_duration(config, now, now + Duration::from_millis(15))
+        );
+        assert_eq!(None, resume_poll_sleep_duration(config, now, now));
+        assert_eq!(
+            None,
+            resume_poll_sleep_duration(
+                RecheckResumeConfig {
+                    poll_interval_ms: 0,
+                    ..config
+                },
+                now,
+                now + Duration::from_millis(15),
+            )
+        );
     }
 
     #[tokio::test]
