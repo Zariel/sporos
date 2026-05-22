@@ -63,6 +63,7 @@ const RUNTIME_CLIENT_INVENTORY_BUFFER: usize = 64;
 const CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY: usize = 8;
 const PROWLARR_REFRESH_CONCURRENCY: usize = 4;
 const INDEXER_CAPS_REFRESH_CONCURRENCY: usize = 4;
+const INDEXER_SEARCH_CONCURRENCY: usize = 4;
 const INDEXER_CAPS_REFRESH_PAGE_SIZE: u16 = 1_000;
 const INDEXER_SEARCH_CAPS_PAGE_SIZE: u16 = 1_000;
 
@@ -554,10 +555,10 @@ impl AppState {
             .lookup_ids_for_item(&item, now_ms)
             .await?;
         let mut plans = Vec::new();
-        let mut candidate_count = 0_usize;
-        let mut all_candidates = Vec::new();
         let mut failed_indexers = 0_usize;
+        let mut search_results = Vec::new();
         let mut after_name = None;
+        let mut search_ordinal = 0_usize;
 
         loop {
             let indexers = self
@@ -570,79 +571,84 @@ impl AppState {
                 .await;
             let indexers = indexers?;
             let is_last_page = indexers.len() < usize::from(INDEXER_SEARCH_CAPS_PAGE_SIZE);
-            for indexer in indexers {
-                after_name = Some(indexer.name.clone());
-                let Some(plan) = plan_runtime_torznab_search(&item, &ids, &indexer.caps) else {
-                    continue;
+            let mut indexers = indexers.into_iter();
+            let mut active = FuturesUnordered::new();
+            let mut endpoint_error = None;
+            let mut search_error = None;
+
+            loop {
+                while active.len() < INDEXER_SEARCH_CONCURRENCY
+                    && endpoint_error.is_none()
+                    && search_error.is_none()
+                {
+                    let Some(indexer) = indexers.next() else {
+                        break;
+                    };
+                    let ordinal = search_ordinal;
+                    search_ordinal = search_ordinal.saturating_add(1);
+                    after_name = Some(indexer.name.clone());
+                    let Some(plan) = plan_runtime_torznab_search(&item, &ids, &indexer.caps) else {
+                        continue;
+                    };
+                    let endpoint = match self.search_caps_endpoint(&indexer) {
+                        Ok(Some(endpoint)) => endpoint,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            endpoint_error = Some(error);
+                            break;
+                        }
+                    };
+                    plans.push(IndexerSearchPlan {
+                        indexer_id: indexer.indexer_id,
+                        indexer_name: indexer.name,
+                        plan: plan.clone(),
+                    });
+                    let state = self.clone();
+                    let media_type = item.media_type;
+                    active.push(async move {
+                        (
+                            ordinal,
+                            state
+                                .search_indexer_endpoint(endpoint, media_type, plan, now_ms)
+                                .await,
+                        )
+                    });
+                }
+
+                let Some((ordinal, result)) = active.next().await else {
+                    break;
                 };
-                let Some(endpoint) = self.search_caps_endpoint(&indexer)? else {
-                    continue;
-                };
-                plans.push(IndexerSearchPlan {
-                    indexer_id: indexer.indexer_id,
-                    indexer_name: indexer.name.clone(),
-                    plan: plan.clone(),
-                });
-                let started = Instant::now();
-                let candidates = self
-                    .torznab_client
-                    .search(&endpoint, item.media_type, &plan.plan, now_ms)
-                    .await;
-                match candidates {
-                    Ok(candidates) => {
-                        self.metrics.record_indexer_request(
-                            ExternalOperation::Search,
-                            ExternalOutcome::Succeeded,
-                            elapsed_ms(started),
-                        );
-                        self.repository
-                            .record_indexer_request_success(&endpoint.name, now_ms)
-                            .await?;
-                        candidate_count = candidate_count.saturating_add(candidates.len());
-                        all_candidates.extend(candidates);
-                    }
+                match result {
+                    Ok(result) => search_results.push((ordinal, result)),
                     Err(error) => {
-                        self.metrics.record_indexer_request(
-                            ExternalOperation::Search,
-                            indexer_request_metric_outcome(&error),
-                            elapsed_ms(started),
-                        );
-                        tracing::warn!(
-                            indexer_name = %endpoint.name,
-                            error = %error,
-                            "Torznab search failed"
-                        );
-                        let message = error.to_string();
-                        let reason = required_health_reason(
-                            Some(&message),
-                            "search failed",
-                            "build indexer search health reason",
-                        )?;
-                        let failure_count = self
-                            .repository
-                            .dependency_failure_count("indexer", &endpoint.name)
-                            .await?;
-                        let retry_after_ms = indexer_error_retry_after(
-                            &error,
-                            now_ms,
-                            failure_count,
-                            endpoint.name.as_str(),
-                        );
-                        self.repository
-                            .record_indexer_request_backoff(
-                                &endpoint.name,
-                                &reason,
-                                retry_after_ms,
-                                now_ms,
-                                indexer_error_is_unavailable(&error),
-                            )
-                            .await?;
-                        failed_indexers += 1;
+                        search_error = Some(error);
                     }
                 }
             }
+
+            if let Some(error) = endpoint_error {
+                return Err(error);
+            }
+            if let Some(error) = search_error {
+                return Err(error);
+            }
             if is_last_page {
                 break;
+            }
+        }
+
+        search_results.sort_by_key(|(ordinal, _)| *ordinal);
+        let mut candidate_count = 0_usize;
+        let mut all_candidates = Vec::new();
+        for (_, result) in search_results {
+            match result {
+                IndexerSearchResult::Succeeded(candidates) => {
+                    candidate_count = candidate_count.saturating_add(candidates.len());
+                    all_candidates.extend(candidates);
+                }
+                IndexerSearchResult::Failed => {
+                    failed_indexers += 1;
+                }
             }
         }
 
@@ -652,6 +658,71 @@ impl AppState {
             candidates: all_candidates,
             failed_indexers,
         })
+    }
+
+    async fn search_indexer_endpoint(
+        &self,
+        endpoint: TorznabEndpoint,
+        media_type: MediaType,
+        plan: RuntimeTorznabSearchPlan,
+        now_ms: i64,
+    ) -> Result<IndexerSearchResult, DatabaseError> {
+        let started = Instant::now();
+        let candidates = self
+            .torznab_client
+            .search(&endpoint, media_type, &plan.plan, now_ms)
+            .await;
+        match candidates {
+            Ok(candidates) => {
+                self.metrics.record_indexer_request(
+                    ExternalOperation::Search,
+                    ExternalOutcome::Succeeded,
+                    elapsed_ms(started),
+                );
+                self.repository
+                    .record_indexer_request_success(&endpoint.name, now_ms)
+                    .await?;
+                Ok(IndexerSearchResult::Succeeded(candidates))
+            }
+            Err(error) => {
+                self.metrics.record_indexer_request(
+                    ExternalOperation::Search,
+                    indexer_request_metric_outcome(&error),
+                    elapsed_ms(started),
+                );
+                tracing::warn!(
+                    indexer_name = %endpoint.name,
+                    error = %error,
+                    "Torznab search failed"
+                );
+                let message = error.to_string();
+                let reason = required_health_reason(
+                    Some(&message),
+                    "search failed",
+                    "build indexer search health reason",
+                )?;
+                let failure_count = self
+                    .repository
+                    .dependency_failure_count("indexer", &endpoint.name)
+                    .await?;
+                let retry_after_ms = indexer_error_retry_after(
+                    &error,
+                    now_ms,
+                    failure_count,
+                    endpoint.name.as_str(),
+                );
+                self.repository
+                    .record_indexer_request_backoff(
+                        &endpoint.name,
+                        &reason,
+                        retry_after_ms,
+                        now_ms,
+                        indexer_error_is_unavailable(&error),
+                    )
+                    .await?;
+                Ok(IndexerSearchResult::Failed)
+            }
+        }
     }
 
     pub async fn refresh_indexer_capabilities(
@@ -805,6 +876,12 @@ pub struct SearchWorkflowPlanSummary {
     pub candidate_count: usize,
     pub candidates: Vec<RemoteCandidate>,
     pub failed_indexers: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum IndexerSearchResult {
+    Succeeded(Vec<RemoteCandidate>),
+    Failed,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -3347,6 +3424,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_workflow_runs_indexer_searches_concurrently_with_limit() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for name in [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ] {
+            let torznab_url = spawn_runtime_torznab_delayed_search_server(
+                Arc::clone(&queries),
+                Arc::clone(&in_flight),
+                Arc::clone(&max_in_flight),
+                Duration::from_millis(100),
+                name,
+            )
+            .await;
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(8, summary.plans.len());
+        assert_eq!(8, summary.candidate_count);
+        assert_eq!(8, queries.lock().unwrap().len());
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) > 1,
+            "expected overlapping search requests"
+        );
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= INDEXER_SEARCH_CONCURRENCY,
+            "expected search requests to stay within the concurrency limit"
+        );
+        assert_eq!(
+            vec![
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"
+            ],
+            summary
+                .candidates
+                .iter()
+                .map(|candidate| candidate.guid.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_workflow_refills_slots_when_earlier_result_is_slow() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let slow_in_flight = Arc::new(AtomicBool::new(false));
+        let echo_started_while_slow = Arc::new(AtomicBool::new(false));
+        let mut config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (name, delay, mark_slow, observe_slow) in [
+            ("alpha", Duration::from_millis(250), true, false),
+            ("bravo", Duration::from_millis(20), false, false),
+            ("charlie", Duration::from_millis(20), false, false),
+            ("delta", Duration::from_millis(20), false, false),
+            ("echo", Duration::from_millis(20), false, true),
+        ] {
+            let torznab_url = spawn_runtime_torznab_observed_search_server(
+                Arc::clone(&queries),
+                delay,
+                name,
+                mark_slow.then(|| Arc::clone(&slow_in_flight)),
+                observe_slow.then(|| Arc::clone(&slow_in_flight)),
+                observe_slow.then(|| Arc::clone(&echo_started_while_slow)),
+            )
+            .await;
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(5, summary.candidate_count);
+        assert_eq!(5, queries.lock().unwrap().len());
+        assert!(
+            echo_started_while_slow.load(Ordering::SeqCst),
+            "expected a freed search slot to start the fifth request before the first completed"
+        );
+    }
+
+    #[tokio::test]
     async fn search_workflow_planning_keeps_candidates_after_one_indexer_fails() {
         let ok_queries = Arc::new(Mutex::new(Vec::new()));
         let failing_queries = Arc::new(Mutex::new(Vec::new()));
@@ -3444,6 +3665,95 @@ mod tests {
         assert_eq!(0, skipped.failed_indexers);
         assert_eq!(2, ok_queries.lock().unwrap().len());
         assert_eq!(1, failing_queries.lock().unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn search_workflow_keeps_candidate_order_with_mixed_concurrent_results() {
+        let alpha_queries = Arc::new(Mutex::new(Vec::new()));
+        let bravo_queries = Arc::new(Mutex::new(Vec::new()));
+        let charlie_queries = Arc::new(Mutex::new(Vec::new()));
+        let alpha_url = spawn_runtime_torznab_observed_search_server(
+            Arc::clone(&alpha_queries),
+            Duration::from_millis(150),
+            "alpha",
+            None,
+            None,
+            None,
+        )
+        .await;
+        let bravo_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&bravo_queries),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let charlie_url = spawn_runtime_torznab_observed_search_server(
+            Arc::clone(&charlie_queries),
+            Duration::from_millis(10),
+            "charlie",
+            None,
+            None,
+            None,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        for (name, url) in [
+            ("alpha", alpha_url),
+            ("bravo", bravo_url),
+            ("charlie", charlie_url),
+        ] {
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in ["alpha", "bravo", "charlie"] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.failed_indexers);
+        assert_eq!(
+            vec!["alpha", "bravo", "charlie"],
+            summary
+                .plans
+                .iter()
+                .map(|plan| plan.indexer_name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["alpha", "charlie"],
+            summary
+                .candidates
+                .iter()
+                .map(|candidate| candidate.guid.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
@@ -5642,6 +5952,95 @@ mod tests {
                         mark_slow.store(false, Ordering::SeqCst);
                     }
                     (StatusCode::OK, torznab_caps_xml().to_owned())
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    async fn spawn_runtime_torznab_delayed_search_server(
+        queries: Arc<Mutex<Vec<String>>>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        delay: Duration,
+        guid: &str,
+    ) -> String {
+        let guid = guid.to_owned();
+        let app = axum::Router::new().route(
+            "/api",
+            get(move |request: Request<Body>| {
+                let queries = Arc::clone(&queries);
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                let guid = guid.clone();
+                async move {
+                    queries
+                        .lock()
+                        .unwrap()
+                        .push(request.uri().query().unwrap_or_default().to_owned());
+                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    update_max_atomic(&max_in_flight, active);
+                    tokio::time::sleep(delay).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        search_rss(&guid, &format!("Example {guid}")),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    async fn spawn_runtime_torznab_observed_search_server(
+        queries: Arc<Mutex<Vec<String>>>,
+        delay: Duration,
+        guid: &str,
+        mark_slow: Option<Arc<AtomicBool>>,
+        observe_slow: Option<Arc<AtomicBool>>,
+        started_while_slow: Option<Arc<AtomicBool>>,
+    ) -> String {
+        let guid = guid.to_owned();
+        let app = axum::Router::new().route(
+            "/api",
+            get(move |request: Request<Body>| {
+                let queries = Arc::clone(&queries);
+                let mark_slow = mark_slow.clone();
+                let observe_slow = observe_slow.clone();
+                let started_while_slow = started_while_slow.clone();
+                let guid = guid.clone();
+                async move {
+                    queries
+                        .lock()
+                        .unwrap()
+                        .push(request.uri().query().unwrap_or_default().to_owned());
+                    if let Some(observe_slow) = observe_slow
+                        && observe_slow.load(Ordering::SeqCst)
+                        && let Some(started_while_slow) = started_while_slow
+                    {
+                        started_while_slow.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(mark_slow) = &mark_slow {
+                        mark_slow.store(true, Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(delay).await;
+                    if let Some(mark_slow) = &mark_slow {
+                        mark_slow.store(false, Ordering::SeqCst);
+                    }
+                    (
+                        StatusCode::OK,
+                        search_rss(&guid, &format!("Example {guid}")),
+                    )
                 }
             }),
         );
