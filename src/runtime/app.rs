@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::stream::{self, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
@@ -59,6 +60,7 @@ use crate::runtime::shutdown::{
 };
 
 const RUNTIME_CLIENT_INVENTORY_BUFFER: usize = 64;
+const CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY: usize = 8;
 const PROWLARR_REFRESH_CONCURRENCY: usize = 4;
 const INDEXER_CAPS_REFRESH_PAGE_SIZE: u16 = 1_000;
 const INDEXER_SEARCH_CAPS_PAGE_SIZE: u16 = 1_000;
@@ -1447,33 +1449,8 @@ impl RuntimeInjectionClient {
                                 let sender = sender.clone();
                                 let shutdown = shutdown.clone();
                                 async move {
-                                    for torrent in page {
-                                        let info_hash =
-                                            torrent.info_hash(self.descriptor.name.as_str())?;
-                                        let files = client
-                                            .fetch_files_until_shutdown(&info_hash, || {
-                                                wait_for_inventory_shutdown(shutdown.clone())
-                                            })
-                                            .await?;
-                                        send_client_inventory_item(
-                                            &sender,
-                                            qbit_client_inventory_item(
-                                                &self.descriptor,
-                                                torrent,
-                                                files,
-                                            )?,
-                                        )
+                                    self.stream_qbit_inventory_page(client, page, &sender, shutdown)
                                         .await
-                                        .map_err(
-                                            |error| {
-                                                unavailable_client_inventory(
-                                                    &self.descriptor,
-                                                    error.to_string(),
-                                                )
-                                            },
-                                        )?;
-                                    }
-                                    Ok(())
                                 }
                             },
                         )
@@ -1487,31 +1464,10 @@ impl RuntimeInjectionClient {
                                 let sender = sender.clone();
                                 let shutdown = shutdown.clone();
                                 async move {
-                                    for download in chunk {
-                                        let files = client
-                                            .fetch_files_until_shutdown(&download.info_hash, || {
-                                                wait_for_inventory_shutdown(shutdown.clone())
-                                            })
-                                            .await?;
-                                        send_client_inventory_item(
-                                            &sender,
-                                            rtorrent_client_inventory_item(
-                                                &self.descriptor,
-                                                download,
-                                                files,
-                                            ),
-                                        )
-                                        .await
-                                        .map_err(
-                                            |error| {
-                                                unavailable_client_inventory(
-                                                    &self.descriptor,
-                                                    error.to_string(),
-                                                )
-                                            },
-                                        )?;
-                                    }
-                                    Ok(())
+                                    self.stream_rtorrent_inventory_chunk(
+                                        client, chunk, &sender, shutdown,
+                                    )
+                                    .await
                                 }
                             },
                         )
@@ -1532,6 +1488,115 @@ impl RuntimeInjectionClient {
             (_, Err(error)) => Err(error),
             (Err(error), Ok(())) => Err(error),
             (Ok(summary), Ok(())) => Ok(summary),
+        }
+    }
+
+    async fn stream_qbit_inventory_page(
+        &self,
+        client: &QbittorrentClient,
+        page: Vec<QbitTorrent>,
+        sender: &mpsc::Sender<ClientInventoryMessage>,
+        shutdown: ShutdownSignal,
+    ) -> Result<(), TorrentClientError> {
+        let descriptor = &self.descriptor;
+        let mut items = stream::iter(page.into_iter().map(|torrent| {
+            let shutdown = shutdown.clone();
+            async move {
+                let info_hash = torrent.info_hash(descriptor.name.as_str())?;
+                let torrent_name = torrent.name.clone();
+                let files = client
+                    .fetch_files_until_shutdown(&info_hash, || {
+                        wait_for_inventory_shutdown(shutdown.clone())
+                    })
+                    .await
+                    .map_err(|error| {
+                        client_inventory_file_error(descriptor, &info_hash, &torrent_name, error)
+                    })?;
+                qbit_client_inventory_item(descriptor, torrent, files)
+            }
+        }))
+        .buffered(CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY);
+
+        while let Some(item) = items.next().await {
+            send_client_inventory_item(sender, item?)
+                .await
+                .map_err(|error| unavailable_client_inventory(descriptor, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn stream_rtorrent_inventory_chunk(
+        &self,
+        client: &RtorrentClient,
+        chunk: Vec<RtorrentDownload>,
+        sender: &mpsc::Sender<ClientInventoryMessage>,
+        shutdown: ShutdownSignal,
+    ) -> Result<(), TorrentClientError> {
+        let descriptor = &self.descriptor;
+        let mut items = stream::iter(chunk.into_iter().map(|download| {
+            let shutdown = shutdown.clone();
+            async move {
+                let info_hash = download.info_hash.clone();
+                let torrent_name = download.name.to_string();
+                let files = client
+                    .fetch_files_until_shutdown(&info_hash, || {
+                        wait_for_inventory_shutdown(shutdown.clone())
+                    })
+                    .await
+                    .map_err(|error| {
+                        client_inventory_file_error(descriptor, &info_hash, &torrent_name, error)
+                    })?;
+                Ok(rtorrent_client_inventory_item(descriptor, download, files))
+            }
+        }))
+        .buffered(CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY);
+
+        while let Some(item) = items.next().await {
+            send_client_inventory_item(sender, item?)
+                .await
+                .map_err(|error| unavailable_client_inventory(descriptor, error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+fn client_inventory_file_error(
+    descriptor: &TorrentClientDescriptor,
+    info_hash: &InfoHash,
+    torrent_name: &str,
+    error: TorrentClientError,
+) -> TorrentClientError {
+    let context = format!(
+        "fetch files for torrent `{torrent_name}` ({}) failed",
+        info_hash.as_str()
+    );
+    match error {
+        TorrentClientError::ApiChanged { message, .. } => TorrentClientError::ApiChanged {
+            client: descriptor.name.to_string(),
+            message: format!("{context}: {message}"),
+        },
+        TorrentClientError::BadResponse { message, .. } => TorrentClientError::BadResponse {
+            client: descriptor.name.to_string(),
+            message: format!("{context}: {message}"),
+        },
+        TorrentClientError::Cancelled { .. } => error,
+        TorrentClientError::Unauthorized { .. } => TorrentClientError::Unauthorized {
+            client: descriptor.name.to_string(),
+        },
+        TorrentClientError::Unavailable {
+            retry_after_ms,
+            message,
+            ..
+        } => TorrentClientError::Unavailable {
+            client: descriptor.name.to_string(),
+            retry_after_ms,
+            message: format!("{context}: {message}"),
+        },
+        TorrentClientError::UnsupportedCapability { capability, .. } => {
+            TorrentClientError::UnsupportedCapability {
+                client: descriptor.name.to_string(),
+                capability: format!("{context}: {capability}"),
+            }
         }
     }
 }
@@ -3597,6 +3662,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_fetches_qbit_inventory_files_with_bounded_concurrency() {
+        let file_requests = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_runtime_qbit_delayed_files_server(
+            file_requests.clone(),
+            in_flight,
+            max_in_flight.clone(),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.torrent_clients.insert(
+            "qbit".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Qbittorrent,
+                url: endpoint,
+                username: None,
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let expected_torrents = CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY + 2;
+        let started_at = Instant::now();
+        let summaries = runtime
+            .state
+            .refresh_torrent_client_inventories()
+            .await
+            .unwrap();
+
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(1, summaries.len());
+        assert_eq!(expected_torrents, summaries[0].persisted_items);
+        assert_eq!(i64::try_from(expected_torrents).unwrap(), item_count);
+        assert_eq!(expected_torrents, file_requests.load(Ordering::SeqCst));
+        assert!(max_in_flight.load(Ordering::SeqCst) > 1);
+        assert!(max_in_flight.load(Ordering::SeqCst) <= CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY);
+        assert!(started_at.elapsed() < Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn runtime_reports_qbit_inventory_file_fetch_failures_with_hash() {
+        let failed_hash = inventory_test_hash(2);
+        let endpoint = spawn_runtime_qbit_failed_files_server(failed_hash.clone()).await;
+        let mut config = SporosConfig::default();
+        config.torrent_clients.insert(
+            "qbit".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Qbittorrent,
+                url: endpoint,
+                username: None,
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let error = runtime
+            .state
+            .refresh_torrent_client_inventories()
+            .await
+            .unwrap_err();
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert!(error.to_string().contains(failed_hash.as_str()));
+        assert!(error.to_string().contains("fetch files for torrent"));
+        assert_eq!(0, item_count);
+    }
+
+    #[test]
+    fn client_inventory_file_error_preserves_unauthorized_failure_class() {
+        let descriptor = torrent_client_descriptor("qbit", TorrentClientKind::Qbittorrent);
+        let error = client_inventory_file_error(
+            &descriptor,
+            &inventory_test_hash(1),
+            "Torrent 1",
+            TorrentClientError::Unauthorized {
+                client: "qbit".to_owned(),
+            },
+        );
+
+        assert!(matches!(error, TorrentClientError::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
     async fn runtime_cancels_qbit_inventory_during_file_fetch() {
         let file_requests = Arc::new(AtomicUsize::new(0));
         let endpoint = spawn_runtime_qbit_blocked_files_server(file_requests.clone()).await;
@@ -3625,7 +3801,7 @@ mod tests {
         let refresh = tokio::spawn(async move { state.refresh_torrent_client_inventories().await });
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while file_requests.load(Ordering::SeqCst) == 0 {
+            while file_requests.load(Ordering::SeqCst) < CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -3649,6 +3825,10 @@ mod tests {
             }
         ));
         assert_eq!(0, item_count);
+        assert_eq!(
+            CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY,
+            file_requests.load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test]
@@ -3697,6 +3877,141 @@ mod tests {
         assert_eq!(1, item_count);
         assert_eq!(1, file_count);
         assert_eq!(1, inventory_requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn runtime_fetches_rtorrent_inventory_files_with_bounded_concurrency() {
+        let file_requests = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_runtime_rtorrent_delayed_files_server(
+            file_requests.clone(),
+            in_flight,
+            max_in_flight.clone(),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.torrent_clients.insert(
+            "rtorrent".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Rtorrent,
+                url: endpoint,
+                username: None,
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: Some("custom1".to_owned()),
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let expected_torrents = CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY + 2;
+        let started_at = Instant::now();
+        let summaries = runtime
+            .state
+            .refresh_torrent_client_inventories()
+            .await
+            .unwrap();
+
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(1, summaries.len());
+        assert_eq!(expected_torrents, summaries[0].persisted_items);
+        assert_eq!(i64::try_from(expected_torrents).unwrap(), item_count);
+        assert_eq!(expected_torrents, file_requests.load(Ordering::SeqCst));
+        assert!(max_in_flight.load(Ordering::SeqCst) > 1);
+        assert!(max_in_flight.load(Ordering::SeqCst) <= CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY);
+        assert!(started_at.elapsed() < Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn runtime_reports_rtorrent_inventory_file_fetch_failures_with_hash() {
+        let failed_hash = inventory_test_hash(2);
+        let endpoint = spawn_runtime_rtorrent_failed_files_server(failed_hash.clone()).await;
+        let mut config = SporosConfig::default();
+        config.torrent_clients.insert(
+            "rtorrent".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Rtorrent,
+                url: endpoint,
+                username: None,
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: Some("custom1".to_owned()),
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let error = runtime
+            .state
+            .refresh_torrent_client_inventories()
+            .await
+            .unwrap_err();
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert!(error.to_string().contains(failed_hash.as_str()));
+        assert!(error.to_string().contains("fetch files for torrent"));
+        assert_eq!(0, item_count);
+    }
+
+    #[tokio::test]
+    async fn runtime_preserves_rtorrent_inventory_file_unauthorized_failure_class() {
+        let endpoint = spawn_runtime_rtorrent_unauthorized_files_server().await;
+        let mut config = SporosConfig::default();
+        config.torrent_clients.insert(
+            "rtorrent".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Rtorrent,
+                url: endpoint,
+                username: None,
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: Some("custom1".to_owned()),
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let error = runtime
+            .state
+            .refresh_torrent_client_inventories()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            InventoryRefreshError::Client {
+                source: TorrentClientError::Unauthorized { .. }
+            }
+        ));
     }
 
     #[tokio::test]
@@ -3752,6 +4067,7 @@ mod tests {
             }
         ));
         assert_eq!(0, item_count);
+        assert_eq!(1, file_requests.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -4362,6 +4678,75 @@ mod tests {
         .await
     }
 
+    async fn spawn_runtime_qbit_delayed_files_server(
+        file_requests: Arc<AtomicUsize>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    ) -> String {
+        spawn_runtime_test_server(move |request| {
+            let file_requests = file_requests.clone();
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                match path.as_str() {
+                    "/api/v2/auth/login" => response_with_cookie(StatusCode::OK, "Ok.", "SID=ok"),
+                    "/api/v2/torrents/info" => (
+                        StatusCode::OK,
+                        qbit_inventory_json(CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY + 2),
+                    )
+                        .into_response(),
+                    "/api/v2/torrents/files" => {
+                        file_requests.fetch_add(1, Ordering::SeqCst);
+                        let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        update_max_atomic(&max_in_flight, active);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            r#"[{"name":"Example/file.mkv","size":42,"progress":1.0,"priority":1}]"#,
+                        )
+                            .into_response()
+                    }
+                    _ => (StatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await
+    }
+
+    async fn spawn_runtime_qbit_failed_files_server(failed_hash: InfoHash) -> String {
+        spawn_runtime_test_server(move |request| {
+            let failed_hash = failed_hash.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                match path.as_str() {
+                    "/api/v2/auth/login" => response_with_cookie(StatusCode::OK, "Ok.", "SID=ok"),
+                    "/api/v2/torrents/info" => {
+                        (StatusCode::OK, qbit_inventory_json(4)).into_response()
+                    }
+                    "/api/v2/torrents/files" => {
+                        if request
+                            .uri()
+                            .query()
+                            .is_some_and(|query| query.contains(failed_hash.as_str()))
+                        {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "file list failed")
+                                .into_response();
+                        }
+                        (
+                            StatusCode::OK,
+                            r#"[{"name":"Example/file.mkv","size":42,"progress":1.0,"priority":1}]"#,
+                        )
+                            .into_response()
+                    }
+                    _ => (StatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await
+    }
+
     async fn spawn_runtime_qbit_blocked_files_server(file_requests: Arc<AtomicUsize>) -> String {
         spawn_runtime_test_server(move |request| {
             let file_requests = file_requests.clone();
@@ -4371,9 +4756,7 @@ mod tests {
                     "/api/v2/auth/login" => response_with_cookie(StatusCode::OK, "Ok.", "SID=ok"),
                     "/api/v2/torrents/info" => (
                         StatusCode::OK,
-                        r#"[
-                          {"hash":"0123456789abcdef0123456789abcdef01234567","name":"First","save_path":"/downloads/first","amount_left":0,"progress":1.0}
-                        ]"#,
+                        qbit_inventory_json(CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY + 2),
                     )
                         .into_response(),
                     "/api/v2/torrents/files" => {
@@ -4451,6 +4834,151 @@ mod tests {
         format!("http://{address}/RPC2")
     }
 
+    async fn spawn_runtime_rtorrent_delayed_files_server(
+        file_requests: Arc<AtomicUsize>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/RPC2",
+            post(move |request: Request<Body>| {
+                let file_requests = file_requests.clone();
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                async move {
+                    let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+                    let body = String::from_utf8(body.to_vec()).unwrap();
+                    if body.contains("<methodName>download_list</methodName>") {
+                        return (
+                            StatusCode::OK,
+                            xml_response(&rtorrent_download_list_xml(
+                                CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY + 2,
+                            )),
+                        )
+                            .into_response();
+                    }
+                    if body.contains("<methodName>system.multicall</methodName>")
+                        && body.contains("d.custom1")
+                    {
+                        return (
+                            StatusCode::OK,
+                            xml_response(&rtorrent_inventory_rows_xml(
+                                CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY + 2,
+                            )),
+                        )
+                            .into_response();
+                    }
+                    if body.contains("<methodName>f.multicall</methodName>") {
+                        file_requests.fetch_add(1, Ordering::SeqCst);
+                        let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        update_max_atomic(&max_in_flight, active);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        return (
+                            StatusCode::OK,
+                            xml_response(
+                                r#"<array><data><value><array><data>
+                                  <value><string>Example/file.mkv</string></value>
+                                  <value><i8>42</i8></value>
+                                </data></array></value></data></array>"#,
+                            ),
+                        )
+                            .into_response();
+                    }
+                    (StatusCode::BAD_REQUEST, body).into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/RPC2")
+    }
+
+    async fn spawn_runtime_rtorrent_failed_files_server(failed_hash: InfoHash) -> String {
+        let app = axum::Router::new().route(
+            "/RPC2",
+            post(move |request: Request<Body>| {
+                let failed_hash = failed_hash.clone();
+                async move {
+                    let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+                    let body = String::from_utf8(body.to_vec()).unwrap();
+                    if body.contains("<methodName>download_list</methodName>") {
+                        return (StatusCode::OK, xml_response(&rtorrent_download_list_xml(4)))
+                            .into_response();
+                    }
+                    if body.contains("<methodName>system.multicall</methodName>")
+                        && body.contains("d.custom1")
+                    {
+                        return (
+                            StatusCode::OK,
+                            xml_response(&rtorrent_inventory_rows_xml(4)),
+                        )
+                            .into_response();
+                    }
+                    if body.contains("<methodName>f.multicall</methodName>") {
+                        if body.contains(failed_hash.as_str()) {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "file list failed")
+                                .into_response();
+                        }
+                        return (
+                            StatusCode::OK,
+                            xml_response(
+                                r#"<array><data><value><array><data>
+                                  <value><string>Example/file.mkv</string></value>
+                                  <value><i8>42</i8></value>
+                                </data></array></value></data></array>"#,
+                            ),
+                        )
+                            .into_response();
+                    }
+                    (StatusCode::BAD_REQUEST, body).into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/RPC2")
+    }
+
+    async fn spawn_runtime_rtorrent_unauthorized_files_server() -> String {
+        let app = axum::Router::new().route(
+            "/RPC2",
+            post(move |request: Request<Body>| async move {
+                let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                if body.contains("<methodName>download_list</methodName>") {
+                    return (StatusCode::OK, xml_response(&rtorrent_download_list_xml(1)))
+                        .into_response();
+                }
+                if body.contains("<methodName>system.multicall</methodName>")
+                    && body.contains("d.custom1")
+                {
+                    return (
+                        StatusCode::OK,
+                        xml_response(&rtorrent_inventory_rows_xml(1)),
+                    )
+                        .into_response();
+                }
+                if body.contains("<methodName>f.multicall</methodName>") {
+                    return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+                }
+                (StatusCode::BAD_REQUEST, body).into_response()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/RPC2")
+    }
+
     async fn spawn_runtime_rtorrent_blocked_files_server(
         file_requests: Arc<AtomicUsize>,
     ) -> String {
@@ -4504,6 +5032,78 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}/RPC2")
+    }
+
+    fn update_max_atomic(max: &AtomicUsize, candidate: usize) {
+        let mut observed = max.load(Ordering::SeqCst);
+        while candidate > observed {
+            match max.compare_exchange(observed, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn qbit_inventory_json(count: usize) -> String {
+        let torrents = (1..=count)
+            .map(|index| {
+                let hash = inventory_test_hash(index);
+                format!(
+                    r#"{{"hash":"{}","name":"Torrent {index}","save_path":"/downloads/torrent-{index}","amount_left":0,"progress":1.0}}"#,
+                    hash.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{torrents}]")
+    }
+
+    fn rtorrent_download_list_xml(count: usize) -> String {
+        let mut rows = String::from("<array><data>");
+        for index in 1..=count {
+            rows.push_str(&format!(
+                "<value><string>{}</string></value>",
+                inventory_test_hash(index).as_str()
+            ));
+        }
+        rows.push_str("</data></array>");
+        rows
+    }
+
+    fn rtorrent_inventory_rows_xml(count: usize) -> String {
+        let mut rows = String::from("<array><data>");
+        for index in 1..=count {
+            rows.push_str(&format!(
+                r#"
+                  <value><array><data><value><string>Example {index}</string></value></data></array></value>
+                  <value><array><data><value><string>/downloads/example-{index}</string></value></data></array></value>
+                  <value><array><data><value><i8>0</i8></value></data></array></value>
+                  <value><array><data><value><boolean>0</boolean></value></data></array></value>
+                  <value><array><data><value><boolean>1</boolean></value></data></array></value>
+                  <value><array><data><value><boolean>1</boolean></value></data></array></value>
+                  <value><array><data><value><boolean>0</boolean></value></data></array></value>
+                  <value><array><data><value><string>sporos</string></value></data></array></value>
+                "#
+            ));
+        }
+        rows.push_str("</data></array>");
+        rows
+    }
+
+    fn inventory_test_hash(index: usize) -> InfoHash {
+        InfoHash::new(format!("{index:040x}")).unwrap()
+    }
+
+    fn torrent_client_descriptor(name: &str, kind: TorrentClientKind) -> TorrentClientDescriptor {
+        TorrentClientDescriptor {
+            name: DisplayName::new(name).unwrap(),
+            kind,
+            host: ClientHost::new(format!("{name}.local")).unwrap(),
+            url: format!("http://{name}.local"),
+            default_save_path: "/downloads".into(),
+            readonly: false,
+            capabilities: TorrentClientCapabilities::for_kind(kind),
+        }
     }
 
     async fn spawn_runtime_test_server<F, Fut, R>(handler: F) -> String
