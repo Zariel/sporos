@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
@@ -62,6 +62,7 @@ use crate::runtime::shutdown::{
 const RUNTIME_CLIENT_INVENTORY_BUFFER: usize = 64;
 const CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY: usize = 8;
 const PROWLARR_REFRESH_CONCURRENCY: usize = 4;
+const INDEXER_CAPS_REFRESH_CONCURRENCY: usize = 4;
 const INDEXER_CAPS_REFRESH_PAGE_SIZE: u16 = 1_000;
 const INDEXER_SEARCH_CAPS_PAGE_SIZE: u16 = 1_000;
 
@@ -675,58 +676,67 @@ impl AppState {
                 )
                 .await?;
             let is_last_page = registry.len() < usize::from(INDEXER_CAPS_REFRESH_PAGE_SIZE);
-            for row in registry {
-                after_name = Some(row.name.clone());
-                let Some(endpoint) = self.registry_endpoint(&row, TorznabCaps::default())? else {
-                    continue;
+            let mut rows = registry.into_iter().enumerate();
+            let mut results = Vec::new();
+            let mut active = FuturesUnordered::new();
+            let mut endpoint_error = None;
+            let mut refresh_error = None;
+
+            loop {
+                while active.len() < INDEXER_CAPS_REFRESH_CONCURRENCY
+                    && endpoint_error.is_none()
+                    && refresh_error.is_none()
+                {
+                    let Some((ordinal, row)) = rows.next() else {
+                        break;
+                    };
+                    after_name = Some(row.name.clone());
+                    let endpoint = match self.registry_endpoint(&row, TorznabCaps::default()) {
+                        Ok(Some(endpoint)) => endpoint,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            endpoint_error = Some(error);
+                            break;
+                        }
+                    };
+                    let state = self.clone();
+                    active.push(async move {
+                        (
+                            ordinal,
+                            state
+                                .refresh_indexer_capability_endpoint(row.name, endpoint, now_ms)
+                                .await,
+                        )
+                    });
+                }
+
+                let Some((ordinal, result)) = active.next().await else {
+                    break;
                 };
-                let started = Instant::now();
-                match self.torznab_client.caps_endpoint(&endpoint).await {
-                    Ok(caps) => {
-                        self.metrics.record_indexer_request(
-                            ExternalOperation::Capabilities,
-                            ExternalOutcome::Succeeded,
-                            elapsed_ms(started),
-                        );
-                        self.repository
-                            .record_indexer_caps_success(&row.name, &caps, now_ms)
-                            .await?;
-                        summary.refreshed += 1;
-                    }
+                match result {
+                    Ok(result) => results.push((ordinal, result)),
                     Err(error) => {
-                        self.metrics.record_indexer_request(
-                            ExternalOperation::Capabilities,
-                            indexer_request_metric_outcome(&error),
-                            elapsed_ms(started),
-                        );
-                        let message = error.to_string();
-                        let reason = required_health_reason(
-                            Some(&message),
-                            "caps failed",
-                            "build indexer caps health reason",
-                        )?;
-                        let failure_count = self
-                            .repository
-                            .dependency_failure_count("indexer", &row.name)
-                            .await?;
-                        let retry_after_ms = indexer_error_retry_after(
-                            &error,
-                            now_ms,
-                            failure_count,
-                            row.name.as_str(),
-                        );
-                        self.repository
-                            .record_indexer_caps_failure(
-                                &row.name,
-                                &reason,
-                                Some(retry_after_ms),
-                                now_ms,
-                            )
-                            .await?;
-                        summary.failed += 1;
-                        last_error = Some(message);
+                        refresh_error = Some(error);
                     }
                 }
+            }
+
+            results.sort_by_key(|(ordinal, _)| *ordinal);
+            for (_, result) in results {
+                if result.refreshed {
+                    summary.refreshed += 1;
+                } else {
+                    summary.failed += 1;
+                }
+                if let Some(error) = result.last_error {
+                    last_error = Some(error);
+                }
+            }
+            if let Some(error) = endpoint_error {
+                return Err(error);
+            }
+            if let Some(error) = refresh_error {
+                return Err(error);
             }
             if is_last_page {
                 break;
@@ -735,6 +745,57 @@ impl AppState {
 
         summary.last_error = last_error;
         Ok(summary)
+    }
+
+    async fn refresh_indexer_capability_endpoint(
+        &self,
+        name: DependencyName,
+        endpoint: TorznabEndpoint,
+        now_ms: i64,
+    ) -> Result<IndexerCapsRefreshResult, DatabaseError> {
+        let started = Instant::now();
+        match self.torznab_client.caps_endpoint(&endpoint).await {
+            Ok(caps) => {
+                self.metrics.record_indexer_request(
+                    ExternalOperation::Capabilities,
+                    ExternalOutcome::Succeeded,
+                    elapsed_ms(started),
+                );
+                self.repository
+                    .record_indexer_caps_success(&name, &caps, now_ms)
+                    .await?;
+                Ok(IndexerCapsRefreshResult {
+                    refreshed: true,
+                    last_error: None,
+                })
+            }
+            Err(error) => {
+                self.metrics.record_indexer_request(
+                    ExternalOperation::Capabilities,
+                    indexer_request_metric_outcome(&error),
+                    elapsed_ms(started),
+                );
+                let message = error.to_string();
+                let reason = required_health_reason(
+                    Some(&message),
+                    "caps failed",
+                    "build indexer caps health reason",
+                )?;
+                let failure_count = self
+                    .repository
+                    .dependency_failure_count("indexer", &name)
+                    .await?;
+                let retry_after_ms =
+                    indexer_error_retry_after(&error, now_ms, failure_count, name.as_str());
+                self.repository
+                    .record_indexer_caps_failure(&name, &reason, Some(retry_after_ms), now_ms)
+                    .await?;
+                Ok(IndexerCapsRefreshResult {
+                    refreshed: false,
+                    last_error: Some(message),
+                })
+            }
+        }
     }
 }
 
@@ -753,6 +814,12 @@ pub struct IndexerCapsRefreshSummary {
     pub skipped_backoff: usize,
     pub next_backoff_deadline_ms: Option<i64>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct IndexerCapsRefreshResult {
+    refreshed: bool,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1946,7 +2013,7 @@ mod tests {
     use std::fs;
     use std::future::{Future, pending};
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2931,6 +2998,242 @@ mod tests {
         assert!(metrics.contains(
             "sporos_indexer_requests_total{operation=\"capabilities\",outcome=\"rate_limited\"} 1"
         ));
+    }
+
+    #[tokio::test]
+    async fn indexer_caps_refresh_runs_requests_concurrently() {
+        let caps_requests = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for name in [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ] {
+            let torznab_url = spawn_runtime_torznab_delayed_caps_server(
+                Arc::clone(&caps_requests),
+                Arc::clone(&in_flight),
+                Arc::clone(&max_in_flight),
+                Duration::from_millis(100),
+            )
+            .await;
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+            insert_indexer_row(&repository, name, true, None, None, "{}").await;
+        }
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .refresh_indexer_capabilities(1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(8, summary.refreshed);
+        assert_eq!(0, summary.failed);
+        assert_eq!(8, caps_requests.lock().unwrap().len());
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) > 1,
+            "expected overlapping caps requests"
+        );
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= INDEXER_CAPS_REFRESH_CONCURRENCY,
+            "expected caps requests to stay within the concurrency limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexer_caps_refresh_refills_slots_when_earlier_result_is_slow() {
+        let caps_requests = Arc::new(Mutex::new(Vec::new()));
+        let slow_in_flight = Arc::new(AtomicBool::new(false));
+        let echo_started_while_slow = Arc::new(AtomicBool::new(false));
+        let mut config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (name, delay, mark_slow, observe_slow) in [
+            ("alpha", Duration::from_millis(250), true, false),
+            ("bravo", Duration::from_millis(20), false, false),
+            ("charlie", Duration::from_millis(20), false, false),
+            ("delta", Duration::from_millis(20), false, false),
+            ("echo", Duration::from_millis(20), false, true),
+        ] {
+            let torznab_url = spawn_runtime_torznab_observed_caps_server(
+                Arc::clone(&caps_requests),
+                delay,
+                mark_slow.then(|| Arc::clone(&slow_in_flight)),
+                observe_slow.then(|| Arc::clone(&slow_in_flight)),
+                observe_slow.then(|| Arc::clone(&echo_started_while_slow)),
+            )
+            .await;
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+            insert_indexer_row(&repository, name, true, None, None, "{}").await;
+        }
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .refresh_indexer_capabilities(1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(5, summary.refreshed);
+        assert_eq!(0, summary.failed);
+        assert_eq!(5, caps_requests.lock().unwrap().len());
+        assert!(
+            echo_started_while_slow.load(Ordering::SeqCst),
+            "expected a freed caps slot to start the fifth request before the first completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexer_caps_refresh_records_mixed_success_and_failure_deterministically() {
+        let ok_requests = Arc::new(Mutex::new(Vec::new()));
+        let rate_limited_requests = Arc::new(Mutex::new(Vec::new()));
+        let unavailable_requests = Arc::new(Mutex::new(Vec::new()));
+        let ok_url = spawn_runtime_torznab_search_server(Arc::clone(&ok_requests)).await;
+        let rate_limited_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&rate_limited_requests),
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+        let unavailable_url = spawn_runtime_torznab_status_server(
+            Arc::clone(&unavailable_requests),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        for (name, url) in [
+            ("aaa-rate-limited", rate_limited_url),
+            ("bbb-ok", ok_url),
+            ("ccc-unavailable", unavailable_url),
+        ] {
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for name in ["aaa-rate-limited", "bbb-ok", "ccc-unavailable"] {
+            insert_indexer_row(&repository, name, true, None, None, "{}").await;
+        }
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .refresh_indexer_capabilities(1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.refreshed);
+        assert_eq!(2, summary.failed);
+        assert_eq!(1, ok_requests.lock().unwrap().len());
+        assert_eq!(1, rate_limited_requests.lock().unwrap().len());
+        assert_eq!(1, unavailable_requests.lock().unwrap().len());
+        assert_eq!(
+            Some("indexer returned HTTP status 500".to_owned()),
+            summary.last_error
+        );
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        let rate_limited_health = health
+            .iter()
+            .find(|snapshot| snapshot.dependency_name.as_str() == "aaa-rate-limited")
+            .unwrap();
+        let ok_health = health
+            .iter()
+            .find(|snapshot| snapshot.dependency_name.as_str() == "bbb-ok")
+            .unwrap();
+        let unavailable_health = health
+            .iter()
+            .find(|snapshot| snapshot.dependency_name.as_str() == "ccc-unavailable")
+            .unwrap();
+        assert_eq!("healthy", ok_health.state);
+        assert_eq!(1_000, ok_health.checked_at_ms);
+        assert_eq!("degraded", rate_limited_health.state);
+        assert!(rate_limited_health.retry_after_ms.is_some());
+        assert_eq!("degraded", unavailable_health.state);
+        assert!(unavailable_health.retry_after_ms.is_some());
+        let metrics = runtime
+            .state
+            .metrics
+            .render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(metrics.contains(
+            "sporos_indexer_requests_total{operation=\"capabilities\",outcome=\"succeeded\"} 1"
+        ));
+        assert!(metrics.contains(
+            "sporos_indexer_requests_total{operation=\"capabilities\",outcome=\"rate_limited\"} 1"
+        ));
+        assert!(metrics.contains(
+            "sporos_indexer_requests_total{operation=\"capabilities\",outcome=\"failed\"} 1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn indexer_caps_refresh_finishes_prior_requests_before_endpoint_error() {
+        let ok_requests = Arc::new(Mutex::new(Vec::new()));
+        let ok_url = spawn_runtime_torznab_search_server(Arc::clone(&ok_requests)).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "aaa-ok".to_owned(),
+            TorznabIndexerConfig {
+                url: ok_url,
+                api_key: Some(ApiKey::new("ok-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config("https://prowlarr.example".to_owned(), false, false, "24h"),
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        insert_prowlarr_indexer_row(&repository, "zzz-invalid", "not a url", "main").await;
+
+        let error = runtime
+            .state
+            .refresh_indexer_capabilities(1_000)
+            .await
+            .unwrap_err();
+
+        assert_eq!(1, ok_requests.lock().unwrap().len());
+        assert!(
+            error
+                .to_string()
+                .contains("build Prowlarr Torznab endpoint")
+        );
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        let ok_health = health
+            .iter()
+            .find(|snapshot| snapshot.dependency_name.as_str() == "aaa-ok")
+            .unwrap();
+        assert_eq!("healthy", ok_health.state);
     }
 
     #[tokio::test]
@@ -5273,8 +5576,160 @@ mod tests {
         format!("http://{address}/api")
     }
 
+    async fn spawn_runtime_torznab_delayed_caps_server(
+        queries: Arc<Mutex<Vec<String>>>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        delay: Duration,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/api",
+            get(move |request: Request<Body>| {
+                let queries = Arc::clone(&queries);
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                async move {
+                    queries
+                        .lock()
+                        .unwrap()
+                        .push(request.uri().query().unwrap_or_default().to_owned());
+                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    update_max_atomic(&max_in_flight, active);
+                    tokio::time::sleep(delay).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    (StatusCode::OK, torznab_caps_xml().to_owned())
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    async fn spawn_runtime_torznab_observed_caps_server(
+        queries: Arc<Mutex<Vec<String>>>,
+        delay: Duration,
+        mark_slow: Option<Arc<AtomicBool>>,
+        observe_slow: Option<Arc<AtomicBool>>,
+        started_while_slow: Option<Arc<AtomicBool>>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/api",
+            get(move |request: Request<Body>| {
+                let queries = Arc::clone(&queries);
+                let mark_slow = mark_slow.clone();
+                let observe_slow = observe_slow.clone();
+                let started_while_slow = started_while_slow.clone();
+                async move {
+                    queries
+                        .lock()
+                        .unwrap()
+                        .push(request.uri().query().unwrap_or_default().to_owned());
+                    if let Some(observe_slow) = observe_slow
+                        && observe_slow.load(Ordering::SeqCst)
+                        && let Some(started_while_slow) = started_while_slow
+                    {
+                        started_while_slow.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(mark_slow) = &mark_slow {
+                        mark_slow.store(true, Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(delay).await;
+                    if let Some(mark_slow) = &mark_slow {
+                        mark_slow.store(false, Ordering::SeqCst);
+                    }
+                    (StatusCode::OK, torznab_caps_xml().to_owned())
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
     async fn insert_disabled_indexers(repository: &Repository, count: usize) {
         insert_indexer_rows(repository, "aaa-disabled", count, false, None, None, "{}").await;
+    }
+
+    async fn insert_indexer_row(
+        repository: &Repository,
+        name: &str,
+        enabled: bool,
+        retry_after_ms: Option<i64>,
+        last_caps_refresh_at_ms: Option<i64>,
+        caps_json: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO indexers (
+                name,
+                url,
+                source_kind,
+                source_name,
+                source_indexer_id,
+                api_key_source,
+                enabled,
+                capabilities_json,
+                state,
+                retry_after,
+                last_caps_refresh_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 'static', '', ?, 'direct', ?, ?, 'unknown', ?, ?, 1, 1)
+            "#,
+        )
+        .bind(name)
+        .bind(format!("https://{name}.example/api"))
+        .bind(name)
+        .bind(if enabled { 1_i64 } else { 0_i64 })
+        .bind(caps_json)
+        .bind(retry_after_ms)
+        .bind(last_caps_refresh_at_ms)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn insert_prowlarr_indexer_row(
+        repository: &Repository,
+        name: &str,
+        url: &str,
+        source_name: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO indexers (
+                name,
+                url,
+                source_kind,
+                source_name,
+                source_indexer_id,
+                api_key_source,
+                enabled,
+                capabilities_json,
+                state,
+                retry_after,
+                last_caps_refresh_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 'prowlarr', ?, ?, 'prowlarr', 1, '{}', 'unknown', NULL, NULL, 1, 1)
+            "#,
+        )
+        .bind(name)
+        .bind(url)
+        .bind(source_name)
+        .bind(name)
+        .execute(repository.pool())
+        .await
+        .unwrap();
     }
 
     async fn insert_indexer_rows(
@@ -5288,36 +5743,15 @@ mod tests {
     ) {
         for index in 0..count {
             let name = format!("{prefix}-{index:04}");
-            sqlx::query(
-                r#"
-                INSERT INTO indexers (
-                    name,
-                    url,
-                    source_kind,
-                    source_name,
-                    source_indexer_id,
-                    api_key_source,
-                    enabled,
-                    capabilities_json,
-                    state,
-                    retry_after,
-                    last_caps_refresh_at,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, ?, 'static', '', ?, 'direct', ?, ?, 'unknown', ?, ?, 1, 1)
-                "#,
+            insert_indexer_row(
+                repository,
+                &name,
+                enabled,
+                retry_after_ms,
+                last_caps_refresh_at_ms,
+                caps_json,
             )
-            .bind(&name)
-            .bind(format!("https://{prefix}-{index:04}.example/api"))
-            .bind(&name)
-            .bind(if enabled { 1_i64 } else { 0_i64 })
-            .bind(caps_json)
-            .bind(retry_after_ms)
-            .bind(last_caps_refresh_at_ms)
-            .execute(repository.pool())
-            .await
-            .unwrap();
+            .await;
         }
     }
 
