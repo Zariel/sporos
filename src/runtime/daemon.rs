@@ -1,6 +1,7 @@
 use std::fmt;
 use std::future::Future;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -10,7 +11,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
-use crate::actions::{candidate_output_metadata, save_candidate_torrent};
+use crate::actions::{
+    SaveTorrentError, SaveTorrentOutcome, candidate_output_metadata, save_candidate_torrent,
+};
 use crate::announce::{AnnounceReason, AnnounceWorkId};
 use crate::config::{SporosConfig, validate_server_auth};
 use crate::content_filter::ContentFilterContext;
@@ -35,6 +38,7 @@ use crate::metrics::{
 };
 use crate::notifications::{NotificationWorker, run_notification_worker};
 use crate::persistence::repository::Repository;
+use crate::persistence::torrent_cache::TorrentOutputMetadata;
 use crate::runtime::announce_worker::{
     AnnounceOutcomeConfig, AnnounceWorkOutcome, AnnounceWorker, AnnounceWorkerError,
     classify_injection_result, classify_reverse_lookup_outcome, unix_time_ms,
@@ -59,6 +63,10 @@ const ANNOUNCE_IDLE_SLEEP: Duration = Duration::from_millis(500);
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
 const SCHEDULER_SHUTDOWN_ERROR: &str = "scheduler is shutting down";
+
+#[cfg(test)]
+static NO_CLIENT_SAVE_THREADS: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -786,15 +794,16 @@ async fn process_downloaded_search_candidate(
                 return Err("search workflow is shutting down".to_owned());
             }
             if state.injection_worker.client_count() == 0 {
-                let save = save_candidate_torrent(
-                    &state.config.paths.output_dir,
-                    &candidate_output_metadata(
+                let save = save_candidate_torrent_blocking(
+                    state.config.paths.output_dir.clone(),
+                    candidate_output_metadata(
                         lookup.local_item.media_type,
                         &cached.candidate,
                         &cached.metafile,
                     ),
-                    &torrent_bytes,
-                );
+                    torrent_bytes,
+                )
+                .await;
                 match save {
                     Ok(outcome) => state.metrics.record_action(outcome.action_outcome()),
                     Err(error) => {
@@ -1541,15 +1550,16 @@ async fn process_downloaded_announce_candidate(
                 });
             }
             if state.injection_worker.client_count() == 0 {
-                let save = save_candidate_torrent(
-                    &state.config.paths.output_dir,
-                    &candidate_output_metadata(
+                let save = save_candidate_torrent_blocking(
+                    state.config.paths.output_dir.clone(),
+                    candidate_output_metadata(
                         lookup.local_item.media_type,
                         &cached.candidate,
                         &cached.metafile,
                     ),
-                    &torrent_bytes,
-                );
+                    torrent_bytes,
+                )
+                .await;
                 match save {
                     Ok(outcome) => state.metrics.record_action(outcome.action_outcome()),
                     Err(error) => {
@@ -1718,6 +1728,28 @@ async fn read_cached_torrent(path: &Path) -> Result<Vec<u8>, String> {
     tokio::task::spawn_blocking(move || std::fs::read(&path).map_err(|error| error.to_string()))
         .await
         .map_err(|error| error.to_string())?
+}
+
+async fn save_candidate_torrent_blocking(
+    output_dir: PathBuf,
+    metadata: TorrentOutputMetadata,
+    torrent_bytes: Vec<u8>,
+) -> Result<SaveTorrentOutcome, SaveTorrentError> {
+    let error_path = output_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        NO_CLIENT_SAVE_THREADS
+            .lock()
+            .unwrap()
+            .push((output_dir.clone(), std::thread::current().id()));
+        save_candidate_torrent(&output_dir, &metadata, &torrent_bytes)
+    })
+    .await
+    .map_err(|error| SaveTorrentError::Io {
+        operation: "join saved torrent write task",
+        path: error_path,
+        source: io::Error::other(error.to_string()),
+    })?
 }
 
 fn actionable_assessment(
@@ -2286,6 +2318,33 @@ mod tests {
             saved_retry.directories
         );
         assert_eq!(recheck, saved_retry.recheck);
+    }
+
+    #[tokio::test]
+    async fn no_client_save_uses_blocking_thread() {
+        let root = unique_temp_dir("daemon-no-client-save-thread");
+        let output_dir = root.join("output");
+        let parsed = parse_metafile(test_torrent_bytes()).unwrap();
+        let candidate = preexisting_indexer_candidate();
+        let metadata = candidate_output_metadata(MediaType::Video, &candidate, &parsed.metafile);
+        let runtime_thread = std::thread::current().id();
+
+        save_candidate_torrent_blocking(
+            output_dir.clone(),
+            metadata,
+            test_torrent_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let save_threads = NO_CLIENT_SAVE_THREADS.lock().unwrap();
+        let matching_threads: Vec<_> = save_threads
+            .iter()
+            .filter_map(|(path, thread)| (path == &output_dir).then_some(*thread))
+            .collect();
+        assert_eq!(1, matching_threads.len());
+        assert_ne!(runtime_thread, matching_threads[0]);
+        assert_eq!(1, saved_torrent_count(&output_dir));
     }
 
     #[tokio::test]
