@@ -3,8 +3,10 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,6 +31,8 @@ use crate::secrets::{ApiKey, sanitize_url_for_logging};
 use crate::torrent::parse_metafile;
 
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static CACHE_WRITE_THREADS: Mutex<Vec<(PathBuf, std::thread::ThreadId)>> = Mutex::new(Vec::new());
 
 const TORZNAB_RSS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const PROWLARR_CATALOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -900,7 +904,7 @@ impl CandidateDownloadClient {
                 message: error.to_string(),
             })?;
         let cache_path = cached_torrent_path(cache_dir, parsed.metafile.info_hash());
-        write_cached_torrent(&cache_path, &bytes)?;
+        write_cached_torrent_blocking(cache_path.clone(), bytes).await?;
 
         let mut updated_candidate = candidate.clone();
         updated_candidate.info_hash = Some(parsed.metafile.info_hash().clone());
@@ -1675,6 +1679,26 @@ fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownlo
             })
         }
     }
+}
+
+async fn write_cached_torrent_blocking(
+    path: PathBuf,
+    bytes: Vec<u8>,
+) -> Result<(), CandidateDownloadError> {
+    let error_path = path.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        CACHE_WRITE_THREADS
+            .lock()
+            .unwrap()
+            .push((path.clone(), std::thread::current().id()));
+        write_cached_torrent(&path, &bytes)
+    })
+    .await
+    .map_err(|error| CandidateDownloadError::CacheWrite {
+        path: error_path,
+        message: format!("cache write task failed: {error}"),
+    })?
 }
 
 fn create_cache_temp_file(
@@ -3016,6 +3040,36 @@ mod tests {
         remove_temp_dir(&cache_dir);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn candidate_download_dispatches_cache_write_to_blocking_thread() {
+        let caller_thread = std::thread::current().id();
+        let url = spawn_torznab_server(|_request| async move {
+            (
+                AxumStatusCode::OK,
+                String::from_utf8(test_torrent_bytes()).unwrap(),
+            )
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-cache-blocking");
+        let candidate = test_candidate(&url);
+        let client = test_candidate_download_client();
+
+        let cached = client
+            .download_and_cache(&candidate, &cache_dir, None)
+            .await
+            .unwrap();
+
+        let writer_thread = CACHE_WRITE_THREADS
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|(path, thread)| (path == &cached.cache_path).then_some(*thread))
+            .unwrap();
+        assert_ne!(caller_thread, writer_thread);
+        remove_temp_dir(&cache_dir);
+    }
+
     #[tokio::test]
     async fn candidate_download_isolates_concurrent_cache_temp_writes() {
         let url = spawn_torznab_server(|_request| async move {
@@ -3054,6 +3108,67 @@ mod tests {
         }));
 
         remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_accepts_existing_cache_file() {
+        let url = spawn_torznab_server(|_request| async move {
+            (
+                AxumStatusCode::OK,
+                String::from_utf8(test_torrent_bytes()).unwrap(),
+            )
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-cache-existing");
+        let candidate = test_candidate(&url);
+        let client = test_candidate_download_client();
+        let first = client
+            .download_and_cache(&candidate, &cache_dir, None)
+            .await
+            .unwrap();
+        fs::write(&first.cache_path, alternate_test_torrent_bytes()).unwrap();
+
+        let second = client
+            .download_and_cache(&candidate, &cache_dir, None)
+            .await
+            .unwrap();
+
+        assert_eq!(first.cache_path, second.cache_path);
+        assert_eq!(test_torrent_bytes(), fs::read(&second.cache_path).unwrap());
+        assert!(fs::read_dir(&cache_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_reports_cache_write_failure_from_blocking_writer() {
+        let url = spawn_torznab_server(|_request| async move {
+            (
+                AxumStatusCode::OK,
+                String::from_utf8(test_torrent_bytes()).unwrap(),
+            )
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-cache-file-parent");
+        fs::write(&cache_dir, b"not a directory").unwrap();
+        let candidate = test_candidate(&url);
+        let client = test_candidate_download_client();
+
+        let error = client
+            .download_and_cache(&candidate, &cache_dir, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CandidateDownloadError::CacheWrite { path, .. } if path == cache_dir
+        ));
+        fs::remove_file(&cache_dir).unwrap();
     }
 
     #[test]
