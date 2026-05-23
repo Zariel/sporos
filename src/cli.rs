@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{CONFIG_SCHEMA, DEFAULT_CONFIG_PATH, load_config};
 use crate::domain::{
@@ -45,6 +45,11 @@ enum Command {
         indexer: String,
         #[arg(long, default_value = "http://torznab-fixture:8080/torrents")]
         fixture_base_url: String,
+    },
+    #[command(hide = true)]
+    SystemTestSnapshot {
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
     },
 }
 
@@ -90,6 +95,15 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
                 "seeded {seeded} system-test candidates for indexer {indexer}"
             ))
         }
+        Command::SystemTestSnapshot { config } => {
+            let loaded = load_config(&config).map_err(|error| error.to_string())?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let snapshot = runtime.block_on(system_test_snapshot(loaded))?;
+            serde_json::to_string(&snapshot).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -110,6 +124,16 @@ struct SystemFixture {
 #[derive(Debug, Deserialize)]
 struct SystemFixtureFile {
     size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestSnapshot {
+    local_items: i64,
+    remote_candidates: i64,
+    cached_candidates: i64,
+    match_decisions: i64,
+    enabled_indexers: i64,
+    saved_torrents: i64,
 }
 
 async fn seed_system_test_candidates(
@@ -208,6 +232,62 @@ async fn seed_system_test_candidates(
     }
 
     Ok(seeded)
+}
+
+async fn system_test_snapshot(
+    config: crate::config::SporosConfig,
+) -> Result<SystemTestSnapshot, String> {
+    let repository = Repository::connect(&config.paths.database)
+        .await
+        .map_err(|error| error.to_string())?;
+    let local_items = count_rows(repository.pool(), "SELECT COUNT(*) FROM local_items").await?;
+    let remote_candidates =
+        count_rows(repository.pool(), "SELECT COUNT(*) FROM remote_candidates").await?;
+    let cached_candidates = count_rows(
+        repository.pool(),
+        "SELECT COUNT(*) FROM remote_candidates WHERE info_hash IS NOT NULL AND torrent_cache_path IS NOT NULL",
+    )
+    .await?;
+    let match_decisions =
+        count_rows(repository.pool(), "SELECT COUNT(*) FROM match_decisions").await?;
+    let enabled_indexers = count_rows(
+        repository.pool(),
+        "SELECT COUNT(*) FROM indexers WHERE enabled = 1",
+    )
+    .await?;
+    let saved_torrents = fs::read_dir(&config.paths.output_dir)
+        .map_err(|error| {
+            format!(
+                "read output dir {}: {error}",
+                config.paths.output_dir.display()
+            )
+        })?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(crate::persistence::torrent_cache::SAVED_TORRENT_SUFFIX)
+        })
+        .count();
+    let saved_torrents =
+        i64::try_from(saved_torrents).map_err(|error| format!("count saved torrents: {error}"))?;
+
+    Ok(SystemTestSnapshot {
+        local_items,
+        remote_candidates,
+        cached_candidates,
+        match_decisions,
+        enabled_indexers,
+        saved_torrents,
+    })
+}
+
+async fn count_rows(pool: &sqlx::SqlitePool, query: &str) -> Result<i64, String> {
+    sqlx::query_scalar(query)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -478,6 +558,17 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(CACHED_TORRENT_SUFFIX)
         }));
+        let snapshot = run([
+            OsString::from("sporos"),
+            OsString::from("system-test-snapshot"),
+            OsString::from("--config"),
+            config_path.into_os_string(),
+        ])
+        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(2, snapshot["remote_candidates"]);
+        assert_eq!(2, snapshot["cached_candidates"]);
+        assert_eq!(1, snapshot["enabled_indexers"]);
         fs::remove_dir_all(root).unwrap();
     }
 

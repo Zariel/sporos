@@ -67,6 +67,7 @@ secrets_dir="$run_dir/secrets"
 diagnostics_dir="$run_dir/diagnostics"
 diagnostics_archive=
 override_file="$run_dir/compose.override.yml"
+env_file="$run_dir/system-test.env"
 http_port="${SPOROS_SYSTEM_HTTP_PORT:-0}"
 
 compose_started=0
@@ -202,6 +203,23 @@ compose exec -T sporos sporos system-test-seed \
   --config /etc/sporos/config.toml \
   --manifest /system-fixtures/manifest.json \
   --indexer fixture
+
+cat > "$env_file" <<EOF
+SPOROS_SYSTEM_HTTP_URL=http://127.0.0.1:$http_port
+SPOROS_SYSTEM_API_TOKEN=$sporos_api_token
+SPOROS_SYSTEM_PROJECT=$project_name
+SPOROS_SYSTEM_COMPOSE_FILE=$compose_file
+SPOROS_SYSTEM_COMPOSE_OVERRIDE=$override_file
+SPOROS_SYSTEM_CONTAINER_CONFIG=/etc/sporos/config.toml
+EOF
+export SPOROS_SYSTEM_HTTP_URL="http://127.0.0.1:$http_port"
+export SPOROS_SYSTEM_API_TOKEN="$sporos_api_token"
+export SPOROS_SYSTEM_PROJECT="$project_name"
+export SPOROS_SYSTEM_COMPOSE_FILE="$compose_file"
+export SPOROS_SYSTEM_COMPOSE_OVERRIDE="$override_file"
+export SPOROS_SYSTEM_CONTAINER_CONFIG="/etc/sporos/config.toml"
+
+cargo test --test system_torrent_clients -- --ignored --nocapture
 
 curl -fsS "http://127.0.0.1:$http_port/v1/status" >/dev/null
 curl -fsS "http://127.0.0.1:$http_port/metrics" >/dev/null

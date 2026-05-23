@@ -86,6 +86,17 @@ compose-network download URLs; the seed step lets later workflow tests use the
 cached torrents without weakening production SSRF protections for candidate
 downloads.
 
+The runner writes `system-test.env` into its per-run directory and exports the
+same values before invoking:
+
+```bash
+cargo test --test system_torrent_clients -- --ignored --nocapture
+```
+
+The ignored Rust test uses that context to call Sporos on the host-published
+HTTP port, inspect SQLite through the Sporos container, and assert the private
+qBittorrent and rTorrent APIs from the compose network.
+
 ## Templates
 
 `config/sporos.toml.template` is a runnable Sporos config shape for the
