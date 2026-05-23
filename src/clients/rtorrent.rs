@@ -1101,7 +1101,10 @@ mod tests {
     use std::future::Future;
     use std::io::{Read, Write};
     use std::net::TcpListener as StdTcpListener;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration as StdDuration;
 
     use axum::Router;
     use axum::body::{Body, to_bytes};
@@ -1163,6 +1166,42 @@ mod tests {
         let error = client.validate().await.unwrap_err();
 
         assert!(error.to_string().contains("HTTP 302"));
+    }
+
+    #[tokio::test]
+    async fn client_ignores_environment_http_proxy() {
+        const CHILD_MODE: &str = "SPOROS_RTORRENT_NO_PROXY_CHILD";
+        const ENDPOINT_ENV: &str = "SPOROS_RTORRENT_NO_PROXY_ENDPOINT";
+        if std::env::var(CHILD_MODE).ok().as_deref() == Some("1") {
+            let endpoint =
+                std::env::var(ENDPOINT_ENV).expect("child proxy test should receive endpoint");
+            let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(2));
+            client.validate().await.unwrap();
+            return;
+        }
+
+        let endpoint = spawn_rtorrent_no_proxy_target();
+        let proxy = ProxyProbe::spawn();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("clients::rtorrent::tests::client_ignores_environment_http_proxy")
+            .arg("--nocapture")
+            .env(CHILD_MODE, "1")
+            .env(ENDPOINT_ENV, endpoint)
+            .env("HTTP_PROXY", proxy.url())
+            .env("HTTPS_PROXY", proxy.url())
+            .env("ALL_PROXY", proxy.url())
+            .env("NO_PROXY", "")
+            .env("http_proxy", proxy.url())
+            .env("https_proxy", proxy.url())
+            .env("all_proxy", proxy.url())
+            .env("no_proxy", "")
+            .status()
+            .unwrap();
+
+        proxy.stop();
+        assert!(status.success());
+        assert_eq!(0, proxy.requests());
     }
 
     #[test]
@@ -1724,5 +1763,76 @@ mod tests {
                 .unwrap();
         });
         format!("http://{address}/RPC2")
+    }
+
+    fn spawn_rtorrent_no_proxy_target() -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            drop(stream.read(&mut request));
+            let body = xml_response("<array><data></data></array>");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{address}/RPC2")
+    }
+
+    struct ProxyProbe {
+        address: std::net::SocketAddr,
+        requests: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl ProxyProbe {
+        fn spawn() -> Self {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_requests = Arc::clone(&requests);
+            let thread_stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            thread_requests.fetch_add(1, Ordering::SeqCst);
+                            let mut request = [0_u8; 1024];
+                            drop(stream.read(&mut request));
+                            drop(stream.write_all(
+                                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+                            ));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(StdDuration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                address,
+                requests,
+                stop,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+
+        fn stop(&self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
     }
 }
