@@ -43,7 +43,7 @@ max_resume_wait_ms = 30000
 below_threshold_action = "inject_paused"
 
 [scheduling]
-client_inventory_interval = "5m"
+client_inventory_interval = "2s"
 indexer_caps_interval = "5m"
 saved_retry_interval = "5m"
 cleanup_interval = "1h"

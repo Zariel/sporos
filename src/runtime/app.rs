@@ -1470,6 +1470,18 @@ fn external_result_metric_outcome<T>(result: &Result<T, TorrentClientError>) -> 
     }
 }
 
+fn inventory_refresh_metric_outcome<T>(
+    result: &Result<T, InventoryRefreshError>,
+) -> ExternalOutcome {
+    match result {
+        Ok(_) => ExternalOutcome::Succeeded,
+        Err(InventoryRefreshError::Client {
+            source: TorrentClientError::UnsupportedCapability { .. },
+        }) => ExternalOutcome::Unsupported,
+        Err(_) => ExternalOutcome::Failed,
+    }
+}
+
 fn indexer_request_metric_outcome(error: &TorznabRequestError) -> ExternalOutcome {
     match error {
         TorznabRequestError::RateLimited { .. } => ExternalOutcome::RateLimited,
@@ -1924,7 +1936,16 @@ impl InjectionClient for RuntimeInjectionClient {
         worker: &'a InventoryRefreshWorker,
         shutdown: ShutdownSignal,
     ) -> ClientInventoryRefreshFuture<'a> {
-        Box::pin(async move { self.refresh_inventory_stream(worker, shutdown).await })
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = self.refresh_inventory_stream(worker, shutdown).await;
+            self.metrics.record_client_request(
+                ExternalOperation::Inventory,
+                inventory_refresh_metric_outcome(&result),
+                elapsed_ms(started),
+            );
+            result
+        })
     }
 }
 
@@ -4272,6 +4293,13 @@ mod tests {
         assert_eq!(2, item_count);
         assert_eq!(2, file_count);
         assert_eq!(1, info_requests.load(Ordering::SeqCst));
+        let metrics = runtime
+            .state
+            .metrics
+            .render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(metrics.contains(
+            "sporos_client_requests_total{operation=\"inventory\",outcome=\"succeeded\"} 1"
+        ));
     }
 
     #[tokio::test]

@@ -19,15 +19,27 @@ struct SystemContext {
     compose_file: String,
     compose_override: String,
     container_config: String,
+    container_manifest: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct SystemSnapshot {
     local_items: i64,
+    local_files: i64,
     remote_candidates: i64,
     cached_candidates: i64,
     match_decisions: i64,
     enabled_indexers: i64,
+    client_items: Vec<ClientItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientItem {
+    title: String,
+    source_key: String,
+    info_hash: Option<String>,
+    save_path: Option<String>,
+    file_count: i64,
 }
 
 #[tokio::test]
@@ -47,15 +59,36 @@ async fn real_torrent_client_harness_uses_prepared_compose_stack() -> TestResult
     context.wait_for_sporos_ready(&client).await?;
     context.assert_qbittorrent_api().await?;
     context.assert_rtorrent_api().await?;
+    context.load_source_torrents().await?;
 
     eventually("seeded candidates and scanned local inventory", || async {
         let snapshot = context.snapshot().await?;
         Ok(snapshot.enabled_indexers >= 1
             && snapshot.remote_candidates >= 2
             && snapshot.cached_candidates >= 2
-            && snapshot.local_items >= 2)
+            && snapshot.local_items >= 2
+            && snapshot.local_files >= 3
+            && has_client_item(
+                &snapshot,
+                "Sporos qBittorrent Fixture",
+                "/downloads/qbittorrent",
+                1,
+            )
+            && has_client_item(
+                &snapshot,
+                "Sporos rTorrent Fixture",
+                "/downloads/rtorrent",
+                2,
+            ))
     })
     .await?;
+
+    let metrics = context.get_text(&client, "/metrics").await?;
+    if !metrics
+        .contains("sporos_client_requests_total{operation=\"inventory\",outcome=\"succeeded\"}")
+    {
+        return Err("metrics did not include successful client inventory requests".into());
+    }
 
     let accepted = client
         .post(context.url("/v1/searches"))
@@ -91,6 +124,7 @@ impl SystemContext {
             "SPOROS_SYSTEM_COMPOSE_FILE",
             "SPOROS_SYSTEM_COMPOSE_OVERRIDE",
             "SPOROS_SYSTEM_CONTAINER_CONFIG",
+            "SPOROS_SYSTEM_CONTAINER_MANIFEST",
         ];
         let mut values = Vec::with_capacity(names.len());
         let mut missing = Vec::new();
@@ -124,6 +158,9 @@ impl SystemContext {
             container_config: values
                 .next()
                 .ok_or("missing SPOROS_SYSTEM_CONTAINER_CONFIG")?,
+            container_manifest: values
+                .next()
+                .ok_or("missing SPOROS_SYSTEM_CONTAINER_MANIFEST")?,
         };
         Ok(Some(context))
     }
@@ -156,6 +193,38 @@ impl SystemContext {
             return Err(format!("GET {path} returned {status}: {body}").into());
         }
         serde_json::from_str(&body).map_err(Into::into)
+    }
+
+    async fn get_text(&self, client: &reqwest::Client, path: &str) -> TestResult<String> {
+        let response = client
+            .get(self.url(path))
+            .bearer_auth(&self.api_token)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(format!("GET {path} returned {status}: {body}").into());
+        }
+        Ok(body)
+    }
+
+    async fn load_source_torrents(&self) -> TestResult {
+        let output = self.compose_output(&[
+            "exec",
+            "-T",
+            "sporos",
+            "sporos",
+            "system-test-load-sources",
+            "--config",
+            &self.container_config,
+            "--manifest",
+            &self.container_manifest,
+        ])?;
+        if !output.contains("loaded") {
+            return Err(format!("unexpected load-source output: {output}").into());
+        }
+        Ok(())
     }
 
     async fn snapshot(&self) -> TestResult<SystemSnapshot> {
@@ -254,6 +323,24 @@ fn output_with_timeout(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn has_client_item(
+    snapshot: &SystemSnapshot,
+    title: &str,
+    save_path: &str,
+    minimum_files: i64,
+) -> bool {
+    snapshot.client_items.iter().any(|item| {
+        item.title == title
+            && item.save_path.as_deref() == Some(save_path)
+            && item.file_count >= minimum_files
+            && item
+                .info_hash
+                .as_deref()
+                .is_some_and(|hash| hash.len() == 40)
+            && !item.source_key.is_empty()
+    })
 }
 
 async fn eventually<F, Fut>(label: &str, mut check: F) -> TestResult

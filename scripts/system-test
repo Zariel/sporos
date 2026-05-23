@@ -211,6 +211,7 @@ SPOROS_SYSTEM_PROJECT=$project_name
 SPOROS_SYSTEM_COMPOSE_FILE=$compose_file
 SPOROS_SYSTEM_COMPOSE_OVERRIDE=$override_file
 SPOROS_SYSTEM_CONTAINER_CONFIG=/etc/sporos/config.toml
+SPOROS_SYSTEM_CONTAINER_MANIFEST=/system-fixtures/manifest.json
 EOF
 export SPOROS_SYSTEM_HTTP_URL="http://127.0.0.1:$http_port"
 export SPOROS_SYSTEM_API_TOKEN="$sporos_api_token"
@@ -218,6 +219,7 @@ export SPOROS_SYSTEM_PROJECT="$project_name"
 export SPOROS_SYSTEM_COMPOSE_FILE="$compose_file"
 export SPOROS_SYSTEM_COMPOSE_OVERRIDE="$override_file"
 export SPOROS_SYSTEM_CONTAINER_CONFIG="/etc/sporos/config.toml"
+export SPOROS_SYSTEM_CONTAINER_MANIFEST="/system-fixtures/manifest.json"
 
 cargo test --test system_torrent_clients -- --ignored --nocapture
 

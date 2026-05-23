@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use crate::clients::qbittorrent::{QbitAddTorrent, QbitContentLayout, QbittorrentClient};
+use crate::clients::rtorrent::RtorrentClient;
+use crate::config::ConfigTorrentClientKind;
 use crate::config::{CONFIG_SCHEMA, DEFAULT_CONFIG_PATH, load_config};
 use crate::domain::{
     ByteSize, CandidateGuid, DownloadUrl, IndexerId, InfoHash, ItemTitle, RemoteCandidate,
@@ -50,6 +53,13 @@ enum Command {
     SystemTestSnapshot {
         #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
+    },
+    #[command(hide = true)]
+    SystemTestLoadSources {
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
     },
 }
 
@@ -104,6 +114,15 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
             let snapshot = runtime.block_on(system_test_snapshot(loaded))?;
             serde_json::to_string(&snapshot).map_err(|error| error.to_string())
         }
+        Command::SystemTestLoadSources { config, manifest } => {
+            let loaded = load_config(&config).map_err(|error| error.to_string())?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let loaded = runtime.block_on(load_system_test_sources(loaded, manifest))?;
+            Ok(format!("loaded {loaded} system-test source torrents"))
+        }
     }
 }
 
@@ -129,11 +148,22 @@ struct SystemFixtureFile {
 #[derive(Debug, Serialize)]
 struct SystemTestSnapshot {
     local_items: i64,
+    local_files: i64,
     remote_candidates: i64,
     cached_candidates: i64,
     match_decisions: i64,
     enabled_indexers: i64,
     saved_torrents: i64,
+    client_items: Vec<SystemTestClientItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestClientItem {
+    title: String,
+    source_key: String,
+    info_hash: Option<String>,
+    save_path: Option<String>,
+    file_count: i64,
 }
 
 async fn seed_system_test_candidates(
@@ -241,6 +271,7 @@ async fn system_test_snapshot(
         .await
         .map_err(|error| error.to_string())?;
     let local_items = count_rows(repository.pool(), "SELECT COUNT(*) FROM local_items").await?;
+    let local_files = count_rows(repository.pool(), "SELECT COUNT(*) FROM local_files").await?;
     let remote_candidates =
         count_rows(repository.pool(), "SELECT COUNT(*) FROM remote_candidates").await?;
     let cached_candidates = count_rows(
@@ -272,15 +303,148 @@ async fn system_test_snapshot(
         .count();
     let saved_torrents =
         i64::try_from(saved_torrents).map_err(|error| format!("count saved torrents: {error}"))?;
+    let client_items = system_test_client_items(repository.pool()).await?;
 
     Ok(SystemTestSnapshot {
         local_items,
+        local_files,
         remote_candidates,
         cached_candidates,
         match_decisions,
         enabled_indexers,
         saved_torrents,
+        client_items,
     })
+}
+
+async fn load_system_test_sources(
+    config: crate::config::SporosConfig,
+    manifest_path: PathBuf,
+) -> Result<usize, String> {
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| format!("read fixture manifest {}: {error}", manifest_path.display()))?;
+    let manifest: SystemFixtureManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "parse fixture manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        format!(
+            "fixture manifest has no parent: {}",
+            manifest_path.display()
+        )
+    })?;
+
+    let mut loaded = 0_usize;
+    for (name, client_config) in &config.torrent_clients {
+        let slug = match client_config.kind {
+            ConfigTorrentClientKind::Qbittorrent => "qbittorrent-source",
+            ConfigTorrentClientKind::Rtorrent => "rtorrent-source",
+        };
+        let fixture = manifest
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.slug == slug)
+            .ok_or_else(|| format!("fixture manifest missing {slug}"))?;
+        let torrent = fs::read(manifest_dir.join(&fixture.torrent_path)).map_err(|error| {
+            format!(
+                "read fixture torrent {}: {error}",
+                fixture.torrent_path.display()
+            )
+        })?;
+        match client_config.kind {
+            ConfigTorrentClientKind::Qbittorrent => {
+                let client = QbittorrentClient::new(
+                    name,
+                    &client_config.url,
+                    client_config.username.clone(),
+                    client_config
+                        .password
+                        .as_ref()
+                        .map(|password| password.expose_secret().to_owned()),
+                    std::time::Duration::from_secs(30),
+                );
+                if let Some(category) = client_config.default_category.as_deref() {
+                    client
+                        .create_category(category, Some(&client_config.default_save_path))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                for tag in &client_config.default_tags {
+                    client
+                        .create_tag(tag)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                client
+                    .inject(QbitAddTorrent {
+                        torrent_bytes: &torrent,
+                        save_path: Some(&client_config.default_save_path),
+                        category: client_config.default_category.as_deref(),
+                        tags: &client_config.default_tags,
+                        pause_for_recheck: false,
+                        content_layout: QbitContentLayout::Original,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            ConfigTorrentClientKind::Rtorrent => {
+                let client = RtorrentClient::new(
+                    name,
+                    &client_config.url,
+                    std::time::Duration::from_secs(30),
+                );
+                client
+                    .inject(
+                        &torrent,
+                        Some(&client_config.default_save_path),
+                        &client_config.default_label,
+                        true,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        loaded = loaded.saturating_add(1);
+    }
+
+    Ok(loaded)
+}
+
+async fn system_test_client_items(
+    pool: &sqlx::SqlitePool,
+) -> Result<Vec<SystemTestClientItem>, String> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            local_items.title,
+            local_items.source_key,
+            local_items.info_hash,
+            local_items.save_path,
+            COUNT(local_files.file_index) AS file_count
+        FROM local_items
+        LEFT JOIN local_files ON local_files.item_id = local_items.id
+        WHERE local_items.source_type = 'client'
+        GROUP BY local_items.id
+        ORDER BY local_items.source_key
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SystemTestClientItem {
+            title: sqlx::Row::get(&row, "title"),
+            source_key: sqlx::Row::get(&row, "source_key"),
+            info_hash: sqlx::Row::get(&row, "info_hash"),
+            save_path: sqlx::Row::get(&row, "save_path"),
+            file_count: sqlx::Row::get(&row, "file_count"),
+        })
+        .collect())
 }
 
 async fn count_rows(pool: &sqlx::SqlitePool, query: &str) -> Result<i64, String> {
