@@ -29,6 +29,7 @@ services:
         target: /var/run/secrets/qbittorrent-password
     volumes:
       - ./config/sporos.toml.template:/etc/sporos/config.toml:ro
+      - ./fixtures:/system-fixtures:ro
       - sporos_state:/data/state
       - torrent_cache:/data/cache/torrents
       - output:/data/output

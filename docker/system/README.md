@@ -77,6 +77,15 @@ It also gives the client UID/GID (`1000:1000`) ownership of client download and
 config/session directories while leaving the downloaded files world-readable for
 the Sporos runtime UID (`10001`).
 
+After Sporos is live, the runner executes the hidden `sporos system-test-seed`
+helper inside the Sporos container. The helper reads the mounted fixture
+manifest, copies candidate torrents into `paths.torrent_cache_dir` using the
+normal cache filename format, and upserts matching `remote_candidates` rows
+through the Rust repository. The Torznab fixture still advertises private
+compose-network download URLs; the seed step lets later workflow tests use the
+cached torrents without weakening production SSRF protections for candidate
+downloads.
+
 ## Templates
 
 `config/sporos.toml.template` is a runnable Sporos config shape for the

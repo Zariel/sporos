@@ -50,6 +50,10 @@ fn real_client_torrent_fixtures_are_deterministic_and_tiny() {
         .collect();
     assert_pair_equivalent_and_distinct(&by_slug, "qbittorrent-source", "qbittorrent-candidate");
     assert_pair_equivalent_and_distinct(&by_slug, "rtorrent-source", "rtorrent-candidate");
+    let search_xml =
+        fs::read_to_string(root.parent().unwrap().join("torznab/www/search.xml")).unwrap();
+    assert_search_fixture_matches_manifest(&search_xml, by_slug["qbittorrent-candidate"], "4096");
+    assert_search_fixture_matches_manifest(&search_xml, by_slug["rtorrent-candidate"], "3329");
 
     for fixture in &manifest.fixtures {
         let torrent =
@@ -112,6 +116,24 @@ fn real_client_torrent_fixtures_are_deterministic_and_tiny() {
             expected_pieces(&piece_input, manifest.piece_length)
         );
     }
+}
+
+fn assert_search_fixture_matches_manifest(
+    search_xml: &str,
+    fixture: &Fixture,
+    expected_size: &str,
+) {
+    let slug = fixture.slug.as_str();
+    assert!(search_xml.contains(&format!("<title>{}</title>", fixture.name)));
+    assert!(search_xml.contains(&format!("<guid>sporos-{slug}</guid>")));
+    assert!(search_xml.contains(&format!(
+        "url=\"http://torznab-fixture:8080/torrents/{slug}.torrent\""
+    )));
+    assert!(search_xml.contains(&format!("name=\"size\" value=\"{expected_size}\"")));
+    assert!(search_xml.contains(&format!(
+        "name=\"infohash\" value=\"{}\"",
+        fixture.info_hash
+    )));
 }
 
 fn assert_pair_equivalent_and_distinct(

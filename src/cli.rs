@@ -1,9 +1,19 @@
 use std::ffi::OsString;
+use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 
 use crate::config::{CONFIG_SCHEMA, DEFAULT_CONFIG_PATH, load_config};
+use crate::domain::{
+    ByteSize, CandidateGuid, DownloadUrl, IndexerId, InfoHash, ItemTitle, RemoteCandidate,
+    TrackerName,
+};
+use crate::indexers::TorznabRegistry;
+use crate::persistence::repository::Repository;
+use crate::persistence::torrent_cache::cached_torrent_path;
+use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::app::validate_runtime_config;
 use crate::runtime::daemon;
 
@@ -25,6 +35,17 @@ enum Command {
         config: PathBuf,
     },
     PrintConfigSchema,
+    #[command(hide = true)]
+    SystemTestSeed {
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = "fixture")]
+        indexer: String,
+        #[arg(long, default_value = "http://torznab-fixture:8080/torrents")]
+        fixture_base_url: String,
+    },
 }
 
 pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
@@ -48,7 +69,145 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
             Ok(format!("sporos config ok: {}", config.display()))
         }
         Command::PrintConfigSchema => Ok(CONFIG_SCHEMA.to_owned()),
+        Command::SystemTestSeed {
+            config,
+            manifest,
+            indexer,
+            fixture_base_url,
+        } => {
+            let loaded = load_config(&config).map_err(|error| error.to_string())?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let seeded = runtime.block_on(seed_system_test_candidates(
+                loaded,
+                manifest,
+                &indexer,
+                &fixture_base_url,
+            ))?;
+            Ok(format!(
+                "seeded {seeded} system-test candidates for indexer {indexer}"
+            ))
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemFixtureManifest {
+    fixtures: Vec<SystemFixture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemFixture {
+    slug: String,
+    name: String,
+    torrent_path: PathBuf,
+    info_hash: String,
+    files: Vec<SystemFixtureFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemFixtureFile {
+    size: u64,
+}
+
+async fn seed_system_test_candidates(
+    config: crate::config::SporosConfig,
+    manifest_path: PathBuf,
+    indexer_name: &str,
+    fixture_base_url: &str,
+) -> Result<usize, String> {
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| format!("read fixture manifest {}: {error}", manifest_path.display()))?;
+    let manifest: SystemFixtureManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "parse fixture manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        format!(
+            "fixture manifest has no parent: {}",
+            manifest_path.display()
+        )
+    })?;
+    fs::create_dir_all(&config.paths.torrent_cache_dir).map_err(|error| {
+        format!(
+            "create torrent cache dir {}: {error}",
+            config.paths.torrent_cache_dir.display()
+        )
+    })?;
+
+    let repository = Repository::connect(&config.paths.database)
+        .await
+        .map_err(|error| error.to_string())?;
+    let registry =
+        TorznabRegistry::from_config(&config.indexers).map_err(|error| error.to_string())?;
+    repository
+        .sync_torznab_indexers(registry.indexers(), unix_time_ms())
+        .await
+        .map_err(|error| error.to_string())?;
+    let indexer = repository
+        .indexer_registry_snapshot(1_000)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|row| row.name.as_str() == indexer_name && row.enabled)
+        .ok_or_else(|| format!("indexer `{indexer_name}` is not synced and enabled"))?;
+    let indexer_id = IndexerId::new(indexer.id)
+        .map_err(|error| format!("indexer `{indexer_name}` has invalid id: {error}"))?;
+
+    let mut seeded = 0_usize;
+    for fixture in manifest
+        .fixtures
+        .into_iter()
+        .filter(|fixture| fixture.slug.ends_with("-candidate"))
+    {
+        let info_hash = InfoHash::new(fixture.info_hash.clone())
+            .map_err(|error| format!("invalid fixture info hash {}: {error}", fixture.slug))?;
+        let source = manifest_dir.join(&fixture.torrent_path);
+        let cache_path = cached_torrent_path(&config.paths.torrent_cache_dir, &info_hash);
+        fs::copy(&source, &cache_path).map_err(|error| {
+            format!(
+                "copy fixture torrent {} to {}: {error}",
+                source.display(),
+                cache_path.display()
+            )
+        })?;
+        repository
+            .upsert_remote_candidate(&RemoteCandidate {
+                id: None,
+                indexer_id,
+                guid: CandidateGuid::new(format!("sporos-{}", fixture.slug))
+                    .map_err(|error| error.to_string())?,
+                download_url: DownloadUrl::new(format!(
+                    "{}/{}.torrent",
+                    fixture_base_url.trim_end_matches('/'),
+                    fixture.slug
+                ))
+                .map_err(|error| error.to_string())?,
+                title: ItemTitle::new(fixture.name).map_err(|error| error.to_string())?,
+                tracker: TrackerName::new(indexer_name.to_owned())
+                    .map_err(|error| error.to_string())?,
+                size: Some(ByteSize::new(
+                    fixture
+                        .files
+                        .iter()
+                        .map(|file| file.size)
+                        .fold(0_u64, u64::saturating_add),
+                )),
+                published_at_ms: None,
+                info_hash: Some(info_hash),
+                torrent_cache_path: Some(cache_path),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        seeded = seeded.saturating_add(1);
+    }
+
+    Ok(seeded)
 }
 
 #[cfg(test)]
@@ -58,6 +217,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::indexers::TorznabRegistry;
+    use crate::persistence::torrent_cache::CACHED_TORRENT_SUFFIX;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -233,6 +394,91 @@ mod tests {
 
         assert!(output.contains("[paths]"));
         assert!(output.contains("[scheduling]"));
+    }
+
+    #[test]
+    fn hidden_system_test_seed_copies_candidate_torrents_and_upserts_rows() {
+        let root = unique_temp_root();
+        let state_dir = root.join("state");
+        let cache_dir = root.join("cache/torrents");
+        let output_dir = root.join("output");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+                [paths]
+                database = "{}/sporos.db"
+                torrent_cache_dir = "{}"
+                output_dir = "{}"
+
+                [indexers.torznab.fixture]
+                url = "http://torznab-fixture:8080/api"
+                "#,
+                state_dir.display(),
+                cache_dir.display(),
+                output_dir.display()
+            ),
+        )
+        .unwrap();
+        let loaded = load_config(&config_path).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let repository = Repository::connect(&loaded.paths.database).await.unwrap();
+            let registry = TorznabRegistry::from_config(&loaded.indexers).unwrap();
+            repository
+                .sync_torznab_indexers(registry.indexers(), 100)
+                .await
+                .unwrap();
+        });
+
+        let manifest =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docker/system/fixtures/manifest.json");
+        let output = run([
+            OsString::from("sporos"),
+            OsString::from("system-test-seed"),
+            OsString::from("--config"),
+            config_path.clone().into_os_string(),
+            OsString::from("--manifest"),
+            manifest.into_os_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            "seeded 2 system-test candidates for indexer fixture",
+            output
+        );
+        let cached = fs::read_dir(&cache_dir).unwrap().count();
+        assert_eq!(2, cached);
+        runtime.block_on(async {
+            let repository = Repository::connect(&loaded.paths.database).await.unwrap();
+            let row: (i64, i64) = sqlx::query_as(
+                r#"
+                SELECT COUNT(*), COUNT(torrent_cache_path)
+                FROM remote_candidates
+                WHERE guid IN ('sporos-qbittorrent-candidate', 'sporos-rtorrent-candidate')
+                  AND info_hash IS NOT NULL
+                "#,
+            )
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+            assert_eq!((2, 2), row);
+        });
+        assert!(fs::read_dir(&cache_dir).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(CACHED_TORRENT_SUFFIX)
+        }));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn write_temp_config(contents: &str) -> PathBuf {
