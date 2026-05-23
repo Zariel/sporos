@@ -90,7 +90,7 @@ The runner writes `system-test.env` into its per-run directory and exports the
 same values before invoking:
 
 ```bash
-cargo test --test system_torrent_clients -- --ignored --nocapture
+cargo test --test system -- --ignored --nocapture
 ```
 
 The ignored Rust test uses that context to call Sporos on the host-published

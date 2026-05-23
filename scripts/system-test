@@ -221,7 +221,7 @@ export SPOROS_SYSTEM_COMPOSE_OVERRIDE="$override_file"
 export SPOROS_SYSTEM_CONTAINER_CONFIG="/etc/sporos/config.toml"
 export SPOROS_SYSTEM_CONTAINER_MANIFEST="/system-fixtures/manifest.json"
 
-cargo test --test system_torrent_clients -- --ignored --nocapture
+cargo test --test system -- --ignored --nocapture
 
 curl -fsS "http://127.0.0.1:$http_port/v1/status" >/dev/null
 curl -fsS "http://127.0.0.1:$http_port/metrics" >/dev/null
