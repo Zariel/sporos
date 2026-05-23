@@ -1,9 +1,17 @@
 # Real Client System Topology
 
 This directory contains the Docker Compose topology used by the real torrent
-client system harness. The stable entry point and lifecycle script are added by
-later beads; for now this topology defines the services, network, volumes, and
-templates they will render or mount.
+client system harness. Use the repository entry point:
+
+```bash
+scripts/system-test torrent-clients
+```
+
+For debugging, preserve the run directory and compose stack:
+
+```bash
+scripts/system-test torrent-clients --preserve-diagnostics
+```
 
 ## Services
 
@@ -47,8 +55,8 @@ replace this with a password-hash seeding path if it needs auth-on coverage.
 
 ## Volumes And Paths
 
-Compose project names isolate runs. The later runner should set a unique
-project name, which gives each run its own named volumes:
+Compose project names isolate runs. The runner sets a unique project name by
+default, which gives each run its own named volumes:
 
 - `sporos_state` -> `/data/state`
 - `torrent_cache` -> `/data/cache/torrents`
@@ -72,11 +80,9 @@ the Sporos runtime UID (`10001`).
 ## Templates
 
 `config/sporos.toml.template` is a runnable Sporos config shape for the
-topology. It points at placeholder secret files and private service names. The
-later runner may render a copy into the run directory if it needs unique tokens
-or alternate ports.
+topology. The runner copies it into a unique run directory and overlays compose
+secrets with generated per-run values.
 
 `secrets/*.template` contain placeholder values only. They are not production
-secrets. The later runner is responsible for generating per-run values and, for
-qBittorrent, aligning the Web UI password in the client config with the
-password file mounted into Sporos.
+secrets. They make `docker compose -f docker/system/compose.yml config` work
+without the runner.

@@ -1,0 +1,205 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/system-test torrent-clients [--preserve-diagnostics] [--skip-build]
+
+Runs the Docker-backed real torrent-client system harness.
+
+Options:
+  --preserve-diagnostics  Keep the compose stack and run directory after exit.
+  --skip-build            Use SPOROS_SYSTEM_IMAGE without building the Sporos image.
+USAGE
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  usage
+  exit 0
+fi
+
+command_name="${1:-}"
+if [ "$command_name" != "torrent-clients" ]; then
+  usage >&2
+  exit 2
+fi
+shift
+
+preserve_diagnostics=0
+skip_build="${SPOROS_SYSTEM_SKIP_BUILD:-0}"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --preserve-diagnostics)
+      preserve_diagnostics=1
+      ;;
+    --skip-build)
+      skip_build=1
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+compose_file="$repo_root/docker/system/compose.yml"
+run_root="${SPOROS_SYSTEM_RUN_ROOT:-${TMPDIR:-/tmp}}"
+run_id="${SPOROS_SYSTEM_RUN_ID:-$(date +%Y%m%d%H%M%S)-$$}"
+project_name="${SPOROS_SYSTEM_PROJECT:-sporos-system-$run_id}"
+case "$project_name" in
+  *[!a-zA-Z0-9_-]* | "" | -*)
+    echo "invalid compose project name: $project_name" >&2
+    exit 2
+    ;;
+esac
+mkdir -p "$run_root"
+run_dir=$(mktemp -d "$run_root/$project_name.XXXXXX")
+config_dir="$run_dir/config"
+secrets_dir="$run_dir/secrets"
+diagnostics_dir="$run_dir/diagnostics"
+diagnostics_archive=
+override_file="$run_dir/compose.override.yml"
+http_port="${SPOROS_SYSTEM_HTTP_PORT:-0}"
+
+compose_started=0
+
+compose() {
+  SPOROS_SYSTEM_PROJECT="$project_name" \
+  SPOROS_SYSTEM_HTTP_PORT="$http_port" \
+  docker compose \
+    --project-name "$project_name" \
+    -f "$compose_file" \
+    -f "$override_file" \
+    "$@"
+}
+
+scrub() {
+  sed \
+    -e "s/$sporos_api_token/[REDACTED_SPOROS_API_TOKEN]/g" \
+    -e "s/$qbittorrent_password/[REDACTED_QBITTORRENT_PASSWORD]/g"
+}
+
+collect_diagnostics() {
+  mkdir -p "$diagnostics_dir"
+  if [ "$compose_started" -eq 1 ]; then
+    compose ps > "$diagnostics_dir/compose-ps.txt" 2>&1 || true
+    compose logs --no-color > "$diagnostics_dir/compose-logs.raw.txt" 2>&1 || true
+    scrub < "$diagnostics_dir/compose-logs.raw.txt" > "$diagnostics_dir/compose-logs.txt" || true
+    rm -f "$diagnostics_dir/compose-logs.raw.txt"
+  fi
+  curl -fsS "http://127.0.0.1:$http_port/livez" > "$diagnostics_dir/livez.json" 2>&1 || true
+  curl -fsS "http://127.0.0.1:$http_port/readyz" > "$diagnostics_dir/readyz.json" 2>&1 || true
+  curl -fsS "http://127.0.0.1:$http_port/v1/status" > "$diagnostics_dir/status.json" 2>&1 || true
+  curl -fsS "http://127.0.0.1:$http_port/metrics" > "$diagnostics_dir/metrics.txt" 2>&1 || true
+  diagnostics_archive=$(mktemp -d "$run_root/$project_name-diagnostics.XXXXXX")
+  cp -R "$diagnostics_dir/." "$diagnostics_archive/" 2>/dev/null || true
+  echo "diagnostics: $diagnostics_archive" >&2
+}
+
+cleanup() {
+  status="${1:-$?}"
+  trap - EXIT INT TERM
+  if [ "$status" -ne 0 ]; then
+    collect_diagnostics
+  fi
+  if [ "$preserve_diagnostics" -eq 1 ]; then
+    echo "preserving compose stack and run directory: $run_dir" >&2
+    exit "$status"
+  fi
+  if [ "$compose_started" -eq 1 ]; then
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
+  rm -rf "$run_dir"
+  exit "$status"
+}
+trap 'cleanup "$?"' EXIT
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is required to generate system-test secrets" >&2
+  exit 2
+fi
+sporos_api_token=$(openssl rand -hex 24)
+qbittorrent_password=$(openssl rand -hex 24)
+
+mkdir -p "$config_dir" "$secrets_dir" "$diagnostics_dir"
+cp "$repo_root/docker/system/config/sporos.toml.template" "$config_dir/sporos.toml"
+printf '%s\n' "$sporos_api_token" > "$secrets_dir/sporos-api-token"
+printf '%s\n' "$qbittorrent_password" > "$secrets_dir/qbittorrent-password"
+chmod 600 "$secrets_dir/sporos-api-token" "$secrets_dir/qbittorrent-password"
+
+cat > "$override_file" <<EOF
+services:
+  sporos:
+    volumes:
+      - "$config_dir/sporos.toml:/etc/sporos/config.toml:ro"
+
+secrets:
+  sporos_api_token:
+    file: "$secrets_dir/sporos-api-token"
+  qbittorrent_password:
+    file: "$secrets_dir/qbittorrent-password"
+EOF
+
+wait_for_http() {
+  label="$1"
+  url="$2"
+  deadline=$(( $(date +%s) + 180 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "timed out waiting for $label at $url" >&2
+  return 1
+}
+
+wait_for_internal_http() {
+  label="$1"
+  script="$2"
+  deadline=$(( $(date +%s) + 180 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if compose run --rm --no-deps system-init /bin/sh -eu -c "$script" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "timed out waiting for $label" >&2
+  return 1
+}
+
+if [ "$skip_build" -ne 1 ]; then
+  compose build sporos
+fi
+
+up_args="-d --remove-orphans"
+if [ "$skip_build" -eq 1 ]; then
+  up_args="$up_args --no-build"
+fi
+compose_started=1
+compose up $up_args
+
+if [ "$http_port" = "0" ]; then
+  http_port=$(compose port sporos 2468 | sed 's/.*://')
+fi
+
+wait_for_http "Sporos liveness" "http://127.0.0.1:$http_port/livez"
+wait_for_http "Sporos readiness" "http://127.0.0.1:$http_port/readyz"
+wait_for_internal_http "qBittorrent Web API" "wget -qO- http://qbittorrent:8080/api/v2/app/version"
+wait_for_internal_http "rTorrent XML-RPC" "wget -qO- --header='Content-Type: text/xml' --post-data='<methodCall><methodName>download_list</methodName><params></params></methodCall>' http://rtorrent:8000/RPC2"
+wait_for_internal_http "Torznab fixture caps" "wget -qO- 'http://torznab-fixture:8080/api?t=caps'"
+
+curl -fsS "http://127.0.0.1:$http_port/v1/status" >/dev/null
+curl -fsS "http://127.0.0.1:$http_port/metrics" >/dev/null
+
+echo "system torrent-client lifecycle completed"
