@@ -30,6 +30,7 @@ struct SystemSnapshot {
     cached_candidates: i64,
     match_decisions: i64,
     enabled_indexers: i64,
+    saved_torrents: i64,
     client_items: Vec<ClientItem>,
 }
 
@@ -40,6 +41,32 @@ struct ClientItem {
     info_hash: Option<String>,
     save_path: Option<String>,
     file_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientState {
+    qbittorrent: Option<QbitState>,
+    rtorrent: Option<RtorrentState>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QbitState {
+    hash: String,
+    name: String,
+    save_path: Option<String>,
+    category: Option<String>,
+    tags: Option<String>,
+    amount_left: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RtorrentState {
+    hash: String,
+    name: String,
+    directory: String,
+    label: Option<String>,
+    left_bytes: u64,
+    complete: bool,
 }
 
 #[tokio::test]
@@ -90,22 +117,37 @@ async fn real_torrent_client_harness_uses_prepared_compose_stack() -> TestResult
         return Err("metrics did not include successful client inventory requests".into());
     }
 
-    let accepted = client
-        .post(context.url("/v1/searches"))
-        .bearer_auth(&context.api_token)
-        .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"query":"Sporos qBittorrent Fixture"}"#)
-        .send()
+    context
+        .post_search(&client, "Sporos qBittorrent Fixture")
         .await?;
-    if accepted.status() != StatusCode::ACCEPTED {
-        return Err(format!("search request returned {}", accepted.status()).into());
-    }
+    context
+        .post_search(&client, "Sporos rTorrent Fixture")
+        .await?;
 
-    eventually("search workflow persisted a match decision", || async {
+    eventually("search workflow injected both candidates", || async {
         let snapshot = context.snapshot().await?;
-        Ok(snapshot.match_decisions >= 1)
+        let client_state = context.client_state().await?;
+        Ok(snapshot.match_decisions >= 2
+            && snapshot.saved_torrents == 0
+            && qbit_candidate_injected(client_state.qbittorrent.as_ref())
+            && rtorrent_candidate_injected(client_state.rtorrent.as_ref()))
     })
     .await?;
+
+    let metrics = context.get_text(&client, "/metrics").await?;
+    assert_metric_present(
+        &metrics,
+        "sporos_search_attempts_total{outcome=\"succeeded\"",
+    )?;
+    assert_metric_present(
+        &metrics,
+        "sporos_indexer_requests_total{operation=\"search\",outcome=\"succeeded\"",
+    )?;
+    assert_metric_present(&metrics, "sporos_actions_total{outcome=\"injected\"")?;
+    assert_metric_present(
+        &metrics,
+        "sporos_client_requests_total{operation=\"inject\",outcome=\"succeeded\"",
+    )?;
 
     let status = context.get_json(&client, "/v1/status").await?;
     if status.get("status").and_then(Value::as_str) != Some("ok") {
@@ -227,6 +269,25 @@ impl SystemContext {
         Ok(())
     }
 
+    async fn post_search(&self, client: &reqwest::Client, query: &str) -> TestResult {
+        let body = serde_json::json!({ "query": query }).to_string();
+        let accepted = client
+            .post(self.url("/v1/searches"))
+            .bearer_auth(&self.api_token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await?;
+        if accepted.status() != StatusCode::ACCEPTED {
+            return Err(format!(
+                "search request for `{query}` returned {}",
+                accepted.status()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     async fn snapshot(&self) -> TestResult<SystemSnapshot> {
         let output = self.compose_output(&[
             "exec",
@@ -236,6 +297,21 @@ impl SystemContext {
             "system-test-snapshot",
             "--config",
             &self.container_config,
+        ])?;
+        serde_json::from_str(&output).map_err(Into::into)
+    }
+
+    async fn client_state(&self) -> TestResult<ClientState> {
+        let output = self.compose_output(&[
+            "exec",
+            "-T",
+            "sporos",
+            "sporos",
+            "system-test-client-state",
+            "--config",
+            &self.container_config,
+            "--manifest",
+            &self.container_manifest,
         ])?;
         serde_json::from_str(&output).map_err(Into::into)
     }
@@ -322,6 +398,42 @@ fn output_with_timeout(
             .into());
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn qbit_candidate_injected(state: Option<&QbitState>) -> bool {
+    state.is_some_and(|torrent| {
+        torrent.hash == "73fc73a21a1c486f3287ed25213743ce6237f841"
+            && torrent.name == "Sporos qBittorrent Fixture"
+            && torrent.save_path.as_deref() == Some("/downloads/qbittorrent")
+            && torrent.category.as_deref() == Some("sporos-system")
+            && torrent
+                .tags
+                .as_deref()
+                .is_some_and(|tags| tags.contains("sporos") && tags.contains("system-test"))
+            && torrent.amount_left == Some(0)
+    })
+}
+
+fn rtorrent_candidate_injected(state: Option<&RtorrentState>) -> bool {
+    state.is_some_and(|download| {
+        download.hash == "65ec0ba73f0ef6c23e3857eac5e7e5a142d63ff4"
+            && download.name == "Sporos rTorrent Fixture"
+            && download.directory == "/downloads/rtorrent"
+            && download.label.as_deref() == Some("sporos-system")
+            && download.left_bytes == 0
+            && download.complete
+    })
+}
+
+fn assert_metric_present(metrics: &str, prefix: &str) -> TestResult {
+    if metrics
+        .lines()
+        .any(|line| line.starts_with(prefix) && !line.ends_with(" 0"))
+    {
+        Ok(())
+    } else {
+        Err(format!("metrics did not include nonzero counter {prefix}").into())
     }
 }
 

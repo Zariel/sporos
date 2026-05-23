@@ -61,6 +61,13 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
+    #[command(hide = true)]
+    SystemTestClientState {
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+    },
 }
 
 pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
@@ -123,6 +130,15 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
             let loaded = runtime.block_on(load_system_test_sources(loaded, manifest))?;
             Ok(format!("loaded {loaded} system-test source torrents"))
         }
+        Command::SystemTestClientState { config, manifest } => {
+            let loaded = load_config(&config).map_err(|error| error.to_string())?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let state = runtime.block_on(system_test_client_state(loaded, manifest))?;
+            serde_json::to_string(&state).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -164,6 +180,32 @@ struct SystemTestClientItem {
     info_hash: Option<String>,
     save_path: Option<String>,
     file_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestClientState {
+    qbittorrent: Option<SystemTestQbitTorrent>,
+    rtorrent: Option<SystemTestRtorrentDownload>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestQbitTorrent {
+    hash: String,
+    name: String,
+    save_path: Option<String>,
+    category: Option<String>,
+    tags: Option<String>,
+    amount_left: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestRtorrentDownload {
+    hash: String,
+    name: String,
+    directory: String,
+    label: Option<String>,
+    left_bytes: u64,
+    complete: bool,
 }
 
 async fn seed_system_test_candidates(
@@ -411,6 +453,92 @@ async fn load_system_test_sources(
     }
 
     Ok(loaded)
+}
+
+async fn system_test_client_state(
+    config: crate::config::SporosConfig,
+    manifest_path: PathBuf,
+) -> Result<SystemTestClientState, String> {
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| format!("read fixture manifest {}: {error}", manifest_path.display()))?;
+    let manifest: SystemFixtureManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "parse fixture manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    let qbit_hash = manifest_info_hash(&manifest, "qbittorrent-candidate")?;
+    let rtorrent_hash = manifest_info_hash(&manifest, "rtorrent-candidate")?;
+    let mut qbittorrent = None;
+    let mut rtorrent = None;
+
+    for (name, client_config) in &config.torrent_clients {
+        match client_config.kind {
+            ConfigTorrentClientKind::Qbittorrent => {
+                let client = QbittorrentClient::new(
+                    name,
+                    &client_config.url,
+                    client_config.username.clone(),
+                    client_config
+                        .password
+                        .as_ref()
+                        .map(|password| password.expose_secret().to_owned()),
+                    std::time::Duration::from_secs(30),
+                );
+                qbittorrent = client
+                    .torrent_info(&qbit_hash)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map(|torrent| SystemTestQbitTorrent {
+                        hash: torrent.hash,
+                        name: torrent.name,
+                        save_path: torrent
+                            .save_path
+                            .map(|path| path.to_string_lossy().into_owned()),
+                        category: torrent.category,
+                        tags: torrent.tags,
+                        amount_left: torrent.amount_left,
+                    });
+            }
+            ConfigTorrentClientKind::Rtorrent => {
+                let client = RtorrentClient::new(
+                    name,
+                    &client_config.url,
+                    std::time::Duration::from_secs(30),
+                );
+                rtorrent = client
+                    .download_info(&rtorrent_hash)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map(|download| SystemTestRtorrentDownload {
+                        hash: download.info_hash.as_str().to_owned(),
+                        name: download.name.as_str().to_owned(),
+                        directory: download.directory.to_string_lossy().into_owned(),
+                        label: download.label,
+                        left_bytes: download.left_bytes.get(),
+                        complete: download.complete,
+                    });
+            }
+        }
+    }
+
+    Ok(SystemTestClientState {
+        qbittorrent,
+        rtorrent,
+    })
+}
+
+fn manifest_info_hash(manifest: &SystemFixtureManifest, slug: &str) -> Result<InfoHash, String> {
+    manifest
+        .fixtures
+        .iter()
+        .find(|fixture| fixture.slug == slug)
+        .ok_or_else(|| format!("fixture manifest missing {slug}"))
+        .and_then(|fixture| {
+            InfoHash::new(&fixture.info_hash)
+                .map_err(|error| format!("invalid fixture info hash {slug}: {error}"))
+        })
 }
 
 async fn system_test_client_items(

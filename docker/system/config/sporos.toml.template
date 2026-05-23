@@ -34,7 +34,7 @@ include_single_episodes = true
 include_non_video = true
 
 [injection.recheck]
-skip_recheck = false
+skip_recheck = true
 max_remaining_bytes = 0
 min_completion_percent = 95.0
 max_remaining_percent = 5.0
