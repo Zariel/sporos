@@ -1,0 +1,56 @@
+{
+  "announce": "http://example.invalid/announce",
+  "piece_length": 16384,
+  "fixtures": [
+    {
+      "slug": "qbittorrent-source",
+      "label": "qBittorrent source",
+      "source_marker": "sporos-qbittorrent-source",
+      "name": "Sporos qBittorrent Fixture",
+      "torrent_path": "torrents/qbittorrent-source.torrent",
+      "media_root": "media/qbittorrent",
+      "info_hash": "84534918d068666f6ce48b4d54136828df42cfe3",
+      "files": [
+        { "path": "Sporos qBittorrent Fixture.mkv", "size": 4096, "sha1": "531c10249aa3f69be181963233909220c7f8a015" }
+      ]
+    },
+    {
+      "slug": "qbittorrent-candidate",
+      "label": "qBittorrent candidate",
+      "source_marker": "sporos-qbittorrent-candidate",
+      "name": "Sporos qBittorrent Fixture",
+      "torrent_path": "torrents/qbittorrent-candidate.torrent",
+      "media_root": "media/qbittorrent",
+      "info_hash": "73fc73a21a1c486f3287ed25213743ce6237f841",
+      "files": [
+        { "path": "Sporos qBittorrent Fixture.mkv", "size": 4096, "sha1": "531c10249aa3f69be181963233909220c7f8a015" }
+      ]
+    },
+    {
+      "slug": "rtorrent-source",
+      "label": "rTorrent source",
+      "source_marker": "sporos-rtorrent-source",
+      "name": "Sporos rTorrent Fixture",
+      "torrent_path": "torrents/rtorrent-source.torrent",
+      "media_root": "media/rtorrent",
+      "info_hash": "7a1a454d52a66a69ddb4c01b8d8e49555e300fe0",
+      "files": [
+        { "path": "Season 01/Sporos rTorrent Fixture S01E01.mkv", "size": 3072, "sha1": "68381a457c7d6b4e285af1ce3e93239054412225" },
+        { "path": "Extras/sample.txt", "size": 257, "sha1": "cb842d72d9b061c9a1c793e2bdf05590a5973d88" }
+      ]
+    },
+    {
+      "slug": "rtorrent-candidate",
+      "label": "rTorrent candidate",
+      "source_marker": "sporos-rtorrent-candidate",
+      "name": "Sporos rTorrent Fixture",
+      "torrent_path": "torrents/rtorrent-candidate.torrent",
+      "media_root": "media/rtorrent",
+      "info_hash": "65ec0ba73f0ef6c23e3857eac5e7e5a142d63ff4",
+      "files": [
+        { "path": "Season 01/Sporos rTorrent Fixture S01E01.mkv", "size": 3072, "sha1": "68381a457c7d6b4e285af1ce3e93239054412225" },
+        { "path": "Extras/sample.txt", "size": 257, "sha1": "cb842d72d9b061c9a1c793e2bdf05590a5973d88" }
+      ]
+    }
+  ]
+}
