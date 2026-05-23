@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<caps>
+  <limits default="50" max="100"/>
+  <searching>
+    <search available="yes" supportedParams="q"/>
+    <movie-search available="yes" supportedParams="q,imdbid"/>
+    <tv-search available="yes" supportedParams="q,tvdbid,season,ep"/>
+  </searching>
+  <categories>
+    <category id="2000" name="Movies"/>
+    <category id="5000" name="TV"/>
+  </categories>
+</caps>

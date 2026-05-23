@@ -1,0 +1,133 @@
+name: ${SPOROS_SYSTEM_PROJECT:-sporos-system}
+
+services:
+  sporos:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        RUST_VERSION: "1.95.0"
+        RUNTIME_DEBIAN_VERSION: bookworm
+    image: ${SPOROS_SYSTEM_IMAGE:-sporos:system-test}
+    depends_on:
+      system-init:
+        condition: service_completed_successfully
+      qbittorrent:
+        condition: service_started
+      rtorrent:
+        condition: service_started
+      torznab-fixture:
+        condition: service_started
+    command: ["serve", "--config", "/etc/sporos/config.toml"]
+    ports:
+      - "127.0.0.1:${SPOROS_SYSTEM_HTTP_PORT:-2468}:2468"
+    secrets:
+      - source: sporos_api_token
+        target: /var/run/secrets/sporos-api-token
+      - source: qbittorrent_password
+        target: /var/run/secrets/qbittorrent-password
+    volumes:
+      - ./config/sporos.toml.template:/etc/sporos/config.toml:ro
+      - sporos_state:/data/state
+      - torrent_cache:/data/cache/torrents
+      - output:/data/output
+      - downloads:/downloads
+    networks:
+      - system
+    restart: "no"
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:5.2.0
+    depends_on:
+      system-init:
+        condition: service_completed_successfully
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: UTC
+      WEBUI_PORT: "8080"
+    expose:
+      - "8080"
+    volumes:
+      - qbittorrent_config:/config
+      - downloads:/downloads
+    networks:
+      - system
+    restart: "no"
+
+  rtorrent:
+    image: ghcr.io/crazy-max/rtorrent-rutorrent:5.2.10-0.16.7-r1
+    depends_on:
+      system-init:
+        condition: service_completed_successfully
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: UTC
+      XMLRPC_PORT: "8000"
+      RUTORRENT_PORT: "8080"
+      RT_INC_PORT: "50000"
+      RT_DHT_PORT: "6881"
+      RT_LOG_LEVEL: info
+    expose:
+      - "8000"
+    volumes:
+      - rtorrent_data:/data
+      - rtorrent_passwd:/passwd
+      - downloads:/downloads
+    networks:
+      - system
+    restart: "no"
+
+  system-init:
+    image: alpine:3.21.3
+    command:
+      - /bin/sh
+      - -eu
+      - /init/seed.sh
+    volumes:
+      - ./init:/init:ro
+      - ./qbittorrent/qBittorrent.conf:/templates/qBittorrent.conf:ro
+      - ./fixtures/media:/fixtures/media:ro
+      - downloads:/downloads
+      - qbittorrent_config:/qbittorrent-config
+      - rtorrent_data:/rtorrent-data
+      - rtorrent_passwd:/rtorrent-passwd
+    networks:
+      - system
+    restart: "no"
+
+  torznab-fixture:
+    image: nginx:1.27.4-alpine
+    depends_on:
+      system-init:
+        condition: service_completed_successfully
+    expose:
+      - "8080"
+    volumes:
+      - ./torznab/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./torznab/www:/usr/share/nginx/html:ro
+      - ./fixtures/torrents:/usr/share/nginx/html/torrents:ro
+    networks:
+      - system
+    restart: "no"
+
+networks:
+  system:
+    internal: true
+
+volumes:
+  sporos_state:
+  torrent_cache:
+  output:
+  downloads:
+  qbittorrent_config:
+  rtorrent_data:
+  rtorrent_passwd:
+
+secrets:
+  sporos_api_token:
+    file: ./secrets/sporos-api-token.template
+  qbittorrent_password:
+    file: ./secrets/qbittorrent-password.template

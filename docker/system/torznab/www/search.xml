@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Sporos system fixture</title>
+    <item>
+      <title>Sporos qBittorrent Fixture</title>
+      <guid>sporos-qbittorrent-candidate</guid>
+      <link>http://torznab-fixture:8080/torrents/qbittorrent-candidate.torrent</link>
+      <enclosure url="http://torznab-fixture:8080/torrents/qbittorrent-candidate.torrent" length="4096" type="application/x-bittorrent"/>
+      <torznab:attr name="category" value="2000"/>
+      <torznab:attr name="size" value="4096"/>
+    </item>
+    <item>
+      <title>Sporos rTorrent Fixture</title>
+      <guid>sporos-rtorrent-candidate</guid>
+      <link>http://torznab-fixture:8080/torrents/rtorrent-candidate.torrent</link>
+      <enclosure url="http://torznab-fixture:8080/torrents/rtorrent-candidate.torrent" length="3329" type="application/x-bittorrent"/>
+      <torznab:attr name="category" value="5000"/>
+      <torznab:attr name="size" value="3329"/>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,53 @@
+[paths]
+database = "/data/state/sporos.db"
+torrent_cache_dir = "/data/cache/torrents"
+output_dir = "/data/output"
+media_dirs = ["/downloads"]
+
+[server]
+bind = "0.0.0.0:2468"
+api_token_file = "/var/run/secrets/sporos-api-token"
+
+[torrent_clients.qbittorrent]
+kind = "qbittorrent"
+url = "http://qbittorrent:8080"
+username = "admin"
+password_file = "/var/run/secrets/qbittorrent-password"
+default_save_path = "/downloads/qbittorrent"
+default_category = "sporos-system"
+default_tags = ["sporos", "system-test"]
+
+[torrent_clients.rtorrent]
+kind = "rtorrent"
+url = "http://rtorrent:8000/RPC2"
+default_save_path = "/downloads/rtorrent"
+default_label = "sporos-system"
+label_field = "custom1"
+
+[indexers.torznab.fixture]
+url = "http://torznab-fixture:8080/api"
+
+[matching]
+mode = "partial"
+fuzzy_size_threshold = 0.02
+include_single_episodes = true
+include_non_video = true
+
+[injection.recheck]
+skip_recheck = false
+max_remaining_bytes = 0
+min_completion_percent = 95.0
+max_remaining_percent = 5.0
+poll_interval_ms = 250
+max_resume_wait_ms = 30000
+below_threshold_action = "inject_paused"
+
+[scheduling]
+client_inventory_interval = "5m"
+indexer_caps_interval = "5m"
+saved_retry_interval = "5m"
+cleanup_interval = "1h"
+
+[announce]
+worker_concurrency = 1
+claim_batch_size = 1
