@@ -52,6 +52,10 @@ The qBittorrent image uses LinuxServer.io's documented `WEBUI_PORT=8080`
 setting. The rTorrent image uses the CrazyMax XML-RPC-over-nginx port
 documented as `XMLRPC_PORT`, set here to `8000`.
 
+The CI compatibility job can override the pinned client images with
+`SPOROS_SYSTEM_QBITTORRENT_IMAGE` and `SPOROS_SYSTEM_RTORRENT_IMAGE`. The
+defaults above remain the release-blocking pins.
+
 qBittorrent is preseeded with `qbittorrent/qBittorrent.conf`. Because
 qBittorrent management ports are private to the Compose network and not
 published to the host, the config enables Web UI auth bypass for the isolated

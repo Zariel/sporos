@@ -39,7 +39,7 @@ services:
     restart: "no"
 
   qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:5.2.0
+    image: ${SPOROS_SYSTEM_QBITTORRENT_IMAGE:-lscr.io/linuxserver/qbittorrent:5.2.0}
     depends_on:
       system-init:
         condition: service_completed_successfully
@@ -58,7 +58,7 @@ services:
     restart: "no"
 
   rtorrent:
-    image: ghcr.io/crazy-max/rtorrent-rutorrent:5.2.10-0.16.7-r1
+    image: ${SPOROS_SYSTEM_RTORRENT_IMAGE:-ghcr.io/crazy-max/rtorrent-rutorrent:5.2.10-0.16.7-r1}
     depends_on:
       system-init:
         condition: service_completed_successfully

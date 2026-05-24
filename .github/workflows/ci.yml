@@ -7,6 +7,9 @@ on:
       - "**"
     tags:
       - "v*"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
@@ -73,11 +76,80 @@ jobs:
       - name: Check image entrypoint
         run: docker run --rm sporos-ci:test --help
 
+  system-torrent-clients:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Run real-client system test
+        env:
+          DOCKER_BUILDKIT: "1"
+          SPOROS_SYSTEM_RUN_ROOT: ${{ runner.temp }}/sporos-system
+        run: |
+          set -euo pipefail
+          mkdir -p "$SPOROS_SYSTEM_RUN_ROOT"
+          scripts/system-test torrent-clients
+
+      - name: Upload system diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-torrent-client-diagnostics
+          path: ${{ runner.temp }}/sporos-system/*diagnostics*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  system-torrent-clients-compatibility:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs:
+      - test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Run floating-client compatibility test
+        env:
+          DOCKER_BUILDKIT: "1"
+          SPOROS_SYSTEM_RUN_ROOT: ${{ runner.temp }}/sporos-system-compatibility
+          SPOROS_SYSTEM_QBITTORRENT_IMAGE: lscr.io/linuxserver/qbittorrent:latest
+          SPOROS_SYSTEM_RTORRENT_IMAGE: ghcr.io/crazy-max/rtorrent-rutorrent:latest
+        run: |
+          set -euo pipefail
+          mkdir -p "$SPOROS_SYSTEM_RUN_ROOT"
+          scripts/system-test torrent-clients
+
+      - name: Upload compatibility diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-torrent-client-compatibility-diagnostics
+          path: ${{ runner.temp }}/sporos-system-compatibility/*diagnostics*
+          if-no-files-found: ignore
+          retention-days: 7
+
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs:
       - test
       - image
+      - system-torrent-clients
     runs-on: ubuntu-latest
     permissions:
       contents: read
