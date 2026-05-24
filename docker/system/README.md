@@ -13,6 +13,12 @@ For debugging, preserve the run directory and compose stack:
 scripts/system-test torrent-clients --preserve-diagnostics
 ```
 
+On failure the runner writes a bounded, scrubbed diagnostics directory and
+prints its path. The bundle includes service logs, Compose status, authenticated
+Sporos probes, metrics, bounded database snapshots, and direct qBittorrent and
+rTorrent state for the fixture candidate hashes. `--preserve-diagnostics` also
+keeps the run directory and compose stack for manual inspection.
+
 ## Services
 
 - `sporos` builds the production image from the repository `Dockerfile` and

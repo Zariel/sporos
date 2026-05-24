@@ -20,6 +20,9 @@ use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::app::validate_runtime_config;
 use crate::runtime::daemon;
 
+const SYSTEM_TEST_DIAGNOSTIC_LIMIT: i64 = 8;
+const SYSTEM_TEST_TEXT_LIMIT: usize = 160;
+
 #[derive(Debug, Parser)]
 #[command(name = "sporos", about = "Sporos torrent automation service")]
 struct Cli {
@@ -67,6 +70,11 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+    },
+    #[command(hide = true)]
+    SystemTestDiagnostics {
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
     },
 }
 
@@ -139,6 +147,15 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
             let state = runtime.block_on(system_test_client_state(loaded, manifest))?;
             serde_json::to_string(&state).map_err(|error| error.to_string())
         }
+        Command::SystemTestDiagnostics { config } => {
+            let loaded = load_config(&config).map_err(|error| error.to_string())?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let diagnostics = runtime.block_on(system_test_diagnostics(loaded))?;
+            serde_json::to_string(&diagnostics).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -196,6 +213,7 @@ struct SystemTestQbitTorrent {
     category: Option<String>,
     tags: Option<String>,
     amount_left: Option<u64>,
+    files: Vec<SystemTestTorrentFileDiagnostic>,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,6 +224,119 @@ struct SystemTestRtorrentDownload {
     label: Option<String>,
     left_bytes: u64,
     complete: bool,
+    files: Vec<SystemTestTorrentFileDiagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestDiagnostics {
+    snapshot: SystemTestSnapshot,
+    local_items: Vec<SystemTestLocalItemDiagnostic>,
+    local_files: Vec<SystemTestLocalFileDiagnostic>,
+    remote_candidates: Vec<SystemTestRemoteCandidateDiagnostic>,
+    match_decisions: Vec<SystemTestMatchDecisionDiagnostic>,
+    indexers: Vec<SystemTestIndexerDiagnostic>,
+    dependency_health: Vec<SystemTestDependencyHealthDiagnostic>,
+    jobs: Vec<SystemTestJobDiagnostic>,
+    announce_work: Vec<SystemTestAnnounceWorkDiagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestLocalItemDiagnostic {
+    id: i64,
+    source_type: String,
+    source_key: String,
+    title: String,
+    media_type: String,
+    info_hash: Option<String>,
+    save_path: Option<String>,
+    total_size: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestLocalFileDiagnostic {
+    item_id: i64,
+    relative_path: String,
+    file_name: String,
+    size: i64,
+    file_index: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestRemoteCandidateDiagnostic {
+    id: i64,
+    guid: String,
+    title: String,
+    tracker: String,
+    size: Option<i64>,
+    info_hash: Option<String>,
+    torrent_cache_path: Option<String>,
+    last_seen_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestMatchDecisionDiagnostic {
+    local_item_id: i64,
+    candidate_id: i64,
+    decision: String,
+    matched_size: Option<i64>,
+    matched_ratio: Option<f64>,
+    reason_code: String,
+    assessed_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestIndexerDiagnostic {
+    id: i64,
+    name: String,
+    source_kind: String,
+    enabled: bool,
+    state: String,
+    retry_after: Option<i64>,
+    last_caps_refresh_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestDependencyHealthDiagnostic {
+    dependency_type: String,
+    dependency_name: String,
+    state: String,
+    reason: Option<String>,
+    retry_after: Option<i64>,
+    failure_count: i64,
+    checked_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestJobDiagnostic {
+    name: String,
+    state: String,
+    last_started_at: Option<i64>,
+    last_finished_at: Option<i64>,
+    next_run_at: Option<i64>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestAnnounceWorkDiagnostic {
+    id: String,
+    tracker: String,
+    title: String,
+    info_hash: Option<String>,
+    status: String,
+    reason: String,
+    attempt_count: i64,
+    next_attempt_at: i64,
+    last_error_class: Option<String>,
+    last_decision: Option<String>,
+    last_action_outcome: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemTestTorrentFileDiagnostic {
+    relative_path: String,
+    file_name: String,
+    size: u64,
+    file_index: u32,
 }
 
 async fn seed_system_test_candidates(
@@ -345,7 +476,8 @@ async fn system_test_snapshot(
         .count();
     let saved_torrents =
         i64::try_from(saved_torrents).map_err(|error| format!("count saved torrents: {error}"))?;
-    let client_items = system_test_client_items(repository.pool()).await?;
+    let client_items =
+        system_test_client_items(repository.pool(), SYSTEM_TEST_DIAGNOSTIC_LIMIT).await?;
 
     Ok(SystemTestSnapshot {
         local_items,
@@ -486,11 +618,16 @@ async fn system_test_client_state(
                         .map(|password| password.expose_secret().to_owned()),
                     std::time::Duration::from_secs(30),
                 );
-                qbittorrent = client
+                let torrent = client
                     .torrent_info(&qbit_hash)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .map(|torrent| SystemTestQbitTorrent {
+                    .map_err(|error| error.to_string())?;
+                if let Some(torrent) = torrent {
+                    let files = client
+                        .fetch_files(&qbit_hash)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    qbittorrent = Some(SystemTestQbitTorrent {
                         hash: torrent.hash,
                         name: torrent.name,
                         save_path: torrent
@@ -499,7 +636,9 @@ async fn system_test_client_state(
                         category: torrent.category,
                         tags: torrent.tags,
                         amount_left: torrent.amount_left,
+                        files: diagnostic_torrent_files(files),
                     });
+                }
             }
             ConfigTorrentClientKind::Rtorrent => {
                 let client = RtorrentClient::new(
@@ -507,18 +646,25 @@ async fn system_test_client_state(
                     &client_config.url,
                     std::time::Duration::from_secs(30),
                 );
-                rtorrent = client
+                let download = client
                     .download_info(&rtorrent_hash)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .map(|download| SystemTestRtorrentDownload {
+                    .map_err(|error| error.to_string())?;
+                if let Some(download) = download {
+                    let files = client
+                        .fetch_files(&rtorrent_hash)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    rtorrent = Some(SystemTestRtorrentDownload {
                         hash: download.info_hash.as_str().to_owned(),
                         name: download.name.as_str().to_owned(),
                         directory: download.directory.to_string_lossy().into_owned(),
                         label: download.label,
                         left_bytes: download.left_bytes.get(),
                         complete: download.complete,
+                        files: diagnostic_torrent_files(files),
                     });
+                }
             }
         }
     }
@@ -526,6 +672,244 @@ async fn system_test_client_state(
     Ok(SystemTestClientState {
         qbittorrent,
         rtorrent,
+    })
+}
+
+fn diagnostic_torrent_files(
+    files: Vec<crate::domain::TorrentFile>,
+) -> Vec<SystemTestTorrentFileDiagnostic> {
+    files
+        .into_iter()
+        .take(usize::try_from(SYSTEM_TEST_DIAGNOSTIC_LIMIT).unwrap_or(8))
+        .map(|file| SystemTestTorrentFileDiagnostic {
+            relative_path: truncated(file.relative_path.to_string_lossy().into_owned()),
+            file_name: truncated(file.file_name.as_str().to_owned()),
+            size: file.size.get(),
+            file_index: file.file_index.get(),
+        })
+        .collect()
+}
+
+async fn system_test_diagnostics(
+    config: crate::config::SporosConfig,
+) -> Result<SystemTestDiagnostics, String> {
+    let snapshot = system_test_snapshot(config.clone()).await?;
+    let repository = Repository::connect(&config.paths.database)
+        .await
+        .map_err(|error| error.to_string())?;
+    let pool = repository.pool();
+
+    let local_items = sqlx::query(
+        r#"
+        SELECT id, source_type, source_key, title, media_type, info_hash, save_path, total_size
+        FROM local_items
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| SystemTestLocalItemDiagnostic {
+        id: sqlx::Row::get(&row, "id"),
+        source_type: truncated(sqlx::Row::get(&row, "source_type")),
+        source_key: truncated(sqlx::Row::get(&row, "source_key")),
+        title: truncated(sqlx::Row::get(&row, "title")),
+        media_type: truncated(sqlx::Row::get(&row, "media_type")),
+        info_hash: sqlx::Row::get(&row, "info_hash"),
+        save_path: truncated_option(sqlx::Row::get(&row, "save_path")),
+        total_size: sqlx::Row::get(&row, "total_size"),
+    })
+    .collect();
+
+    let local_files = sqlx::query(
+        r#"
+        SELECT local_files.item_id, local_files.relative_path, local_files.file_name,
+               local_files.size, local_files.file_index
+        FROM local_files
+        JOIN local_items ON local_items.id = local_files.item_id
+        ORDER BY local_items.updated_at DESC, local_files.item_id DESC, local_files.file_index
+        LIMIT ?
+        "#,
+    )
+    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| SystemTestLocalFileDiagnostic {
+        item_id: sqlx::Row::get(&row, "item_id"),
+        relative_path: truncated(sqlx::Row::get(&row, "relative_path")),
+        file_name: truncated(sqlx::Row::get(&row, "file_name")),
+        size: sqlx::Row::get(&row, "size"),
+        file_index: sqlx::Row::get(&row, "file_index"),
+    })
+    .collect();
+
+    let remote_candidates = sqlx::query(
+        r#"
+        SELECT id, guid, title, tracker, size, info_hash, torrent_cache_path, last_seen_at
+        FROM remote_candidates
+        ORDER BY last_seen_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| SystemTestRemoteCandidateDiagnostic {
+        id: sqlx::Row::get(&row, "id"),
+        guid: truncated(sqlx::Row::get(&row, "guid")),
+        title: truncated(sqlx::Row::get(&row, "title")),
+        tracker: truncated(sqlx::Row::get(&row, "tracker")),
+        size: sqlx::Row::get(&row, "size"),
+        info_hash: sqlx::Row::get(&row, "info_hash"),
+        torrent_cache_path: truncated_option(sqlx::Row::get(&row, "torrent_cache_path")),
+        last_seen_at: sqlx::Row::get(&row, "last_seen_at"),
+    })
+    .collect();
+
+    let match_decisions = sqlx::query(
+        r#"
+        SELECT local_item_id, candidate_id, decision, matched_size, matched_ratio, reason_code, assessed_at
+        FROM match_decisions
+        ORDER BY assessed_at DESC, candidate_id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| SystemTestMatchDecisionDiagnostic {
+        local_item_id: sqlx::Row::get(&row, "local_item_id"),
+        candidate_id: sqlx::Row::get(&row, "candidate_id"),
+        decision: truncated(sqlx::Row::get(&row, "decision")),
+        matched_size: sqlx::Row::get(&row, "matched_size"),
+        matched_ratio: sqlx::Row::get(&row, "matched_ratio"),
+        reason_code: truncated(sqlx::Row::get(&row, "reason_code")),
+        assessed_at: sqlx::Row::get(&row, "assessed_at"),
+    })
+    .collect();
+
+    let indexers = sqlx::query(
+        r#"
+        SELECT id, name, source_kind, enabled, state, retry_after, last_caps_refresh_at
+        FROM indexers
+        ORDER BY name
+        LIMIT ?
+        "#,
+    )
+    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| {
+        let enabled: i64 = sqlx::Row::get(&row, "enabled");
+        SystemTestIndexerDiagnostic {
+            id: sqlx::Row::get(&row, "id"),
+            name: truncated(sqlx::Row::get(&row, "name")),
+            source_kind: truncated(sqlx::Row::get(&row, "source_kind")),
+            enabled: enabled != 0,
+            state: truncated(sqlx::Row::get(&row, "state")),
+            retry_after: sqlx::Row::get(&row, "retry_after"),
+            last_caps_refresh_at: sqlx::Row::get(&row, "last_caps_refresh_at"),
+        }
+    })
+    .collect();
+
+    let dependency_health = sqlx::query(
+        r#"
+        SELECT dependency_type, dependency_name, state, reason, retry_after, failure_count, checked_at
+        FROM dependency_health
+        ORDER BY checked_at DESC, dependency_type, dependency_name
+        LIMIT ?
+        "#,
+    )
+    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| SystemTestDependencyHealthDiagnostic {
+        dependency_type: truncated(sqlx::Row::get(&row, "dependency_type")),
+        dependency_name: truncated(sqlx::Row::get(&row, "dependency_name")),
+        state: truncated(sqlx::Row::get(&row, "state")),
+        reason: truncated_option(sqlx::Row::get(&row, "reason")),
+        retry_after: sqlx::Row::get(&row, "retry_after"),
+        failure_count: sqlx::Row::get(&row, "failure_count"),
+        checked_at: sqlx::Row::get(&row, "checked_at"),
+    })
+    .collect();
+
+    let jobs = sqlx::query(
+        r#"
+        SELECT name, state, last_started_at, last_finished_at, next_run_at, last_error
+        FROM jobs
+        ORDER BY name
+        LIMIT ?
+        "#,
+    )
+    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| SystemTestJobDiagnostic {
+        name: truncated(sqlx::Row::get(&row, "name")),
+        state: truncated(sqlx::Row::get(&row, "state")),
+        last_started_at: sqlx::Row::get(&row, "last_started_at"),
+        last_finished_at: sqlx::Row::get(&row, "last_finished_at"),
+        next_run_at: sqlx::Row::get(&row, "next_run_at"),
+        last_error: truncated_option(sqlx::Row::get(&row, "last_error")),
+    })
+    .collect();
+
+    let announce_work = sqlx::query(
+        r#"
+        SELECT id, tracker, title, info_hash, status, reason, attempt_count, next_attempt_at,
+               last_error_class, last_decision, last_action_outcome
+        FROM announce_work
+        ORDER BY updated_at DESC, received_at DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| SystemTestAnnounceWorkDiagnostic {
+        id: truncated(sqlx::Row::get(&row, "id")),
+        tracker: truncated(sqlx::Row::get(&row, "tracker")),
+        title: truncated(sqlx::Row::get(&row, "title")),
+        info_hash: sqlx::Row::get(&row, "info_hash"),
+        status: truncated(sqlx::Row::get(&row, "status")),
+        reason: truncated(sqlx::Row::get(&row, "reason")),
+        attempt_count: sqlx::Row::get(&row, "attempt_count"),
+        next_attempt_at: sqlx::Row::get(&row, "next_attempt_at"),
+        last_error_class: truncated_option(sqlx::Row::get(&row, "last_error_class")),
+        last_decision: truncated_option(sqlx::Row::get(&row, "last_decision")),
+        last_action_outcome: truncated_option(sqlx::Row::get(&row, "last_action_outcome")),
+    })
+    .collect();
+
+    Ok(SystemTestDiagnostics {
+        snapshot,
+        local_items,
+        local_files,
+        remote_candidates,
+        match_decisions,
+        indexers,
+        dependency_health,
+        jobs,
+        announce_work,
     })
 }
 
@@ -543,6 +927,7 @@ fn manifest_info_hash(manifest: &SystemFixtureManifest, slug: &str) -> Result<In
 
 async fn system_test_client_items(
     pool: &sqlx::SqlitePool,
+    limit: i64,
 ) -> Result<Vec<SystemTestClientItem>, String> {
     let rows = sqlx::query(
         r#"
@@ -557,8 +942,10 @@ async fn system_test_client_items(
         WHERE local_items.source_type = 'client'
         GROUP BY local_items.id
         ORDER BY local_items.source_key
+        LIMIT ?
         "#,
     )
+    .bind(limit)
     .fetch_all(pool)
     .await
     .map_err(|error| error.to_string())?;
@@ -566,10 +953,10 @@ async fn system_test_client_items(
     Ok(rows
         .into_iter()
         .map(|row| SystemTestClientItem {
-            title: sqlx::Row::get(&row, "title"),
-            source_key: sqlx::Row::get(&row, "source_key"),
+            title: truncated(sqlx::Row::get(&row, "title")),
+            source_key: truncated(sqlx::Row::get(&row, "source_key")),
             info_hash: sqlx::Row::get(&row, "info_hash"),
-            save_path: sqlx::Row::get(&row, "save_path"),
+            save_path: truncated_option(sqlx::Row::get(&row, "save_path")),
             file_count: sqlx::Row::get(&row, "file_count"),
         })
         .collect())
@@ -580,6 +967,17 @@ async fn count_rows(pool: &sqlx::SqlitePool, query: &str) -> Result<i64, String>
         .fetch_one(pool)
         .await
         .map_err(|error| error.to_string())
+}
+
+fn truncated(value: String) -> String {
+    if value.len() <= SYSTEM_TEST_TEXT_LIMIT {
+        return value;
+    }
+    value.chars().take(SYSTEM_TEST_TEXT_LIMIT).collect()
+}
+
+fn truncated_option(value: Option<String>) -> Option<String> {
+    value.map(truncated)
 }
 
 #[cfg(test)]
@@ -850,17 +1248,84 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(CACHED_TORRENT_SUFFIX)
         }));
+        runtime.block_on(async {
+            let repository = Repository::connect(&loaded.paths.database).await.unwrap();
+            for index in 0..12 {
+                let title = format!("{}-{index}", "x".repeat(256));
+                let source_key = format!("client:{index}");
+                sqlx::query(
+                    r#"
+                    INSERT INTO local_items (
+                        source_type, source_key, title, display_name, media_type, info_hash,
+                        path, save_path, total_size, mtime_ms, metadata_json, created_at, updated_at
+                    )
+                    VALUES ('client', ?, ?, ?, 'movie', NULL, NULL, ?, 100, NULL, '{}', 100, ?)
+                    "#,
+                )
+                .bind(&source_key)
+                .bind(&title)
+                .bind(&title)
+                .bind(format!("/downloads/{title}"))
+                .bind(100 + i64::from(index))
+                .execute(repository.pool())
+                .await
+                .unwrap();
+                let item_id: i64 = sqlx::query_scalar(
+                    "SELECT id FROM local_items WHERE source_type = 'client' AND source_key = ?",
+                )
+                .bind(&source_key)
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+                sqlx::query(
+                    r#"
+                    INSERT INTO local_files (item_id, relative_path, file_name, size, mtime_ms, file_index)
+                    VALUES (?, ?, ?, 100, NULL, 0)
+                    "#,
+                )
+                .bind(item_id)
+                .bind(format!("{}-{index}.mkv", "f".repeat(256)))
+                .bind(format!("{}-{index}.mkv", "f".repeat(256)))
+                .execute(repository.pool())
+                .await
+                .unwrap();
+            }
+        });
         let snapshot = run([
             OsString::from("sporos"),
             OsString::from("system-test-snapshot"),
             OsString::from("--config"),
-            config_path.into_os_string(),
+            config_path.clone().into_os_string(),
         ])
         .unwrap();
         let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
         assert_eq!(2, snapshot["remote_candidates"]);
         assert_eq!(2, snapshot["cached_candidates"]);
         assert_eq!(1, snapshot["enabled_indexers"]);
+
+        let diagnostics = run([
+            OsString::from("sporos"),
+            OsString::from("system-test-diagnostics"),
+            OsString::from("--config"),
+            config_path.into_os_string(),
+        ])
+        .unwrap();
+        let diagnostics: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
+        assert_eq!(2, diagnostics["snapshot"]["remote_candidates"]);
+        assert_eq!(
+            2,
+            diagnostics["remote_candidates"].as_array().unwrap().len()
+        );
+        assert_eq!(1, diagnostics["indexers"].as_array().unwrap().len());
+        assert_eq!(8, diagnostics["local_items"].as_array().unwrap().len());
+        assert_eq!(8, diagnostics["local_files"].as_array().unwrap().len());
+        assert!(
+            diagnostics["local_items"][0]["title"]
+                .as_str()
+                .unwrap()
+                .len()
+                <= SYSTEM_TEST_TEXT_LIMIT
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

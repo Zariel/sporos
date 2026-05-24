@@ -69,6 +69,10 @@ diagnostics_archive=
 override_file="$run_dir/compose.override.yml"
 env_file="$run_dir/system-test.env"
 http_port="${SPOROS_SYSTEM_HTTP_PORT:-0}"
+diagnostic_limit_bytes="${SPOROS_SYSTEM_DIAGNOSTIC_LIMIT_BYTES:-65536}"
+diagnostic_timeout_seconds="${SPOROS_SYSTEM_DIAGNOSTIC_TIMEOUT_SECONDS:-20}"
+sporos_api_token=
+qbittorrent_password=
 
 compose_started=0
 
@@ -83,23 +87,112 @@ compose() {
 }
 
 scrub() {
-  sed \
-    -e "s/$sporos_api_token/[REDACTED_SPOROS_API_TOKEN]/g" \
-    -e "s/$qbittorrent_password/[REDACTED_QBITTORRENT_PASSWORD]/g"
+  if command -v perl >/dev/null 2>&1; then
+    SPOROS_SCRUB_API_TOKEN="${sporos_api_token:-}" \
+    SPOROS_SCRUB_QBIT_PASSWORD="${qbittorrent_password:-}" \
+    perl -pe '
+      BEGIN {
+        $api = quotemeta($ENV{"SPOROS_SCRUB_API_TOKEN"} // "");
+        $qbit = quotemeta($ENV{"SPOROS_SCRUB_QBIT_PASSWORD"} // "");
+      }
+      s/$api/[REDACTED_SPOROS_API_TOKEN]/g if length $api;
+      s/$qbit/[REDACTED_QBITTORRENT_PASSWORD]/g if length $qbit;
+      s/(Authorization\s*:\s*Bearer\s+)[^\s"<>]+/${1}[REDACTED]/ig;
+      s/(Set-Cookie\s*:\s*)[^\r\n]+/${1}[REDACTED]/ig;
+      s/((?:passkey|api[_-]?key|authkey|rsskey|torrent_pass|token|cookie|password)\s*[=:]\s*)[^" ,;&<>\r\n]+/${1}[REDACTED]/ig;
+      s#https?://[^\s"<>]*[?&](?:passkey|api[_-]?key|authkey|rsskey|torrent_pass|token|cookie|password)=[^\s"<>]*#[REDACTED_SECRET_URL]#ig;
+    '
+  else
+    if [ "${sporos_api_token:-}" != "" ] && [ "${qbittorrent_password:-}" != "" ]; then
+      sed \
+        -e "s/$sporos_api_token/[REDACTED_SPOROS_API_TOKEN]/g" \
+        -e "s/$qbittorrent_password/[REDACTED_QBITTORRENT_PASSWORD]/g"
+    elif [ "${sporos_api_token:-}" != "" ]; then
+      sed -e "s/$sporos_api_token/[REDACTED_SPOROS_API_TOKEN]/g"
+    elif [ "${qbittorrent_password:-}" != "" ]; then
+      sed -e "s/$qbittorrent_password/[REDACTED_QBITTORRENT_PASSWORD]/g"
+    else
+      cat
+    fi
+  fi
+}
+
+write_bounded() {
+  destination="$1"
+  scrub | tail -c "$diagnostic_limit_bytes" > "$destination" || true
+}
+
+run_with_timeout() {
+  timeout_seconds="$1"
+  shift
+  output_file=$(mktemp "$diagnostics_dir/command.XXXXXX") || return 1
+  status=0
+  "$@" > "$output_file" 2>&1 &
+  command_pid=$!
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while kill -0 "$command_pid" >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      kill "$command_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -9 "$command_pid" >/dev/null 2>&1 || true
+      status=124
+      break
+    fi
+    sleep 1
+  done
+  if [ "$status" -eq 0 ]; then
+    wait "$command_pid" || status=$?
+  else
+    wait "$command_pid" >/dev/null 2>&1 || true
+    printf '\ncommand timed out after %ss\n' "$timeout_seconds" >> "$output_file"
+  fi
+  cat "$output_file"
+  rm -f "$output_file"
+  return "$status"
+}
+
+collect_command() {
+  destination="$1"
+  shift
+  run_with_timeout "$diagnostic_timeout_seconds" "$@" | write_bounded "$destination"
+}
+
+collect_probe() {
+  name="$1"
+  path="$2"
+  if [ "${sporos_api_token:-}" = "" ] || [ "$http_port" = "0" ]; then
+    return 0
+  fi
+  collect_command "$diagnostics_dir/$name" \
+    curl -fsS --max-time "$diagnostic_timeout_seconds" \
+    -H "Authorization: Bearer $sporos_api_token" \
+    "http://127.0.0.1:$http_port$path"
+}
+
+collect_sporos_json() {
+  name="$1"
+  shift
+  collect_command "$diagnostics_dir/$name" \
+    compose exec -T sporos timeout "${diagnostic_timeout_seconds}s" sporos "$@"
 }
 
 collect_diagnostics() {
   mkdir -p "$diagnostics_dir"
   if [ "$compose_started" -eq 1 ]; then
-    compose ps > "$diagnostics_dir/compose-ps.txt" 2>&1 || true
-    compose logs --no-color > "$diagnostics_dir/compose-logs.raw.txt" 2>&1 || true
-    scrub < "$diagnostics_dir/compose-logs.raw.txt" > "$diagnostics_dir/compose-logs.txt" || true
-    rm -f "$diagnostics_dir/compose-logs.raw.txt"
+    collect_command "$diagnostics_dir/compose-ps.txt" compose ps
+    collect_command "$diagnostics_dir/compose-logs.txt" compose logs --no-color --tail 300
+    collect_sporos_json "database.json" \
+      system-test-diagnostics \
+      --config /etc/sporos/config.toml
+    collect_sporos_json "client-state.json" \
+      system-test-client-state \
+      --config /etc/sporos/config.toml \
+      --manifest /system-fixtures/manifest.json
   fi
-  curl -fsS "http://127.0.0.1:$http_port/livez" > "$diagnostics_dir/livez.json" 2>&1 || true
-  curl -fsS "http://127.0.0.1:$http_port/readyz" > "$diagnostics_dir/readyz.json" 2>&1 || true
-  curl -fsS "http://127.0.0.1:$http_port/v1/status" > "$diagnostics_dir/status.json" 2>&1 || true
-  curl -fsS "http://127.0.0.1:$http_port/metrics" > "$diagnostics_dir/metrics.txt" 2>&1 || true
+  collect_probe "livez.json" "/livez"
+  collect_probe "readyz.json" "/readyz"
+  collect_probe "status.json" "/v1/status"
+  collect_probe "metrics.txt" "/metrics"
   diagnostics_archive=$(mktemp -d "$run_root/$project_name-diagnostics.XXXXXX")
   cp -R "$diagnostics_dir/." "$diagnostics_archive/" 2>/dev/null || true
   echo "diagnostics: $diagnostics_archive" >&2
@@ -116,7 +209,9 @@ cleanup() {
     exit "$status"
   fi
   if [ "$compose_started" -eq 1 ]; then
-    compose down -v --remove-orphans >/dev/null 2>&1 || true
+    mkdir -p "$diagnostics_dir"
+    run_with_timeout "$diagnostic_timeout_seconds" \
+      compose down -v --remove-orphans >/dev/null 2>&1 || true
   fi
   rm -rf "$run_dir"
   exit "$status"
