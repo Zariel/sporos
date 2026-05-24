@@ -693,41 +693,64 @@ impl InjectionWorker {
             if should_stop() {
                 InjectionMutationResult::SavedForShutdown
             } else {
-                match client_call_until_shutdown(shutdown, || {
-                    target.has_torrent(request.metafile.info_hash())
-                })
-                .await
+                match self
+                    .find_existing_client(
+                        request.metafile.info_hash(),
+                        target.descriptor(),
+                        request.assessed_at_ms,
+                        shutdown,
+                    )
+                    .await
                 {
-                    ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
-                    ClientCall::Completed(Ok(true)) => {
-                        match validate_prepared_links_for_inject(&prepared_links).await {
-                            Ok(()) => InjectionMutationResult::AlreadyExists,
-                            Err(error) => InjectionMutationResult::PreparedLinksInvalid(error),
-                        }
+                    Ok(ExistingClientLookup::Found(existing_client)) => {
+                        InjectionMutationResult::AlreadyExistsOnOtherClient(existing_client)
                     }
-                    ClientCall::Completed(Ok(false)) => {
-                        match validate_prepared_links_for_inject(&prepared_links).await {
-                            Ok(()) => match client_call_until_shutdown(shutdown, || {
-                                target.inject(ClientInjectionRequest {
-                                    info_hash: request.metafile.info_hash(),
-                                    torrent_bytes: &request.torrent_bytes,
-                                    save_path: save_path.as_deref(),
-                                    pause_for_recheck,
-                                })
-                            })
-                            .await
-                            {
-                                ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
-                                ClientCall::Completed(result) => {
-                                    InjectionMutationResult::Injected(result)
+                    Ok(ExistingClientLookup::Shutdown) => InjectionMutationResult::SavedForShutdown,
+                    Ok(ExistingClientLookup::NotFound) => {
+                        match client_call_until_shutdown(shutdown, || {
+                            target.has_torrent(request.metafile.info_hash())
+                        })
+                        .await
+                        {
+                            ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
+                            ClientCall::Completed(Ok(true)) => {
+                                match validate_prepared_links_for_inject(&prepared_links).await {
+                                    Ok(()) => InjectionMutationResult::AlreadyExistsOnTarget,
+                                    Err(error) => {
+                                        InjectionMutationResult::PreparedLinksInvalid(error)
+                                    }
                                 }
-                            },
-                            Err(error) => InjectionMutationResult::PreparedLinksInvalid(error),
+                            }
+                            ClientCall::Completed(Ok(false)) => {
+                                match validate_prepared_links_for_inject(&prepared_links).await {
+                                    Ok(()) => match client_call_until_shutdown(shutdown, || {
+                                        target.inject(ClientInjectionRequest {
+                                            info_hash: request.metafile.info_hash(),
+                                            torrent_bytes: &request.torrent_bytes,
+                                            save_path: save_path.as_deref(),
+                                            pause_for_recheck,
+                                        })
+                                    })
+                                    .await
+                                    {
+                                        ClientCall::Shutdown => {
+                                            InjectionMutationResult::SavedForShutdown
+                                        }
+                                        ClientCall::Completed(result) => {
+                                            InjectionMutationResult::Injected(result)
+                                        }
+                                    },
+                                    Err(error) => {
+                                        InjectionMutationResult::PreparedLinksInvalid(error)
+                                    }
+                                }
+                            }
+                            ClientCall::Completed(Err(error)) => {
+                                InjectionMutationResult::TargetPrecheckFailed(error)
+                            }
                         }
                     }
-                    ClientCall::Completed(Err(error)) => {
-                        InjectionMutationResult::PrecheckFailed(error)
-                    }
+                    Err(error) => InjectionMutationResult::ExistingLookupFailed(error),
                 }
             }
         };
@@ -745,7 +768,7 @@ impl InjectionWorker {
                     prepared_link_cleanup_incomplete,
                 })
             }
-            InjectionMutationResult::AlreadyExists => {
+            InjectionMutationResult::AlreadyExistsOnTarget => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
                 let mut saved_for_retry = false;
@@ -773,6 +796,24 @@ impl InjectionWorker {
                     saved_for_retry,
                     linked_files,
                     prepared_link_cleanup_incomplete: false,
+                })
+            }
+            InjectionMutationResult::AlreadyExistsOnOtherClient(existing_client) => {
+                let prepared_link_cleanup_incomplete =
+                    cleanup_prepared_links(&created_links, &created_roots);
+                self.record_client_health(
+                    existing_client.descriptor(),
+                    true,
+                    None,
+                    request.assessed_at_ms,
+                )
+                .await?;
+                Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::AlreadyExists,
+                    target_client: Some(dependency_name(existing_client.descriptor())?),
+                    saved_for_retry: false,
+                    linked_files: 0,
+                    prepared_link_cleanup_incomplete,
                 })
             }
             InjectionMutationResult::Injected(Ok(())) => {
@@ -841,7 +882,24 @@ impl InjectionWorker {
                     Err(error.into())
                 }
             }
-            InjectionMutationResult::PrecheckFailed(error) => {
+            InjectionMutationResult::ExistingLookupFailed(error) => {
+                let prepared_link_cleanup_incomplete =
+                    cleanup_prepared_links(&created_links, &created_roots);
+                if prepared_link_cleanup_incomplete {
+                    match error {
+                        InjectionWorkerError::Client(source) => {
+                            Err(InjectionWorkerError::ClientWithPreparedLinkCleanup {
+                                source,
+                                prepared_link_cleanup_incomplete,
+                            })
+                        }
+                        error => Err(error),
+                    }
+                } else {
+                    Err(error)
+                }
+            }
+            InjectionMutationResult::TargetPrecheckFailed(error) => {
                 let prepared_link_cleanup_incomplete =
                     cleanup_prepared_links(&created_links, &created_roots);
                 self.record_client_health(
@@ -1961,10 +2019,12 @@ enum LinkPreparation {
 
 enum InjectionMutationResult {
     SavedForShutdown,
-    AlreadyExists,
+    AlreadyExistsOnTarget,
+    AlreadyExistsOnOtherClient(Arc<dyn InjectionClient>),
     Injected(Result<(), TorrentClientError>),
     PreparedLinksInvalid(LinkActionError),
-    PrecheckFailed(TorrentClientError),
+    ExistingLookupFailed(InjectionWorkerError),
+    TargetPrecheckFailed(TorrentClientError),
 }
 
 pub fn injection_queue(
@@ -2187,19 +2247,20 @@ mod tests {
     use std::fs;
     use std::future::pending;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::clients::TorrentClientCapabilities;
     use crate::domain::{
         ByteSize, CandidateGuid, ClientHost, DisplayName, DownloadUrl, FileIndex, ItemTitle,
-        LocalItemSource, MatchRatio, MediaType, TrackerName,
+        LocalItemSource, MatchRatio, MediaType, SourceKey, TrackerName,
     };
     use crate::inventory::{InventoryScanOptions, ScannedLocalItem};
     use crate::inventory_refresh::{ClientInventoryItem, ClientInventoryMessage};
     use crate::persistence::repository::Repository;
     use crate::runtime::shutdown::ShutdownController;
+    use tokio::sync::Barrier;
 
     #[tokio::test]
     async fn worker_checks_other_clients_before_mutating_target() {
@@ -2226,6 +2287,60 @@ mod tests {
         assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
         assert_eq!(1, existing.has_calls.load(Ordering::SeqCst));
         assert_eq!("healthy", health[0].state);
+    }
+
+    #[tokio::test]
+    async fn worker_rechecks_other_clients_while_mutation_is_locked() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-cross-client-race");
+        let first = Arc::new(
+            FakeClient::new(descriptor("first", "first"))
+                .with_existing_after_inject()
+                .with_first_has_barrier(Arc::new(Barrier::new(2))),
+        );
+        let second = Arc::new(
+            FakeClient::new(descriptor("second", "second"))
+                .with_existing_after_inject()
+                .with_first_has_barrier(first.first_has_barrier.as_ref().unwrap().clone()),
+        );
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let worker = Arc::new(InjectionWorker::new(
+            repository,
+            vec![
+                first.clone() as Arc<dyn InjectionClient>,
+                second.clone() as Arc<dyn InjectionClient>,
+            ],
+        ));
+        let mut first_request = request(local.clone(), candidate.clone(), candidate_id, &root);
+        first_request.local_item.source = LocalItemSource::Client {
+            client_host: first.descriptor.host.clone(),
+            source_key: SourceKey::new("first-source").unwrap(),
+        };
+        first_request.recheck = skip_recheck_config();
+        let mut second_request = request(local, candidate, candidate_id, &root);
+        second_request.local_item.source = LocalItemSource::Client {
+            client_host: second.descriptor.host.clone(),
+            source_key: SourceKey::new("second-source").unwrap(),
+        };
+        second_request.recheck = skip_recheck_config();
+
+        let first_worker = worker.clone();
+        let first_handle = tokio::spawn(async move { first_worker.process(first_request).await });
+        let second_worker = worker.clone();
+        let second_handle =
+            tokio::spawn(async move { second_worker.process(second_request).await });
+        let (first_result, second_result) = tokio::join!(first_handle, second_handle);
+        let outcomes = [
+            first_result.unwrap().unwrap().outcome,
+            second_result.unwrap().unwrap().outcome,
+        ];
+
+        assert_eq!(
+            1,
+            first.inject_calls.load(Ordering::SeqCst) + second.inject_calls.load(Ordering::SeqCst)
+        );
+        assert!(outcomes.contains(&InjectionOutcome::Injected));
+        assert!(outcomes.contains(&InjectionOutcome::AlreadyExists));
     }
 
     #[tokio::test]
@@ -2615,6 +2730,42 @@ mod tests {
         assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
         assert!(!root.join("links/tracker.example/movie.mkv").exists());
         assert_eq!(1, saved_torrent_count(&root.join("output")));
+        assert_eq!("degraded", health[0].state);
+    }
+
+    #[tokio::test]
+    async fn worker_cleans_links_when_locked_other_client_recheck_fails() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-other-recheck-failure");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let other = Arc::new(
+            FakeClient::new(descriptor("other", "other"))
+                .with_has_errors(1)
+                .with_has_successes_before_error(1),
+        );
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("links")];
+        fs::create_dir_all(&request.link_dirs[0]).unwrap();
+        let worker = InjectionWorker::new(
+            repository.clone(),
+            vec![
+                target.clone() as Arc<dyn InjectionClient>,
+                other.clone() as Arc<dyn InjectionClient>,
+            ],
+        );
+
+        let error = worker.process(request).await.unwrap_err();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert!(matches!(error, InjectionWorkerError::Client(_)));
+        assert_eq!(2, other.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert!(!root.join("links/tracker.example/movie.mkv").exists());
+        assert_eq!(1, health.len());
+        assert_eq!("other", health[0].dependency_name.as_str());
         assert_eq!("degraded", health[0].state);
     }
 
@@ -4728,11 +4879,14 @@ mod tests {
 
     struct FakeClient {
         descriptor: TorrentClientDescriptor,
-        existing: bool,
+        existing: AtomicBool,
         inject_error: bool,
         has_pending: bool,
         inject_pending: bool,
         resume_pending: bool,
+        mark_existing_on_inject: bool,
+        first_has_barrier: Option<Arc<Barrier>>,
+        has_successes_before_error: AtomicUsize,
         has_errors_remaining: AtomicUsize,
         recheck_errors_remaining: AtomicUsize,
         checking_true_remaining: AtomicUsize,
@@ -4989,11 +5143,14 @@ mod tests {
         fn new(descriptor: TorrentClientDescriptor) -> Self {
             Self {
                 descriptor,
-                existing: false,
+                existing: AtomicBool::new(false),
                 inject_error: false,
                 has_pending: false,
                 inject_pending: false,
                 resume_pending: false,
+                mark_existing_on_inject: false,
+                first_has_barrier: None,
+                has_successes_before_error: AtomicUsize::new(0),
                 has_errors_remaining: AtomicUsize::new(0),
                 recheck_errors_remaining: AtomicUsize::new(0),
                 checking_true_remaining: AtomicUsize::new(0),
@@ -5012,8 +5169,18 @@ mod tests {
             }
         }
 
-        const fn with_existing(mut self, existing: bool) -> Self {
-            self.existing = existing;
+        fn with_existing(self, existing: bool) -> Self {
+            self.existing.store(existing, Ordering::SeqCst);
+            self
+        }
+
+        fn with_first_has_barrier(mut self, barrier: Arc<Barrier>) -> Self {
+            self.first_has_barrier = Some(barrier);
+            self
+        }
+
+        const fn with_existing_after_inject(mut self) -> Self {
+            self.mark_existing_on_inject = true;
             self
         }
 
@@ -5039,6 +5206,12 @@ mod tests {
 
         fn with_has_errors(self, count: usize) -> Self {
             self.has_errors_remaining.store(count, Ordering::SeqCst);
+            self
+        }
+
+        fn with_has_successes_before_error(self, count: usize) -> Self {
+            self.has_successes_before_error
+                .store(count, Ordering::SeqCst);
             self
         }
 
@@ -5083,7 +5256,10 @@ mod tests {
         }
 
         fn has_torrent<'a>(&'a self, _info_hash: &'a InfoHash) -> ClientResultFuture<'a, bool> {
-            self.has_calls.fetch_add(1, Ordering::SeqCst);
+            let has_call = self.has_calls.fetch_add(1, Ordering::SeqCst);
+            let first_has_barrier = (has_call == 0)
+                .then(|| self.first_has_barrier.clone())
+                .flatten();
             if let Some((path, contents)) =
                 self.replace_save_path_file_on_has.lock().unwrap().take()
             {
@@ -5099,23 +5275,35 @@ mod tests {
                     async move { pending::<Result<bool, TorrentClientError>>().await },
                 );
             }
-            let error = self
-                .has_errors_remaining
+            let succeed_before_error = self
+                .has_successes_before_error
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                     current.checked_sub(1)
                 })
-                .is_ok()
-                .then(|| TorrentClientError::Unavailable {
-                    client: self.descriptor.name.as_str().to_owned(),
-                    retry_after_ms: Some(1_000),
-                    message: "offline".to_owned(),
-                });
-            let existing = self.existing;
+                .is_ok();
+            let error = (!succeed_before_error)
+                .then(|| {
+                    self.has_errors_remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                            current.checked_sub(1)
+                        })
+                        .is_ok()
+                        .then(|| TorrentClientError::Unavailable {
+                            client: self.descriptor.name.as_str().to_owned(),
+                            retry_after_ms: Some(1_000),
+                            message: "offline".to_owned(),
+                        })
+                })
+                .flatten();
+            let existing = &self.existing;
             Box::pin(async move {
+                if let Some(barrier) = first_has_barrier {
+                    barrier.wait().await;
+                }
                 if let Some(error) = error {
                     Err(error)
                 } else {
-                    Ok(existing)
+                    Ok(existing.load(Ordering::SeqCst))
                 }
             })
         }
@@ -5139,10 +5327,14 @@ mod tests {
                 retry_after_ms: Some(1_000),
                 message: "offline".to_owned(),
             });
+            let existing = self.mark_existing_on_inject.then_some(&self.existing);
             Box::pin(async move {
                 if let Some(error) = error {
                     Err(error)
                 } else {
+                    if let Some(existing) = existing {
+                        existing.store(true, Ordering::SeqCst);
+                    }
                     Ok(())
                 }
             })
