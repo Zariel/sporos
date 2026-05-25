@@ -1,4 +1,4 @@
-use std::cmp::Ordering as CompareOrdering;
+use std::cmp::{Ordering as CompareOrdering, Reverse};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -597,6 +597,7 @@ pub async fn reverse_lookup_and_assess_candidate(
     config: &ReverseLookupConfig,
 ) -> Result<ReverseLookupOutcome, ReverseLookupError> {
     let matches = reverse_lookup_candidates(repository, candidate, context, config).await?;
+    let mut best_actionable = None;
     let mut best_failure = None;
 
     for lookup in matches {
@@ -622,7 +623,7 @@ pub async fn reverse_lookup_and_assess_candidate(
             });
         }
 
-        if assessment_is_already_present(&assessment) {
+        if persisted_assessment_is_already_present(&assessment) {
             return Ok(ReverseLookupOutcome::AlreadyPresent {
                 local_item: lookup.local_item,
                 assessment,
@@ -630,13 +631,23 @@ pub async fn reverse_lookup_and_assess_candidate(
         }
 
         if assessment_is_actionable(&assessment) {
-            return Ok(ReverseLookupOutcome::Matched {
-                local_item: lookup.local_item,
-                assessment,
+            let replace = best_actionable.as_ref().is_none_or(|(_, current)| {
+                persisted_actionable_assessment_is_better(&assessment, current)
             });
+            if replace {
+                best_actionable = Some((lookup.local_item, assessment));
+            }
+            continue;
         }
 
         best_failure = better_failure(best_failure, lookup.local_item, assessment);
+    }
+
+    if let Some((local_item, assessment)) = best_actionable {
+        return Ok(ReverseLookupOutcome::Matched {
+            local_item,
+            assessment,
+        });
     }
 
     Ok(best_failure.map_or(
@@ -1216,7 +1227,7 @@ fn levenshtein(left: &str, right: &str) -> usize {
     previous.get(right_chars.len()).copied().unwrap_or_default()
 }
 
-fn assessment_is_already_present(assessment: &PersistedCandidateAssessment) -> bool {
+pub fn persisted_assessment_is_already_present(assessment: &PersistedCandidateAssessment) -> bool {
     matches!(
         assessment,
         PersistedCandidateAssessment::Rejected {
@@ -1240,6 +1251,93 @@ fn assessment_is_actionable(assessment: &PersistedCandidateAssessment) -> bool {
             ..
         }
     )
+}
+
+pub fn actionable_assessment_is_better(
+    candidate: &CandidateAssessment,
+    current: &CandidateAssessment,
+) -> bool {
+    let Some(candidate_rank) = actionable_assessment_rank(candidate) else {
+        return false;
+    };
+    let Some(current_rank) = actionable_assessment_rank(current) else {
+        return true;
+    };
+    candidate_rank < current_rank
+}
+
+fn persisted_actionable_assessment_is_better(
+    candidate: &PersistedCandidateAssessment,
+    current: &PersistedCandidateAssessment,
+) -> bool {
+    let PersistedCandidateAssessment::Assessed {
+        assessment: candidate,
+        ..
+    } = candidate
+    else {
+        return false;
+    };
+    let PersistedCandidateAssessment::Assessed {
+        assessment: current,
+        ..
+    } = current
+    else {
+        return true;
+    };
+    actionable_assessment_is_better(candidate, current)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActionableRank {
+    decision: u8,
+    ratio: Option<MatchRatio>,
+    size: Reverse<u64>,
+}
+
+impl PartialEq for ActionableRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CompareOrdering::Equal
+    }
+}
+
+impl Eq for ActionableRank {}
+
+impl Ord for ActionableRank {
+    fn cmp(&self, other: &Self) -> CompareOrdering {
+        self.decision
+            .cmp(&other.decision)
+            .then_with(|| match (self.ratio, other.ratio) {
+                (Some(left), Some(right)) => right.get().total_cmp(&left.get()),
+                (Some(_), None) => CompareOrdering::Less,
+                (None, Some(_)) => CompareOrdering::Greater,
+                (None, None) => CompareOrdering::Equal,
+            })
+            .then_with(|| self.size.cmp(&other.size))
+    }
+}
+
+impl PartialOrd for ActionableRank {
+    fn partial_cmp(&self, other: &Self) -> Option<CompareOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn actionable_assessment_rank(assessment: &CandidateAssessment) -> Option<ActionableRank> {
+    let decision = match assessment.decision {
+        MatchDecision::Exact => 0,
+        MatchDecision::SizeOnly => 1,
+        MatchDecision::Partial => 2,
+        MatchDecision::NoMatch | MatchDecision::Rejected => return None,
+    };
+    let size = assessment
+        .matched_size
+        .map(ByteSize::get)
+        .unwrap_or_default();
+    Some(ActionableRank {
+        decision,
+        ratio: assessment.matched_ratio,
+        size: Reverse(size),
+    })
 }
 
 fn better_failure(
@@ -2476,6 +2574,35 @@ mod tests {
 
         assert_eq!(current_item, selected_item);
         assert_eq!(current_assessment, selected_assessment);
+    }
+
+    #[test]
+    fn actionable_rank_prefers_exact_then_ratio_then_size() {
+        let exact = candidate_assessment(MatchDecision::Exact, Some(1.0), Some(10));
+        let size_only = candidate_assessment(MatchDecision::SizeOnly, Some(1.0), Some(10));
+        let lower_partial = candidate_assessment(MatchDecision::Partial, Some(0.5), Some(10));
+        let higher_partial = candidate_assessment(MatchDecision::Partial, Some(0.75), Some(10));
+        let smaller_partial = candidate_assessment(MatchDecision::Partial, Some(0.75), Some(8));
+        let close_lower_larger =
+            candidate_assessment(MatchDecision::Partial, Some(0.750_000_1), Some(10));
+        let close_higher_smaller =
+            candidate_assessment(MatchDecision::Partial, Some(0.750_000_2), Some(8));
+        let rejected = candidate_assessment(MatchDecision::Rejected, Some(1.0), Some(10));
+
+        assert!(actionable_assessment_is_better(&exact, &size_only));
+        assert!(actionable_assessment_is_better(
+            &higher_partial,
+            &lower_partial
+        ));
+        assert!(actionable_assessment_is_better(
+            &higher_partial,
+            &smaller_partial
+        ));
+        assert!(actionable_assessment_is_better(
+            &close_higher_smaller,
+            &close_lower_larger
+        ));
+        assert!(!actionable_assessment_is_better(&rejected, &lower_partial));
     }
 
     #[test]
@@ -3717,6 +3844,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_lookup_prefers_later_exact_match_over_earlier_partial_match() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("reverse-best-actionable");
+        let cache_path =
+            write_cache_file(&cache_dir, "candidate.torrent", multi_file_torrent_bytes());
+        let weak = local_item(
+            LocalItemSource::Client {
+                client_host: ClientHost::new("qbit.local").unwrap(),
+                source_key: SourceKey::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            },
+            "Example",
+            MediaType::Movie,
+            10,
+        );
+        let exact = local_item(
+            LocalItemSource::DataRoot {
+                path: PathBuf::from("/media/example"),
+            },
+            "Example",
+            MediaType::Movie,
+            20,
+        );
+        insert_local(&repository, &weak, &[local_file("a.mkv", 10, 0)]).await;
+        insert_local(
+            &repository,
+            &exact,
+            &[local_file("a.mkv", 10, 0), local_file("b.mkv", 10, 1)],
+        )
+        .await;
+        let mut candidate = remote_candidate("guid-best-actionable", "Example", Some(cache_path));
+        candidate.size = None;
+        let config = ReverseLookupConfig {
+            assessment: CandidateAssessmentConfig {
+                file_tree: FileTreeMatchConfig {
+                    mode: FileTreeMatchMode::Partial,
+                    ..FileTreeMatchConfig::default()
+                },
+                ..CandidateAssessmentConfig::default()
+            },
+            ..ReverseLookupConfig::default()
+        };
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let ReverseLookupOutcome::Matched {
+            local_item,
+            assessment,
+        } = outcome
+        else {
+            panic!("expected matched outcome");
+        };
+        let PersistedCandidateAssessment::Assessed { assessment, .. } = assessment else {
+            panic!("expected assessed candidate");
+        };
+        assert!(matches!(
+            local_item.source,
+            LocalItemSource::DataRoot { .. }
+        ));
+        assert_eq!(MatchDecision::Exact, assessment.decision);
+
+        fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn reverse_lookup_rejects_truncated_local_file_tree() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let cache_dir = unique_temp_dir("reverse-truncated");
@@ -4167,13 +4367,21 @@ mod tests {
     ) -> PersistedCandidateAssessment {
         PersistedCandidateAssessment::Assessed {
             candidate_id: RemoteCandidateId::new(1).unwrap(),
-            assessment: CandidateAssessment {
-                decision,
-                reason: DecisionReason::NameMismatch,
-                matched_size: None,
-                matched_ratio: matched_ratio.map(|ratio| MatchRatio::new(ratio).unwrap()),
-            },
+            assessment: candidate_assessment(decision, matched_ratio, None),
             cache_status: CandidateCacheStatus::Reused,
+        }
+    }
+
+    fn candidate_assessment(
+        decision: MatchDecision,
+        matched_ratio: Option<f64>,
+        matched_size: Option<u64>,
+    ) -> CandidateAssessment {
+        CandidateAssessment {
+            decision,
+            reason: DecisionReason::NameMismatch,
+            matched_size: matched_size.map(ByteSize::new),
+            matched_ratio: matched_ratio.map(|ratio| MatchRatio::new(ratio).unwrap()),
         }
     }
 
@@ -4318,6 +4526,10 @@ mod tests {
 
     fn test_torrent_bytes() -> &'static [u8] {
         b"d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"
+    }
+
+    fn multi_file_torrent_bytes() -> &'static [u8] {
+        b"d8:announce14:http://tracker4:infod5:filesld6:lengthi10e4:pathl5:a.mkveed6:lengthi10e4:pathl5:b.mkveee4:name7:Example12:piece lengthi10e6:pieces40:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaee"
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

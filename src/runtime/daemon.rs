@@ -23,7 +23,8 @@ use crate::config::{MatchingMode, SporosConfig, validate_server_auth};
 use crate::content_filter::{ContentFilterConfig, ContentFilterContext, Permille};
 use crate::domain::{
     CandidateAssessment, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash,
-    InjectionOutcome, JobName, MatchDecision, ReasonText, RemoteCandidate, RemoteCandidateId,
+    InjectionOutcome, JobName, LocalFile, LocalItem, MatchDecision, ReasonText, RemoteCandidate,
+    RemoteCandidateId,
 };
 use crate::errors::{ConfigError, DatabaseError};
 use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
@@ -34,7 +35,8 @@ use crate::inventory_refresh::run_inventory_refresh_worker;
 use crate::matching::{
     CandidateAssessmentConfig, CandidateAssessmentInput, CandidatePrecheckConfig,
     FileTreeMatchConfig, FileTreeMatchMode, PersistedCandidateAssessment, ReverseLookupConfig,
-    ReverseLookupError, ReverseLookupOutcome, assess_and_persist_candidate,
+    ReverseLookupError, ReverseLookupOutcome, actionable_assessment_is_better,
+    assess_and_persist_candidate, persisted_assessment_is_already_present,
     reverse_lookup_and_assess_candidate, reverse_lookup_candidates,
 };
 use crate::metrics::{
@@ -741,6 +743,7 @@ fn search_metric_outcome(summary: &SearchWorkflowExecutionSummary) -> SearchOutc
     }
 }
 
+#[derive(Debug)]
 enum SearchCandidatePreflight {
     Outcome(SearchCandidateOutcome),
     Save {
@@ -774,6 +777,13 @@ struct DownloadedSearchCandidateStage {
     torrent_bytes: Vec<u8>,
     now_ms: i64,
     shutdown: ShutdownSignal,
+}
+
+struct ActionableLookup {
+    local_item: LocalItem,
+    local_files: Vec<LocalFile>,
+    candidate_id: RemoteCandidateId,
+    assessment: CandidateAssessment,
 }
 
 async fn prepare_search_candidate(
@@ -991,6 +1001,7 @@ async fn process_downloaded_search_candidate(
     )
     .await
     .map_err(|error| format!("{error:?}"))?;
+    let mut best_actionable: Option<ActionableLookup> = None;
     let mut best_failure = None;
 
     for lookup in lookups {
@@ -1012,40 +1023,60 @@ async fn process_downloaded_search_candidate(
         .await
         .map_err(|error| format!("{error:?}"))?;
         record_persisted_decision(&state, &assessment);
+        if persisted_assessment_is_already_present(&assessment) {
+            return Ok(SearchCandidatePreflight::Outcome(
+                SearchCandidateOutcome::AlreadyPresent,
+            ));
+        }
         if let Some((candidate_id, assessment)) = actionable_assessment(&assessment) {
-            if shutdown.state().phase != ShutdownPhase::Running {
-                return Err("search workflow is shutting down".to_owned());
+            let candidate = ActionableLookup {
+                local_item: lookup.local_item,
+                local_files: lookup.local_files,
+                candidate_id,
+                assessment,
+            };
+            if best_actionable.as_ref().is_none_or(|current| {
+                actionable_assessment_is_better(&candidate.assessment, &current.assessment)
+            }) {
+                best_actionable = Some(candidate);
             }
-            if state.injection_worker.client_count() == 0 {
-                return Ok(SearchCandidatePreflight::Save {
-                    metadata: candidate_output_metadata(
-                        lookup.local_item.media_type,
-                        &cached.candidate,
-                        &cached.metafile,
-                    ),
-                    torrent_bytes,
-                });
-            }
-            let recheck = runtime_recheck_resume_config(&state.config);
-            return Ok(SearchCandidatePreflight::Inject {
-                request: Box::new(InjectionRequest {
-                    local_item: lookup.local_item,
-                    local_files: lookup.local_files,
-                    candidate: cached.candidate.clone(),
-                    candidate_id,
-                    metafile: cached.metafile,
-                    torrent_bytes,
-                    assessment,
-                    assessed_at_ms: now_ms,
-                    output_dir: state.config.paths.output_dir,
-                    link_dirs: Vec::new(),
-                    link_type: None,
-                    flat_linking: false,
-                    recheck,
-                }),
-            });
+            continue;
         }
         best_failure = Some(assessment);
+    }
+
+    if let Some(selected) = best_actionable {
+        if shutdown.state().phase != ShutdownPhase::Running {
+            return Err("search workflow is shutting down".to_owned());
+        }
+        if state.injection_worker.client_count() == 0 {
+            return Ok(SearchCandidatePreflight::Save {
+                metadata: candidate_output_metadata(
+                    selected.local_item.media_type,
+                    &cached.candidate,
+                    &cached.metafile,
+                ),
+                torrent_bytes,
+            });
+        }
+        let recheck = runtime_recheck_resume_config(&state.config);
+        return Ok(SearchCandidatePreflight::Inject {
+            request: Box::new(InjectionRequest {
+                local_item: selected.local_item,
+                local_files: selected.local_files,
+                candidate: cached.candidate.clone(),
+                candidate_id: selected.candidate_id,
+                metafile: cached.metafile,
+                torrent_bytes,
+                assessment: selected.assessment,
+                assessed_at_ms: now_ms,
+                output_dir: state.config.paths.output_dir,
+                link_dirs: Vec::new(),
+                link_type: None,
+                flat_linking: false,
+                recheck,
+            }),
+        });
     }
 
     Ok(SearchCandidatePreflight::Outcome(
@@ -1832,6 +1863,7 @@ async fn process_downloaded_announce_candidate(
     )
     .await
     .map_err(|error| format!("{error:?}"))?;
+    let mut best_actionable: Option<ActionableLookup> = None;
     let mut best_failure = None;
 
     for lookup in lookups {
@@ -1855,86 +1887,113 @@ async fn process_downloaded_announce_candidate(
         )
         .await
         .map_err(|error| format!("{error:?}"))?;
-        if let Some((candidate_id, assessment)) = actionable_assessment(&assessment) {
-            if shutdown.state().phase != ShutdownPhase::Running {
-                return Ok(AnnounceWorkOutcome::Release {
-                    reason: AnnounceReason::DependencyBackoff,
-                    next_attempt_at_ms: now_ms,
-                });
-            }
-            if state.injection_worker.client_count() == 0 {
-                let save = save_candidate_torrent_blocking(
-                    state.config.paths.output_dir.clone(),
-                    candidate_output_metadata(
-                        lookup.local_item.media_type,
-                        &cached.candidate,
-                        &cached.metafile,
-                    ),
-                    torrent_bytes,
-                )
-                .await;
-                match save {
-                    Ok(outcome) => state.metrics.record_action(outcome.action_outcome()),
-                    Err(error) => {
-                        state.metrics.record_action(ActionOutcome::Failed);
-                        return Err(error.to_string());
-                    }
-                }
-                return Ok(AnnounceWorkOutcome::Succeeded {
-                    reason: AnnounceReason::Saved,
-                    outcome: "saved".to_owned(),
-                });
-            }
-            if shutdown.state().phase != ShutdownPhase::Running {
-                return Ok(AnnounceWorkOutcome::Release {
-                    reason: AnnounceReason::DependencyBackoff,
-                    next_attempt_at_ms: now_ms,
-                });
-            }
-            let recheck = runtime_recheck_resume_config(&state.config);
-            let result = state
-                .injection_worker
-                .process_until_shutdown(
-                    InjectionRequest {
-                        local_item: lookup.local_item,
-                        local_files: lookup.local_files,
-                        candidate: cached.candidate.clone(),
-                        candidate_id,
-                        metafile: cached.metafile,
-                        torrent_bytes,
-                        assessment,
-                        assessed_at_ms: now_ms,
-                        output_dir: state.config.paths.output_dir,
-                        link_dirs: Vec::new(),
-                        link_type: None,
-                        flat_linking: false,
-                        recheck,
-                    },
-                    shutdown.clone(),
-                )
-                .await;
-            let result = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    state.metrics.record_action(ActionOutcome::Failed);
-                    return Err(format!("{error:?}"));
-                }
-            };
-            state
-                .metrics
-                .record_action(injection_metric_outcome(result.outcome));
-            return Ok(classify_injection_result(
-                &result,
+        if persisted_assessment_is_already_present(&assessment) {
+            return Ok(classify_reverse_lookup_outcome(
+                &ReverseLookupOutcome::AlreadyPresent {
+                    local_item: lookup.local_item,
+                    assessment,
+                },
                 now_ms,
                 attempt_count,
                 jitter_key,
                 outcome_config,
             ));
         }
+        if let Some((candidate_id, assessment)) = actionable_assessment(&assessment) {
+            let candidate = ActionableLookup {
+                local_item: lookup.local_item,
+                local_files: lookup.local_files,
+                candidate_id,
+                assessment,
+            };
+            if best_actionable.as_ref().is_none_or(|current| {
+                actionable_assessment_is_better(&candidate.assessment, &current.assessment)
+            }) {
+                best_actionable = Some(candidate);
+            }
+            continue;
+        }
         best_failure = Some(ReverseLookupOutcome::BestFailure {
             local_item: lookup.local_item,
             assessment,
         });
+    }
+
+    if let Some(selected) = best_actionable {
+        if shutdown.state().phase != ShutdownPhase::Running {
+            return Ok(AnnounceWorkOutcome::Release {
+                reason: AnnounceReason::DependencyBackoff,
+                next_attempt_at_ms: now_ms,
+            });
+        }
+        if state.injection_worker.client_count() == 0 {
+            let save = save_candidate_torrent_blocking(
+                state.config.paths.output_dir.clone(),
+                candidate_output_metadata(
+                    selected.local_item.media_type,
+                    &cached.candidate,
+                    &cached.metafile,
+                ),
+                torrent_bytes,
+            )
+            .await;
+            match save {
+                Ok(outcome) => state.metrics.record_action(outcome.action_outcome()),
+                Err(error) => {
+                    state.metrics.record_action(ActionOutcome::Failed);
+                    return Err(error.to_string());
+                }
+            }
+            return Ok(AnnounceWorkOutcome::Succeeded {
+                reason: AnnounceReason::Saved,
+                outcome: "saved".to_owned(),
+            });
+        }
+        if shutdown.state().phase != ShutdownPhase::Running {
+            return Ok(AnnounceWorkOutcome::Release {
+                reason: AnnounceReason::DependencyBackoff,
+                next_attempt_at_ms: now_ms,
+            });
+        }
+        let recheck = runtime_recheck_resume_config(&state.config);
+        let result = state
+            .injection_worker
+            .process_until_shutdown(
+                InjectionRequest {
+                    local_item: selected.local_item,
+                    local_files: selected.local_files,
+                    candidate: cached.candidate.clone(),
+                    candidate_id: selected.candidate_id,
+                    metafile: cached.metafile,
+                    torrent_bytes,
+                    assessment: selected.assessment,
+                    assessed_at_ms: now_ms,
+                    output_dir: state.config.paths.output_dir,
+                    link_dirs: Vec::new(),
+                    link_type: None,
+                    flat_linking: false,
+                    recheck,
+                },
+                shutdown.clone(),
+            )
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                state.metrics.record_action(ActionOutcome::Failed);
+                return Err(format!("{error:?}"));
+            }
+        };
+        state
+            .metrics
+            .record_action(injection_metric_outcome(result.outcome));
+        return Ok(classify_injection_result(
+            &result,
+            now_ms,
+            attempt_count,
+            jitter_key,
+            outcome_config,
+        ));
     }
 
     Ok(best_failure.map_or_else(
@@ -2554,9 +2613,9 @@ mod tests {
         TorznabIndexerConfig,
     };
     use crate::domain::{
-        ByteSize, CandidateGuid, DependencyName, DisplayName, DownloadUrl, FileIndex, IndexerId,
-        InfoHash, ItemTitle, JobName, JobState, LocalFile, LocalItem, LocalItemSource, MediaType,
-        ReasonText, RemoteCandidate, TrackerName,
+        ByteSize, CandidateGuid, ClientHost, DependencyName, DisplayName, DownloadUrl, FileIndex,
+        IndexerId, InfoHash, ItemTitle, JobName, JobState, LocalFile, LocalItem, LocalItemSource,
+        MediaType, ReasonText, RemoteCandidate, SourceKey, TrackerName,
     };
     use crate::indexers::{CategoryCaps, RetryAfter, SearchCaps, TorznabCaps, TorznabLimits};
     use crate::persistence::repository::{JobStateUpdate, Repository};
@@ -2757,6 +2816,173 @@ mod tests {
         assert_eq!(SearchCandidateOutcome::Saved, outcome);
         assert_eq!(1, saved_torrent_count(&output_dir));
         assert_eq!("partial", decisions[0].decision);
+    }
+
+    #[tokio::test]
+    async fn downloaded_search_candidate_stops_on_known_info_hash_before_later_exact_match() {
+        let root = unique_temp_dir("daemon-search-already-present");
+        let output_dir = root.join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let bytes = test_torrent_bytes_with_source("already-present");
+        let parsed = parse_metafile(&bytes).unwrap();
+        let info_hash = parsed.metafile.info_hash().clone();
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let already_present = LocalItem {
+            source: LocalItemSource::Client {
+                client_host: ClientHost::new("qbit.local").unwrap(),
+                source_key: SourceKey::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            },
+            info_hash: Some(info_hash.clone()),
+            total_size: ByteSize::new(1),
+            ..local_item(&root)
+        };
+        repository
+            .upsert_local_item_with_files(
+                &already_present,
+                &[LocalFile::new(
+                    None,
+                    PathBuf::from("other.mkv"),
+                    ByteSize::new(1),
+                    FileIndex::new(0),
+                )
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        let mut exact = local_item(&root);
+        exact.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&exact, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let mut candidate = search_candidate(
+            1,
+            "already-present",
+            "https://indexer.example/download/already-present",
+            &info_hash,
+        );
+        candidate.size = None;
+        candidate.torrent_cache_path = Some(root.join("cache.torrent"));
+        let cached = CachedCandidateTorrent {
+            candidate,
+            metafile: parsed.metafile,
+            tracker_hosts: parsed.tracker_hosts,
+            cache_path: root.join("cache.torrent"),
+        };
+
+        let outcome = process_downloaded_search_candidate(DownloadedSearchCandidateStage {
+            state: runtime.state,
+            cached,
+            torrent_bytes: bytes,
+            now_ms: unix_time_ms(),
+            shutdown: crate::runtime::shutdown::shutdown_channel().1,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                SearchCandidatePreflight::Outcome(SearchCandidateOutcome::AlreadyPresent)
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(0, saved_torrent_count(&output_dir));
+    }
+
+    #[tokio::test]
+    async fn downloaded_announce_candidate_stops_on_known_info_hash_before_later_exact_match() {
+        let root = unique_temp_dir("daemon-announce-already-present");
+        let output_dir = root.join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let bytes = test_torrent_bytes_with_source("announce-already-present");
+        let parsed = parse_metafile(&bytes).unwrap();
+        let info_hash = parsed.metafile.info_hash().clone();
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        let context = AnnounceWorkflowContext {
+            now_ms: unix_time_ms(),
+            attempt_count: 1,
+            jitter_key: "announce-already-present".to_owned(),
+            outcome_config: announce_outcome_config(&config.announce),
+            reverse_lookup_config: runtime_reverse_lookup_config(&config),
+        };
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let already_present = LocalItem {
+            source: LocalItemSource::Client {
+                client_host: ClientHost::new("qbit.local").unwrap(),
+                source_key: SourceKey::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            },
+            info_hash: Some(info_hash.clone()),
+            total_size: ByteSize::new(1),
+            ..local_item(&root)
+        };
+        repository
+            .upsert_local_item_with_files(
+                &already_present,
+                &[LocalFile::new(
+                    None,
+                    PathBuf::from("other.mkv"),
+                    ByteSize::new(1),
+                    FileIndex::new(0),
+                )
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        let mut exact = local_item(&root);
+        exact.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&exact, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let mut candidate = search_candidate(
+            1,
+            "announce-already-present",
+            "https://indexer.example/download/announce-already-present",
+            &info_hash,
+        );
+        candidate.size = None;
+        candidate.torrent_cache_path = Some(root.join("cache.torrent"));
+        let cached = CachedCandidateTorrent {
+            candidate,
+            metafile: parsed.metafile,
+            tracker_hosts: parsed.tracker_hosts,
+            cache_path: root.join("cache.torrent"),
+        };
+
+        let outcome = process_downloaded_announce_candidate(DownloadedAnnounceCandidate {
+            state: runtime.state,
+            cached,
+            torrent_bytes: bytes,
+            context,
+            shutdown: crate::runtime::shutdown::shutdown_channel().1,
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            AnnounceWorkOutcome::Succeeded {
+                reason: AnnounceReason::AlreadyExists,
+                ..
+            }
+        ));
+        assert_eq!(0, saved_torrent_count(&output_dir));
     }
 
     #[tokio::test]
