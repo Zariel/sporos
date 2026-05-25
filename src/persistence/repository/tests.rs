@@ -3466,7 +3466,7 @@ async fn stale_fetch_material_scrub_uses_bounded_indexes() {
 #[tokio::test]
 async fn announce_queue_snapshot_queries_avoid_retained_table_scans() {
     let repository = Repository::connect_in_memory().await.unwrap();
-    for (label, query) in [
+    for (label, query, expected_index, allow_temp_btree) in [
         (
             "active queue summary",
             r#"
@@ -3484,6 +3484,8 @@ async fn announce_queue_snapshot_queries_avoid_retained_table_scans() {
                 FROM announce_work
                 WHERE status IN ('queued', 'running', 'waiting', 'retryable')
                 "#,
+            "idx_announce_work_status_reason",
+            false,
         ),
         (
             "active status counts",
@@ -3495,26 +3497,43 @@ async fn announce_queue_snapshot_queries_avoid_retained_table_scans() {
                 ORDER BY status, reason
                 LIMIT 100
                 "#,
+            "idx_announce_work_status_reason",
+            false,
         ),
         (
-            "active attempt rows",
+            "active attempt summary",
             r#"
-                SELECT last_error_class, last_action_outcome, reason, status, attempt_count
-                FROM announce_work
-                WHERE status = 'retryable'
+                SELECT
+                    COALESCE(last_error_class, last_action_outcome, NULLIF(reason, ''), status)
+                        AS outcome_class,
+                    SUM(attempt_count) AS attempts
+                FROM announce_work INDEXED BY idx_announce_work_active_attempt_summary
+                WHERE status IN ('queued', 'running', 'waiting', 'retryable')
                   AND attempt_count > 0
+                GROUP BY outcome_class
+                ORDER BY attempts DESC, outcome_class
+                LIMIT 100
                 "#,
+            "idx_announce_work_active_attempt_summary",
+            true,
         ),
         (
-            "active dependency rows",
+            "active dependency summary",
             r#"
-                SELECT last_dependency_kind, last_dependency_name
-                FROM announce_work
-                WHERE status = 'waiting'
+                SELECT
+                    last_dependency_kind AS dependency_kind,
+                    last_dependency_name AS dependency_name,
+                    COUNT(*) AS count
+                FROM announce_work INDEXED BY idx_announce_work_active_dependency
+                WHERE status IN ('queued', 'running', 'waiting', 'retryable')
                   AND last_dependency_kind IS NOT NULL
                   AND last_dependency_name IS NOT NULL
-                ORDER BY last_dependency_kind, last_dependency_name
+                GROUP BY dependency_kind, dependency_name
+                ORDER BY count DESC, dependency_kind, dependency_name
+                LIMIT 100
                 "#,
+            "idx_announce_work_active_dependency",
+            true,
         ),
     ] {
         let plan = explain_query_plan_raw(&repository, query).await;
@@ -3526,10 +3545,95 @@ async fn announce_queue_snapshot_queries_avoid_retained_table_scans() {
             "{label} should not scan retained announce_work rows: {plan:?}"
         );
         assert!(
-            !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+            plan.iter().any(|detail| detail.contains(expected_index)),
+            "{label} should use {expected_index}: {plan:?}"
+        );
+        assert!(
+            allow_temp_btree || !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
             "{label} should not sort with a temp b-tree: {plan:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn announce_queue_snapshot_aggregates_active_attempts_and_waits_in_sql() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    for index in 0..120 {
+        insert_announce_summary_row(
+            &repository,
+            index,
+            AnnounceSummaryFixture {
+                status: "waiting",
+                attempt_count: 2,
+                error_class: Some("timeout"),
+                action_outcome: None,
+                reason: "retry_after",
+                dependency: Some(("indexer", "alpha")),
+            },
+        )
+        .await;
+    }
+    for index in 120..180 {
+        insert_announce_summary_row(
+            &repository,
+            index,
+            AnnounceSummaryFixture {
+                status: "retryable",
+                attempt_count: 3,
+                error_class: None,
+                action_outcome: Some("downloaded"),
+                reason: "accepted",
+                dependency: Some(("indexer", "beta")),
+            },
+        )
+        .await;
+    }
+    for index in 180..220 {
+        insert_announce_summary_row(
+            &repository,
+            index,
+            AnnounceSummaryFixture {
+                status: "queued",
+                attempt_count: 1,
+                error_class: None,
+                action_outcome: None,
+                reason: "source_incomplete",
+                dependency: Some(("client", "qbit")),
+            },
+        )
+        .await;
+    }
+
+    let snapshot = repository.announce_queue_snapshot(2, 500).await.unwrap();
+
+    assert_eq!(
+        vec![
+            AnnounceAttemptCount {
+                outcome_class: "timeout".to_owned(),
+                attempts: 240,
+            },
+            AnnounceAttemptCount {
+                outcome_class: "downloaded".to_owned(),
+                attempts: 180,
+            },
+        ],
+        snapshot.attempt_counts
+    );
+    assert_eq!(
+        vec![
+            AnnounceDependencyWaitCount {
+                dependency_kind: "indexer".to_owned(),
+                dependency_name: "alpha".to_owned(),
+                count: 120,
+            },
+            AnnounceDependencyWaitCount {
+                dependency_kind: "indexer".to_owned(),
+                dependency_name: "beta".to_owned(),
+                count: 60,
+            },
+        ],
+        snapshot.dependency_wait_counts
+    );
 }
 
 #[tokio::test]
@@ -4267,6 +4371,55 @@ fn test_announce_work(id: &str, guid: &str, received_at_ms: i64) -> AnnounceWork
         last_error_class: None,
         last_redacted_message: None,
     }
+}
+
+struct AnnounceSummaryFixture<'a> {
+    status: &'a str,
+    attempt_count: i64,
+    error_class: Option<&'a str>,
+    action_outcome: Option<&'a str>,
+    reason: &'a str,
+    dependency: Option<(&'a str, &'a str)>,
+}
+
+async fn insert_announce_summary_row(
+    repository: &Repository,
+    index: usize,
+    row: AnnounceSummaryFixture<'_>,
+) {
+    let id = format!("ann_summary_{index:04}");
+    repository
+        .insert_or_dedupe_announce_work(
+            &test_announce_work(&id, &format!("guid-summary-{index}"), index as i64),
+            1_000,
+        )
+        .await
+        .unwrap();
+    let (dependency_kind, dependency_name) = row.dependency.unwrap_or(("", ""));
+    sqlx::query(
+        r#"
+            UPDATE announce_work
+            SET status = ?,
+                reason = ?,
+                attempt_count = ?,
+                last_error_class = ?,
+                last_action_outcome = ?,
+                last_dependency_kind = NULLIF(?, ''),
+                last_dependency_name = NULLIF(?, '')
+            WHERE id = ?
+            "#,
+    )
+    .bind(row.status)
+    .bind(row.reason)
+    .bind(row.attempt_count)
+    .bind(row.error_class)
+    .bind(row.action_outcome)
+    .bind(dependency_kind)
+    .bind(dependency_name)
+    .bind(id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
 }
 
 async fn set_announce_waiting(

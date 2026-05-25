@@ -1,5 +1,5 @@
 use std::cmp::Ordering as CompareOrdering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -4139,106 +4139,66 @@ impl Repository {
         &self,
         limit: u16,
     ) -> Result<Vec<AnnounceAttemptCount>, DatabaseError> {
-        let mut counts = BTreeMap::<String, i64>::new();
-        for status in ACTIVE_ANNOUNCE_STATUSES {
-            let status = announce_status_key(status);
-            let rows = sqlx::query(
-                r#"
-                SELECT last_error_class, last_action_outcome, reason, status, attempt_count
-                FROM announce_work
-                WHERE status = ?
-                  AND attempt_count > 0
-                "#,
-            )
-            .bind(status)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| db_error("read announce attempt counts", error))?;
-            for row in rows {
-                let outcome_class = row
-                    .get::<Option<String>, _>("last_error_class")
-                    .or_else(|| row.get::<Option<String>, _>("last_action_outcome"))
-                    .unwrap_or_else(|| {
-                        let reason: String = row.get("reason");
-                        if reason.is_empty() {
-                            row.get("status")
-                        } else {
-                            reason
-                        }
-                    });
-                let attempts = row.get::<i64, _>("attempt_count");
-                counts
-                    .entry(outcome_class)
-                    .and_modify(|count| *count = count.saturating_add(attempts))
-                    .or_insert(attempts);
-            }
-        }
-        let mut counts = counts
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(last_error_class, last_action_outcome, NULLIF(reason, ''), status)
+                    AS outcome_class,
+                SUM(attempt_count) AS attempts
+            FROM announce_work INDEXED BY idx_announce_work_active_attempt_summary
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+              AND attempt_count > 0
+            GROUP BY outcome_class
+            ORDER BY attempts DESC, outcome_class
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce attempt counts", error))?;
+
+        Ok(rows
             .into_iter()
-            .map(|(outcome_class, attempts)| AnnounceAttemptCount {
-                outcome_class,
-                attempts,
+            .map(|row| AnnounceAttemptCount {
+                outcome_class: row.get("outcome_class"),
+                attempts: row.get("attempts"),
             })
-            .collect::<Vec<_>>();
-        counts.sort_by(|left, right| {
-            right
-                .attempts
-                .cmp(&left.attempts)
-                .then_with(|| left.outcome_class.cmp(&right.outcome_class))
-        });
-        counts.truncate(usize::from(limit));
-        Ok(counts)
+            .collect())
     }
 
     async fn active_announce_dependency_wait_counts(
         &self,
         limit: u16,
     ) -> Result<Vec<AnnounceDependencyWaitCount>, DatabaseError> {
-        let mut counts = BTreeMap::<(String, String), i64>::new();
-        for status in ACTIVE_ANNOUNCE_STATUSES {
-            let status = announce_status_key(status);
-            let rows = sqlx::query(
-                r#"
-                SELECT last_dependency_kind, last_dependency_name
-                FROM announce_work
-                WHERE status = ?
-                  AND last_dependency_kind IS NOT NULL
-                  AND last_dependency_name IS NOT NULL
-                ORDER BY last_dependency_kind, last_dependency_name
-                "#,
-            )
-            .bind(status)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| db_error("read announce dependency wait counts", error))?;
-            for row in rows {
-                let dependency_kind = row.get::<String, _>("last_dependency_kind");
-                let dependency_name = row.get::<String, _>("last_dependency_name");
-                counts
-                    .entry((dependency_kind, dependency_name))
-                    .and_modify(|count| *count = count.saturating_add(1))
-                    .or_insert(1);
-            }
-        }
-        let mut counts = counts
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                last_dependency_kind AS dependency_kind,
+                last_dependency_name AS dependency_name,
+                COUNT(*) AS count
+            FROM announce_work INDEXED BY idx_announce_work_active_dependency
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+              AND last_dependency_kind IS NOT NULL
+              AND last_dependency_name IS NOT NULL
+            GROUP BY dependency_kind, dependency_name
+            ORDER BY count DESC, dependency_kind, dependency_name
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce dependency wait counts", error))?;
+
+        Ok(rows
             .into_iter()
-            .map(
-                |((dependency_kind, dependency_name), count)| AnnounceDependencyWaitCount {
-                    dependency_kind,
-                    dependency_name,
-                    count,
-                },
-            )
-            .collect::<Vec<_>>();
-        counts.sort_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then_with(|| left.dependency_kind.cmp(&right.dependency_kind))
-                .then_with(|| left.dependency_name.cmp(&right.dependency_name))
-        });
-        counts.truncate(usize::from(limit));
-        Ok(counts)
+            .map(|row| AnnounceDependencyWaitCount {
+                dependency_kind: row.get("dependency_kind"),
+                dependency_name: row.get("dependency_name"),
+                count: row.get("count"),
+            })
+            .collect())
     }
 
     async fn transition_leased(

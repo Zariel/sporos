@@ -242,6 +242,14 @@ CREATE INDEX IF NOT EXISTS idx_announce_work_status_reason
     ON announce_work (status, reason);
 CREATE INDEX IF NOT EXISTS idx_announce_work_active_dependency
     ON announce_work (status, last_dependency_kind, last_dependency_name);
+CREATE INDEX IF NOT EXISTS idx_announce_work_active_attempt_summary
+    ON announce_work (
+        status,
+        COALESCE(last_error_class, last_action_outcome, NULLIF(reason, ''), status),
+        attempt_count
+    )
+    WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+      AND attempt_count > 0;
 CREATE INDEX IF NOT EXISTS idx_announce_work_dependency_schedule
     ON announce_work (next_attempt_at, received_at)
     WHERE status IN ('queued', 'retryable', 'waiting')
@@ -362,6 +370,7 @@ mod tests {
             "idx_announce_work_lease_until",
             "idx_announce_work_status_reason",
             "idx_announce_work_active_dependency",
+            "idx_announce_work_active_attempt_summary",
             "idx_announce_work_dependency_schedule",
             "idx_announce_work_waiting_due",
             "idx_announce_work_inventory_wakeup",
