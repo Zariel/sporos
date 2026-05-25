@@ -36,6 +36,14 @@ search_worker_concurrency = 4
 manual_search_per_indexer_result_limit = 1000
 manual_search_workflow_result_limit = 10000
 
+[notifications.endpoints.ops]
+url = "https://hooks.example/sporos"
+token_file = "/var/run/secrets/notification-token"
+timeout = "30s"
+retry_max_attempts = 3
+retry_initial_delay = "1s"
+retry_max_delay = "30s"
+
 [torrent_clients.qbit_main]
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
@@ -128,6 +136,10 @@ one indexer response, and `runtime.manual_search_workflow_result_limit` caps the
 total candidates accepted for one manual search workflow. Announcement admission
 is durable and is bounded by `announce.max_pending`.
 
+`runtime.notification_queue_limit` bounds accepted notification jobs before
+backpressure is reported. Leaving `[notifications.endpoints]` empty keeps
+notification delivery disabled.
+
 ## Server And Auth
 
 `server.bind` defaults to `127.0.0.1:2468`. Use `server.api_token_file`,
@@ -182,6 +194,26 @@ Use `cross-seed` values when matching an existing cross-seed-oriented client
 layout. The built-in `sporos` defaults are intentionally conservative and keep
 Sporos-owned injections easy to distinguish. qBittorrent uses category and
 tags; rTorrent uses only `default_label` with `label_field = "custom1"`.
+
+## Notifications
+
+Configure optional webhook destinations under
+`[notifications.endpoints.<name>]`. Endpoints are disabled when no entries are
+configured. Each endpoint accepts a URL, one optional bearer token source, a
+request timeout, and bounded retry policy:
+
+```toml
+[notifications.endpoints.ops]
+url = "https://hooks.example/sporos"
+token_file = "/var/run/secrets/notification-token"
+timeout = "30s"
+retry_max_attempts = 3
+retry_initial_delay = "1s"
+retry_max_delay = "30s"
+```
+
+Use `token_file`, `token_env`, or local-development `token`. URLs must use
+HTTP(S) and must not contain credentials, query parameters, or fragments.
 
 ## Injection Recheck And Auto-Resume
 
@@ -305,6 +337,7 @@ SPOROS__TORRENT_CLIENTS__RTORRENT_ARCHIVE__DEFAULT_LABEL='"cross-seed"'
 SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT='15.0'
 SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION='"inject_paused"'
 SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_FILE='"/var/run/secrets/indexer-api-key"'
+SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN_FILE='"/var/run/secrets/notification-token"'
 ```
 
 Arrays such as `paths.media_dirs` should be set in TOML. `default_tags` can be
@@ -314,9 +347,10 @@ overridden as a comma-separated scalar environment value.
 
 Secret-bearing fields generally support three forms:
 
-- inline local-development value, such as `api_key` or `password`
-- file path, such as `api_key_file` or `password_file`
-- environment variable name, such as `api_key_env` or `password_env`
+- inline local-development value, such as `api_key`, `password`, or `token`
+- file path, such as `api_key_file`, `password_file`, or `token_file`
+- environment variable name, such as `api_key_env`, `password_env`, or
+  `token_env`
 
 Use file or environment-backed secrets for production. Do not place API keys in
 indexer URL query strings.

@@ -128,6 +128,14 @@ refresh_on_startup = true
 required = false
 remove_policy = "deactivate"
 
+[notifications.endpoints.ops]
+url = "https://hooks.example/sporos"
+token_file = "/var/run/secrets/notification-token"
+timeout = "30s"
+retry_max_attempts = 3
+retry_initial_delay = "1s"
+retry_max_delay = "30s"
+
 [matching]
 mode = "partial"
 fuzzy_size_threshold = 0.02
@@ -343,14 +351,16 @@ mutating workflow endpoints.
 
 Torrent client passwords support `password`, `password_file`, and
 `password_env`. Torznab and Prowlarr indexer keys support `api_key`,
-`api_key_file`, and `api_key_env`.
+`api_key_file`, and `api_key_env`. Notification endpoints support `token`,
+`token_file`, and `token_env`; configure no endpoints to keep notification
+delivery disabled.
 
-Use file or environment-backed secrets in production. Inline `password` and
-`api_key` values are for local development. Secret wrappers redact debug and
-display output, and operator endpoints intentionally avoid exposing request
-cookies, API keys, passkeys, and secret-bearing URLs. Prowlarr API keys and the
-keys attached to imported Prowlarr indexers are redacted from logs, metrics,
-status, support output, and validation errors.
+Use file or environment-backed secrets in production. Inline `password`,
+`api_key`, and notification `token` values are for local development. Secret
+wrappers redact debug and display output, and operator endpoints intentionally
+avoid exposing request cookies, API keys, passkeys, and secret-bearing URLs.
+Prowlarr API keys and the keys attached to imported Prowlarr indexers are
+redacted from logs, metrics, status, support output, and validation errors.
 
 Sporos does not provide SQLite-at-rest encryption. Treat the database,
 WAL/journal files, database backups, torrent cache, and output directory as

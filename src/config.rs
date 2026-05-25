@@ -9,7 +9,7 @@ use toml::Value;
 
 use crate::announce::AnnounceQueueConfig;
 use crate::errors::ConfigError;
-use crate::secrets::{ApiKey, ApiToken, Password};
+use crate::secrets::{ApiKey, ApiToken, NotificationToken, Password};
 
 pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
 pub const DEFAULT_INJECTION_METADATA: &str = "sporos";
@@ -25,6 +25,7 @@ pub const DEFAULT_MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT: usize = 10_000;
 pub const MAX_RUNTIME_QUEUE_LIMIT: usize = 1_000_000;
 pub const MAX_SEARCH_WORKER_CONCURRENCY: usize = 256;
 pub const MAX_MANUAL_SEARCH_RESULT_LIMIT: usize = 1_000_000;
+pub const MAX_NOTIFICATION_RETRY_ATTEMPTS: u8 = 10;
 const ENV_PREFIX: &str = "SPOROS__";
 static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -41,6 +42,7 @@ pub struct SporosConfig {
     pub injection: InjectionConfig,
     pub scheduling: SchedulingConfig,
     pub announce: AnnounceQueueConfig,
+    pub notifications: NotificationsConfig,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
@@ -94,6 +96,40 @@ pub struct RuntimeConfig {
     pub search_worker_concurrency: usize,
     pub manual_search_per_indexer_result_limit: usize,
     pub manual_search_workflow_result_limit: usize,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    pub endpoints: BTreeMap<String, NotificationEndpointConfig>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationEndpointConfig {
+    pub url: String,
+    pub token: Option<NotificationToken>,
+    pub token_file: Option<PathBuf>,
+    pub token_env: Option<String>,
+    pub timeout: String,
+    pub retry_max_attempts: u8,
+    pub retry_initial_delay: String,
+    pub retry_max_delay: String,
+}
+
+impl Default for NotificationEndpointConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token: None,
+            token_file: None,
+            token_env: None,
+            timeout: "300s".to_owned(),
+            retry_max_attempts: 3,
+            retry_initial_delay: "1s".to_owned(),
+            retry_max_delay: "30s".to_owned(),
+        }
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -434,6 +470,7 @@ where
             reason: error.to_string(),
         })?;
     validate_runtime_threads(&config)?;
+    validate_notifications_config(&config)?;
     validate_secret_source_counts(&config)?;
     validate_torrent_clients(&config)?;
     validate_injection_config(&config)?;
@@ -657,6 +694,21 @@ fn resolve_secret_env(
             );
         }
     }
+    for (name, endpoint) in &mut config.notifications.endpoints {
+        if endpoint.token.is_none()
+            && let Some(env_name) = nonempty_secret_env(
+                "notifications.endpoints.token_env",
+                name,
+                &endpoint.token_env,
+            )?
+        {
+            let value = secret_env_value(env, env_name, "notifications.endpoints.token_env", name)?;
+            endpoint.token = Some(
+                NotificationToken::new(value.clone())
+                    .map_err(|source| ConfigError::InvalidSecret { source })?,
+            );
+        }
+    }
     resolve_arr_secret_env(
         "indexers.arr.sonarr.api_key_env",
         &mut config.indexers.arr.sonarr,
@@ -707,6 +759,17 @@ fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
             let value = secret_file_value("indexers.prowlarr.api_key_file", name, path)?;
             source.api_key =
                 Some(ApiKey::new(value).map_err(|source| ConfigError::InvalidSecret { source })?);
+        }
+    }
+    for (name, endpoint) in &mut config.notifications.endpoints {
+        if endpoint.token.is_none()
+            && let Some(path) = &endpoint.token_file
+        {
+            let value = secret_file_value("notifications.endpoints.token_file", name, path)?;
+            endpoint.token = Some(
+                NotificationToken::new(value)
+                    .map_err(|source| ConfigError::InvalidSecret { source })?,
+            );
         }
     }
     resolve_arr_secret_files(
@@ -910,6 +973,64 @@ fn validate_runtime_threads(config: &SporosConfig) -> Result<(), ConfigError> {
     )
 }
 
+fn validate_notifications_config(config: &SporosConfig) -> Result<(), ConfigError> {
+    for (name, endpoint) in &config.notifications.endpoints {
+        if name.trim().is_empty() {
+            return Err(ConfigError::InvalidField {
+                field: "notifications.endpoints",
+                reason: "endpoint names must not be empty".to_owned(),
+            });
+        }
+        validate_http_url("notifications.endpoints.url", name, &endpoint.url)?;
+        validate_interval("notifications.endpoints.timeout", name, &endpoint.timeout)?;
+        validate_interval(
+            "notifications.endpoints.retry_initial_delay",
+            name,
+            &endpoint.retry_initial_delay,
+        )?;
+        validate_interval(
+            "notifications.endpoints.retry_max_delay",
+            name,
+            &endpoint.retry_max_delay,
+        )?;
+        validate_secret_source_count(
+            "notifications.endpoints.token",
+            name,
+            [
+                ("token", endpoint.token.is_some()),
+                ("token_file", endpoint.token_file.is_some()),
+                ("token_env", endpoint.token_env.is_some()),
+            ],
+        )?;
+        if !(1..=MAX_NOTIFICATION_RETRY_ATTEMPTS).contains(&endpoint.retry_max_attempts) {
+            return Err(ConfigError::InvalidField {
+                field: "notifications.endpoints.retry_max_attempts",
+                reason: format!(
+                    "{name}: retry_max_attempts must be between 1 and {MAX_NOTIFICATION_RETRY_ATTEMPTS}"
+                ),
+            });
+        }
+        let initial_delay_ms = interval_ms(
+            "notifications.endpoints.retry_initial_delay",
+            name,
+            &endpoint.retry_initial_delay,
+        )?;
+        let max_delay_ms = interval_ms(
+            "notifications.endpoints.retry_max_delay",
+            name,
+            &endpoint.retry_max_delay,
+        )?;
+        if max_delay_ms < initial_delay_ms {
+            return Err(ConfigError::InvalidField {
+                field: "notifications.endpoints.retry_max_delay",
+                reason: format!("{name}: retry_max_delay must be at least retry_initial_delay"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_optional_usize_range(
     field: &'static str,
     value: Option<usize>,
@@ -1043,7 +1164,6 @@ fn validate_secret_source_counts(config: &SporosConfig) -> Result<(), ConfigErro
             ],
         )?;
     }
-
     Ok(())
 }
 
@@ -1180,6 +1300,10 @@ fn validate_http_url(field: &'static str, name: &str, value: &str) -> Result<(),
 }
 
 fn validate_interval(field: &'static str, name: &str, value: &str) -> Result<(), ConfigError> {
+    interval_ms(field, name, value).map(|_millis| ())
+}
+
+fn interval_ms(field: &'static str, name: &str, value: &str) -> Result<i64, ConfigError> {
     let trimmed = value.trim();
     let split_at = trimmed
         .find(|character: char| !character.is_ascii_digit())
@@ -1217,9 +1341,7 @@ fn validate_interval(field: &'static str, name: &str, value: &str) -> Result<(),
         .ok_or_else(|| ConfigError::InvalidField {
             field,
             reason: format!("{name}: interval is too large"),
-        })?;
-
-    Ok(())
+        })
 }
 
 fn validate_secret_source_count(
@@ -1538,6 +1660,16 @@ search_worker_concurrency = 4
 manual_search_per_indexer_result_limit = 1000
 manual_search_workflow_result_limit = 10000
 
+[notifications.endpoints.<name>]
+url = "https://hooks.example/sporos"
+token = "optional local-development bearer token"
+token_file = "optional path"
+token_env = "optional env var containing bearer token"
+timeout = "300s"
+retry_max_attempts = 3
+retry_initial_delay = "1s"
+retry_max_delay = "30s"
+
 [torrent_clients.<name>]
 kind = "qbittorrent|rtorrent"
 url = "http://client.example"
@@ -1599,6 +1731,8 @@ SPOROS__RUNTIME__NOTIFICATION_QUEUE_LIMIT = "500"
 SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY = "4"
 SPOROS__RUNTIME__MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT = "1000"
 SPOROS__RUNTIME__MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT = "10000"
+SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__URL = "https://hooks.example/sporos"
+SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_FILE = "/var/run/secrets/notification-token"
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__INJECTION__RECHECK__SKIP_RECHECK = "false"
 SPOROS__INJECTION__RECHECK__MAX_REMAINING_BYTES = "104857600"
@@ -1693,6 +1827,14 @@ mod tests {
             manual_search_per_indexer_result_limit = 333
             manual_search_workflow_result_limit = 444
 
+            [notifications.endpoints.ops]
+            url = "https://hooks.example/sporos"
+            token = "notification-secret"
+            timeout = "30s"
+            retry_max_attempts = 4
+            retry_initial_delay = "2s"
+            retry_max_delay = "20s"
+
             [torrent_clients.qbit_main]
             kind = "qbittorrent"
             url = "http://qbittorrent:8080"
@@ -1719,6 +1861,19 @@ mod tests {
         assert_eq!(8, config.runtime.search_worker_concurrency);
         assert_eq!(333, config.runtime.manual_search_per_indexer_result_limit);
         assert_eq!(444, config.runtime.manual_search_workflow_result_limit);
+        let endpoint = &config.notifications.endpoints["ops"];
+        assert_eq!("https://hooks.example/sporos", endpoint.url);
+        assert_eq!(
+            Some("notification-secret"),
+            endpoint
+                .token
+                .as_ref()
+                .map(NotificationToken::expose_secret)
+        );
+        assert_eq!("30s", endpoint.timeout);
+        assert_eq!(4, endpoint.retry_max_attempts);
+        assert_eq!("2s", endpoint.retry_initial_delay);
+        assert_eq!("20s", endpoint.retry_max_delay);
         assert_eq!(1, config.torrent_clients.len());
         assert_eq!(1, config.indexers.torznab.len());
         assert_eq!(
@@ -1783,6 +1938,7 @@ mod tests {
             DEFAULT_MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT,
             config.runtime.manual_search_workflow_result_limit
         );
+        assert!(config.notifications.endpoints.is_empty());
     }
 
     #[test]
@@ -1886,6 +2042,111 @@ mod tests {
                 .to_string()
                 .contains("between 1 and 1000000")
         );
+    }
+
+    #[test]
+    fn notifications_parse_endpoints_and_redact_tokens() {
+        let config = parse_config(
+            r#"
+            [notifications.endpoints.ops]
+            url = "https://hooks.example/sporos"
+            token = "notification-secret"
+            timeout = "45s"
+            retry_max_attempts = 2
+            retry_initial_delay = "5s"
+            retry_max_delay = "30s"
+            "#,
+        )
+        .unwrap();
+        let endpoint = &config.notifications.endpoints["ops"];
+
+        assert_eq!("https://hooks.example/sporos", endpoint.url);
+        assert_eq!(
+            Some("notification-secret"),
+            endpoint
+                .token
+                .as_ref()
+                .map(NotificationToken::expose_secret)
+        );
+        assert_eq!("45s", endpoint.timeout);
+        assert_eq!(2, endpoint.retry_max_attempts);
+        assert_eq!("5s", endpoint.retry_initial_delay);
+        assert_eq!("30s", endpoint.retry_max_delay);
+        assert!(!format!("{endpoint:?}").contains("notification-secret"));
+    }
+
+    #[test]
+    fn notifications_reject_invalid_endpoint_config() {
+        for (field, value, expected) in [
+            (
+                "url",
+                "\"http://user:pass@hooks.example/sporos\"",
+                "userinfo",
+            ),
+            (
+                "url",
+                "\"https://hooks.example/sporos?token=secret\"",
+                "query",
+            ),
+            ("timeout", "\"0s\"", "interval must be positive"),
+            ("retry_max_attempts", "0", "retry_max_attempts"),
+            (
+                "retry_initial_delay",
+                "\"1ms\"",
+                "unsupported duration unit",
+            ),
+        ] {
+            let endpoint = if field == "url" {
+                format!(
+                    r#"
+                    [notifications.endpoints.ops]
+                    url = {value}
+                    "#
+                )
+            } else {
+                format!(
+                    r#"
+                    [notifications.endpoints.ops]
+                    url = "https://hooks.example/sporos"
+                    {field} = {value}
+                    "#
+                )
+            };
+            let error = parse_config(&endpoint).unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{error} did not contain {expected}"
+            );
+        }
+
+        let max_before_initial = parse_config(
+            r#"
+            [notifications.endpoints.ops]
+            url = "https://hooks.example/sporos"
+            retry_initial_delay = "30s"
+            retry_max_delay = "5s"
+            "#,
+        )
+        .unwrap_err();
+        assert!(max_before_initial.to_string().contains("retry_max_delay"));
+    }
+
+    #[test]
+    fn notifications_reject_duplicate_token_sources() {
+        let error = parse_config(
+            r#"
+            [notifications.endpoints.ops]
+            url = "https://hooks.example/sporos"
+            token = "direct"
+            token_env = "SPOROS_NOTIFICATION_TOKEN"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("notifications.endpoints.token"));
+        assert!(error.to_string().contains("only one"));
+        assert!(error.to_string().contains("token_file"));
     }
 
     #[test]
@@ -2372,11 +2633,13 @@ mod tests {
         let api_key_file = cwd.join("indexer-api-key");
         let prowlarr_api_key_file = cwd.join("prowlarr-api-key");
         let sonarr_api_key_file = cwd.join("sonarr-api-key");
+        let notification_token_file = cwd.join("notification-token");
         fs::write(&api_token_file, "server-secret\n").unwrap();
         fs::write(&password_file, "super-secret\n").unwrap();
         fs::write(&api_key_file, "api-secret\r\n").unwrap();
         fs::write(&prowlarr_api_key_file, "prowlarr-secret\n").unwrap();
         fs::write(&sonarr_api_key_file, "sonarr-secret\n").unwrap();
+        fs::write(&notification_token_file, "notification-secret\n").unwrap();
         let contents = format!(
             r#"
             [paths]
@@ -2405,6 +2668,10 @@ mod tests {
             [indexers.arr.sonarr.main]
             url = "http://sonarr:8989"
             api_key_file = "{}"
+
+            [notifications.endpoints.ops]
+            url = "https://hooks.example/sporos"
+            token_file = "{}"
             "#,
             cwd.display(),
             cwd.display(),
@@ -2413,7 +2680,8 @@ mod tests {
             password_file.display(),
             api_key_file.display(),
             prowlarr_api_key_file.display(),
-            sonarr_api_key_file.display()
+            sonarr_api_key_file.display(),
+            notification_token_file.display()
         );
 
         let config = parse_startup_config(&contents, &cwd).unwrap();
@@ -2421,6 +2689,7 @@ mod tests {
         let indexer = &config.indexers.torznab["example"];
         let prowlarr = &config.indexers.prowlarr["main"];
         let sonarr = &config.indexers.arr.sonarr["main"];
+        let endpoint = &config.notifications.endpoints["ops"];
 
         assert_eq!(
             Some("super-secret"),
@@ -2446,11 +2715,19 @@ mod tests {
             Some("sonarr-secret"),
             sonarr.api_key.as_ref().map(ApiKey::expose_secret)
         );
+        assert_eq!(
+            Some("notification-secret"),
+            endpoint
+                .token
+                .as_ref()
+                .map(NotificationToken::expose_secret)
+        );
         assert!(!format!("{:?}", config.server).contains("server-secret"));
         assert!(!format!("{client:?}").contains("super-secret"));
         assert!(!format!("{indexer:?}").contains("api-secret"));
         assert!(!format!("{prowlarr:?}").contains("prowlarr-secret"));
         assert!(!format!("{sonarr:?}").contains("sonarr-secret"));
+        assert!(!format!("{endpoint:?}").contains("notification-secret"));
 
         fs::remove_dir_all(cwd).unwrap();
     }
@@ -2525,6 +2802,7 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("[torrent_clients.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[indexers.torznab.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[indexers.prowlarr.<name>]"));
+        assert!(CONFIG_SCHEMA.contains("[notifications.endpoints.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[inventory]"));
         assert!(CONFIG_SCHEMA.contains("[injection.recheck]"));
         assert!(!CONFIG_SCHEMA.contains("rss_interval"));
@@ -2541,6 +2819,7 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_FILE"));
     }
 
     #[test]
@@ -2634,6 +2913,10 @@ mod tests {
             [indexers.arr.radarr.main]
             url = "http://old-radarr:7878"
             api_key_env = "RADARR_API_KEY"
+
+            [notifications.endpoints.ops]
+            url = "https://old-hooks.example/sporos"
+            token_env = "SPOROS_NOTIFICATION_TOKEN"
             "#,
             vec![
                 (
@@ -2660,10 +2943,18 @@ mod tests {
                     "SPOROS__INDEXERS__ARR__RADARR__MAIN__URL".to_owned(),
                     "http://radarr:7878".to_owned(),
                 ),
+                (
+                    "SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__URL".to_owned(),
+                    "https://hooks.example/sporos".to_owned(),
+                ),
                 ("QBIT_PASSWORD".to_owned(), "super-secret".to_owned()),
                 ("INDEXER_API_KEY".to_owned(), "api-secret".to_owned()),
                 ("PROWLARR_API_KEY".to_owned(), "prowlarr-secret".to_owned()),
                 ("RADARR_API_KEY".to_owned(), "radarr-secret".to_owned()),
+                (
+                    "SPOROS_NOTIFICATION_TOKEN".to_owned(),
+                    "notification-secret".to_owned(),
+                ),
             ],
         )
         .unwrap();
@@ -2671,6 +2962,7 @@ mod tests {
         let indexer = &config.indexers.torznab["example"];
         let prowlarr = &config.indexers.prowlarr["main"];
         let radarr = &config.indexers.arr.radarr["main"];
+        let endpoint = &config.notifications.endpoints["ops"];
 
         assert_eq!("http://qbittorrent:8080", client.url);
         assert_eq!(Some("cross-seed"), client.default_category.as_deref());
@@ -2700,6 +2992,14 @@ mod tests {
         assert_eq!(
             Some("radarr-secret"),
             radarr.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert_eq!("https://hooks.example/sporos", endpoint.url);
+        assert_eq!(
+            Some("notification-secret"),
+            endpoint
+                .token
+                .as_ref()
+                .map(NotificationToken::expose_secret)
         );
     }
 
