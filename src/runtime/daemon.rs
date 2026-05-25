@@ -15,8 +15,8 @@ use crate::actions::{
     SaveTorrentError, SaveTorrentOutcome, candidate_output_metadata, save_candidate_torrent,
 };
 use crate::announce::{AnnounceReason, AnnounceWorkId};
-use crate::config::{SporosConfig, validate_server_auth};
-use crate::content_filter::ContentFilterContext;
+use crate::config::{MatchingMode, SporosConfig, validate_server_auth};
+use crate::content_filter::{ContentFilterConfig, ContentFilterContext, Permille};
 use crate::domain::{
     CandidateAssessment, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash,
     InjectionOutcome, ItemTitle, JobName, MatchDecision, ReasonText, RemoteCandidate,
@@ -29,7 +29,8 @@ use crate::indexers::{
 };
 use crate::inventory_refresh::run_inventory_refresh_worker;
 use crate::matching::{
-    CandidateAssessmentInput, PersistedCandidateAssessment, ReverseLookupConfig,
+    CandidateAssessmentConfig, CandidateAssessmentInput, CandidatePrecheckConfig,
+    FileTreeMatchConfig, FileTreeMatchMode, PersistedCandidateAssessment, ReverseLookupConfig,
     ReverseLookupError, ReverseLookupOutcome, assess_and_persist_candidate,
     reverse_lookup_and_assess_candidate, reverse_lookup_candidates,
 };
@@ -364,10 +365,50 @@ fn runtime_recheck_resume_config(config: &SporosConfig) -> RecheckResumeConfig {
     RecheckResumeConfig::from(&config.injection.recheck)
 }
 
+fn runtime_reverse_lookup_config(config: &SporosConfig) -> ReverseLookupConfig {
+    let file_tree = FileTreeMatchConfig {
+        mode: match config.matching.mode {
+            MatchingMode::Exact => FileTreeMatchMode::Strict,
+            MatchingMode::Partial => FileTreeMatchMode::Partial,
+        },
+        fuzzy_size_threshold: config.matching.fuzzy_size_threshold,
+        season_from_episodes: config.matching.season_from_episodes,
+    };
+    ReverseLookupConfig {
+        content_filter: ContentFilterConfig {
+            include_single_episodes: config.matching.include_single_episodes,
+            include_non_videos: config.matching.include_non_video,
+            fuzzy_size_threshold: fuzzy_size_threshold_permille(
+                config.matching.fuzzy_size_threshold,
+            ),
+            ..ContentFilterConfig::default()
+        },
+        assessment: CandidateAssessmentConfig {
+            precheck: CandidatePrecheckConfig {
+                fuzzy_size_threshold: config.matching.fuzzy_size_threshold,
+                season_from_episodes: config.matching.season_from_episodes,
+                include_single_episodes: config.matching.include_single_episodes,
+                ..CandidatePrecheckConfig::default()
+            },
+            file_tree,
+        },
+        ..ReverseLookupConfig::default()
+    }
+}
+
+fn fuzzy_size_threshold_permille(threshold: f64) -> Permille {
+    if !threshold.is_finite() || threshold <= 0.0 {
+        return Permille::new(0);
+    }
+    let scaled = (threshold * 1_000.0).round().clamp(0.0, 1_000.0);
+    Permille::new(scaled.to_string().parse::<u16>().unwrap_or(1_000))
+}
+
 fn saved_torrent_retry_config(config: &SporosConfig) -> SavedTorrentRetryConfig {
     SavedTorrentRetryConfig {
         directories: vec![config.paths.output_dir.clone()],
         recheck: runtime_recheck_resume_config(config),
+        reverse_lookup: runtime_reverse_lookup_config(config),
         ..SavedTorrentRetryConfig::default()
     }
 }
@@ -606,7 +647,7 @@ async fn process_search_candidate(
         .upsert_remote_candidate(&candidate)
         .await
         .map_err(|error| error.to_string())?;
-    let config = ReverseLookupConfig::default();
+    let config = runtime_reverse_lookup_config(&state.config);
     let initial = reverse_lookup_and_assess_candidate(
         &state.repository,
         &candidate,
@@ -759,7 +800,7 @@ async fn process_downloaded_search_candidate(
     now_ms: i64,
     shutdown: ShutdownSignal,
 ) -> Result<SearchCandidateOutcome, String> {
-    let config = ReverseLookupConfig::default();
+    let config = runtime_reverse_lookup_config(&state.config);
     let lookups = reverse_lookup_candidates(
         &state.repository,
         &cached.candidate,
@@ -1345,7 +1386,7 @@ async fn process_announce_work(
     let outcome_config = announce_outcome_config(&state.config.announce);
     let attempt_count = candidate.attempt_count;
     let jitter_key = id.as_str();
-    let config = ReverseLookupConfig::default();
+    let config = runtime_reverse_lookup_config(&state.config);
     let initial = match reverse_lookup_and_assess_candidate(
         &state.repository,
         &candidate.candidate,
@@ -1510,7 +1551,7 @@ async fn process_downloaded_announce_candidate(
         outcome_config,
         shutdown,
     } = input;
-    let config = ReverseLookupConfig::default();
+    let config = runtime_reverse_lookup_config(&state.config);
     let lookups = reverse_lookup_candidates(
         &state.repository,
         &cached.candidate,
@@ -2296,9 +2337,16 @@ mod tests {
         config.injection.recheck.max_resume_wait_ms = 500;
         config.injection.recheck.below_threshold_action =
             crate::config::BelowThresholdActionConfig::RejectWithoutInjecting;
+        config.matching.mode = MatchingMode::Exact;
+        config.matching.fuzzy_size_threshold = 0.075;
+        config.matching.include_single_episodes = true;
+        config.matching.include_non_video = true;
+        config.matching.season_from_episodes = 0.8;
 
         let recheck = runtime_recheck_resume_config(&config);
+        let matching = runtime_reverse_lookup_config(&config);
         let saved_retry = saved_torrent_retry_config(&config);
+        let default_matching = runtime_reverse_lookup_config(&SporosConfig::default());
 
         assert!(recheck.skip_recheck);
         assert_eq!(ByteSize::new(123), recheck.auto_resume_max_download);
@@ -2318,6 +2366,22 @@ mod tests {
             saved_retry.directories
         );
         assert_eq!(recheck, saved_retry.recheck);
+        assert_eq!(
+            FileTreeMatchMode::Strict,
+            matching.assessment.file_tree.mode
+        );
+        assert!((matching.assessment.file_tree.fuzzy_size_threshold - 0.075).abs() < f64::EPSILON);
+        assert!((matching.assessment.file_tree.season_from_episodes - 0.8).abs() < f64::EPSILON);
+        assert!((matching.assessment.precheck.fuzzy_size_threshold - 0.075).abs() < f64::EPSILON);
+        assert!(matching.assessment.precheck.include_single_episodes);
+        assert!(matching.content_filter.include_single_episodes);
+        assert!(matching.content_filter.include_non_videos);
+        assert_eq!(75, matching.content_filter.fuzzy_size_threshold.get());
+        assert_eq!(matching, saved_retry.reverse_lookup);
+        assert_eq!(
+            FileTreeMatchMode::Partial,
+            default_matching.assessment.file_tree.mode
+        );
     }
 
     #[tokio::test]
@@ -2345,6 +2409,96 @@ mod tests {
         assert_eq!(1, matching_threads.len());
         assert_ne!(runtime_thread, matching_threads[0]);
         assert_eq!(1, saved_torrent_count(&output_dir));
+    }
+
+    #[tokio::test]
+    async fn downloaded_search_candidate_uses_runtime_partial_matching_config() {
+        let root = unique_temp_dir("daemon-search-partial-config");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_dir.join("partial.torrent");
+        fs::write(&cache_path, partial_torrent_bytes()).unwrap();
+        let parsed = parse_metafile(partial_torrent_bytes()).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        config.matching.mode = MatchingMode::Partial;
+        config.matching.fuzzy_size_threshold = 0.25;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let item_id = repository
+            .upsert_local_item_with_files(
+                &LocalItem {
+                    id: None,
+                    source: LocalItemSource::DataRoot {
+                        path: root.to_path_buf(),
+                    },
+                    title: ItemTitle::new("Candidate").unwrap(),
+                    display_name: DisplayName::new("Candidate").unwrap(),
+                    media_type: MediaType::Movie,
+                    info_hash: None,
+                    path: Some(root.clone()),
+                    save_path: Some(root.clone()),
+                    total_size: ByteSize::new(80),
+                    mtime_ms: None,
+                },
+                &[
+                    LocalFile::new(
+                        None,
+                        PathBuf::from("Candidate/a.mkv"),
+                        ByteSize::new(40),
+                        FileIndex::new(0),
+                    )
+                    .unwrap(),
+                    LocalFile::new(
+                        None,
+                        PathBuf::from("Candidate/b.mkv"),
+                        ByteSize::new(40),
+                        FileIndex::new(1),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let candidate = RemoteCandidate {
+            id: None,
+            indexer_id: IndexerId::new(1).unwrap(),
+            guid: CandidateGuid::new("partial-runtime").unwrap(),
+            download_url: DownloadUrl::new("https://indexer.example/download/partial-runtime")
+                .unwrap(),
+            title: ItemTitle::new("Candidate").unwrap(),
+            tracker: TrackerName::new("indexer.example").unwrap(),
+            size: Some(ByteSize::new(100)),
+            published_at_ms: None,
+            info_hash: Some(parsed.metafile.info_hash().clone()),
+            torrent_cache_path: Some(cache_path.clone()),
+        };
+
+        let outcome = process_downloaded_search_candidate(
+            runtime.state.clone(),
+            CachedCandidateTorrent {
+                candidate,
+                metafile: parsed.metafile,
+                tracker_hosts: parsed.tracker_hosts,
+                cache_path,
+            },
+            partial_torrent_bytes().to_vec(),
+            unix_time_ms(),
+            runtime.state.shutdown_signal.clone(),
+        )
+        .await
+        .unwrap();
+        let decisions = repository
+            .match_decisions_for_local_item(item_id, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(SearchCandidateOutcome::Saved, outcome);
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        assert_eq!("partial", decisions[0].decision);
     }
 
     #[tokio::test]
@@ -4708,6 +4862,10 @@ mod tests {
 
     fn test_torrent_bytes() -> &'static [u8] {
         b"d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"
+    }
+
+    fn partial_torrent_bytes() -> &'static [u8] {
+        b"d8:announce14:http://tracker4:infod5:filesld6:lengthi40e4:pathl9:Candidate5:a.mkveed6:lengthi40e4:pathl9:Candidate5:b.mkveed6:lengthi20e4:pathl9:Candidate5:c.mkveee4:name9:Candidate12:piece lengthi20e6:pieces100:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaee"
     }
 
     fn torznab_caps_xml() -> &'static str {
