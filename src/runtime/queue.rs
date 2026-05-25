@@ -50,10 +50,10 @@ impl Default for RuntimeQueueConfig {
     fn default() -> Self {
         Self {
             announcement_limit: nonzero(1_000),
-            search_limit: nonzero(100),
-            injection_limit: nonzero(100),
-            notification_limit: nonzero(500),
-            indexing_limit: nonzero(50),
+            search_limit: nonzero(crate::config::DEFAULT_SEARCH_QUEUE_LIMIT),
+            injection_limit: nonzero(crate::config::DEFAULT_INJECTION_QUEUE_LIMIT),
+            notification_limit: nonzero(crate::config::DEFAULT_NOTIFICATION_QUEUE_LIMIT),
+            indexing_limit: nonzero(crate::config::DEFAULT_INDEXING_QUEUE_LIMIT),
         }
     }
 }
@@ -354,9 +354,21 @@ mod tests {
         let config = RuntimeQueueConfig::default();
 
         assert_eq!(nonzero(1_000), config.limit_for(QueueKind::Announcement));
-        assert_eq!(nonzero(100), config.limit_for(QueueKind::Search));
-        assert_eq!(nonzero(100), config.limit_for(QueueKind::Injection));
-        assert_eq!(nonzero(500), config.limit_for(QueueKind::Notification));
-        assert_eq!(nonzero(50), config.limit_for(QueueKind::Indexing));
+        assert_eq!(
+            nonzero(crate::config::DEFAULT_SEARCH_QUEUE_LIMIT),
+            config.limit_for(QueueKind::Search)
+        );
+        assert_eq!(
+            nonzero(crate::config::DEFAULT_INJECTION_QUEUE_LIMIT),
+            config.limit_for(QueueKind::Injection)
+        );
+        assert_eq!(
+            nonzero(crate::config::DEFAULT_NOTIFICATION_QUEUE_LIMIT),
+            config.limit_for(QueueKind::Notification)
+        );
+        assert_eq!(
+            nonzero(crate::config::DEFAULT_INDEXING_QUEUE_LIMIT),
+            config.limit_for(QueueKind::Indexing)
+        );
     }
 }

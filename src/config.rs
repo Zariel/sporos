@@ -15,6 +15,13 @@ pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
 pub const DEFAULT_INJECTION_METADATA: &str = "sporos";
 pub const MAX_RUNTIME_WORKER_THREADS: usize = 256;
 pub const MAX_RUNTIME_BLOCKING_THREADS: usize = 512;
+pub const DEFAULT_SEARCH_QUEUE_LIMIT: usize = 100;
+pub const DEFAULT_INJECTION_QUEUE_LIMIT: usize = 100;
+pub const DEFAULT_INDEXING_QUEUE_LIMIT: usize = 50;
+pub const DEFAULT_NOTIFICATION_QUEUE_LIMIT: usize = 500;
+pub const DEFAULT_SEARCH_WORKER_CONCURRENCY: usize = 4;
+pub const MAX_RUNTIME_QUEUE_LIMIT: usize = 1_000_000;
+pub const MAX_SEARCH_WORKER_CONCURRENCY: usize = 256;
 const ENV_PREFIX: &str = "SPOROS__";
 static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -73,11 +80,28 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub worker_threads: Option<usize>,
     pub max_blocking_threads: Option<usize>,
+    pub search_queue_limit: usize,
+    pub indexing_queue_limit: usize,
+    pub notification_queue_limit: usize,
+    pub search_worker_concurrency: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: None,
+            max_blocking_threads: None,
+            search_queue_limit: DEFAULT_SEARCH_QUEUE_LIMIT,
+            indexing_queue_limit: DEFAULT_INDEXING_QUEUE_LIMIT,
+            notification_queue_limit: DEFAULT_NOTIFICATION_QUEUE_LIMIT,
+            search_worker_concurrency: DEFAULT_SEARCH_WORKER_CONCURRENCY,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
@@ -846,6 +870,26 @@ fn validate_runtime_threads(config: &SporosConfig) -> Result<(), ConfigError> {
         "runtime.max_blocking_threads",
         config.runtime.max_blocking_threads,
         MAX_RUNTIME_BLOCKING_THREADS,
+    )?;
+    validate_usize_range(
+        "runtime.search_queue_limit",
+        config.runtime.search_queue_limit,
+        MAX_RUNTIME_QUEUE_LIMIT,
+    )?;
+    validate_usize_range(
+        "runtime.indexing_queue_limit",
+        config.runtime.indexing_queue_limit,
+        MAX_RUNTIME_QUEUE_LIMIT,
+    )?;
+    validate_usize_range(
+        "runtime.notification_queue_limit",
+        config.runtime.notification_queue_limit,
+        MAX_RUNTIME_QUEUE_LIMIT,
+    )?;
+    validate_usize_range(
+        "runtime.search_worker_concurrency",
+        config.runtime.search_worker_concurrency,
+        MAX_SEARCH_WORKER_CONCURRENCY,
     )
 }
 
@@ -864,6 +908,17 @@ fn validate_optional_usize_range(
     Err(ConfigError::InvalidField {
         field,
         reason: format!("must be between 1 and {max} when configured"),
+    })
+}
+
+fn validate_usize_range(field: &'static str, value: usize, max: usize) -> Result<(), ConfigError> {
+    if (1..=max).contains(&value) {
+        return Ok(());
+    }
+
+    Err(ConfigError::InvalidField {
+        field,
+        reason: format!("must be between 1 and {max}"),
     })
 }
 
@@ -1459,6 +1514,10 @@ api_token_env = "optional env var containing bearer token"
 [runtime]
 worker_threads = "optional 1-256 integer; defaults to Tokio"
 max_blocking_threads = "optional 1-512 integer; defaults to Tokio"
+search_queue_limit = 100
+indexing_queue_limit = 50
+notification_queue_limit = 500
+search_worker_concurrency = 4
 
 [torrent_clients.<name>]
 kind = "qbittorrent|rtorrent"
@@ -1515,6 +1574,10 @@ SPOROS__SERVER__API_TOKEN_FILE = "/var/run/secrets/sporos-api-token"
 SPOROS__PATHS__DATABASE = "/data/state/sporos.db"
 SPOROS__RUNTIME__WORKER_THREADS = "4"
 SPOROS__RUNTIME__MAX_BLOCKING_THREADS = "64"
+SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT = "100"
+SPOROS__RUNTIME__INDEXING_QUEUE_LIMIT = "50"
+SPOROS__RUNTIME__NOTIFICATION_QUEUE_LIMIT = "500"
+SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY = "4"
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__INJECTION__RECHECK__SKIP_RECHECK = "false"
 SPOROS__INJECTION__RECHECK__MAX_REMAINING_BYTES = "104857600"
@@ -1602,6 +1665,10 @@ mod tests {
             [runtime]
             worker_threads = 4
             max_blocking_threads = 64
+            search_queue_limit = 250
+            indexing_queue_limit = 75
+            notification_queue_limit = 800
+            search_worker_concurrency = 8
 
             [torrent_clients.qbit_main]
             kind = "qbittorrent"
@@ -1623,6 +1690,10 @@ mod tests {
         );
         assert_eq!(Some(4), config.runtime.worker_threads);
         assert_eq!(Some(64), config.runtime.max_blocking_threads);
+        assert_eq!(250, config.runtime.search_queue_limit);
+        assert_eq!(75, config.runtime.indexing_queue_limit);
+        assert_eq!(800, config.runtime.notification_queue_limit);
+        assert_eq!(8, config.runtime.search_worker_concurrency);
         assert_eq!(1, config.torrent_clients.len());
         assert_eq!(1, config.indexers.torznab.len());
         assert_eq!(
@@ -1663,6 +1734,22 @@ mod tests {
 
         assert_eq!(None, config.runtime.worker_threads);
         assert_eq!(None, config.runtime.max_blocking_threads);
+        assert_eq!(
+            DEFAULT_SEARCH_QUEUE_LIMIT,
+            config.runtime.search_queue_limit
+        );
+        assert_eq!(
+            DEFAULT_INDEXING_QUEUE_LIMIT,
+            config.runtime.indexing_queue_limit
+        );
+        assert_eq!(
+            DEFAULT_NOTIFICATION_QUEUE_LIMIT,
+            config.runtime.notification_queue_limit
+        );
+        assert_eq!(
+            DEFAULT_SEARCH_WORKER_CONCURRENCY,
+            config.runtime.search_worker_concurrency
+        );
     }
 
     #[test]
@@ -1717,6 +1804,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_rejects_out_of_range_queue_and_worker_limits() {
+        for (field, value) in [
+            ("search_queue_limit", "0"),
+            ("indexing_queue_limit", "0"),
+            ("notification_queue_limit", "0"),
+            ("search_worker_concurrency", "0"),
+        ] {
+            let error = parse_config(&format!(
+                r#"
+                [runtime]
+                {field} = {value}
+                "#
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains(&format!("runtime.{field}")));
+        }
+
+        let queue_error = parse_config(
+            r#"
+            [runtime]
+            search_queue_limit = 1000001
+            "#,
+        )
+        .unwrap_err();
+        assert!(queue_error.to_string().contains("between 1 and 1000000"));
+
+        let worker_error = parse_config(
+            r#"
+            [runtime]
+            search_worker_concurrency = 257
+            "#,
+        )
+        .unwrap_err();
+        assert!(worker_error.to_string().contains("between 1 and 256"));
+    }
+
+    #[test]
     fn runtime_thread_counts_support_env_overrides() {
         let config = parse_config_with_env(
             "",
@@ -1726,12 +1850,32 @@ mod tests {
                     "SPOROS__RUNTIME__MAX_BLOCKING_THREADS".to_owned(),
                     "16".to_owned(),
                 ),
+                (
+                    "SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT".to_owned(),
+                    "250".to_owned(),
+                ),
+                (
+                    "SPOROS__RUNTIME__INDEXING_QUEUE_LIMIT".to_owned(),
+                    "75".to_owned(),
+                ),
+                (
+                    "SPOROS__RUNTIME__NOTIFICATION_QUEUE_LIMIT".to_owned(),
+                    "800".to_owned(),
+                ),
+                (
+                    "SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY".to_owned(),
+                    "8".to_owned(),
+                ),
             ],
         )
         .unwrap();
 
         assert_eq!(Some(3), config.runtime.worker_threads);
         assert_eq!(Some(16), config.runtime.max_blocking_threads);
+        assert_eq!(250, config.runtime.search_queue_limit);
+        assert_eq!(75, config.runtime.indexing_queue_limit);
+        assert_eq!(800, config.runtime.notification_queue_limit);
+        assert_eq!(8, config.runtime.search_worker_concurrency);
     }
 
     #[test]

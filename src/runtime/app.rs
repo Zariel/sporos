@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,7 +54,8 @@ use crate::runtime::shutdown::{
 
 const PROWLARR_REFRESH_CONCURRENCY: usize = 4;
 const INDEXER_CAPS_REFRESH_CONCURRENCY: usize = 4;
-const INDEXER_SEARCH_CONCURRENCY: usize = 4;
+#[cfg(test)]
+const INDEXER_SEARCH_CONCURRENCY: usize = crate::config::DEFAULT_SEARCH_WORKER_CONCURRENCY;
 const INDEXER_CAPS_REFRESH_PAGE_SIZE: u16 = 1_000;
 const INDEXER_SEARCH_CAPS_PAGE_SIZE: u16 = 1_000;
 
@@ -567,7 +569,7 @@ impl AppState {
             let mut search_error = None;
 
             loop {
-                while active.len() < INDEXER_SEARCH_CONCURRENCY
+                while active.len() < self.config.runtime.search_worker_concurrency
                     && endpoint_error.is_none()
                     && search_error.is_none()
                 {
@@ -949,7 +951,7 @@ impl AppRuntime {
         repository
             .sync_torznab_indexers(runtime_config.indexers.indexers(), now_ms)
             .await?;
-        let queue_config = RuntimeQueueConfig::default();
+        let queue_config = runtime_queue_config(&config);
         let (workflow, workflow_receivers) = workflow_queues(queue_config);
         let (scheduler_queue, scheduler_receiver) = scheduler_queue(queue_config.indexing_limit);
         let (inventory_queue, inventory_receiver) =
@@ -1014,9 +1016,9 @@ impl AppRuntime {
         let (shutdown, shutdown_signal) = shutdown_channel();
         let queues = RuntimeQueues {
             workflow: workflow.clone(),
-            scheduler: scheduler_queue,
-            inventory_refresh: inventory_queue,
-            notifications: notification_queue,
+            scheduler: scheduler_queue.clone(),
+            inventory_refresh: inventory_queue.clone(),
+            notifications: notification_queue.clone(),
         };
         let mut readiness = ReadinessState::ready();
         readiness.workers_running = false;
@@ -1032,6 +1034,10 @@ impl AppRuntime {
             .with_metrics(metrics.clone())
             .with_search_queue(workflow.searches.clone())
             .with_job_queue(workflow.jobs.clone())
+            .with_scheduler_queue(scheduler_queue.clone())
+            .with_inventory_refresh_queue(inventory_queue.clone())
+            .with_notification_queue(notification_queue.clone())
+            .with_search_worker_concurrency(config.runtime.search_worker_concurrency)
             .with_allowed_jobs(runtime_config.http_jobs)
             .with_announce_acceptor(repository.clone(), config.announce.clone());
         if let Some(api_token) = config.server.api_token.as_ref() {
@@ -1508,6 +1514,20 @@ fn workflow_queues(queue_config: RuntimeQueueConfig) -> (WorkflowQueues, Workflo
     )
 }
 
+fn runtime_queue_config(config: &SporosConfig) -> RuntimeQueueConfig {
+    RuntimeQueueConfig {
+        announcement_limit: nonzero_config(1_000),
+        search_limit: nonzero_config(config.runtime.search_queue_limit),
+        injection_limit: nonzero_config(crate::config::DEFAULT_INJECTION_QUEUE_LIMIT),
+        notification_limit: nonzero_config(config.runtime.notification_queue_limit),
+        indexing_limit: nonzero_config(config.runtime.indexing_queue_limit),
+    }
+}
+
+fn nonzero_config(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1519,6 +1539,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::announce::AnnounceQueueConfig;
     use crate::clients::runtime::CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY;
     use crate::config::{
         ArrInstanceConfig, ConfigTorrentClientKind, ProwlarrSourceConfig, TorrentClientConfig,
@@ -1547,6 +1568,10 @@ mod tests {
     async fn runtime_composes_services_from_config_and_repository() {
         let mut config = SporosConfig::default();
         config.scheduling.saved_retry_interval = "5m".to_owned();
+        config.runtime.search_queue_limit = 12;
+        config.runtime.indexing_queue_limit = 13;
+        config.runtime.notification_queue_limit = 14;
+        config.runtime.search_worker_concurrency = 7;
         config.torrent_clients.insert(
             "qbit".to_owned(),
             TorrentClientConfig {
@@ -1586,9 +1611,41 @@ mod tests {
         assert_eq!("https://indexer.example/api", indexers[0].url);
         assert_eq!("direct", indexers[0].api_key_source);
         assert_eq!(0, runtime.state.queues.workflow.announcements.stats().depth);
+        assert_eq!(12, runtime.state.queues.workflow.searches.stats().capacity);
+        assert_eq!(13, runtime.state.queues.workflow.jobs.stats().capacity);
         assert_eq!(0, runtime.state.queues.scheduler.stats().depth);
+        assert_eq!(13, runtime.state.queues.scheduler.stats().capacity);
         assert_eq!(0, runtime.state.queues.inventory_refresh.stats().depth);
+        assert_eq!(13, runtime.state.queues.inventory_refresh.stats().capacity);
         assert_eq!(0, runtime.state.queues.notifications.stats().depth);
+        assert_eq!(14, runtime.state.queues.notifications.stats().capacity);
+        assert_eq!(7, runtime.state.config.runtime.search_worker_concurrency);
+        let app = router(runtime.state.http.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let queues = status_json["runtime"]["queues"].as_array().unwrap();
+        assert_eq!(7, status_json["runtime"]["search_worker_concurrency"]);
+        assert_eq!(12, status_queue_capacity(queues, "search"));
+        assert_eq!(13, status_queue_capacity(queues, "indexing"));
+        assert_eq!(13, status_queue_capacity(queues, "scheduler"));
+        assert_eq!(13, status_queue_capacity(queues, "inventory_refresh"));
+        assert_eq!(14, status_queue_capacity(queues, "notification"));
+        assert!(!queues.iter().any(|queue| queue["kind"] == "announcement"));
+        assert_eq!(
+            u64::from(AnnounceQueueConfig::default().max_pending),
+            status_json["announce_queue"]["max_pending"]
+                .as_u64()
+                .unwrap()
+        );
         assert_eq!(1, runtime.state.injection_worker.client_count());
         assert_eq!(Duration::from_secs(300), runtime.state.saved_retry_interval);
         assert_eq!(
@@ -5335,6 +5392,15 @@ mod tests {
             builder = builder.header("authorization", auth);
         }
         builder.body(Body::from(r#"{"query":"Example"}"#)).unwrap()
+    }
+
+    fn status_queue_capacity(queues: &[serde_json::Value], kind: &str) -> usize {
+        queues
+            .iter()
+            .find(|queue| queue["kind"] == kind)
+            .and_then(|queue| queue["capacity"].as_u64())
+            .and_then(|capacity| usize::try_from(capacity).ok())
+            .unwrap_or_else(|| panic!("missing queue capacity for {kind}"))
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

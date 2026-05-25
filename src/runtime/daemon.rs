@@ -583,7 +583,14 @@ async fn process_search_workflow(
         ..SearchWorkflowExecutionSummary::default()
     };
 
-    process_search_candidates(state, planned.candidates, now_ms, shutdown, &mut summary).await?;
+    Box::pin(process_search_candidates(
+        state,
+        planned.candidates,
+        now_ms,
+        shutdown,
+        &mut summary,
+    ))
+    .await?;
 
     Ok(summary)
 }
@@ -3036,9 +3043,15 @@ mod tests {
         };
         let signal = runtime.state.shutdown_signal.clone();
 
-        process_search_candidates(runtime.state, candidates, now_ms, signal, &mut summary)
-            .await
-            .unwrap();
+        Box::pin(process_search_candidates(
+            runtime.state,
+            candidates,
+            now_ms,
+            signal,
+            &mut summary,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(
             SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY,
@@ -3111,13 +3124,13 @@ mod tests {
         };
         let signal = runtime.state.shutdown_signal.clone();
 
-        process_search_candidates(
+        Box::pin(process_search_candidates(
             runtime.state,
             candidates,
             unix_time_ms(),
             signal,
             &mut summary,
-        )
+        ))
         .await
         .unwrap();
 
@@ -3194,13 +3207,13 @@ mod tests {
         };
         let signal = runtime.state.shutdown_signal.clone();
 
-        process_search_candidates(
+        Box::pin(process_search_candidates(
             runtime.state,
             candidates,
             unix_time_ms(),
             signal,
             &mut summary,
-        )
+        ))
         .await
         .unwrap();
 

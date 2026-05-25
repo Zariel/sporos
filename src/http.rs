@@ -28,13 +28,16 @@ use crate::announce::{
 };
 use crate::domain::{ByteSize, CandidateGuid, DownloadUrl, ItemTitle, JobName, TrackerName};
 use crate::errors::DatabaseError;
+use crate::inventory_refresh::InventoryRefreshRequest;
 use crate::metrics::{
     HttpMethod, HttpRoute, MetricsRegistry, MetricsSnapshot, WorkflowMetric, WorkflowOutcome,
 };
+use crate::notifications::NotificationJob;
 use crate::persistence::repository::{AnnounceInsertResult, AnnounceQueueSnapshot, Repository};
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
+use crate::runtime::scheduler::ScheduledJobRun;
 use crate::secrets::{CookieSecret, sanitize_url_for_logging};
 
 const WORKFLOW_BODY_LIMIT_BYTES: usize = 16 * 1024;
@@ -102,6 +105,10 @@ pub struct HttpState {
     workflow_queues: Option<WorkflowQueues>,
     search_queue: Option<BoundedWorkQueue<SearchWorkflowRequest>>,
     job_queue: Option<BoundedWorkQueue<JobRunWorkflowRequest>>,
+    scheduler_queue: Option<BoundedWorkQueue<ScheduledJobRun>>,
+    inventory_refresh_queue: Option<BoundedWorkQueue<InventoryRefreshRequest>>,
+    notification_queue: Option<BoundedWorkQueue<NotificationJob>>,
+    search_worker_concurrency: usize,
     allowed_jobs: Option<Arc<BTreeSet<JobName>>>,
     announce_acceptor: Option<AnnounceAcceptor>,
     announce_download_resolver: AnnounceDownloadUrlResolver,
@@ -120,6 +127,10 @@ impl HttpState {
             workflow_queues: None,
             search_queue: None,
             job_queue: None,
+            scheduler_queue: None,
+            inventory_refresh_queue: None,
+            notification_queue: None,
+            search_worker_concurrency: crate::config::DEFAULT_SEARCH_WORKER_CONCURRENCY,
             allowed_jobs: None,
             announce_acceptor: None,
             announce_download_resolver: AnnounceDownloadUrlResolver::system(),
@@ -153,6 +164,35 @@ impl HttpState {
 
     pub fn with_job_queue(mut self, job_queue: BoundedWorkQueue<JobRunWorkflowRequest>) -> Self {
         self.job_queue = Some(job_queue);
+        self
+    }
+
+    pub fn with_scheduler_queue(
+        mut self,
+        scheduler_queue: BoundedWorkQueue<ScheduledJobRun>,
+    ) -> Self {
+        self.scheduler_queue = Some(scheduler_queue);
+        self
+    }
+
+    pub fn with_inventory_refresh_queue(
+        mut self,
+        inventory_refresh_queue: BoundedWorkQueue<InventoryRefreshRequest>,
+    ) -> Self {
+        self.inventory_refresh_queue = Some(inventory_refresh_queue);
+        self
+    }
+
+    pub fn with_notification_queue(
+        mut self,
+        notification_queue: BoundedWorkQueue<NotificationJob>,
+    ) -> Self {
+        self.notification_queue = Some(notification_queue);
+        self
+    }
+
+    pub fn with_search_worker_concurrency(mut self, concurrency: usize) -> Self {
+        self.search_worker_concurrency = concurrency;
         self
     }
 
@@ -262,7 +302,11 @@ impl HttpState {
 
     fn queue_stats(&self) -> Vec<crate::runtime::queue::QueueStats> {
         if let Some(workflow_queues) = self.workflow_queues.as_ref() {
-            return workflow_queues.stats();
+            let mut queues = workflow_queues.stats();
+            if let Some(notification_queue) = self.notification_queue.as_ref() {
+                queues.push(notification_queue.stats());
+            }
+            return queues;
         }
         let mut queues = Vec::new();
         if let Some(search_queue) = self.search_queue.as_ref() {
@@ -270,6 +314,62 @@ impl HttpState {
         }
         if let Some(job_queue) = self.job_queue.as_ref() {
             queues.push(job_queue.stats());
+        }
+        if let Some(notification_queue) = self.notification_queue.as_ref() {
+            queues.push(notification_queue.stats());
+        }
+        queues
+    }
+
+    fn runtime_status(&self) -> RuntimeStatusResponse {
+        RuntimeStatusResponse {
+            search_worker_concurrency: self.search_worker_concurrency,
+            queues: self.runtime_queue_statuses(),
+        }
+    }
+
+    fn runtime_queue_statuses(&self) -> Vec<QueueStatusResponse> {
+        let mut queues = Vec::new();
+        if let Some(workflow_queues) = self.workflow_queues.as_ref() {
+            queues.extend([
+                QueueStatusResponse::from_stats(
+                    "announcement",
+                    workflow_queues.announcements.stats(),
+                ),
+                QueueStatusResponse::from_stats("search", workflow_queues.searches.stats()),
+                QueueStatusResponse::from_stats("indexing", workflow_queues.jobs.stats()),
+            ]);
+        } else {
+            if let Some(search_queue) = self.search_queue.as_ref() {
+                queues.push(QueueStatusResponse::from_stats(
+                    "search",
+                    search_queue.stats(),
+                ));
+            }
+            if let Some(job_queue) = self.job_queue.as_ref() {
+                queues.push(QueueStatusResponse::from_stats(
+                    "indexing",
+                    job_queue.stats(),
+                ));
+            }
+        }
+        if let Some(scheduler_queue) = self.scheduler_queue.as_ref() {
+            queues.push(QueueStatusResponse::from_stats(
+                "scheduler",
+                scheduler_queue.stats(),
+            ));
+        }
+        if let Some(inventory_refresh_queue) = self.inventory_refresh_queue.as_ref() {
+            queues.push(QueueStatusResponse::from_stats(
+                "inventory_refresh",
+                inventory_refresh_queue.stats(),
+            ));
+        }
+        if let Some(notification_queue) = self.notification_queue.as_ref() {
+            queues.push(QueueStatusResponse::from_stats(
+                "notification",
+                notification_queue.stats(),
+            ));
         }
         queues
     }
@@ -496,8 +596,40 @@ struct ReadinessResponse {
 struct StatusResponse {
     status: &'static str,
     readiness: ReadinessResponse,
+    runtime: RuntimeStatusResponse,
     announce_queue: Option<AnnounceQueueStatusResponse>,
     announce_queue_error: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeStatusResponse {
+    search_worker_concurrency: usize,
+    queues: Vec<QueueStatusResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueStatusResponse {
+    kind: String,
+    capacity: usize,
+    depth: usize,
+    accepted: u64,
+    rejected: u64,
+    completed: u64,
+    cancelled: u64,
+}
+
+impl QueueStatusResponse {
+    fn from_stats(kind: impl Into<String>, stats: crate::runtime::queue::QueueStats) -> Self {
+        Self {
+            kind: kind.into(),
+            capacity: stats.capacity,
+            depth: stats.depth,
+            accepted: stats.accepted,
+            rejected: stats.rejected,
+            completed: stats.completed,
+            cancelled: stats.cancelled,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -912,6 +1044,7 @@ async fn status(State(state): State<HttpState>) -> impl IntoResponse {
         Json(StatusResponse {
             status: "ok",
             readiness,
+            runtime: state.runtime_status(),
             announce_queue,
             announce_queue_error,
         }),
@@ -1666,6 +1799,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_reports_runtime_queue_and_worker_capacity() {
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(11));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(12));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(13));
+        let (notifications, _notification_receiver) =
+            bounded_work_queue::<NotificationJob>(QueueKind::Notification, nonzero(14));
+        let state = HttpState::new(ReadinessState::ready(), HealthRegistry::new())
+            .with_workflow_queues(WorkflowQueues {
+                announcements,
+                searches,
+                jobs,
+            })
+            .with_notification_queue(notifications)
+            .with_search_worker_concurrency(7);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let queues = json["runtime"]["queues"].as_array().unwrap();
+
+        assert_eq!(7, json["runtime"]["search_worker_concurrency"]);
+        assert_queue_capacity(queues, "announcement", 11);
+        assert_queue_capacity(queues, "search", 12);
+        assert_queue_capacity(queues, "indexing", 13);
+        assert_queue_capacity(queues, "notification", 14);
+    }
+
+    #[tokio::test]
     async fn metrics_route_exports_prometheus_text() {
         let (app, _announcements, _searches, _jobs) = workflow_app(None);
         let search = app
@@ -2399,6 +2572,14 @@ mod tests {
             builder = builder.header(header::AUTHORIZATION, authorization);
         }
         builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn assert_queue_capacity(queues: &[Value], kind: &str, capacity: usize) {
+        let queue = queues
+            .iter()
+            .find(|queue| queue["kind"] == kind)
+            .unwrap_or_else(|| panic!("missing queue status for {kind}"));
+        assert_eq!(capacity, queue["capacity"]);
     }
 
     fn nonzero(value: usize) -> NonZeroUsize {
