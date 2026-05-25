@@ -33,6 +33,8 @@ search_queue_limit = 100
 indexing_queue_limit = 50
 notification_queue_limit = 500
 search_worker_concurrency = 4
+manual_search_per_indexer_result_limit = 1000
+manual_search_workflow_result_limit = 10000
 
 [torrent_clients.qbit_main]
 kind = "qbittorrent"
@@ -115,8 +117,10 @@ The runtime queue limits bound accepted in-memory workflow requests before
 backpressure is returned to callers. The defaults are intentionally conservative:
 100 search requests, 50 indexing job requests, and 500 notification jobs.
 `runtime.search_worker_concurrency` controls concurrent indexer search fan-out
-for one search workflow. Announcement admission is durable and is bounded by
-`announce.max_pending`.
+for one search workflow. `runtime.manual_search_per_indexer_result_limit` caps
+one indexer response, and `runtime.manual_search_workflow_result_limit` caps the
+total candidates accepted for one manual search workflow. Announcement admission
+is durable and is bounded by `announce.max_pending`.
 
 ## Server And Auth
 
@@ -285,6 +289,8 @@ SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT='100'
 SPOROS__RUNTIME__INDEXING_QUEUE_LIMIT='50'
 SPOROS__RUNTIME__NOTIFICATION_QUEUE_LIMIT='500'
 SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY='4'
+SPOROS__RUNTIME__MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT='1000'
+SPOROS__RUNTIME__MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT='10000'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-password"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'

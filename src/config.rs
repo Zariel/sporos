@@ -20,8 +20,11 @@ pub const DEFAULT_INJECTION_QUEUE_LIMIT: usize = 100;
 pub const DEFAULT_INDEXING_QUEUE_LIMIT: usize = 50;
 pub const DEFAULT_NOTIFICATION_QUEUE_LIMIT: usize = 500;
 pub const DEFAULT_SEARCH_WORKER_CONCURRENCY: usize = 4;
+pub const DEFAULT_MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT: usize = 1_000;
+pub const DEFAULT_MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT: usize = 10_000;
 pub const MAX_RUNTIME_QUEUE_LIMIT: usize = 1_000_000;
 pub const MAX_SEARCH_WORKER_CONCURRENCY: usize = 256;
+pub const MAX_MANUAL_SEARCH_RESULT_LIMIT: usize = 1_000_000;
 const ENV_PREFIX: &str = "SPOROS__";
 static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -89,6 +92,8 @@ pub struct RuntimeConfig {
     pub indexing_queue_limit: usize,
     pub notification_queue_limit: usize,
     pub search_worker_concurrency: usize,
+    pub manual_search_per_indexer_result_limit: usize,
+    pub manual_search_workflow_result_limit: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -100,6 +105,8 @@ impl Default for RuntimeConfig {
             indexing_queue_limit: DEFAULT_INDEXING_QUEUE_LIMIT,
             notification_queue_limit: DEFAULT_NOTIFICATION_QUEUE_LIMIT,
             search_worker_concurrency: DEFAULT_SEARCH_WORKER_CONCURRENCY,
+            manual_search_per_indexer_result_limit: DEFAULT_MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT,
+            manual_search_workflow_result_limit: DEFAULT_MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT,
         }
     }
 }
@@ -890,6 +897,16 @@ fn validate_runtime_threads(config: &SporosConfig) -> Result<(), ConfigError> {
         "runtime.search_worker_concurrency",
         config.runtime.search_worker_concurrency,
         MAX_SEARCH_WORKER_CONCURRENCY,
+    )?;
+    validate_usize_range(
+        "runtime.manual_search_per_indexer_result_limit",
+        config.runtime.manual_search_per_indexer_result_limit,
+        MAX_MANUAL_SEARCH_RESULT_LIMIT,
+    )?;
+    validate_usize_range(
+        "runtime.manual_search_workflow_result_limit",
+        config.runtime.manual_search_workflow_result_limit,
+        MAX_MANUAL_SEARCH_RESULT_LIMIT,
     )
 }
 
@@ -1518,6 +1535,8 @@ search_queue_limit = 100
 indexing_queue_limit = 50
 notification_queue_limit = 500
 search_worker_concurrency = 4
+manual_search_per_indexer_result_limit = 1000
+manual_search_workflow_result_limit = 10000
 
 [torrent_clients.<name>]
 kind = "qbittorrent|rtorrent"
@@ -1578,6 +1597,8 @@ SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT = "100"
 SPOROS__RUNTIME__INDEXING_QUEUE_LIMIT = "50"
 SPOROS__RUNTIME__NOTIFICATION_QUEUE_LIMIT = "500"
 SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY = "4"
+SPOROS__RUNTIME__MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT = "1000"
+SPOROS__RUNTIME__MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT = "10000"
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__INJECTION__RECHECK__SKIP_RECHECK = "false"
 SPOROS__INJECTION__RECHECK__MAX_REMAINING_BYTES = "104857600"
@@ -1669,6 +1690,8 @@ mod tests {
             indexing_queue_limit = 75
             notification_queue_limit = 800
             search_worker_concurrency = 8
+            manual_search_per_indexer_result_limit = 333
+            manual_search_workflow_result_limit = 444
 
             [torrent_clients.qbit_main]
             kind = "qbittorrent"
@@ -1694,6 +1717,8 @@ mod tests {
         assert_eq!(75, config.runtime.indexing_queue_limit);
         assert_eq!(800, config.runtime.notification_queue_limit);
         assert_eq!(8, config.runtime.search_worker_concurrency);
+        assert_eq!(333, config.runtime.manual_search_per_indexer_result_limit);
+        assert_eq!(444, config.runtime.manual_search_workflow_result_limit);
         assert_eq!(1, config.torrent_clients.len());
         assert_eq!(1, config.indexers.torznab.len());
         assert_eq!(
@@ -1749,6 +1774,14 @@ mod tests {
         assert_eq!(
             DEFAULT_SEARCH_WORKER_CONCURRENCY,
             config.runtime.search_worker_concurrency
+        );
+        assert_eq!(
+            DEFAULT_MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT,
+            config.runtime.manual_search_per_indexer_result_limit
+        );
+        assert_eq!(
+            DEFAULT_MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT,
+            config.runtime.manual_search_workflow_result_limit
         );
     }
 
@@ -1810,6 +1843,8 @@ mod tests {
             ("indexing_queue_limit", "0"),
             ("notification_queue_limit", "0"),
             ("search_worker_concurrency", "0"),
+            ("manual_search_per_indexer_result_limit", "0"),
+            ("manual_search_workflow_result_limit", "0"),
         ] {
             let error = parse_config(&format!(
                 r#"
@@ -1838,6 +1873,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(worker_error.to_string().contains("between 1 and 256"));
+
+        let search_cap_error = parse_config(
+            r#"
+            [runtime]
+            manual_search_workflow_result_limit = 1000001
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            search_cap_error
+                .to_string()
+                .contains("between 1 and 1000000")
+        );
     }
 
     #[test]
@@ -1866,6 +1914,14 @@ mod tests {
                     "SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY".to_owned(),
                     "8".to_owned(),
                 ),
+                (
+                    "SPOROS__RUNTIME__MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT".to_owned(),
+                    "333".to_owned(),
+                ),
+                (
+                    "SPOROS__RUNTIME__MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT".to_owned(),
+                    "444".to_owned(),
+                ),
             ],
         )
         .unwrap();
@@ -1876,6 +1932,8 @@ mod tests {
         assert_eq!(75, config.runtime.indexing_queue_limit);
         assert_eq!(800, config.runtime.notification_queue_limit);
         assert_eq!(8, config.runtime.search_worker_concurrency);
+        assert_eq!(333, config.runtime.manual_search_per_indexer_result_limit);
+        assert_eq!(444, config.runtime.manual_search_workflow_result_limit);
     }
 
     #[test]

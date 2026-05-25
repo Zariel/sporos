@@ -216,7 +216,7 @@ impl TorznabHttpClient {
             })
             .await?;
 
-        parse_torznab_rss(&response, endpoint)
+        parse_torznab_rss_limited(&response, endpoint, usize::from(limit))
     }
 
     pub async fn rss(
@@ -1238,6 +1238,14 @@ pub fn parse_torznab_rss(
     xml: &str,
     endpoint: &TorznabEndpoint,
 ) -> Result<Vec<RemoteCandidate>, TorznabRequestError> {
+    parse_torznab_rss_limited(xml, endpoint, usize::MAX)
+}
+
+fn parse_torznab_rss_limited(
+    xml: &str,
+    endpoint: &TorznabEndpoint,
+    candidate_limit: usize,
+) -> Result<Vec<RemoteCandidate>, TorznabRequestError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
@@ -1302,7 +1310,15 @@ pub fn parse_torznab_rss(
                         });
                     };
                     match builder.into_candidate(endpoint) {
-                        Ok(candidate) => candidates.push(candidate),
+                        Ok(candidate) => {
+                            if candidates.len() >= candidate_limit {
+                                break;
+                            }
+                            candidates.push(candidate);
+                            if candidates.len() >= candidate_limit {
+                                break;
+                            }
+                        }
                         Err(TorznabRequestError::InvalidCandidate { message }) => {
                             warn!(
                                 indexer = %endpoint.name,

@@ -590,6 +590,9 @@ impl AppState {
         let mut search_ordinal = 0_usize;
         let mut next_emit_ordinal = 0_usize;
         let mut candidate_count = 0_usize;
+        let mut reserved_candidate_count = 0_usize;
+        let workflow_result_limit = self.config.runtime.manual_search_workflow_result_limit;
+        let per_indexer_result_limit = self.config.runtime.manual_search_per_indexer_result_limit;
 
         loop {
             let indexers = self
@@ -612,6 +615,8 @@ impl AppState {
             loop {
                 while active.len() < self.config.runtime.search_worker_concurrency
                     && search_ordinal.saturating_sub(next_emit_ordinal) < reorder_window
+                    && candidate_count.saturating_add(reserved_candidate_count)
+                        < workflow_result_limit
                     && endpoint_error.is_none()
                     && search_error.is_none()
                 {
@@ -619,9 +624,21 @@ impl AppState {
                         break;
                     };
                     after_name = Some(indexer.name.clone());
-                    let Some(plan) = plan_runtime_torznab_search(&item, &ids, &indexer.caps) else {
+                    let Some(mut plan) = plan_runtime_torznab_search(&item, &ids, &indexer.caps)
+                    else {
                         continue;
                     };
+                    let remaining_budget = workflow_result_limit
+                        .saturating_sub(candidate_count)
+                        .saturating_sub(reserved_candidate_count);
+                    let reserved_result_count = capped_torznab_limit(
+                        plan.plan.limit,
+                        per_indexer_result_limit.min(remaining_budget),
+                    );
+                    if reserved_result_count == 0 {
+                        continue;
+                    }
+                    plan.plan.limit = u16::try_from(reserved_result_count).unwrap_or(u16::MAX);
                     let endpoint = match self.search_caps_endpoint(&indexer) {
                         Ok(Some(endpoint)) => endpoint,
                         Ok(None) => continue,
@@ -632,6 +649,8 @@ impl AppState {
                     };
                     let ordinal = search_ordinal;
                     search_ordinal = search_ordinal.saturating_add(1);
+                    reserved_candidate_count =
+                        reserved_candidate_count.saturating_add(reserved_result_count);
                     plans.push(IndexerSearchPlan {
                         indexer_id: indexer.indexer_id,
                         indexer_name: indexer.name,
@@ -642,6 +661,7 @@ impl AppState {
                     active.push(async move {
                         (
                             ordinal,
+                            reserved_result_count,
                             state
                                 .search_indexer_endpoint(endpoint, media_type, plan, now_ms)
                                 .await,
@@ -649,22 +669,35 @@ impl AppState {
                     });
                 }
 
-                let Some((ordinal, result)) = active.next().await else {
+                let Some((ordinal, reserved_result_count, result)) = active.next().await else {
                     break;
                 };
                 match result {
                     Ok(result) => {
-                        completed_results.insert(ordinal, result);
+                        completed_results.insert(
+                            ordinal,
+                            SearchResultSlot {
+                                reserved: reserved_result_count,
+                                result,
+                            },
+                        );
                         emit_ready_search_results(
                             &mut completed_results,
                             &mut next_emit_ordinal,
                             &mut failed_indexers,
                             &mut candidate_count,
+                            &mut reserved_candidate_count,
+                            workflow_result_limit,
                             sink,
                         )
                         .await?;
+                        if candidate_count >= workflow_result_limit {
+                            break;
+                        }
                     }
                     Err(error) => {
+                        reserved_candidate_count =
+                            reserved_candidate_count.saturating_sub(reserved_result_count);
                         search_error = Some(error);
                     }
                 }
@@ -676,6 +709,10 @@ impl AppState {
             if let Some(error) = search_error {
                 return Err(error);
             }
+            if candidate_count >= workflow_result_limit {
+                warn_search_workflow_cap(workflow_result_limit);
+                break;
+            }
             if is_last_page {
                 break;
             }
@@ -686,6 +723,8 @@ impl AppState {
             &mut next_emit_ordinal,
             &mut failed_indexers,
             &mut candidate_count,
+            &mut reserved_candidate_count,
+            workflow_result_limit,
             sink,
         )
         .await?;
@@ -928,6 +967,11 @@ enum IndexerSearchResult {
     Failed,
 }
 
+struct SearchResultSlot {
+    reserved: usize,
+    result: IndexerSearchResult,
+}
+
 enum SearchCandidateSink {
     Collect(Vec<RemoteCandidate>),
     Send {
@@ -974,16 +1018,28 @@ impl SearchCandidateSink {
 }
 
 async fn emit_ready_search_results(
-    completed_results: &mut BTreeMap<usize, IndexerSearchResult>,
+    completed_results: &mut BTreeMap<usize, SearchResultSlot>,
     next_emit_ordinal: &mut usize,
     failed_indexers: &mut usize,
     candidate_count: &mut usize,
+    reserved_candidate_count: &mut usize,
+    workflow_result_limit: usize,
     sink: &mut SearchCandidateSink,
 ) -> Result<(), DatabaseError> {
-    while let Some(result) = completed_results.remove(next_emit_ordinal) {
+    while let Some(slot) = completed_results.remove(next_emit_ordinal) {
         *next_emit_ordinal = (*next_emit_ordinal).saturating_add(1);
-        match result {
-            IndexerSearchResult::Succeeded(candidates) => {
+        *reserved_candidate_count = reserved_candidate_count.saturating_sub(slot.reserved);
+        match slot.result {
+            IndexerSearchResult::Succeeded(mut candidates) => {
+                let remaining = workflow_result_limit.saturating_sub(*candidate_count);
+                if remaining == 0 {
+                    warn_search_workflow_cap(workflow_result_limit);
+                    return Ok(());
+                }
+                if candidates.len() > remaining {
+                    warn_search_workflow_cap(workflow_result_limit);
+                    candidates.truncate(remaining);
+                }
                 let sent = sink.send_candidates(candidates).await?;
                 *candidate_count = candidate_count.saturating_add(sent);
             }
@@ -993,6 +1049,17 @@ async fn emit_ready_search_results(
         }
     }
     Ok(())
+}
+
+fn capped_torznab_limit(plan_limit: u16, configured_limit: usize) -> usize {
+    usize::from(plan_limit).min(configured_limit)
+}
+
+fn warn_search_workflow_cap(workflow_result_limit: usize) {
+    tracing::warn!(
+        workflow_result_limit,
+        "manual search workflow result limit reached"
+    );
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -3353,6 +3420,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_workflow_enforces_per_indexer_result_cap() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let torznab_url =
+            spawn_runtime_torznab_dynamic_server(Arc::clone(&queries), |query, _call| {
+                if query.contains("t=caps") {
+                    (StatusCode::OK, torznab_caps_xml().to_owned())
+                } else {
+                    (StatusCode::OK, search_rss_many("candidate", 5))
+                }
+            })
+            .await;
+        let mut config = SporosConfig::default();
+        config.runtime.manual_search_per_indexer_result_limit = 3;
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: torznab_url,
+                api_key: Some(ApiKey::new("indexer-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(&DependencyName::new("main").unwrap(), &movie_caps(), 100)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(3, summary.candidate_count);
+        assert_eq!(3, summary.candidates.len());
+        let queries = queries.lock().unwrap();
+        assert_eq!(1, queries.len());
+        assert!(queries[0].contains("limit=3"));
+    }
+
+    #[tokio::test]
+    async fn search_workflow_enforces_workflow_result_cap() {
+        let mut config = SporosConfig::default();
+        config.runtime.manual_search_per_indexer_result_limit = 4;
+        config.runtime.manual_search_workflow_result_limit = 5;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for name in ["alpha", "bravo"] {
+            let torznab_url = spawn_runtime_torznab_dynamic_server(
+                Arc::new(Mutex::new(Vec::new())),
+                move |query, _call| {
+                    if query.contains("t=caps") {
+                        (StatusCode::OK, torznab_caps_xml().to_owned())
+                    } else {
+                        (StatusCode::OK, search_rss_many(name, 8))
+                    }
+                },
+            )
+            .await;
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in ["alpha", "bravo"] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(5, summary.candidate_count);
+        assert_eq!(
+            vec!["alpha-0", "alpha-1", "alpha-2", "alpha-3", "bravo-0"],
+            summary
+                .candidates
+                .iter()
+                .map(|candidate| candidate.guid.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_workflow_reserves_workflow_cap_before_launching_indexers() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let alpha_in_flight = Arc::new(AtomicBool::new(false));
+        let release_alpha = Arc::new(tokio::sync::Notify::new());
+        let mut config = SporosConfig::default();
+        config.runtime.search_worker_concurrency = 4;
+        config.runtime.manual_search_per_indexer_result_limit = 10;
+        config.runtime.manual_search_workflow_result_limit = 1;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for name in ["alpha", "bravo", "charlie", "delta"] {
+            let torznab_url = if name == "alpha" {
+                spawn_runtime_torznab_blocked_search_server(
+                    Arc::clone(&queries),
+                    name,
+                    Arc::clone(&alpha_in_flight),
+                    Arc::clone(&release_alpha),
+                )
+                .await
+            } else {
+                spawn_runtime_torznab_dynamic_server(Arc::clone(&queries), move |query, _call| {
+                    if query.contains("t=caps") {
+                        (StatusCode::OK, torznab_caps_xml().to_owned())
+                    } else {
+                        (StatusCode::OK, search_rss_many(name, 10))
+                    }
+                })
+                .await
+            };
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in ["alpha", "bravo", "charlie", "delta"] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        let (_shutdown, shutdown_signal) = shutdown_channel();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let state = runtime.state.clone();
+        let handle = tokio::spawn(async move {
+            state
+                .stream_search_workflow_candidates(
+                    SearchWorkflowRequest {
+                        query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                    },
+                    1_000,
+                    sender,
+                    shutdown_signal,
+                )
+                .await
+        });
+
+        wait_for_query_count(&queries, 1).await;
+        assert!(alpha_in_flight.load(Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            1,
+            queries.lock().unwrap().len(),
+            "workflow cap reservation should prevent later indexer launches"
+        );
+        release_alpha.notify_one();
+        let candidate = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!("alpha", candidate.guid.as_str());
+        let summary = handle.await.unwrap().unwrap();
+        assert_eq!(1, summary.plans.len());
+        assert_eq!(1, summary.candidate_count);
+    }
+
+    #[tokio::test]
+    async fn search_workflow_skips_zero_limit_indexers() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let ok_url = spawn_runtime_torznab_search_server(Arc::clone(&queries)).await;
+        let mut config = SporosConfig::default();
+        config.indexers.torznab.insert(
+            "zero".to_owned(),
+            TorznabIndexerConfig {
+                url: "https://zero.example/api".to_owned(),
+                api_key: Some(ApiKey::new("zero-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        config.indexers.torznab.insert(
+            "zz-ok".to_owned(),
+            TorznabIndexerConfig {
+                url: ok_url,
+                api_key: Some(ApiKey::new("ok-secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(
+                &DependencyName::new("zero").unwrap(),
+                &TorznabCaps {
+                    limits: TorznabLimits { default: 0, max: 0 },
+                    ..movie_caps()
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(&DependencyName::new("zz-ok").unwrap(), &movie_caps(), 100)
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .state
+            .plan_search_workflow(
+                SearchWorkflowRequest {
+                    query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.plans.len());
+        assert_eq!("zz-ok", summary.plans[0].indexer_name.as_str());
+        assert_eq!(1, summary.candidate_count);
+        assert_eq!(1, queries.lock().unwrap().len());
+    }
+
+    #[tokio::test]
     async fn search_workflow_planning_keeps_candidates_after_one_indexer_fails() {
         let ok_queries = Arc::new(Mutex::new(Vec::new()));
         let failing_queries = Arc::new(Mutex::new(Vec::new()));
@@ -5700,6 +6028,26 @@ mod tests {
             </rss>
             "#
         )
+    }
+
+    fn search_rss_many(guid_prefix: &str, candidate_count: usize) -> String {
+        let mut body = "<rss><channel>".to_owned();
+        for index in 0..candidate_count {
+            let guid = format!("{guid_prefix}-{index}");
+            body.push_str(&format!(
+                r#"
+                <item>
+                  <title>Example {guid}</title>
+                  <guid>{guid}</guid>
+                  <link>https://indexer.example/download/{guid}</link>
+                  <torznab:attr name="size" value="1234"/>
+                  <torznab:attr name="infohash" value="0123456789abcdef0123456789abcdef01234567"/>
+                </item>
+                "#
+            ));
+        }
+        body.push_str("</channel></rss>");
+        body
     }
 
     fn torznab_caps_xml() -> &'static str {
