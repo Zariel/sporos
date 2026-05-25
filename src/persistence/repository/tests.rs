@@ -2670,6 +2670,37 @@ async fn announce_insert_persists_fetch_material() {
 }
 
 #[tokio::test]
+async fn targeted_announce_fetch_scrub_clears_active_material() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut work = test_announce_work("ann_fetch_scrubbed", "guid-fetch-scrubbed", 1);
+    work.fetch = Some(test_announce_fetch_material());
+    repository
+        .insert_or_dedupe_announce_work(&work, 10)
+        .await
+        .unwrap();
+    let claimed = repository
+        .claim_announce_work("worker-1", 1, 100, 1)
+        .await
+        .unwrap();
+
+    assert!(
+        repository
+            .scrub_announce_fetch_material(&claimed[0], 2)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        repository
+            .announce_fetch_material(&work.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_announce_fetch_columns_cleared(&repository, work.id.as_str()).await;
+}
+
+#[tokio::test]
 async fn non_terminal_announce_states_retain_sensitive_fetch_material() {
     let repository = Repository::connect_in_memory().await.unwrap();
     let mut work = test_announce_work("ann_fetch_states", "guid-fetch-states", 1);

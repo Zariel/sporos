@@ -3280,6 +3280,31 @@ impl Repository {
         Ok(Some(material))
     }
 
+    pub async fn scrub_announce_fetch_material(
+        &self,
+        id: &AnnounceWorkId,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET download_url = NULL,
+                cookie = NULL,
+                updated_at = ?
+            WHERE id = ?
+              AND status IN ('queued', 'running', 'waiting', 'retryable')
+              AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+            "#,
+        )
+        .bind(now_ms)
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("scrub announce fetch material", error))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn schedule_announce_dependency_backoff(
         &self,
         now_ms: i64,

@@ -24,7 +24,7 @@ use crate::content_filter::{ContentFilterConfig, ContentFilterContext, Permille}
 use crate::domain::{
     CandidateAssessment, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash,
     InjectionOutcome, JobName, LocalFile, LocalItem, MatchDecision, ReasonText, RemoteCandidate,
-    RemoteCandidateId,
+    RemoteCandidateId, TrackerName,
 };
 use crate::errors::{ConfigError, DatabaseError};
 use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
@@ -1668,17 +1668,20 @@ async fn process_announce_work(
     };
     let prepared = PreparedAnnounceCandidateStage {
         state,
+        id: id.clone(),
         candidate,
         context,
         shutdown,
     };
-    let prepared = match initial_announce_lookup_stage(prepared).await {
-        AnnounceInitialLookupStage::NeedsDownload(prepared) => *prepared,
+    let downloaded = match initial_announce_lookup_stage(prepared).await {
+        AnnounceInitialLookupStage::NeedsDownload(prepared) => {
+            match download_announce_candidate_stage(*prepared).await {
+                AnnounceDownloadStage::Downloaded(downloaded) => *downloaded,
+                AnnounceDownloadStage::Finished(outcome) => return outcome,
+            }
+        }
+        AnnounceInitialLookupStage::Cached(downloaded) => *downloaded,
         AnnounceInitialLookupStage::Finished(outcome) => return outcome,
-    };
-    let downloaded = match download_announce_candidate_stage(prepared).await {
-        AnnounceDownloadStage::Downloaded(downloaded) => *downloaded,
-        AnnounceDownloadStage::Finished(outcome) => return outcome,
     };
     let error_context = downloaded.context.clone();
 
@@ -1707,6 +1710,7 @@ struct AnnounceWorkflowContext {
 #[derive(Clone)]
 struct PreparedAnnounceCandidateStage {
     state: AppState,
+    id: AnnounceWorkId,
     candidate: RuntimeAnnounceCandidate,
     context: AnnounceWorkflowContext,
     shutdown: ShutdownSignal,
@@ -1714,6 +1718,7 @@ struct PreparedAnnounceCandidateStage {
 
 enum AnnounceInitialLookupStage {
     NeedsDownload(Box<PreparedAnnounceCandidateStage>),
+    Cached(Box<DownloadedAnnounceCandidate>),
     Finished(AnnounceWorkOutcome),
 }
 
@@ -1751,6 +1756,14 @@ async fn initial_announce_lookup_stage(
         ReverseLookupOutcome::NeedsTorrentDownload { .. } => {
             AnnounceInitialLookupStage::NeedsDownload(Box::new(input))
         }
+        ReverseLookupOutcome::Matched { .. }
+            if input.candidate.candidate.torrent_cache_path.is_some() =>
+        {
+            match cached_announce_candidate_stage(input).await {
+                Ok(downloaded) => AnnounceInitialLookupStage::Cached(Box::new(downloaded)),
+                Err(outcome) => AnnounceInitialLookupStage::Finished(outcome),
+            }
+        }
         outcome => AnnounceInitialLookupStage::Finished(classify_reverse_lookup_outcome(
             &outcome,
             input.context.now_ms,
@@ -1761,11 +1774,74 @@ async fn initial_announce_lookup_stage(
     }
 }
 
+async fn cached_announce_candidate_stage(
+    input: PreparedAnnounceCandidateStage,
+) -> Result<DownloadedAnnounceCandidate, AnnounceWorkOutcome> {
+    let PreparedAnnounceCandidateStage {
+        state,
+        candidate,
+        context,
+        shutdown,
+        ..
+    } = input;
+    let now_ms = context.now_ms;
+    let attempt_count = context.attempt_count;
+    let jitter_key = context.jitter_key.as_str();
+    let outcome_config = context.outcome_config;
+    if shutdown.state().phase != ShutdownPhase::Running {
+        return Err(AnnounceWorkOutcome::Release {
+            reason: AnnounceReason::DependencyBackoff,
+            next_attempt_at_ms: now_ms,
+        });
+    }
+    let Some(cache_path) = candidate.candidate.torrent_cache_path.clone() else {
+        return Err(AnnounceWorkOutcome::Waiting {
+            reason: AnnounceReason::CandidateDownloading,
+            next_attempt_at_ms: now_ms.saturating_add(outcome_config.candidate_download_wait_ms),
+            dependency: None,
+        });
+    };
+    let torrent_bytes = read_cached_torrent(&cache_path).await.map_err(|error| {
+        retryable_worker_outcome(
+            "torrent-cache",
+            error,
+            now_ms,
+            attempt_count,
+            jitter_key,
+            outcome_config,
+        )
+    })?;
+    let parsed = parse_metafile(&torrent_bytes).map_err(|error| {
+        retryable_worker_outcome(
+            "torrent-cache",
+            error.to_string(),
+            now_ms,
+            attempt_count,
+            jitter_key,
+            outcome_config,
+        )
+    })?;
+
+    Ok(DownloadedAnnounceCandidate {
+        state,
+        cached: CachedCandidateTorrent {
+            candidate: candidate.candidate,
+            metafile: parsed.metafile,
+            tracker_hosts: parsed.tracker_hosts,
+            cache_path,
+        },
+        torrent_bytes,
+        context,
+        shutdown,
+    })
+}
+
 async fn download_announce_candidate_stage(
     input: PreparedAnnounceCandidateStage,
 ) -> AnnounceDownloadStage {
     let PreparedAnnounceCandidateStage {
         state,
+        id,
         candidate,
         context,
         shutdown,
@@ -1842,6 +1918,19 @@ async fn download_announce_candidate_stage(
             }
         }
     };
+    if let Err(error) = state
+        .repository
+        .upsert_remote_candidate(&cached.candidate)
+        .await
+    {
+        return AnnounceDownloadStage::Finished(retryable_database_outcome(
+            error,
+            now_ms,
+            attempt_count,
+            jitter_key,
+            outcome_config,
+        ));
+    }
     let torrent_bytes = match read_cached_torrent(&cached.cache_path).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -1855,6 +1944,19 @@ async fn download_announce_candidate_stage(
             ));
         }
     };
+    if let Err(error) = state
+        .repository
+        .scrub_announce_fetch_material(&id, now_ms)
+        .await
+    {
+        return AnnounceDownloadStage::Finished(retryable_database_outcome(
+            error,
+            now_ms,
+            attempt_count,
+            jitter_key,
+            outcome_config,
+        ));
+    }
 
     AnnounceDownloadStage::Downloaded(Box::new(DownloadedAnnounceCandidate {
         state,
@@ -2070,21 +2172,17 @@ async fn load_announce_candidate(
         return Ok(None);
     };
     let has_fetch_material = material.download_url.is_some();
+    let guid = announce_candidate_guid(&material.tracker, material.guid.as_deref(), id)?;
     let download_url = match material.download_url {
         Some(download_url) => download_url,
         None => {
             DownloadUrl::new(format!("announce:{}", id.as_str())).map_err(domain_database_error)?
         }
     };
-    let candidate = RemoteCandidate {
+    let mut candidate = RemoteCandidate {
         id: None,
         indexer_id: IndexerId::new(ANNOUNCE_CANDIDATE_INDEXER_ID).map_err(domain_database_error)?,
-        guid: CandidateGuid::new(format!(
-            "announce:{}:{}",
-            material.tracker.as_str(),
-            material.guid.unwrap_or_else(|| id.as_str().to_owned())
-        ))
-        .map_err(domain_database_error)?,
+        guid,
         download_url,
         title: material.title,
         tracker: material.tracker,
@@ -2093,6 +2191,17 @@ async fn load_announce_candidate(
         info_hash: material.info_hash,
         torrent_cache_path: None,
     };
+    if let Some(cache_material) = repository
+        .remote_candidate_cache_material(&candidate.indexer_id, &candidate.guid)
+        .await?
+    {
+        if candidate.info_hash.is_none() {
+            candidate.info_hash = cache_material
+                .info_hash
+                .and_then(|hash| InfoHash::new(hash).ok());
+        }
+        candidate.torrent_cache_path = cache_material.torrent_cache_path;
+    }
     let cookie_or_fetch = has_fetch_material.then_some(RuntimeAnnounceFetch {
         cookie: material.cookie,
     });
@@ -2102,6 +2211,19 @@ async fn load_announce_candidate(
         cookie_or_fetch,
         attempt_count: material.attempt_count,
     }))
+}
+
+fn announce_candidate_guid(
+    tracker: &TrackerName,
+    guid: Option<&str>,
+    id: &AnnounceWorkId,
+) -> Result<CandidateGuid, DatabaseError> {
+    CandidateGuid::new(format!(
+        "announce:{}:{}",
+        tracker.as_str(),
+        guid.unwrap_or_else(|| id.as_str())
+    ))
+    .map_err(domain_database_error)
 }
 
 async fn read_cached_torrent(path: &Path) -> Result<Vec<u8>, String> {
@@ -4018,6 +4140,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_candidate_cache_handoff_scrubs_fetch_material_before_later_waits() {
+        let root = unique_temp_dir("daemon-announce-cache-scrub");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let download_requests = Arc::new(AtomicUsize::new(0));
+        let indexer_url = spawn_daemon_torznab_search_server_with_download(
+            StatusCode::OK,
+            Arc::clone(&download_requests),
+        )
+        .await;
+        let download_url = format!("{}/download", indexer_url.trim_end_matches("/api"));
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[])
+            .await
+            .unwrap();
+        let id = AnnounceWorkId::new("ann_cache_scrub").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-cache-scrub",
+            "tracker.example",
+            &download_url,
+        )
+        .await;
+        sqlx::query("UPDATE announce_work SET cookie = ? WHERE id = ?")
+            .bind("sid=secret-cookie")
+            .bind(id.as_str())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let first = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id.clone(),
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        let second = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id.clone(),
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        assert!(matches!(
+            first,
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::SourceIncomplete | AnnounceReason::InventoryRefreshing,
+                ..
+            }
+        ));
+        assert!(matches!(
+            second,
+            AnnounceWorkOutcome::Succeeded {
+                reason: AnnounceReason::Saved,
+                ..
+            }
+        ));
+        assert_eq!(1, download_requests.load(Ordering::SeqCst));
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        assert_announce_fetch_columns_cleared(&repository, id.as_str()).await;
+    }
+
+    #[tokio::test]
     async fn announce_retry_uses_configured_backoff_in_daemon_path() {
         let root = unique_temp_dir("daemon-announce-configured-backoff");
         let cache_dir = root.join("cache");
@@ -5766,6 +5966,18 @@ mod tests {
         .execute(repository.pool())
         .await
         .unwrap();
+    }
+
+    async fn assert_announce_fetch_columns_cleared(repository: &Repository, id: &str) {
+        let (download_url, cookie): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT download_url, cookie FROM announce_work WHERE id = ?")
+                .bind(id)
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+
+        assert!(download_url.is_none());
+        assert!(cookie.is_none());
     }
 
     async fn insert_cleanup_fixture_rows(repository: &Repository) {
