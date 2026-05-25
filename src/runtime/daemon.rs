@@ -1,13 +1,16 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 #[cfg(test)]
 use sqlx::Row;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
@@ -64,6 +67,7 @@ const ANNOUNCE_IDLE_SLEEP: Duration = Duration::from_millis(500);
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
 const SCHEDULER_SHUTDOWN_ERROR: &str = "scheduler is shutting down";
+const SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY: usize = 4;
 
 #[cfg(test)]
 static NO_CLIENT_SAVE_THREADS: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
@@ -577,30 +581,66 @@ async fn process_search_workflow(
         ..SearchWorkflowExecutionSummary::default()
     };
 
-    for candidate in planned.candidates {
-        if shutdown.state().phase != ShutdownPhase::Running {
-            return Err("search workflow is shutting down".to_owned());
-        }
-        match Box::pin(process_search_candidate(
-            state.clone(),
-            candidate,
-            now_ms,
-            shutdown.clone(),
-        ))
-        .await
-        {
-            Ok(outcome) => summary.record(outcome),
-            Err(error) => {
-                if shutdown.state().phase != ShutdownPhase::Running {
-                    return Err("search workflow is shutting down".to_owned());
-                }
-                summary.failed += 1;
-                warn!(error = %error, "search candidate processing failed");
-            }
-        }
-    }
+    process_search_candidates(state, planned.candidates, now_ms, shutdown, &mut summary).await?;
 
     Ok(summary)
+}
+
+async fn process_search_candidates(
+    state: AppState,
+    candidates: Vec<RemoteCandidate>,
+    now_ms: i64,
+    shutdown: ShutdownSignal,
+    summary: &mut SearchWorkflowExecutionSummary,
+) -> Result<(), String> {
+    let total = candidates.len();
+    let mut next_launch = 0;
+    let mut next_record = 0;
+    let mut candidates = candidates.into_iter();
+    let mut in_flight = FuturesUnordered::new();
+    let mut completed = BTreeMap::new();
+    let database_gate = Arc::new(Semaphore::new(1));
+
+    while next_record < total {
+        while in_flight.len() + completed.len() < SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY {
+            let Some(candidate) = candidates.next() else {
+                break;
+            };
+            if shutdown.state().phase != ShutdownPhase::Running {
+                return Err("search workflow is shutting down".to_owned());
+            }
+            let index = next_launch;
+            next_launch += 1;
+            in_flight.push(preflight_search_candidate(
+                index,
+                state.clone(),
+                candidate,
+                now_ms,
+                shutdown.clone(),
+                Arc::clone(&database_gate),
+            ));
+        }
+
+        if let Some(result) = completed.remove(&next_record) {
+            record_search_candidate_preflight(state.clone(), result, &shutdown, summary).await?;
+            next_record += 1;
+            continue;
+        }
+
+        let mut preflight_shutdown = shutdown.clone();
+        let Some((index, result)) = (tokio::select! {
+            biased;
+            _ = preflight_shutdown.cancelled() => {
+                return Err("search workflow is shutting down".to_owned());
+            }
+            result = in_flight.next() => result,
+        }) else {
+            break;
+        };
+        completed.insert(index, result);
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -630,6 +670,67 @@ impl SearchWorkflowExecutionSummary {
     }
 }
 
+async fn preflight_search_candidate(
+    index: usize,
+    state: AppState,
+    candidate: RemoteCandidate,
+    now_ms: i64,
+    shutdown: ShutdownSignal,
+    database_gate: Arc<Semaphore>,
+) -> (usize, Result<SearchCandidatePreflight, String>) {
+    let result = Box::pin(async move {
+        let prepared = {
+            let _permit = database_gate
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?;
+            prepare_search_candidate(SearchCandidateStage {
+                state,
+                candidate,
+                now_ms,
+                shutdown,
+            })
+            .await?
+        };
+        resolve_search_candidate_preflight(prepared, database_gate).await
+    })
+    .await;
+    (index, result)
+}
+
+async fn record_search_candidate_preflight(
+    state: AppState,
+    result: Result<SearchCandidatePreflight, String>,
+    shutdown: &ShutdownSignal,
+    summary: &mut SearchWorkflowExecutionSummary,
+) -> Result<(), String> {
+    match result {
+        Ok(preflight) => {
+            match execute_search_candidate_preflight(state, preflight, shutdown).await {
+                Ok(outcome) => {
+                    summary.record(outcome);
+                    Ok(())
+                }
+                Err(error) => record_failed_search_candidate(error, shutdown, summary),
+            }
+        }
+        Err(error) => record_failed_search_candidate(error, shutdown, summary),
+    }
+}
+
+fn record_failed_search_candidate(
+    error: String,
+    shutdown: &ShutdownSignal,
+    summary: &mut SearchWorkflowExecutionSummary,
+) -> Result<(), String> {
+    if shutdown.state().phase != ShutdownPhase::Running {
+        return Err("search workflow is shutting down".to_owned());
+    }
+    summary.failed += 1;
+    warn!(error = %error, "search candidate processing failed");
+    Ok(())
+}
+
 fn search_metric_outcome(summary: &SearchWorkflowExecutionSummary) -> SearchOutcome {
     if summary.failed > 0 || summary.failed_indexers > 0 {
         SearchOutcome::Failed
@@ -640,20 +741,15 @@ fn search_metric_outcome(summary: &SearchWorkflowExecutionSummary) -> SearchOutc
     }
 }
 
-async fn process_search_candidate(
-    state: AppState,
-    candidate: RemoteCandidate,
-    now_ms: i64,
-    shutdown: ShutdownSignal,
-) -> Result<SearchCandidateOutcome, String> {
-    let prepared = prepare_search_candidate(SearchCandidateStage {
-        state,
-        candidate,
-        now_ms,
-        shutdown,
-    })
-    .await?;
-    resolve_search_candidate(prepared).await
+enum SearchCandidatePreflight {
+    Outcome(SearchCandidateOutcome),
+    Save {
+        metadata: TorrentOutputMetadata,
+        torrent_bytes: Vec<u8>,
+    },
+    Inject {
+        request: Box<InjectionRequest>,
+    },
 }
 
 #[derive(Clone)]
@@ -718,9 +814,10 @@ async fn prepare_search_candidate(
     })
 }
 
-async fn resolve_search_candidate(
+async fn resolve_search_candidate_preflight(
     input: PreparedSearchCandidateStage,
-) -> Result<SearchCandidateOutcome, String> {
+    database_gate: Arc<Semaphore>,
+) -> Result<SearchCandidatePreflight, String> {
     let PreparedSearchCandidateStage {
         state,
         candidate,
@@ -761,6 +858,10 @@ async fn resolve_search_candidate(
                                 candidate_download_metric_outcome(&error),
                                 elapsed_ms(started),
                             );
+                            let _permit = database_gate
+                                .acquire()
+                                .await
+                                .map_err(|error| error.to_string())?;
                             record_candidate_download_failure(
                                 &state,
                                 &candidate,
@@ -775,6 +876,10 @@ async fn resolve_search_candidate(
                 }
             };
             let torrent_bytes = read_cached_torrent(&cached.cache_path).await?;
+            let _permit = database_gate
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?;
             process_downloaded_search_candidate(DownloadedSearchCandidateStage {
                 state,
                 cached,
@@ -787,8 +892,14 @@ async fn resolve_search_candidate(
         ReverseLookupOutcome::Matched { assessment, .. } => {
             let Some((cached, torrent_bytes)) = cached_search_candidate(&candidate).await? else {
                 record_persisted_decision(&state, &assessment);
-                return Ok(SearchCandidateOutcome::Persisted);
+                return Ok(SearchCandidatePreflight::Outcome(
+                    SearchCandidateOutcome::Persisted,
+                ));
             };
+            let _permit = database_gate
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?;
             process_downloaded_search_candidate(DownloadedSearchCandidateStage {
                 state,
                 cached,
@@ -800,13 +911,19 @@ async fn resolve_search_candidate(
         }
         ReverseLookupOutcome::AlreadyPresent { assessment, .. } => {
             record_persisted_decision(&state, &assessment);
-            Ok(SearchCandidateOutcome::AlreadyPresent)
+            Ok(SearchCandidatePreflight::Outcome(
+                SearchCandidateOutcome::AlreadyPresent,
+            ))
         }
         ReverseLookupOutcome::BestFailure { assessment, .. } => {
             record_persisted_decision(&state, &assessment);
-            Ok(SearchCandidateOutcome::Rejected)
+            Ok(SearchCandidatePreflight::Outcome(
+                SearchCandidateOutcome::Rejected,
+            ))
         }
-        ReverseLookupOutcome::NoCandidates => Ok(SearchCandidateOutcome::Persisted),
+        ReverseLookupOutcome::NoCandidates => Ok(SearchCandidatePreflight::Outcome(
+            SearchCandidateOutcome::Persisted,
+        )),
     }
 }
 
@@ -857,7 +974,7 @@ async fn cached_search_candidate(
 
 async fn process_downloaded_search_candidate(
     input: DownloadedSearchCandidateStage,
-) -> Result<SearchCandidateOutcome, String> {
+) -> Result<SearchCandidatePreflight, String> {
     let DownloadedSearchCandidateStage {
         state,
         cached,
@@ -900,46 +1017,82 @@ async fn process_downloaded_search_candidate(
                 return Err("search workflow is shutting down".to_owned());
             }
             if state.injection_worker.client_count() == 0 {
-                let save = save_candidate_torrent_blocking(
-                    state.config.paths.output_dir.clone(),
-                    candidate_output_metadata(
+                return Ok(SearchCandidatePreflight::Save {
+                    metadata: candidate_output_metadata(
                         lookup.local_item.media_type,
                         &cached.candidate,
                         &cached.metafile,
                     ),
                     torrent_bytes,
-                )
-                .await;
-                match save {
-                    Ok(outcome) => state.metrics.record_action(outcome.action_outcome()),
-                    Err(error) => {
-                        state.metrics.record_action(ActionOutcome::Failed);
-                        return Err(error.to_string());
-                    }
-                }
-                return Ok(SearchCandidateOutcome::Saved);
+                });
             }
             let recheck = runtime_recheck_resume_config(&state.config);
+            return Ok(SearchCandidatePreflight::Inject {
+                request: Box::new(InjectionRequest {
+                    local_item: lookup.local_item,
+                    local_files: lookup.local_files,
+                    candidate: cached.candidate.clone(),
+                    candidate_id,
+                    metafile: cached.metafile,
+                    torrent_bytes,
+                    assessment,
+                    assessed_at_ms: now_ms,
+                    output_dir: state.config.paths.output_dir,
+                    link_dirs: Vec::new(),
+                    link_type: None,
+                    flat_linking: false,
+                    recheck,
+                }),
+            });
+        }
+        best_failure = Some(assessment);
+    }
+
+    Ok(SearchCandidatePreflight::Outcome(
+        best_failure.map_or(SearchCandidateOutcome::Persisted, |_| {
+            SearchCandidateOutcome::Rejected
+        }),
+    ))
+}
+
+async fn execute_search_candidate_preflight(
+    state: AppState,
+    preflight: SearchCandidatePreflight,
+    shutdown: &ShutdownSignal,
+) -> Result<SearchCandidateOutcome, String> {
+    match preflight {
+        SearchCandidatePreflight::Outcome(outcome) => Ok(outcome),
+        SearchCandidatePreflight::Save {
+            metadata,
+            torrent_bytes,
+        } => {
+            if shutdown.state().phase != ShutdownPhase::Running {
+                return Err("search workflow is shutting down".to_owned());
+            }
+            let save = save_candidate_torrent_blocking(
+                state.config.paths.output_dir.clone(),
+                metadata,
+                torrent_bytes,
+            )
+            .await;
+            match save {
+                Ok(outcome) => {
+                    state.metrics.record_action(outcome.action_outcome());
+                    Ok(SearchCandidateOutcome::Saved)
+                }
+                Err(error) => {
+                    state.metrics.record_action(ActionOutcome::Failed);
+                    Err(error.to_string())
+                }
+            }
+        }
+        SearchCandidatePreflight::Inject { request } => {
+            if shutdown.state().phase != ShutdownPhase::Running {
+                return Err("search workflow is shutting down".to_owned());
+            }
             let result = state
                 .injection_worker
-                .process_until_shutdown(
-                    InjectionRequest {
-                        local_item: lookup.local_item,
-                        local_files: lookup.local_files,
-                        candidate: cached.candidate.clone(),
-                        candidate_id,
-                        metafile: cached.metafile,
-                        torrent_bytes,
-                        assessment,
-                        assessed_at_ms: now_ms,
-                        output_dir: state.config.paths.output_dir,
-                        link_dirs: Vec::new(),
-                        link_type: None,
-                        flat_linking: false,
-                        recheck,
-                    },
-                    shutdown.clone(),
-                )
+                .process_until_shutdown(*request, shutdown.clone())
                 .await;
             let result = match result {
                 Ok(result) => result,
@@ -951,21 +1104,16 @@ async fn process_downloaded_search_candidate(
             state
                 .metrics
                 .record_action(injection_metric_outcome(result.outcome));
-            return Ok(match result.outcome {
+            Ok(match result.outcome {
                 InjectionOutcome::Injected => SearchCandidateOutcome::Injected,
                 InjectionOutcome::Saved => SearchCandidateOutcome::Saved,
                 InjectionOutcome::AlreadyExists => SearchCandidateOutcome::AlreadyPresent,
                 InjectionOutcome::SourceIncomplete
                 | InjectionOutcome::Rejected
                 | InjectionOutcome::Failed => SearchCandidateOutcome::Rejected,
-            });
+            })
         }
-        best_failure = Some(assessment);
     }
-
-    Ok(best_failure.map_or(SearchCandidateOutcome::Persisted, |_| {
-        SearchCandidateOutcome::Rejected
-    }))
 }
 
 fn record_persisted_decision(state: &AppState, assessment: &PersistedCandidateAssessment) {
@@ -2525,7 +2673,9 @@ mod tests {
         config.paths.output_dir = output_dir.clone();
         config.matching.mode = MatchingMode::Partial;
         config.matching.fuzzy_size_threshold = 0.25;
-        let repository = Repository::connect_in_memory().await.unwrap();
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
         let item_id = repository
             .upsert_local_item_with_files(
                 &LocalItem {
@@ -2592,6 +2742,13 @@ mod tests {
         })
         .await
         .unwrap();
+        let outcome = execute_search_candidate_preflight(
+            runtime.state.clone(),
+            outcome,
+            &runtime.state.shutdown_signal,
+        )
+        .await
+        .unwrap();
         let decisions = repository
             .match_decisions_for_local_item(item_id, 10)
             .await
@@ -2600,6 +2757,237 @@ mod tests {
         assert_eq!(SearchCandidateOutcome::Saved, outcome);
         assert_eq!(1, saved_torrent_count(&output_dir));
         assert_eq!("partial", decisions[0].decision);
+    }
+
+    #[tokio::test]
+    async fn search_workflow_prefetches_candidate_downloads_with_bounded_concurrency() {
+        let root = unique_temp_dir("daemon-search-candidate-prefetch");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let download_base = spawn_daemon_observed_download_server(
+            Arc::clone(&in_flight),
+            Arc::clone(&max_in_flight),
+            Duration::from_millis(75),
+            |_| StatusCode::OK,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir;
+        config.paths.torrent_cache_dir = cache_dir;
+        config.injection.recheck.skip_recheck = true;
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let mut item = local_item(&root);
+        item.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&item, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let now_ms = unix_time_ms();
+        let candidates = (0..=SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY)
+            .map(|index| {
+                let bytes = test_torrent_bytes_with_source(&format!("prefetch-{index}"));
+                search_candidate(
+                    u64::try_from(index + 1).unwrap(),
+                    &format!("candidate-{index}"),
+                    &format!("{download_base}/download/{index}"),
+                    &parse_metafile(&bytes).unwrap().metafile.info_hash().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut summary = SearchWorkflowExecutionSummary {
+            candidates: candidates.len(),
+            ..SearchWorkflowExecutionSummary::default()
+        };
+        let signal = runtime.state.shutdown_signal.clone();
+
+        process_search_candidates(runtime.state, candidates, now_ms, signal, &mut summary)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY,
+            max_in_flight.load(Ordering::SeqCst)
+        );
+        assert_eq!(SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY + 1, summary.saved);
+    }
+
+    #[tokio::test]
+    async fn search_workflow_continues_after_candidate_download_failure() {
+        let root = unique_temp_dir("daemon-search-candidate-failure");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let download_base = spawn_daemon_observed_download_server(
+            Arc::clone(&in_flight),
+            Arc::clone(&max_in_flight),
+            Duration::ZERO,
+            |index| {
+                if index == 0 {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            },
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir;
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let mut item = local_item(&root);
+        item.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&item, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let successful_bytes = test_torrent_bytes_with_source("successful");
+        let successful_hash = parse_metafile(&successful_bytes)
+            .unwrap()
+            .metafile
+            .info_hash()
+            .clone();
+        let candidates = vec![
+            search_candidate(
+                1,
+                "failing",
+                &format!("{download_base}/download/0"),
+                &InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            ),
+            search_candidate(
+                2,
+                "successful",
+                &format!("{download_base}/download/1"),
+                &successful_hash,
+            ),
+        ];
+        let mut summary = SearchWorkflowExecutionSummary {
+            candidates: candidates.len(),
+            ..SearchWorkflowExecutionSummary::default()
+        };
+        let signal = runtime.state.shutdown_signal.clone();
+
+        process_search_candidates(
+            runtime.state,
+            candidates,
+            unix_time_ms(),
+            signal,
+            &mut summary,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(1, summary.failed);
+        assert_eq!(1, summary.saved);
+    }
+
+    #[tokio::test]
+    async fn search_workflow_continues_after_serialized_save_failure() {
+        let root = unique_temp_dir("daemon-search-save-failure");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        let first_bytes = test_torrent_bytes_with_source("download-0");
+        let second_bytes = test_torrent_bytes_with_source("download-1");
+        let first_metafile = parse_metafile(&first_bytes).unwrap().metafile;
+        let second_metafile = parse_metafile(&second_bytes).unwrap().metafile;
+        let first_metadata = candidate_output_metadata(
+            MediaType::Movie,
+            &search_candidate(
+                1,
+                "save-failure-0",
+                "https://indexer.example/download/save-failure-0",
+                first_metafile.info_hash(),
+            ),
+            &first_metafile,
+        );
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(
+            crate::persistence::torrent_cache::torrent_output_path(&output_dir, &first_metadata)
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let download_base = spawn_daemon_observed_download_server(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Duration::ZERO,
+            |_| StatusCode::OK,
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let mut item = local_item(&root);
+        item.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&item, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let candidates = vec![
+            search_candidate(
+                1,
+                "save-failure-0",
+                &format!("{download_base}/download/0"),
+                first_metafile.info_hash(),
+            ),
+            search_candidate(
+                2,
+                "save-failure-1",
+                &format!("{download_base}/download/1"),
+                second_metafile.info_hash(),
+            ),
+        ];
+        let mut summary = SearchWorkflowExecutionSummary {
+            candidates: candidates.len(),
+            ..SearchWorkflowExecutionSummary::default()
+        };
+        let signal = runtime.state.shutdown_signal.clone();
+
+        process_search_candidates(
+            runtime.state,
+            candidates,
+            unix_time_ms(),
+            signal,
+            &mut summary,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(1, summary.failed);
+        assert_eq!(1, summary.saved);
+        assert_eq!(
+            1,
+            fs::read_dir(&output_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .count()
+        );
     }
 
     #[tokio::test]
@@ -4580,6 +4968,41 @@ mod tests {
         format!("http://{address}/download")
     }
 
+    async fn spawn_daemon_observed_download_server(
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        delay: Duration,
+        status_for_index: impl Fn(usize) -> StatusCode + Send + Sync + 'static,
+    ) -> String {
+        let status_for_index = Arc::new(status_for_index);
+        let app = axum::Router::new().route(
+            "/download/{index}",
+            get(
+                move |axum::extract::Path(index): axum::extract::Path<usize>| {
+                    let in_flight = Arc::clone(&in_flight);
+                    let max_in_flight = Arc::clone(&max_in_flight);
+                    let status_for_index = Arc::clone(&status_for_index);
+                    async move {
+                        let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        update_max_atomic(&max_in_flight, active);
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        let bytes = test_torrent_bytes_with_source(&format!("download-{index}"));
+                        (status_for_index(index), bytes).into_response()
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
     async fn spawn_daemon_torznab_search_download_server() -> String {
         spawn_daemon_torznab_search_server_with_download(
             StatusCode::OK,
@@ -4824,6 +5247,26 @@ mod tests {
         response
     }
 
+    fn search_candidate(
+        indexer_id: u64,
+        guid: &str,
+        download_url: &str,
+        info_hash: &InfoHash,
+    ) -> RemoteCandidate {
+        RemoteCandidate {
+            id: None,
+            indexer_id: IndexerId::new(indexer_id).unwrap(),
+            guid: CandidateGuid::new(guid).unwrap(),
+            download_url: DownloadUrl::new(download_url).unwrap(),
+            title: ItemTitle::new("movie.mkv").unwrap(),
+            tracker: TrackerName::new("indexer.example").unwrap(),
+            size: Some(ByteSize::new(10)),
+            published_at_ms: None,
+            info_hash: Some(info_hash.clone()),
+            torrent_cache_path: None,
+        }
+    }
+
     fn local_item(root: &Path) -> LocalItem {
         LocalItem {
             id: None,
@@ -4975,8 +5418,26 @@ mod tests {
         b"d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"
     }
 
+    fn test_torrent_bytes_with_source(source: &str) -> Vec<u8> {
+        format!(
+            "d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces20:aaaaaaaaaaaaaaaaaaaa6:source{}:{source}ee",
+            source.len()
+        )
+        .into_bytes()
+    }
+
     fn partial_torrent_bytes() -> &'static [u8] {
         b"d8:announce14:http://tracker4:infod5:filesld6:lengthi40e4:pathl9:Candidate5:a.mkveed6:lengthi40e4:pathl9:Candidate5:b.mkveed6:lengthi20e4:pathl9:Candidate5:c.mkveee4:name9:Candidate12:piece lengthi20e6:pieces100:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaee"
+    }
+
+    fn update_max_atomic(max: &AtomicUsize, candidate: usize) {
+        let mut current = max.load(Ordering::SeqCst);
+        while candidate > current {
+            match max.compare_exchange(current, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
     }
 
     fn torznab_caps_xml() -> &'static str {
