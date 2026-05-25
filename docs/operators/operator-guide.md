@@ -352,6 +352,14 @@ cookies, API keys, passkeys, and secret-bearing URLs. Prowlarr API keys and the
 keys attached to imported Prowlarr indexers are redacted from logs, metrics,
 status, support output, and validation errors.
 
+Sporos does not encrypt the local SQLite database or cache directories at rest.
+Treat the database, database backups, torrent cache, and output directory as
+operator-owned sensitive state. While announce work is active, the
+`announce_work.download_url` and `announce_work.cookie` columns can contain raw
+tracker passkeys, signed URLs, or cookies so the daemon can retry after
+restart. Redacted status, metrics, logs, and HTTP responses are not a guarantee
+that local files are free of secrets.
+
 ## Paths And State
 
 `paths.database` stores SQLite state. `paths.torrent_cache_dir` stores cached
@@ -367,7 +375,10 @@ roots.
 Back up the SQLite database and any saved torrent/output directories together.
 For a consistent SQLite backup, stop the writer or use SQLite backup tooling
 against the mounted state volume. The torrent cache can be recreated from
-indexers, but preserving it avoids unnecessary redownloads.
+indexers, but preserving it avoids unnecessary redownloads. Protect backups
+with the same filesystem, host, and off-host access controls as production
+secrets because they may include plaintext URLs, cookies, tracker metadata,
+client paths, media titles, and cached torrent files.
 
 ## HTTP Surface
 

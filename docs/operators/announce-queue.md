@@ -59,6 +59,11 @@ outcome classes. Secret-bearing fields are not metric labels.
 
 `announce.default_ttl_secs` bounds how long non-terminal work can remain active.
 Expired work moves to the `expired` terminal state and stops being claimable.
+Queued, running, waiting, and retryable announce work may retain plaintext
+`announce_work.download_url` and `announce_work.cookie` values in SQLite so the
+daemon can recover and retry the workflow after restart. Those fields are
+sensitive local state, not operator-facing diagnostics. Successful, terminal
+failed, and expired transitions scrub the raw fetch material from retained rows.
 
 Succeeded work is retained for `announce.success_retention_secs`; failed work is
 retained for `announce.failure_retention_secs`. Retention is for operator

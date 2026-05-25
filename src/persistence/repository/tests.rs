@@ -2648,14 +2648,94 @@ async fn announce_insert_persists_fetch_material() {
             .fetch_one(repository.pool())
             .await
             .unwrap();
+    let (raw_download_url, raw_cookie): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT download_url, cookie FROM announce_work WHERE id = ?")
+            .bind(work.id.as_str())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
 
     assert_eq!(download_url.as_str(), stored.expose_download_url());
     assert_eq!(
         "sid=secret-cookie",
         stored.cookie().unwrap().expose_secret()
     );
+    assert_eq!(
+        Some("https://tracker.example/download?id=1&apikey=secret".to_owned()),
+        raw_download_url
+    );
+    assert_eq!(Some("sid=secret-cookie".to_owned()), raw_cookie);
     assert!(redacted.contains("[REDACTED]"));
     assert!(!redacted.contains("secret"));
+}
+
+#[tokio::test]
+async fn non_terminal_announce_states_retain_sensitive_fetch_material() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut work = test_announce_work("ann_fetch_states", "guid-fetch-states", 1);
+    let download_url =
+        DownloadUrl::new("https://tracker.example/download?id=1&apikey=secret").unwrap();
+    work.fetch = Some(
+        AnnounceFetchMaterial::new(
+            &download_url,
+            Some(CookieSecret::new("sid=secret-cookie").unwrap()),
+        )
+        .unwrap(),
+    );
+    repository
+        .insert_or_dedupe_announce_work(&work, 10)
+        .await
+        .unwrap();
+
+    assert_announce_fetch_columns_present(&repository, work.id.as_str()).await;
+    let claimed = repository
+        .claim_announce_work("worker-1", 1, 100, 1)
+        .await
+        .unwrap();
+    assert_announce_fetch_columns_present(&repository, work.id.as_str()).await;
+
+    assert!(
+        repository
+            .mark_announce_waiting(
+                &claimed[0],
+                "worker-1",
+                AnnounceReason::DependencyBackoff,
+                50,
+                2,
+                Some(("indexer", "tracker.example")),
+            )
+            .await
+            .unwrap()
+    );
+    assert_announce_fetch_columns_present(&repository, work.id.as_str()).await;
+
+    let mut retryable_work = test_announce_work("ann_fetch_retryable", "guid-fetch-retryable", 2);
+    retryable_work.fetch = work.fetch.clone();
+    repository
+        .insert_or_dedupe_announce_work(&retryable_work, 10)
+        .await
+        .unwrap();
+    let claimed = repository
+        .claim_announce_work("worker-2", 2, 100, 1)
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .mark_announce_retryable(
+                &claimed[0],
+                "worker-2",
+                AnnounceRetryUpdate {
+                    reason: AnnounceReason::RetryAfter,
+                    next_attempt_at_ms: 60,
+                    now_ms: 55,
+                    error_class: "retryable_dependency",
+                    redacted_message: "rate limited",
+                },
+            )
+            .await
+            .unwrap()
+    );
+    assert_announce_fetch_columns_present(&repository, retryable_work.id.as_str()).await;
 }
 
 #[tokio::test]
@@ -2687,6 +2767,51 @@ async fn terminal_announce_transitions_clear_fetch_material() {
                 "worker-1",
                 AnnounceReason::Injected,
                 "injected",
+                2,
+            )
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        repository
+            .announce_fetch_material(&work.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_announce_fetch_columns_cleared(&repository, work.id.as_str()).await;
+}
+
+#[tokio::test]
+async fn terminal_announce_failures_clear_fetch_material() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut work = test_announce_work("ann_fetch_failed", "guid-fetch-failed", 1);
+    let download_url =
+        DownloadUrl::new("https://tracker.example/download?id=1&apikey=secret").unwrap();
+    work.fetch = Some(
+        AnnounceFetchMaterial::new(
+            &download_url,
+            Some(CookieSecret::new("sid=secret-cookie").unwrap()),
+        )
+        .unwrap(),
+    );
+    repository
+        .insert_or_dedupe_announce_work(&work, 10)
+        .await
+        .unwrap();
+    let claimed = repository
+        .claim_announce_work("worker-1", 1, 100, 1)
+        .await
+        .unwrap();
+
+    assert!(
+        repository
+            .mark_announce_terminal_failed(
+                &claimed[0],
+                "worker-1",
+                AnnounceReason::NoMatchTerminal,
+                "no match",
                 2,
             )
             .await
@@ -2829,6 +2954,30 @@ async fn assert_announce_fetch_columns_cleared(repository: &Repository, id: &str
 
     assert!(download_url.is_none());
     assert!(cookie.is_none());
+}
+
+async fn assert_announce_fetch_columns_present(repository: &Repository, id: &str) {
+    let (download_url, redacted_download_url, cookie): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT download_url, redacted_download_url, cookie FROM announce_work WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        Some("https://tracker.example/download?id=1&apikey=secret".to_owned()),
+        download_url
+    );
+    assert_eq!(Some("sid=secret-cookie".to_owned()), cookie);
+    assert_eq!(
+        Some("https://tracker.example/download?id=1&apikey=[REDACTED]".to_owned()),
+        redacted_download_url
+    );
 }
 
 #[tokio::test]
