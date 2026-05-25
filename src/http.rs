@@ -35,7 +35,7 @@ use crate::persistence::repository::{AnnounceInsertResult, AnnounceQueueSnapshot
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
-use crate::secrets::CookieSecret;
+use crate::secrets::{CookieSecret, sanitize_url_for_logging};
 
 const WORKFLOW_BODY_LIMIT_BYTES: usize = 16 * 1024;
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -384,7 +384,7 @@ impl WorkflowQueues {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AnnouncementWorkflowRequest {
     pub title: ItemTitle,
     pub guid: CandidateGuid,
@@ -392,6 +392,24 @@ pub struct AnnouncementWorkflowRequest {
     pub tracker: TrackerName,
     pub cookie: Option<String>,
     pub size: Option<ByteSize>,
+}
+
+impl fmt::Debug for AnnouncementWorkflowRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let title = sanitize_url_for_logging(self.title.as_str());
+        let guid = sanitize_url_for_logging(self.guid.as_str());
+        let download_url = sanitize_url_for_logging(self.download_url.as_str());
+        let tracker = sanitize_url_for_logging(self.tracker.as_str());
+        formatter
+            .debug_struct("AnnouncementWorkflowRequest")
+            .field("title", &title)
+            .field("guid", &guid)
+            .field("download_url", &download_url)
+            .field("tracker", &tracker)
+            .field("cookie", &self.cookie.as_ref().map(|_cookie| "[REDACTED]"))
+            .field("size", &self.size)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -526,7 +544,7 @@ struct ReadinessChecks {
     workers_running: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnnouncementRequestDto {
     name: String,
@@ -535,6 +553,24 @@ struct AnnouncementRequestDto {
     tracker: String,
     cookie: Option<String>,
     size: Option<u64>,
+}
+
+impl fmt::Debug for AnnouncementRequestDto {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = sanitize_url_for_logging(self.name.as_str());
+        let guid = sanitize_url_for_logging(self.guid.as_str());
+        let download_url = sanitize_url_for_logging(self.download_url.as_str());
+        let tracker = sanitize_url_for_logging(self.tracker.as_str());
+        formatter
+            .debug_struct("AnnouncementRequestDto")
+            .field("name", &name)
+            .field("guid", &guid)
+            .field("download_url", &download_url)
+            .field("tracker", &tracker)
+            .field("cookie", &self.cookie.as_ref().map(|_cookie| "[REDACTED]"))
+            .field("size", &self.size)
+            .finish()
+    }
 }
 
 impl AnnouncementRequestDto {
@@ -1453,6 +1489,43 @@ mod tests {
         assert!(!auth.authorizes(&headers));
         headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
         assert!(auth.authorizes(&headers));
+    }
+
+    #[test]
+    fn announcement_debug_output_redacts_fetch_secrets() {
+        let dto = AnnouncementRequestDto {
+            name: "https://tracker.example/title?token=title-secret".to_owned(),
+            guid: "https://tracker.example/guid?passkey=guid-secret".to_owned(),
+            download_url: "https://tracker.example/download?id=1&passkey=secret&torrent_pass=other"
+                .to_owned(),
+            tracker: "https://tracker.example/api?apikey=tracker-secret".to_owned(),
+            cookie: Some("sid=secret-cookie".to_owned()),
+            size: Some(42),
+        };
+        let dto_debug = format!("{dto:?}");
+
+        assert!(dto_debug.contains("[REDACTED]"));
+        assert!(!dto_debug.contains("secret"));
+        assert!(!dto_debug.contains("other"));
+        assert!(!dto_debug.contains("sid="));
+
+        let request = AnnouncementWorkflowRequest {
+            title: ItemTitle::new("https://tracker.example/title?token=title-secret").unwrap(),
+            guid: CandidateGuid::new("https://tracker.example/guid?passkey=guid-secret").unwrap(),
+            download_url: DownloadUrl::new(
+                "https://tracker.example/download?id=1&authkey=secret&torrent_pass=other",
+            )
+            .unwrap(),
+            tracker: TrackerName::new("https://tracker.example/api?apikey=tracker-secret").unwrap(),
+            cookie: Some("sid=secret-cookie".to_owned()),
+            size: Some(ByteSize::new(42)),
+        };
+        let request_debug = format!("{request:?}");
+
+        assert!(request_debug.contains("[REDACTED]"));
+        assert!(!request_debug.contains("secret"));
+        assert!(!request_debug.contains("other"));
+        assert!(!request_debug.contains("sid="));
     }
 
     #[tokio::test]

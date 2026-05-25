@@ -258,7 +258,7 @@ impl AnnounceLease {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct AnnounceWorkItem {
     pub id: AnnounceWorkId,
     pub status: AnnounceStatus,
@@ -282,6 +282,59 @@ pub struct AnnounceWorkItem {
     pub last_dependency_name: Option<ReasonText>,
     pub last_error_class: Option<ReasonText>,
     pub last_redacted_message: Option<ReasonText>,
+}
+
+impl fmt::Debug for AnnounceWorkItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let title = sanitize_url_for_logging(self.title.as_str());
+        let tracker = sanitize_url_for_logging(self.tracker.as_str());
+        let guid = self
+            .guid
+            .as_ref()
+            .map(|guid| sanitize_url_for_logging(guid.as_str()));
+        let last_dependency_kind = self
+            .last_dependency_kind
+            .as_ref()
+            .map(|kind| sanitize_url_for_logging(kind.as_str()));
+        let last_dependency_name = self
+            .last_dependency_name
+            .as_ref()
+            .map(|name| sanitize_url_for_logging(name.as_str()));
+        let last_error_class = self
+            .last_error_class
+            .as_ref()
+            .map(|class| sanitize_url_for_logging(class.as_str()));
+        let last_redacted_message = self
+            .last_redacted_message
+            .as_ref()
+            .map(|message| sanitize_url_for_logging(message.as_str()));
+
+        formatter
+            .debug_struct("AnnounceWorkItem")
+            .field("id", &self.id)
+            .field("status", &self.status)
+            .field("reason", &self.reason)
+            .field("dedupe_hash", &self.dedupe_hash)
+            .field("title", &title)
+            .field("tracker", &tracker)
+            .field("guid", &guid)
+            .field("info_hash", &self.info_hash)
+            .field("size", &self.size)
+            .field("fetch", &self.fetch)
+            .field("received_at_ms", &self.received_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .field("first_attempt_at_ms", &self.first_attempt_at_ms)
+            .field("finished_at_ms", &self.finished_at_ms)
+            .field("attempt_count", &self.attempt_count)
+            .field("next_attempt_at_ms", &self.next_attempt_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("lease", &self.lease)
+            .field("last_dependency_kind", &last_dependency_kind)
+            .field("last_dependency_name", &last_dependency_name)
+            .field("last_error_class", &last_error_class)
+            .field("last_redacted_message", &last_redacted_message)
+            .finish()
+    }
 }
 
 impl AnnounceWorkItem {
@@ -489,6 +542,66 @@ mod tests {
         assert_eq!(download_url.as_str(), material.expose_download_url());
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret"));
+        assert!(!debug.contains("sid="));
+    }
+
+    #[test]
+    fn work_item_debug_redacts_fetch_material() {
+        let download_url = DownloadUrl::new(
+            "https://tracker.example/download?id=1&passkey=secret&torrent_pass=other",
+        )
+        .unwrap();
+        let work = AnnounceWorkItem {
+            id: AnnounceWorkId::new("ann_01").unwrap(),
+            status: AnnounceStatus::Queued,
+            reason: AnnounceReason::Accepted,
+            dedupe_hash: AnnounceDedupeIdentity::Guid {
+                tracker: TrackerName::new("tracker").unwrap(),
+                guid: CandidateGuid::new("https://tracker.example/guid?passkey=guid-secret")
+                    .unwrap(),
+            }
+            .hash(),
+            title: ItemTitle::new("https://tracker.example/title?token=title-secret").unwrap(),
+            tracker: TrackerName::new("https://tracker.example/api?apikey=tracker-secret").unwrap(),
+            guid: Some(
+                CandidateGuid::new("https://tracker.example/guid?passkey=guid-secret").unwrap(),
+            ),
+            info_hash: None,
+            size: None,
+            fetch: Some(
+                AnnounceFetchMaterial::new(
+                    &download_url,
+                    Some(CookieSecret::new("sid=secret-cookie").unwrap()),
+                )
+                .unwrap(),
+            ),
+            received_at_ms: 1,
+            updated_at_ms: 1,
+            first_attempt_at_ms: None,
+            finished_at_ms: None,
+            attempt_count: 0,
+            next_attempt_at_ms: 1,
+            expires_at_ms: 10,
+            lease: None,
+            last_dependency_kind: Some(
+                ReasonText::new("https://tracker.example/kind?token=kind-secret").unwrap(),
+            ),
+            last_dependency_name: Some(
+                ReasonText::new("https://tracker.example/name?token=name-secret").unwrap(),
+            ),
+            last_error_class: Some(
+                ReasonText::new("https://tracker.example/class?token=class-secret").unwrap(),
+            ),
+            last_redacted_message: Some(
+                ReasonText::new("https://tracker.example/message?token=message-secret").unwrap(),
+            ),
+        };
+
+        let debug = format!("{work:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("other"));
         assert!(!debug.contains("sid="));
     }
 
