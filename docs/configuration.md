@@ -89,6 +89,12 @@ candidate torrent files. `paths.output_dir` stores saved torrents prepared for
 client injection or retry. These local state paths must be writable by the
 Sporos process.
 
+These paths are plaintext operator-owned sensitive state. They can contain raw
+active announce fetch URLs or cookies, tracker and indexer metadata, torrent
+client hosts and paths, media titles, cached torrent files, and saved torrent
+files. Protect database files, WAL/journal files, cache/output directories, and
+backups with host, filesystem, and backup access controls.
+
 `paths.media_dirs` are read-only media inventory roots. They must already
 exist and be readable; Sporos does not create media roots.
 

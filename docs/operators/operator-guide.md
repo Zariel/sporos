@@ -352,13 +352,26 @@ cookies, API keys, passkeys, and secret-bearing URLs. Prowlarr API keys and the
 keys attached to imported Prowlarr indexers are redacted from logs, metrics,
 status, support output, and validation errors.
 
-Sporos does not encrypt the local SQLite database or cache directories at rest.
-Treat the database, database backups, torrent cache, and output directory as
-operator-owned sensitive state. While announce work is active, the
+Sporos does not provide SQLite-at-rest encryption. Treat the database,
+WAL/journal files, database backups, torrent cache, and output directory as
+plaintext operator-owned sensitive state. While announce work is active, the
 `announce_work.download_url` and `announce_work.cookie` columns can contain raw
 tracker passkeys, signed URLs, or cookies so the daemon can retry after
 restart. Redacted status, metrics, logs, and HTTP responses are not a guarantee
 that local files are free of secrets.
+
+Sensitive local state can include:
+
+- raw active announce fetch URLs and cookies in SQLite;
+- configured and imported indexer names, endpoint URLs, imported source
+  identities, tracker hosts, capability metadata, API key source labels, and
+  request health/backoff history;
+- torrent-client hosts, save paths, categories, tags, labels, torrent hashes,
+  file paths, tracker hosts, and progress state;
+- media titles, virtual inventory paths, local source paths, match decisions,
+  and rejection reasons;
+- cached torrent files and saved torrent files prepared for injection or retry;
+- SQLite WAL, journal, snapshots, diagnostics, and off-host backups.
 
 ## Paths And State
 
