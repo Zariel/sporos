@@ -1,5 +1,6 @@
 use std::cmp::Ordering as CompareOrdering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,13 +22,13 @@ use crate::domain::{
     ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyName, DependencyState,
     DisplayName, DownloadUrl, FileIndex, IndexerId, InfoHash, ItemTitle, JobName, JobState,
     LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision, MediaType, ReasonText,
-    RemoteCandidate, RemoteCandidateId, SourceKey,
+    RemoteCandidate, RemoteCandidateId, SourceKey, TrackerName,
 };
 use crate::errors::DatabaseError;
 use crate::indexers::{ConfiguredTorznabIndexer, ProwlarrIndexer, TorznabCaps};
 use crate::secrets::{CookieSecret, sanitize_url_for_logging};
 
-use super::schema::{CONNECTION_PRAGMAS, initial_schema_statements};
+use super::schema::{CONNECTION_PRAGMAS, REQUIRED_TABLES, initial_schema_statements};
 
 mod connection;
 mod schema_setup;
@@ -337,6 +338,12 @@ pub struct RemoteCandidateSnapshot {
     pub torrent_cache_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteCandidateCacheMaterial {
+    pub info_hash: Option<String>,
+    pub torrent_cache_path: Option<std::path::PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchDecisionSnapshot {
     pub candidate_id: RemoteCandidateId,
@@ -345,6 +352,163 @@ pub struct MatchDecisionSnapshot {
     pub matched_ratio: Option<f64>,
     pub reason_code: String,
     pub assessed_at_ms: i64,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct AnnounceCandidateMaterial {
+    pub title: ItemTitle,
+    pub tracker: TrackerName,
+    pub guid: Option<String>,
+    pub info_hash: Option<InfoHash>,
+    pub size: Option<ByteSize>,
+    pub download_url: Option<DownloadUrl>,
+    pub cookie: Option<String>,
+    pub attempt_count: u16,
+}
+
+impl fmt::Debug for AnnounceCandidateMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnnounceCandidateMaterial")
+            .field("title", &self.title)
+            .field("tracker", &self.tracker)
+            .field("guid", &self.guid)
+            .field("info_hash", &self.info_hash)
+            .field("size", &self.size)
+            .field(
+                "download_url",
+                &self
+                    .download_url
+                    .as_ref()
+                    .map(|url| sanitize_url_for_logging(url.as_str())),
+            )
+            .field("cookie", &self.cookie.as_ref().map(|_| "[REDACTED]"))
+            .field("attempt_count", &self.attempt_count)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestRepositorySnapshot {
+    pub local_items: i64,
+    pub local_files: i64,
+    pub remote_candidates: i64,
+    pub cached_candidates: i64,
+    pub match_decisions: i64,
+    pub enabled_indexers: i64,
+    pub client_items: Vec<SystemTestClientItemRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemTestRepositoryDiagnostics {
+    pub local_items: Vec<SystemTestLocalItemRow>,
+    pub local_files: Vec<SystemTestLocalFileRow>,
+    pub remote_candidates: Vec<SystemTestRemoteCandidateRow>,
+    pub match_decisions: Vec<SystemTestMatchDecisionRow>,
+    pub indexers: Vec<SystemTestIndexerRow>,
+    pub dependency_health: Vec<SystemTestDependencyHealthRow>,
+    pub jobs: Vec<SystemTestJobRow>,
+    pub announce_work: Vec<SystemTestAnnounceWorkRow>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestClientItemRow {
+    pub title: String,
+    pub source_key: String,
+    pub info_hash: Option<String>,
+    pub save_path: Option<String>,
+    pub file_count: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestLocalItemRow {
+    pub id: i64,
+    pub source_type: String,
+    pub source_key: String,
+    pub title: String,
+    pub media_type: String,
+    pub info_hash: Option<String>,
+    pub save_path: Option<String>,
+    pub total_size: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestLocalFileRow {
+    pub item_id: i64,
+    pub relative_path: String,
+    pub file_name: String,
+    pub size: i64,
+    pub file_index: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestRemoteCandidateRow {
+    pub id: i64,
+    pub guid: String,
+    pub title: String,
+    pub tracker: String,
+    pub size: Option<i64>,
+    pub info_hash: Option<String>,
+    pub torrent_cache_path: Option<String>,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemTestMatchDecisionRow {
+    pub local_item_id: i64,
+    pub candidate_id: i64,
+    pub decision: String,
+    pub matched_size: Option<i64>,
+    pub matched_ratio: Option<f64>,
+    pub reason_code: String,
+    pub assessed_at: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestIndexerRow {
+    pub id: i64,
+    pub name: String,
+    pub source_kind: String,
+    pub enabled: bool,
+    pub state: String,
+    pub retry_after: Option<i64>,
+    pub last_caps_refresh_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestDependencyHealthRow {
+    pub dependency_type: String,
+    pub dependency_name: String,
+    pub state: String,
+    pub reason: Option<String>,
+    pub retry_after: Option<i64>,
+    pub failure_count: i64,
+    pub checked_at: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestJobRow {
+    pub name: String,
+    pub state: String,
+    pub last_started_at: Option<i64>,
+    pub last_finished_at: Option<i64>,
+    pub next_run_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SystemTestAnnounceWorkRow {
+    pub id: String,
+    pub tracker: String,
+    pub title: String,
+    pub info_hash: Option<String>,
+    pub status: String,
+    pub reason: String,
+    pub attempt_count: i64,
+    pub next_attempt_at: i64,
+    pub last_error_class: Option<String>,
+    pub last_decision: Option<String>,
+    pub last_action_outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -431,6 +595,321 @@ impl Repository {
         }
 
         Ok(())
+    }
+
+    pub async fn check_connection(&self) -> Result<(), DatabaseError> {
+        let value = sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| db_error("check sqlite connection", error))?;
+        if value == 1 {
+            Ok(())
+        } else {
+            Err(DatabaseError::QueryFailed {
+                operation: "check sqlite connection".to_owned(),
+                message: format!("unexpected probe result {value}"),
+            })
+        }
+    }
+
+    pub async fn schema_initialized(&self) -> Result<bool, DatabaseError> {
+        for table in REQUIRED_TABLES {
+            let found: Option<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| db_error("check sqlite schema", error))?;
+            if found.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn system_test_snapshot(
+        &self,
+        limit: u16,
+    ) -> Result<SystemTestRepositorySnapshot, DatabaseError> {
+        Ok(SystemTestRepositorySnapshot {
+            local_items: self.count_rows("SELECT COUNT(*) FROM local_items").await?,
+            local_files: self.count_rows("SELECT COUNT(*) FROM local_files").await?,
+            remote_candidates: self
+                .count_rows("SELECT COUNT(*) FROM remote_candidates")
+                .await?,
+            cached_candidates: self
+                .count_rows(
+                    "SELECT COUNT(*) FROM remote_candidates WHERE info_hash IS NOT NULL AND torrent_cache_path IS NOT NULL",
+                )
+                .await?,
+            match_decisions: self
+                .count_rows("SELECT COUNT(*) FROM match_decisions")
+                .await?,
+            enabled_indexers: self
+                .count_rows("SELECT COUNT(*) FROM indexers WHERE enabled = 1")
+                .await?,
+            client_items: self.system_test_client_items(limit).await?,
+        })
+    }
+
+    pub async fn system_test_diagnostics(
+        &self,
+        limit: u16,
+    ) -> Result<SystemTestRepositoryDiagnostics, DatabaseError> {
+        let limit = i64::from(limit);
+        let local_items = sqlx::query(
+            r#"
+            SELECT id, source_type, source_key, title, media_type, info_hash, save_path, total_size
+            FROM local_items
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test local items", error))?
+        .into_iter()
+        .map(|row| SystemTestLocalItemRow {
+            id: row.get("id"),
+            source_type: row.get("source_type"),
+            source_key: row.get("source_key"),
+            title: row.get("title"),
+            media_type: row.get("media_type"),
+            info_hash: row.get("info_hash"),
+            save_path: row.get("save_path"),
+            total_size: row.get("total_size"),
+        })
+        .collect();
+
+        let local_files = sqlx::query(
+            r#"
+            SELECT local_files.item_id, local_files.relative_path, local_files.file_name,
+                   local_files.size, local_files.file_index
+            FROM local_files
+            JOIN local_items ON local_items.id = local_files.item_id
+            ORDER BY local_items.updated_at DESC, local_files.item_id DESC, local_files.file_index
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test local files", error))?
+        .into_iter()
+        .map(|row| SystemTestLocalFileRow {
+            item_id: row.get("item_id"),
+            relative_path: row.get("relative_path"),
+            file_name: row.get("file_name"),
+            size: row.get("size"),
+            file_index: row.get("file_index"),
+        })
+        .collect();
+
+        let remote_candidates = sqlx::query(
+            r#"
+            SELECT id, guid, title, tracker, size, info_hash, torrent_cache_path, last_seen_at
+            FROM remote_candidates
+            ORDER BY last_seen_at DESC, id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test remote candidates", error))?
+        .into_iter()
+        .map(|row| SystemTestRemoteCandidateRow {
+            id: row.get("id"),
+            guid: row.get("guid"),
+            title: row.get("title"),
+            tracker: row.get("tracker"),
+            size: row.get("size"),
+            info_hash: row.get("info_hash"),
+            torrent_cache_path: row.get("torrent_cache_path"),
+            last_seen_at: row.get("last_seen_at"),
+        })
+        .collect();
+
+        let match_decisions = sqlx::query(
+            r#"
+            SELECT local_item_id, candidate_id, decision, matched_size, matched_ratio, reason_code, assessed_at
+            FROM match_decisions
+            ORDER BY assessed_at DESC, candidate_id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test match decisions", error))?
+        .into_iter()
+        .map(|row| SystemTestMatchDecisionRow {
+            local_item_id: row.get("local_item_id"),
+            candidate_id: row.get("candidate_id"),
+            decision: row.get("decision"),
+            matched_size: row.get("matched_size"),
+            matched_ratio: row.get("matched_ratio"),
+            reason_code: row.get("reason_code"),
+            assessed_at: row.get("assessed_at"),
+        })
+        .collect();
+
+        let indexers = sqlx::query(
+            r#"
+            SELECT id, name, source_kind, enabled, state, retry_after, last_caps_refresh_at
+            FROM indexers
+            ORDER BY name
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test indexers", error))?
+        .into_iter()
+        .map(|row| SystemTestIndexerRow {
+            id: row.get("id"),
+            name: row.get("name"),
+            source_kind: row.get("source_kind"),
+            enabled: row.get::<i64, _>("enabled") != 0,
+            state: row.get("state"),
+            retry_after: row.get("retry_after"),
+            last_caps_refresh_at: row.get("last_caps_refresh_at"),
+        })
+        .collect();
+
+        let dependency_health = sqlx::query(
+            r#"
+            SELECT dependency_type, dependency_name, state, reason, retry_after, failure_count, checked_at
+            FROM dependency_health
+            ORDER BY checked_at DESC, dependency_type, dependency_name
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test dependency health", error))?
+        .into_iter()
+        .map(|row| SystemTestDependencyHealthRow {
+            dependency_type: row.get("dependency_type"),
+            dependency_name: row.get("dependency_name"),
+            state: row.get("state"),
+            reason: row.get("reason"),
+            retry_after: row.get("retry_after"),
+            failure_count: row.get("failure_count"),
+            checked_at: row.get("checked_at"),
+        })
+        .collect();
+
+        let jobs = sqlx::query(
+            r#"
+            SELECT name, state, last_started_at, last_finished_at, next_run_at, last_error
+            FROM jobs
+            ORDER BY name
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test jobs", error))?
+        .into_iter()
+        .map(|row| SystemTestJobRow {
+            name: row.get("name"),
+            state: row.get("state"),
+            last_started_at: row.get("last_started_at"),
+            last_finished_at: row.get("last_finished_at"),
+            next_run_at: row.get("next_run_at"),
+            last_error: row.get("last_error"),
+        })
+        .collect();
+
+        let announce_work = sqlx::query(
+            r#"
+            SELECT id, tracker, title, info_hash, status, reason, attempt_count, next_attempt_at,
+                   last_error_class, last_decision, last_action_outcome
+            FROM announce_work
+            ORDER BY updated_at DESC, received_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test announce work", error))?
+        .into_iter()
+        .map(|row| SystemTestAnnounceWorkRow {
+            id: row.get("id"),
+            tracker: row.get("tracker"),
+            title: row.get("title"),
+            info_hash: row.get("info_hash"),
+            status: row.get("status"),
+            reason: row.get("reason"),
+            attempt_count: row.get("attempt_count"),
+            next_attempt_at: row.get("next_attempt_at"),
+            last_error_class: row.get("last_error_class"),
+            last_decision: row.get("last_decision"),
+            last_action_outcome: row.get("last_action_outcome"),
+        })
+        .collect();
+
+        Ok(SystemTestRepositoryDiagnostics {
+            local_items,
+            local_files,
+            remote_candidates,
+            match_decisions,
+            indexers,
+            dependency_health,
+            jobs,
+            announce_work,
+        })
+    }
+
+    async fn system_test_client_items(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<SystemTestClientItemRow>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                local_items.title,
+                local_items.source_key,
+                local_items.info_hash,
+                local_items.save_path,
+                COUNT(local_files.file_index) AS file_count
+            FROM local_items
+            LEFT JOIN local_files ON local_files.item_id = local_items.id
+            WHERE local_items.source_type = 'client'
+            GROUP BY local_items.id
+            ORDER BY local_items.source_key
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read system test client items", error))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| SystemTestClientItemRow {
+                title: row.get("title"),
+                source_key: row.get("source_key"),
+                info_hash: row.get("info_hash"),
+                save_path: row.get("save_path"),
+                file_count: row.get("file_count"),
+            })
+            .collect())
+    }
+
+    async fn count_rows(&self, query: &'static str) -> Result<i64, DatabaseError> {
+        sqlx::query_scalar(query)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| db_error("count system test rows", error))
     }
 
     pub async fn upsert_local_item_with_files(
@@ -1369,6 +1848,31 @@ impl Repository {
         rows.into_iter()
             .map(remote_candidate_snapshot_from_row)
             .collect()
+    }
+
+    pub async fn remote_candidate_cache_material(
+        &self,
+        indexer_id: &IndexerId,
+        guid: &CandidateGuid,
+    ) -> Result<Option<RemoteCandidateCacheMaterial>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT info_hash, torrent_cache_path
+            FROM remote_candidates
+            WHERE indexer_id = ? AND guid = ?
+            "#,
+        )
+        .bind(i64_from_u64(
+            indexer_id.get(),
+            "remote candidate indexer id",
+        )?)
+        .bind(guid.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read remote candidate cache material", error))?;
+
+        row.map(remote_candidate_cache_material_from_row)
+            .transpose()
     }
 
     pub async fn match_decisions_for_local_item(
@@ -2612,6 +3116,25 @@ impl Repository {
                 retry_after_ms: None,
             })
         }
+    }
+
+    pub async fn announce_candidate_material(
+        &self,
+        id: &AnnounceWorkId,
+    ) -> Result<Option<AnnounceCandidateMaterial>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT title, tracker, guid, info_hash, size, download_url, cookie, attempt_count
+            FROM announce_work
+            WHERE id = ?
+            "#,
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("load announce work candidate", error))?;
+
+        row.map(announce_candidate_material_from_row).transpose()
     }
 
     pub async fn claim_announce_work(
@@ -5398,6 +5921,65 @@ fn local_file_snapshot_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<LocalFileSnapshot, DatabaseError> {
     local_file_snapshot_from_row_ref(&row)
+}
+
+fn remote_candidate_cache_material_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<RemoteCandidateCacheMaterial, DatabaseError> {
+    Ok(RemoteCandidateCacheMaterial {
+        info_hash: row.get("info_hash"),
+        torrent_cache_path: row
+            .get::<Option<String>, _>("torrent_cache_path")
+            .map(PathBuf::from),
+    })
+}
+
+fn announce_candidate_material_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<AnnounceCandidateMaterial, DatabaseError> {
+    let size = row
+        .get::<Option<i64>, _>("size")
+        .and_then(|size| u64::try_from(size).ok())
+        .map(ByteSize::new);
+    let attempt_count = row
+        .get::<i64, _>("attempt_count")
+        .try_into()
+        .unwrap_or(u16::MAX);
+
+    Ok(AnnounceCandidateMaterial {
+        title: ItemTitle::new(row.get::<String, _>("title")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read announce candidate title".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        tracker: TrackerName::new(row.get::<String, _>("tracker")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read announce candidate tracker".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        guid: row.get("guid"),
+        info_hash: row
+            .get::<Option<String>, _>("info_hash")
+            .map(InfoHash::new)
+            .transpose()
+            .map_err(|error| DatabaseError::QueryFailed {
+                operation: "read announce candidate info hash".to_owned(),
+                message: error.to_string(),
+            })?,
+        size,
+        download_url: row
+            .get::<Option<String>, _>("download_url")
+            .map(DownloadUrl::new)
+            .transpose()
+            .map_err(|error| DatabaseError::QueryFailed {
+                operation: "read announce candidate download URL".to_owned(),
+                message: error.to_string(),
+            })?,
+        cookie: row.get("cookie"),
+        attempt_count,
+    })
 }
 
 fn local_file_snapshot_from_row_ref(

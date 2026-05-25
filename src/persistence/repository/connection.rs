@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(test)]
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 #[cfg(test)]
@@ -59,6 +60,7 @@ impl Repository {
         Ok(repository)
     }
 
+    #[cfg(test)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }

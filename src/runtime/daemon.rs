@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::FutureExt;
+#[cfg(test)]
 use sqlx::Row;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -19,8 +20,7 @@ use crate::config::{MatchingMode, SporosConfig, validate_server_auth};
 use crate::content_filter::{ContentFilterConfig, ContentFilterContext, Permille};
 use crate::domain::{
     CandidateAssessment, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash,
-    InjectionOutcome, ItemTitle, JobName, MatchDecision, ReasonText, RemoteCandidate,
-    RemoteCandidateId, TrackerName,
+    InjectionOutcome, JobName, MatchDecision, ReasonText, RemoteCandidate, RemoteCandidateId,
 };
 use crate::errors::{ConfigError, DatabaseError};
 use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
@@ -732,39 +732,19 @@ async fn hydrate_search_candidate(
     repository: &Repository,
     mut candidate: RemoteCandidate,
 ) -> Result<RemoteCandidate, DatabaseError> {
-    let indexer_id =
-        i64::try_from(candidate.indexer_id.get()).map_err(|error| DatabaseError::QueryFailed {
-            operation: "hydrate search candidate".to_owned(),
-            message: error.to_string(),
-        })?;
-    let row = sqlx::query(
-        r#"
-        SELECT info_hash, torrent_cache_path
-        FROM remote_candidates
-        WHERE indexer_id = ? AND guid = ?
-        "#,
-    )
-    .bind(indexer_id)
-    .bind(candidate.guid.as_str())
-    .fetch_optional(repository.pool())
-    .await
-    .map_err(|error| DatabaseError::QueryFailed {
-        operation: "hydrate search candidate".to_owned(),
-        message: error.to_string(),
-    })?;
-
-    if let Some(row) = row {
+    if let Some(material) = repository
+        .remote_candidate_cache_material(&candidate.indexer_id, &candidate.guid)
+        .await?
+    {
         if candidate.info_hash.is_none() {
-            candidate.info_hash = row
-                .get::<Option<String>, _>("info_hash")
+            candidate.info_hash = material
+                .info_hash
                 .map(InfoHash::new)
                 .transpose()
                 .map_err(domain_database_error)?;
         }
         if candidate.torrent_cache_path.is_none() {
-            candidate.torrent_cache_path = row
-                .get::<Option<String>, _>("torrent_cache_path")
-                .map(std::path::PathBuf::from);
+            candidate.torrent_cache_path = material.torrent_cache_path;
         }
     }
 
@@ -1703,64 +1683,41 @@ async fn load_announce_candidate(
     repository: &Repository,
     id: &AnnounceWorkId,
 ) -> Result<Option<RuntimeAnnounceCandidate>, DatabaseError> {
-    let row = sqlx::query(
-        r#"
-        SELECT title, tracker, guid, info_hash, size, download_url, cookie, attempt_count
-        FROM announce_work
-        WHERE id = ?
-        "#,
-    )
-    .bind(id.as_str())
-    .fetch_optional(repository.pool())
-    .await
-    .map_err(|error| DatabaseError::QueryFailed {
-        operation: "load announce work candidate".to_owned(),
-        message: error.to_string(),
-    })?;
-    let Some(row) = row else {
+    let Some(material) = repository.announce_candidate_material(id).await? else {
         return Ok(None);
     };
-    let download_url = row
-        .get::<Option<String>, _>("download_url")
-        .unwrap_or_else(|| format!("announce:{}", id.as_str()));
+    let has_fetch_material = material.download_url.is_some();
+    let download_url = match material.download_url {
+        Some(download_url) => download_url,
+        None => {
+            DownloadUrl::new(format!("announce:{}", id.as_str())).map_err(domain_database_error)?
+        }
+    };
     let candidate = RemoteCandidate {
         id: None,
         indexer_id: IndexerId::new(ANNOUNCE_CANDIDATE_INDEXER_ID).map_err(domain_database_error)?,
         guid: CandidateGuid::new(format!(
             "announce:{}:{}",
-            row.get::<String, _>("tracker"),
-            row.get::<Option<String>, _>("guid")
-                .unwrap_or_else(|| id.as_str().to_owned())
+            material.tracker.as_str(),
+            material.guid.unwrap_or_else(|| id.as_str().to_owned())
         ))
         .map_err(domain_database_error)?,
-        download_url: DownloadUrl::new(download_url).map_err(domain_database_error)?,
-        title: ItemTitle::new(row.get::<String, _>("title")).map_err(domain_database_error)?,
-        tracker: TrackerName::new(row.get::<String, _>("tracker"))
-            .map_err(domain_database_error)?,
-        size: row
-            .get::<Option<i64>, _>("size")
-            .and_then(|size| u64::try_from(size).ok())
-            .map(crate::domain::ByteSize::new),
+        download_url,
+        title: material.title,
+        tracker: material.tracker,
+        size: material.size,
         published_at_ms: None,
-        info_hash: row
-            .get::<Option<String>, _>("info_hash")
-            .map(crate::domain::InfoHash::new)
-            .transpose()
-            .map_err(domain_database_error)?,
+        info_hash: material.info_hash,
         torrent_cache_path: None,
     };
-    let cookie = row.get::<Option<String>, _>("cookie");
-    let cookie_or_fetch = row
-        .get::<Option<String>, _>("download_url")
-        .map(|_download_url| RuntimeAnnounceFetch { cookie });
+    let cookie_or_fetch = has_fetch_material.then_some(RuntimeAnnounceFetch {
+        cookie: material.cookie,
+    });
 
     Ok(Some(RuntimeAnnounceCandidate {
         candidate,
         cookie_or_fetch,
-        attempt_count: row
-            .get::<i64, _>("attempt_count")
-            .try_into()
-            .unwrap_or(u16::MAX),
+        attempt_count: material.attempt_count,
     }))
 }
 

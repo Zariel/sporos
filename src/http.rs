@@ -32,7 +32,6 @@ use crate::metrics::{
     HttpMethod, HttpRoute, MetricsRegistry, MetricsSnapshot, WorkflowMetric, WorkflowOutcome,
 };
 use crate::persistence::repository::{AnnounceInsertResult, AnnounceQueueSnapshot, Repository};
-use crate::persistence::schema::REQUIRED_TABLES;
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
@@ -319,33 +318,14 @@ impl LiveReadinessChecks {
 
     async fn database_available(&self) -> bool {
         matches!(
-            tokio::time::timeout(
-                self.timeout,
-                sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(self.repository.pool())
-            )
-            .await,
-            Ok(Ok(1))
+            tokio::time::timeout(self.timeout, self.repository.check_connection()).await,
+            Ok(Ok(()))
         )
     }
 
     async fn schema_initialized(&self) -> bool {
-        let repository = self.repository.clone();
         matches!(
-            tokio::time::timeout(self.timeout, async move {
-                for table in REQUIRED_TABLES {
-                    let found: Option<String> = sqlx::query_scalar(
-                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-                    )
-                    .bind(table)
-                    .fetch_optional(repository.pool())
-                    .await?;
-                    if found.is_none() {
-                        return Ok::<_, sqlx::Error>(false);
-                    }
-                }
-                Ok(true)
-            })
-            .await,
+            tokio::time::timeout(self.timeout, self.repository.schema_initialized()).await,
             Ok(Ok(true))
         )
     }

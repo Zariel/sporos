@@ -1,7 +1,7 @@
 use super::*;
 use crate::announce::{
-    AnnounceDedupeIdentity, AnnounceLease, AnnounceReason, AnnounceStatus, AnnounceWorkId,
-    AnnounceWorkItem,
+    AnnounceDedupeIdentity, AnnounceFetchMaterial, AnnounceLease, AnnounceReason, AnnounceStatus,
+    AnnounceWorkId, AnnounceWorkItem,
 };
 use crate::domain::{
     CandidateGuid, ClientHost, DecisionReason, DisplayName, DownloadUrl, FileIndex, IndexerId,
@@ -12,7 +12,7 @@ use crate::indexers::{
     parse_torznab_caps,
 };
 use crate::persistence::schema::{BUSY_TIMEOUT_MS, REQUIRED_TABLES};
-use crate::secrets::ApiKey;
+use crate::secrets::{ApiKey, CookieSecret};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
 use std::path::PathBuf;
@@ -56,6 +56,167 @@ async fn file_backed_repository_initializes_schema_and_connection_pragmas() {
 
     repository.pool().close().await;
     fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn readiness_helpers_probe_connection_and_schema() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+
+    repository.check_connection().await.unwrap();
+    assert!(repository.schema_initialized().await.unwrap());
+
+    sqlx::query("DROP TABLE jobs")
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    assert!(!repository.schema_initialized().await.unwrap());
+}
+
+#[tokio::test]
+async fn remote_candidate_cache_material_reads_persisted_torrent_fields() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut candidate = test_remote_candidate("guid-cache", "Example");
+    candidate.torrent_cache_path = Some(PathBuf::from("/cache/example.torrent"));
+
+    repository
+        .upsert_remote_candidate(&candidate)
+        .await
+        .unwrap();
+    let material = repository
+        .remote_candidate_cache_material(&candidate.indexer_id, &candidate.guid)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        candidate.info_hash.as_ref().map(|hash| hash.as_str()),
+        material.info_hash.as_deref()
+    );
+    assert_eq!(candidate.torrent_cache_path, material.torrent_cache_path);
+}
+
+#[tokio::test]
+async fn remote_candidate_cache_material_leaves_cached_hash_unparsed() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let candidate = test_remote_candidate("guid-invalid-cache", "Example");
+
+    repository
+        .upsert_remote_candidate(&candidate)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE remote_candidates SET info_hash = 'not-a-hash' WHERE guid = ?")
+        .bind(candidate.guid.as_str())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let material = repository
+        .remote_candidate_cache_material(&candidate.indexer_id, &candidate.guid)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(Some("not-a-hash"), material.info_hash.as_deref());
+}
+
+#[tokio::test]
+async fn announce_candidate_material_reads_typed_fetch_material() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut work = test_announce_work("ann_material", "guid-material", 1);
+    let download_url =
+        DownloadUrl::new("https://tracker.example/download?passkey=supersecret").unwrap();
+    work.fetch = Some(
+        AnnounceFetchMaterial::new(
+            &download_url,
+            Some(CookieSecret::new("session=abc").unwrap()),
+        )
+        .unwrap(),
+    );
+    work.info_hash = Some(InfoHash::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap());
+    work.attempt_count = 3;
+
+    repository
+        .insert_or_dedupe_announce_work(&work, 10)
+        .await
+        .unwrap();
+    let material = repository
+        .announce_candidate_material(&work.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(work.title, material.title);
+    assert_eq!(work.tracker, material.tracker);
+    assert_eq!(
+        work.guid.as_ref().map(|guid| guid.as_str().to_owned()),
+        material.guid
+    );
+    assert_eq!(work.info_hash, material.info_hash);
+    assert_eq!(work.size, material.size);
+    assert_eq!(Some(download_url), material.download_url);
+    assert_eq!(Some("session=abc"), material.cookie.as_deref());
+    assert_eq!(3, material.attempt_count);
+
+    let debug = format!("{material:?}");
+    assert!(!debug.contains("supersecret"));
+    assert!(!debug.contains("session=abc"));
+}
+
+#[tokio::test]
+async fn announce_candidate_material_treats_negative_size_as_absent() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let work = test_announce_work("ann_negative_size", "guid-negative-size", 1);
+
+    repository
+        .insert_or_dedupe_announce_work(&work, 10)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE announce_work SET size = -1 WHERE id = ?")
+        .bind(work.id.as_str())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let material = repository
+        .announce_candidate_material(&work.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(None, material.size);
+}
+
+#[tokio::test]
+async fn system_test_snapshot_and_diagnostics_read_app_tables() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let item = test_local_item("Diagnostic Example");
+    let file = LocalFile::new(
+        None,
+        PathBuf::from("Diagnostic Example/file.mkv"),
+        ByteSize::new(10),
+        FileIndex::new(0),
+    )
+    .unwrap();
+    repository
+        .upsert_local_item_with_files(&item, &[file])
+        .await
+        .unwrap();
+    repository
+        .upsert_remote_candidate(&test_remote_candidate("guid-diag", "Diagnostic Candidate"))
+        .await
+        .unwrap();
+
+    let snapshot = repository.system_test_snapshot(8).await.unwrap();
+    let diagnostics = repository.system_test_diagnostics(8).await.unwrap();
+
+    assert_eq!(1, snapshot.local_items);
+    assert_eq!(1, snapshot.local_files);
+    assert_eq!(1, snapshot.remote_candidates);
+    assert_eq!(1, snapshot.client_items.len());
+    assert_eq!("Diagnostic Example", diagnostics.local_items[0].title);
+    assert_eq!("file.mkv", diagnostics.local_files[0].file_name);
+    assert_eq!(
+        "Diagnostic Candidate",
+        diagnostics.remote_candidates[0].title
+    );
 }
 
 #[tokio::test]

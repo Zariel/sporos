@@ -20,7 +20,7 @@ use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::app::validate_runtime_config;
 use crate::runtime::daemon;
 
-const SYSTEM_TEST_DIAGNOSTIC_LIMIT: i64 = 8;
+const SYSTEM_TEST_DIAGNOSTIC_LIMIT: u16 = 8;
 const SYSTEM_TEST_TEXT_LIMIT: usize = 160;
 
 #[derive(Debug, Parser)]
@@ -443,22 +443,10 @@ async fn system_test_snapshot(
     let repository = Repository::connect(&config.paths.database)
         .await
         .map_err(|error| error.to_string())?;
-    let local_items = count_rows(repository.pool(), "SELECT COUNT(*) FROM local_items").await?;
-    let local_files = count_rows(repository.pool(), "SELECT COUNT(*) FROM local_files").await?;
-    let remote_candidates =
-        count_rows(repository.pool(), "SELECT COUNT(*) FROM remote_candidates").await?;
-    let cached_candidates = count_rows(
-        repository.pool(),
-        "SELECT COUNT(*) FROM remote_candidates WHERE info_hash IS NOT NULL AND torrent_cache_path IS NOT NULL",
-    )
-    .await?;
-    let match_decisions =
-        count_rows(repository.pool(), "SELECT COUNT(*) FROM match_decisions").await?;
-    let enabled_indexers = count_rows(
-        repository.pool(),
-        "SELECT COUNT(*) FROM indexers WHERE enabled = 1",
-    )
-    .await?;
+    let snapshot = repository
+        .system_test_snapshot(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+        .await
+        .map_err(|error| error.to_string())?;
     let saved_torrents = fs::read_dir(&config.paths.output_dir)
         .map_err(|error| {
             format!(
@@ -476,18 +464,26 @@ async fn system_test_snapshot(
         .count();
     let saved_torrents =
         i64::try_from(saved_torrents).map_err(|error| format!("count saved torrents: {error}"))?;
-    let client_items =
-        system_test_client_items(repository.pool(), SYSTEM_TEST_DIAGNOSTIC_LIMIT).await?;
 
     Ok(SystemTestSnapshot {
-        local_items,
-        local_files,
-        remote_candidates,
-        cached_candidates,
-        match_decisions,
-        enabled_indexers,
+        local_items: snapshot.local_items,
+        local_files: snapshot.local_files,
+        remote_candidates: snapshot.remote_candidates,
+        cached_candidates: snapshot.cached_candidates,
+        match_decisions: snapshot.match_decisions,
+        enabled_indexers: snapshot.enabled_indexers,
         saved_torrents,
-        client_items,
+        client_items: snapshot
+            .client_items
+            .into_iter()
+            .map(|row| SystemTestClientItem {
+                title: truncated(row.title),
+                source_key: truncated(row.source_key),
+                info_hash: row.info_hash,
+                save_path: truncated_option(row.save_path),
+                file_count: row.file_count,
+            })
+            .collect(),
     })
 }
 
@@ -680,7 +676,7 @@ fn diagnostic_torrent_files(
 ) -> Vec<SystemTestTorrentFileDiagnostic> {
     files
         .into_iter()
-        .take(usize::try_from(SYSTEM_TEST_DIAGNOSTIC_LIMIT).unwrap_or(8))
+        .take(usize::from(SYSTEM_TEST_DIAGNOSTIC_LIMIT))
         .map(|file| SystemTestTorrentFileDiagnostic {
             relative_path: truncated(file.relative_path.to_string_lossy().into_owned()),
             file_name: truncated(file.file_name.as_str().to_owned()),
@@ -697,208 +693,117 @@ async fn system_test_diagnostics(
     let repository = Repository::connect(&config.paths.database)
         .await
         .map_err(|error| error.to_string())?;
-    let pool = repository.pool();
-
-    let local_items = sqlx::query(
-        r#"
-        SELECT id, source_type, source_key, title, media_type, info_hash, save_path, total_size
-        FROM local_items
-        ORDER BY updated_at DESC, id DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|row| SystemTestLocalItemDiagnostic {
-        id: sqlx::Row::get(&row, "id"),
-        source_type: truncated(sqlx::Row::get(&row, "source_type")),
-        source_key: truncated(sqlx::Row::get(&row, "source_key")),
-        title: truncated(sqlx::Row::get(&row, "title")),
-        media_type: truncated(sqlx::Row::get(&row, "media_type")),
-        info_hash: sqlx::Row::get(&row, "info_hash"),
-        save_path: truncated_option(sqlx::Row::get(&row, "save_path")),
-        total_size: sqlx::Row::get(&row, "total_size"),
-    })
-    .collect();
-
-    let local_files = sqlx::query(
-        r#"
-        SELECT local_files.item_id, local_files.relative_path, local_files.file_name,
-               local_files.size, local_files.file_index
-        FROM local_files
-        JOIN local_items ON local_items.id = local_files.item_id
-        ORDER BY local_items.updated_at DESC, local_files.item_id DESC, local_files.file_index
-        LIMIT ?
-        "#,
-    )
-    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|row| SystemTestLocalFileDiagnostic {
-        item_id: sqlx::Row::get(&row, "item_id"),
-        relative_path: truncated(sqlx::Row::get(&row, "relative_path")),
-        file_name: truncated(sqlx::Row::get(&row, "file_name")),
-        size: sqlx::Row::get(&row, "size"),
-        file_index: sqlx::Row::get(&row, "file_index"),
-    })
-    .collect();
-
-    let remote_candidates = sqlx::query(
-        r#"
-        SELECT id, guid, title, tracker, size, info_hash, torrent_cache_path, last_seen_at
-        FROM remote_candidates
-        ORDER BY last_seen_at DESC, id DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|row| SystemTestRemoteCandidateDiagnostic {
-        id: sqlx::Row::get(&row, "id"),
-        guid: truncated(sqlx::Row::get(&row, "guid")),
-        title: truncated(sqlx::Row::get(&row, "title")),
-        tracker: truncated(sqlx::Row::get(&row, "tracker")),
-        size: sqlx::Row::get(&row, "size"),
-        info_hash: sqlx::Row::get(&row, "info_hash"),
-        torrent_cache_path: truncated_option(sqlx::Row::get(&row, "torrent_cache_path")),
-        last_seen_at: sqlx::Row::get(&row, "last_seen_at"),
-    })
-    .collect();
-
-    let match_decisions = sqlx::query(
-        r#"
-        SELECT local_item_id, candidate_id, decision, matched_size, matched_ratio, reason_code, assessed_at
-        FROM match_decisions
-        ORDER BY assessed_at DESC, candidate_id DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|row| SystemTestMatchDecisionDiagnostic {
-        local_item_id: sqlx::Row::get(&row, "local_item_id"),
-        candidate_id: sqlx::Row::get(&row, "candidate_id"),
-        decision: truncated(sqlx::Row::get(&row, "decision")),
-        matched_size: sqlx::Row::get(&row, "matched_size"),
-        matched_ratio: sqlx::Row::get(&row, "matched_ratio"),
-        reason_code: truncated(sqlx::Row::get(&row, "reason_code")),
-        assessed_at: sqlx::Row::get(&row, "assessed_at"),
-    })
-    .collect();
-
-    let indexers = sqlx::query(
-        r#"
-        SELECT id, name, source_kind, enabled, state, retry_after, last_caps_refresh_at
-        FROM indexers
-        ORDER BY name
-        LIMIT ?
-        "#,
-    )
-    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|row| {
-        let enabled: i64 = sqlx::Row::get(&row, "enabled");
-        SystemTestIndexerDiagnostic {
-            id: sqlx::Row::get(&row, "id"),
-            name: truncated(sqlx::Row::get(&row, "name")),
-            source_kind: truncated(sqlx::Row::get(&row, "source_kind")),
-            enabled: enabled != 0,
-            state: truncated(sqlx::Row::get(&row, "state")),
-            retry_after: sqlx::Row::get(&row, "retry_after"),
-            last_caps_refresh_at: sqlx::Row::get(&row, "last_caps_refresh_at"),
-        }
-    })
-    .collect();
-
-    let dependency_health = sqlx::query(
-        r#"
-        SELECT dependency_type, dependency_name, state, reason, retry_after, failure_count, checked_at
-        FROM dependency_health
-        ORDER BY checked_at DESC, dependency_type, dependency_name
-        LIMIT ?
-        "#,
-    )
-    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|row| SystemTestDependencyHealthDiagnostic {
-        dependency_type: truncated(sqlx::Row::get(&row, "dependency_type")),
-        dependency_name: truncated(sqlx::Row::get(&row, "dependency_name")),
-        state: truncated(sqlx::Row::get(&row, "state")),
-        reason: truncated_option(sqlx::Row::get(&row, "reason")),
-        retry_after: sqlx::Row::get(&row, "retry_after"),
-        failure_count: sqlx::Row::get(&row, "failure_count"),
-        checked_at: sqlx::Row::get(&row, "checked_at"),
-    })
-    .collect();
-
-    let jobs = sqlx::query(
-        r#"
-        SELECT name, state, last_started_at, last_finished_at, next_run_at, last_error
-        FROM jobs
-        ORDER BY name
-        LIMIT ?
-        "#,
-    )
-    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|row| SystemTestJobDiagnostic {
-        name: truncated(sqlx::Row::get(&row, "name")),
-        state: truncated(sqlx::Row::get(&row, "state")),
-        last_started_at: sqlx::Row::get(&row, "last_started_at"),
-        last_finished_at: sqlx::Row::get(&row, "last_finished_at"),
-        next_run_at: sqlx::Row::get(&row, "next_run_at"),
-        last_error: truncated_option(sqlx::Row::get(&row, "last_error")),
-    })
-    .collect();
-
-    let announce_work = sqlx::query(
-        r#"
-        SELECT id, tracker, title, info_hash, status, reason, attempt_count, next_attempt_at,
-               last_error_class, last_decision, last_action_outcome
-        FROM announce_work
-        ORDER BY updated_at DESC, received_at DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .map(|row| SystemTestAnnounceWorkDiagnostic {
-        id: truncated(sqlx::Row::get(&row, "id")),
-        tracker: truncated(sqlx::Row::get(&row, "tracker")),
-        title: truncated(sqlx::Row::get(&row, "title")),
-        info_hash: sqlx::Row::get(&row, "info_hash"),
-        status: truncated(sqlx::Row::get(&row, "status")),
-        reason: truncated(sqlx::Row::get(&row, "reason")),
-        attempt_count: sqlx::Row::get(&row, "attempt_count"),
-        next_attempt_at: sqlx::Row::get(&row, "next_attempt_at"),
-        last_error_class: truncated_option(sqlx::Row::get(&row, "last_error_class")),
-        last_decision: truncated_option(sqlx::Row::get(&row, "last_decision")),
-        last_action_outcome: truncated_option(sqlx::Row::get(&row, "last_action_outcome")),
-    })
-    .collect();
+    let diagnostics = repository
+        .system_test_diagnostics(SYSTEM_TEST_DIAGNOSTIC_LIMIT)
+        .await
+        .map_err(|error| error.to_string())?;
+    let local_items = diagnostics
+        .local_items
+        .into_iter()
+        .map(|row| SystemTestLocalItemDiagnostic {
+            id: row.id,
+            source_type: truncated(row.source_type),
+            source_key: truncated(row.source_key),
+            title: truncated(row.title),
+            media_type: truncated(row.media_type),
+            info_hash: row.info_hash,
+            save_path: truncated_option(row.save_path),
+            total_size: row.total_size,
+        })
+        .collect();
+    let local_files = diagnostics
+        .local_files
+        .into_iter()
+        .map(|row| SystemTestLocalFileDiagnostic {
+            item_id: row.item_id,
+            relative_path: truncated(row.relative_path),
+            file_name: truncated(row.file_name),
+            size: row.size,
+            file_index: row.file_index,
+        })
+        .collect();
+    let remote_candidates = diagnostics
+        .remote_candidates
+        .into_iter()
+        .map(|row| SystemTestRemoteCandidateDiagnostic {
+            id: row.id,
+            guid: truncated(row.guid),
+            title: truncated(row.title),
+            tracker: truncated(row.tracker),
+            size: row.size,
+            info_hash: row.info_hash,
+            torrent_cache_path: truncated_option(row.torrent_cache_path),
+            last_seen_at: row.last_seen_at,
+        })
+        .collect();
+    let match_decisions = diagnostics
+        .match_decisions
+        .into_iter()
+        .map(|row| SystemTestMatchDecisionDiagnostic {
+            local_item_id: row.local_item_id,
+            candidate_id: row.candidate_id,
+            decision: truncated(row.decision),
+            matched_size: row.matched_size,
+            matched_ratio: row.matched_ratio,
+            reason_code: truncated(row.reason_code),
+            assessed_at: row.assessed_at,
+        })
+        .collect();
+    let indexers = diagnostics
+        .indexers
+        .into_iter()
+        .map(|row| SystemTestIndexerDiagnostic {
+            id: row.id,
+            name: truncated(row.name),
+            source_kind: truncated(row.source_kind),
+            enabled: row.enabled,
+            state: truncated(row.state),
+            retry_after: row.retry_after,
+            last_caps_refresh_at: row.last_caps_refresh_at,
+        })
+        .collect();
+    let dependency_health = diagnostics
+        .dependency_health
+        .into_iter()
+        .map(|row| SystemTestDependencyHealthDiagnostic {
+            dependency_type: truncated(row.dependency_type),
+            dependency_name: truncated(row.dependency_name),
+            state: truncated(row.state),
+            reason: truncated_option(row.reason),
+            retry_after: row.retry_after,
+            failure_count: row.failure_count,
+            checked_at: row.checked_at,
+        })
+        .collect();
+    let jobs = diagnostics
+        .jobs
+        .into_iter()
+        .map(|row| SystemTestJobDiagnostic {
+            name: truncated(row.name),
+            state: truncated(row.state),
+            last_started_at: row.last_started_at,
+            last_finished_at: row.last_finished_at,
+            next_run_at: row.next_run_at,
+            last_error: truncated_option(row.last_error),
+        })
+        .collect();
+    let announce_work = diagnostics
+        .announce_work
+        .into_iter()
+        .map(|row| SystemTestAnnounceWorkDiagnostic {
+            id: truncated(row.id),
+            tracker: truncated(row.tracker),
+            title: truncated(row.title),
+            info_hash: row.info_hash,
+            status: truncated(row.status),
+            reason: truncated(row.reason),
+            attempt_count: row.attempt_count,
+            next_attempt_at: row.next_attempt_at,
+            last_error_class: truncated_option(row.last_error_class),
+            last_decision: truncated_option(row.last_decision),
+            last_action_outcome: truncated_option(row.last_action_outcome),
+        })
+        .collect();
 
     Ok(SystemTestDiagnostics {
         snapshot,
@@ -923,50 +828,6 @@ fn manifest_info_hash(manifest: &SystemFixtureManifest, slug: &str) -> Result<In
             InfoHash::new(&fixture.info_hash)
                 .map_err(|error| format!("invalid fixture info hash {slug}: {error}"))
         })
-}
-
-async fn system_test_client_items(
-    pool: &sqlx::SqlitePool,
-    limit: i64,
-) -> Result<Vec<SystemTestClientItem>, String> {
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            local_items.title,
-            local_items.source_key,
-            local_items.info_hash,
-            local_items.save_path,
-            COUNT(local_files.file_index) AS file_count
-        FROM local_items
-        LEFT JOIN local_files ON local_files.item_id = local_items.id
-        WHERE local_items.source_type = 'client'
-        GROUP BY local_items.id
-        ORDER BY local_items.source_key
-        LIMIT ?
-        "#,
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| SystemTestClientItem {
-            title: truncated(sqlx::Row::get(&row, "title")),
-            source_key: truncated(sqlx::Row::get(&row, "source_key")),
-            info_hash: sqlx::Row::get(&row, "info_hash"),
-            save_path: truncated_option(sqlx::Row::get(&row, "save_path")),
-            file_count: sqlx::Row::get(&row, "file_count"),
-        })
-        .collect())
-}
-
-async fn count_rows(pool: &sqlx::SqlitePool, query: &str) -> Result<i64, String> {
-    sqlx::query_scalar(query)
-        .fetch_one(pool)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 fn truncated(value: String) -> String {
