@@ -7,8 +7,11 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
@@ -50,7 +53,15 @@ use crate::torrent::parse_metafile;
 
 const MAX_SAVED_TORRENT_BYTES: u64 = 32 * 1024 * 1024;
 const SAVED_TORRENT_SCAN_BATCH: usize = 32;
+const SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY: usize = 4;
 const CLIENT_INVENTORY_REFRESH_CONCURRENCY: usize = 4;
+
+#[cfg(test)]
+static SAVED_TORRENT_READ_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static SAVED_TORRENT_READ_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static SAVED_TORRENT_READ_MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 pub type ClientResultFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, TorrentClientError>> + Send + 'a>>;
@@ -844,6 +855,7 @@ impl InjectionWorker {
             }
             let mut scan =
                 saved_torrent_path_scan(directory, config.max_saved_torrents - summary.scanned);
+            let mut preflight = FuturesUnordered::new();
             while let Some(path) = scan.next_path_until_stop(&mut should_stop).await? {
                 if summary.scanned >= config.max_saved_torrents || should_stop() {
                     scan.cancel();
@@ -851,11 +863,37 @@ impl InjectionWorker {
                     return Ok(summary);
                 }
                 summary.scanned += 1;
+                preflight.push(preflight_saved_torrent_retry(
+                    directory.clone(),
+                    path,
+                    config.clone(),
+                ));
+                if preflight.len() >= SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY
+                    && let Err(error) = self
+                        .drain_one_saved_torrent_preflight(
+                            &mut preflight,
+                            &mut summary,
+                            &mut should_stop,
+                            shutdown,
+                        )
+                        .await
+                {
+                    scan.cancel();
+                    scan.finish().await?;
+                    return Err(error);
+                }
+            }
+            while !preflight.is_empty() {
+                if should_stop() {
+                    summary.kept += preflight.len();
+                    preflight.clear();
+                    scan.cancel();
+                    scan.finish().await?;
+                    return Ok(summary);
+                }
                 if let Err(error) = self
-                    .retry_saved_torrent(
-                        directory,
-                        &path,
-                        &config,
+                    .drain_one_saved_torrent_preflight(
+                        &mut preflight,
                         &mut summary,
                         &mut should_stop,
                         shutdown,
@@ -878,11 +916,11 @@ impl InjectionWorker {
         Ok(summary)
     }
 
-    async fn retry_saved_torrent<F>(
+    async fn drain_one_saved_torrent_preflight<F>(
         &self,
-        directory: &Path,
-        path: &Path,
-        config: &SavedTorrentRetryConfig,
+        preflight: &mut FuturesUnordered<
+            impl Future<Output = Result<SavedTorrentPreflight, InjectionWorkerError>>,
+        >,
         summary: &mut SavedTorrentRetrySummary,
         should_stop: &mut F,
         shutdown: Option<&ShutdownSignal>,
@@ -890,38 +928,74 @@ impl InjectionWorker {
     where
         F: FnMut() -> bool,
     {
+        let result = match shutdown {
+            Some(signal) => {
+                if shutdown_requested(Some(signal)) {
+                    summary.kept += preflight.len();
+                    preflight.clear();
+                    return Ok(());
+                }
+                let mut signal = signal.clone();
+                tokio::select! {
+                    biased;
+                    _ = signal.cancelled() => {
+                        summary.kept += preflight.len();
+                        preflight.clear();
+                        return Ok(());
+                    }
+                    result = preflight.next() => result,
+                }
+            }
+            None => preflight.next().await,
+        };
+        let Some(result) = result else {
+            return Ok(());
+        };
+        match result? {
+            SavedTorrentPreflight::Ready(prepared) => {
+                if should_stop() {
+                    summary.kept += 1;
+                    return Ok(());
+                }
+                self.retry_preflighted_saved_torrent(*prepared, summary, should_stop, shutdown)
+                    .await
+            }
+            SavedTorrentPreflight::Skipped => {
+                summary.skipped += 1;
+                summary.kept += 1;
+                Ok(())
+            }
+            SavedTorrentPreflight::Failed => {
+                summary.failed += 1;
+                summary.kept += 1;
+                Ok(())
+            }
+        }
+    }
+
+    async fn retry_preflighted_saved_torrent<F>(
+        &self,
+        prepared: LoadedSavedTorrentRetry,
+        summary: &mut SavedTorrentRetrySummary,
+        should_stop: &mut F,
+        shutdown: Option<&ShutdownSignal>,
+    ) -> Result<(), InjectionWorkerError>
+    where
+        F: FnMut() -> bool,
+    {
+        let LoadedSavedTorrentRetry {
+            directory,
+            path,
+            file_name,
+            metadata,
+            saved,
+            candidate,
+            config,
+        } = prepared;
         if should_stop() {
             summary.kept += 1;
             return Ok(());
         }
-        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-            summary.skipped += 1;
-            summary.kept += 1;
-            return Ok(());
-        };
-        let metadata = match parse_torrent_output_filename(file_name) {
-            Ok(metadata) if !metadata.cached => metadata,
-            Ok(_) | Err(_) => {
-                summary.skipped += 1;
-                summary.kept += 1;
-                return Ok(());
-            }
-        };
-        let saved = match read_saved_torrent(path).await {
-            Ok(saved) if saved.parsed.metafile.info_hash() == &metadata.info_hash => saved,
-            Ok(_) => {
-                summary.failed += 1;
-                summary.kept += 1;
-                return Ok(());
-            }
-            Err(InjectionWorkerError::Io { .. } | InjectionWorkerError::TorrentParse(_)) => {
-                summary.failed += 1;
-                summary.kept += 1;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let candidate = saved_remote_candidate(&metadata, path)?;
         let saved_media_types = if metadata.media_type == crate::domain::MediaType::Unknown {
             Vec::new()
         } else {
@@ -975,7 +1049,7 @@ impl InjectionWorker {
                 torrent_bytes: saved.bytes.clone(),
                 assessment,
                 assessed_at_ms: config.assessed_at_ms,
-                output_dir: directory.to_path_buf(),
+                output_dir: directory.clone(),
                 link_dirs: config.link_dirs.clone(),
                 link_type: config.link_type,
                 flat_linking: config.flat_linking,
@@ -1002,8 +1076,8 @@ impl InjectionWorker {
                 InjectionOutcome::Injected | InjectionOutcome::AlreadyExists => {
                     match self
                         .delete_saved_torrent_if_complete(
-                            path,
-                            file_name,
+                            &path,
+                            &file_name,
                             &metadata.info_hash,
                             saved.identity,
                             &result,
@@ -1022,7 +1096,7 @@ impl InjectionWorker {
                     return Ok(());
                 }
                 InjectionOutcome::Rejected => {
-                    match delete_saved_torrent(path, saved.identity).await {
+                    match delete_saved_torrent(&path, saved.identity).await {
                         Ok(true) => summary.deleted += 1,
                         Ok(false) => summary.kept += 1,
                         Err(error) if saved_retry_can_continue_after_error(&error) => {
@@ -1594,6 +1668,60 @@ enum ExistingClientLookup {
     Shutdown,
 }
 
+enum SavedTorrentPreflight {
+    Ready(Box<LoadedSavedTorrentRetry>),
+    Skipped,
+    Failed,
+}
+
+struct LoadedSavedTorrentRetry {
+    directory: PathBuf,
+    path: PathBuf,
+    file_name: String,
+    metadata: TorrentOutputMetadata,
+    saved: SavedTorrentFile,
+    candidate: RemoteCandidate,
+    config: SavedTorrentRetryConfig,
+}
+
+async fn preflight_saved_torrent_retry(
+    directory: PathBuf,
+    path: PathBuf,
+    config: SavedTorrentRetryConfig,
+) -> Result<SavedTorrentPreflight, InjectionWorkerError> {
+    let Some(file_name) = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+    else {
+        return Ok(SavedTorrentPreflight::Skipped);
+    };
+    let metadata = match parse_torrent_output_filename(&file_name) {
+        Ok(metadata) if !metadata.cached => metadata,
+        Ok(_) | Err(_) => return Ok(SavedTorrentPreflight::Skipped),
+    };
+    let saved = match read_saved_torrent(&path).await {
+        Ok(saved) if saved.parsed.metafile.info_hash() == &metadata.info_hash => saved,
+        Ok(_) => return Ok(SavedTorrentPreflight::Failed),
+        Err(InjectionWorkerError::Io { .. } | InjectionWorkerError::TorrentParse(_)) => {
+            return Ok(SavedTorrentPreflight::Failed);
+        }
+        Err(error) => return Err(error),
+    };
+    let candidate = saved_remote_candidate(&metadata, &path)?;
+    Ok(SavedTorrentPreflight::Ready(Box::new(
+        LoadedSavedTorrentRetry {
+            directory,
+            path,
+            file_name,
+            metadata,
+            saved,
+            candidate,
+            config,
+        },
+    )))
+}
+
 struct SavedTorrentPathScan {
     directory: PathBuf,
     receiver: mpsc::Receiver<Result<PathBuf, InjectionWorkerError>>,
@@ -1753,6 +1881,8 @@ async fn read_saved_torrent(path: &Path) -> Result<SavedTorrentFile, InjectionWo
     let path = path.to_path_buf();
     let blocking_path = path.clone();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _read_tracker = SavedTorrentReadTracker::enter(&blocking_path);
         let file =
             open_saved_torrent_file(&blocking_path).map_err(|source| InjectionWorkerError::Io {
                 operation: "open saved torrent",
@@ -1798,6 +1928,46 @@ async fn read_saved_torrent(path: &Path) -> Result<SavedTorrentFile, InjectionWo
         path: path.to_path_buf(),
         source: std::io::Error::other(source),
     })?
+}
+
+#[cfg(test)]
+struct SavedTorrentReadTracker;
+
+#[cfg(test)]
+impl SavedTorrentReadTracker {
+    fn enter(path: &Path) -> Option<Self> {
+        let delay = SAVED_TORRENT_READ_DELAY_MS.load(Ordering::SeqCst);
+        if delay == 0 || !path.to_string_lossy().contains("saved-retry-prefetch") {
+            return None;
+        }
+        let active = SAVED_TORRENT_READ_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        update_saved_torrent_read_max(active);
+        std::thread::sleep(Duration::from_millis(delay));
+        Some(Self)
+    }
+}
+
+#[cfg(test)]
+impl Drop for SavedTorrentReadTracker {
+    fn drop(&mut self) {
+        SAVED_TORRENT_READ_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn update_saved_torrent_read_max(active: usize) {
+    let mut current = SAVED_TORRENT_READ_MAX_IN_FLIGHT.load(Ordering::SeqCst);
+    while active > current {
+        match SAVED_TORRENT_READ_MAX_IN_FLIGHT.compare_exchange(
+            current,
+            active,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return,
+            Err(next) => current = next,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2331,6 +2501,8 @@ mod tests {
     use crate::persistence::repository::Repository;
     use crate::runtime::shutdown::ShutdownController;
     use tokio::sync::Barrier;
+
+    static SAVED_TORRENT_READ_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn worker_checks_other_clients_before_mutating_target() {
@@ -4307,6 +4479,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_torrent_retry_prefetches_saved_files_with_bounded_concurrency() {
+        let _read_lock = SAVED_TORRENT_READ_TEST_LOCK.lock().await;
+        let _read_delay = SavedTorrentReadDelay::new(Duration::from_millis(75));
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-prefetch");
+        let output_dir = root.join("output");
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        for index in 0..=SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY {
+            let bytes = test_torrent_bytes_with_source(&format!("prefetch-{index}"));
+            save_test_torrent(&output_dir, "movie.mkv", &bytes, MediaType::Movie);
+        }
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let summary = worker
+            .retry_saved_torrents(SavedTorrentRetryConfig {
+                directories: vec![output_dir.clone()],
+                recheck: skip_recheck_config(),
+                assessed_at_ms: 1_700_000_000_000,
+                ..SavedTorrentRetryConfig::default()
+            })
+            .await
+            .unwrap();
+
+        let max_in_flight = SAVED_TORRENT_READ_MAX_IN_FLIGHT.load(Ordering::SeqCst);
+        assert_eq!(
+            SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY + 1,
+            summary.scanned
+        );
+        assert_eq!(
+            SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY + 1,
+            summary.attempted
+        );
+        assert_eq!(
+            SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY + 1,
+            summary.injected
+        );
+        assert_eq!(
+            SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY + 1,
+            summary.deleted
+        );
+        assert_eq!(
+            SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY + 1,
+            target.inject_calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY, max_in_flight);
+        assert!(max_in_flight <= SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_retry_shutdown_keeps_pending_preflight_files() {
+        let _read_lock = SAVED_TORRENT_READ_TEST_LOCK.lock().await;
+        let _read_delay = SavedTorrentReadDelay::new(Duration::from_millis(200));
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-prefetch-shutdown");
+        let output_dir = root.join("output");
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        for index in 0..SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY {
+            let bytes = test_torrent_bytes_with_source(&format!("shutdown-{index}"));
+            save_test_torrent(&output_dir, "movie.mkv", &bytes, MediaType::Movie);
+        }
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let worker = InjectionWorker::new(repository, vec![target as Arc<dyn InjectionClient>]);
+        let (shutdown, mut signal) = shutdown_channel();
+
+        let retry = tokio::spawn(async move {
+            worker
+                .retry_saved_torrents_until_shutdown(
+                    SavedTorrentRetryConfig {
+                        directories: vec![output_dir],
+                        recheck: skip_recheck_config(),
+                        assessed_at_ms: 1_700_000_000_000,
+                        ..SavedTorrentRetryConfig::default()
+                    },
+                    &mut signal,
+                )
+                .await
+        });
+        wait_for_saved_torrent_reads(1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        let summary = retry.await.unwrap().unwrap();
+
+        assert_eq!(SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY, summary.scanned);
+        assert_eq!(0, summary.attempted);
+        assert_eq!(SAVED_TORRENT_RETRY_PREFLIGHT_CONCURRENCY, summary.kept);
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_retry_serializes_duplicate_info_hash_mutation() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-duplicate-info-hash");
+        let first_output_dir = root.join("first-output");
+        let second_output_dir = root.join("second-output");
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        save_test_torrent(
+            &first_output_dir,
+            "movie.mkv",
+            test_torrent_bytes(),
+            MediaType::Movie,
+        );
+        save_test_torrent(
+            &second_output_dir,
+            "movie.mkv",
+            test_torrent_bytes(),
+            MediaType::Movie,
+        );
+        let target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_existing_after_inject());
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let summary = worker
+            .retry_saved_torrents(SavedTorrentRetryConfig {
+                directories: vec![first_output_dir.clone(), second_output_dir.clone()],
+                recheck: skip_recheck_config(),
+                assessed_at_ms: 1_700_000_000_000,
+                ..SavedTorrentRetryConfig::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(2, summary.scanned);
+        assert_eq!(2, summary.attempted);
+        assert_eq!(1, summary.injected);
+        assert_eq!(1, summary.already_exists);
+        assert_eq!(2, summary.deleted);
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, saved_torrent_count(&first_output_dir));
+        assert_eq!(0, saved_torrent_count(&second_output_dir));
+    }
+
+    #[tokio::test]
     async fn saved_torrent_retry_filters_info_hash_media_type_before_limit() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("saved-retry-info-hash-limit");
@@ -4972,6 +5286,28 @@ mod tests {
         replace_save_path_file_on_has: StdMutex<Option<(PathBuf, Vec<u8>)>>,
         last_pause_for_recheck: StdMutex<Option<bool>>,
         last_save_path: StdMutex<Option<PathBuf>>,
+    }
+
+    struct SavedTorrentReadDelay;
+
+    impl SavedTorrentReadDelay {
+        fn new(delay: Duration) -> Self {
+            SAVED_TORRENT_READ_DELAY_MS.store(
+                u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            SAVED_TORRENT_READ_IN_FLIGHT.store(0, Ordering::SeqCst);
+            SAVED_TORRENT_READ_MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for SavedTorrentReadDelay {
+        fn drop(&mut self) {
+            SAVED_TORRENT_READ_DELAY_MS.store(0, Ordering::SeqCst);
+            SAVED_TORRENT_READ_IN_FLIGHT.store(0, Ordering::SeqCst);
+            SAVED_TORRENT_READ_MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+        }
     }
 
     struct FakeRefreshClient {
@@ -5744,6 +6080,14 @@ mod tests {
         b"d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces20:bbbbbbbbbbbbbbbbbbbbee"
     }
 
+    fn test_torrent_bytes_with_source(source: &str) -> Vec<u8> {
+        format!(
+            "d8:announce14:http://tracker4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi10e6:pieces20:aaaaaaaaaaaaaaaaaaaa6:source{}:{source}ee",
+            source.len()
+        )
+        .into_bytes()
+    }
+
     fn save_test_torrent(output_dir: &Path, title: &str, bytes: &[u8], media_type: MediaType) {
         let parsed = parse_metafile(bytes).unwrap();
         let mut candidate = remote_candidate();
@@ -5755,6 +6099,17 @@ mod tests {
             bytes,
         )
         .unwrap();
+    }
+
+    async fn wait_for_saved_torrent_reads(minimum: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while SAVED_TORRENT_READ_IN_FLIGHT.load(Ordering::SeqCst) < minimum {
+            assert!(
+                Instant::now() < deadline,
+                "saved torrent reads did not start before timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
