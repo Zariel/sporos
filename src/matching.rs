@@ -242,6 +242,7 @@ pub struct CandidatePrecheckInput<'a> {
     pub tracker: Option<&'a str>,
     pub size: Option<ByteSize>,
     pub info_hash: Option<&'a InfoHash>,
+    pub torrent_metadata_available: bool,
 }
 
 impl<'a> CandidatePrecheckInput<'a> {
@@ -252,6 +253,7 @@ impl<'a> CandidatePrecheckInput<'a> {
             tracker: Some(candidate.tracker.as_str()),
             size: candidate.size,
             info_hash: candidate.info_hash.as_ref(),
+            torrent_metadata_available: candidate.torrent_cache_path.is_some(),
         }
     }
 }
@@ -334,6 +336,7 @@ pub fn precheck_candidate(
 
     if candidate
         .size
+        .filter(|_| !candidate.torrent_metadata_available)
         .is_some_and(|size| !candidate_size_in_bounds(local_item, size, config))
     {
         return reject(CandidatePrecheckReason::FuzzySizeMismatch);
@@ -428,12 +431,36 @@ pub async fn assess_and_persist_candidate(
     let cached = match cached_metafile(cache_path).await {
         CachedMetafile::Parsed(metafile) => metafile,
         CachedMetafile::Unreadable => {
+            if let Some(assessment) = reported_size_rejection(
+                repository,
+                local_item,
+                candidate,
+                candidate_id,
+                assessed_at_ms,
+                &config.precheck,
+            )
+            .await?
+            {
+                return Ok(assessment);
+            }
             return Ok(PersistedCandidateAssessment::NeedsTorrentDownload {
                 candidate_id,
                 cache_status: CandidateCacheStatus::Unreadable,
             });
         }
         CachedMetafile::Invalid => {
+            if let Some(assessment) = reported_size_rejection(
+                repository,
+                local_item,
+                candidate,
+                candidate_id,
+                assessed_at_ms,
+                &config.precheck,
+            )
+            .await?
+            {
+                return Ok(assessment);
+            }
             return Ok(PersistedCandidateAssessment::NeedsTorrentDownload {
                 candidate_id,
                 cache_status: CandidateCacheStatus::Invalid,
@@ -446,6 +473,18 @@ pub async fn assess_and_persist_candidate(
         .as_ref()
         .is_some_and(|info_hash| info_hash != cached.info_hash())
     {
+        if let Some(assessment) = reported_size_rejection(
+            repository,
+            local_item,
+            candidate,
+            candidate_id,
+            assessed_at_ms,
+            &config.precheck,
+        )
+        .await?
+        {
+            return Ok(assessment);
+        }
         return Ok(PersistedCandidateAssessment::NeedsTorrentDownload {
             candidate_id,
             cache_status: CandidateCacheStatus::UnsafeInfoHashMismatch,
@@ -497,6 +536,34 @@ pub async fn assess_and_persist_candidate(
         assessment,
         cache_status: CandidateCacheStatus::Reused,
     })
+}
+
+async fn reported_size_rejection(
+    repository: &Repository,
+    local_item: &LocalItem,
+    candidate: &RemoteCandidate,
+    candidate_id: RemoteCandidateId,
+    assessed_at_ms: i64,
+    config: &CandidatePrecheckConfig,
+) -> Result<Option<PersistedCandidateAssessment>, CandidateAssessmentError> {
+    if candidate
+        .size
+        .is_none_or(|size| candidate_size_in_bounds(local_item, size, config))
+    {
+        return Ok(None);
+    }
+    let local_item_id = local_item
+        .id
+        .ok_or(CandidateAssessmentError::MissingLocalItemId)?;
+    let assessment = rejected_assessment(CandidatePrecheckReason::FuzzySizeMismatch);
+    repository
+        .record_match_decision(local_item_id, candidate_id, assessment, assessed_at_ms)
+        .await?;
+    Ok(Some(PersistedCandidateAssessment::Rejected {
+        candidate_id,
+        assessment,
+        cache_status: CandidateCacheStatus::NotAvailable,
+    }))
 }
 
 pub async fn reverse_lookup_candidates(
@@ -3098,6 +3165,43 @@ mod tests {
     }
 
     #[test]
+    fn candidate_precheck_defers_size_mismatch_when_torrent_metadata_is_available() {
+        let mut local = search_item("Movie.2026.1080p.WEB-DL-GRP", MediaType::Movie);
+        local.total_size = ByteSize::new(100);
+        let config = CandidatePrecheckConfig {
+            fuzzy_size_threshold: 0.2,
+            ..CandidatePrecheckConfig::default()
+        };
+
+        assert_eq!(
+            CandidatePrecheckDecision::Accepted,
+            precheck_candidate(
+                &local,
+                CandidatePrecheckInput {
+                    size: Some(ByteSize::new(40)),
+                    torrent_metadata_available: true,
+                    ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
+                },
+                &[],
+                &config,
+            )
+        );
+        assert_eq!(
+            CandidatePrecheckReason::FuzzySizeMismatch,
+            rejected_reason(precheck_candidate(
+                &local,
+                CandidatePrecheckInput {
+                    size: Some(ByteSize::new(40)),
+                    torrent_metadata_available: false,
+                    ..candidate_input("Movie.2026.1080p.WEB-DL-GRP")
+                },
+                &[],
+                &config,
+            ))
+        );
+    }
+
+    #[test]
     fn candidate_precheck_rejects_missing_download_links() {
         let local = search_item("Movie.2026.1080p.WEB-DL-GRP", MediaType::Movie);
 
@@ -3917,6 +4021,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_lookup_accepts_cached_seedable_subset_despite_reported_size_mismatch() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("reverse-seedable-subset");
+        let cache_path = write_cache_file(&cache_dir, "candidate.torrent", test_torrent_bytes());
+        let mut local = data_root_item();
+        local.total_size = ByteSize::new(20);
+        insert_local(
+            &repository,
+            &local,
+            &[
+                local_file("movie.mkv", 10, 0),
+                local_file("sample.mkv", 10, 1),
+            ],
+        )
+        .await;
+        let mut candidate = remote_candidate("guid-seedable-subset", "Example", Some(cache_path));
+        candidate.size = Some(ByteSize::new(10));
+        let config = ReverseLookupConfig {
+            assessment: CandidateAssessmentConfig {
+                precheck: CandidatePrecheckConfig {
+                    fuzzy_size_threshold: 0.2,
+                    ..CandidatePrecheckConfig::default()
+                },
+                ..CandidateAssessmentConfig::default()
+            },
+            ..ReverseLookupConfig::default()
+        };
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReverseLookupOutcome::Matched {
+                assessment: PersistedCandidateAssessment::Assessed {
+                    assessment: CandidateAssessment {
+                        decision: MatchDecision::Exact,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
+
+        fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_rejects_uncached_unrelated_size_mismatch_before_download() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut local = data_root_item();
+        local.total_size = ByteSize::new(20);
+        insert_local(
+            &repository,
+            &local,
+            &[
+                local_file("movie.mkv", 10, 0),
+                local_file("sample.mkv", 10, 1),
+            ],
+        )
+        .await;
+        let mut candidate = remote_candidate("guid-uncached-size-mismatch", "Example", None);
+        candidate.size = Some(ByteSize::new(10));
+        let config = ReverseLookupConfig {
+            assessment: CandidateAssessmentConfig {
+                precheck: CandidatePrecheckConfig {
+                    fuzzy_size_threshold: 0.2,
+                    ..CandidatePrecheckConfig::default()
+                },
+                ..CandidateAssessmentConfig::default()
+            },
+            ..ReverseLookupConfig::default()
+        };
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReverseLookupOutcome::BestFailure {
+                assessment: PersistedCandidateAssessment::Rejected {
+                    assessment: CandidateAssessment {
+                        decision: MatchDecision::Rejected,
+                        reason: DecisionReason::FuzzySizeMismatch,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_rejects_size_mismatch_when_cached_metadata_is_invalid() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let cache_dir = unique_temp_dir("reverse-invalid-size-mismatch");
+        let cache_path = write_cache_file(&cache_dir, "invalid.torrent", b"not a torrent");
+        let mut local = data_root_item();
+        local.total_size = ByteSize::new(20);
+        insert_local(
+            &repository,
+            &local,
+            &[
+                local_file("movie.mkv", 10, 0),
+                local_file("sample.mkv", 10, 1),
+            ],
+        )
+        .await;
+        let mut candidate =
+            remote_candidate("guid-invalid-size-mismatch", "Example", Some(cache_path));
+        candidate.size = Some(ByteSize::new(10));
+        let config = ReverseLookupConfig {
+            assessment: CandidateAssessmentConfig {
+                precheck: CandidatePrecheckConfig {
+                    fuzzy_size_threshold: 0.2,
+                    ..CandidatePrecheckConfig::default()
+                },
+                ..CandidateAssessmentConfig::default()
+            },
+            ..ReverseLookupConfig::default()
+        };
+
+        let outcome = reverse_lookup_and_assess_candidate(
+            &repository,
+            &candidate,
+            &[],
+            100,
+            ContentFilterContext::ReverseLookup,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReverseLookupOutcome::BestFailure {
+                assessment: PersistedCandidateAssessment::Rejected {
+                    assessment: CandidateAssessment {
+                        decision: MatchDecision::Rejected,
+                        reason: DecisionReason::FuzzySizeMismatch,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
+
+        fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn reverse_lookup_rejects_truncated_local_file_tree() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let cache_dir = unique_temp_dir("reverse-truncated");
@@ -4506,6 +4780,7 @@ mod tests {
             tracker: Some("tracker.example"),
             size: Some(ByteSize::new(10)),
             info_hash: None,
+            torrent_metadata_available: false,
         }
     }
 
