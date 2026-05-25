@@ -8,6 +8,7 @@ use tracing::debug_span;
 
 pub mod qbittorrent;
 pub mod rtorrent;
+pub(crate) mod runtime;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TorrentClientOperation {
