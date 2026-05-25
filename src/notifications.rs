@@ -530,181 +530,194 @@ mod tests {
     use crate::runtime::health::DependencySummary;
     use crate::runtime::shutdown::shutdown_channel;
 
-    #[tokio::test]
-    async fn delivery_posts_json_and_marks_endpoint_healthy() {
-        let server = TestServer::new(TestBehavior::Ok).await;
-        let health = HealthRegistry::new();
-        let worker = test_worker(health.clone(), Duration::from_secs(2));
-        let endpoint =
-            endpoint(server.url()).with_token(NotificationToken::new("bearer-secret").unwrap());
-        let job = NotificationJob::new(endpoint.clone(), NotificationEvent::test());
+    mod delivery_contract {
+        use super::*;
 
-        let report = worker.deliver(&job).await;
+        #[tokio::test]
+        async fn posts_json_and_marks_endpoint_healthy() {
+            let server = TestServer::new(TestBehavior::Ok).await;
+            let health = HealthRegistry::new();
+            let worker = test_worker(health.clone(), Duration::from_secs(2));
+            let endpoint =
+                endpoint(server.url()).with_token(NotificationToken::new("bearer-secret").unwrap());
+            let job = NotificationJob::new(endpoint.clone(), NotificationEvent::test());
 
-        assert!(report.succeeded());
-        assert_eq!(1, server.requests().len());
-        let request = &server.requests()[0];
-        assert_eq!(
-            "application/json",
-            request.content_type.as_deref().unwrap_or("")
-        );
-        assert_eq!(
-            "Bearer bearer-secret",
-            request.authorization.as_deref().unwrap_or("")
-        );
-        assert_eq!(json!("sporos"), request.body["title"]);
-        assert_eq!(json!("TEST"), request.body["extra"]["event"]);
-        assert_eq!(
-            Some(DependencySummary::Healthy),
-            health
-                .snapshot()
-                .summaries
-                .get(&DependencyKind::Notification)
-                .copied()
-        );
-    }
+            let report = worker.deliver(&job).await;
 
-    #[tokio::test]
-    async fn delivery_retries_retryable_non_ok_and_records_health() {
-        let server = TestServer::new(TestBehavior::Status(StatusCode::SERVICE_UNAVAILABLE)).await;
-        let health = HealthRegistry::new();
-        let worker = test_worker(health.clone(), Duration::from_secs(2));
-        let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
-
-        let report = worker.deliver(&job).await;
-
-        assert_eq!(
-            NotificationDeliveryOutcome::NonOk {
-                status: StatusCode::SERVICE_UNAVAILABLE
-            },
-            report.final_outcome
-        );
-        assert_eq!(2, report.attempts.len());
-        assert_eq!(2, server.requests().len());
-        let state = health.state(&notification_dependency_key(&job.endpoint));
-        assert!(matches!(
-            state,
-            Some(crate::domain::DependencyState::Degraded { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn delivery_does_not_retry_terminal_non_ok() {
-        let server = TestServer::new(TestBehavior::Status(StatusCode::BAD_REQUEST)).await;
-        let health = HealthRegistry::new();
-        let worker = test_worker(health, Duration::from_secs(2));
-        let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
-
-        let report = worker.deliver(&job).await;
-
-        assert_eq!(
-            NotificationDeliveryOutcome::NonOk {
-                status: StatusCode::BAD_REQUEST
-            },
-            report.final_outcome
-        );
-        assert_eq!(1, report.attempts.len());
-        assert_eq!(1, server.requests().len());
-    }
-
-    #[tokio::test]
-    async fn delivery_times_out_without_failing_worker_loop() {
-        let server = TestServer::new(TestBehavior::Slow(Duration::from_millis(100))).await;
-        let health = HealthRegistry::new();
-        let worker = test_worker(health, Duration::from_millis(10));
-        let (queue, receiver) =
-            notification_queue(NonZeroUsize::new(1).unwrap_or(NonZeroUsize::MIN));
-        let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
-        queue.try_enqueue(job).unwrap();
-        drop(queue);
-
-        let (_controller, signal) = shutdown_channel();
-        run_notification_worker(worker, receiver, signal).await;
-
-        assert_eq!(2, server.requests().len());
-    }
-
-    #[tokio::test]
-    async fn delivery_stops_retry_sleep_on_shutdown() {
-        let server = TestServer::new(TestBehavior::Status(StatusCode::SERVICE_UNAVAILABLE)).await;
-        let health = HealthRegistry::new();
-        let worker = NotificationWorker::with_config(
-            health,
-            MetricsRegistry::new(),
-            Duration::from_secs(2),
-            NotificationRetryPolicy {
-                max_attempts: NonZeroU8::new(2).unwrap_or(NonZeroU8::MIN),
-                initial_delay: Duration::from_secs(60),
-                max_delay: Duration::from_secs(60),
-            },
-        );
-        let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
-        let (controller, signal) = shutdown_channel();
-
-        let handle =
-            tokio::spawn(async move { worker.deliver_until_shutdown(&job, Some(&signal)).await });
-        while server.requests().is_empty() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(report.succeeded());
+            assert_eq!(1, server.requests().len());
+            let request = &server.requests()[0];
+            assert_eq!(
+                "application/json",
+                request.content_type.as_deref().unwrap_or("")
+            );
+            assert_eq!(
+                "Bearer bearer-secret",
+                request.authorization.as_deref().unwrap_or("")
+            );
+            assert_eq!(json!("sporos"), request.body["title"]);
+            assert_eq!(json!("TEST"), request.body["extra"]["event"]);
+            assert_eq!(
+                Some(DependencySummary::Healthy),
+                health
+                    .snapshot()
+                    .summaries
+                    .get(&DependencyKind::Notification)
+                    .copied()
+            );
         }
-        controller.cancel_now("test shutdown").unwrap();
-        let report = tokio::time::timeout(Duration::from_secs(1), handle)
-            .await
-            .unwrap()
-            .unwrap();
 
-        assert_eq!(1, report.attempts.len());
-        assert_eq!(1, server.requests().len());
-    }
+        #[tokio::test]
+        async fn retries_retryable_non_ok_and_records_health() {
+            let server =
+                TestServer::new(TestBehavior::Status(StatusCode::SERVICE_UNAVAILABLE)).await;
+            let health = HealthRegistry::new();
+            let worker = test_worker(health.clone(), Duration::from_secs(2));
+            let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
 
-    #[tokio::test]
-    async fn worker_stops_retrying_delivery_on_shutdown() {
-        let server = TestServer::new(TestBehavior::Status(StatusCode::SERVICE_UNAVAILABLE)).await;
-        let health = HealthRegistry::new();
-        let worker = NotificationWorker::with_config(
-            health,
-            MetricsRegistry::new(),
-            Duration::from_secs(2),
-            NotificationRetryPolicy {
-                max_attempts: NonZeroU8::new(2).unwrap_or(NonZeroU8::MIN),
-                initial_delay: Duration::from_secs(60),
-                max_delay: Duration::from_secs(60),
-            },
-        );
-        let (queue, receiver) =
-            notification_queue(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN));
-        let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
-        queue.try_enqueue(job).unwrap();
-        let (controller, signal) = shutdown_channel();
+            let report = worker.deliver(&job).await;
 
-        let handle = tokio::spawn(run_notification_worker(worker, receiver, signal));
-        while server.requests().is_empty() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(
+                NotificationDeliveryOutcome::NonOk {
+                    status: StatusCode::SERVICE_UNAVAILABLE
+                },
+                report.final_outcome
+            );
+            assert_eq!(2, report.attempts.len());
+            assert_eq!(2, server.requests().len());
+            let state = health.state(&notification_dependency_key(&job.endpoint));
+            assert!(matches!(
+                state,
+                Some(crate::domain::DependencyState::Degraded { .. })
+            ));
         }
-        controller.cancel_now("test shutdown").unwrap();
-        tokio::time::timeout(Duration::from_secs(1), handle)
-            .await
-            .unwrap()
-            .unwrap();
 
-        assert_eq!(1, server.requests().len());
-        assert_eq!(0, queue.stats().depth);
-        assert_eq!(1, queue.stats().completed);
+        #[tokio::test]
+        async fn does_not_retry_terminal_non_ok() {
+            let server = TestServer::new(TestBehavior::Status(StatusCode::BAD_REQUEST)).await;
+            let health = HealthRegistry::new();
+            let worker = test_worker(health, Duration::from_secs(2));
+            let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
+
+            let report = worker.deliver(&job).await;
+
+            assert_eq!(
+                NotificationDeliveryOutcome::NonOk {
+                    status: StatusCode::BAD_REQUEST
+                },
+                report.final_outcome
+            );
+            assert_eq!(1, report.attempts.len());
+            assert_eq!(1, server.requests().len());
+        }
+
+        #[tokio::test]
+        async fn times_out_without_failing_worker_loop() {
+            let server = TestServer::new(TestBehavior::Slow(Duration::from_millis(100))).await;
+            let health = HealthRegistry::new();
+            let worker = test_worker(health, Duration::from_millis(10));
+            let (queue, receiver) =
+                notification_queue(NonZeroUsize::new(1).unwrap_or(NonZeroUsize::MIN));
+            let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
+            queue.try_enqueue(job).unwrap();
+            drop(queue);
+
+            let (_controller, signal) = shutdown_channel();
+            run_notification_worker(worker, receiver, signal).await;
+
+            assert_eq!(2, server.requests().len());
+        }
+
+        #[tokio::test]
+        async fn stops_retry_sleep_on_shutdown() {
+            let server =
+                TestServer::new(TestBehavior::Status(StatusCode::SERVICE_UNAVAILABLE)).await;
+            let health = HealthRegistry::new();
+            let worker = NotificationWorker::with_config(
+                health,
+                MetricsRegistry::new(),
+                Duration::from_secs(2),
+                NotificationRetryPolicy {
+                    max_attempts: NonZeroU8::new(2).unwrap_or(NonZeroU8::MIN),
+                    initial_delay: Duration::from_secs(60),
+                    max_delay: Duration::from_secs(60),
+                },
+            );
+            let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
+            let (controller, signal) = shutdown_channel();
+
+            let handle =
+                tokio::spawn(
+                    async move { worker.deliver_until_shutdown(&job, Some(&signal)).await },
+                );
+            while server.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            controller.cancel_now("test shutdown").unwrap();
+            let report = tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(1, report.attempts.len());
+            assert_eq!(1, server.requests().len());
+        }
+
+        #[tokio::test]
+        async fn worker_stops_retrying_delivery_on_shutdown() {
+            let server =
+                TestServer::new(TestBehavior::Status(StatusCode::SERVICE_UNAVAILABLE)).await;
+            let health = HealthRegistry::new();
+            let worker = NotificationWorker::with_config(
+                health,
+                MetricsRegistry::new(),
+                Duration::from_secs(2),
+                NotificationRetryPolicy {
+                    max_attempts: NonZeroU8::new(2).unwrap_or(NonZeroU8::MIN),
+                    initial_delay: Duration::from_secs(60),
+                    max_delay: Duration::from_secs(60),
+                },
+            );
+            let (queue, receiver) =
+                notification_queue(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN));
+            let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
+            queue.try_enqueue(job).unwrap();
+            let (controller, signal) = shutdown_channel();
+
+            let handle = tokio::spawn(run_notification_worker(worker, receiver, signal));
+            while server.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            controller.cancel_now("test shutdown").unwrap();
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(1, server.requests().len());
+            assert_eq!(0, queue.stats().depth);
+            assert_eq!(1, queue.stats().completed);
+        }
     }
 
-    #[test]
-    fn debug_and_errors_redact_tokens_and_secret_urls() {
-        let endpoint = endpoint(
-            "https://user:password@example.invalid/hook?token=url-token&ok=true#fragment"
-                .to_owned(),
-        )
-        .with_token(NotificationToken::new("bearer-secret").unwrap());
-        let job = NotificationJob::new(endpoint.clone(), NotificationEvent::test());
-        let rendered = format!("{job:?}");
+    mod redaction_contract {
+        use super::*;
 
-        assert!(!rendered.contains("bearer-secret"));
-        assert!(!rendered.contains("url-token"));
-        assert!(!rendered.contains("password"));
-        assert!(rendered.contains("[REDACTED]"));
+        #[test]
+        fn debug_and_errors_redact_tokens_and_secret_urls() {
+            let endpoint = endpoint(
+                "https://user:password@example.invalid/hook?token=url-token&ok=true#fragment"
+                    .to_owned(),
+            )
+            .with_token(NotificationToken::new("bearer-secret").unwrap());
+            let job = NotificationJob::new(endpoint.clone(), NotificationEvent::test());
+            let rendered = format!("{job:?}");
+
+            assert!(!rendered.contains("bearer-secret"));
+            assert!(!rendered.contains("url-token"));
+            assert!(!rendered.contains("password"));
+            assert!(rendered.contains("[REDACTED]"));
+        }
     }
 
     fn endpoint(url: String) -> NotificationEndpoint {

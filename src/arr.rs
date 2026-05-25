@@ -767,239 +767,244 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn client_sends_secret_header_and_decodes_sonarr_ids() {
-        let endpoint = endpoint(
-            ArrKind::Sonarr,
-            spawn_arr_server(|request| async move {
-                let has_key = request
-                    .headers()
-                    .get("X-Api-Key")
-                    .and_then(|value| value.to_str().ok())
-                    == Some("secret");
-                let query = request.uri().query().unwrap_or_default();
-                if !has_key || !query.contains("title=Example") {
-                    return (AxumStatusCode::BAD_REQUEST, "{}".to_owned()).into_response();
-                }
-                (
-                    AxumStatusCode::OK,
-                    r#"{"series":{"tvdbId":42,"tvMazeId":84,"imdbId":"tt123"}}"#.to_owned(),
-                )
-                    .into_response()
-            })
-            .await,
-        );
-        let client = ArrHttpClient::new(Duration::from_secs(5));
+    mod lookup_contract {
+        use super::*;
 
-        let ids = client
-            .lookup_endpoint(
-                &endpoint,
-                MediaType::Episode,
-                &ItemTitle::new("Example.1080p.WEB-DL").unwrap(),
-                1_000,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(Some("42"), ids.tvdb_id.as_deref());
-        assert_eq!(Some("84"), ids.tvmaze_id.as_deref());
-        assert_eq!(Some("tt123"), ids.imdb_id.as_deref());
-    }
-
-    #[tokio::test]
-    async fn client_does_not_forward_api_key_on_redirect() {
-        let saw_redirected_key = Arc::new(AtomicBool::new(false));
-        let target_saw_redirected_key = saw_redirected_key.clone();
-        let target_url = spawn_arr_server(move |request| {
-            let target_saw_redirected_key = target_saw_redirected_key.clone();
-            async move {
-                if request.headers().get("x-api-key").is_some() {
-                    target_saw_redirected_key.store(true, AtomicOrdering::Relaxed);
-                }
-                (AxumStatusCode::OK, "{}").into_response()
-            }
-        })
-        .await;
-        let redirect_url = target_url.clone();
-        let endpoint = endpoint(
-            ArrKind::Sonarr,
-            spawn_arr_server(move |_request| {
-                let redirect_url = redirect_url.clone();
-                async move {
+        #[tokio::test]
+        async fn sends_secret_header_and_decodes_sonarr_ids() {
+            let endpoint = endpoint(
+                ArrKind::Sonarr,
+                spawn_arr_server(|request| async move {
+                    let has_key = request
+                        .headers()
+                        .get("X-Api-Key")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("secret");
+                    let query = request.uri().query().unwrap_or_default();
+                    if !has_key || !query.contains("title=Example") {
+                        return (AxumStatusCode::BAD_REQUEST, "{}".to_owned()).into_response();
+                    }
                     (
-                        AxumStatusCode::FOUND,
-                        [(
-                            LOCATION,
-                            HeaderValue::from_str(&format!("{redirect_url}/api/v3/parse")).unwrap(),
-                        )],
-                        "",
+                        AxumStatusCode::OK,
+                        r#"{"series":{"tvdbId":42,"tvMazeId":84,"imdbId":"tt123"}}"#.to_owned(),
                     )
                         .into_response()
+                })
+                .await,
+            );
+            let client = ArrHttpClient::new(Duration::from_secs(5));
+
+            let ids = client
+                .lookup_endpoint(
+                    &endpoint,
+                    MediaType::Episode,
+                    &ItemTitle::new("Example.1080p.WEB-DL").unwrap(),
+                    1_000,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(Some("42"), ids.tvdb_id.as_deref());
+            assert_eq!(Some("84"), ids.tvmaze_id.as_deref());
+            assert_eq!(Some("tt123"), ids.imdb_id.as_deref());
+        }
+
+        #[tokio::test]
+        async fn does_not_forward_api_key_on_redirect() {
+            let saw_redirected_key = Arc::new(AtomicBool::new(false));
+            let target_saw_redirected_key = saw_redirected_key.clone();
+            let target_url = spawn_arr_server(move |request| {
+                let target_saw_redirected_key = target_saw_redirected_key.clone();
+                async move {
+                    if request.headers().get("x-api-key").is_some() {
+                        target_saw_redirected_key.store(true, AtomicOrdering::Relaxed);
+                    }
+                    (AxumStatusCode::OK, "{}").into_response()
                 }
             })
-            .await,
-        );
-        let client = ArrHttpClient::new(Duration::from_secs(5));
+            .await;
+            let redirect_url = target_url.clone();
+            let endpoint = endpoint(
+                ArrKind::Sonarr,
+                spawn_arr_server(move |_request| {
+                    let redirect_url = redirect_url.clone();
+                    async move {
+                        (
+                            AxumStatusCode::FOUND,
+                            [(
+                                LOCATION,
+                                HeaderValue::from_str(&format!("{redirect_url}/api/v3/parse"))
+                                    .unwrap(),
+                            )],
+                            "",
+                        )
+                            .into_response()
+                    }
+                })
+                .await,
+            );
+            let client = ArrHttpClient::new(Duration::from_secs(5));
 
-        let error = client
-            .lookup_endpoint(
-                &endpoint,
-                MediaType::Episode,
-                &ItemTitle::new("Example.1080p.WEB-DL").unwrap(),
-                1_000,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ArrRequestError::HttpStatus { status: 302, .. }
-        ));
-        assert!(!saw_redirected_key.load(AtomicOrdering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn lookup_uses_media_order_and_records_backoff_failures() {
-        let sonarr = endpoint(
-            ArrKind::Sonarr,
-            spawn_arr_server(|_request| async move {
-                (
-                    AxumStatusCode::TOO_MANY_REQUESTS,
-                    [("Retry-After", "5")],
-                    "{}",
+            let error = client
+                .lookup_endpoint(
+                    &endpoint,
+                    MediaType::Episode,
+                    &ItemTitle::new("Example.1080p.WEB-DL").unwrap(),
+                    1_000,
                 )
-                    .into_response()
-            })
-            .await,
-        );
-        let radarr = endpoint(
-            ArrKind::Radarr,
-            spawn_arr_server(|_request| async move {
-                (AxumStatusCode::OK, r#"{"movie":{"tmdbId":99}}"#).into_response()
-            })
-            .await,
-        );
-        let client =
-            ArrHttpClient::new(Duration::from_secs(5)).with_backoff(IndexerBackoffPolicy {
-                base_delay_ms: 100,
-                max_delay_ms: 10_000,
-                jitter_ms: 0,
-                recovery_probe_interval_ms: 100,
-            });
+                .await
+                .unwrap_err();
 
-        let result = client
-            .lookup_ids(
-                &[radarr, sonarr],
-                MediaType::Video,
-                &ItemTitle::new("Example.Movie.2160p.WEB-DL").unwrap(),
-                1_000,
-            )
-            .await;
+            assert!(matches!(
+                error,
+                ArrRequestError::HttpStatus { status: 302, .. }
+            ));
+            assert!(!saw_redirected_key.load(AtomicOrdering::Relaxed));
+        }
 
-        assert_eq!(Some("99"), result.ids.tmdb_id.as_deref());
-        assert_eq!(2, result.attempts.len());
-        assert!(matches!(
-            result.attempts[0].outcome,
-            ArrLookupOutcome::Failure {
-                retry_after_ms: 6_000,
-                unavailable: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            result.attempts[1].outcome,
-            ArrLookupOutcome::Found { .. }
-        ));
-    }
+        #[tokio::test]
+        async fn uses_media_order_and_records_backoff_failures() {
+            let sonarr = endpoint(
+                ArrKind::Sonarr,
+                spawn_arr_server(|_request| async move {
+                    (
+                        AxumStatusCode::TOO_MANY_REQUESTS,
+                        [("Retry-After", "5")],
+                        "{}",
+                    )
+                        .into_response()
+                })
+                .await,
+            );
+            let radarr = endpoint(
+                ArrKind::Radarr,
+                spawn_arr_server(|_request| async move {
+                    (AxumStatusCode::OK, r#"{"movie":{"tmdbId":99}}"#).into_response()
+                })
+                .await,
+            );
+            let client =
+                ArrHttpClient::new(Duration::from_secs(5)).with_backoff(IndexerBackoffPolicy {
+                    base_delay_ms: 100,
+                    max_delay_ms: 10_000,
+                    jitter_ms: 0,
+                    recovery_probe_interval_ms: 100,
+                });
 
-    #[tokio::test]
-    async fn lookup_falls_back_after_empty_arr_ids() {
-        let sonarr = endpoint(
-            ArrKind::Sonarr,
-            spawn_arr_server(|_request| async move {
-                (AxumStatusCode::OK, r#"{"series":{"tvdbId":0}}"#).into_response()
-            })
-            .await,
-        );
-        let radarr = endpoint(
-            ArrKind::Radarr,
-            spawn_arr_server(|_request| async move {
-                (AxumStatusCode::OK, r#"{"movie":{"tmdbId":99}}"#).into_response()
-            })
-            .await,
-        );
-        let client = ArrHttpClient::new(Duration::from_secs(5));
+            let result = client
+                .lookup_ids(
+                    &[radarr, sonarr],
+                    MediaType::Video,
+                    &ItemTitle::new("Example.Movie.2160p.WEB-DL").unwrap(),
+                    1_000,
+                )
+                .await;
 
-        let result = client
-            .lookup_ids(
-                &[sonarr, radarr],
-                MediaType::Video,
-                &ItemTitle::new("Example.Movie.2160p.WEB-DL").unwrap(),
-                1_000,
-            )
-            .await;
+            assert_eq!(Some("99"), result.ids.tmdb_id.as_deref());
+            assert_eq!(2, result.attempts.len());
+            assert!(matches!(
+                result.attempts[0].outcome,
+                ArrLookupOutcome::Failure {
+                    retry_after_ms: 6_000,
+                    unavailable: false,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                result.attempts[1].outcome,
+                ArrLookupOutcome::Found { .. }
+            ));
+        }
 
-        assert_eq!(Some("99"), result.ids.tmdb_id.as_deref());
-        assert_eq!(2, result.attempts.len());
-        assert!(matches!(
-            result.attempts[0].outcome,
-            ArrLookupOutcome::Empty
-        ));
-        assert!(matches!(
-            result.attempts[1].outcome,
-            ArrLookupOutcome::Found { .. }
-        ));
-    }
+        #[tokio::test]
+        async fn falls_back_after_empty_arr_ids() {
+            let sonarr = endpoint(
+                ArrKind::Sonarr,
+                spawn_arr_server(|_request| async move {
+                    (AxumStatusCode::OK, r#"{"series":{"tvdbId":0}}"#).into_response()
+                })
+                .await,
+            );
+            let radarr = endpoint(
+                ArrKind::Radarr,
+                spawn_arr_server(|_request| async move {
+                    (AxumStatusCode::OK, r#"{"movie":{"tmdbId":99}}"#).into_response()
+                })
+                .await,
+            );
+            let client = ArrHttpClient::new(Duration::from_secs(5));
 
-    #[tokio::test]
-    async fn client_honors_endpoint_backoff_without_request() {
-        let endpoint = ArrEndpoint {
-            retry_after_ms: Some(5_000),
-            ..endpoint(ArrKind::Radarr, "http://127.0.0.1:9".to_owned())
-        };
-        let client = ArrHttpClient::new(Duration::from_millis(10));
+            let result = client
+                .lookup_ids(
+                    &[sonarr, radarr],
+                    MediaType::Video,
+                    &ItemTitle::new("Example.Movie.2160p.WEB-DL").unwrap(),
+                    1_000,
+                )
+                .await;
 
-        let error = client
-            .lookup_endpoint(
-                &endpoint,
-                MediaType::Movie,
-                &ItemTitle::new("Example").unwrap(),
-                1_000,
-            )
-            .await
-            .unwrap_err();
+            assert_eq!(Some("99"), result.ids.tmdb_id.as_deref());
+            assert_eq!(2, result.attempts.len());
+            assert!(matches!(
+                result.attempts[0].outcome,
+                ArrLookupOutcome::Empty
+            ));
+            assert!(matches!(
+                result.attempts[1].outcome,
+                ArrLookupOutcome::Found { .. }
+            ));
+        }
 
-        assert!(matches!(
-            error,
-            ArrRequestError::Backoff {
-                retry_after_ms: Some(5_000)
-            }
-        ));
-    }
+        #[tokio::test]
+        async fn honors_endpoint_backoff_without_request() {
+            let endpoint = ArrEndpoint {
+                retry_after_ms: Some(5_000),
+                ..endpoint(ArrKind::Radarr, "http://127.0.0.1:9".to_owned())
+            };
+            let client = ArrHttpClient::new(Duration::from_millis(10));
 
-    #[test]
-    fn request_error_classification_treats_outages_as_unavailable() {
-        assert!(ArrRequestError::Timeout.is_unavailable());
-        assert!(
-            ArrRequestError::Request {
-                message: "connection refused".to_owned()
-            }
-            .is_unavailable()
-        );
-        assert!(
-            ArrRequestError::HttpStatus {
-                status: 503,
-                retry_after: None
-            }
-            .is_unavailable()
-        );
-        assert!(!ArrRequestError::Unauthorized.is_unavailable());
-        assert!(
-            !ArrRequestError::InvalidJson {
-                message: "bad payload".to_owned()
-            }
-            .is_unavailable()
-        );
+            let error = client
+                .lookup_endpoint(
+                    &endpoint,
+                    MediaType::Movie,
+                    &ItemTitle::new("Example").unwrap(),
+                    1_000,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                ArrRequestError::Backoff {
+                    retry_after_ms: Some(5_000)
+                }
+            ));
+        }
+
+        #[test]
+        fn request_error_classification_treats_outages_as_unavailable() {
+            assert!(ArrRequestError::Timeout.is_unavailable());
+            assert!(
+                ArrRequestError::Request {
+                    message: "connection refused".to_owned()
+                }
+                .is_unavailable()
+            );
+            assert!(
+                ArrRequestError::HttpStatus {
+                    status: 503,
+                    retry_after: None
+                }
+                .is_unavailable()
+            );
+            assert!(!ArrRequestError::Unauthorized.is_unavailable());
+            assert!(
+                !ArrRequestError::InvalidJson {
+                    message: "bad payload".to_owned()
+                }
+                .is_unavailable()
+            );
+        }
     }
 
     #[test]

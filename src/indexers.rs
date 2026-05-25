@@ -2306,75 +2306,78 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn search_client_sends_query_and_parses_rss_candidates() {
-        let endpoint = test_endpoint(
-            spawn_torznab_server(|request| async move {
-                let query = request.uri().query().unwrap_or_default();
-                if !query.contains("t=tvsearch")
-                    || !query.contains("tvdbid=42")
-                    || !query.contains("apikey=secret")
-                    || !query.contains("limit=50")
-                {
-                    return (AxumStatusCode::BAD_REQUEST, "bad query".to_owned());
-                }
-                (
-                    AxumStatusCode::OK,
-                    search_rss("candidate-1", "Example S01E01"),
-                )
-            })
-            .await,
-        );
-        let client = TorznabHttpClient::new(Duration::from_secs(5));
-        let plan = TorznabSearchPlan {
-            query: TorznabSearchQuery {
-                search_type: TorznabSearchType::TvSearch,
-                q: None,
-                season: Some(1),
-                episode: Some(1),
-                ids: SearchIds {
-                    tvdb_id: Some("42".to_owned()),
-                    ..SearchIds::default()
+    mod adapter_contract {
+        use super::*;
+
+        #[tokio::test]
+        async fn search_client_sends_query_and_parses_rss_candidates() {
+            let endpoint = test_endpoint(
+                spawn_torznab_server(|request| async move {
+                    let query = request.uri().query().unwrap_or_default();
+                    if !query.contains("t=tvsearch")
+                        || !query.contains("tvdbid=42")
+                        || !query.contains("apikey=secret")
+                        || !query.contains("limit=50")
+                    {
+                        return (AxumStatusCode::BAD_REQUEST, "bad query".to_owned());
+                    }
+                    (
+                        AxumStatusCode::OK,
+                        search_rss("candidate-1", "Example S01E01"),
+                    )
+                })
+                .await,
+            );
+            let client = TorznabHttpClient::new(Duration::from_secs(5));
+            let plan = TorznabSearchPlan {
+                query: TorznabSearchQuery {
+                    search_type: TorznabSearchType::TvSearch,
+                    q: None,
+                    season: Some(1),
+                    episode: Some(1),
+                    ids: SearchIds {
+                        tvdb_id: Some("42".to_owned()),
+                        ..SearchIds::default()
+                    },
                 },
-            },
-            limit: 200,
-        };
+                limit: 200,
+            };
 
-        let candidates = client
-            .search(&endpoint, MediaType::Episode, &plan, 1_700_000_000_000)
-            .await
-            .unwrap();
+            let candidates = client
+                .search(&endpoint, MediaType::Episode, &plan, 1_700_000_000_000)
+                .await
+                .unwrap();
 
-        assert_eq!(1, candidates.len());
-        assert_eq!("candidate-1", candidates[0].guid.as_str());
-        assert_eq!("Example S01E01", candidates[0].title.as_str());
-        assert_eq!(Some(ByteSize::new(1234)), candidates[0].size);
-        assert_eq!(
-            Some("0123456789abcdef0123456789abcdef01234567"),
-            candidates[0].info_hash.as_ref().map(InfoHash::as_str)
-        );
-    }
+            assert_eq!(1, candidates.len());
+            assert_eq!("candidate-1", candidates[0].guid.as_str());
+            assert_eq!("Example S01E01", candidates[0].title.as_str());
+            assert_eq!(Some(ByteSize::new(1234)), candidates[0].size);
+            assert_eq!(
+                Some("0123456789abcdef0123456789abcdef01234567"),
+                candidates[0].info_hash.as_ref().map(InfoHash::as_str)
+            );
+        }
 
-    #[tokio::test]
-    async fn prowlarr_client_fetches_and_filters_torznab_indexers() {
-        let url = spawn_prowlarr_server(|request| async move {
-            if request
-                .headers()
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok())
-                != Some("prowlarr-secret")
-            {
-                return (AxumStatusCode::UNAUTHORIZED, "missing key").into_response();
-            }
-            match request.uri().path() {
-                "/api/v1/tag" => (
-                    AxumStatusCode::OK,
-                    r#"[{"id":1,"label":"movies"},{"id":2,"label":"hd"}]"#,
-                )
-                    .into_response(),
-                "/api/v1/indexer" => (
-                    AxumStatusCode::OK,
-                    r#"
+        #[tokio::test]
+        async fn prowlarr_client_fetches_and_filters_torznab_indexers() {
+            let url = spawn_prowlarr_server(|request| async move {
+                if request
+                    .headers()
+                    .get("x-api-key")
+                    .and_then(|value| value.to_str().ok())
+                    != Some("prowlarr-secret")
+                {
+                    return (AxumStatusCode::UNAUTHORIZED, "missing key").into_response();
+                }
+                match request.uri().path() {
+                    "/api/v1/tag" => (
+                        AxumStatusCode::OK,
+                        r#"[{"id":1,"label":"movies"},{"id":2,"label":"hd"}]"#,
+                    )
+                        .into_response(),
+                    "/api/v1/indexer" => (
+                        AxumStatusCode::OK,
+                        r#"
                 [
                   {
                     "id": 101,
@@ -2429,42 +2432,42 @@ mod tests {
                   }
                 ]
                 "#,
-                )
-                    .into_response(),
-                _ => (AxumStatusCode::NOT_FOUND, "bad path").into_response(),
-            }
-        })
-        .await;
-        let source_url = url.clone();
-        let source = test_prowlarr_source(url, &["movies"], ProwlarrTagMatch::Any, false);
-        let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+                    )
+                        .into_response(),
+                    _ => (AxumStatusCode::NOT_FOUND, "bad path").into_response(),
+                }
+            })
+            .await;
+            let source_url = url.clone();
+            let source = test_prowlarr_source(url, &["movies"], ProwlarrTagMatch::Any, false);
+            let client = ProwlarrHttpClient::new(Duration::from_secs(5));
 
-        let indexers = client.indexers(&source).await.unwrap();
+            let indexers = client.indexers(&source).await.unwrap();
 
-        assert_eq!(1, indexers.len());
-        assert_eq!(101, indexers[0].prowlarr_id);
-        assert_eq!("Movies", indexers[0].name.as_str());
-        assert_eq!(format!("{source_url}/101/api"), indexers[0].url.as_str());
-        assert_eq!(
-            Some("prowlarr-secret"),
-            indexers[0].api_key.as_ref().map(ApiKey::expose_secret)
-        );
-        assert_eq!(ApiKeySource::Direct, indexers[0].api_key_source);
-        assert_eq!(vec!["movies", "hd"], indexers[0].tags);
-    }
+            assert_eq!(1, indexers.len());
+            assert_eq!(101, indexers[0].prowlarr_id);
+            assert_eq!("Movies", indexers[0].name.as_str());
+            assert_eq!(format!("{source_url}/101/api"), indexers[0].url.as_str());
+            assert_eq!(
+                Some("prowlarr-secret"),
+                indexers[0].api_key.as_ref().map(ApiKey::expose_secret)
+            );
+            assert_eq!(ApiKeySource::Direct, indexers[0].api_key_source);
+            assert_eq!(vec!["movies", "hd"], indexers[0].tags);
+        }
 
-    #[tokio::test]
-    async fn prowlarr_client_applies_all_tags_and_include_untagged() {
-        let url = spawn_prowlarr_server(|request| async move {
-            match request.uri().path() {
-                "/api/v1/tag" => (
-                    AxumStatusCode::OK,
-                    r#"[{"id":1,"label":"movies"},{"id":2,"label":"hd"}]"#,
-                )
-                    .into_response(),
-                "/api/v1/indexer" => (
-                    AxumStatusCode::OK,
-                    r#"
+        #[tokio::test]
+        async fn prowlarr_client_applies_all_tags_and_include_untagged() {
+            let url = spawn_prowlarr_server(|request| async move {
+                match request.uri().path() {
+                    "/api/v1/tag" => (
+                        AxumStatusCode::OK,
+                        r#"[{"id":1,"label":"movies"},{"id":2,"label":"hd"}]"#,
+                    )
+                        .into_response(),
+                    "/api/v1/indexer" => (
+                        AxumStatusCode::OK,
+                        r#"
                 [
                   {
                     "id": 201,
@@ -2498,280 +2501,285 @@ mod tests {
                   }
                 ]
                 "#,
+                    )
+                        .into_response(),
+                    _ => (AxumStatusCode::NOT_FOUND, "bad path").into_response(),
+                }
+            })
+            .await;
+            let source = test_prowlarr_source(url, &["movies", "hd"], ProwlarrTagMatch::All, true);
+            let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+
+            let indexers = client.indexers(&source).await.unwrap();
+            let names = indexers
+                .iter()
+                .map(|indexer| indexer.name.as_str())
+                .collect::<Vec<_>>();
+
+            assert_eq!(vec!["Tagged", "Untagged"], names);
+        }
+
+        #[tokio::test]
+        async fn prowlarr_client_maps_status_malformed_and_oversized_responses() {
+            let status_url =
+                spawn_prowlarr_server(
+                    |_request| async move { (AxumStatusCode::UNAUTHORIZED, "no") },
                 )
-                    .into_response(),
-                _ => (AxumStatusCode::NOT_FOUND, "bad path").into_response(),
-            }
-        })
-        .await;
-        let source = test_prowlarr_source(url, &["movies", "hd"], ProwlarrTagMatch::All, true);
-        let client = ProwlarrHttpClient::new(Duration::from_secs(5));
-
-        let indexers = client.indexers(&source).await.unwrap();
-        let names = indexers
-            .iter()
-            .map(|indexer| indexer.name.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(vec!["Tagged", "Untagged"], names);
-    }
-
-    #[tokio::test]
-    async fn prowlarr_client_maps_status_malformed_and_oversized_responses() {
-        let status_url =
-            spawn_prowlarr_server(|_request| async move { (AxumStatusCode::UNAUTHORIZED, "no") })
                 .await;
-        let malformed_url =
-            spawn_prowlarr_server(|_request| async move { (AxumStatusCode::OK, "not json") }).await;
-        let oversized_url = spawn_prowlarr_server(|_request| async move {
-            oversized_response(PROWLARR_CATALOG_MAX_BYTES.saturating_add(1))
-        })
-        .await;
-        let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+            let malformed_url =
+                spawn_prowlarr_server(|_request| async move { (AxumStatusCode::OK, "not json") })
+                    .await;
+            let oversized_url = spawn_prowlarr_server(|_request| async move {
+                oversized_response(PROWLARR_CATALOG_MAX_BYTES.saturating_add(1))
+            })
+            .await;
+            let client = ProwlarrHttpClient::new(Duration::from_secs(5));
 
-        let status = client
-            .indexers(&test_prowlarr_source(
-                status_url,
-                &[],
-                ProwlarrTagMatch::Any,
-                true,
-            ))
-            .await
-            .unwrap_err();
-        let malformed = client
-            .indexers(&test_prowlarr_source(
-                malformed_url,
-                &[],
-                ProwlarrTagMatch::Any,
-                true,
-            ))
-            .await
-            .unwrap_err();
-        let oversized = client
-            .indexers(&test_prowlarr_source(
-                oversized_url,
-                &[],
-                ProwlarrTagMatch::Any,
-                true,
-            ))
-            .await
-            .unwrap_err();
+            let status = client
+                .indexers(&test_prowlarr_source(
+                    status_url,
+                    &[],
+                    ProwlarrTagMatch::Any,
+                    true,
+                ))
+                .await
+                .unwrap_err();
+            let malformed = client
+                .indexers(&test_prowlarr_source(
+                    malformed_url,
+                    &[],
+                    ProwlarrTagMatch::Any,
+                    true,
+                ))
+                .await
+                .unwrap_err();
+            let oversized = client
+                .indexers(&test_prowlarr_source(
+                    oversized_url,
+                    &[],
+                    ProwlarrTagMatch::Any,
+                    true,
+                ))
+                .await
+                .unwrap_err();
 
-        assert!(matches!(
-            status,
-            ProwlarrRequestError::HttpStatus { status: 401, .. }
-        ));
-        assert!(matches!(
-            malformed,
-            ProwlarrRequestError::InvalidResponse { .. }
-        ));
-        assert!(matches!(
-            oversized,
-            ProwlarrRequestError::ResponseTooLarge {
-                limit: PROWLARR_CATALOG_MAX_BYTES
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn prowlarr_client_does_not_forward_api_key_on_redirect() {
-        let saw_redirected_key = Arc::new(AtomicBool::new(false));
-        let target_saw_redirected_key = saw_redirected_key.clone();
-        let target_url = spawn_prowlarr_server(move |request| {
-            let target_saw_redirected_key = target_saw_redirected_key.clone();
-            async move {
-                if request.headers().get("x-api-key").is_some() {
-                    target_saw_redirected_key.store(true, AtomicOrdering::Relaxed);
+            assert!(matches!(
+                status,
+                ProwlarrRequestError::HttpStatus { status: 401, .. }
+            ));
+            assert!(matches!(
+                malformed,
+                ProwlarrRequestError::InvalidResponse { .. }
+            ));
+            assert!(matches!(
+                oversized,
+                ProwlarrRequestError::ResponseTooLarge {
+                    limit: PROWLARR_CATALOG_MAX_BYTES
                 }
-                (AxumStatusCode::OK, "[]").into_response()
-            }
-        })
-        .await;
-        let redirect_url = target_url.clone();
-        let source_url = spawn_prowlarr_server(move |_request| {
-            let redirect_url = redirect_url.clone();
-            async move {
-                (
-                    AxumStatusCode::FOUND,
-                    [(
-                        LOCATION,
-                        HeaderValue::from_str(&format!("{redirect_url}/api/v1/indexer")).unwrap(),
-                    )],
-                    "",
-                )
-                    .into_response()
-            }
-        })
-        .await;
-        let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+            ));
+        }
 
-        let error = client
-            .indexers(&test_prowlarr_source(
-                source_url,
-                &[],
-                ProwlarrTagMatch::Any,
-                true,
-            ))
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ProwlarrRequestError::HttpStatus { status: 302, .. }
-        ));
-        assert!(!saw_redirected_key.load(AtomicOrdering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn prowlarr_errors_redact_secret_bearing_urls() {
-        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let source = ProwlarrSource {
-            name: DependencyName::new("main").unwrap(),
-            url: format!("http://user:password@{address}/path-token?apikey=secret#frag"),
-            api_key: ApiKey::new("prowlarr-secret").unwrap(),
-            api_key_source: ApiKeySource::Direct,
-            tags: BTreeSet::new(),
-            tag_match: ProwlarrTagMatch::Any,
-            include_untagged: true,
-        };
-        let client = ProwlarrHttpClient::new(Duration::from_millis(100));
-
-        let error = client.indexers(&source).await.unwrap_err().to_string();
-        let debug = format!("{source:?}");
-
-        assert!(!error.contains("user"));
-        assert!(!error.contains("password"));
-        assert!(!error.contains("path-token"));
-        assert!(!error.contains("apikey=secret"));
-        assert!(error.contains(&format!("http://{address}")));
-        assert!(!debug.contains("user"));
-        assert!(!debug.contains("password"));
-        assert!(!debug.contains("path-token"));
-        assert!(!debug.contains("apikey=secret"));
-        assert!(!debug.contains("prowlarr-secret"));
-    }
-
-    #[tokio::test]
-    async fn search_client_sends_audio_queries_as_music() {
-        let endpoint = test_endpoint(
-            spawn_torznab_server(|request| async move {
-                let query = request.uri().query().unwrap_or_default();
-                if !query.contains("t=music")
-                    || !query.contains("q=Example")
-                    || !query.contains("apikey=secret")
-                {
-                    return (AxumStatusCode::BAD_REQUEST, "bad query".to_owned());
+        #[tokio::test]
+        async fn prowlarr_client_does_not_forward_api_key_on_redirect() {
+            let saw_redirected_key = Arc::new(AtomicBool::new(false));
+            let target_saw_redirected_key = saw_redirected_key.clone();
+            let target_url = spawn_prowlarr_server(move |request| {
+                let target_saw_redirected_key = target_saw_redirected_key.clone();
+                async move {
+                    if request.headers().get("x-api-key").is_some() {
+                        target_saw_redirected_key.store(true, AtomicOrdering::Relaxed);
+                    }
+                    (AxumStatusCode::OK, "[]").into_response()
                 }
-                (
-                    AxumStatusCode::OK,
-                    search_rss("candidate-1", "Example Album"),
-                )
             })
-            .await,
-        );
-        let client = TorznabHttpClient::new(Duration::from_secs(5));
-        let plan = TorznabSearchPlan {
-            query: TorznabSearchQuery {
-                search_type: TorznabSearchType::AudioSearch,
-                q: Some("Example".to_owned()),
-                season: None,
-                episode: None,
-                ids: SearchIds::default(),
-            },
-            limit: 50,
-        };
-
-        let candidates = client
-            .search(&endpoint, MediaType::Audio, &plan, 1_700_000_000_000)
-            .await
-            .unwrap();
-
-        assert_eq!(1, candidates.len());
-        assert_eq!("candidate-1", candidates[0].guid.as_str());
-    }
-
-    #[tokio::test]
-    async fn search_client_maps_rate_limits_and_malformed_rss() {
-        let rate_limited = test_endpoint(
-            spawn_torznab_server(|_request| async move {
-                (AxumStatusCode::TOO_MANY_REQUESTS, "limited".to_owned())
+            .await;
+            let redirect_url = target_url.clone();
+            let source_url = spawn_prowlarr_server(move |_request| {
+                let redirect_url = redirect_url.clone();
+                async move {
+                    (
+                        AxumStatusCode::FOUND,
+                        [(
+                            LOCATION,
+                            HeaderValue::from_str(&format!("{redirect_url}/api/v1/indexer"))
+                                .unwrap(),
+                        )],
+                        "",
+                    )
+                        .into_response()
+                }
             })
-            .await,
-        );
-        let malformed = test_endpoint(
-            spawn_torznab_server(
-                |_request| async move { (AxumStatusCode::OK, "not rss".to_owned()) },
-            )
-            .await,
-        );
-        let client = TorznabHttpClient::new(Duration::from_secs(5));
-        let plan = generic_plan();
+            .await;
+            let client = ProwlarrHttpClient::new(Duration::from_secs(5));
 
-        let limited = client
-            .search(&rate_limited, MediaType::Movie, &plan, 1_700_000_000_000)
-            .await
-            .unwrap_err();
-        let invalid = client
-            .search(&malformed, MediaType::Movie, &plan, 1_700_000_000_000)
-            .await
-            .unwrap_err();
+            let error = client
+                .indexers(&test_prowlarr_source(
+                    source_url,
+                    &[],
+                    ProwlarrTagMatch::Any,
+                    true,
+                ))
+                .await
+                .unwrap_err();
 
-        assert!(matches!(limited, TorznabRequestError::RateLimited { .. }));
-        assert!(matches!(invalid, TorznabRequestError::InvalidXml { .. }));
-    }
-
-    #[tokio::test]
-    async fn search_client_rejects_oversized_rss_response() {
-        let endpoint = test_endpoint(
-            spawn_torznab_server(|_request| async move {
-                oversized_response(TORZNAB_RSS_MAX_BYTES.saturating_add(1))
-            })
-            .await,
-        );
-        let client = TorznabHttpClient::new(Duration::from_secs(5));
-        let plan = generic_plan();
-
-        let error = client
-            .search(&endpoint, MediaType::Movie, &plan, 1_700_000_000_000)
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(
+            assert!(matches!(
                 error,
-                TorznabRequestError::ResponseTooLarge {
-                    limit: TORZNAB_RSS_MAX_BYTES
-                }
-            ),
-            "got {error:?}"
-        );
-    }
+                ProwlarrRequestError::HttpStatus { status: 302, .. }
+            ));
+            assert!(!saw_redirected_key.load(AtomicOrdering::Relaxed));
+        }
 
-    #[tokio::test]
-    async fn search_client_rejects_chunked_oversized_rss_response() {
-        let endpoint = test_endpoint(spawn_chunked_response_server(
-            "/api",
-            TORZNAB_RSS_MAX_BYTES.saturating_add(1),
-        ));
-        let client = TorznabHttpClient::new(Duration::from_secs(5));
-        let plan = generic_plan();
+        #[tokio::test]
+        async fn prowlarr_errors_redact_secret_bearing_urls() {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            let source = ProwlarrSource {
+                name: DependencyName::new("main").unwrap(),
+                url: format!("http://user:password@{address}/path-token?apikey=secret#frag"),
+                api_key: ApiKey::new("prowlarr-secret").unwrap(),
+                api_key_source: ApiKeySource::Direct,
+                tags: BTreeSet::new(),
+                tag_match: ProwlarrTagMatch::Any,
+                include_untagged: true,
+            };
+            let client = ProwlarrHttpClient::new(Duration::from_millis(100));
 
-        let error = client
-            .search(&endpoint, MediaType::Movie, &plan, 1_700_000_000_000)
-            .await
-            .unwrap_err();
+            let error = client.indexers(&source).await.unwrap_err().to_string();
+            let debug = format!("{source:?}");
 
-        assert!(
-            matches!(
-                error,
-                TorznabRequestError::ResponseTooLarge {
-                    limit: TORZNAB_RSS_MAX_BYTES
-                }
-            ),
-            "got {error:?}"
-        );
+            assert!(!error.contains("user"));
+            assert!(!error.contains("password"));
+            assert!(!error.contains("path-token"));
+            assert!(!error.contains("apikey=secret"));
+            assert!(error.contains(&format!("http://{address}")));
+            assert!(!debug.contains("user"));
+            assert!(!debug.contains("password"));
+            assert!(!debug.contains("path-token"));
+            assert!(!debug.contains("apikey=secret"));
+            assert!(!debug.contains("prowlarr-secret"));
+        }
+
+        #[tokio::test]
+        async fn search_client_sends_audio_queries_as_music() {
+            let endpoint = test_endpoint(
+                spawn_torznab_server(|request| async move {
+                    let query = request.uri().query().unwrap_or_default();
+                    if !query.contains("t=music")
+                        || !query.contains("q=Example")
+                        || !query.contains("apikey=secret")
+                    {
+                        return (AxumStatusCode::BAD_REQUEST, "bad query".to_owned());
+                    }
+                    (
+                        AxumStatusCode::OK,
+                        search_rss("candidate-1", "Example Album"),
+                    )
+                })
+                .await,
+            );
+            let client = TorznabHttpClient::new(Duration::from_secs(5));
+            let plan = TorznabSearchPlan {
+                query: TorznabSearchQuery {
+                    search_type: TorznabSearchType::AudioSearch,
+                    q: Some("Example".to_owned()),
+                    season: None,
+                    episode: None,
+                    ids: SearchIds::default(),
+                },
+                limit: 50,
+            };
+
+            let candidates = client
+                .search(&endpoint, MediaType::Audio, &plan, 1_700_000_000_000)
+                .await
+                .unwrap();
+
+            assert_eq!(1, candidates.len());
+            assert_eq!("candidate-1", candidates[0].guid.as_str());
+        }
+
+        #[tokio::test]
+        async fn search_client_maps_rate_limits_and_malformed_rss() {
+            let rate_limited = test_endpoint(
+                spawn_torznab_server(|_request| async move {
+                    (AxumStatusCode::TOO_MANY_REQUESTS, "limited".to_owned())
+                })
+                .await,
+            );
+            let malformed = test_endpoint(
+                spawn_torznab_server(|_request| async move {
+                    (AxumStatusCode::OK, "not rss".to_owned())
+                })
+                .await,
+            );
+            let client = TorznabHttpClient::new(Duration::from_secs(5));
+            let plan = generic_plan();
+
+            let limited = client
+                .search(&rate_limited, MediaType::Movie, &plan, 1_700_000_000_000)
+                .await
+                .unwrap_err();
+            let invalid = client
+                .search(&malformed, MediaType::Movie, &plan, 1_700_000_000_000)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(limited, TorznabRequestError::RateLimited { .. }));
+            assert!(matches!(invalid, TorznabRequestError::InvalidXml { .. }));
+        }
+
+        #[tokio::test]
+        async fn search_client_rejects_oversized_rss_response() {
+            let endpoint = test_endpoint(
+                spawn_torznab_server(|_request| async move {
+                    oversized_response(TORZNAB_RSS_MAX_BYTES.saturating_add(1))
+                })
+                .await,
+            );
+            let client = TorznabHttpClient::new(Duration::from_secs(5));
+            let plan = generic_plan();
+
+            let error = client
+                .search(&endpoint, MediaType::Movie, &plan, 1_700_000_000_000)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    TorznabRequestError::ResponseTooLarge {
+                        limit: TORZNAB_RSS_MAX_BYTES
+                    }
+                ),
+                "got {error:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn search_client_rejects_chunked_oversized_rss_response() {
+            let endpoint = test_endpoint(spawn_chunked_response_server(
+                "/api",
+                TORZNAB_RSS_MAX_BYTES.saturating_add(1),
+            ));
+            let client = TorznabHttpClient::new(Duration::from_secs(5));
+            let plan = generic_plan();
+
+            let error = client
+                .search(&endpoint, MediaType::Movie, &plan, 1_700_000_000_000)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    TorznabRequestError::ResponseTooLarge {
+                        limit: TORZNAB_RSS_MAX_BYTES
+                    }
+                ),
+                "got {error:?}"
+            );
+        }
     }
 
     #[test]

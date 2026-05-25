@@ -1519,19 +1519,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::clients::runtime::{
-        CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY, RuntimeInjectionClient,
-        client_inventory_file_error,
-    };
-    use crate::clients::{TorrentClientCapabilities, TorrentClientDescriptor};
+    use crate::clients::runtime::CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY;
     use crate::config::{
         ArrInstanceConfig, ConfigTorrentClientKind, ProwlarrSourceConfig, TorrentClientConfig,
         TorznabIndexerConfig,
     };
-    use crate::domain::{
-        ClientHost, DependencyName, DependencyState, InfoHash, ItemTitle, ReasonText,
-        TorrentClientKind,
-    };
+    use crate::domain::{DependencyName, DependencyState, InfoHash, ItemTitle, ReasonText};
     use crate::errors::TorrentClientError;
     use crate::http::router;
     use crate::indexers::{
@@ -1539,12 +1532,11 @@ mod tests {
         SearchCaps, TorznabCaps, TorznabLimits,
     };
     use crate::metrics::ExternalOutcome;
-    use crate::runtime::injection_worker::ClientInjectionRequest;
     use crate::secrets::{ApiKey, ApiToken};
     use axum::body::{Body, to_bytes};
     use axum::http::{
         Request, StatusCode,
-        header::{CONTENT_LENGTH, RETRY_AFTER, SET_COOKIE},
+        header::{RETRY_AFTER, SET_COOKIE},
     };
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
@@ -3811,21 +3803,6 @@ mod tests {
         assert_eq!(0, item_count);
     }
 
-    #[test]
-    fn client_inventory_file_error_preserves_unauthorized_failure_class() {
-        let descriptor = torrent_client_descriptor("qbit", TorrentClientKind::Qbittorrent);
-        let error = client_inventory_file_error(
-            &descriptor,
-            &inventory_test_hash(1),
-            "Torrent 1",
-            TorrentClientError::Unauthorized {
-                client: "qbit".to_owned(),
-            },
-        );
-
-        assert!(matches!(error, TorrentClientError::Unauthorized { .. }));
-    }
-
     #[tokio::test]
     async fn runtime_cancels_qbit_inventory_during_file_fetch() {
         let file_requests = Arc::new(AtomicUsize::new(0));
@@ -4336,352 +4313,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_qbittorrent_adapter_validates_before_inject() {
-        let add_calls = Arc::new(AtomicUsize::new(0));
-        let add_call_counter = add_calls.clone();
-        let app = axum::Router::new()
-            .route(
-                "/api/v2/auth/login",
-                post(|| async { ([(axum::http::header::SET_COOKIE, "SID=ok")], "Ok") }),
-            )
-            .route("/api/v2/app/version", get(|| async { "4.2.0" }))
-            .route(
-                "/api/v2/torrents/add",
-                post(move || {
-                    let add_call_counter = add_call_counter.clone();
-                    async move {
-                        add_call_counter.fetch_add(1, Ordering::SeqCst);
-                        StatusCode::OK
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await });
-        let descriptor = TorrentClientDescriptor {
-            name: DisplayName::new("qbit").unwrap(),
-            kind: TorrentClientKind::Qbittorrent,
-            host: ClientHost::new(address.to_string()).unwrap(),
-            url: format!("http://{address}"),
-            default_save_path: "/downloads".into(),
-            readonly: false,
-            capabilities: TorrentClientCapabilities::for_kind(TorrentClientKind::Qbittorrent),
-        };
-        let config = TorrentClientConfig {
-            kind: ConfigTorrentClientKind::Qbittorrent,
-            url: format!("http://{address}"),
-            username: None,
-            password: None,
-            password_file: None,
-            password_env: None,
-            default_save_path: "/downloads".into(),
-            default_category: None,
-            default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
-            default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
-            label_field: None,
-        };
-        let metrics = MetricsRegistry::new();
-        let client = RuntimeInjectionClient::new("qbit", &config, descriptor, metrics.clone());
-        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
-
-        let error = client
-            .inject(ClientInjectionRequest {
-                info_hash: &info_hash,
-                torrent_bytes: b"torrent bytes",
-                save_path: None,
-                pause_for_recheck: false,
-            })
-            .await
-            .unwrap_err();
-
-        handle.abort();
-        assert!(matches!(
-            error,
-            TorrentClientError::UnsupportedCapability { .. }
-        ));
-        assert_eq!(0, add_calls.load(Ordering::SeqCst));
-        let output = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
-        assert!(output.contains("sporos_client_requests_total"));
-        assert!(output.contains("operation=\"inject\""));
-        assert!(output.contains("outcome=\"unsupported\""));
-
-        let _error = client.has_torrent(&info_hash).await.unwrap_err();
-        let output = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
-        assert!(output.contains("sporos_client_requests_total"));
-        assert!(output.contains("operation=\"inventory\""));
-        assert!(output.contains("outcome=\"failed\""));
-    }
-
-    #[tokio::test]
-    async fn runtime_qbittorrent_adapter_pauses_for_recheck() {
-        let add_body = Arc::new(Mutex::new(None::<String>));
-        let seen_add_body = add_body.clone();
-        let create_tag_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen_create_tag_bodies = create_tag_bodies.clone();
-        let create_category_body = Arc::new(Mutex::new(None::<String>));
-        let seen_create_category_body = create_category_body.clone();
-        let app = axum::Router::new()
-            .route(
-                "/api/v2/auth/login",
-                post(|| async { ([(axum::http::header::SET_COOKIE, "SID=ok")], "Ok") }),
-            )
-            .route("/api/v2/app/version", get(|| async { "4.6.0" }))
-            .route(
-                "/api/v2/torrents/createTags",
-                post(move |request: Request<Body>| {
-                    let seen_create_tag_bodies = seen_create_tag_bodies.clone();
-                    async move {
-                        let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
-                        let body = String::from_utf8(body.to_vec()).unwrap();
-                        seen_create_tag_bodies.lock().unwrap().push(body);
-                        StatusCode::OK
-                    }
-                }),
-            )
-            .route(
-                "/api/v2/torrents/createCategory",
-                post(move |request: Request<Body>| {
-                    let seen_create_category_body = seen_create_category_body.clone();
-                    async move {
-                        let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
-                        let body = String::from_utf8(body.to_vec()).unwrap();
-                        *seen_create_category_body.lock().unwrap() = Some(body);
-                        StatusCode::OK
-                    }
-                }),
-            )
-            .route(
-                "/api/v2/torrents/add",
-                post(move |request: Request<Body>| {
-                    let seen_add_body = seen_add_body.clone();
-                    async move {
-                        let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
-                        let body = String::from_utf8(body.to_vec()).unwrap();
-                        *seen_add_body.lock().unwrap() = Some(body);
-                        StatusCode::OK
-                    }
-                }),
-            );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await });
-        let descriptor = TorrentClientDescriptor {
-            name: DisplayName::new("qbit").unwrap(),
-            kind: TorrentClientKind::Qbittorrent,
-            host: ClientHost::new(address.to_string()).unwrap(),
-            url: format!("http://{address}"),
-            default_save_path: "/downloads".into(),
-            readonly: false,
-            capabilities: TorrentClientCapabilities::for_kind(TorrentClientKind::Qbittorrent),
-        };
-        let config = TorrentClientConfig {
-            kind: ConfigTorrentClientKind::Qbittorrent,
-            url: format!("http://{address}"),
-            username: None,
-            password: None,
-            password_file: None,
-            password_env: None,
-            default_save_path: "/downloads".into(),
-            default_category: Some("movies".to_owned()),
-            default_tags: vec!["cross-seed".to_owned(), "sporos".to_owned()],
-            default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
-            label_field: None,
-        };
-        let client =
-            RuntimeInjectionClient::new("qbit", &config, descriptor, MetricsRegistry::new());
-        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
-
-        client
-            .inject(ClientInjectionRequest {
-                info_hash: &info_hash,
-                torrent_bytes: b"torrent bytes",
-                save_path: None,
-                pause_for_recheck: true,
-            })
-            .await
-            .unwrap();
-
-        handle.abort();
-        let body = add_body.lock().unwrap().clone().unwrap();
-        let tag_bodies = create_tag_bodies.lock().unwrap().join("\n");
-        let category_body = create_category_body.lock().unwrap().clone().unwrap();
-        assert!(tag_bodies.contains("tags=cross-seed"));
-        assert!(tag_bodies.contains("tags=sporos"));
-        assert!(category_body.contains("category=movies"));
-        assert!(category_body.contains("savePath=%2Fdownloads"));
-        assert!(body.contains("name=\"tags\"\r\n\r\ncross-seed,sporos"));
-        assert!(body.contains("name=\"category\"\r\n\r\nmovies"));
-        assert!(body.contains("name=\"paused\"\r\n\r\ntrue"));
-        assert!(body.contains("name=\"skip_checking\"\r\n\r\nfalse"));
-    }
-
-    #[tokio::test]
-    async fn runtime_rtorrent_adapter_pauses_for_recheck() {
-        let inject_body = Arc::new(Mutex::new(None::<String>));
-        let seen_inject_body = inject_body.clone();
-        let app = axum::Router::new().route(
-            "/RPC2",
-            post(move |request: Request<Body>| {
-                let seen_inject_body = seen_inject_body.clone();
-                async move {
-                    let body = to_bytes(request.into_body(), 65_536).await.unwrap();
-                    let body = String::from_utf8(body.to_vec()).unwrap();
-                    *seen_inject_body.lock().unwrap() = Some(body);
-                    (StatusCode::OK, xml_response("<i8>0</i8>"))
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await });
-        let descriptor = TorrentClientDescriptor {
-            name: DisplayName::new("rtorrent").unwrap(),
-            kind: TorrentClientKind::Rtorrent,
-            host: ClientHost::new(address.to_string()).unwrap(),
-            url: format!("http://{address}/RPC2"),
-            default_save_path: "/downloads".into(),
-            readonly: false,
-            capabilities: TorrentClientCapabilities::for_kind(TorrentClientKind::Rtorrent),
-        };
-        let config = TorrentClientConfig {
-            kind: ConfigTorrentClientKind::Rtorrent,
-            url: format!("http://{address}/RPC2"),
-            username: None,
-            password: None,
-            password_file: None,
-            password_env: None,
-            default_save_path: "/downloads".into(),
-            default_category: None,
-            default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
-            default_label: "cross-seed".to_owned(),
-            label_field: None,
-        };
-        let client =
-            RuntimeInjectionClient::new("rtorrent", &config, descriptor, MetricsRegistry::new());
-        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
-
-        client
-            .inject(ClientInjectionRequest {
-                info_hash: &info_hash,
-                torrent_bytes: b"torrent bytes",
-                save_path: None,
-                pause_for_recheck: true,
-            })
-            .await
-            .unwrap();
-
-        handle.abort();
-        let body = inject_body.lock().unwrap().clone().unwrap();
-        assert!(body.contains("<methodName>load.raw</methodName>"));
-        assert!(!body.contains("<methodName>load.raw_start</methodName>"));
-        assert!(body.contains("<string>d.custom1.set=cross-seed</string>"));
-    }
-
-    #[tokio::test]
-    async fn runtime_qbittorrent_adapter_records_oversized_metrics() {
-        let app = axum::Router::new()
-            .route(
-                "/api/v2/auth/login",
-                post(|| async { ([(axum::http::header::SET_COOKIE, "SID=ok")], "Ok") }),
-            )
-            .route(
-                "/api/v2/app/version",
-                get(|| async { oversized_response(65 * 1024 * 1024) }),
-            )
-            .route("/api/v2/torrents/info", get(|| async { "[]" }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await });
-        let descriptor = TorrentClientDescriptor {
-            name: DisplayName::new("qbit").unwrap(),
-            kind: TorrentClientKind::Qbittorrent,
-            host: ClientHost::new(address.to_string()).unwrap(),
-            url: format!("http://{address}"),
-            default_save_path: "/downloads".into(),
-            readonly: false,
-            capabilities: TorrentClientCapabilities::for_kind(TorrentClientKind::Qbittorrent),
-        };
-        let config = TorrentClientConfig {
-            kind: ConfigTorrentClientKind::Qbittorrent,
-            url: format!("http://{address}"),
-            username: None,
-            password: None,
-            password_file: None,
-            password_env: None,
-            default_save_path: "/downloads".into(),
-            default_category: None,
-            default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
-            default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
-            label_field: None,
-        };
-        let metrics = MetricsRegistry::new();
-        let client = RuntimeInjectionClient::new("qbit", &config, descriptor, metrics.clone());
-        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
-
-        let error = client
-            .inject(ClientInjectionRequest {
-                info_hash: &info_hash,
-                torrent_bytes: b"torrent bytes",
-                save_path: None,
-                pause_for_recheck: false,
-            })
-            .await
-            .unwrap_err();
-
-        handle.abort();
-        assert!(matches!(error, TorrentClientError::BadResponse { .. }));
-        let output = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
-        assert!(output.contains("sporos_client_requests_total"));
-        assert!(output.contains("operation=\"inject\""));
-        assert!(output.contains("outcome=\"failed\""));
-    }
-
-    #[tokio::test]
-    async fn runtime_rtorrent_adapter_records_oversized_metrics() {
-        let app = axum::Router::new().route(
-            "/RPC2",
-            post(|_request: Request<Body>| async { oversized_response(65 * 1024 * 1024) }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move { axum::serve(listener, app).await });
-        let descriptor = TorrentClientDescriptor {
-            name: DisplayName::new("rtorrent").unwrap(),
-            kind: TorrentClientKind::Rtorrent,
-            host: ClientHost::new(address.to_string()).unwrap(),
-            url: format!("http://{address}/RPC2"),
-            default_save_path: "/downloads".into(),
-            readonly: false,
-            capabilities: TorrentClientCapabilities::for_kind(TorrentClientKind::Rtorrent),
-        };
-        let config = TorrentClientConfig {
-            kind: ConfigTorrentClientKind::Rtorrent,
-            url: format!("http://{address}/RPC2"),
-            username: None,
-            password: None,
-            password_file: None,
-            password_env: None,
-            default_save_path: "/downloads".into(),
-            default_category: None,
-            default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
-            default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
-            label_field: None,
-        };
-        let metrics = MetricsRegistry::new();
-        let client = RuntimeInjectionClient::new("rtorrent", &config, descriptor, metrics.clone());
-        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
-
-        let error = client.has_torrent(&info_hash).await.unwrap_err();
-
-        handle.abort();
-        assert!(matches!(error, TorrentClientError::BadResponse { .. }));
-        let output = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
-        assert!(output.contains("sporos_client_requests_total"));
-        assert!(output.contains("operation=\"inventory\""));
-        assert!(output.contains("outcome=\"failed\""));
-    }
-
-    #[tokio::test]
     async fn runtime_composes_configured_api_auth() {
         let mut config = SporosConfig::default();
         config.server.api_token = Some(ApiToken::new("secret-token").unwrap());
@@ -5146,18 +4777,6 @@ mod tests {
 
     fn inventory_test_hash(index: usize) -> InfoHash {
         InfoHash::new(format!("{index:040x}")).unwrap()
-    }
-
-    fn torrent_client_descriptor(name: &str, kind: TorrentClientKind) -> TorrentClientDescriptor {
-        TorrentClientDescriptor {
-            name: DisplayName::new(name).unwrap(),
-            kind,
-            host: ClientHost::new(format!("{name}.local")).unwrap(),
-            url: format!("http://{name}.local"),
-            default_save_path: "/downloads".into(),
-            readonly: false,
-            capabilities: TorrentClientCapabilities::for_kind(kind),
-        }
     }
 
     async fn spawn_runtime_test_server<F, Fut, R>(handler: F) -> String
@@ -5699,14 +5318,6 @@ mod tests {
             .headers_mut()
             .insert(SET_COOKIE, cookie.parse().unwrap());
         response
-    }
-
-    fn oversized_response(length: u64) -> Response {
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_LENGTH, length.to_string())
-            .body(Body::from(vec![b'a'; length as usize]))
-            .unwrap()
     }
 
     fn xml_response(inner: &str) -> String {
