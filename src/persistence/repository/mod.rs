@@ -3936,7 +3936,7 @@ impl Repository {
                 updated_at = ?
             WHERE id IN (
                 SELECT id
-                FROM announce_work INDEXED BY idx_announce_work_succeeded_retention
+                FROM announce_work INDEXED BY idx_announce_work_succeeded_fetch_scrub
                 WHERE status = 'succeeded'
                   AND finished_at IS NOT NULL
                   AND finished_at <= ?
@@ -3954,7 +3954,7 @@ impl Repository {
                 updated_at = ?
             WHERE id IN (
                 SELECT id
-                FROM announce_work INDEXED BY idx_announce_work_terminal_failed_retention
+                FROM announce_work INDEXED BY idx_announce_work_terminal_failed_fetch_scrub
                 WHERE status = 'terminal_failed'
                   AND finished_at IS NOT NULL
                   AND finished_at <= ?
@@ -3972,7 +3972,7 @@ impl Repository {
                 updated_at = ?
             WHERE id IN (
                 SELECT id
-                FROM announce_work INDEXED BY idx_announce_work_expired_retention
+                FROM announce_work INDEXED BY idx_announce_work_expired_fetch_scrub
                 WHERE status = 'expired'
                   AND finished_at IS NOT NULL
                   AND finished_at <= ?

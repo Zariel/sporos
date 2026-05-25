@@ -3433,7 +3433,20 @@ async fn stale_fetch_material_scrub_uses_bounded_indexes() {
         (
             r#"
             SELECT id
-            FROM announce_work INDEXED BY idx_announce_work_terminal_failed_retention
+            FROM announce_work INDEXED BY idx_announce_work_succeeded_fetch_scrub
+            WHERE status = 'succeeded'
+              AND finished_at IS NOT NULL
+              AND finished_at <= ?
+              AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+            ORDER BY finished_at, id
+            LIMIT ?
+            "#,
+            "idx_announce_work_succeeded_fetch_scrub",
+        ),
+        (
+            r#"
+            SELECT id
+            FROM announce_work INDEXED BY idx_announce_work_terminal_failed_fetch_scrub
             WHERE status = 'terminal_failed'
               AND finished_at IS NOT NULL
               AND finished_at <= ?
@@ -3441,7 +3454,20 @@ async fn stale_fetch_material_scrub_uses_bounded_indexes() {
             ORDER BY finished_at, id
             LIMIT ?
             "#,
-            "idx_announce_work_terminal_failed_retention",
+            "idx_announce_work_terminal_failed_fetch_scrub",
+        ),
+        (
+            r#"
+            SELECT id
+            FROM announce_work INDEXED BY idx_announce_work_expired_fetch_scrub
+            WHERE status = 'expired'
+              AND finished_at IS NOT NULL
+              AND finished_at <= ?
+              AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+            ORDER BY finished_at, id
+            LIMIT ?
+            "#,
+            "idx_announce_work_expired_fetch_scrub",
         ),
     ] {
         let plan = explain_query_plan(&repository, query, 10_000, 100).await;

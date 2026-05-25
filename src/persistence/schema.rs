@@ -281,6 +281,21 @@ CREATE INDEX IF NOT EXISTS idx_announce_work_expired_retention
     ON announce_work (status, finished_at, id)
     WHERE status = 'expired'
       AND finished_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_announce_work_succeeded_fetch_scrub
+    ON announce_work (finished_at, id)
+    WHERE status = 'succeeded'
+      AND finished_at IS NOT NULL
+      AND (download_url IS NOT NULL OR cookie IS NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_announce_work_terminal_failed_fetch_scrub
+    ON announce_work (finished_at, id)
+    WHERE status = 'terminal_failed'
+      AND finished_at IS NOT NULL
+      AND (download_url IS NOT NULL OR cookie IS NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_announce_work_expired_fetch_scrub
+    ON announce_work (finished_at, id)
+    WHERE status = 'expired'
+      AND finished_at IS NOT NULL
+      AND (download_url IS NOT NULL OR cookie IS NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_announce_work_active_fetch_scrub
     ON announce_work (expires_at, id)
     WHERE status IN ('queued', 'running', 'waiting', 'retryable')
@@ -378,6 +393,9 @@ mod tests {
             "idx_announce_work_succeeded_retention",
             "idx_announce_work_terminal_failed_retention",
             "idx_announce_work_expired_retention",
+            "idx_announce_work_succeeded_fetch_scrub",
+            "idx_announce_work_terminal_failed_fetch_scrub",
+            "idx_announce_work_expired_fetch_scrub",
             "idx_announce_work_active_fetch_scrub",
         ] {
             assert!(
