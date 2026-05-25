@@ -545,7 +545,7 @@ impl InjectionWorker {
             .ok_or(InjectionWorkerError::NoWritableClient)?;
         let target_name = dependency_name(target.descriptor())?;
         if should_stop() {
-            self.save_for_retry(&request).await?;
+            self.save_for_retry_phase(&request).await?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
@@ -581,7 +581,7 @@ impl InjectionWorker {
             }
             ExistingClientLookup::NotFound => {}
             ExistingClientLookup::Shutdown => {
-                self.save_for_retry(&request).await?;
+                self.save_for_retry_phase(&request).await?;
                 return Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
@@ -593,7 +593,7 @@ impl InjectionWorker {
         }
 
         if should_stop() {
-            self.save_for_retry(&request).await?;
+            self.save_for_retry_phase(&request).await?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
@@ -603,190 +603,75 @@ impl InjectionWorker {
             });
         }
 
-        let recheck_plan =
-            recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
-        let below_threshold = is_below_resume_threshold(
-            &request.metafile,
-            &request.assessment,
-            request.recheck,
-            recheck_plan,
-        );
-        if below_threshold
-            && request.recheck.below_threshold_action
-                == BelowThresholdAction::RejectWithoutInjecting
-        {
-            return Ok(InjectionWorkResult {
-                outcome: InjectionOutcome::Rejected,
-                target_client: Some(target_name),
-                saved_for_retry: false,
-                linked_files: 0,
-                prepared_link_cleanup_incomplete: false,
-            });
-        }
-
-        let link_result = self.prepare_links(&request).await?;
-        let (save_path, created_links, prepared_links, created_roots, linked_files) =
-            match link_result {
-                LinkPreparation::Ready {
-                    save_path,
-                    created_links,
-                    prepared_links,
-                    created_roots,
-                    linked_files,
-                } => (
-                    save_path,
-                    created_links,
-                    prepared_links,
-                    created_roots,
-                    linked_files,
-                ),
-                LinkPreparation::SourceIncomplete => {
-                    self.save_for_retry(&request).await?;
-                    return Ok(InjectionWorkResult {
-                        outcome: InjectionOutcome::SourceIncomplete,
-                        target_client: Some(target_name),
-                        saved_for_retry: true,
-                        linked_files: 0,
-                        prepared_link_cleanup_incomplete: false,
-                    });
-                }
-            };
-
-        let has_prepared_links = !prepared_links.is_empty();
-        let recheck_after_linking = RecheckResumePlan {
-            should_recheck: true,
-            ..recheck_plan
-        };
-        let pause_for_recheck = has_prepared_links
-            || (recheck_plan.should_recheck
-                && !(below_threshold
-                    && request.recheck.below_threshold_action
-                        == BelowThresholdAction::InjectAndStart));
-        let run_resume_after_inject = pause_for_recheck
-            && !(below_threshold
-                && request.recheck.below_threshold_action == BelowThresholdAction::InjectPaused);
-        if should_stop() {
-            self.save_for_retry(&request).await?;
-            let prepared_link_cleanup_incomplete =
-                cleanup_prepared_links(&created_links, &created_roots);
-            return Ok(InjectionWorkResult {
-                outcome: InjectionOutcome::Saved,
-                target_client: Some(target_name),
-                saved_for_retry: true,
-                linked_files,
-                prepared_link_cleanup_incomplete,
-            });
-        }
-        let mutation_result = {
-            let Some(_guard) = lock_until_shutdown(&self.mutation_lock, shutdown).await else {
-                self.save_for_retry(&request).await?;
-                let prepared_link_cleanup_incomplete =
-                    cleanup_prepared_links(&created_links, &created_roots);
+        let preparation = match self.prepare_injection_phase(&request, &target_name).await? {
+            InjectionPreparationPhase::Ready(preparation) => preparation,
+            InjectionPreparationPhase::Rejected(result) => return Ok(result),
+            InjectionPreparationPhase::SourceIncomplete => {
+                self.save_for_retry_phase(&request).await?;
                 return Ok(InjectionWorkResult {
-                    outcome: InjectionOutcome::Saved,
+                    outcome: InjectionOutcome::SourceIncomplete,
                     target_client: Some(target_name),
                     saved_for_retry: true,
-                    linked_files,
-                    prepared_link_cleanup_incomplete,
+                    linked_files: 0,
+                    prepared_link_cleanup_incomplete: false,
                 });
-            };
-            if should_stop() {
-                InjectionMutationResult::SavedForShutdown
-            } else {
-                match self
-                    .find_existing_client(
-                        request.metafile.info_hash(),
-                        target.descriptor(),
-                        request.assessed_at_ms,
-                        shutdown,
-                    )
-                    .await
-                {
-                    Ok(ExistingClientLookup::Found(existing_client)) => {
-                        InjectionMutationResult::AlreadyExistsOnOtherClient(existing_client)
-                    }
-                    Ok(ExistingClientLookup::Shutdown) => InjectionMutationResult::SavedForShutdown,
-                    Ok(ExistingClientLookup::NotFound) => {
-                        match client_call_until_shutdown(shutdown, || {
-                            target.has_torrent(request.metafile.info_hash())
-                        })
-                        .await
-                        {
-                            ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
-                            ClientCall::Completed(Ok(true)) => {
-                                match validate_prepared_links_for_inject(&prepared_links).await {
-                                    Ok(()) => InjectionMutationResult::AlreadyExistsOnTarget,
-                                    Err(error) => {
-                                        InjectionMutationResult::PreparedLinksInvalid(error)
-                                    }
-                                }
-                            }
-                            ClientCall::Completed(Ok(false)) => {
-                                match validate_prepared_links_for_inject(&prepared_links).await {
-                                    Ok(()) => match client_call_until_shutdown(shutdown, || {
-                                        target.inject(ClientInjectionRequest {
-                                            info_hash: request.metafile.info_hash(),
-                                            torrent_bytes: &request.torrent_bytes,
-                                            save_path: save_path.as_deref(),
-                                            pause_for_recheck,
-                                        })
-                                    })
-                                    .await
-                                    {
-                                        ClientCall::Shutdown => {
-                                            InjectionMutationResult::SavedForShutdown
-                                        }
-                                        ClientCall::Completed(result) => {
-                                            InjectionMutationResult::Injected(result)
-                                        }
-                                    },
-                                    Err(error) => {
-                                        InjectionMutationResult::PreparedLinksInvalid(error)
-                                    }
-                                }
-                            }
-                            ClientCall::Completed(Err(error)) => {
-                                InjectionMutationResult::TargetPrecheckFailed(error)
-                            }
-                        }
-                    }
-                    Err(error) => InjectionMutationResult::ExistingLookupFailed(error),
-                }
             }
         };
 
+        if should_stop() {
+            self.save_for_retry_phase(&request).await?;
+            let cleanup = preparation.cleanup_prepared_links_phase();
+            return Ok(InjectionWorkResult {
+                outcome: InjectionOutcome::Saved,
+                target_client: Some(target_name),
+                saved_for_retry: true,
+                linked_files: preparation.linked_files,
+                prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
+            });
+        }
+        let mutation_result = self
+            .run_mutation_phase(
+                &request,
+                target.as_ref(),
+                &preparation,
+                should_stop,
+                shutdown,
+            )
+            .await;
+
         match mutation_result {
             InjectionMutationResult::SavedForShutdown => {
-                self.save_for_retry(&request).await?;
-                let prepared_link_cleanup_incomplete =
-                    cleanup_prepared_links(&created_links, &created_roots);
+                self.save_for_retry_phase(&request).await?;
+                let cleanup = preparation.cleanup_prepared_links_phase();
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
                     saved_for_retry: true,
-                    linked_files,
-                    prepared_link_cleanup_incomplete,
+                    linked_files: preparation.linked_files,
+                    prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
                 })
             }
             InjectionMutationResult::AlreadyExistsOnTarget => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
                 let mut saved_for_retry = false;
-                if has_prepared_links || (from_saved_retry && recheck_plan.should_recheck) {
+                if preparation.has_prepared_links
+                    || (from_saved_retry && preparation.recheck_plan.should_recheck)
+                {
                     let resume_outcome = self
                         .run_recheck_resume(
                             target.as_ref(),
                             &request,
-                            if has_prepared_links {
-                                recheck_after_linking
+                            if preparation.has_prepared_links {
+                                preparation.recheck_after_linking
                             } else {
-                                recheck_plan
+                                preparation.recheck_plan
                             },
                             shutdown,
                         )
                         .await?;
                     if resume_outcome == ResumeLoopOutcome::StillChecking {
-                        self.save_for_retry(&request).await?;
+                        self.save_for_retry_phase(&request).await?;
                         saved_for_retry = true;
                     }
                 }
@@ -794,13 +679,12 @@ impl InjectionWorker {
                     outcome: InjectionOutcome::AlreadyExists,
                     target_client: Some(target_name),
                     saved_for_retry,
-                    linked_files,
+                    linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: false,
                 })
             }
             InjectionMutationResult::AlreadyExistsOnOtherClient(existing_client) => {
-                let prepared_link_cleanup_incomplete =
-                    cleanup_prepared_links(&created_links, &created_roots);
+                let cleanup = preparation.cleanup_prepared_links_phase();
                 self.record_client_health(
                     existing_client.descriptor(),
                     true,
@@ -813,22 +697,22 @@ impl InjectionWorker {
                     target_client: Some(dependency_name(existing_client.descriptor())?),
                     saved_for_retry: false,
                     linked_files: 0,
-                    prepared_link_cleanup_incomplete,
+                    prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
                 })
             }
             InjectionMutationResult::Injected(Ok(())) => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
-                if run_resume_after_inject {
-                    let save_result = self.save_for_retry(&request).await;
+                if preparation.run_resume_after_inject {
+                    let save_result = self.save_for_retry_phase(&request).await;
                     let resume_result = self
                         .run_recheck_resume(
                             target.as_ref(),
                             &request,
-                            if has_prepared_links {
-                                recheck_after_linking
+                            if preparation.has_prepared_links {
+                                preparation.recheck_after_linking
                             } else {
-                                recheck_plan
+                                preparation.recheck_plan
                             },
                             shutdown,
                         )
@@ -839,15 +723,14 @@ impl InjectionWorker {
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Injected,
                     target_client: Some(target_name),
-                    saved_for_retry: run_resume_after_inject,
-                    linked_files,
+                    saved_for_retry: preparation.run_resume_after_inject,
+                    linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: false,
                 })
             }
             InjectionMutationResult::Injected(Err(error)) => {
-                self.save_for_retry(&request).await?;
-                let prepared_link_cleanup_incomplete =
-                    cleanup_prepared_links(&created_links, &created_roots);
+                self.save_for_retry_phase(&request).await?;
+                let cleanup = preparation.cleanup_prepared_links_phase();
                 self.record_client_health(
                     target.descriptor(),
                     false,
@@ -859,21 +742,20 @@ impl InjectionWorker {
                     outcome: InjectionOutcome::Failed,
                     target_client: Some(target_name),
                     saved_for_retry: true,
-                    linked_files,
-                    prepared_link_cleanup_incomplete,
+                    linked_files: preparation.linked_files,
+                    prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
                 })
             }
             InjectionMutationResult::PreparedLinksInvalid(error) => {
-                self.save_for_retry(&request).await?;
-                let prepared_link_cleanup_incomplete =
-                    cleanup_prepared_links(&created_links, &created_roots);
-                if prepared_link_cleanup_incomplete {
+                self.save_for_retry_phase(&request).await?;
+                let cleanup = preparation.cleanup_prepared_links_phase();
+                if cleanup.prepared_link_cleanup_incomplete {
                     Err(InjectionWorkerError::Link(
                         LinkActionError::CleanupIncomplete {
                             primary: Box::new(error),
                             cleanup: Box::new(LinkActionError::Io {
                                 operation: "clean prepared links after revalidation failure",
-                                path: save_path.clone().unwrap_or_default(),
+                                path: preparation.save_path.clone().unwrap_or_default(),
                                 source: std::io::Error::other("prepared link cleanup incomplete"),
                             }),
                         },
@@ -883,14 +765,14 @@ impl InjectionWorker {
                 }
             }
             InjectionMutationResult::ExistingLookupFailed(error) => {
-                let prepared_link_cleanup_incomplete =
-                    cleanup_prepared_links(&created_links, &created_roots);
-                if prepared_link_cleanup_incomplete {
+                let cleanup = preparation.cleanup_prepared_links_phase();
+                if cleanup.prepared_link_cleanup_incomplete {
                     match error {
                         InjectionWorkerError::Client(source) => {
                             Err(InjectionWorkerError::ClientWithPreparedLinkCleanup {
                                 source,
-                                prepared_link_cleanup_incomplete,
+                                prepared_link_cleanup_incomplete: cleanup
+                                    .prepared_link_cleanup_incomplete,
                             })
                         }
                         error => Err(error),
@@ -900,8 +782,7 @@ impl InjectionWorker {
                 }
             }
             InjectionMutationResult::TargetPrecheckFailed(error) => {
-                let prepared_link_cleanup_incomplete =
-                    cleanup_prepared_links(&created_links, &created_roots);
+                let cleanup = preparation.cleanup_prepared_links_phase();
                 self.record_client_health(
                     target.descriptor(),
                     false,
@@ -909,10 +790,10 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
-                if prepared_link_cleanup_incomplete {
+                if cleanup.prepared_link_cleanup_incomplete {
                     Err(InjectionWorkerError::ClientWithPreparedLinkCleanup {
                         source: error,
-                        prepared_link_cleanup_incomplete,
+                        prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
                     })
                 } else {
                     Err(error.into())
@@ -1287,6 +1168,147 @@ impl InjectionWorker {
         .map_err(InjectionWorkerError::Link)
     }
 
+    async fn prepare_injection_phase(
+        &self,
+        request: &InjectionRequest,
+        target_name: &DependencyName,
+    ) -> Result<InjectionPreparationPhase, InjectionWorkerError> {
+        let recheck_plan =
+            recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
+        let below_threshold = is_below_resume_threshold(
+            &request.metafile,
+            &request.assessment,
+            request.recheck,
+            recheck_plan,
+        );
+        if below_threshold
+            && request.recheck.below_threshold_action
+                == BelowThresholdAction::RejectWithoutInjecting
+        {
+            return Ok(InjectionPreparationPhase::Rejected(InjectionWorkResult {
+                outcome: InjectionOutcome::Rejected,
+                target_client: Some(target_name.clone()),
+                saved_for_retry: false,
+                linked_files: 0,
+                prepared_link_cleanup_incomplete: false,
+            }));
+        }
+
+        let link_result = self.prepare_links(request).await?;
+        let LinkPreparation::Ready {
+            save_path,
+            created_links,
+            prepared_links,
+            created_roots,
+            linked_files,
+        } = link_result
+        else {
+            return Ok(InjectionPreparationPhase::SourceIncomplete);
+        };
+
+        let has_prepared_links = !prepared_links.is_empty();
+        let recheck_after_linking = RecheckResumePlan {
+            should_recheck: true,
+            ..recheck_plan
+        };
+        let pause_for_recheck = has_prepared_links
+            || (recheck_plan.should_recheck
+                && !(below_threshold
+                    && request.recheck.below_threshold_action
+                        == BelowThresholdAction::InjectAndStart));
+        let run_resume_after_inject = pause_for_recheck
+            && !(below_threshold
+                && request.recheck.below_threshold_action == BelowThresholdAction::InjectPaused);
+
+        Ok(InjectionPreparationPhase::Ready(PreparedInjectionPhase {
+            save_path,
+            created_links,
+            prepared_links,
+            created_roots,
+            linked_files,
+            has_prepared_links,
+            recheck_plan,
+            recheck_after_linking,
+            pause_for_recheck,
+            run_resume_after_inject,
+        }))
+    }
+
+    async fn run_mutation_phase<F>(
+        &self,
+        request: &InjectionRequest,
+        target: &dyn InjectionClient,
+        preparation: &PreparedInjectionPhase,
+        should_stop: &mut F,
+        shutdown: Option<&ShutdownSignal>,
+    ) -> InjectionMutationResult
+    where
+        F: FnMut() -> bool,
+    {
+        let Some(_guard) = lock_until_shutdown(&self.mutation_lock, shutdown).await else {
+            return InjectionMutationResult::SavedForShutdown;
+        };
+        if should_stop() {
+            return InjectionMutationResult::SavedForShutdown;
+        }
+
+        match self
+            .find_existing_client(
+                request.metafile.info_hash(),
+                target.descriptor(),
+                request.assessed_at_ms,
+                shutdown,
+            )
+            .await
+        {
+            Ok(ExistingClientLookup::Found(existing_client)) => {
+                InjectionMutationResult::AlreadyExistsOnOtherClient(existing_client)
+            }
+            Ok(ExistingClientLookup::Shutdown) => InjectionMutationResult::SavedForShutdown,
+            Ok(ExistingClientLookup::NotFound) => {
+                match client_call_until_shutdown(shutdown, || {
+                    target.has_torrent(request.metafile.info_hash())
+                })
+                .await
+                {
+                    ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
+                    ClientCall::Completed(Ok(true)) => {
+                        match validate_prepared_links_for_inject(&preparation.prepared_links).await
+                        {
+                            Ok(()) => InjectionMutationResult::AlreadyExistsOnTarget,
+                            Err(error) => InjectionMutationResult::PreparedLinksInvalid(error),
+                        }
+                    }
+                    ClientCall::Completed(Ok(false)) => {
+                        match validate_prepared_links_for_inject(&preparation.prepared_links).await
+                        {
+                            Ok(()) => match client_call_until_shutdown(shutdown, || {
+                                target.inject(ClientInjectionRequest {
+                                    info_hash: request.metafile.info_hash(),
+                                    torrent_bytes: &request.torrent_bytes,
+                                    save_path: preparation.save_path.as_deref(),
+                                    pause_for_recheck: preparation.pause_for_recheck,
+                                })
+                            })
+                            .await
+                            {
+                                ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
+                                ClientCall::Completed(result) => {
+                                    InjectionMutationResult::Injected(result)
+                                }
+                            },
+                            Err(error) => InjectionMutationResult::PreparedLinksInvalid(error),
+                        }
+                    }
+                    ClientCall::Completed(Err(error)) => {
+                        InjectionMutationResult::TargetPrecheckFailed(error)
+                    }
+                }
+            }
+            Err(error) => InjectionMutationResult::ExistingLookupFailed(error),
+        }
+    }
+
     async fn save_for_retry(&self, request: &InjectionRequest) -> Result<(), InjectionWorkerError> {
         let metadata = candidate_output_metadata(
             request.local_item.media_type,
@@ -1306,6 +1328,14 @@ impl InjectionWorker {
         })?
         .map(|_| ())
         .map_err(InjectionWorkerError::Save)
+    }
+
+    async fn save_for_retry_phase(
+        &self,
+        request: &InjectionRequest,
+    ) -> Result<RetrySavePhaseResult, InjectionWorkerError> {
+        self.save_for_retry(request).await?;
+        Ok(RetrySavePhaseResult::Saved)
     }
 
     async fn record_client_health(
@@ -2015,6 +2045,46 @@ enum LinkPreparation {
         linked_files: usize,
     },
     SourceIncomplete,
+}
+
+enum InjectionPreparationPhase {
+    Ready(PreparedInjectionPhase),
+    Rejected(InjectionWorkResult),
+    SourceIncomplete,
+}
+
+struct PreparedInjectionPhase {
+    save_path: Option<PathBuf>,
+    created_links: Vec<CreatedLink>,
+    prepared_links: Vec<PreparedLink>,
+    created_roots: Vec<CreatedRoot>,
+    linked_files: usize,
+    has_prepared_links: bool,
+    recheck_plan: RecheckResumePlan,
+    recheck_after_linking: RecheckResumePlan,
+    pause_for_recheck: bool,
+    run_resume_after_inject: bool,
+}
+
+impl PreparedInjectionPhase {
+    fn cleanup_prepared_links_phase(&self) -> CleanupPhaseResult {
+        CleanupPhaseResult {
+            prepared_link_cleanup_incomplete: cleanup_prepared_links(
+                &self.created_links,
+                &self.created_roots,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RetrySavePhaseResult {
+    Saved,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CleanupPhaseResult {
+    prepared_link_cleanup_incomplete: bool,
 }
 
 enum InjectionMutationResult {
