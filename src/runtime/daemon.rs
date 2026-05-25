@@ -581,7 +581,14 @@ async fn process_search_workflow(
         if shutdown.state().phase != ShutdownPhase::Running {
             return Err("search workflow is shutting down".to_owned());
         }
-        match process_search_candidate(state.clone(), candidate, now_ms, shutdown.clone()).await {
+        match Box::pin(process_search_candidate(
+            state.clone(),
+            candidate,
+            now_ms,
+            shutdown.clone(),
+        ))
+        .await
+        {
             Ok(outcome) => summary.record(outcome),
             Err(error) => {
                 if shutdown.state().phase != ShutdownPhase::Running {
@@ -639,6 +646,49 @@ async fn process_search_candidate(
     now_ms: i64,
     shutdown: ShutdownSignal,
 ) -> Result<SearchCandidateOutcome, String> {
+    let prepared = prepare_search_candidate(SearchCandidateStage {
+        state,
+        candidate,
+        now_ms,
+        shutdown,
+    })
+    .await?;
+    resolve_search_candidate(prepared).await
+}
+
+#[derive(Clone)]
+struct SearchCandidateStage {
+    state: AppState,
+    candidate: RemoteCandidate,
+    now_ms: i64,
+    shutdown: ShutdownSignal,
+}
+
+struct PreparedSearchCandidateStage {
+    state: AppState,
+    candidate: RemoteCandidate,
+    initial: ReverseLookupOutcome,
+    now_ms: i64,
+    shutdown: ShutdownSignal,
+}
+
+struct DownloadedSearchCandidateStage {
+    state: AppState,
+    cached: CachedCandidateTorrent,
+    torrent_bytes: Vec<u8>,
+    now_ms: i64,
+    shutdown: ShutdownSignal,
+}
+
+async fn prepare_search_candidate(
+    input: SearchCandidateStage,
+) -> Result<PreparedSearchCandidateStage, String> {
+    let SearchCandidateStage {
+        state,
+        candidate,
+        now_ms,
+        shutdown,
+    } = input;
     let candidate = hydrate_search_candidate(&state.repository, candidate)
         .await
         .map_err(|error| error.to_string())?;
@@ -658,6 +708,26 @@ async fn process_search_candidate(
     )
     .await
     .map_err(|error| format!("{error:?}"))?;
+
+    Ok(PreparedSearchCandidateStage {
+        state,
+        candidate,
+        initial,
+        now_ms,
+        shutdown,
+    })
+}
+
+async fn resolve_search_candidate(
+    input: PreparedSearchCandidateStage,
+) -> Result<SearchCandidateOutcome, String> {
+    let PreparedSearchCandidateStage {
+        state,
+        candidate,
+        initial,
+        now_ms,
+        shutdown,
+    } = input;
 
     match initial {
         ReverseLookupOutcome::NeedsTorrentDownload { .. } => {
@@ -705,16 +775,28 @@ async fn process_search_candidate(
                 }
             };
             let torrent_bytes = read_cached_torrent(&cached.cache_path).await?;
-            process_downloaded_search_candidate(state, cached, torrent_bytes, now_ms, shutdown)
-                .await
+            process_downloaded_search_candidate(DownloadedSearchCandidateStage {
+                state,
+                cached,
+                torrent_bytes,
+                now_ms,
+                shutdown,
+            })
+            .await
         }
         ReverseLookupOutcome::Matched { assessment, .. } => {
             let Some((cached, torrent_bytes)) = cached_search_candidate(&candidate).await? else {
                 record_persisted_decision(&state, &assessment);
                 return Ok(SearchCandidateOutcome::Persisted);
             };
-            process_downloaded_search_candidate(state, cached, torrent_bytes, now_ms, shutdown)
-                .await
+            process_downloaded_search_candidate(DownloadedSearchCandidateStage {
+                state,
+                cached,
+                torrent_bytes,
+                now_ms,
+                shutdown,
+            })
+            .await
         }
         ReverseLookupOutcome::AlreadyPresent { assessment, .. } => {
             record_persisted_decision(&state, &assessment);
@@ -774,12 +856,15 @@ async fn cached_search_candidate(
 }
 
 async fn process_downloaded_search_candidate(
-    state: AppState,
-    cached: CachedCandidateTorrent,
-    torrent_bytes: Vec<u8>,
-    now_ms: i64,
-    shutdown: ShutdownSignal,
+    input: DownloadedSearchCandidateStage,
 ) -> Result<SearchCandidateOutcome, String> {
+    let DownloadedSearchCandidateStage {
+        state,
+        cached,
+        torrent_bytes,
+        now_ms,
+        shutdown,
+    } = input;
     let config = runtime_reverse_lookup_config(&state.config);
     let lookups = reverse_lookup_candidates(
         &state.repository,
@@ -1363,68 +1448,145 @@ async fn process_announce_work(
             );
         }
     };
-    let outcome_config = announce_outcome_config(&state.config.announce);
-    let attempt_count = candidate.attempt_count;
-    let jitter_key = id.as_str();
-    let config = runtime_reverse_lookup_config(&state.config);
-    let initial = match reverse_lookup_and_assess_candidate(
-        &state.repository,
-        &candidate.candidate,
-        &[],
+    let context = AnnounceWorkflowContext {
         now_ms,
+        attempt_count: candidate.attempt_count,
+        jitter_key: id.as_str().to_owned(),
+        outcome_config: announce_outcome_config(&state.config.announce),
+        reverse_lookup_config: runtime_reverse_lookup_config(&state.config),
+    };
+    let prepared = PreparedAnnounceCandidateStage {
+        state,
+        candidate,
+        context,
+        shutdown,
+    };
+    let prepared = match initial_announce_lookup_stage(prepared).await {
+        AnnounceInitialLookupStage::NeedsDownload(prepared) => *prepared,
+        AnnounceInitialLookupStage::Finished(outcome) => return outcome,
+    };
+    let downloaded = match download_announce_candidate_stage(prepared).await {
+        AnnounceDownloadStage::Downloaded(downloaded) => *downloaded,
+        AnnounceDownloadStage::Finished(outcome) => return outcome,
+    };
+    let error_context = downloaded.context.clone();
+
+    match process_downloaded_announce_candidate(downloaded).await {
+        Ok(outcome) => outcome,
+        Err(error) => retryable_worker_outcome(
+            "announce",
+            error,
+            error_context.now_ms,
+            error_context.attempt_count,
+            error_context.jitter_key.as_str(),
+            error_context.outcome_config,
+        ),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AnnounceWorkflowContext {
+    now_ms: i64,
+    attempt_count: u16,
+    jitter_key: String,
+    outcome_config: AnnounceOutcomeConfig,
+    reverse_lookup_config: ReverseLookupConfig,
+}
+
+#[derive(Clone)]
+struct PreparedAnnounceCandidateStage {
+    state: AppState,
+    candidate: RuntimeAnnounceCandidate,
+    context: AnnounceWorkflowContext,
+    shutdown: ShutdownSignal,
+}
+
+enum AnnounceInitialLookupStage {
+    NeedsDownload(Box<PreparedAnnounceCandidateStage>),
+    Finished(AnnounceWorkOutcome),
+}
+
+enum AnnounceDownloadStage {
+    Downloaded(Box<DownloadedAnnounceCandidate>),
+    Finished(AnnounceWorkOutcome),
+}
+
+async fn initial_announce_lookup_stage(
+    input: PreparedAnnounceCandidateStage,
+) -> AnnounceInitialLookupStage {
+    let initial = match reverse_lookup_and_assess_candidate(
+        &input.state.repository,
+        &input.candidate.candidate,
+        &[],
+        input.context.now_ms,
         ContentFilterContext::Announcement,
-        &config,
+        &input.context.reverse_lookup_config,
     )
     .await
     {
         Ok(outcome) => outcome,
         Err(error) => {
-            return classify_reverse_lookup_error(
+            return AnnounceInitialLookupStage::Finished(classify_reverse_lookup_error(
                 error,
-                now_ms,
-                attempt_count,
-                jitter_key,
-                outcome_config,
-            );
+                input.context.now_ms,
+                input.context.attempt_count,
+                input.context.jitter_key.as_str(),
+                input.context.outcome_config,
+            ));
         }
     };
 
     match initial {
-        ReverseLookupOutcome::NeedsTorrentDownload { .. } => {}
-        outcome => {
-            return classify_reverse_lookup_outcome(
-                &outcome,
-                now_ms,
-                attempt_count,
-                jitter_key,
-                outcome_config,
-            );
+        ReverseLookupOutcome::NeedsTorrentDownload { .. } => {
+            AnnounceInitialLookupStage::NeedsDownload(Box::new(input))
         }
+        outcome => AnnounceInitialLookupStage::Finished(classify_reverse_lookup_outcome(
+            &outcome,
+            input.context.now_ms,
+            input.context.attempt_count,
+            input.context.jitter_key.as_str(),
+            input.context.outcome_config,
+        )),
     }
+}
+
+async fn download_announce_candidate_stage(
+    input: PreparedAnnounceCandidateStage,
+) -> AnnounceDownloadStage {
+    let PreparedAnnounceCandidateStage {
+        state,
+        candidate,
+        context,
+        shutdown,
+    } = input;
+    let now_ms = context.now_ms;
+    let attempt_count = context.attempt_count;
+    let jitter_key = context.jitter_key.as_str();
+    let outcome_config = context.outcome_config;
 
     if shutdown.state().phase != ShutdownPhase::Running {
-        return AnnounceWorkOutcome::Release {
+        return AnnounceDownloadStage::Finished(AnnounceWorkOutcome::Release {
             reason: AnnounceReason::DependencyBackoff,
             next_attempt_at_ms: now_ms,
-        };
+        });
     }
 
     let Some(fetch) = candidate.cookie_or_fetch.as_ref() else {
-        return AnnounceWorkOutcome::Waiting {
+        return AnnounceDownloadStage::Finished(AnnounceWorkOutcome::Waiting {
             reason: AnnounceReason::CandidateDownloading,
             next_attempt_at_ms: now_ms.saturating_add(outcome_config.candidate_download_wait_ms),
             dependency: None,
-        };
+        });
     };
     let downloader = candidate_download_client(Duration::from_secs(120));
     let mut download_shutdown = shutdown.clone();
     let started = Instant::now();
     let cached = tokio::select! {
         _state = download_shutdown.cancelled() => {
-            return AnnounceWorkOutcome::Release {
+            return AnnounceDownloadStage::Finished(AnnounceWorkOutcome::Release {
                 reason: AnnounceReason::DependencyBackoff,
                 next_attempt_at_ms: now_ms,
-            };
+            });
         }
         result = downloader.download_and_cache(
             &candidate.candidate,
@@ -1450,21 +1612,21 @@ async fn process_announce_work(
                         record_candidate_download_failure(&state, &candidate.candidate, &error, now_ms)
                             .await
                     {
-                        return retryable_database_outcome(
+                        return AnnounceDownloadStage::Finished(retryable_database_outcome(
                             error,
                             now_ms,
                             attempt_count,
                             jitter_key,
                             outcome_config,
-                        );
+                        ));
                     }
-                    return classify_candidate_download_error(
+                    return AnnounceDownloadStage::Finished(classify_candidate_download_error(
                         error,
                         now_ms,
                         attempt_count,
                         jitter_key,
                         outcome_config,
-                    );
+                    ));
                 }
             }
         }
@@ -1472,71 +1634,53 @@ async fn process_announce_work(
     let torrent_bytes = match read_cached_torrent(&cached.cache_path).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            return retryable_worker_outcome(
+            return AnnounceDownloadStage::Finished(retryable_worker_outcome(
                 "torrent-cache",
                 error,
                 now_ms,
                 attempt_count,
                 jitter_key,
                 outcome_config,
-            );
+            ));
         }
     };
 
-    match process_downloaded_announce_candidate(DownloadedAnnounceCandidate {
+    AnnounceDownloadStage::Downloaded(Box::new(DownloadedAnnounceCandidate {
         state,
         cached,
         torrent_bytes,
-        now_ms,
-        attempt_count,
-        jitter_key,
-        outcome_config,
+        context,
         shutdown,
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => retryable_worker_outcome(
-            "announce",
-            error,
-            now_ms,
-            attempt_count,
-            jitter_key,
-            outcome_config,
-        ),
-    }
+    }))
 }
 
-struct DownloadedAnnounceCandidate<'a> {
+struct DownloadedAnnounceCandidate {
     state: AppState,
     cached: CachedCandidateTorrent,
     torrent_bytes: Vec<u8>,
-    now_ms: i64,
-    attempt_count: u16,
-    jitter_key: &'a str,
-    outcome_config: AnnounceOutcomeConfig,
+    context: AnnounceWorkflowContext,
     shutdown: ShutdownSignal,
 }
 
 async fn process_downloaded_announce_candidate(
-    input: DownloadedAnnounceCandidate<'_>,
+    input: DownloadedAnnounceCandidate,
 ) -> Result<AnnounceWorkOutcome, String> {
     let DownloadedAnnounceCandidate {
         state,
         cached,
         torrent_bytes,
-        now_ms,
-        attempt_count,
-        jitter_key,
-        outcome_config,
+        context,
         shutdown,
     } = input;
-    let config = runtime_reverse_lookup_config(&state.config);
+    let now_ms = context.now_ms;
+    let attempt_count = context.attempt_count;
+    let jitter_key = context.jitter_key.as_str();
+    let outcome_config = context.outcome_config;
     let lookups = reverse_lookup_candidates(
         &state.repository,
         &cached.candidate,
         ContentFilterContext::Announcement,
-        &config,
+        &context.reverse_lookup_config,
     )
     .await
     .map_err(|error| format!("{error:?}"))?;
@@ -1558,7 +1702,7 @@ async fn process_downloaded_announce_candidate(
                 candidate: &cached.candidate,
                 owned_info_hashes: &[],
                 assessed_at_ms: now_ms,
-                config: &config.assessment,
+                config: &context.reverse_lookup_config.assessment,
             },
         )
         .await
@@ -2434,18 +2578,18 @@ mod tests {
             torrent_cache_path: Some(cache_path.clone()),
         };
 
-        let outcome = process_downloaded_search_candidate(
-            runtime.state.clone(),
-            CachedCandidateTorrent {
+        let outcome = process_downloaded_search_candidate(DownloadedSearchCandidateStage {
+            state: runtime.state.clone(),
+            cached: CachedCandidateTorrent {
                 candidate,
                 metafile: parsed.metafile,
                 tracker_hosts: parsed.tracker_hosts,
                 cache_path,
             },
-            partial_torrent_bytes().to_vec(),
-            unix_time_ms(),
-            runtime.state.shutdown_signal.clone(),
-        )
+            torrent_bytes: partial_torrent_bytes().to_vec(),
+            now_ms: unix_time_ms(),
+            shutdown: runtime.state.shutdown_signal.clone(),
+        })
         .await
         .unwrap();
         let decisions = repository
@@ -3110,7 +3254,12 @@ mod tests {
         let state = runtime.state.clone();
         let metrics = state.metrics.clone();
 
-        let result = process_announce_work(state.clone(), id, state.shutdown_signal.clone()).await;
+        let result = Box::pin(process_announce_work(
+            state.clone(),
+            id,
+            state.shutdown_signal.clone(),
+        ))
+        .await;
 
         assert!(matches!(result, AnnounceWorkOutcome::Retryable { .. }));
         let metrics = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
@@ -3156,11 +3305,11 @@ mod tests {
             .unwrap();
 
         let before_ms = unix_time_ms();
-        let result = process_announce_work(
+        let result = Box::pin(process_announce_work(
             runtime.state.clone(),
             id.clone(),
             runtime.state.shutdown_signal.clone(),
-        )
+        ))
         .await;
         let after_ms = unix_time_ms();
 
@@ -3230,7 +3379,12 @@ mod tests {
         let state = runtime.state.clone();
         let metrics = state.metrics.clone();
 
-        let result = process_announce_work(state.clone(), id, state.shutdown_signal.clone()).await;
+        let result = Box::pin(process_announce_work(
+            state.clone(),
+            id,
+            state.shutdown_signal.clone(),
+        ))
+        .await;
 
         assert!(matches!(result, AnnounceWorkOutcome::TerminalFailed { .. }));
         let metrics = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
