@@ -273,6 +273,10 @@ CREATE INDEX IF NOT EXISTS idx_announce_work_expired_retention
     ON announce_work (status, finished_at, id)
     WHERE status = 'expired'
       AND finished_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_announce_work_active_fetch_scrub
+    ON announce_work (expires_at, id)
+    WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+      AND (download_url IS NOT NULL OR cookie IS NOT NULL);
 "#;
 
 pub const REQUIRED_TABLES: &[&str] = &[
@@ -365,6 +369,7 @@ mod tests {
             "idx_announce_work_succeeded_retention",
             "idx_announce_work_terminal_failed_retention",
             "idx_announce_work_expired_retention",
+            "idx_announce_work_active_fetch_scrub",
         ] {
             assert!(
                 INITIAL_SCHEMA.contains(fragment),

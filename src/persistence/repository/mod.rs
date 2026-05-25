@@ -3851,6 +3851,130 @@ impl Repository {
         Ok(result.rows_affected())
     }
 
+    pub async fn scrub_stale_announce_fetch_material_batch(
+        &self,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let active_expired = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET download_url = NULL,
+                cookie = NULL,
+                updated_at = ?
+            WHERE id IN (
+                SELECT id
+                FROM announce_work INDEXED BY idx_announce_work_active_fetch_scrub
+                WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+                  AND expires_at <= ?
+                  AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+                ORDER BY expires_at, id
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("scrub expired announce fetch material", error))?;
+        let succeeded = self
+            .scrub_terminal_announce_fetch_material_status("succeeded", now_ms, limit)
+            .await?;
+        let terminal_failed = self
+            .scrub_terminal_announce_fetch_material_status("terminal_failed", now_ms, limit)
+            .await?;
+        let expired = self
+            .scrub_terminal_announce_fetch_material_status("expired", now_ms, limit)
+            .await?;
+
+        Ok(active_expired
+            .rows_affected()
+            .saturating_add(succeeded)
+            .saturating_add(terminal_failed)
+            .saturating_add(expired))
+    }
+
+    async fn scrub_terminal_announce_fetch_material_status(
+        &self,
+        status: &str,
+        now_ms: i64,
+        limit: u16,
+    ) -> Result<u64, DatabaseError> {
+        let query = match status {
+            "succeeded" => {
+                r#"
+            UPDATE announce_work
+            SET download_url = NULL,
+                cookie = NULL,
+                updated_at = ?
+            WHERE id IN (
+                SELECT id
+                FROM announce_work INDEXED BY idx_announce_work_succeeded_retention
+                WHERE status = 'succeeded'
+                  AND finished_at IS NOT NULL
+                  AND finished_at <= ?
+                  AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+                ORDER BY finished_at, id
+                LIMIT ?
+            )
+            "#
+            }
+            "terminal_failed" => {
+                r#"
+            UPDATE announce_work
+            SET download_url = NULL,
+                cookie = NULL,
+                updated_at = ?
+            WHERE id IN (
+                SELECT id
+                FROM announce_work INDEXED BY idx_announce_work_terminal_failed_retention
+                WHERE status = 'terminal_failed'
+                  AND finished_at IS NOT NULL
+                  AND finished_at <= ?
+                  AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+                ORDER BY finished_at, id
+                LIMIT ?
+            )
+            "#
+            }
+            "expired" => {
+                r#"
+            UPDATE announce_work
+            SET download_url = NULL,
+                cookie = NULL,
+                updated_at = ?
+            WHERE id IN (
+                SELECT id
+                FROM announce_work INDEXED BY idx_announce_work_expired_retention
+                WHERE status = 'expired'
+                  AND finished_at IS NOT NULL
+                  AND finished_at <= ?
+                  AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+                ORDER BY finished_at, id
+                LIMIT ?
+            )
+            "#
+            }
+            _ => {
+                return Err(DatabaseError::QueryFailed {
+                    operation: "scrub terminal announce fetch material".to_owned(),
+                    message: format!("unsupported terminal status {status}"),
+                });
+            }
+        };
+        let result = sqlx::query(query)
+            .bind(now_ms)
+            .bind(now_ms)
+            .bind(i64::from(limit))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| db_error("scrub terminal announce fetch material", error))?;
+
+        Ok(result.rows_affected())
+    }
+
     pub async fn recover_stale_announce_leases(&self, now_ms: i64) -> Result<u64, DatabaseError> {
         self.recover_stale_announce_leases_batch_limit(now_ms, i64::MAX)
             .await

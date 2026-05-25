@@ -2860,6 +2860,148 @@ async fn expired_announce_work_clears_fetch_material() {
 }
 
 #[tokio::test]
+async fn stale_fetch_material_scrub_clears_expired_active_and_terminal_rows() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut expired_active = test_announce_work("ann_scrub_expired", "guid-scrub-expired", 1);
+    expired_active.expires_at_ms = 10;
+    expired_active.fetch = Some(test_announce_fetch_material());
+    repository
+        .insert_or_dedupe_announce_work(&expired_active, 10)
+        .await
+        .unwrap();
+    let mut retryable = test_announce_work("ann_scrub_retryable", "guid-scrub-retryable", 1);
+    retryable.fetch = Some(test_announce_fetch_material());
+    repository
+        .insert_or_dedupe_announce_work(&retryable, 10)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE announce_work SET status = 'retryable' WHERE id = ?")
+        .bind(retryable.id.as_str())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let mut terminal = test_announce_work("ann_scrub_terminal", "guid-scrub-terminal", 1);
+    terminal.fetch = Some(test_announce_fetch_material());
+    repository
+        .insert_or_dedupe_announce_work(&terminal, 10)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        UPDATE announce_work
+        SET status = 'terminal_failed',
+            finished_at = 2,
+            download_url = ?,
+            redacted_download_url = ?,
+            cookie = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind("https://tracker.example/download?id=1&apikey=secret")
+    .bind("https://tracker.example/download?id=1&apikey=[REDACTED]")
+    .bind("sid=secret-cookie")
+    .bind(terminal.id.as_str())
+    .execute(repository.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        2,
+        repository
+            .scrub_stale_announce_fetch_material_batch(10, 10)
+            .await
+            .unwrap()
+    );
+
+    assert_announce_fetch_columns_cleared(&repository, expired_active.id.as_str()).await;
+    assert_announce_fetch_columns_cleared(&repository, terminal.id.as_str()).await;
+    assert_announce_fetch_columns_present(&repository, retryable.id.as_str()).await;
+}
+
+#[tokio::test]
+async fn stale_fetch_material_scrub_is_bounded() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    for index in 0..3 {
+        let mut work = test_announce_work(
+            &format!("ann_scrub_bounded_{index}"),
+            &format!("guid-scrub-bounded-{index}"),
+            1,
+        );
+        work.expires_at_ms = 10;
+        work.fetch = Some(test_announce_fetch_material());
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        2,
+        repository
+            .scrub_stale_announce_fetch_material_batch(10, 2)
+            .await
+            .unwrap()
+    );
+    let remaining: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM announce_work
+        WHERE download_url IS NOT NULL OR cookie IS NOT NULL
+        "#,
+    )
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(1, remaining);
+}
+
+#[tokio::test]
+async fn stale_fetch_material_scrub_does_not_starve_terminal_statuses() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    for index in 0..3 {
+        insert_stale_terminal_fetch_row(
+            &repository,
+            &format!("ann_scrub_success_{index}"),
+            &format!("guid-scrub-success-{index}"),
+            "succeeded",
+            1,
+        )
+        .await;
+    }
+    insert_stale_terminal_fetch_row(
+        &repository,
+        "ann_scrub_failed",
+        "guid-scrub-failed",
+        "terminal_failed",
+        1,
+    )
+    .await;
+    insert_stale_terminal_fetch_row(
+        &repository,
+        "ann_scrub_expired_terminal",
+        "guid-scrub-expired-terminal",
+        "expired",
+        1,
+    )
+    .await;
+
+    assert_eq!(
+        3,
+        repository
+            .scrub_stale_announce_fetch_material_batch(10, 1)
+            .await
+            .unwrap()
+    );
+
+    assert_announce_fetch_columns_cleared(&repository, "ann_scrub_success_0").await;
+    assert_announce_fetch_columns_cleared(&repository, "ann_scrub_failed").await;
+    assert_announce_fetch_columns_cleared(&repository, "ann_scrub_expired_terminal").await;
+    assert_announce_fetch_columns_present(&repository, "ann_scrub_success_1").await;
+    assert_announce_fetch_columns_present(&repository, "ann_scrub_success_2").await;
+}
+
+#[tokio::test]
 async fn announce_expiry_and_lease_recovery_batches_are_bounded() {
     let repository = Repository::connect_in_memory().await.unwrap();
     for index in 0..3 {
@@ -2954,6 +3096,51 @@ async fn assert_announce_fetch_columns_cleared(repository: &Repository, id: &str
 
     assert!(download_url.is_none());
     assert!(cookie.is_none());
+}
+
+fn test_announce_fetch_material() -> AnnounceFetchMaterial {
+    let download_url =
+        DownloadUrl::new("https://tracker.example/download?id=1&apikey=secret").unwrap();
+    AnnounceFetchMaterial::new(
+        &download_url,
+        Some(CookieSecret::new("sid=secret-cookie").unwrap()),
+    )
+    .unwrap()
+}
+
+async fn insert_stale_terminal_fetch_row(
+    repository: &Repository,
+    id: &str,
+    guid: &str,
+    status: &str,
+    finished_at_ms: i64,
+) {
+    let mut work = test_announce_work(id, guid, 1);
+    work.fetch = Some(test_announce_fetch_material());
+    repository
+        .insert_or_dedupe_announce_work(&work, 10)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        UPDATE announce_work
+        SET status = ?,
+            finished_at = ?,
+            download_url = ?,
+            redacted_download_url = ?,
+            cookie = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(status)
+    .bind(finished_at_ms)
+    .bind("https://tracker.example/download?id=1&apikey=secret")
+    .bind("https://tracker.example/download?id=1&apikey=[REDACTED]")
+    .bind("sid=secret-cookie")
+    .bind(id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
 }
 
 async fn assert_announce_fetch_columns_present(repository: &Repository, id: &str) {
@@ -3192,6 +3379,55 @@ async fn terminal_announce_cleanup_uses_retention_indexes() {
         assert!(
             plan.iter().any(|detail| detail.contains(index_name)),
             "retention cleanup should use a retention index: {plan:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_fetch_material_scrub_uses_bounded_indexes() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    for (query, index_name) in [
+        (
+            r#"
+            SELECT id
+            FROM announce_work INDEXED BY idx_announce_work_active_fetch_scrub
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+              AND expires_at <= ?
+              AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+            ORDER BY expires_at, id
+            LIMIT ?
+            "#,
+            "idx_announce_work_active_fetch_scrub",
+        ),
+        (
+            r#"
+            SELECT id
+            FROM announce_work INDEXED BY idx_announce_work_terminal_failed_retention
+            WHERE status = 'terminal_failed'
+              AND finished_at IS NOT NULL
+              AND finished_at <= ?
+              AND (download_url IS NOT NULL OR cookie IS NOT NULL)
+            ORDER BY finished_at, id
+            LIMIT ?
+            "#,
+            "idx_announce_work_terminal_failed_retention",
+        ),
+    ] {
+        let plan = explain_query_plan(&repository, query, 10_000, 100).await;
+
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN announce_work")),
+            "fetch scrub should not scan announce_work: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+            "fetch scrub should not sort with a temp b-tree: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|detail| detail.contains(index_name)),
+            "fetch scrub should use a scrub index: {plan:?}"
         );
     }
 }

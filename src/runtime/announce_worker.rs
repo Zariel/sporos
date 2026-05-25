@@ -513,7 +513,14 @@ impl AnnounceWorker {
         now_ms: i64,
     ) -> Result<AnnounceStartupSummary, AnnounceWorkerError> {
         let _span = info_span!("announce.recover_startup", now_ms);
+        let batch_size = self.config.retention_cleanup_batch_size;
+        let max_batches = self.config.retention_cleanup_max_batches.max(1);
         let expired = self.repository.expire_announce_work(now_ms).await?;
+        self.run_batched_cleanup_no_shutdown(batch_size, max_batches, || {
+            self.repository
+                .scrub_stale_announce_fetch_material_batch(now_ms, batch_size)
+        })
+        .await?;
         self.cleanup_retained(now_ms, true).await?;
         let recovered_leases = self
             .repository
@@ -541,6 +548,12 @@ impl AnnounceWorker {
                     .expire_announce_work_batch(now_ms, batch_size)
             })
             .await?;
+        ensure_cleanup_running(shutdown)?;
+        self.run_batched_cleanup(shutdown, batch_size, max_batches, || {
+            self.repository
+                .scrub_stale_announce_fetch_material_batch(now_ms, batch_size)
+        })
+        .await?;
         ensure_cleanup_running(shutdown)?;
         let retained_deleted = self
             .cleanup_retained_until_shutdown(now_ms, true, shutdown)
@@ -574,6 +587,28 @@ impl AnnounceWorker {
         let mut affected = 0_u64;
         for _ in 0..max_batches {
             ensure_cleanup_running(shutdown)?;
+            let batch_affected = cleanup().await?;
+            affected = affected.saturating_add(batch_affected);
+            if batch_affected < u64::from(batch_size) {
+                break;
+            }
+        }
+
+        Ok(affected)
+    }
+
+    async fn run_batched_cleanup_no_shutdown<F, Fut>(
+        &self,
+        batch_size: u16,
+        max_batches: u16,
+        mut cleanup: F,
+    ) -> Result<u64, AnnounceWorkerError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<u64, DatabaseError>>,
+    {
+        let mut affected = 0_u64;
+        for _ in 0..max_batches {
             let batch_affected = cleanup().await?;
             affected = affected.saturating_add(batch_affected);
             if batch_affected < u64::from(batch_size) {
@@ -1162,6 +1197,34 @@ mod tests {
             summary
         );
         assert!(announce_ids(&repository).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_drains_multiple_fetch_scrub_batches() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for index in 0..5 {
+            insert_stale_terminal_fetch_work(
+                &repository,
+                &format!("ann_stale_fetch_{index}"),
+                &format!("guid-stale-fetch-{index}"),
+            )
+            .await;
+        }
+        let mut worker =
+            AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+        worker.config.retention_cleanup_batch_size = 2;
+        worker.config.retention_cleanup_max_batches = 3;
+
+        let summary = worker.recover_startup(100_000).await.unwrap();
+
+        assert_eq!(
+            AnnounceStartupSummary {
+                expired: 0,
+                recovered_leases: 0
+            },
+            summary
+        );
+        assert_eq!(0, fetch_material_count(&repository).await);
     }
 
     #[tokio::test]
@@ -1957,6 +2020,26 @@ mod tests {
         );
     }
 
+    async fn insert_stale_terminal_fetch_work(repository: &Repository, id: &str, guid: &str) {
+        insert_work(repository, id, guid, 1).await;
+        sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'terminal_failed',
+                reason = 'no_match_terminal',
+                finished_at = 1,
+                download_url = 'https://tracker.example/download?id=1&apikey=secret',
+                redacted_download_url = 'https://tracker.example/download?id=1&apikey=[REDACTED]',
+                cookie = 'sid=secret-cookie'
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    }
+
     fn test_work(id: &str, guid: &str, received_at_ms: i64) -> AnnounceWorkItem {
         let tracker = TrackerName::new("tracker.example").unwrap();
         let guid = CandidateGuid::new(guid).unwrap();
@@ -2038,6 +2121,19 @@ mod tests {
             .fetch_all(repository.pool())
             .await
             .unwrap()
+    }
+
+    async fn fetch_material_count(repository: &Repository) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM announce_work
+            WHERE download_url IS NOT NULL OR cookie IS NOT NULL
+            "#,
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
     }
 
     async fn dependency_rows(
