@@ -10,7 +10,7 @@ use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 #[cfg(test)]
 use sqlx::Row;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
@@ -70,6 +70,7 @@ const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
 const SCHEDULER_SHUTDOWN_ERROR: &str = "scheduler is shutting down";
 const SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY: usize = 4;
+const SEARCH_CANDIDATE_STREAM_CAPACITY: usize = SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY;
 
 #[cfg(test)]
 static NO_CLIENT_SAVE_THREADS: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
@@ -567,88 +568,112 @@ async fn process_search_workflow(
     }
 
     let now_ms = unix_time_ms();
-    let mut planning_shutdown = shutdown.clone();
-    let planned = tokio::select! {
-        _state = planning_shutdown.cancelled() => {
-            return Err("search workflow is shutting down".to_owned());
-        }
-        result = state.plan_search_workflow(request, now_ms) => {
-            result.map_err(|error| error.to_string())?
-        }
-    };
-    let mut summary = SearchWorkflowExecutionSummary {
-        planned_indexers: planned.plans.len(),
-        failed_indexers: planned.failed_indexers,
-        candidates: planned.candidate_count,
-        ..SearchWorkflowExecutionSummary::default()
-    };
-
-    Box::pin(process_search_candidates(
+    let (candidate_sender, candidate_receiver) = mpsc::channel(SEARCH_CANDIDATE_STREAM_CAPACITY);
+    let planning_state = state.clone();
+    let planning_shutdown = shutdown.clone();
+    let processing_shutdown = shutdown.clone();
+    let planning = Box::pin(async move {
+        planning_state
+            .stream_search_workflow_candidates(request, now_ms, candidate_sender, planning_shutdown)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let processing = Box::pin(process_search_candidates(
         state,
-        planned.candidates,
+        candidate_receiver,
         now_ms,
-        shutdown,
-        &mut summary,
-    ))
-    .await?;
+        processing_shutdown,
+    ));
+    let (planned, mut summary) = tokio::try_join!(planning, processing)?;
+
+    summary.planned_indexers = planned.plans.len();
+    summary.failed_indexers = planned.failed_indexers;
+    summary.candidates = planned.candidate_count;
 
     Ok(summary)
 }
 
 async fn process_search_candidates(
     state: AppState,
+    mut candidates: mpsc::Receiver<RemoteCandidate>,
+    now_ms: i64,
+    shutdown: ShutdownSignal,
+) -> Result<SearchWorkflowExecutionSummary, String> {
+    let mut summary = SearchWorkflowExecutionSummary::default();
+    let mut next_launch = 0_usize;
+    let mut next_record = 0_usize;
+    let mut candidates_closed = false;
+    let mut in_flight = FuturesUnordered::new();
+    let mut completed = BTreeMap::new();
+    let database_gate = Arc::new(Semaphore::new(1));
+
+    while !candidates_closed || next_record < next_launch {
+        if let Some(result) = completed.remove(&next_record) {
+            record_search_candidate_preflight(state.clone(), result, &shutdown, &mut summary)
+                .await?;
+            next_record += 1;
+            continue;
+        }
+
+        let can_launch = !candidates_closed
+            && in_flight.len() + completed.len() < SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY;
+        let mut preflight_shutdown = shutdown.clone();
+        tokio::select! {
+            biased;
+            _ = preflight_shutdown.cancelled() => {
+                return Err("search workflow is shutting down".to_owned());
+            }
+            candidate = candidates.recv(), if can_launch => {
+                let Some(candidate) = candidate else {
+                    candidates_closed = true;
+                    continue;
+                };
+                summary.candidates = summary.candidates.saturating_add(1);
+                let index = next_launch;
+                next_launch = next_launch.saturating_add(1);
+                in_flight.push(preflight_search_candidate(
+                    index,
+                    state.clone(),
+                    candidate,
+                    now_ms,
+                    shutdown.clone(),
+                    Arc::clone(&database_gate),
+                ));
+            }
+            result = in_flight.next(), if !in_flight.is_empty() => {
+                let Some((index, result)) = result else {
+                    continue;
+                };
+                completed.insert(index, result);
+            }
+            else => break,
+        }
+    }
+
+    Ok(summary)
+}
+
+#[cfg(test)]
+async fn process_search_candidate_vec(
+    state: AppState,
     candidates: Vec<RemoteCandidate>,
     now_ms: i64,
     shutdown: ShutdownSignal,
     summary: &mut SearchWorkflowExecutionSummary,
 ) -> Result<(), String> {
-    let total = candidates.len();
-    let mut next_launch = 0;
-    let mut next_record = 0;
-    let mut candidates = candidates.into_iter();
-    let mut in_flight = FuturesUnordered::new();
-    let mut completed = BTreeMap::new();
-    let database_gate = Arc::new(Semaphore::new(1));
-
-    while next_record < total {
-        while in_flight.len() + completed.len() < SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY {
-            let Some(candidate) = candidates.next() else {
-                break;
-            };
-            if shutdown.state().phase != ShutdownPhase::Running {
-                return Err("search workflow is shutting down".to_owned());
-            }
-            let index = next_launch;
-            next_launch += 1;
-            in_flight.push(preflight_search_candidate(
-                index,
-                state.clone(),
-                candidate,
-                now_ms,
-                shutdown.clone(),
-                Arc::clone(&database_gate),
-            ));
+    let (sender, receiver) = mpsc::channel(SEARCH_CANDIDATE_STREAM_CAPACITY);
+    let sending = Box::pin(async move {
+        for candidate in candidates {
+            sender
+                .send(candidate)
+                .await
+                .map_err(|error| format!("candidate receiver closed: {error}"))?;
         }
-
-        if let Some(result) = completed.remove(&next_record) {
-            record_search_candidate_preflight(state.clone(), result, &shutdown, summary).await?;
-            next_record += 1;
-            continue;
-        }
-
-        let mut preflight_shutdown = shutdown.clone();
-        let Some((index, result)) = (tokio::select! {
-            biased;
-            _ = preflight_shutdown.cancelled() => {
-                return Err("search workflow is shutting down".to_owned());
-            }
-            result = in_flight.next() => result,
-        }) else {
-            break;
-        };
-        completed.insert(index, result);
-    }
-
+        Ok::<(), String>(())
+    });
+    let processing = Box::pin(process_search_candidates(state, receiver, now_ms, shutdown));
+    let ((), processed) = tokio::try_join!(sending, processing)?;
+    *summary = processed;
     Ok(())
 }
 
@@ -3043,7 +3068,7 @@ mod tests {
         };
         let signal = runtime.state.shutdown_signal.clone();
 
-        Box::pin(process_search_candidates(
+        Box::pin(process_search_candidate_vec(
             runtime.state,
             candidates,
             now_ms,
@@ -3124,7 +3149,7 @@ mod tests {
         };
         let signal = runtime.state.shutdown_signal.clone();
 
-        Box::pin(process_search_candidates(
+        Box::pin(process_search_candidate_vec(
             runtime.state,
             candidates,
             unix_time_ms(),
@@ -3207,7 +3232,7 @@ mod tests {
         };
         let signal = runtime.state.shutdown_signal.clone();
 
-        Box::pin(process_search_candidates(
+        Box::pin(process_search_candidate_vec(
             runtime.state,
             candidates,
             unix_time_ms(),
@@ -3571,6 +3596,103 @@ mod tests {
         ));
         assert!(metrics.contains("sporos_decisions_total{outcome=\"exact_match\"} 1"));
         assert!(metrics.contains("sporos_actions_total{outcome=\"saved\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn search_workflow_streams_planning_into_candidate_processing() {
+        let root = unique_temp_dir("daemon-search-streaming");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let search_requests = Arc::new(AtomicUsize::new(0));
+        let download_in_flight = Arc::new(AtomicUsize::new(0));
+        let max_download_in_flight = Arc::new(AtomicUsize::new(0));
+        let blocked_search_in_flight = Arc::new(AtomicUsize::new(0));
+        let release_blocked_search = Arc::new(tokio::sync::Notify::new());
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir;
+        config.paths.torrent_cache_dir = cache_dir;
+        config.runtime.search_worker_concurrency = 2;
+        for name in ["alpha", "bravo", "charlie"] {
+            let indexer_url = spawn_daemon_multi_candidate_search_download_server(
+                name,
+                5,
+                Arc::clone(&search_requests),
+                Arc::clone(&download_in_flight),
+                Arc::clone(&max_download_in_flight),
+                (name == "charlie").then(|| {
+                    (
+                        Arc::clone(&blocked_search_in_flight),
+                        Arc::clone(&release_blocked_search),
+                    )
+                }),
+            )
+            .await;
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: indexer_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut item = local_item(&root);
+        item.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&item, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in ["alpha", "bravo", "charlie"] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &daemon_movie_caps(),
+                    unix_time_ms(),
+                )
+                .await
+                .unwrap();
+        }
+        let shutdown = runtime.state.shutdown_signal.clone();
+
+        let handle = tokio::spawn(process_search_workflow(
+            runtime.state,
+            SearchWorkflowRequest {
+                query: ItemTitle::new("movie.mkv").unwrap(),
+            },
+            shutdown,
+        ));
+        wait_for_atomic_count(&blocked_search_in_flight, 1).await;
+        wait_for_atomic_count(&max_download_in_flight, 1).await;
+        release_blocked_search.notify_one();
+        let summary = handle.await.unwrap().unwrap();
+
+        assert_eq!(3, summary.planned_indexers);
+        assert_eq!(15, summary.candidates);
+        assert_eq!(15, summary.saved);
+        assert_eq!(0, summary.failed);
+        assert_eq!(3, search_requests.load(Ordering::SeqCst));
+        assert!(
+            max_download_in_flight.load(Ordering::SeqCst) <= SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY,
+            "candidate processing should stay bounded"
+        );
+        let candidates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_candidates")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let decisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM match_decisions")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(15, candidates);
+        assert_eq!(15, decisions);
     }
 
     #[tokio::test]
@@ -5290,6 +5412,69 @@ mod tests {
         format!("http://{address}/api")
     }
 
+    async fn spawn_daemon_multi_candidate_search_download_server(
+        guid_prefix: &str,
+        candidate_count: usize,
+        search_requests: Arc<AtomicUsize>,
+        download_in_flight: Arc<AtomicUsize>,
+        max_download_in_flight: Arc<AtomicUsize>,
+        blocked_search: Option<(Arc<AtomicUsize>, Arc<tokio::sync::Notify>)>,
+    ) -> String {
+        let guid_prefix = guid_prefix.to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let download_base = format!("http://{address}/download");
+        let app = axum::Router::new()
+            .route(
+                "/api",
+                get({
+                    let guid_prefix = guid_prefix.clone();
+                    move || {
+                        let search_requests = Arc::clone(&search_requests);
+                        let guid_prefix = guid_prefix.clone();
+                        let download_base = download_base.clone();
+                        let blocked_search = blocked_search.clone();
+                        async move {
+                            search_requests.fetch_add(1, Ordering::SeqCst);
+                            if let Some((blocked_search_in_flight, release)) = blocked_search {
+                                blocked_search_in_flight.fetch_add(1, Ordering::SeqCst);
+                                release.notified().await;
+                                blocked_search_in_flight.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            (
+                                StatusCode::OK,
+                                search_rss_many_with_downloads(
+                                    &guid_prefix,
+                                    candidate_count,
+                                    &download_base,
+                                ),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/download/{guid}",
+                get(
+                    move |axum::extract::Path(guid): axum::extract::Path<String>| {
+                        let download_in_flight = Arc::clone(&download_in_flight);
+                        let max_download_in_flight = Arc::clone(&max_download_in_flight);
+                        async move {
+                            let active = download_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            update_max_atomic(&max_download_in_flight, active);
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            download_in_flight.fetch_sub(1, Ordering::SeqCst);
+                            (StatusCode::OK, test_torrent_bytes_with_source(&guid)).into_response()
+                        }
+                    },
+                ),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
     async fn spawn_daemon_stalled_torznab_search_server(requests: Arc<AtomicUsize>) -> String {
         let app = axum::Router::new().route(
             "/api",
@@ -5727,6 +5912,30 @@ mod tests {
             </rss>
             "#
         )
+    }
+
+    fn search_rss_many_with_downloads(
+        guid_prefix: &str,
+        candidate_count: usize,
+        download_base: &str,
+    ) -> String {
+        let mut body = "<rss><channel>".to_owned();
+        for index in 0..candidate_count {
+            let guid = format!("{guid_prefix}-{index}");
+            body.push_str(&format!(
+                r#"
+                <item>
+                  <title>movie.mkv</title>
+                  <guid>{guid}</guid>
+                  <link>https://indexer.example/details/{guid}</link>
+                  <enclosure url="{download_base}/{guid}" length="10" type="application/x-bittorrent"/>
+                  <torznab:attr name="size" value="10"/>
+                </item>
+                "#
+            ));
+        }
+        body.push_str("</channel></rss>");
+        body
     }
 
     fn daemon_movie_caps() -> TorznabCaps {

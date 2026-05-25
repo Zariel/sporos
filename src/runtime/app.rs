@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::arr::{ArrEndpoint, ArrRegistry};
@@ -56,6 +56,7 @@ const PROWLARR_REFRESH_CONCURRENCY: usize = 4;
 const INDEXER_CAPS_REFRESH_CONCURRENCY: usize = 4;
 #[cfg(test)]
 const INDEXER_SEARCH_CONCURRENCY: usize = crate::config::DEFAULT_SEARCH_WORKER_CONCURRENCY;
+const INDEXER_SEARCH_REORDER_WINDOW_MULTIPLIER: usize = 2;
 const INDEXER_CAPS_REFRESH_PAGE_SIZE: u16 = 1_000;
 const INDEXER_SEARCH_CAPS_PAGE_SIZE: u16 = 1_000;
 
@@ -541,6 +542,42 @@ impl AppState {
         request: SearchWorkflowRequest,
         now_ms: i64,
     ) -> Result<SearchWorkflowPlanSummary, DatabaseError> {
+        let mut sink = SearchCandidateSink::Collect(Vec::new());
+        let summary = self
+            .plan_search_workflow_with_sink(request, now_ms, &mut sink)
+            .await?;
+        let SearchCandidateSink::Collect(candidates) = sink else {
+            return Err(DatabaseError::QueryFailed {
+                operation: "collect search candidates".to_owned(),
+                message: "unexpected streaming candidate sink".to_owned(),
+            });
+        };
+        Ok(SearchWorkflowPlanSummary {
+            plans: summary.plans,
+            candidate_count: summary.candidate_count,
+            candidates,
+            failed_indexers: summary.failed_indexers,
+        })
+    }
+
+    pub async fn stream_search_workflow_candidates(
+        &self,
+        request: SearchWorkflowRequest,
+        now_ms: i64,
+        sender: mpsc::Sender<RemoteCandidate>,
+        shutdown: ShutdownSignal,
+    ) -> Result<SearchWorkflowStreamSummary, DatabaseError> {
+        let mut sink = SearchCandidateSink::Send { sender, shutdown };
+        self.plan_search_workflow_with_sink(request, now_ms, &mut sink)
+            .await
+    }
+
+    async fn plan_search_workflow_with_sink(
+        &self,
+        request: SearchWorkflowRequest,
+        now_ms: i64,
+        sink: &mut SearchCandidateSink,
+    ) -> Result<SearchWorkflowStreamSummary, DatabaseError> {
         let item = search_workflow_item(request.query)?;
         let ids = self
             .search_planner
@@ -548,9 +585,11 @@ impl AppState {
             .await?;
         let mut plans = Vec::new();
         let mut failed_indexers = 0_usize;
-        let mut search_results = Vec::new();
+        let mut completed_results = BTreeMap::new();
         let mut after_name = None;
         let mut search_ordinal = 0_usize;
+        let mut next_emit_ordinal = 0_usize;
+        let mut candidate_count = 0_usize;
 
         loop {
             let indexers = self
@@ -567,17 +606,18 @@ impl AppState {
             let mut active = FuturesUnordered::new();
             let mut endpoint_error = None;
             let mut search_error = None;
+            let reorder_window =
+                indexer_search_reorder_window(self.config.runtime.search_worker_concurrency);
 
             loop {
                 while active.len() < self.config.runtime.search_worker_concurrency
+                    && search_ordinal.saturating_sub(next_emit_ordinal) < reorder_window
                     && endpoint_error.is_none()
                     && search_error.is_none()
                 {
                     let Some(indexer) = indexers.next() else {
                         break;
                     };
-                    let ordinal = search_ordinal;
-                    search_ordinal = search_ordinal.saturating_add(1);
                     after_name = Some(indexer.name.clone());
                     let Some(plan) = plan_runtime_torznab_search(&item, &ids, &indexer.caps) else {
                         continue;
@@ -590,6 +630,8 @@ impl AppState {
                             break;
                         }
                     };
+                    let ordinal = search_ordinal;
+                    search_ordinal = search_ordinal.saturating_add(1);
                     plans.push(IndexerSearchPlan {
                         indexer_id: indexer.indexer_id,
                         indexer_name: indexer.name,
@@ -611,7 +653,17 @@ impl AppState {
                     break;
                 };
                 match result {
-                    Ok(result) => search_results.push((ordinal, result)),
+                    Ok(result) => {
+                        completed_results.insert(ordinal, result);
+                        emit_ready_search_results(
+                            &mut completed_results,
+                            &mut next_emit_ordinal,
+                            &mut failed_indexers,
+                            &mut candidate_count,
+                            sink,
+                        )
+                        .await?;
+                    }
                     Err(error) => {
                         search_error = Some(error);
                     }
@@ -629,25 +681,18 @@ impl AppState {
             }
         }
 
-        search_results.sort_by_key(|(ordinal, _)| *ordinal);
-        let mut candidate_count = 0_usize;
-        let mut all_candidates = Vec::new();
-        for (_, result) in search_results {
-            match result {
-                IndexerSearchResult::Succeeded(candidates) => {
-                    candidate_count = candidate_count.saturating_add(candidates.len());
-                    all_candidates.extend(candidates);
-                }
-                IndexerSearchResult::Failed => {
-                    failed_indexers += 1;
-                }
-            }
-        }
+        emit_ready_search_results(
+            &mut completed_results,
+            &mut next_emit_ordinal,
+            &mut failed_indexers,
+            &mut candidate_count,
+            sink,
+        )
+        .await?;
 
-        Ok(SearchWorkflowPlanSummary {
+        Ok(SearchWorkflowStreamSummary {
             plans,
             candidate_count,
-            candidates: all_candidates,
             failed_indexers,
         })
     }
@@ -871,9 +916,83 @@ pub struct SearchWorkflowPlanSummary {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchWorkflowStreamSummary {
+    pub plans: Vec<IndexerSearchPlan>,
+    pub candidate_count: usize,
+    pub failed_indexers: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum IndexerSearchResult {
     Succeeded(Vec<RemoteCandidate>),
     Failed,
+}
+
+enum SearchCandidateSink {
+    Collect(Vec<RemoteCandidate>),
+    Send {
+        sender: mpsc::Sender<RemoteCandidate>,
+        shutdown: ShutdownSignal,
+    },
+}
+
+impl SearchCandidateSink {
+    async fn send_candidates(
+        &mut self,
+        candidates: Vec<RemoteCandidate>,
+    ) -> Result<usize, DatabaseError> {
+        let count = candidates.len();
+        match self {
+            Self::Collect(collected) => {
+                collected.extend(candidates);
+                Ok(count)
+            }
+            Self::Send { sender, shutdown } => {
+                for candidate in candidates {
+                    let mut shutdown = shutdown.clone();
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            return Err(DatabaseError::QueryFailed {
+                                operation: "stream search candidates".to_owned(),
+                                message: "search workflow is shutting down".to_owned(),
+                            });
+                        }
+                        result = sender.send(candidate) => {
+                            if result.is_err() {
+                                return Err(DatabaseError::QueryFailed {
+                                    operation: "stream search candidates".to_owned(),
+                                    message: "candidate receiver closed".to_owned(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(count)
+            }
+        }
+    }
+}
+
+async fn emit_ready_search_results(
+    completed_results: &mut BTreeMap<usize, IndexerSearchResult>,
+    next_emit_ordinal: &mut usize,
+    failed_indexers: &mut usize,
+    candidate_count: &mut usize,
+    sink: &mut SearchCandidateSink,
+) -> Result<(), DatabaseError> {
+    while let Some(result) = completed_results.remove(next_emit_ordinal) {
+        *next_emit_ordinal = (*next_emit_ordinal).saturating_add(1);
+        match result {
+            IndexerSearchResult::Succeeded(candidates) => {
+                let sent = sink.send_candidates(candidates).await?;
+                *candidate_count = candidate_count.saturating_add(sent);
+            }
+            IndexerSearchResult::Failed => {
+                *failed_indexers = failed_indexers.saturating_add(1);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -1526,6 +1645,12 @@ fn runtime_queue_config(config: &SporosConfig) -> RuntimeQueueConfig {
 
 fn nonzero_config(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
+}
+
+fn indexer_search_reorder_window(concurrency: usize) -> usize {
+    concurrency
+        .saturating_mul(INDEXER_SEARCH_REORDER_WINDOW_MULTIPLIER)
+        .max(1)
 }
 
 #[cfg(test)]
@@ -3048,6 +3173,183 @@ mod tests {
             echo_started_while_slow.load(Ordering::SeqCst),
             "expected a freed search slot to start the fifth request before the first completed"
         );
+    }
+
+    #[tokio::test]
+    async fn search_workflow_streams_candidates_before_later_indexers_finish() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let slow_in_flight = Arc::new(AtomicBool::new(false));
+        let mut config = SporosConfig::default();
+        config.runtime.search_worker_concurrency = 2;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for (name, delay, mark_slow) in [
+            ("alpha", Duration::from_millis(100), false),
+            ("bravo", Duration::from_millis(500), true),
+        ] {
+            let torznab_url = spawn_runtime_torznab_observed_search_server(
+                Arc::clone(&queries),
+                delay,
+                name,
+                mark_slow.then(|| Arc::clone(&slow_in_flight)),
+                None,
+                None,
+            )
+            .await;
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for name in ["alpha", "bravo"] {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        let (_shutdown, shutdown_signal) = shutdown_channel();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let state = runtime.state.clone();
+        let handle = tokio::spawn(async move {
+            state
+                .stream_search_workflow_candidates(
+                    SearchWorkflowRequest {
+                        query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                    },
+                    1_000,
+                    sender,
+                    shutdown_signal,
+                )
+                .await
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!("alpha", first.guid.as_str());
+        assert!(
+            slow_in_flight.load(Ordering::SeqCst),
+            "expected first candidate while a later indexer search was still running"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!("bravo", second.guid.as_str());
+        let summary = handle.await.unwrap().unwrap();
+        assert_eq!(2, summary.plans.len());
+        assert_eq!(2, summary.candidate_count);
+    }
+
+    #[tokio::test]
+    async fn search_workflow_bounds_out_of_order_result_buffering() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let slow_in_flight = Arc::new(AtomicBool::new(false));
+        let mut config = SporosConfig::default();
+        config.runtime.search_worker_concurrency = 2;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let indexers = [
+            ("alpha", Duration::from_millis(500), true),
+            ("bravo", Duration::from_millis(20), false),
+            ("charlie", Duration::from_millis(20), false),
+            ("delta", Duration::from_millis(20), false),
+            ("echo", Duration::from_millis(20), false),
+            ("foxtrot", Duration::from_millis(20), false),
+        ];
+        let release_alpha = Arc::new(tokio::sync::Notify::new());
+        for (name, delay, mark_slow) in indexers {
+            let torznab_url = if mark_slow {
+                spawn_runtime_torznab_blocked_search_server(
+                    Arc::clone(&queries),
+                    name,
+                    Arc::clone(&slow_in_flight),
+                    Arc::clone(&release_alpha),
+                )
+                .await
+            } else {
+                spawn_runtime_torznab_observed_search_server(
+                    Arc::clone(&queries),
+                    delay,
+                    name,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            };
+            config.indexers.torznab.insert(
+                name.to_owned(),
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new(name).unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for (name, _, _) in indexers {
+            repository
+                .record_indexer_caps_success(
+                    &DependencyName::new(name).unwrap(),
+                    &movie_caps(),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        let (_shutdown, shutdown_signal) = shutdown_channel();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let state = runtime.state.clone();
+        let handle = tokio::spawn(async move {
+            state
+                .stream_search_workflow_candidates(
+                    SearchWorkflowRequest {
+                        query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                    },
+                    1_000,
+                    sender,
+                    shutdown_signal,
+                )
+                .await
+        });
+
+        wait_for_query_count(&queries, indexer_search_reorder_window(2)).await;
+        assert!(
+            slow_in_flight.load(Ordering::SeqCst),
+            "expected earliest indexer search to still be running"
+        );
+        assert_eq!(
+            indexer_search_reorder_window(2),
+            queries.lock().unwrap().len(),
+            "later indexer launches should stop at the bounded reorder window"
+        );
+        release_alpha.notify_one();
+
+        for expected in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] {
+            let candidate = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(expected, candidate.guid.as_str());
+        }
+        let summary = handle.await.unwrap().unwrap();
+        assert_eq!(6, summary.plans.len());
+        assert_eq!(6, summary.candidate_count);
     }
 
     #[tokio::test]
@@ -5167,6 +5469,56 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}/api")
+    }
+
+    async fn spawn_runtime_torznab_blocked_search_server(
+        queries: Arc<Mutex<Vec<String>>>,
+        guid: &str,
+        in_flight: Arc<AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> String {
+        let guid = guid.to_owned();
+        let app = axum::Router::new().route(
+            "/api",
+            get(move |request: Request<Body>| {
+                let queries = Arc::clone(&queries);
+                let guid = guid.clone();
+                let in_flight = Arc::clone(&in_flight);
+                let release = Arc::clone(&release);
+                async move {
+                    queries
+                        .lock()
+                        .unwrap()
+                        .push(request.uri().query().unwrap_or_default().to_owned());
+                    in_flight.store(true, Ordering::SeqCst);
+                    release.notified().await;
+                    in_flight.store(false, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        search_rss(&guid, &format!("Example {guid}")),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    async fn wait_for_query_count(queries: &Arc<Mutex<Vec<String>>>, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if queries.lock().unwrap().len() >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expected} Torznab queries"));
     }
 
     async fn insert_disabled_indexers(repository: &Repository, count: usize) {
