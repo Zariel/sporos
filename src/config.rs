@@ -13,6 +13,8 @@ use crate::secrets::{ApiKey, ApiToken, Password};
 
 pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
 pub const DEFAULT_INJECTION_METADATA: &str = "sporos";
+pub const MAX_RUNTIME_WORKER_THREADS: usize = 256;
+pub const MAX_RUNTIME_BLOCKING_THREADS: usize = 512;
 const ENV_PREFIX: &str = "SPOROS__";
 static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -21,6 +23,7 @@ static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct SporosConfig {
     pub paths: PathsConfig,
     pub server: ServerConfig,
+    pub runtime: RuntimeConfig,
     pub torrent_clients: BTreeMap<String, TorrentClientConfig>,
     pub indexers: IndexersConfig,
     pub matching: MatchingConfig,
@@ -68,6 +71,13 @@ impl Default for ServerConfig {
             api_token_env: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    pub worker_threads: Option<usize>,
+    pub max_blocking_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
@@ -392,6 +402,7 @@ where
             field: "announce",
             reason: error.to_string(),
         })?;
+    validate_runtime_threads(&config)?;
     validate_secret_source_counts(&config)?;
     validate_torrent_clients(&config)?;
     validate_injection_config(&config)?;
@@ -823,6 +834,37 @@ fn validate_injection_config(config: &SporosConfig) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+fn validate_runtime_threads(config: &SporosConfig) -> Result<(), ConfigError> {
+    validate_optional_usize_range(
+        "runtime.worker_threads",
+        config.runtime.worker_threads,
+        MAX_RUNTIME_WORKER_THREADS,
+    )?;
+    validate_optional_usize_range(
+        "runtime.max_blocking_threads",
+        config.runtime.max_blocking_threads,
+        MAX_RUNTIME_BLOCKING_THREADS,
+    )
+}
+
+fn validate_optional_usize_range(
+    field: &'static str,
+    value: Option<usize>,
+    max: usize,
+) -> Result<(), ConfigError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if (1..=max).contains(&value) {
+        return Ok(());
+    }
+
+    Err(ConfigError::InvalidField {
+        field,
+        reason: format!("must be between 1 and {max} when configured"),
+    })
 }
 
 fn validate_percent(
@@ -1414,6 +1456,10 @@ api_token = "optional local-development bearer token"
 api_token_file = "optional path"
 api_token_env = "optional env var containing bearer token"
 
+[runtime]
+worker_threads = "optional 1-256 integer; defaults to Tokio"
+max_blocking_threads = "optional 1-512 integer; defaults to Tokio"
+
 [torrent_clients.<name>]
 kind = "qbittorrent|rtorrent"
 url = "http://client.example"
@@ -1467,6 +1513,8 @@ api_key_env = "optional env var containing api key"
 SPOROS__SERVER__BIND = "0.0.0.0:2468"
 SPOROS__SERVER__API_TOKEN_FILE = "/var/run/secrets/sporos-api-token"
 SPOROS__PATHS__DATABASE = "/data/state/sporos.db"
+SPOROS__RUNTIME__WORKER_THREADS = "4"
+SPOROS__RUNTIME__MAX_BLOCKING_THREADS = "64"
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__INJECTION__RECHECK__SKIP_RECHECK = "false"
 SPOROS__INJECTION__RECHECK__MAX_REMAINING_BYTES = "104857600"
@@ -1551,6 +1599,10 @@ mod tests {
             [server]
             bind = "0.0.0.0:2468"
 
+            [runtime]
+            worker_threads = 4
+            max_blocking_threads = 64
+
             [torrent_clients.qbit_main]
             kind = "qbittorrent"
             url = "http://qbittorrent:8080"
@@ -1569,6 +1621,8 @@ mod tests {
             "0.0.0.0:2468".parse::<SocketAddr>().unwrap(),
             config.server.bind
         );
+        assert_eq!(Some(4), config.runtime.worker_threads);
+        assert_eq!(Some(64), config.runtime.max_blocking_threads);
         assert_eq!(1, config.torrent_clients.len());
         assert_eq!(1, config.indexers.torznab.len());
         assert_eq!(
@@ -1601,6 +1655,83 @@ mod tests {
             BelowThresholdActionConfig::InjectPaused,
             config.injection.recheck.below_threshold_action
         );
+    }
+
+    #[test]
+    fn runtime_thread_counts_default_to_tokio_policy() {
+        let config = parse_config("").unwrap();
+
+        assert_eq!(None, config.runtime.worker_threads);
+        assert_eq!(None, config.runtime.max_blocking_threads);
+    }
+
+    #[test]
+    fn runtime_rejects_out_of_range_thread_counts() {
+        let worker_error = parse_config(
+            r#"
+            [runtime]
+            worker_threads = 0
+            "#,
+        )
+        .unwrap_err();
+        assert!(worker_error.to_string().contains("runtime.worker_threads"));
+
+        let blocking_error = parse_config(
+            r#"
+            [runtime]
+            max_blocking_threads = 0
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            blocking_error
+                .to_string()
+                .contains("runtime.max_blocking_threads")
+        );
+
+        let oversized_worker_error = parse_config(
+            r#"
+            [runtime]
+            worker_threads = 257
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            oversized_worker_error
+                .to_string()
+                .contains("between 1 and 256")
+        );
+
+        let oversized_blocking_error = parse_config(
+            r#"
+            [runtime]
+            max_blocking_threads = 513
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            oversized_blocking_error
+                .to_string()
+                .contains("between 1 and 512")
+        );
+    }
+
+    #[test]
+    fn runtime_thread_counts_support_env_overrides() {
+        let config = parse_config_with_env(
+            "",
+            [
+                ("SPOROS__RUNTIME__WORKER_THREADS".to_owned(), "3".to_owned()),
+                (
+                    "SPOROS__RUNTIME__MAX_BLOCKING_THREADS".to_owned(),
+                    "16".to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(Some(3), config.runtime.worker_threads);
+        assert_eq!(Some(16), config.runtime.max_blocking_threads);
     }
 
     #[test]

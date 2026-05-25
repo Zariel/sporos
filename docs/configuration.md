@@ -26,6 +26,10 @@ media_dirs = ["/media/movies", "/media/tv"]
 bind = "0.0.0.0:2468"
 api_token_file = "/var/run/secrets/sporos-api-token"
 
+[runtime]
+worker_threads = 4
+max_blocking_threads = 64
+
 [torrent_clients.qbit_main]
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
@@ -95,6 +99,13 @@ For a network-facing daemon, configure:
 
 Matching, scheduling, announce queue limits, Arr services, notification
 endpoints, and Prowlarr tag filters are optional tuning or integration settings.
+
+## Runtime
+
+`sporos serve` uses Tokio's multi-thread scheduler. Leave `[runtime]` unset to
+use Tokio's default worker and blocking-thread policy, or set
+`runtime.worker_threads` from 1 to 256 and `runtime.max_blocking_threads` from
+1 to 512 when the deployment needs explicit CPU or blocking-IO caps.
 
 ## Server And Auth
 
@@ -257,6 +268,8 @@ underscores separate TOML path segments, and values are parsed as TOML scalars:
 ```bash
 SPOROS__SERVER__BIND='"0.0.0.0:2468"'
 SPOROS__PATHS__DATABASE='"/data/state/sporos.db"'
+SPOROS__RUNTIME__WORKER_THREADS='4'
+SPOROS__RUNTIME__MAX_BLOCKING_THREADS='64'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-password"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'

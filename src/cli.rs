@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::clients::qbittorrent::{QbitAddTorrent, QbitContentLayout, QbittorrentClient};
 use crate::clients::rtorrent::RtorrentClient;
 use crate::config::ConfigTorrentClientKind;
-use crate::config::{CONFIG_SCHEMA, DEFAULT_CONFIG_PATH, load_config};
+use crate::config::{CONFIG_SCHEMA, DEFAULT_CONFIG_PATH, SporosConfig, load_config};
 use crate::domain::{
     ByteSize, CandidateGuid, DownloadUrl, IndexerId, InfoHash, ItemTitle, RemoteCandidate,
     TrackerName,
@@ -84,10 +84,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
     match cli.command {
         Command::Serve { config } => {
             let loaded = load_config(&config).map_err(|error| error.to_string())?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
+            let runtime = build_serve_runtime(&loaded)?;
             runtime
                 .block_on(daemon::serve(loaded))
                 .map_err(|error| error.to_string())?;
@@ -106,10 +103,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
             fixture_base_url,
         } => {
             let loaded = load_config(&config).map_err(|error| error.to_string())?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
+            let runtime = build_current_thread_runtime()?;
             let seeded = runtime.block_on(seed_system_test_candidates(
                 loaded,
                 manifest,
@@ -122,41 +116,50 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
         }
         Command::SystemTestSnapshot { config } => {
             let loaded = load_config(&config).map_err(|error| error.to_string())?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
+            let runtime = build_current_thread_runtime()?;
             let snapshot = runtime.block_on(system_test_snapshot(loaded))?;
             serde_json::to_string(&snapshot).map_err(|error| error.to_string())
         }
         Command::SystemTestLoadSources { config, manifest } => {
             let loaded = load_config(&config).map_err(|error| error.to_string())?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
+            let runtime = build_current_thread_runtime()?;
             let loaded = runtime.block_on(load_system_test_sources(loaded, manifest))?;
             Ok(format!("loaded {loaded} system-test source torrents"))
         }
         Command::SystemTestClientState { config, manifest } => {
             let loaded = load_config(&config).map_err(|error| error.to_string())?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
+            let runtime = build_current_thread_runtime()?;
             let state = runtime.block_on(system_test_client_state(loaded, manifest))?;
             serde_json::to_string(&state).map_err(|error| error.to_string())
         }
         Command::SystemTestDiagnostics { config } => {
             let loaded = load_config(&config).map_err(|error| error.to_string())?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
+            let runtime = build_current_thread_runtime()?;
             let diagnostics = runtime.block_on(system_test_diagnostics(loaded))?;
             serde_json::to_string(&diagnostics).map_err(|error| error.to_string())
         }
     }
+}
+
+pub(crate) fn build_serve_runtime(
+    config: &SporosConfig,
+) -> Result<tokio::runtime::Runtime, String> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(worker_threads) = config.runtime.worker_threads {
+        builder.worker_threads(worker_threads);
+    }
+    if let Some(max_blocking_threads) = config.runtime.max_blocking_threads {
+        builder.max_blocking_threads(max_blocking_threads);
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
+fn build_current_thread_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1024,7 +1027,20 @@ mod tests {
         .unwrap();
 
         assert!(output.contains("[paths]"));
+        assert!(output.contains("[runtime]"));
         assert!(output.contains("[scheduling]"));
+    }
+
+    #[test]
+    fn serve_runtime_uses_multi_thread_scheduler() {
+        let mut config = SporosConfig::default();
+        config.runtime.worker_threads = Some(2);
+        config.runtime.max_blocking_threads = Some(2);
+
+        let runtime = build_serve_runtime(&config).unwrap();
+        let flavor = runtime.block_on(async { tokio::runtime::Handle::current().runtime_flavor() });
+
+        assert_eq!(tokio::runtime::RuntimeFlavor::MultiThread, flavor);
     }
 
     #[test]
