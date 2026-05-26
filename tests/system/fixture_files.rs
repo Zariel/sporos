@@ -7,6 +7,8 @@ use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use sporos::torrent::parse_metafile;
 
+const RTORRENT_RELEASE_IMAGE: &str = "ghcr.io/crazy-max/rtorrent-rutorrent@sha256:377bc208ec9d88c5fba6241e0c2ef08648ce8322307a6c687641a4182a7447e4";
+
 #[derive(Debug, Deserialize)]
 struct Manifest {
     announce: String,
@@ -54,9 +56,11 @@ fn real_client_torrent_fixtures_are_deterministic_and_tiny() {
         fs::read_to_string(root.parent().unwrap().join("torznab/www/search.xml")).unwrap();
     let compose = fs::read_to_string(root.parent().unwrap().join("compose.yml")).unwrap();
     let nginx = fs::read_to_string(root.parent().unwrap().join("torznab/nginx.conf")).unwrap();
+    let readme = fs::read_to_string(root.parent().unwrap().join("README.md")).unwrap();
     assert_search_fixture_matches_manifest(&search_xml, by_slug["qbittorrent-candidate"], "4096");
     assert_search_fixture_matches_manifest(&search_xml, by_slug["rtorrent-candidate"], "3329");
     assert_torznab_mounts_do_not_nest_read_only_document_root(&compose, &nginx);
+    assert_rtorrent_release_image_pin_matches_docs(&compose, &readme);
 
     for fixture in &manifest.fixtures {
         let torrent =
@@ -119,6 +123,15 @@ fn real_client_torrent_fixtures_are_deterministic_and_tiny() {
             expected_pieces(&piece_input, manifest.piece_length)
         );
     }
+}
+
+fn assert_rtorrent_release_image_pin_matches_docs(compose: &str, readme: &str) {
+    assert!(compose.contains(&format!(
+        "SPOROS_SYSTEM_RTORRENT_IMAGE:-{RTORRENT_RELEASE_IMAGE}"
+    )));
+    assert!(readme.contains(&format!("| rTorrent | `{RTORRENT_RELEASE_IMAGE}` |")));
+    assert!(!compose.contains("rtorrent-rutorrent:5.2.10-0.16.7-r1"));
+    assert!(!readme.contains("rtorrent-rutorrent:5.2.10-0.16.7-r1"));
 }
 
 fn assert_torznab_mounts_do_not_nest_read_only_document_root(compose: &str, nginx: &str) {

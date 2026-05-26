@@ -58,7 +58,7 @@ services:
     restart: "no"
 
   rtorrent:
-    image: ${SPOROS_SYSTEM_RTORRENT_IMAGE:-ghcr.io/crazy-max/rtorrent-rutorrent:5.2.10-0.16.7-r1}
+    image: ${SPOROS_SYSTEM_RTORRENT_IMAGE:-ghcr.io/crazy-max/rtorrent-rutorrent@sha256:377bc208ec9d88c5fba6241e0c2ef08648ce8322307a6c687641a4182a7447e4}
     depends_on:
       system-init:
         condition: service_completed_successfully

@@ -92,13 +92,13 @@ containers on the private `system` network.
 
 ## Image Pins
 
-Release-blocking harness runs should keep these tags pinned until a later bead
-switches to digest pins:
+Release-blocking harness runs should keep these images pinned. Use digest pins
+where upstream tags are not stable enough for release gates:
 
 | Service | Image |
 | --- | --- |
 | qBittorrent | `lscr.io/linuxserver/qbittorrent:5.2.0` |
-| rTorrent | `ghcr.io/crazy-max/rtorrent-rutorrent:5.2.10-0.16.7-r1` |
+| rTorrent | `ghcr.io/crazy-max/rtorrent-rutorrent@sha256:377bc208ec9d88c5fba6241e0c2ef08648ce8322307a6c687641a4182a7447e4` |
 | Torznab fixture | `nginx:1.27.4-alpine` |
 | Init | `alpine:3.21.3` |
 | Sporos | local build from `Dockerfile` with Rust `1.95.0` and Debian `bookworm` |
