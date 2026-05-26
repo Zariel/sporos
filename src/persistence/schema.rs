@@ -98,6 +98,9 @@ CREATE INDEX IF NOT EXISTS idx_remote_candidates_title
     ON remote_candidates (title);
 CREATE INDEX IF NOT EXISTS idx_remote_candidates_published_at
     ON remote_candidates (published_at);
+CREATE INDEX IF NOT EXISTS idx_remote_candidates_torrent_cache_path
+    ON remote_candidates (torrent_cache_path)
+    WHERE torrent_cache_path IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS match_decisions (
     local_item_id INTEGER NOT NULL REFERENCES local_items(id) ON DELETE CASCADE,
@@ -114,6 +117,8 @@ CREATE INDEX IF NOT EXISTS idx_match_decisions_decision_assessed_at
     ON match_decisions (decision, assessed_at);
 CREATE INDEX IF NOT EXISTS idx_match_decisions_candidate_id
     ON match_decisions (candidate_id);
+CREATE INDEX IF NOT EXISTS idx_match_decisions_candidate_assessed_at
+    ON match_decisions (candidate_id, assessed_at);
 CREATE INDEX IF NOT EXISTS idx_match_decisions_local_assessed
     ON match_decisions (local_item_id, assessed_at DESC, candidate_id);
 
@@ -356,7 +361,9 @@ mod tests {
             "UNIQUE (indexer_id, guid)",
             "redacted_download_url TEXT NOT NULL",
             "idx_remote_candidates_info_hash_seen",
+            "idx_remote_candidates_torrent_cache_path",
             "PRIMARY KEY (local_item_id, candidate_id)",
+            "idx_match_decisions_candidate_assessed_at",
             "idx_match_decisions_local_assessed",
             "UNIQUE (name)",
             "UNIQUE (source_kind, source_name, source_indexer_id)",

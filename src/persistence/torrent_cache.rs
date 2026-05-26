@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::{collections::BTreeMap, sync::MutexGuard};
 
 use crate::domain::{InfoHash, MediaType};
 
@@ -55,6 +57,61 @@ impl Error for TorrentCachePathError {}
 /// candidate title metadata.
 pub fn cached_torrent_path(cache_dir: &Path, info_hash: &InfoHash) -> PathBuf {
     cache_dir.join(format!("{}{CACHED_TORRENT_SUFFIX}", info_hash.as_str()))
+}
+
+pub fn with_cached_torrent_path_lock<T>(path: &Path, action: impl FnOnce() -> T) -> T {
+    let lock = cached_torrent_path_lock(path);
+    let _release = CachePathLockRelease {
+        path: path.to_path_buf(),
+        lock: Arc::clone(&lock),
+    };
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    action()
+}
+
+type CachePathLockMap = Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>;
+
+struct CachePathLockRelease {
+    path: PathBuf,
+    lock: Arc<Mutex<()>>,
+}
+
+impl Drop for CachePathLockRelease {
+    fn drop(&mut self) {
+        release_cached_torrent_path_lock(&self.path, &self.lock);
+    }
+}
+
+fn cached_torrent_path_locks() -> &'static CachePathLockMap {
+    static LOCKS: OnceLock<CachePathLockMap> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn lock_map() -> MutexGuard<'static, BTreeMap<PathBuf, Arc<Mutex<()>>>> {
+    cached_torrent_path_locks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn cached_torrent_path_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = lock_map();
+    Arc::clone(
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+fn release_cached_torrent_path_lock(path: &Path, lock: &Arc<Mutex<()>>) {
+    let mut locks = lock_map();
+    if Arc::strong_count(lock) == 3 {
+        locks.remove(path);
+    }
+}
+
+#[cfg(test)]
+fn cached_torrent_path_lock_is_tracked(path: &Path) -> bool {
+    lock_map().contains_key(path)
 }
 
 /// Parses a cached torrent filename and returns its info hash.
@@ -306,6 +363,18 @@ mod tests {
             path
         );
         assert_eq!(info_hash, parsed);
+    }
+
+    #[test]
+    fn cached_torrent_path_lock_is_released_after_panic() {
+        let path = Path::new("/cache/torrents/panic.cached.torrent");
+
+        let result = std::panic::catch_unwind(|| {
+            with_cached_torrent_path_lock(path, || panic!("cache lock panic test"));
+        });
+
+        assert!(result.is_err());
+        assert!(!cached_torrent_path_lock_is_tracked(path));
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::domain::{
     MediaType, RemoteCandidate, TorrentMetafile, TrackerName,
 };
 use crate::matching::{TorznabSearchPlan, TorznabSearchType};
-use crate::persistence::torrent_cache::cached_torrent_path;
+use crate::persistence::torrent_cache::{cached_torrent_path, with_cached_torrent_path_lock};
 use crate::runtime::backoff::{BackoffProbePolicy, JitteredBackoffPolicy};
 use crate::secrets::{ApiKey, sanitize_url_for_logging};
 use crate::torrent::parse_metafile;
@@ -1661,6 +1661,10 @@ fn parse_http_date_ms(value: &str) -> Option<i64> {
 }
 
 fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownloadError> {
+    with_cached_torrent_path_lock(path, || write_cached_torrent_locked(path, bytes))
+}
+
+fn write_cached_torrent_locked(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownloadError> {
     let parent = path
         .parent()
         .ok_or_else(|| CandidateDownloadError::CacheWrite {
@@ -1685,7 +1689,7 @@ fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownlo
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_file() => {
             drop(fs::remove_file(&temporary));
-            Ok(())
+            touch_existing_cache_file(path)
         }
         Err(error) => {
             drop(fs::remove_file(&temporary));
@@ -1695,6 +1699,20 @@ fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownlo
             })
         }
     }
+}
+
+fn touch_existing_cache_file(path: &Path) -> Result<(), CandidateDownloadError> {
+    let file = File::options().write(true).open(path).map_err(|error| {
+        CandidateDownloadError::CacheWrite {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        }
+    })?;
+    file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+        .map_err(|error| CandidateDownloadError::CacheWrite {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })
 }
 
 async fn write_cached_torrent_blocking(
@@ -3437,6 +3455,60 @@ mod tests {
 
         assert!(matches!(error, CandidateDownloadError::Request { .. }));
 
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[test]
+    fn existing_cache_reuse_refreshes_mtime() {
+        let cache_dir = unique_temp_dir("candidate-cache-touch-existing");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let path = cache_dir.join("existing.cached.torrent");
+        fs::write(&path, test_torrent_bytes()).unwrap();
+        let file = File::options().write(true).open(&path).unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_accessed(UNIX_EPOCH)
+                .set_modified(UNIX_EPOCH),
+        )
+        .unwrap();
+
+        touch_existing_cache_file(&path).unwrap();
+
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(modified > UNIX_EPOCH);
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[test]
+    fn cache_writer_serializes_with_cached_path_lock() {
+        let cache_dir = unique_temp_dir("candidate-cache-write-lock");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let path = cache_dir.join("locked.cached.torrent");
+        let writer_path = path.clone();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+
+        let writer = with_cached_torrent_path_lock(&path, || {
+            let writer = std::thread::spawn(move || {
+                started_sender.send(()).unwrap();
+                let result = write_cached_torrent(&writer_path, &test_torrent_bytes());
+                finished_sender.send(result).unwrap();
+            });
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            finished_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap_err();
+            writer
+        });
+
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(test_torrent_bytes(), fs::read(&path).unwrap());
         remove_temp_dir(&cache_dir);
     }
 

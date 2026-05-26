@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use serde_json::Value;
@@ -52,7 +53,9 @@ use crate::notifications::{
     run_notification_worker,
 };
 use crate::persistence::repository::Repository;
-use crate::persistence::torrent_cache::TorrentOutputMetadata;
+use crate::persistence::torrent_cache::{
+    TorrentOutputMetadata, parse_cached_torrent_filename, with_cached_torrent_path_lock,
+};
 use crate::runtime::announce_worker::{
     AnnounceOutcomeConfig, AnnounceWorkOutcome, AnnounceWorker, AnnounceWorkerError,
     classify_injection_result, classify_reverse_lookup_outcome, unix_time_ms,
@@ -79,6 +82,7 @@ const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
 const SCHEDULER_SHUTDOWN_ERROR: &str = "scheduler is shutting down";
 const SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY: usize = 4;
 const SEARCH_CANDIDATE_STREAM_CAPACITY: usize = SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY;
+const REMOTE_CANDIDATE_CLEANUP_MAX_BATCHES: u16 = 4;
 
 #[cfg(test)]
 static NO_CLIENT_SAVE_THREADS: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
@@ -1756,21 +1760,327 @@ async fn run_scheduled_cleanup_job(
     shutdown: &ShutdownSignal,
 ) -> Result<(), String> {
     if shutdown.state().phase == ShutdownPhase::Running {
+        let now_ms = unix_time_ms();
         let summary = state
             .announce_worker
-            .run_scheduled_cleanup(unix_time_ms(), shutdown)
+            .run_scheduled_cleanup(now_ms, shutdown)
             .await
             .map_err(|error| error.to_string())?;
+        let candidate_summary = cleanup_stale_remote_candidates(state, now_ms, shutdown).await?;
         info!(
             expired = summary.expired,
             retained_deleted = summary.retained_deleted,
             recovered_leases = summary.recovered_leases,
+            stale_remote_candidates_deleted = candidate_summary.deleted,
+            stale_remote_candidate_cache_files_deleted = candidate_summary.cache_files_deleted,
+            stale_remote_candidate_cache_file_delete_failures =
+                candidate_summary.cache_file_delete_failures,
             "scheduled cleanup completed"
         );
         Ok(())
     } else {
         Err(SCHEDULER_SHUTDOWN_ERROR.to_owned())
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct RemoteCandidateCleanupSummary {
+    deleted: u64,
+    cache_files_deleted: u64,
+    cache_file_delete_failures: u64,
+}
+
+async fn cleanup_stale_remote_candidates(
+    state: &AppState,
+    now_ms: i64,
+    shutdown: &ShutdownSignal,
+) -> Result<RemoteCandidateCleanupSummary, String> {
+    let cutoff_ms = now_ms.saturating_sub(seconds_to_millis(
+        state.config.announce.remote_candidate_retention_secs,
+    ));
+    let batch_size = remote_candidate_cleanup_batch_size(&state.config.announce);
+    let mut summary = RemoteCandidateCleanupSummary::default();
+    for _ in 0..REMOTE_CANDIDATE_CLEANUP_MAX_BATCHES {
+        if shutdown.state().phase != ShutdownPhase::Running {
+            return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
+        }
+        let deleted = state
+            .repository
+            .cleanup_stale_remote_candidates_batch(cutoff_ms, cutoff_ms, batch_size)
+            .await
+            .map_err(|error| error.to_string())?;
+        if deleted.is_empty() {
+            break;
+        }
+        let batch_len = deleted.len();
+        summary.deleted = summary
+            .deleted
+            .saturating_add(u64::try_from(batch_len).unwrap_or(u64::MAX));
+        let mut cache_paths = BTreeSet::new();
+        for candidate in deleted {
+            let Some(cache_path) = candidate.torrent_cache_path.as_deref().and_then(|path| {
+                safe_stale_candidate_cache_path(&state.config.paths.torrent_cache_dir, path)
+            }) else {
+                continue;
+            };
+            cache_paths.insert(cache_path);
+        }
+        for cache_path in cache_paths {
+            match remove_unreferenced_stale_candidate_cache_file(
+                &state.repository,
+                cache_path.clone(),
+                cutoff_ms,
+            )
+            .await
+            {
+                Ok(Ok(true)) => {
+                    summary.cache_files_deleted = summary.cache_files_deleted.saturating_add(1);
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    summary.cache_file_delete_failures =
+                        summary.cache_file_delete_failures.saturating_add(1);
+                    warn!(
+                        cache_path = %cache_path.display(),
+                        error = %error,
+                        "failed to delete stale remote candidate cache file"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if batch_len < usize::from(batch_size) {
+            break;
+        }
+    }
+    let orphan_summary = cleanup_orphaned_candidate_cache_files(
+        &state.repository,
+        &state.config.paths.torrent_cache_dir,
+        cutoff_ms,
+        batch_size,
+        shutdown,
+    )
+    .await?;
+    summary.cache_files_deleted = summary
+        .cache_files_deleted
+        .saturating_add(orphan_summary.cache_files_deleted);
+    summary.cache_file_delete_failures = summary
+        .cache_file_delete_failures
+        .saturating_add(orphan_summary.cache_file_delete_failures);
+
+    Ok(summary)
+}
+
+fn remote_candidate_cleanup_batch_size(config: &crate::announce::AnnounceQueueConfig) -> u16 {
+    let batch_size = u32::from(config.claim_batch_size)
+        .saturating_mul(u32::from(config.worker_concurrency))
+        .saturating_mul(120);
+    u16::try_from(batch_size.max(1)).unwrap_or(u16::MAX)
+}
+
+fn seconds_to_millis(seconds: u64) -> i64 {
+    i64::try_from(u128::from(seconds).saturating_mul(1_000)).unwrap_or(i64::MAX)
+}
+
+fn safe_stale_candidate_cache_path(cache_dir: &Path, cache_path: &Path) -> Option<PathBuf> {
+    let file_name = cache_path.file_name()?.to_str()?;
+    parse_cached_torrent_filename(file_name).ok()?;
+    let expected = cache_dir.join(file_name);
+    (cache_path == expected).then_some(cache_path.to_path_buf())
+}
+
+async fn cleanup_orphaned_candidate_cache_files(
+    repository: &Repository,
+    cache_dir: &Path,
+    mtime_cutoff_ms: i64,
+    limit: u16,
+    shutdown: &ShutdownSignal,
+) -> Result<RemoteCandidateCleanupSummary, String> {
+    let (sender, mut receiver) = mpsc::channel(64);
+    let stop_scan = Arc::new(AtomicBool::new(false));
+    let scan_stop = Arc::clone(&stop_scan);
+    let cache_dir = cache_dir.to_path_buf();
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_canonical_candidate_cache_files(cache_dir, sender, scan_stop)
+    });
+    let stream_result = cleanup_candidate_cache_file_stream(
+        repository,
+        &mut receiver,
+        mtime_cutoff_ms,
+        limit,
+        shutdown,
+        Some(&stop_scan),
+    )
+    .await;
+    drop(receiver);
+    let scan_result = scan.await.map_err(|error| error.to_string())?;
+    let summary = stream_result?;
+    scan_result?;
+
+    Ok(summary)
+}
+
+async fn cleanup_candidate_cache_file_stream(
+    repository: &Repository,
+    receiver: &mut mpsc::Receiver<CandidateCacheFile>,
+    mtime_cutoff_ms: i64,
+    limit: u16,
+    shutdown: &ShutdownSignal,
+    stop_scan: Option<&AtomicBool>,
+) -> Result<RemoteCandidateCleanupSummary, String> {
+    let mut summary = RemoteCandidateCleanupSummary::default();
+    while let Some(cache_file) = receiver.recv().await {
+        if shutdown.state().phase != ShutdownPhase::Running {
+            if let Some(stop_scan) = stop_scan {
+                stop_scan.store(true, AtomicOrdering::Release);
+            }
+            return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
+        }
+        if cache_file.mtime_ms > mtime_cutoff_ms {
+            continue;
+        }
+        match remove_unreferenced_stale_candidate_cache_file(
+            repository,
+            cache_file.path.clone(),
+            mtime_cutoff_ms,
+        )
+        .await
+        {
+            Ok(Ok(true)) => {
+                summary.cache_files_deleted = summary.cache_files_deleted.saturating_add(1);
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                summary.cache_file_delete_failures =
+                    summary.cache_file_delete_failures.saturating_add(1);
+                warn!(
+                    cache_path = %cache_file.path.display(),
+                    error = %error,
+                    "failed to delete orphaned remote candidate cache file"
+                );
+            }
+            Err(error) => {
+                if let Some(stop_scan) = stop_scan {
+                    stop_scan.store(true, AtomicOrdering::Release);
+                }
+                return Err(error);
+            }
+        }
+        if summary.cache_files_deleted >= u64::from(limit) {
+            if let Some(stop_scan) = stop_scan {
+                stop_scan.store(true, AtomicOrdering::Release);
+            }
+            break;
+        }
+    }
+
+    Ok(summary)
+}
+
+struct CandidateCacheFile {
+    path: PathBuf,
+    mtime_ms: i64,
+}
+
+fn scan_canonical_candidate_cache_files(
+    cache_dir: PathBuf,
+    sender: mpsc::Sender<CandidateCacheFile>,
+    stop_scan: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        if stop_scan.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let entry = entry.map_err(|error| error.to_string())?;
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        let file_type = metadata.file_type();
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(file_name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if parse_cached_torrent_filename(&file_name).is_ok()
+            && sender
+                .blocking_send(CandidateCacheFile {
+                    path: cache_dir.join(file_name),
+                    mtime_ms: metadata
+                        .modified()
+                        .ok()
+                        .map(system_time_ms)
+                        .unwrap_or(i64::MAX),
+                })
+                .is_err()
+        {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn system_time_ms(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+async fn remove_stale_candidate_cache_file(
+    path: PathBuf,
+    mtime_cutoff_ms: i64,
+) -> io::Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        with_cached_torrent_path_lock(&path, || {
+            remove_stale_candidate_cache_file_locked(&path, mtime_cutoff_ms)
+        })
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+fn remove_stale_candidate_cache_file_locked(path: &Path, mtime_cutoff_ms: i64) -> io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .map(system_time_ms)
+        .unwrap_or(i64::MAX);
+    if mtime_ms > mtime_cutoff_ms {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn remove_unreferenced_stale_candidate_cache_file(
+    repository: &Repository,
+    path: PathBuf,
+    mtime_cutoff_ms: i64,
+) -> Result<io::Result<bool>, String> {
+    if repository
+        .remote_candidate_cache_path_is_referenced(&path)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(Ok(false));
+    }
+    Ok(remove_stale_candidate_cache_file(path, mtime_cutoff_ms).await)
 }
 
 async fn run_announce_worker_loop(
@@ -5498,6 +5808,438 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_cleanup_removes_stale_remote_candidates_and_safe_cache_files() {
+        let root = unique_temp_dir("remote-candidate-cleanup");
+        let mut config = readiness_config(&root);
+        config.announce.remote_candidate_retention_secs = 10;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let safe_cache_path = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("0123456789abcdef0123456789abcdef01234567.cached.torrent");
+        let unshared_cache_path = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.cached.torrent");
+        let fresh_cache_path = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cached.torrent");
+        let unsafe_cache_path = runtime
+            .state
+            .config
+            .paths
+            .output_dir
+            .join("fedcba9876543210fedcba9876543210fedcba98.cached.torrent");
+        fs::write(&safe_cache_path, test_torrent_bytes()).unwrap();
+        fs::write(&unshared_cache_path, test_torrent_bytes()).unwrap();
+        fs::write(&fresh_cache_path, test_torrent_bytes()).unwrap();
+        fs::write(&unsafe_cache_path, test_torrent_bytes()).unwrap();
+        set_file_mtime_ms(&unshared_cache_path, 80_000);
+        set_file_mtime_ms(&fresh_cache_path, 95_000);
+        let mut safe_candidate = preexisting_indexer_candidate();
+        safe_candidate.guid = CandidateGuid::new("guid-stale-safe").unwrap();
+        safe_candidate.torrent_cache_path = Some(safe_cache_path.clone());
+        let safe_id = repository
+            .upsert_remote_candidate(&safe_candidate)
+            .await
+            .unwrap();
+        let mut retained_safe_candidate = preexisting_indexer_candidate();
+        retained_safe_candidate.guid = CandidateGuid::new("guid-retained-safe").unwrap();
+        retained_safe_candidate.torrent_cache_path = Some(safe_cache_path.clone());
+        let retained_safe_id = repository
+            .upsert_remote_candidate(&retained_safe_candidate)
+            .await
+            .unwrap();
+        let mut unshared_candidate = preexisting_indexer_candidate();
+        unshared_candidate.guid = CandidateGuid::new("guid-stale-unshared").unwrap();
+        unshared_candidate.torrent_cache_path = Some(unshared_cache_path.clone());
+        let unshared_id = repository
+            .upsert_remote_candidate(&unshared_candidate)
+            .await
+            .unwrap();
+        let mut fresh_candidate = preexisting_indexer_candidate();
+        fresh_candidate.guid = CandidateGuid::new("guid-stale-fresh").unwrap();
+        fresh_candidate.torrent_cache_path = Some(fresh_cache_path.clone());
+        let fresh_id = repository
+            .upsert_remote_candidate(&fresh_candidate)
+            .await
+            .unwrap();
+        let mut unsafe_candidate = preexisting_indexer_candidate();
+        unsafe_candidate.guid = CandidateGuid::new("guid-stale-unsafe").unwrap();
+        unsafe_candidate.torrent_cache_path = Some(unsafe_cache_path.clone());
+        let unsafe_id = repository
+            .upsert_remote_candidate(&unsafe_candidate)
+            .await
+            .unwrap();
+        for id in [safe_id, unshared_id, fresh_id, unsafe_id] {
+            sqlx::query("UPDATE remote_candidates SET last_seen_at = 80_000 WHERE id = ?")
+                .bind(i64::try_from(id.get()).unwrap())
+                .execute(repository.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE remote_candidates SET last_seen_at = 99_000 WHERE id = ?")
+            .bind(i64::try_from(retained_safe_id.get()).unwrap())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+
+        let summary = cleanup_stale_remote_candidates(
+            &runtime.state,
+            100_000,
+            &runtime.state.shutdown_signal,
+        )
+        .await
+        .unwrap();
+        let candidate_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_candidates")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            RemoteCandidateCleanupSummary {
+                deleted: 4,
+                cache_files_deleted: 1,
+                cache_file_delete_failures: 0,
+            },
+            summary
+        );
+        assert_eq!(1, candidate_count);
+        assert!(safe_cache_path.exists());
+        assert!(!unshared_cache_path.exists());
+        assert!(fresh_cache_path.exists());
+        assert!(unsafe_cache_path.exists());
+    }
+
+    #[tokio::test]
+    async fn remote_candidate_cleanup_sweeps_unreferenced_canonical_cache_files() {
+        let root = unique_temp_dir("remote-candidate-orphan-sweep");
+        let mut config = readiness_config(&root);
+        config.announce.remote_candidate_retention_secs = 10;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let orphan_cache_path = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("0123456789abcdef0123456789abcdef01234567.cached.torrent");
+        let referenced_cache_path = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("fedcba9876543210fedcba9876543210fedcba98.cached.torrent");
+        let noncanonical_path = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("not-a-cache.torrent");
+        fs::write(&orphan_cache_path, test_torrent_bytes()).unwrap();
+        fs::write(&referenced_cache_path, test_torrent_bytes()).unwrap();
+        fs::write(&noncanonical_path, test_torrent_bytes()).unwrap();
+        set_file_mtime_ms(&orphan_cache_path, 80_000);
+        set_file_mtime_ms(&referenced_cache_path, 80_000);
+        set_file_mtime_ms(&noncanonical_path, 80_000);
+        let mut retained = preexisting_indexer_candidate();
+        retained.guid = CandidateGuid::new("guid-retained-cache").unwrap();
+        retained.torrent_cache_path = Some(referenced_cache_path.clone());
+        repository.upsert_remote_candidate(&retained).await.unwrap();
+
+        let summary = cleanup_stale_remote_candidates(
+            &runtime.state,
+            100_000,
+            &runtime.state.shutdown_signal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            RemoteCandidateCleanupSummary {
+                deleted: 0,
+                cache_files_deleted: 1,
+                cache_file_delete_failures: 0,
+            },
+            summary
+        );
+        assert!(!orphan_cache_path.exists());
+        assert!(referenced_cache_path.exists());
+        assert!(noncanonical_path.exists());
+    }
+
+    #[tokio::test]
+    async fn remote_candidate_orphan_sweep_limit_applies_to_deleted_files() {
+        let root = unique_temp_dir("remote-candidate-orphan-sweep-limit");
+        let config = readiness_config(&root);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let first_referenced = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("0000000000000000000000000000000000000000.cached.torrent");
+        let second_referenced = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("1111111111111111111111111111111111111111.cached.torrent");
+        let orphan = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("ffffffffffffffffffffffffffffffffffffffff.cached.torrent");
+        for path in [&first_referenced, &second_referenced, &orphan] {
+            fs::write(path, test_torrent_bytes()).unwrap();
+            set_file_mtime_ms(path, 80_000);
+        }
+        for (guid, path) in [
+            ("guid-first-reference", &first_referenced),
+            ("guid-second-reference", &second_referenced),
+        ] {
+            let mut retained = preexisting_indexer_candidate();
+            retained.guid = CandidateGuid::new(guid).unwrap();
+            retained.torrent_cache_path = Some(path.clone());
+            repository.upsert_remote_candidate(&retained).await.unwrap();
+        }
+
+        let summary = cleanup_orphaned_candidate_cache_files(
+            &repository,
+            &runtime.state.config.paths.torrent_cache_dir,
+            90_000,
+            1,
+            &runtime.state.shutdown_signal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            RemoteCandidateCleanupSummary {
+                deleted: 0,
+                cache_files_deleted: 1,
+                cache_file_delete_failures: 0,
+            },
+            summary
+        );
+        assert!(first_referenced.exists());
+        assert!(second_referenced.exists());
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn remote_candidate_cache_stream_limit_applies_after_reference_checks() {
+        let root = unique_temp_dir("remote-candidate-cache-stream-limit");
+        let config = readiness_config(&root);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let first_referenced = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("0000000000000000000000000000000000000000.cached.torrent");
+        let second_referenced = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("1111111111111111111111111111111111111111.cached.torrent");
+        let orphan = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("ffffffffffffffffffffffffffffffffffffffff.cached.torrent");
+        for path in [&first_referenced, &second_referenced, &orphan] {
+            fs::write(path, test_torrent_bytes()).unwrap();
+            set_file_mtime_ms(path, 80_000);
+        }
+        for (guid, path) in [
+            ("guid-stream-first-reference", &first_referenced),
+            ("guid-stream-second-reference", &second_referenced),
+        ] {
+            let mut retained = preexisting_indexer_candidate();
+            retained.guid = CandidateGuid::new(guid).unwrap();
+            retained.torrent_cache_path = Some(path.clone());
+            repository.upsert_remote_candidate(&retained).await.unwrap();
+        }
+        let (sender, mut receiver) = mpsc::channel(3);
+        for path in [&first_referenced, &second_referenced, &orphan] {
+            sender
+                .send(CandidateCacheFile {
+                    path: path.clone(),
+                    mtime_ms: 80_000,
+                })
+                .await
+                .unwrap();
+        }
+        drop(sender);
+
+        let summary = cleanup_candidate_cache_file_stream(
+            &repository,
+            &mut receiver,
+            90_000,
+            1,
+            &runtime.state.shutdown_signal,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            RemoteCandidateCleanupSummary {
+                deleted: 0,
+                cache_files_deleted: 1,
+                cache_file_delete_failures: 0,
+            },
+            summary
+        );
+        assert!(first_referenced.exists());
+        assert!(second_referenced.exists());
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn remote_candidate_orphan_sweep_keeps_fresh_cache_files() {
+        let root = unique_temp_dir("remote-candidate-orphan-sweep-fresh");
+        let config = readiness_config(&root);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let old_orphan = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("0123456789abcdef0123456789abcdef01234567.cached.torrent");
+        let fresh_orphan = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("fedcba9876543210fedcba9876543210fedcba98.cached.torrent");
+        fs::write(&old_orphan, test_torrent_bytes()).unwrap();
+        fs::write(&fresh_orphan, test_torrent_bytes()).unwrap();
+        set_file_mtime_ms(&old_orphan, 80_000);
+        set_file_mtime_ms(&fresh_orphan, 95_000);
+
+        let summary = cleanup_orphaned_candidate_cache_files(
+            &repository,
+            &runtime.state.config.paths.torrent_cache_dir,
+            90_000,
+            10,
+            &runtime.state.shutdown_signal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            RemoteCandidateCleanupSummary {
+                deleted: 0,
+                cache_files_deleted: 1,
+                cache_file_delete_failures: 0,
+            },
+            summary
+        );
+        assert!(!old_orphan.exists());
+        assert!(fresh_orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn remote_candidate_cache_delete_waits_for_locked_writer_refresh() {
+        let root = unique_temp_dir("remote-candidate-cache-delete-lock");
+        let config = readiness_config(&root);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let cache_path = runtime
+            .state
+            .config
+            .paths
+            .torrent_cache_dir
+            .join("0123456789abcdef0123456789abcdef01234567.cached.torrent");
+        fs::write(&cache_path, test_torrent_bytes()).unwrap();
+        set_file_mtime_ms(&cache_path, 80_000);
+        let cleanup_repository = repository.clone();
+        let cleanup_path = cache_path.clone();
+
+        let cleanup = with_cached_torrent_path_lock(&cache_path, || {
+            let cleanup = tokio::spawn(async move {
+                remove_unreferenced_stale_candidate_cache_file(
+                    &cleanup_repository,
+                    cleanup_path,
+                    90_000,
+                )
+                .await
+            });
+            set_file_mtime_ms(&cache_path, 95_000);
+            cleanup
+        });
+        let removed = cleanup.await.unwrap().unwrap().unwrap();
+
+        assert!(!removed);
+        assert!(cache_path.exists());
+    }
+
+    #[tokio::test]
+    async fn remote_candidate_cleanup_stops_before_work_after_shutdown() {
+        let root = unique_temp_dir("remote-candidate-cleanup-shutdown");
+        let mut config = readiness_config(&root);
+        config.announce.remote_candidate_retention_secs = 10;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let mut candidate = preexisting_indexer_candidate();
+        candidate.guid = CandidateGuid::new("guid-stale-shutdown").unwrap();
+        let candidate_id = repository
+            .upsert_remote_candidate(&candidate)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE remote_candidates SET last_seen_at = 80_000 WHERE id = ?")
+            .bind(i64::try_from(candidate_id.get()).unwrap())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        runtime.state.shutdown.cancel_now("test shutdown").unwrap();
+
+        let result = cleanup_stale_remote_candidates(
+            &runtime.state,
+            100_000,
+            &runtime.state.shutdown_signal,
+        )
+        .await;
+        let candidate_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_candidates")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(Err(SCHEDULER_SHUTDOWN_ERROR.to_owned()), result);
+        assert_eq!(1, candidate_count);
+    }
+
+    #[tokio::test]
     async fn scheduled_indexer_caps_stops_on_shutdown() {
         let caps_requests = Arc::new(AtomicUsize::new(0));
         let indexer_url =
@@ -7510,6 +8252,16 @@ mod tests {
             std::env::temp_dir().join(format!("sporos-{label}-{}-{unique}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn set_file_mtime_ms(path: &Path, mtime_ms: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_accessed(UNIX_EPOCH + Duration::from_millis(mtime_ms))
+                .set_modified(UNIX_EPOCH + Duration::from_millis(mtime_ms)),
+        )
+        .unwrap();
     }
 
     fn readiness_config(root: &Path) -> SporosConfig {

@@ -373,6 +373,7 @@ pub struct AnnounceQueueConfig {
     pub retry_jitter_ratio: f64,
     pub success_retention_secs: u64,
     pub failure_retention_secs: u64,
+    pub remote_candidate_retention_secs: u64,
 }
 
 impl Default for AnnounceQueueConfig {
@@ -389,6 +390,7 @@ impl Default for AnnounceQueueConfig {
             retry_jitter_ratio: 0.2,
             success_retention_secs: 604_800,
             failure_retention_secs: 1_209_600,
+            remote_candidate_retention_secs: 2_592_000,
         }
     }
 }
@@ -405,6 +407,10 @@ impl AnnounceQueueConfig {
         require_nonzero("retry_max_delay_secs", self.retry_max_delay_secs)?;
         require_nonzero("success_retention_secs", self.success_retention_secs)?;
         require_nonzero("failure_retention_secs", self.failure_retention_secs)?;
+        require_nonzero(
+            "remote_candidate_retention_secs",
+            self.remote_candidate_retention_secs,
+        )?;
 
         if u32::from(self.claim_batch_size) > self.max_pending {
             return Err(config_error(

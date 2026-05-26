@@ -3334,6 +3334,127 @@ async fn terminal_announce_cleanup_uses_success_and_failure_retention() {
 }
 
 #[tokio::test]
+async fn stale_remote_candidate_cleanup_is_bounded_and_preserves_recent_decisions() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let stale_path = PathBuf::from("/cache/stale.cached.torrent");
+    let mut stale = test_remote_candidate("guid-stale", "Stale Candidate");
+    stale.torrent_cache_path = Some(stale_path.clone());
+    let stale_id = repository.upsert_remote_candidate(&stale).await.unwrap();
+    let mut retained_shared_cache = test_remote_candidate("guid-retained-shared-cache", "Retained");
+    retained_shared_cache.torrent_cache_path = Some(stale_path.clone());
+    let retained_shared_cache_id = repository
+        .upsert_remote_candidate(&retained_shared_cache)
+        .await
+        .unwrap();
+    let mut stale_without_cache = test_remote_candidate("guid-stale-no-cache", "No Cache");
+    stale_without_cache.torrent_cache_path = None;
+    let stale_without_cache_id = repository
+        .upsert_remote_candidate(&stale_without_cache)
+        .await
+        .unwrap();
+    let mut stale_old_decision = test_remote_candidate("guid-stale-old-decision", "Old Decision");
+    stale_old_decision.torrent_cache_path = Some(PathBuf::from("/cache/old.cached.torrent"));
+    let stale_old_decision_id = repository
+        .upsert_remote_candidate(&stale_old_decision)
+        .await
+        .unwrap();
+    let mut stale_recent_decision =
+        test_remote_candidate("guid-stale-recent-decision", "Recent Decision");
+    stale_recent_decision.torrent_cache_path = Some(PathBuf::from("/cache/recent.cached.torrent"));
+    let stale_recent_decision_id = repository
+        .upsert_remote_candidate(&stale_recent_decision)
+        .await
+        .unwrap();
+    let mut recently_seen = test_remote_candidate("guid-recently-seen", "Recently Seen");
+    recently_seen.torrent_cache_path = Some(PathBuf::from("/cache/seen.cached.torrent"));
+    let recently_seen_id = repository
+        .upsert_remote_candidate(&recently_seen)
+        .await
+        .unwrap();
+    for (id, last_seen_at) in [
+        (stale_id, 900_i64),
+        (stale_without_cache_id, 910),
+        (stale_old_decision_id, 920),
+        (stale_recent_decision_id, 930),
+        (recently_seen_id, 1_100),
+        (retained_shared_cache_id, 1_100),
+    ] {
+        sqlx::query("UPDATE remote_candidates SET last_seen_at = ? WHERE id = ?")
+            .bind(last_seen_at)
+            .bind(i64_from_u64(id.get(), "remote candidate id").unwrap())
+            .execute(repository.pool())
+            .await
+            .unwrap();
+    }
+    let item_id = repository
+        .upsert_local_item_with_files(&test_local_item("Matched"), &[])
+        .await
+        .unwrap();
+    let assessment = CandidateAssessment {
+        decision: MatchDecision::NoMatch,
+        reason: DecisionReason::NameMismatch,
+        matched_size: None,
+        matched_ratio: None,
+    };
+    repository
+        .record_match_decision(item_id, stale_old_decision_id, assessment, 950)
+        .await
+        .unwrap();
+    repository
+        .record_match_decision(item_id, stale_recent_decision_id, assessment, 1_050)
+        .await
+        .unwrap();
+
+    let first_batch = repository
+        .cleanup_stale_remote_candidates_batch(1_000, 1_000, 2)
+        .await
+        .unwrap();
+    let second_batch = repository
+        .cleanup_stale_remote_candidates_batch(1_000, 1_000, 2)
+        .await
+        .unwrap();
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT guid FROM remote_candidates ORDER BY guid")
+            .fetch_all(repository.pool())
+            .await
+            .unwrap();
+    let decision_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM match_decisions")
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        vec![
+            DeletedRemoteCandidate {
+                id: stale_id,
+                torrent_cache_path: None,
+            },
+            DeletedRemoteCandidate {
+                id: stale_without_cache_id,
+                torrent_cache_path: None,
+            },
+        ],
+        first_batch
+    );
+    assert_eq!(
+        vec![DeletedRemoteCandidate {
+            id: stale_old_decision_id,
+            torrent_cache_path: Some(PathBuf::from("/cache/old.cached.torrent")),
+        }],
+        second_batch
+    );
+    assert_eq!(
+        vec![
+            "guid-recently-seen".to_owned(),
+            "guid-retained-shared-cache".to_owned(),
+            "guid-stale-recent-decision".to_owned(),
+        ],
+        remaining
+    );
+    assert_eq!(1, decision_count);
+}
+
+#[tokio::test]
 async fn terminal_announce_cleanup_uses_retention_indexes() {
     let repository = Repository::connect_in_memory().await.unwrap();
     for (query, index_name) in [
@@ -3391,6 +3512,49 @@ async fn terminal_announce_cleanup_uses_retention_indexes() {
             "retention cleanup should use a retention index: {plan:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn stale_remote_candidate_cleanup_uses_last_seen_index() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let plan = explain_query_plan_raw(
+        &repository,
+        r#"
+        SELECT id, torrent_cache_path
+        FROM remote_candidates
+        WHERE last_seen_at <= 10000
+          AND NOT EXISTS (
+              SELECT 1
+              FROM match_decisions
+              WHERE candidate_id = remote_candidates.id
+                AND assessed_at > 10000
+          )
+        ORDER BY last_seen_at, id
+        LIMIT 100
+        "#,
+    )
+    .await;
+
+    assert!(
+        !plan
+            .iter()
+            .any(|detail| detail.contains("SCAN remote_candidates")),
+        "remote candidate cleanup should not scan remote_candidates: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|detail| detail.contains("USE TEMP B-TREE")),
+        "remote candidate cleanup should not sort with a temp b-tree: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_remote_candidates_last_seen_at")),
+        "remote candidate cleanup should use last_seen_at index: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_match_decisions_candidate_assessed_at")),
+        "remote candidate cleanup should seek recent decisions by candidate and assessed_at: {plan:?}"
+    );
 }
 
 #[tokio::test]

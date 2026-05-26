@@ -377,6 +377,12 @@ pub struct RemoteCandidateCacheMaterial {
     pub torrent_cache_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DeletedRemoteCandidate {
+    pub id: RemoteCandidateId,
+    pub torrent_cache_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchDecisionSnapshot {
     pub candidate_id: RemoteCandidateId,
@@ -1511,6 +1517,104 @@ impl Repository {
 
         row.map(remote_candidate_cache_material_from_row)
             .transpose()
+    }
+
+    pub async fn cleanup_stale_remote_candidates_batch(
+        &self,
+        last_seen_cutoff_ms: i64,
+        decision_cutoff_ms: i64,
+        limit: u16,
+    ) -> Result<Vec<DeletedRemoteCandidate>, DatabaseError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("begin stale remote candidate cleanup", error))?;
+        let rows = sqlx::query(
+            r#"
+            SELECT id, torrent_cache_path
+            FROM remote_candidates
+            WHERE last_seen_at <= ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM match_decisions
+                  WHERE candidate_id = remote_candidates.id
+                    AND assessed_at > ?
+              )
+            ORDER BY last_seen_at, id
+            LIMIT ?
+            "#,
+        )
+        .bind(last_seen_cutoff_ms)
+        .bind(decision_cutoff_ms)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|error| db_error("read stale remote candidates", error))?;
+        if rows.is_empty() {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| db_error("commit stale remote candidate cleanup", error))?;
+            return Ok(Vec::new());
+        }
+
+        let mut deleted = Vec::with_capacity(rows.len());
+        let mut candidate_paths = Vec::with_capacity(rows.len());
+        let mut delete = QueryBuilder::new("DELETE FROM remote_candidates WHERE id IN (");
+        let mut separated = delete.separated(", ");
+        for row in rows {
+            let id: i64 = row.get("id");
+            let torrent_cache_path = row.get::<Option<String>, _>("torrent_cache_path");
+            separated.push_bind(id);
+            deleted.push(DeletedRemoteCandidate {
+                id: remote_id_from_i64(id, "remote candidate id")?,
+                torrent_cache_path: torrent_cache_path.as_ref().map(PathBuf::from),
+            });
+            candidate_paths.push(torrent_cache_path);
+        }
+        separated.push_unseparated(")");
+        delete
+            .build()
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| db_error("delete stale remote candidates", error))?;
+        for (candidate, path) in deleted.iter_mut().zip(candidate_paths.iter()) {
+            let Some(path) = path else {
+                continue;
+            };
+            let remaining_reference: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM remote_candidates WHERE torrent_cache_path = ? LIMIT 1",
+            )
+            .bind(path)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| db_error("read retained remote candidate cache reference", error))?;
+            if remaining_reference.is_some() {
+                candidate.torrent_cache_path = None;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit stale remote candidate cleanup", error))?;
+
+        Ok(deleted)
+    }
+
+    pub async fn remote_candidate_cache_path_is_referenced(
+        &self,
+        path: &Path,
+    ) -> Result<bool, DatabaseError> {
+        let referenced: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM remote_candidates WHERE torrent_cache_path = ? LIMIT 1",
+        )
+        .bind(path_to_string(path))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read remote candidate cache reference", error))?;
+
+        Ok(referenced.is_some())
     }
 
     pub async fn match_decisions_for_local_item(

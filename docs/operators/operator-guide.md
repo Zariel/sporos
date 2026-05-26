@@ -178,6 +178,7 @@ retry_max_delay_secs = 3600
 retry_jitter_ratio = 0.2
 success_retention_secs = 604800
 failure_retention_secs = 1209600
+remote_candidate_retention_secs = 2592000
 ```
 
 Supported torrent clients are qBittorrent and rTorrent.
@@ -298,15 +299,21 @@ refresh applies additions, updates, or deactivations.
 The daemon persists supported scheduler jobs in SQLite and enqueues due runs
 through bounded in-memory queues. Supported scheduled jobs are:
 
-- `cleanup`: runs local maintenance for durable announce work, including stale
-  lease recovery, TTL expiry, and retained terminal row cleanup.
+- `cleanup`: runs local maintenance for durable announce work and search state,
+  including stale lease recovery, TTL expiry, retained terminal row cleanup, and
+  stale remote candidate/torrent cache cleanup.
 - `indexer_caps`: refreshes imported indexer capability metadata.
 
 `[scheduling].cleanup_interval` controls how often the cleanup job is due. The
 default is `24h`, which is usually enough for low-volume deployments. Shorten
-it when operators need expired or retained announce work removed more quickly;
-lengthen it when status history should remain visible longer and the queue is
-not growing.
+it when operators need expired or retained announce work, stale remote
+candidates, or canonical cached torrent files removed more quickly; lengthen it
+when status and candidate history should remain visible longer and the queue is
+not growing. `[announce].remote_candidate_retention_secs` controls stale remote
+candidate retention. Candidates with recent match decisions may remain longer
+so recent matching history stays available. Cleanup bounds row and canonical
+cache-file growth, but SQLite database files may not shrink immediately after
+deletes because freed pages can be reused by future writes.
 
 `[scheduling].indexer_caps_interval` controls periodic indexer capability
 refresh. `client_inventory_interval` and `saved_retry_interval` control their

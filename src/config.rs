@@ -1823,6 +1823,7 @@ retry_max_delay_secs = 3600
 retry_jitter_ratio = 0.2
 success_retention_secs = 604800
 failure_retention_secs = 1209600
+remote_candidate_retention_secs = 2592000
 "#;
 
 #[cfg(test)]
