@@ -816,6 +816,7 @@ mod tests {
             let (queue, receiver) =
                 notification_queue(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN));
             let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
+            queue.try_enqueue(job.clone()).unwrap();
             queue.try_enqueue(job).unwrap();
             let (controller, signal) = shutdown_channel();
 
@@ -832,6 +833,14 @@ mod tests {
             assert_eq!(1, server.requests().len());
             assert_eq!(0, queue.stats().depth);
             assert_eq!(1, queue.stats().completed);
+            assert_eq!(1, queue.stats().cancelled);
+            let metrics =
+                MetricsRegistry::new().render_prometheus(&crate::metrics::MetricsSnapshot {
+                    queues: vec![queue.stats()],
+                    ..crate::metrics::MetricsSnapshot::default()
+                });
+            assert!(metrics.contains("sporos_queue_completed_total{queue=\"notification\"} 1"));
+            assert!(metrics.contains("sporos_queue_cancelled_total{queue=\"notification\"} 1"));
         }
     }
 

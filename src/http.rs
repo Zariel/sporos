@@ -1686,10 +1686,10 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::domain::{DependencyName, ReasonText};
-    use crate::notifications::{NotificationEndpoint, NotificationEventKind};
+    use crate::notifications::{NotificationEndpoint, NotificationEvent, NotificationEventKind};
     use crate::persistence::repository::Repository;
     use crate::runtime::health::DependencyKind;
-    use crate::runtime::queue::{QueueKind, WorkReceiver, bounded_work_queue};
+    use crate::runtime::queue::{EnqueueError, QueueKind, WorkReceiver, bounded_work_queue};
 
     #[test]
     fn bearer_auth_validates_prefix_and_token() {
@@ -1818,6 +1818,7 @@ mod tests {
         ));
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/status")
@@ -1863,6 +1864,7 @@ mod tests {
         let app = router(state);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/status")
@@ -1887,8 +1889,29 @@ mod tests {
             bounded_work_queue(QueueKind::Announcement, nonzero(11));
         let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(12));
         let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(13));
-        let (notifications, _notification_receiver) =
-            bounded_work_queue::<NotificationJob>(QueueKind::Notification, nonzero(14));
+        let (notifications, mut notification_receiver) =
+            bounded_work_queue::<NotificationJob>(QueueKind::Notification, nonzero(1));
+        let notification_endpoint = NotificationEndpoint::new(
+            DependencyName::new("ops").unwrap(),
+            "https://hooks.example/ops",
+        );
+        notifications
+            .try_enqueue(NotificationJob::new(
+                notification_endpoint.clone(),
+                NotificationEvent::test(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            notifications
+                .try_enqueue(NotificationJob::new(
+                    notification_endpoint,
+                    NotificationEvent::test(),
+                ))
+                .unwrap_err(),
+            EnqueueError::Full { .. }
+        ));
+        notification_receiver.recv().await.unwrap();
+        notification_receiver.mark_cancelled();
         let state = HttpState::new(ReadinessState::ready(), HealthRegistry::new())
             .with_workflow_queues(WorkflowQueues {
                 announcements,
@@ -1900,6 +1923,7 @@ mod tests {
         let app = router(state);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/status")
@@ -1918,7 +1942,27 @@ mod tests {
         assert_queue_capacity(queues, "announcement", 11);
         assert_queue_capacity(queues, "search", 12);
         assert_queue_capacity(queues, "indexing", 13);
-        assert_queue_capacity(queues, "notification", 14);
+        assert_queue_status(queues, "notification", (1, 0, 1, 1, 0, 1));
+
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        assert!(text.contains("sporos_queue_depth{queue=\"notification\"} 0"));
+        assert!(text.contains("sporos_queue_capacity{queue=\"notification\"} 1"));
+        assert!(text.contains("sporos_queue_enqueued_total{queue=\"notification\"} 1"));
+        assert!(text.contains("sporos_queue_rejected_total{queue=\"notification\"} 1"));
+        assert!(text.contains("sporos_queue_cancelled_total{queue=\"notification\"} 1"));
     }
 
     #[tokio::test]
@@ -2701,11 +2745,30 @@ mod tests {
     }
 
     fn assert_queue_capacity(queues: &[Value], kind: &str, capacity: usize) {
-        let queue = queues
+        let queue = queue_status(queues, kind);
+        assert_eq!(capacity, queue["capacity"]);
+    }
+
+    fn assert_queue_status(
+        queues: &[Value],
+        kind: &str,
+        expected: (usize, usize, u64, u64, u64, u64),
+    ) {
+        let (capacity, depth, accepted, rejected, completed, cancelled) = expected;
+        let queue = queue_status(queues, kind);
+        assert_eq!(capacity, queue["capacity"]);
+        assert_eq!(depth, queue["depth"]);
+        assert_eq!(accepted, queue["accepted"]);
+        assert_eq!(rejected, queue["rejected"]);
+        assert_eq!(completed, queue["completed"]);
+        assert_eq!(cancelled, queue["cancelled"]);
+    }
+
+    fn queue_status<'a>(queues: &'a [Value], kind: &str) -> &'a Value {
+        queues
             .iter()
             .find(|queue| queue["kind"] == kind)
-            .unwrap_or_else(|| panic!("missing queue status for {kind}"));
-        assert_eq!(capacity, queue["capacity"]);
+            .unwrap_or_else(|| panic!("missing queue status for {kind}"))
     }
 
     fn nonzero(value: usize) -> NonZeroUsize {
