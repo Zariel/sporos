@@ -2,6 +2,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::secrets::sanitize_url_for_logging;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DomainError {
     EmptyField { field: &'static str },
@@ -350,7 +352,7 @@ impl LocalFile {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct RemoteCandidate {
     pub id: Option<RemoteCandidateId>,
     pub indexer_id: IndexerId,
@@ -362,6 +364,28 @@ pub struct RemoteCandidate {
     pub published_at_ms: Option<i64>,
     pub info_hash: Option<InfoHash>,
     pub torrent_cache_path: Option<PathBuf>,
+}
+
+impl fmt::Debug for RemoteCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let guid = sanitize_url_for_logging(self.guid.as_str());
+        let download_url = sanitize_url_for_logging(self.download_url.as_str());
+        let title = sanitize_url_for_logging(self.title.as_str());
+        let tracker = sanitize_url_for_logging(self.tracker.as_str());
+        formatter
+            .debug_struct("RemoteCandidate")
+            .field("id", &self.id)
+            .field("indexer_id", &self.indexer_id)
+            .field("guid", &guid)
+            .field("download_url", &download_url)
+            .field("title", &title)
+            .field("tracker", &tracker)
+            .field("size", &self.size)
+            .field("published_at_ms", &self.published_at_ms)
+            .field("info_hash", &self.info_hash)
+            .field("torrent_cache_path", &self.torrent_cache_path)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -582,7 +606,11 @@ fn file_name_from_relative_path(
 }
 
 pub mod dto {
-    #[derive(Debug, Clone, Eq, PartialEq)]
+    use std::fmt;
+
+    use crate::secrets::sanitize_url_for_logging;
+
+    #[derive(Clone, Eq, PartialEq)]
     pub struct AnnouncementRequest {
         pub name: String,
         pub guid: String,
@@ -592,7 +620,25 @@ pub mod dto {
         pub size: Option<u64>,
     }
 
-    #[derive(Debug, Clone, Eq, PartialEq)]
+    impl fmt::Debug for AnnouncementRequest {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let name = sanitize_url_for_logging(&self.name);
+            let guid = sanitize_url_for_logging(&self.guid);
+            let download_url = sanitize_url_for_logging(&self.download_url);
+            let tracker = sanitize_url_for_logging(&self.tracker);
+            formatter
+                .debug_struct("AnnouncementRequest")
+                .field("name", &name)
+                .field("guid", &guid)
+                .field("download_url", &download_url)
+                .field("tracker", &tracker)
+                .field("cookie", &self.cookie.as_ref().map(|_cookie| "[REDACTED]"))
+                .field("size", &self.size)
+                .finish()
+        }
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
     pub struct RemoteCandidate {
         pub indexer_id: u64,
         pub guid: String,
@@ -602,6 +648,26 @@ pub mod dto {
         pub size: Option<u64>,
         pub published_at_ms: Option<i64>,
         pub info_hash: Option<String>,
+    }
+
+    impl fmt::Debug for RemoteCandidate {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let guid = sanitize_url_for_logging(&self.guid);
+            let download_url = sanitize_url_for_logging(&self.download_url);
+            let title = sanitize_url_for_logging(&self.title);
+            let tracker = sanitize_url_for_logging(&self.tracker);
+            formatter
+                .debug_struct("RemoteCandidate")
+                .field("indexer_id", &self.indexer_id)
+                .field("guid", &guid)
+                .field("download_url", &download_url)
+                .field("title", &title)
+                .field("tracker", &tracker)
+                .field("size", &self.size)
+                .field("published_at_ms", &self.published_at_ms)
+                .field("info_hash", &self.info_hash)
+                .finish()
+        }
     }
 }
 
@@ -681,6 +747,80 @@ mod tests {
         }
         assert_eq!(None, DependencyKind::from_persisted("client"));
         assert_eq!(None, DependencyKind::from_persisted("unknown"));
+    }
+
+    #[test]
+    fn remote_candidate_debug_redacts_secret_bearing_fields() {
+        let candidate = RemoteCandidate {
+            id: Some(RemoteCandidateId::new(1).unwrap()),
+            indexer_id: IndexerId::new(2).unwrap(),
+            guid: CandidateGuid::new("https://tracker.example/guid?token=guid-secret").unwrap(),
+            download_url: DownloadUrl::new(
+                "https://tracker.example/download?authkey=url-secret&torrent_pass=other-secret",
+            )
+            .unwrap(),
+            title: ItemTitle::new("https://tracker.example/title?apikey=title-secret").unwrap(),
+            tracker: TrackerName::new("https://tracker.example/api?passkey=tracker-secret")
+                .unwrap(),
+            size: Some(ByteSize::new(42)),
+            published_at_ms: Some(100),
+            info_hash: None,
+            torrent_cache_path: None,
+        };
+
+        let debug = format!("{candidate:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        for secret in [
+            "guid-secret",
+            "url-secret",
+            "other-secret",
+            "title-secret",
+            "tracker-secret",
+        ] {
+            assert!(!debug.contains(secret), "{secret} leaked in {debug}");
+        }
+    }
+
+    #[test]
+    fn dto_debug_redacts_secret_bearing_fields() {
+        let announcement = dto::AnnouncementRequest {
+            name: "https://tracker.example/name?apikey=name-secret".to_owned(),
+            guid: "https://tracker.example/guid?token=guid-secret".to_owned(),
+            download_url:
+                "https://tracker.example/download?authkey=url-secret&torrent_pass=other-secret"
+                    .to_owned(),
+            tracker: "https://tracker.example/api?passkey=tracker-secret".to_owned(),
+            cookie: Some("sid=cookie-secret".to_owned()),
+            size: Some(42),
+        };
+        let candidate = dto::RemoteCandidate {
+            indexer_id: 1,
+            guid: "https://tracker.example/guid?token=guid-secret".to_owned(),
+            download_url:
+                "https://tracker.example/download?authkey=url-secret&torrent_pass=other-secret"
+                    .to_owned(),
+            title: "https://tracker.example/title?apikey=title-secret".to_owned(),
+            tracker: "https://tracker.example/api?passkey=tracker-secret".to_owned(),
+            size: Some(42),
+            published_at_ms: None,
+            info_hash: None,
+        };
+
+        let debug = format!("{announcement:?} {candidate:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        for secret in [
+            "name-secret",
+            "guid-secret",
+            "url-secret",
+            "other-secret",
+            "tracker-secret",
+            "cookie-secret",
+            "title-secret",
+        ] {
+            assert!(!debug.contains(secret), "{secret} leaked in {debug}");
+        }
     }
 
     #[test]

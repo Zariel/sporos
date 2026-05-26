@@ -13,6 +13,7 @@ use crate::persistence::repository::{
 };
 use crate::runtime::health::DependencyHealthSnapshot;
 use crate::runtime::queue::QueueStats;
+use crate::secrets::sanitize_url_for_logging;
 
 #[derive(Clone)]
 pub struct MetricsRegistry {
@@ -684,20 +685,37 @@ fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto
             register(&registry, Box::new(announce_worker_busy.clone()));
             register(&registry, Box::new(announce_worker_idle.clone()));
         }
+        let mut announce_work_counts = BTreeMap::<(String, String), i64>::new();
         for count in &queue.status_counts {
+            let status = sanitized_label(&count.status);
+            let reason = sanitized_label(&count.reason);
+            let total = announce_work_counts.entry((status, reason)).or_insert(0);
+            *total = total.saturating_add(count.count);
+        }
+        for ((status, reason), count) in announce_work_counts {
             announce_work
-                .with_label_values(&[&count.status, &count.reason])
-                .set(count.count);
+                .with_label_values(&[status.as_str(), reason.as_str()])
+                .set(count);
         }
         for count in &queue.attempt_counts {
+            let outcome_class = sanitized_label(&count.outcome_class);
             announce_attempts
-                .with_label_values(&[&count.outcome_class])
+                .with_label_values(&[outcome_class.as_str()])
                 .inc_by(i64_to_u64_floor(count.attempts));
         }
+        let mut dependency_wait_counts = BTreeMap::<(String, String), i64>::new();
         for count in &queue.dependency_wait_counts {
+            let dependency_kind = sanitized_label(&count.dependency_kind);
+            let dependency_name = sanitized_label(&count.dependency_name);
+            let total = dependency_wait_counts
+                .entry((dependency_kind, dependency_name))
+                .or_insert(0);
+            *total = total.saturating_add(count.count);
+        }
+        for ((dependency_kind, dependency_name), count) in dependency_wait_counts {
             announce_dependency_wait
-                .with_label_values(&[&count.dependency_kind, &count.dependency_name])
-                .set(count.count);
+                .with_label_values(&[dependency_kind.as_str(), dependency_name.as_str()])
+                .set(count);
         }
     }
 
@@ -796,6 +814,10 @@ fn register(registry: &Registry, metric: Box<dyn prometheus::core::Collector>) {
 
 fn ms_to_seconds(value_ms: u64) -> f64 {
     value_ms as f64 / 1_000.0
+}
+
+fn sanitized_label(value: &str) -> String {
+    sanitize_url_for_logging(value).to_string()
 }
 
 fn i64_from_usize(value: usize) -> i64 {
@@ -943,6 +965,62 @@ mod tests {
                 .contains("sporos_job_last_duration_seconds{job=\"rss\",state=\"succeeded\"} 1.5")
         );
         assert!(output.contains("sporos_metrics_snapshot_error{source=\"announce_work\"} 1"));
+    }
+
+    #[test]
+    fn announce_metrics_redact_secret_bearing_snapshot_labels() {
+        let registry = MetricsRegistry::new();
+        let snapshot = MetricsSnapshot {
+            announce_queue: Some(AnnounceQueueSnapshot {
+                active_count: 1,
+                oldest_active_age_ms: None,
+                next_retry_delay_ms: None,
+                running_leases: 0,
+                status_counts: vec![
+                    AnnounceStatusCount {
+                        status: "queued".to_owned(),
+                        reason: "https://tracker.example/status?passkey=status-secret".to_owned(),
+                        count: 1,
+                    },
+                    AnnounceStatusCount {
+                        status: "queued".to_owned(),
+                        reason: "https://tracker.example/status?passkey=other-status-secret"
+                            .to_owned(),
+                        count: 2,
+                    },
+                ],
+                attempt_counts: vec![AnnounceAttemptCount {
+                    outcome_class: "https://tracker.example/error?token=attempt-secret".to_owned(),
+                    attempts: 1,
+                }],
+                dependency_wait_counts: vec![
+                    AnnounceDependencyWaitCount {
+                        dependency_kind: "indexer".to_owned(),
+                        dependency_name: "https://tracker.example/wait?cookie=dependency-secret"
+                            .to_owned(),
+                        count: 1,
+                    },
+                    AnnounceDependencyWaitCount {
+                        dependency_kind: "indexer".to_owned(),
+                        dependency_name:
+                            "https://tracker.example/wait?cookie=other-dependency-secret".to_owned(),
+                        count: 2,
+                    },
+                ],
+            }),
+            ..MetricsSnapshot::default()
+        };
+
+        let output = registry.render_prometheus(&snapshot);
+
+        assert!(output.contains("[REDACTED]"));
+        assert!(output.contains("sporos_announce_work_total{reason=\"https://tracker.example/status?passkey=[REDACTED]\",status=\"queued\"} 3"));
+        assert!(output.contains("sporos_announce_dependency_wait_count{dependency_kind=\"indexer\",dependency_name=\"https://tracker.example/wait?cookie=[REDACTED]\"} 3"));
+        assert!(!output.contains("status-secret"));
+        assert!(!output.contains("other-status-secret"));
+        assert!(!output.contains("attempt-secret"));
+        assert!(!output.contains("dependency-secret"));
+        assert!(!output.contains("other-dependency-secret"));
     }
 
     #[test]

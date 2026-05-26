@@ -72,6 +72,7 @@ use crate::runtime::scheduler::{
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
 };
+use crate::secrets::sanitize_url_for_logging;
 use crate::torrent::parse_metafile;
 
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2645,16 +2646,49 @@ async fn process_downloaded_announce_candidate(
     ))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RuntimeAnnounceCandidate {
     candidate: RemoteCandidate,
     cookie_or_fetch: Option<RuntimeAnnounceFetch>,
     attempt_count: u16,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for RuntimeAnnounceCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let title = sanitize_url_for_logging(self.candidate.title.as_str());
+        let tracker = sanitize_url_for_logging(self.candidate.tracker.as_str());
+        let guid = sanitize_url_for_logging(self.candidate.guid.as_str());
+        let download_url = sanitize_url_for_logging(self.candidate.download_url.as_str());
+        formatter
+            .debug_struct("RuntimeAnnounceCandidate")
+            .field("id", &self.candidate.id)
+            .field("indexer_id", &self.candidate.indexer_id)
+            .field("guid", &guid)
+            .field("download_url", &download_url)
+            .field("title", &title)
+            .field("tracker", &tracker)
+            .field("size", &self.candidate.size)
+            .field("published_at_ms", &self.candidate.published_at_ms)
+            .field("info_hash", &self.candidate.info_hash)
+            .field("torrent_cache_path", &self.candidate.torrent_cache_path)
+            .field("cookie_or_fetch", &self.cookie_or_fetch)
+            .field("attempt_count", &self.attempt_count)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 struct RuntimeAnnounceFetch {
     cookie: Option<String>,
+}
+
+impl fmt::Debug for RuntimeAnnounceFetch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeAnnounceFetch")
+            .field("cookie", &self.cookie.as_ref().map(|_cookie| "[REDACTED]"))
+            .finish()
+    }
 }
 
 async fn load_announce_candidate(
@@ -7910,6 +7944,29 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    #[test]
+    fn runtime_announce_candidate_debug_redacts_fetch_secrets() {
+        let info_hash = InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let candidate = RuntimeAnnounceCandidate {
+            candidate: search_candidate(
+                1,
+                "guid-debug",
+                "https://tracker.example/download?id=1&passkey=url-secret",
+                &info_hash,
+            ),
+            cookie_or_fetch: Some(RuntimeAnnounceFetch {
+                cookie: Some("sid=secret-cookie".to_owned()),
+            }),
+            attempt_count: 1,
+        };
+
+        let debug = format!("{candidate:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("url-secret"));
+        assert!(!debug.contains("secret-cookie"));
     }
 
     fn response_with_cookie(

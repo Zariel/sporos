@@ -3801,6 +3801,13 @@ impl Repository {
         &self,
         limit: u16,
     ) -> Result<Vec<AnnounceStatusCount>, DatabaseError> {
+        self.announce_status_counts_limited(Some(limit)).await
+    }
+
+    async fn announce_status_counts_limited(
+        &self,
+        limit: Option<u16>,
+    ) -> Result<Vec<AnnounceStatusCount>, DatabaseError> {
         let mut counts = Vec::new();
         for status in ACTIVE_ANNOUNCE_STATUSES {
             let status = announce_status_key(status);
@@ -3831,13 +3838,31 @@ impl Repository {
                 .then_with(|| left.status.cmp(&right.status))
                 .then_with(|| left.reason.cmp(&right.reason))
         });
-        counts.truncate(usize::from(limit));
+        if let Some(limit) = limit {
+            counts.truncate(usize::from(limit));
+        }
         Ok(counts)
     }
 
     pub async fn announce_queue_snapshot(
         &self,
         limit: u16,
+        now_ms: i64,
+    ) -> Result<AnnounceQueueSnapshot, DatabaseError> {
+        self.announce_queue_snapshot_limited(Some(limit), now_ms)
+            .await
+    }
+
+    pub async fn announce_queue_metrics_snapshot(
+        &self,
+        now_ms: i64,
+    ) -> Result<AnnounceQueueSnapshot, DatabaseError> {
+        self.announce_queue_snapshot_limited(None, now_ms).await
+    }
+
+    async fn announce_queue_snapshot_limited(
+        &self,
+        limit: Option<u16>,
         now_ms: i64,
     ) -> Result<AnnounceQueueSnapshot, DatabaseError> {
         let summary = sqlx::query(
@@ -3877,7 +3902,7 @@ impl Repository {
             oldest_active_age_ms,
             next_retry_delay_ms,
             running_leases,
-            status_counts: self.announce_status_counts(limit).await?,
+            status_counts: self.announce_status_counts_limited(limit).await?,
             attempt_counts,
             dependency_wait_counts,
         })
@@ -3885,10 +3910,11 @@ impl Repository {
 
     async fn active_announce_attempt_counts(
         &self,
-        limit: u16,
+        limit: Option<u16>,
     ) -> Result<Vec<AnnounceAttemptCount>, DatabaseError> {
-        let rows = sqlx::query(
-            r#"
+        let query = match limit {
+            Some(_) => {
+                r#"
             SELECT
                 COALESCE(last_error_class, last_action_outcome, NULLIF(reason, ''), status)
                     AS outcome_class,
@@ -3899,12 +3925,30 @@ impl Repository {
             GROUP BY outcome_class
             ORDER BY attempts DESC, outcome_class
             LIMIT ?
-            "#,
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| db_error("read announce attempt counts", error))?;
+            "#
+            }
+            None => {
+                r#"
+            SELECT
+                COALESCE(last_error_class, last_action_outcome, NULLIF(reason, ''), status)
+                    AS outcome_class,
+                SUM(attempt_count) AS attempts
+            FROM announce_work INDEXED BY idx_announce_work_active_attempt_summary
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+              AND attempt_count > 0
+            GROUP BY outcome_class
+            ORDER BY attempts DESC, outcome_class
+            "#
+            }
+        };
+        let mut query = sqlx::query(query);
+        if let Some(limit) = limit {
+            query = query.bind(i64::from(limit));
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("read announce attempt counts", error))?;
 
         Ok(rows
             .into_iter()
@@ -3917,10 +3961,11 @@ impl Repository {
 
     async fn active_announce_dependency_wait_counts(
         &self,
-        limit: u16,
+        limit: Option<u16>,
     ) -> Result<Vec<AnnounceDependencyWaitCount>, DatabaseError> {
-        let rows = sqlx::query(
-            r#"
+        let query = match limit {
+            Some(_) => {
+                r#"
             SELECT
                 last_dependency_kind AS dependency_kind,
                 last_dependency_name AS dependency_name,
@@ -3932,12 +3977,31 @@ impl Repository {
             GROUP BY dependency_kind, dependency_name
             ORDER BY count DESC, dependency_kind, dependency_name
             LIMIT ?
-            "#,
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| db_error("read announce dependency wait counts", error))?;
+            "#
+            }
+            None => {
+                r#"
+            SELECT
+                last_dependency_kind AS dependency_kind,
+                last_dependency_name AS dependency_name,
+                COUNT(*) AS count
+            FROM announce_work INDEXED BY idx_announce_work_active_dependency
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+              AND last_dependency_kind IS NOT NULL
+              AND last_dependency_name IS NOT NULL
+            GROUP BY dependency_kind, dependency_name
+            ORDER BY count DESC, dependency_kind, dependency_name
+            "#
+            }
+        };
+        let mut query = sqlx::query(query);
+        if let Some(limit) = limit {
+            query = query.bind(i64::from(limit));
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("read announce dependency wait counts", error))?;
 
         Ok(rows
             .into_iter()

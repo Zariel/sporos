@@ -1159,11 +1159,9 @@ async fn post_announcement(
             return error.into_response();
         }
     };
-    let span = info_span!(
-        "http.announcement",
-        tracker = %request.tracker,
-        candidate_guid = %request.guid
-    );
+    let (tracker, candidate_guid) = announcement_span_fields(&request);
+    let span =
+        info_span!("http.announcement", tracker = %tracker, candidate_guid = %candidate_guid);
     if let Some(acceptor) = state.announce_acceptor.as_ref() {
         let response = accept_announcement(&state.metrics, acceptor, request)
             .instrument(span)
@@ -1304,6 +1302,13 @@ fn announcement_work_item(
         last_error_class: None,
         last_redacted_message: None,
     })
+}
+
+fn announcement_span_fields(request: &AnnouncementWorkflowRequest) -> (String, String) {
+    (
+        sanitize_url_for_logging(request.tracker.as_str()).to_string(),
+        sanitize_url_for_logging(request.guid.as_str()).to_string(),
+    )
 }
 
 async fn post_search(
@@ -1593,7 +1598,7 @@ async fn metrics_snapshot(state: &HttpState) -> MetricsSnapshot {
         snapshot.announce_worker_capacity = Some(acceptor.config.worker_concurrency);
         match acceptor
             .repository
-            .announce_queue_snapshot(100, unix_time_ms())
+            .announce_queue_metrics_snapshot(unix_time_ms())
             .await
         {
             Ok(queue) => snapshot.announce_queue = Some(queue),
@@ -1645,12 +1650,12 @@ async fn job_statuses(state: &HttpState) -> (Vec<JobStatusResponse>, Option<&'st
 
 fn job_status_response(job: JobStatusSnapshot) -> JobStatusResponse {
     JobStatusResponse {
-        name: job.name.as_str().to_owned(),
-        state: job.state,
+        name: safe_operator_text(job.name.as_str()),
+        state: safe_operator_text(&job.state),
         last_started_at_ms: job.last_started_at_ms,
         last_finished_at_ms: job.last_finished_at_ms,
         next_run_at_ms: job.next_run_at_ms,
-        last_error: job.last_error,
+        last_error: job.last_error.as_deref().map(safe_operator_text),
     }
 }
 
@@ -1730,10 +1735,10 @@ fn memory_dependency_status(
 ) -> DependencyStatusResponse {
     let state = dependency_state_response(memory);
     DependencyStatusResponse {
-        kind: kind.to_owned(),
-        name: name.to_owned(),
-        state: state.state,
-        reason: state.reason,
+        kind: safe_operator_text(kind),
+        name: safe_operator_text(name),
+        state: safe_operator_text(&state.state),
+        reason: state.reason.as_deref().map(safe_operator_text),
         retry_after_ms: state.retry_after_ms,
         failure_count: 0,
         checked_at_ms: state.checked_at_ms,
@@ -1755,10 +1760,10 @@ fn merged_dependency_status(
         || memory_state.retry_after_ms != persisted_state.retry_after_ms;
 
     DependencyStatusResponse {
-        kind: kind.to_owned(),
-        name: name.to_owned(),
-        state: memory_state.state,
-        reason: memory_state.reason,
+        kind: safe_operator_text(kind),
+        name: safe_operator_text(name),
+        state: safe_operator_text(&memory_state.state),
+        reason: memory_state.reason.as_deref().map(safe_operator_text),
         retry_after_ms: memory_state.retry_after_ms,
         failure_count: persisted.failure_count,
         checked_at_ms: memory_state.checked_at_ms.or(Some(persisted.checked_at_ms)),
@@ -1776,10 +1781,10 @@ fn persisted_dependency_status(
 ) -> DependencyStatusResponse {
     let state = persisted_dependency_state_response(persisted);
     DependencyStatusResponse {
-        kind: kind.to_owned(),
-        name: name.to_owned(),
-        state: state.state,
-        reason: state.reason,
+        kind: safe_operator_text(kind),
+        name: safe_operator_text(name),
+        state: safe_operator_text(&state.state),
+        reason: state.reason.as_deref().map(safe_operator_text),
         retry_after_ms: state.retry_after_ms,
         failure_count: persisted.failure_count,
         checked_at_ms: Some(persisted.checked_at_ms),
@@ -1861,8 +1866,8 @@ fn announce_queue_status_response(
             .status_counts
             .into_iter()
             .map(|count| AnnounceStatusCountResponse {
-                status: count.status,
-                reason: count.reason,
+                status: safe_operator_text(&count.status),
+                reason: safe_operator_text(&count.reason),
                 count: count.count,
             })
             .collect(),
@@ -1870,7 +1875,7 @@ fn announce_queue_status_response(
             .attempt_counts
             .into_iter()
             .map(|count| AnnounceAttemptCountResponse {
-                outcome_class: count.outcome_class,
+                outcome_class: safe_operator_text(&count.outcome_class),
                 attempts: count.attempts,
             })
             .collect(),
@@ -1878,12 +1883,16 @@ fn announce_queue_status_response(
             .dependency_wait_counts
             .into_iter()
             .map(|count| AnnounceDependencyWaitResponse {
-                dependency_kind: count.dependency_kind,
-                dependency_name: count.dependency_name,
+                dependency_kind: safe_operator_text(&count.dependency_kind),
+                dependency_name: safe_operator_text(&count.dependency_name),
                 count: count.count,
             })
             .collect(),
     }
+}
+
+fn safe_operator_text(value: &str) -> String {
+    sanitize_url_for_logging(value).to_string()
 }
 
 async fn readiness_response(state: &HttpState) -> ReadinessResponse {
@@ -1992,6 +2001,28 @@ mod tests {
         assert!(!request_debug.contains("secret"));
         assert!(!request_debug.contains("other"));
         assert!(!request_debug.contains("sid="));
+    }
+
+    #[test]
+    fn announcement_trace_fields_redact_secret_bearing_metadata() {
+        let request = AnnouncementWorkflowRequest {
+            title: ItemTitle::new("Example").unwrap(),
+            guid: CandidateGuid::new("https://tracker.example/guid?passkey=guid-secret").unwrap(),
+            download_url: DownloadUrl::new(
+                "https://tracker.example/download?id=1&authkey=url-secret",
+            )
+            .unwrap(),
+            tracker: TrackerName::new("https://tracker.example/api?apikey=tracker-secret").unwrap(),
+            cookie: Some("sid=secret-cookie".to_owned()),
+            size: None,
+        };
+
+        let (tracker, candidate_guid) = announcement_span_fields(&request);
+
+        assert!(tracker.contains("[REDACTED]"));
+        assert!(candidate_guid.contains("[REDACTED]"));
+        assert!(!tracker.contains("tracker-secret"));
+        assert!(!candidate_guid.contains("guid-secret"));
     }
 
     #[tokio::test]
@@ -2817,6 +2848,8 @@ mod tests {
         );
         assert_eq!(true, status_json["readiness"]["accepting_work"]);
         assert_eq!(true, status_json["readiness"]["processing_ready"]);
+        let status_text = std::str::from_utf8(&status_body).unwrap();
+        assert_omits_fetch_secrets(status_text);
 
         let metrics_response = app
             .oneshot(
@@ -2839,6 +2872,207 @@ mod tests {
                 .contains("sporos_announce_work_total{reason=\"accepted\",status=\"queued\"} 1")
         );
         assert!(!metrics_text.contains("secret"));
+        assert_omits_fetch_secrets(metrics_text);
+    }
+
+    #[tokio::test]
+    async fn announcement_validation_errors_omit_fetch_secrets() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let app = announce_app(repository, None, AnnounceQueueConfig::default());
+
+        let response = app
+            .oneshot(json_post(
+                "/v1/announcements",
+                serde_json::json!({
+                    "name": "Example",
+                    "guid": "guid-1",
+                    "download_url": "https://user:password-secret@tracker.example/download?passkey=url-secret",
+                    "tracker": "tracker.example",
+                    "cookie": "sid=secret-cookie"
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+
+        assert!(body.contains("credentials are not allowed"));
+        assert_omits_fetch_secrets(body);
+    }
+
+    #[tokio::test]
+    async fn status_and_metrics_redact_secret_bearing_announce_summaries() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .record_dependency_health(
+                DependencyKind::Indexer,
+                &DependencyName::new("https://tracker.example/health?passkey=dependency-secret")
+                    .unwrap(),
+                &DependencyState::Degraded {
+                    reason: ReasonText::new("https://tracker.example/reason?token=reason-secret")
+                        .unwrap(),
+                    retry_after_ms: Some(1_000),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        let work = AnnounceWorkItem {
+            id: AnnounceWorkId::new("ann_secret_summaries").unwrap(),
+            status: AnnounceStatus::Waiting,
+            reason: AnnounceReason::DependencyBackoff,
+            dedupe_hash: AnnounceDedupeIdentity::Guid {
+                tracker: TrackerName::new("tracker.example").unwrap(),
+                guid: CandidateGuid::new("guid-secret-summary").unwrap(),
+            }
+            .hash(),
+            title: ItemTitle::new("Example").unwrap(),
+            tracker: TrackerName::new("tracker.example").unwrap(),
+            guid: Some(CandidateGuid::new("guid-secret-summary").unwrap()),
+            info_hash: None,
+            size: None,
+            fetch: Some(
+                AnnounceFetchMaterial::new(
+                    &DownloadUrl::new("https://tracker.example/download?id=1&authkey=url-secret")
+                        .unwrap(),
+                    Some(CookieSecret::new("sid=secret-cookie").unwrap()),
+                )
+                .unwrap(),
+            ),
+            received_at_ms: 100,
+            updated_at_ms: 100,
+            first_attempt_at_ms: Some(100),
+            finished_at_ms: None,
+            attempt_count: 2,
+            next_attempt_at_ms: 200,
+            expires_at_ms: 10_000,
+            lease: None,
+            last_dependency_kind: Some(ReasonText::new("indexer").unwrap()),
+            last_dependency_name: Some(
+                ReasonText::new("https://tracker.example/wait?passkey=wait-secret").unwrap(),
+            ),
+            last_error_class: Some(
+                ReasonText::new("https://tracker.example/error?token=attempt-secret").unwrap(),
+            ),
+            last_redacted_message: Some(
+                ReasonText::new("https://tracker.example/message?apikey=message-secret").unwrap(),
+            ),
+        };
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        let app = announce_app(repository, None, AnnounceQueueConfig::default());
+
+        let status_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status_body = axum::body::to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_text = std::str::from_utf8(&status_body).unwrap();
+
+        let metrics_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_body = axum::body::to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics_text = std::str::from_utf8(&metrics_body).unwrap();
+
+        assert!(status_text.contains("[REDACTED]"));
+        assert!(metrics_text.contains("[REDACTED]"));
+        assert_omits_fetch_secrets(status_text);
+        assert_omits_fetch_secrets(metrics_text);
+    }
+
+    #[tokio::test]
+    async fn metrics_aggregate_redacted_announce_labels_before_limiting() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for index in 0_u64..101 {
+            let index_ms = i64::try_from(index).unwrap();
+            let title = ItemTitle::new(format!("Example {index}")).unwrap();
+            let work = AnnounceWorkItem {
+                id: AnnounceWorkId::new(format!("ann_secret_metric_{index}")).unwrap(),
+                status: AnnounceStatus::Queued,
+                reason: AnnounceReason::Accepted,
+                dedupe_hash: AnnounceDedupeIdentity::Fallback {
+                    tracker: TrackerName::new("tracker.example").unwrap(),
+                    title: title.clone(),
+                    size: Some(ByteSize::new(index)),
+                    published_at_ms: None,
+                }
+                .hash(),
+                title,
+                tracker: TrackerName::new("tracker.example").unwrap(),
+                guid: Some(CandidateGuid::new(format!("guid-secret-metric-{index}")).unwrap()),
+                info_hash: None,
+                size: Some(ByteSize::new(index)),
+                fetch: None,
+                received_at_ms: 100 + index_ms,
+                updated_at_ms: 100 + index_ms,
+                first_attempt_at_ms: Some(100),
+                finished_at_ms: None,
+                attempt_count: 1,
+                next_attempt_at_ms: 200,
+                expires_at_ms: 10_000,
+                lease: None,
+                last_dependency_kind: Some(ReasonText::new("indexer").unwrap()),
+                last_dependency_name: Some(
+                    ReasonText::new(format!(
+                        "https://tracker.example/wait?passkey=wait-secret-{index}"
+                    ))
+                    .unwrap(),
+                ),
+                last_error_class: Some(
+                    ReasonText::new(format!(
+                        "https://tracker.example/error?token=attempt-secret-{index}"
+                    ))
+                    .unwrap(),
+                ),
+                last_redacted_message: None,
+            };
+            repository
+                .insert_or_dedupe_announce_work(&work, 200)
+                .await
+                .unwrap();
+        }
+        let app = announce_app(repository, None, AnnounceQueueConfig::default());
+
+        let metrics_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_body = axum::body::to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics_text = std::str::from_utf8(&metrics_body).unwrap();
+
+        assert!(metrics_text.contains("sporos_announce_attempts_total{outcome_class=\"https://tracker.example/error?token=[REDACTED]\"} 101"));
+        assert!(metrics_text.contains("sporos_announce_dependency_wait_count{dependency_kind=\"indexer\",dependency_name=\"https://tracker.example/wait?passkey=[REDACTED]\"} 101"));
+        assert!(!metrics_text.contains("wait-secret-"));
+        assert!(!metrics_text.contains("attempt-secret-"));
     }
 
     #[tokio::test]
@@ -3259,6 +3493,23 @@ mod tests {
             .iter()
             .find(|dependency| dependency["kind"] == kind && dependency["name"] == name)
             .unwrap_or_else(|| panic!("missing dependency status for {kind} {name}"))
+    }
+
+    fn assert_omits_fetch_secrets(text: &str) {
+        for secret in [
+            "https://tracker.example/download?id=1&passkey=secret",
+            "https://user:password-secret@tracker.example/download?passkey=url-secret",
+            "password-secret",
+            "url-secret",
+            "secret-cookie",
+            "dependency-secret",
+            "reason-secret",
+            "wait-secret",
+            "attempt-secret",
+            "message-secret",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked in {text}");
+        }
     }
 
     fn nonzero(value: usize) -> NonZeroUsize {

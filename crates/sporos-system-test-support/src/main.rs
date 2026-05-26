@@ -17,6 +17,7 @@ use sporos::indexers::TorznabRegistry;
 use sporos::persistence::repository::Repository;
 use sporos::persistence::torrent_cache::cached_torrent_path;
 use sporos::runtime::announce_worker::unix_time_ms;
+use sporos::secrets::sanitize_url_for_logging;
 
 fn main() -> std::process::ExitCode {
     if let Err(error) = sporos::logging::init_from_env() {
@@ -577,10 +578,10 @@ async fn system_test_snapshot(
             .await?
             .into_iter()
             .map(|row| SystemTestClientItem {
-                title: truncated(row.title),
-                source_key: truncated(row.source_key),
+                title: diagnostic_text(row.title),
+                source_key: diagnostic_text(row.source_key),
                 info_hash: row.info_hash,
-                save_path: truncated_option(row.save_path),
+                save_path: diagnostic_text_option(row.save_path),
                 file_count: row.file_count,
             })
             .collect(),
@@ -799,12 +800,12 @@ async fn system_test_diagnostics(
         .into_iter()
         .map(|row| SystemTestLocalItemDiagnostic {
             id: row.id,
-            source_type: truncated(row.source_type),
-            source_key: truncated(row.source_key),
-            title: truncated(row.title),
-            media_type: truncated(row.media_type),
+            source_type: diagnostic_text(row.source_type),
+            source_key: diagnostic_text(row.source_key),
+            title: diagnostic_text(row.title),
+            media_type: diagnostic_text(row.media_type),
             info_hash: row.info_hash,
-            save_path: truncated_option(row.save_path),
+            save_path: diagnostic_text_option(row.save_path),
             total_size: row.total_size,
         })
         .collect();
@@ -813,8 +814,8 @@ async fn system_test_diagnostics(
         .into_iter()
         .map(|row| SystemTestLocalFileDiagnostic {
             item_id: row.item_id,
-            relative_path: truncated(row.relative_path),
-            file_name: truncated(row.file_name),
+            relative_path: diagnostic_text(row.relative_path),
+            file_name: diagnostic_text(row.file_name),
             size: row.size,
             file_index: row.file_index,
         })
@@ -824,12 +825,12 @@ async fn system_test_diagnostics(
         .into_iter()
         .map(|row| SystemTestRemoteCandidateDiagnostic {
             id: row.id,
-            guid: truncated(row.guid),
-            title: truncated(row.title),
-            tracker: truncated(row.tracker),
+            guid: diagnostic_text(row.guid),
+            title: diagnostic_text(row.title),
+            tracker: diagnostic_text(row.tracker),
             size: row.size,
             info_hash: row.info_hash,
-            torrent_cache_path: truncated_option(row.torrent_cache_path),
+            torrent_cache_path: diagnostic_text_option(row.torrent_cache_path),
             last_seen_at: row.last_seen_at,
         })
         .collect();
@@ -839,10 +840,10 @@ async fn system_test_diagnostics(
         .map(|row| SystemTestMatchDecisionDiagnostic {
             local_item_id: row.local_item_id,
             candidate_id: row.candidate_id,
-            decision: truncated(row.decision),
+            decision: diagnostic_text(row.decision),
             matched_size: row.matched_size,
             matched_ratio: row.matched_ratio,
-            reason_code: truncated(row.reason_code),
+            reason_code: diagnostic_text(row.reason_code),
             assessed_at: row.assessed_at,
         })
         .collect();
@@ -851,10 +852,10 @@ async fn system_test_diagnostics(
         .into_iter()
         .map(|row| SystemTestIndexerDiagnostic {
             id: row.id,
-            name: truncated(row.name),
-            source_kind: truncated(row.source_kind),
+            name: diagnostic_text(row.name),
+            source_kind: diagnostic_text(row.source_kind),
             enabled: row.enabled,
-            state: truncated(row.state),
+            state: diagnostic_text(row.state),
             retry_after: row.retry_after,
             last_caps_refresh_at: row.last_caps_refresh_at,
         })
@@ -863,10 +864,10 @@ async fn system_test_diagnostics(
         .dependency_health
         .into_iter()
         .map(|row| SystemTestDependencyHealthDiagnostic {
-            dependency_type: truncated(row.dependency_type),
-            dependency_name: truncated(row.dependency_name),
-            state: truncated(row.state),
-            reason: truncated_option(row.reason),
+            dependency_type: diagnostic_text(row.dependency_type),
+            dependency_name: diagnostic_text(row.dependency_name),
+            state: diagnostic_text(row.state),
+            reason: diagnostic_text_option(row.reason),
             retry_after: row.retry_after,
             failure_count: row.failure_count,
             checked_at: row.checked_at,
@@ -876,29 +877,29 @@ async fn system_test_diagnostics(
         .jobs
         .into_iter()
         .map(|row| SystemTestJobDiagnostic {
-            name: truncated(row.name),
-            state: truncated(row.state),
+            name: diagnostic_text(row.name),
+            state: diagnostic_text(row.state),
             last_started_at: row.last_started_at,
             last_finished_at: row.last_finished_at,
             next_run_at: row.next_run_at,
-            last_error: truncated_option(row.last_error),
+            last_error: diagnostic_text_option(row.last_error),
         })
         .collect();
     let announce_work = diagnostics
         .announce_work
         .into_iter()
         .map(|row| SystemTestAnnounceWorkDiagnostic {
-            id: truncated(row.id),
-            tracker: truncated(row.tracker),
-            title: truncated(row.title),
+            id: diagnostic_text(row.id),
+            tracker: diagnostic_text(row.tracker),
+            title: diagnostic_text(row.title),
             info_hash: row.info_hash,
-            status: truncated(row.status),
-            reason: truncated(row.reason),
+            status: diagnostic_text(row.status),
+            reason: diagnostic_text(row.reason),
             attempt_count: row.attempt_count,
             next_attempt_at: row.next_attempt_at,
-            last_error_class: truncated_option(row.last_error_class),
-            last_decision: truncated_option(row.last_decision),
-            last_action_outcome: truncated_option(row.last_action_outcome),
+            last_error_class: diagnostic_text_option(row.last_error_class),
+            last_decision: diagnostic_text_option(row.last_decision),
+            last_action_outcome: diagnostic_text_option(row.last_action_outcome),
         })
         .collect();
 
@@ -1193,8 +1194,12 @@ fn truncated(value: String) -> String {
     value.chars().take(SYSTEM_TEST_TEXT_LIMIT).collect()
 }
 
-fn truncated_option(value: Option<String>) -> Option<String> {
-    value.map(truncated)
+fn diagnostic_text(value: String) -> String {
+    truncated(sanitize_url_for_logging(&value).to_string())
+}
+
+fn diagnostic_text_option(value: Option<String>) -> Option<String> {
+    value.map(diagnostic_text)
 }
 
 #[cfg(test)]
@@ -1299,9 +1304,83 @@ mod tests {
             let pool = SqlitePool::connect(&loaded.paths.database.to_string_lossy())
                 .await
                 .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO announce_work (
+                    id, dedupe_hash, received_at, updated_at, first_attempt_at, finished_at,
+                    tracker, guid, info_hash, title, size, download_url, redacted_download_url,
+                    cookie, status, reason, attempt_count, next_attempt_at, expires_at,
+                    lease_owner, lease_until, last_dependency_kind, last_dependency_name,
+                    last_error_class, last_error_message
+                )
+                VALUES (
+                    'ann_system_test_secret', 'dedupe-system-test-secret', 100, 100, NULL, NULL,
+                    'tracker.example', 'guid-system-test-secret', NULL, 'Secret fixture', NULL,
+                    'https://tracker.example/download?id=1&passkey=diagnostic-secret',
+                    'https://tracker.example/download?id=1&passkey=[REDACTED]',
+                    'sid=diagnostic-cookie', 'queued', 'accepted', 0, 100, 10000,
+                    NULL, NULL, NULL, NULL,
+                    'https://tracker.example/error?token=diagnostic-error-secret',
+                    NULL
+                )
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                UPDATE remote_candidates
+                SET guid = 'https://tracker.example/guid?passkey=diagnostic-guid-secret'
+                WHERE guid = 'sporos-qbittorrent-candidate'
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO dependency_health (
+                    dependency_type, dependency_name, state, reason, retry_after,
+                    failure_count, checked_at
+                )
+                VALUES (
+                    'indexer',
+                    'https://tracker.example/health?passkey=diagnostic-dependency-secret',
+                    'degraded',
+                    'https://tracker.example/reason?token=diagnostic-reason-secret',
+                    200, 1, 100
+                )
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO jobs (name, state, last_started_at, last_finished_at, next_run_at, last_error)
+                VALUES (
+                    'system-test-secret-job', 'failed', 100, 200, 300,
+                    'https://tracker.example/job?apikey=diagnostic-job-secret'
+                )
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             for index in 0..12 {
                 let title = format!("{}-{index}", "x".repeat(256));
-                let source_key = format!("client:{index}");
+                let source_key = if index == 11 {
+                    "https://tracker.example/client?passkey=diagnostic-client-source-secret"
+                        .to_owned()
+                } else {
+                    format!("client:{index}")
+                };
+                let save_path = if index == 11 {
+                    "https://tracker.example/save?token=diagnostic-client-save-secret".to_owned()
+                } else {
+                    format!("/downloads/{title}")
+                };
                 sqlx::query(
                     r#"
                     INSERT INTO local_items (
@@ -1314,7 +1393,7 @@ mod tests {
                 .bind(&source_key)
                 .bind(&title)
                 .bind(&title)
-                .bind(format!("/downloads/{title}"))
+                .bind(save_path)
                 .bind(100 + i64::from(index))
                 .execute(&pool)
                 .await
@@ -1359,6 +1438,15 @@ mod tests {
             config_path.into_os_string(),
         ])
         .unwrap();
+        assert!(!diagnostics.contains("diagnostic-secret"));
+        assert!(!diagnostics.contains("diagnostic-cookie"));
+        assert!(!diagnostics.contains("diagnostic-guid-secret"));
+        assert!(!diagnostics.contains("diagnostic-error-secret"));
+        assert!(!diagnostics.contains("diagnostic-dependency-secret"));
+        assert!(!diagnostics.contains("diagnostic-reason-secret"));
+        assert!(!diagnostics.contains("diagnostic-job-secret"));
+        assert!(!diagnostics.contains("diagnostic-client-source-secret"));
+        assert!(!diagnostics.contains("diagnostic-client-save-secret"));
         let diagnostics: serde_json::Value = serde_json::from_str(&diagnostics).unwrap();
         assert_eq!(2, diagnostics["snapshot"]["remote_candidates"]);
         assert_eq!(
