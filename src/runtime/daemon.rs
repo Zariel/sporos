@@ -17,7 +17,8 @@ use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::actions::{
-    SaveTorrentError, SaveTorrentOutcome, candidate_output_metadata, save_candidate_torrent,
+    LinkType, SaveTorrentError, SaveTorrentOutcome, candidate_output_metadata,
+    save_candidate_torrent,
 };
 use crate::announce::{AnnounceReason, AnnounceWorkId};
 use crate::config::{MatchingMode, SporosConfig, validate_server_auth};
@@ -374,6 +375,15 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
 
 fn runtime_recheck_resume_config(config: &SporosConfig) -> RecheckResumeConfig {
     RecheckResumeConfig::from(&config.injection.recheck)
+}
+
+fn runtime_link_type(config: &SporosConfig) -> Option<LinkType> {
+    config.injection.link_type.map(|link_type| match link_type {
+        crate::config::InjectionLinkTypeConfig::Hardlink => LinkType::Hardlink,
+        crate::config::InjectionLinkTypeConfig::Symlink => LinkType::Symlink,
+        crate::config::InjectionLinkTypeConfig::Reflink => LinkType::Reflink,
+        crate::config::InjectionLinkTypeConfig::ReflinkOrCopy => LinkType::ReflinkOrCopy,
+    })
 }
 
 fn runtime_reverse_lookup_config(config: &SporosConfig) -> ReverseLookupConfig {
@@ -1184,10 +1194,10 @@ async fn process_downloaded_search_candidate(
                 torrent_bytes,
                 assessment: selected.assessment,
                 assessed_at_ms: now_ms,
-                output_dir: state.config.paths.output_dir,
-                link_dirs: Vec::new(),
-                link_type: None,
-                flat_linking: false,
+                output_dir: state.config.paths.output_dir.clone(),
+                link_dirs: state.config.injection.link_dirs.clone(),
+                link_type: runtime_link_type(&state.config),
+                flat_linking: state.config.injection.flat_linking,
                 recheck,
             }),
         });
@@ -2184,10 +2194,10 @@ async fn process_downloaded_announce_candidate(
                     torrent_bytes,
                     assessment: selected.assessment,
                     assessed_at_ms: now_ms,
-                    output_dir: state.config.paths.output_dir,
-                    link_dirs: Vec::new(),
-                    link_type: None,
-                    flat_linking: false,
+                    output_dir: state.config.paths.output_dir.clone(),
+                    link_dirs: state.config.injection.link_dirs.clone(),
+                    link_type: runtime_link_type(&state.config),
+                    flat_linking: state.config.injection.flat_linking,
                     recheck,
                 },
                 shutdown.clone(),
@@ -2845,8 +2855,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        ConfigTorrentClientKind, NotificationEndpointConfig, ProwlarrSourceConfig, SporosConfig,
-        TorrentClientConfig, TorznabIndexerConfig,
+        ConfigTorrentClientKind, InjectionLinkTypeConfig, NotificationEndpointConfig,
+        ProwlarrSourceConfig, SporosConfig, TorrentClientConfig, TorznabIndexerConfig,
     };
     use crate::domain::{
         ByteSize, CandidateGuid, ClientHost, DependencyName, DependencyState, DisplayName,
@@ -3219,6 +3229,278 @@ mod tests {
             }
         ));
         assert_eq!(0, saved_torrent_count(&output_dir));
+    }
+
+    #[tokio::test]
+    async fn downloaded_search_candidate_injection_uses_configured_link_policy() {
+        let root = fs::canonicalize(unique_temp_dir("daemon-search-link-policy")).unwrap();
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        let link_dir =
+            fs::canonicalize(unique_temp_dir("daemon-search-link-policy-links")).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&link_dir).unwrap();
+        fs::create_dir_all(root.join("Candidate")).unwrap();
+        fs::write(
+            root.join("Candidate/a.mkv"),
+            b"0123456789012345678901234567890123456789",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Candidate/b.mkv"),
+            b"0123456789012345678901234567890123456789",
+        )
+        .unwrap();
+        fs::write(root.join("Candidate/c.mkv"), b"01234567890123456789").unwrap();
+        let cache_path = cache_dir.join("partial.torrent");
+        fs::write(&cache_path, partial_torrent_bytes()).unwrap();
+        let add_bodies = Arc::new(Mutex::new(Vec::new()));
+        let qbit_endpoint = spawn_daemon_qbit_injection_server(Arc::clone(&add_bodies)).await;
+        let parsed = parse_metafile(partial_torrent_bytes()).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        config.paths.torrent_cache_dir = cache_dir;
+        config.matching.mode = MatchingMode::Partial;
+        config.matching.fuzzy_size_threshold = 0.25;
+        config.injection.link_type = Some(InjectionLinkTypeConfig::Hardlink);
+        config.injection.link_dirs = vec![link_dir.clone()];
+        config.injection.recheck.skip_recheck = true;
+        configure_qbit_client(&mut config, qbit_endpoint);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .upsert_local_item_with_files(
+                &LocalItem {
+                    id: None,
+                    source: LocalItemSource::DataRoot {
+                        path: root.to_path_buf(),
+                    },
+                    title: ItemTitle::new("Candidate").unwrap(),
+                    display_name: DisplayName::new("Candidate").unwrap(),
+                    media_type: MediaType::Movie,
+                    info_hash: None,
+                    path: Some(root.clone()),
+                    save_path: Some(root.clone()),
+                    total_size: ByteSize::new(100),
+                    mtime_ms: None,
+                },
+                &[
+                    LocalFile::new(
+                        None,
+                        PathBuf::from("Candidate/a.mkv"),
+                        ByteSize::new(40),
+                        FileIndex::new(0),
+                    )
+                    .unwrap(),
+                    LocalFile::new(
+                        None,
+                        PathBuf::from("Candidate/b.mkv"),
+                        ByteSize::new(40),
+                        FileIndex::new(1),
+                    )
+                    .unwrap(),
+                    LocalFile::new(
+                        None,
+                        PathBuf::from("Candidate/c.mkv"),
+                        ByteSize::new(20),
+                        FileIndex::new(2),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let candidate = RemoteCandidate {
+            id: None,
+            indexer_id: IndexerId::new(1).unwrap(),
+            guid: CandidateGuid::new("search-link-policy").unwrap(),
+            download_url: DownloadUrl::new("https://indexer.example/download/search-link-policy")
+                .unwrap(),
+            title: ItemTitle::new("Candidate").unwrap(),
+            tracker: TrackerName::new("indexer.example").unwrap(),
+            size: Some(ByteSize::new(100)),
+            published_at_ms: None,
+            info_hash: Some(parsed.metafile.info_hash().clone()),
+            torrent_cache_path: Some(cache_path.clone()),
+        };
+
+        let preflight = process_downloaded_search_candidate(DownloadedSearchCandidateStage {
+            state: runtime.state.clone(),
+            cached: CachedCandidateTorrent {
+                candidate,
+                metafile: parsed.metafile,
+                tracker_hosts: parsed.tracker_hosts,
+                cache_path,
+            },
+            torrent_bytes: partial_torrent_bytes().to_vec(),
+            now_ms: unix_time_ms(),
+            shutdown: runtime.state.shutdown_signal.clone(),
+        })
+        .await
+        .unwrap();
+        let outcome = execute_search_candidate_preflight(
+            runtime.state.clone(),
+            preflight,
+            &runtime.state.shutdown_signal,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "search injection failed: {error}; qbit calls: {:?}",
+                add_bodies.lock().unwrap()
+            )
+        });
+
+        let prepared_dir = link_dir.join("indexer.example");
+        assert_eq!(
+            SearchCandidateOutcome::Injected,
+            outcome,
+            "add bodies: {:?}",
+            add_bodies.lock().unwrap()
+        );
+        assert!(prepared_dir.join("Candidate/a.mkv").exists());
+        assert!(prepared_dir.join("Candidate/b.mkv").exists());
+        assert!(prepared_dir.join("Candidate/c.mkv").exists());
+        let add_body = add_bodies.lock().unwrap().join("\n");
+        assert!(add_body.contains("name=\"savepath\""));
+        assert!(add_body.contains(prepared_dir.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn downloaded_announce_candidate_injection_uses_configured_link_policy() {
+        let root = fs::canonicalize(unique_temp_dir("daemon-announce-link-policy")).unwrap();
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        let link_dir =
+            fs::canonicalize(unique_temp_dir("daemon-announce-link-policy-links")).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&link_dir).unwrap();
+        fs::create_dir_all(root.join("Candidate")).unwrap();
+        fs::write(
+            root.join("Candidate/a.mkv"),
+            b"0123456789012345678901234567890123456789",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Candidate/b.mkv"),
+            b"0123456789012345678901234567890123456789",
+        )
+        .unwrap();
+        fs::write(root.join("Candidate/c.mkv"), b"01234567890123456789").unwrap();
+        let cache_path = cache_dir.join("partial.torrent");
+        fs::write(&cache_path, partial_torrent_bytes()).unwrap();
+        let add_bodies = Arc::new(Mutex::new(Vec::new()));
+        let qbit_endpoint = spawn_daemon_qbit_injection_server(Arc::clone(&add_bodies)).await;
+        let parsed = parse_metafile(partial_torrent_bytes()).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        config.paths.torrent_cache_dir = cache_dir;
+        config.matching.mode = MatchingMode::Partial;
+        config.matching.fuzzy_size_threshold = 0.25;
+        config.injection.link_type = Some(InjectionLinkTypeConfig::Hardlink);
+        config.injection.link_dirs = vec![link_dir.clone()];
+        config.injection.recheck.skip_recheck = true;
+        configure_qbit_client(&mut config, qbit_endpoint);
+        let context = AnnounceWorkflowContext {
+            now_ms: unix_time_ms(),
+            attempt_count: 1,
+            jitter_key: "announce-link-policy".to_owned(),
+            outcome_config: announce_outcome_config(&config.announce),
+            reverse_lookup_config: runtime_reverse_lookup_config(&config),
+        };
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .upsert_local_item_with_files(
+                &LocalItem {
+                    id: None,
+                    source: LocalItemSource::DataRoot {
+                        path: root.to_path_buf(),
+                    },
+                    title: ItemTitle::new("Candidate").unwrap(),
+                    display_name: DisplayName::new("Candidate").unwrap(),
+                    media_type: MediaType::Movie,
+                    info_hash: None,
+                    path: Some(root.clone()),
+                    save_path: Some(root.clone()),
+                    total_size: ByteSize::new(100),
+                    mtime_ms: None,
+                },
+                &[
+                    LocalFile::new(
+                        None,
+                        PathBuf::from("Candidate/a.mkv"),
+                        ByteSize::new(40),
+                        FileIndex::new(0),
+                    )
+                    .unwrap(),
+                    LocalFile::new(
+                        None,
+                        PathBuf::from("Candidate/b.mkv"),
+                        ByteSize::new(40),
+                        FileIndex::new(1),
+                    )
+                    .unwrap(),
+                    LocalFile::new(
+                        None,
+                        PathBuf::from("Candidate/c.mkv"),
+                        ByteSize::new(20),
+                        FileIndex::new(2),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let candidate = RemoteCandidate {
+            id: None,
+            indexer_id: IndexerId::new(1).unwrap(),
+            guid: CandidateGuid::new("announce-link-policy").unwrap(),
+            download_url: DownloadUrl::new("https://indexer.example/download/announce-link-policy")
+                .unwrap(),
+            title: ItemTitle::new("Candidate").unwrap(),
+            tracker: TrackerName::new("indexer.example").unwrap(),
+            size: Some(ByteSize::new(100)),
+            published_at_ms: None,
+            info_hash: Some(parsed.metafile.info_hash().clone()),
+            torrent_cache_path: Some(cache_path.clone()),
+        };
+
+        let outcome = process_downloaded_announce_candidate(DownloadedAnnounceCandidate {
+            state: runtime.state,
+            cached: CachedCandidateTorrent {
+                candidate,
+                metafile: parsed.metafile,
+                tracker_hosts: parsed.tracker_hosts,
+                cache_path,
+            },
+            torrent_bytes: partial_torrent_bytes().to_vec(),
+            context,
+            shutdown: crate::runtime::shutdown::shutdown_channel().1,
+        })
+        .await
+        .unwrap();
+
+        let prepared_dir = link_dir.join("indexer.example");
+        assert!(matches!(
+            outcome,
+            AnnounceWorkOutcome::Succeeded {
+                reason: AnnounceReason::Injected,
+                ..
+            }
+        ));
+        assert!(prepared_dir.join("Candidate/a.mkv").exists());
+        assert!(prepared_dir.join("Candidate/b.mkv").exists());
+        assert!(prepared_dir.join("Candidate/c.mkv").exists());
+        let add_body = add_bodies.lock().unwrap().join("\n");
+        assert!(add_body.contains("name=\"savepath\""));
+        assert!(add_body.contains(prepared_dir.to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
@@ -5720,6 +6002,67 @@ mod tests {
         .await
     }
 
+    async fn spawn_daemon_qbit_injection_server(add_bodies: Arc<Mutex<Vec<String>>>) -> String {
+        let add_count = Arc::new(AtomicUsize::new(0));
+        spawn_daemon_test_server(move |request| {
+            let add_bodies = Arc::clone(&add_bodies);
+            let add_count = Arc::clone(&add_count);
+            async move {
+                let path = request.uri().path().to_owned();
+                match path.as_str() {
+                    "/api/v2/auth/login" => response_with_cookie(StatusCode::OK, "Ok.", "SID=ok"),
+                    "/api/v2/app/version" => (StatusCode::OK, "4.6.0").into_response(),
+                    "/api/v2/torrents/info" if add_count.load(Ordering::SeqCst) > 0 => (
+                        StatusCode::OK,
+                        r#"[{"hash":"0123456789abcdef0123456789abcdef01234567","name":"Candidate","save_path":"/downloads/example","amount_left":0,"progress":1.0,"state":"pausedUP"}]"#,
+                    )
+                        .into_response(),
+                    "/api/v2/torrents/info" => (StatusCode::OK, "[]").into_response(),
+                    "/api/v2/torrents/add" => {
+                        let body = axum::body::to_bytes(request.into_body(), 1_000_000)
+                            .await
+                            .unwrap();
+                        add_bodies
+                            .lock()
+                            .unwrap()
+                            .push(format!("BODY {}", String::from_utf8_lossy(&body)));
+                        add_count.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, "").into_response()
+                    }
+                    "/api/v2/torrents/recheck"
+                    | "/api/v2/torrents/resume"
+                    | "/api/v2/torrents/start"
+                    | "/api/v2/torrents/pause"
+                    | "/api/v2/torrents/stop"
+                    | "/api/v2/torrents/createTags" => {
+                        (StatusCode::OK, "").into_response()
+                    }
+                    _ => (StatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await
+    }
+
+    fn configure_qbit_client(config: &mut SporosConfig, endpoint: String) {
+        config.torrent_clients.insert(
+            "qbit".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Qbittorrent,
+                url: endpoint,
+                username: None,
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: Vec::new(),
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: None,
+            },
+        );
+    }
+
     async fn spawn_daemon_torrent_download_server() -> String {
         let app = axum::Router::new().route(
             "/download",
@@ -6142,6 +6485,14 @@ mod tests {
     {
         let app = axum::Router::new()
             .route("/api/v2/auth/login", post(handler.clone()))
+            .route("/api/v2/app/version", get(handler.clone()))
+            .route("/api/v2/torrents/add", post(handler.clone()))
+            .route("/api/v2/torrents/createTags", post(handler.clone()))
+            .route("/api/v2/torrents/pause", post(handler.clone()))
+            .route("/api/v2/torrents/recheck", post(handler.clone()))
+            .route("/api/v2/torrents/resume", post(handler.clone()))
+            .route("/api/v2/torrents/start", post(handler.clone()))
+            .route("/api/v2/torrents/stop", post(handler.clone()))
             .route("/api/v2/torrents/info", get(handler.clone()))
             .route("/api/v2/torrents/files", get(handler));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
