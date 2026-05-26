@@ -32,7 +32,7 @@ use crate::runtime::health::DependencyKind;
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 
-const INVENTORY_REFRESH_DEPENDENCY: &str = "inventory-refresh";
+pub(crate) const INVENTORY_REFRESH_DEPENDENCY: &str = "inventory-refresh";
 const INVENTORY_REFRESH_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const INVENTORY_REFRESH_RETRY_MAX: Duration = Duration::from_secs(5);
 const DATA_ROOT_SCAN_BUFFER: usize = 64;

@@ -27,8 +27,8 @@ use crate::indexers::{
 };
 use crate::inventory::InventoryScanOptions;
 use crate::inventory_refresh::{
-    InventoryRefreshError, InventoryRefreshRequest, InventoryRefreshSummary,
-    InventoryRefreshWorker, inventory_refresh_queue,
+    INVENTORY_REFRESH_DEPENDENCY, InventoryRefreshError, InventoryRefreshRequest,
+    InventoryRefreshSummary, InventoryRefreshWorker, inventory_refresh_queue,
 };
 use crate::metrics::{ExternalOperation, ExternalOutcome, MetricsRegistry, ProwlarrRefreshOutcome};
 use crate::notifications::{
@@ -1186,6 +1186,13 @@ impl AppRuntime {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        let client_dependency_names = torrent_client_dependency_names(&runtime_config.clients)?;
+        let notification_names = runtime_config
+            .notification_endpoints
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let local_state_names = vec![inventory_refresh_dependency_name()?];
         let mut persisted_health = repository
             .dependency_health_for_type_names(DependencyKind::Arr, &arr_names)
             .await?;
@@ -1195,8 +1202,26 @@ impl AppRuntime {
                 .await?,
         );
         persisted_health.extend(repository.dependency_health_for_indexer_registry().await?);
+        persisted_health.extend(
+            repository
+                .dependency_health_for_type_names(
+                    DependencyKind::TorrentClient,
+                    &client_dependency_names,
+                )
+                .await?,
+        );
+        persisted_health.extend(
+            repository
+                .dependency_health_for_type_names(DependencyKind::Notification, &notification_names)
+                .await?,
+        );
+        persisted_health.extend(
+            repository
+                .dependency_health_for_type_names(DependencyKind::LocalState, &local_state_names)
+                .await?,
+        );
         seed_runtime_health(&health, &persisted_health);
-        seed_notification_health(&health, runtime_config.notification_endpoints.keys());
+        seed_unknown_health_for_missing(&health, DependencyKind::Notification, &notification_names);
         seed_arr_endpoint_backoff(&mut arr_endpoints, &persisted_health, now_ms);
         let search_planner = RuntimeSearchPlanner::new(
             repository.clone(),
@@ -1569,13 +1594,40 @@ fn seed_runtime_health(health: &HealthRegistry, rows: &[DependencyHealthSnapshot
     }
 }
 
-fn seed_notification_health<'a>(
+fn seed_unknown_health_for_missing(
     health: &HealthRegistry,
-    endpoint_names: impl IntoIterator<Item = &'a DependencyName>,
+    kind: DependencyKind,
+    names: &[DependencyName],
 ) {
-    for name in endpoint_names {
-        health.set_unknown(DependencyKind::Notification, name.clone());
+    for name in names {
+        let key = crate::runtime::health::DependencyKey::new(kind, name.clone());
+        if health.state(&key).is_none() {
+            health.set_unknown(kind, name.clone());
+        }
     }
+}
+
+fn torrent_client_dependency_names(
+    clients: &TorrentClientRegistry,
+) -> Result<Vec<DependencyName>, DatabaseError> {
+    clients
+        .iter()
+        .map(|client| {
+            client
+                .dependency_name()
+                .map_err(|error| DatabaseError::Unavailable {
+                    operation: "build torrent client dependency name".to_owned(),
+                    message: error.to_string(),
+                })
+        })
+        .collect()
+}
+
+fn inventory_refresh_dependency_name() -> Result<DependencyName, DatabaseError> {
+    DependencyName::new(INVENTORY_REFRESH_DEPENDENCY).map_err(|error| DatabaseError::Unavailable {
+        operation: "build local state dependency name".to_owned(),
+        message: error.to_string(),
+    })
 }
 
 fn health_reason(value: Option<&str>, fallback: &'static str) -> Option<ReasonText> {
@@ -2313,6 +2365,10 @@ mod tests {
                 api_key_env: None,
             },
         );
+        config.indexers.prowlarr.insert(
+            "main".to_owned(),
+            test_prowlarr_config("https://prowlarr.example".to_owned(), false, false, "24h"),
+        );
         config.indexers.arr.radarr.insert(
             "main".to_owned(),
             ArrInstanceConfig {
@@ -2320,6 +2376,34 @@ mod tests {
                 api_key: Some(ApiKey::new("arr-secret").unwrap()),
                 api_key_file: None,
                 api_key_env: None,
+            },
+        );
+        config.torrent_clients.insert(
+            "qbit".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Qbittorrent,
+                url: "http://qbit.local:8080".to_owned(),
+                username: None,
+                password: None,
+                password_file: None,
+                password_env: None,
+                default_save_path: "/downloads".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: None,
+            },
+        );
+        config.notifications.endpoints.insert(
+            "ops".to_owned(),
+            NotificationEndpointConfig {
+                url: "https://hooks.example/ops".to_owned(),
+                token: Some(NotificationToken::new("ops-secret").unwrap()),
+                timeout: "45s".to_owned(),
+                retry_max_attempts: 2,
+                retry_initial_delay: "5s".to_owned(),
+                retry_max_delay: "30s".to_owned(),
+                ..NotificationEndpointConfig::default()
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -2351,46 +2435,150 @@ mod tests {
             .sync_torznab_indexers(&disabled_indexers, 100)
             .await
             .unwrap();
-        repository
-            .record_dependency_health(
+        for (kind, name) in [
+            (DependencyKind::Notification, "ghost"),
+            (DependencyKind::Prowlarr, "removed"),
+            (DependencyKind::TorrentClient, "other.local"),
+            (DependencyKind::LocalState, "other-local-state"),
+        ] {
+            repository
+                .record_dependency_health(
+                    kind,
+                    &DependencyName::new(name).unwrap(),
+                    &DependencyState::Unavailable {
+                        reason: ReasonText::new("stale").unwrap(),
+                        retry_after_ms: Some(60_000),
+                    },
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        for (kind, name, state) in [
+            (
                 DependencyKind::Arr,
-                &DependencyName::new("radarr-main").unwrap(),
-                &DependencyState::Degraded {
+                "radarr-main",
+                DependencyState::Degraded {
                     reason: ReasonText::new("rate limited").unwrap(),
                     retry_after_ms: Some(1_000),
                 },
-                100,
-            )
-            .await
-            .unwrap();
-        repository
-            .record_dependency_health(
+            ),
+            (
                 DependencyKind::Indexer,
-                &DependencyName::new("main").unwrap(),
-                &DependencyState::Degraded {
+                "main",
+                DependencyState::Degraded {
                     reason: ReasonText::new("indexer backoff").unwrap(),
                     retry_after_ms: Some(2_000),
                 },
-                100,
-            )
-            .await
-            .unwrap();
+            ),
+            (
+                DependencyKind::Prowlarr,
+                "main",
+                DependencyState::Unavailable {
+                    reason: ReasonText::new("prowlarr down").unwrap(),
+                    retry_after_ms: Some(3_000),
+                },
+            ),
+            (
+                DependencyKind::TorrentClient,
+                "qbit.local:8080",
+                DependencyState::Degraded {
+                    reason: ReasonText::new("client down").unwrap(),
+                    retry_after_ms: Some(4_000),
+                },
+            ),
+            (
+                DependencyKind::Notification,
+                "ops",
+                DependencyState::Degraded {
+                    reason: ReasonText::new("webhook down").unwrap(),
+                    retry_after_ms: Some(5_000),
+                },
+            ),
+            (
+                DependencyKind::LocalState,
+                INVENTORY_REFRESH_DEPENDENCY,
+                DependencyState::Healthy { checked_at_ms: 100 },
+            ),
+        ] {
+            repository
+                .record_dependency_health(kind, &DependencyName::new(name).unwrap(), &state, 100)
+                .await
+                .unwrap();
+        }
 
         let runtime = AppRuntime::from_repository(config, repository)
             .await
             .unwrap();
         let health = runtime.state.health.snapshot();
 
-        assert_eq!(2, health.entries.len());
-        assert!(health.entries.iter().any(|entry| {
-            entry.key.kind == DependencyKind::Arr && entry.key.name.as_str() == "radarr-main"
-        }));
-        assert!(health.entries.iter().any(|entry| {
-            entry.key.kind == DependencyKind::Indexer && entry.key.name.as_str() == "main"
-        }));
-        assert!(!health.entries.iter().any(|entry| {
-            entry.key.kind == DependencyKind::Indexer && entry.key.name.as_str() == "indexer0000"
-        }));
+        assert_dependency_state(
+            &health,
+            DependencyKind::Arr,
+            "radarr-main",
+            DependencyState::Degraded {
+                reason: ReasonText::new("rate limited").unwrap(),
+                retry_after_ms: Some(1_000),
+            },
+        );
+        assert_dependency_state(
+            &health,
+            DependencyKind::Indexer,
+            "main",
+            DependencyState::Degraded {
+                reason: ReasonText::new("indexer backoff").unwrap(),
+                retry_after_ms: Some(2_000),
+            },
+        );
+        assert_dependency_state(
+            &health,
+            DependencyKind::Prowlarr,
+            "main",
+            DependencyState::Unavailable {
+                reason: ReasonText::new("prowlarr down").unwrap(),
+                retry_after_ms: Some(3_000),
+            },
+        );
+        assert_dependency_state(
+            &health,
+            DependencyKind::TorrentClient,
+            "qbit.local:8080",
+            DependencyState::Degraded {
+                reason: ReasonText::new("client down").unwrap(),
+                retry_after_ms: Some(4_000),
+            },
+        );
+        assert_dependency_state(
+            &health,
+            DependencyKind::Notification,
+            "ops",
+            DependencyState::Degraded {
+                reason: ReasonText::new("webhook down").unwrap(),
+                retry_after_ms: Some(5_000),
+            },
+        );
+        assert_dependency_state(
+            &health,
+            DependencyKind::LocalState,
+            INVENTORY_REFRESH_DEPENDENCY,
+            DependencyState::Healthy { checked_at_ms: 100 },
+        );
+        assert_eq!(6, health.entries.len());
+        for (kind, name) in [
+            (DependencyKind::Indexer, "indexer0000"),
+            (DependencyKind::Notification, "ghost"),
+            (DependencyKind::Prowlarr, "removed"),
+            (DependencyKind::TorrentClient, "other.local"),
+            (DependencyKind::LocalState, "other-local-state"),
+        ] {
+            assert!(
+                !health
+                    .entries
+                    .iter()
+                    .any(|entry| entry.key.kind == kind && entry.key.name.as_str() == name),
+                "{kind} {name} should not be hydrated"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5709,10 +5897,25 @@ mod tests {
         }
     }
 
+    fn assert_dependency_state(
+        health: &crate::runtime::health::DependencyHealthSnapshot,
+        kind: DependencyKind,
+        name: &str,
+        expected: DependencyState,
+    ) {
+        let actual = health
+            .entries
+            .iter()
+            .find(|entry| entry.key.kind == kind && entry.key.name.as_str() == name)
+            .map(|entry| entry.state.clone());
+
+        assert_eq!(Some(expected), actual, "{kind} {name}");
+    }
+
     fn prowlarr_catalog() -> &'static str {
         r#"
         [
-          {
+            {
             "id": 101,
             "name": "Movies",
             "enable": true,
