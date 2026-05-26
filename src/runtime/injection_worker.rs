@@ -1503,7 +1503,7 @@ impl InjectionWorker {
     ) -> Option<&Arc<dyn InjectionClient>> {
         self.clients
             .iter()
-            .find(|client| client.descriptor().name.as_str() == name.as_str())
+            .find(|client| client.descriptor().host.as_str() == name.as_str())
     }
 
     async fn run_recheck_resume(
@@ -2474,7 +2474,7 @@ fn resume_poll_sleep_duration(
 fn dependency_name(
     descriptor: &TorrentClientDescriptor,
 ) -> Result<DependencyName, InjectionWorkerError> {
-    DependencyName::new(descriptor.name.as_str()).map_err(|error| {
+    descriptor.dependency_name().map_err(|error| {
         InjectionWorkerError::Database(DatabaseError::QueryFailed {
             operation: "build client dependency name".to_owned(),
             message: error.to_string(),
@@ -2589,7 +2589,8 @@ mod tests {
     async fn worker_records_client_health_when_has_torrent_fails() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("injection-has-error");
-        let target = Arc::new(FakeClient::new(descriptor("target", "target")).with_has_errors(1));
+        let target =
+            Arc::new(FakeClient::new(descriptor("target", "qbit.local")).with_has_errors(1));
         let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
         let worker = InjectionWorker::new(
             repository.clone(),
@@ -2606,6 +2607,7 @@ mod tests {
         assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
         assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
         assert_eq!("degraded", health[0].state);
+        assert_eq!("qbit.local", health[0].dependency_name.as_str());
         assert_eq!(Some(1_000), health[0].retry_after_ms);
     }
 

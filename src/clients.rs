@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::config::{ConfigTorrentClientKind, TorrentClientConfig};
-use crate::domain::{ClientHost, DisplayName, TorrentClientKind};
+use crate::domain::{ClientHost, DependencyName, DisplayName, TorrentClientKind};
 use crate::errors::TorrentClientError;
 use tracing::debug_span;
 
@@ -119,6 +119,18 @@ pub struct TorrentClientDescriptor {
 }
 
 impl TorrentClientDescriptor {
+    /// Durable dependency-health name for this client.
+    ///
+    /// This intentionally follows `client_host`, not the configured display
+    /// name, because local inventory rows and announce waits are keyed by the
+    /// client host boundary.
+    pub fn dependency_name(&self) -> Result<DependencyName, TorrentClientError> {
+        DependencyName::new(self.host.as_str()).map_err(|error| TorrentClientError::BadResponse {
+            client: self.name.as_str().to_owned(),
+            message: format!("invalid torrent client dependency name: {error}"),
+        })
+    }
+
     pub fn ensure_supported(
         &self,
         operation: TorrentClientOperation,
@@ -159,6 +171,7 @@ impl TorrentClientRegistry {
         }
 
         let mut clients = BTreeMap::new();
+        let mut dependency_names = BTreeMap::<ClientHost, DisplayName>::new();
         for (name, config) in config {
             let _client_span = debug_span!(
                 "torrent_client.configure",
@@ -176,6 +189,14 @@ impl TorrentClientRegistry {
                     message: "torrent client url must include a host".to_owned(),
                 }
             })?;
+            if let Some(existing) = dependency_names.insert(host.clone(), name.clone()) {
+                return Err(TorrentClientError::BadResponse {
+                    client: name.as_str().to_owned(),
+                    message: format!(
+                        "torrent client dependency name {host} is already used by {existing}"
+                    ),
+                });
+            }
             let descriptor = TorrentClientDescriptor {
                 name: name.clone(),
                 kind,
@@ -381,6 +402,31 @@ mod tests {
 
         assert_eq!("box.local/qbit", first.host.as_str());
         assert_eq!("box.local/rtorrent", second.host.as_str());
+        assert_eq!("box.local/qbit", first.dependency_name().unwrap().as_str());
+        assert_eq!(
+            "box.local/rtorrent",
+            second.dependency_name().unwrap().as_str()
+        );
+    }
+
+    #[test]
+    fn duplicate_derived_dependency_names_are_rejected() {
+        let mut config = BTreeMap::new();
+        config.insert(
+            "first".to_owned(),
+            client_config(
+                ConfigTorrentClientKind::Qbittorrent,
+                "http://box.local/qbit",
+            ),
+        );
+        config.insert(
+            "second".to_owned(),
+            client_config(ConfigTorrentClientKind::Rtorrent, "http://box.local/qbit"),
+        );
+
+        let error = TorrentClientRegistry::from_config(&config).unwrap_err();
+
+        assert!(error.to_string().contains("dependency name box.local/qbit"));
     }
 
     #[test]
