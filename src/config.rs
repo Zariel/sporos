@@ -3007,6 +3007,51 @@ mod tests {
     }
 
     #[test]
+    fn operator_guide_documents_notification_operations() {
+        let guide = include_str!("../docs/operators/operator-guide.md");
+        let configuration = include_str!("../docs/configuration.md");
+        let guide_example = notification_example(guide);
+        let configuration_example = notification_example(configuration);
+        let config = parse_config(guide_example).unwrap();
+        let endpoint = &config.notifications.endpoints["ops"];
+
+        assert_eq!(configuration_example.trim(), guide_example.trim());
+        assert_eq!("https://hooks.example/sporos", endpoint.url);
+        assert_eq!(
+            Some(Path::new("/var/run/secrets/notification-token")),
+            endpoint.token_file.as_deref()
+        );
+        assert_eq!(None, endpoint.token_env);
+        assert_eq!(None, endpoint.token);
+        assert_eq!("30s", endpoint.timeout);
+        assert_eq!(3, endpoint.retry_max_attempts);
+        assert_eq!("1s", endpoint.retry_initial_delay);
+        assert_eq!("30s", endpoint.retry_max_delay);
+
+        for expected in [
+            "runtime.notification_queue_limit",
+            "POST /v1/notifications/test",
+            "sporos_notification_requests_total",
+            "sporos_notification_request_duration_seconds",
+            "sporos_dependency_health_state",
+        ] {
+            assert!(guide.contains(expected), "missing {expected}");
+        }
+    }
+
+    fn notification_example(document: &str) -> &str {
+        for block in document.split("```toml\n").skip(1) {
+            let Some((body, _rest)) = block.split_once("\n```") else {
+                continue;
+            };
+            if body.starts_with("[notifications.endpoints.ops]") {
+                return body;
+            }
+        }
+        panic!("missing notification TOML example");
+    }
+
+    #[test]
     fn environment_overrides_scalar_fields_before_typed_parse() {
         let config = parse_config_with_env(
             r#"

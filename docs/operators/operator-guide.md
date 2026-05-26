@@ -434,6 +434,8 @@ The service exposes:
 - `POST /v1/searches`: queues an explicit search workflow.
 - `POST /v1/jobs/{job_name}/runs`: queues a supported scheduler job run.
   Supported jobs are `cleanup` and `indexer_caps`.
+- `POST /v1/notifications/test`: queues one test delivery for each configured
+  notification endpoint.
 
 Workflow endpoints require bearer auth when an API token is configured. Startup
 rejects externally reachable binds without a configured token.
@@ -462,6 +464,46 @@ rTorrent HTTP authentication is not supported in this release. Configure
 authentication at a reverse proxy or use a private RPC endpoint; Sporos rejects
 rTorrent `username`, `password`, `password_file`, and `password_env` settings so
 credentials are not silently ignored.
+
+## Notification Operations
+
+Notifications are optional webhook deliveries. Configure endpoints under
+`[notifications.endpoints.<name>]`:
+
+```toml
+[notifications.endpoints.ops]
+url = "https://hooks.example/sporos"
+token_file = "/var/run/secrets/notification-token"
+timeout = "30s"
+retry_max_attempts = 3
+retry_initial_delay = "1s"
+retry_max_delay = "30s"
+```
+
+Use one token source per endpoint: `token_file`, `token_env`, or
+local-development `token`. The token is sent as a bearer token and is redacted
+from debug output, errors, and metrics. Endpoint URLs must use HTTP(S) and must
+not contain credentials, query parameters, or fragments.
+
+`runtime.notification_queue_limit` bounds accepted notification jobs. When the
+queue is full or closed, producers report rejected notification work instead of
+blocking without bound. Queue depth, capacity, accepted, rejected, completed,
+and cancelled counters are visible in `/v1/status` under the `notification`
+runtime queue and in the `sporos_queue_*` metrics.
+
+Each delivery uses the endpoint timeout and bounded retry policy. 2xx responses
+are success. 429 and 5xx responses are retryable; other non-2xx responses fail
+without retry. Request timeouts and transport failures are retryable until the
+retry budget or shutdown is reached. Delivery health is best-effort and
+memory-only: `/v1/status` and `sporos_dependency_health_state` expose the
+latest in-process endpoint state, but notification health returns to `unknown`
+after restart.
+
+Use `POST /v1/notifications/test` after changing endpoint config. The response
+reports the number of endpoints, enqueued jobs, full-queue rejections, and
+closed-queue rejections. Delivery attempts are observable through
+`sporos_notification_requests_total` and
+`sporos_notification_request_duration_seconds`.
 
 ## Metrics
 
