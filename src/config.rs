@@ -329,7 +329,19 @@ impl Default for InventoryConfig {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InjectionConfig {
+    pub link_type: Option<InjectionLinkTypeConfig>,
+    pub link_dirs: Vec<PathBuf>,
+    pub flat_linking: bool,
     pub recheck: AutoResumePolicyConfig,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectionLinkTypeConfig {
+    Hardlink,
+    Symlink,
+    Reflink,
+    ReflinkOrCopy,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -895,6 +907,12 @@ fn validate_torrent_clients(config: &SporosConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_injection_config(config: &SporosConfig) -> Result<(), ConfigError> {
+    if config.injection.link_type.is_some() && config.injection.link_dirs.is_empty() {
+        return Err(ConfigError::InvalidField {
+            field: "injection.link_dirs",
+            reason: "link_dirs must not be empty when link_type is configured".to_owned(),
+        });
+    }
     let recheck = &config.injection.recheck;
     validate_percent(
         "injection.recheck.min_completion_percent",
@@ -1744,6 +1762,8 @@ SPOROS__INJECTION__RECHECK__PIECE_SLACK_MULTIPLIER = "2"
 SPOROS__INJECTION__RECHECK__POLL_INTERVAL_MS = "5000"
 SPOROS__INJECTION__RECHECK__MAX_RESUME_WAIT_MS = "3600000"
 SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION = "inject_paused"
+SPOROS__INJECTION__LINK_TYPE = "hardlink"
+SPOROS__INJECTION__FLAT_LINKING = "true"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE = "/var/run/secrets/qbit-password"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY = "cross-seed"
@@ -1764,6 +1784,11 @@ first_search_window_secs = 604800
 
 [inventory]
 media_scan_max_depth = 3
+
+[injection]
+link_type = "optional hardlink|symlink|reflink|reflink_or_copy"
+link_dirs = ["optional path", "..."]
+flat_linking = false
 
 [injection.recheck]
 skip_recheck = false
@@ -1845,6 +1870,11 @@ mod tests {
             [indexers.torznab.main]
             url = "https://indexer.example/api"
             api_key_file = "/var/run/secrets/indexer-api-key"
+
+            [injection]
+            link_type = "hardlink"
+            link_dirs = ["/links/fast", "/links/slow"]
+            flat_linking = true
             "#,
         )
         .unwrap();
@@ -1891,6 +1921,15 @@ mod tests {
             client.default_tags
         );
         assert_eq!(DEFAULT_INJECTION_METADATA, client.default_label);
+        assert_eq!(
+            Some(InjectionLinkTypeConfig::Hardlink),
+            config.injection.link_type
+        );
+        assert_eq!(
+            vec![PathBuf::from("/links/fast"), PathBuf::from("/links/slow")],
+            config.injection.link_dirs
+        );
+        assert!(config.injection.flat_linking);
         assert!(!config.injection.recheck.skip_recheck);
         assert_eq!(0, config.injection.recheck.max_remaining_bytes);
         assert_eq!(None, config.injection.recheck.min_completion_percent);
@@ -2332,6 +2371,74 @@ mod tests {
             qbit.default_tags
         );
         assert_eq!("cross-seed", rtorrent.default_label);
+    }
+
+    #[test]
+    fn injection_link_policy_defaults_to_disabled() {
+        let config = parse_config("").unwrap();
+
+        assert_eq!(None, config.injection.link_type);
+        assert!(config.injection.link_dirs.is_empty());
+        assert!(!config.injection.flat_linking);
+    }
+
+    #[test]
+    fn parses_injection_link_policy_settings() {
+        for (link_type, expected) in [
+            ("hardlink", InjectionLinkTypeConfig::Hardlink),
+            ("symlink", InjectionLinkTypeConfig::Symlink),
+            ("reflink", InjectionLinkTypeConfig::Reflink),
+            ("reflink_or_copy", InjectionLinkTypeConfig::ReflinkOrCopy),
+        ] {
+            let config = parse_config(&format!(
+                r#"
+                [injection]
+                link_type = "{link_type}"
+                link_dirs = ["/links"]
+                flat_linking = true
+                "#
+            ))
+            .unwrap();
+
+            assert_eq!(Some(expected), config.injection.link_type);
+            assert_eq!(vec![PathBuf::from("/links")], config.injection.link_dirs);
+            assert!(config.injection.flat_linking);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_injection_link_policy_settings() {
+        for (contents, expected) in [
+            (
+                r#"
+                [injection]
+                link_type = "junction"
+                link_dirs = ["/links"]
+                "#,
+                "unknown variant",
+            ),
+            (
+                r#"
+                [injection]
+                link_type = "hardlink"
+                link_dirs = []
+                "#,
+                "link_dirs must not be empty",
+            ),
+            (
+                r#"
+                [injection]
+                link_type = "hardlink"
+                "#,
+                "link_dirs must not be empty",
+            ),
+        ] {
+            let error = parse_config(contents).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{error:?} did not contain {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -2804,11 +2911,17 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("[indexers.prowlarr.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[notifications.endpoints.<name>]"));
         assert!(CONFIG_SCHEMA.contains("[inventory]"));
+        assert!(CONFIG_SCHEMA.contains("[injection]"));
+        assert!(CONFIG_SCHEMA.contains("link_type"));
+        assert!(CONFIG_SCHEMA.contains("link_dirs"));
+        assert!(CONFIG_SCHEMA.contains("flat_linking"));
         assert!(CONFIG_SCHEMA.contains("[injection.recheck]"));
         assert!(!CONFIG_SCHEMA.contains("rss_interval"));
         assert!(CONFIG_SCHEMA.contains("default_tags = [\"sporos\"]"));
         assert!(CONFIG_SCHEMA.contains("below_threshold_action"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__LINK_TYPE"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__FLAT_LINKING"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__SKIP_RECHECK"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__MIN_COMPLETION_PERCENT"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT"));
@@ -2820,6 +2933,16 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_FILE"));
+    }
+
+    #[test]
+    fn system_config_template_documents_link_policy() {
+        let template = include_str!("../docker/system/config/sporos.toml.template");
+
+        assert!(template.contains("[injection]"));
+        assert!(template.contains("link_type"));
+        assert!(template.contains("link_dirs"));
+        assert!(template.contains("flat_linking"));
     }
 
     #[test]

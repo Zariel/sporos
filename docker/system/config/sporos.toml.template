@@ -33,6 +33,12 @@ fuzzy_size_threshold = 0.02
 include_single_episodes = true
 include_non_video = true
 
+[injection]
+# Link preparation is disabled until link_type is set.
+# link_type = "hardlink" # hardlink, symlink, reflink, or reflink_or_copy
+# link_dirs = ["/data/links"]
+flat_linking = false
+
 [injection.recheck]
 skip_recheck = true
 max_remaining_bytes = 0

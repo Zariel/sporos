@@ -218,6 +218,24 @@ Delivery health is best-effort and memory-only: `/v1/status` and metrics show
 the latest in-process success or failure for each configured endpoint, and
 endpoints return to `unknown` after restart.
 
+## Injection Link Preparation
+
+`[injection]` can define a disabled-by-default link preparation policy. Leave
+`link_type` unset to keep the current behavior of injecting torrents directly
+into the client save path. When `link_type` is set, `link_dirs` must contain at
+least one trusted operator-controlled directory.
+
+```toml
+[injection]
+link_type = "hardlink" # hardlink, symlink, reflink, or reflink_or_copy
+link_dirs = ["/srv/sporos/links"]
+flat_linking = false
+```
+
+`flat_linking = false` creates tracker-named subdirectories under the selected
+link directory; `true` writes prepared links directly under the selected link
+directory.
+
 ## Injection Recheck And Auto-Resume
 
 `[injection.recheck]` controls how Sporos adds a matched torrent, waits for the
