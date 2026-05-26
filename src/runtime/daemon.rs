@@ -6512,7 +6512,7 @@ mod tests {
                 .is_some_and(|error| error.contains("failed for"))
         );
         assert!(metrics_text.contains(
-            "sporos_dependency_health_state{dependency=\"local_state\",state=\"degraded\"} 1"
+            "sporos_dependency_health_entries{dependency=\"local_state\",state=\"degraded\"} 1"
         ));
         fs::remove_dir_all(root).unwrap();
     }

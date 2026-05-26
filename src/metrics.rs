@@ -599,6 +599,11 @@ fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto
         "Dependency health summaries.",
         &["dependency", "state"],
     );
+    let stored_dependency_health = int_gauge_vec(
+        "sporos_dependency_health_entries",
+        "Persisted dependency health entry counts.",
+        &["dependency", "state"],
+    );
     for (kind, summary) in &snapshot.dependency_health.summaries {
         dependency_health
             .with_label_values(&[kind.as_str(), summary.as_str()])
@@ -612,8 +617,10 @@ fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto
         *count = count.saturating_add(1);
     }
     for ((dependency, state), count) in stored_dependency_counts {
-        dependency_health
-            .with_label_values(&[&dependency, &state])
+        let dependency = sanitized_label(&dependency);
+        let state = sanitized_label(&state);
+        stored_dependency_health
+            .with_label_values(&[dependency.as_str(), state.as_str()])
             .set(count);
     }
 
@@ -779,6 +786,7 @@ fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto
         Box::new(queue_completed.clone()),
         Box::new(queue_cancelled.clone()),
         Box::new(dependency_health.clone()),
+        Box::new(stored_dependency_health.clone()),
         Box::new(announce_work.clone()),
         Box::new(announce_attempts.clone()),
         Box::new(announce_dependency_wait.clone()),
@@ -974,6 +982,9 @@ mod tests {
         assert!(output.contains(
             "sporos_dependency_health_state{dependency=\"indexer\",state=\"degraded\"} 1"
         ));
+        assert!(output.contains(
+            "sporos_dependency_health_entries{dependency=\"torrent_client\",state=\"healthy\"} 1"
+        ));
         assert!(
             output.contains("sporos_announce_work_total{reason=\"accepted\",status=\"queued\"} 3")
         );
@@ -988,6 +999,41 @@ mod tests {
                 .contains("sporos_job_last_duration_seconds{job=\"rss\",state=\"succeeded\"} 1.5")
         );
         assert!(output.contains("sporos_metrics_snapshot_error{source=\"announce_work\"} 1"));
+    }
+
+    #[test]
+    fn dependency_health_summary_and_entries_use_distinct_metrics() {
+        let registry = MetricsRegistry::new();
+        let mut summaries = BTreeMap::new();
+        summaries.insert(DependencyKind::Indexer, DependencySummary::Degraded);
+        summaries.insert(DependencyKind::TorrentClient, DependencySummary::Healthy);
+        let snapshot = MetricsSnapshot {
+            dependency_health: DependencyHealthSnapshot {
+                entries: Vec::new(),
+                summaries,
+            },
+            stored_dependency_health: vec![
+                stored_dependency("indexer", "main", "degraded"),
+                stored_dependency("indexer", "backup", "degraded"),
+                stored_dependency("torrent_client", "qbit", "healthy"),
+            ],
+            ..MetricsSnapshot::default()
+        };
+
+        let output = registry.render_prometheus(&snapshot);
+
+        assert!(output.contains(
+            "sporos_dependency_health_state{dependency=\"indexer\",state=\"degraded\"} 1"
+        ));
+        assert!(output.contains(
+            "sporos_dependency_health_entries{dependency=\"indexer\",state=\"degraded\"} 2"
+        ));
+        assert!(output.contains(
+            "sporos_dependency_health_state{dependency=\"torrent_client\",state=\"healthy\"} 1"
+        ));
+        assert!(output.contains(
+            "sporos_dependency_health_entries{dependency=\"torrent_client\",state=\"healthy\"} 1"
+        ));
     }
 
     #[test]
@@ -1073,5 +1119,21 @@ mod tests {
         assert!(!output.contains("sporos_announce_worker_capacity"));
         assert!(!output.contains("sporos_announce_worker_busy"));
         assert!(!output.contains("sporos_announce_worker_idle"));
+    }
+
+    fn stored_dependency(
+        dependency_type: &str,
+        dependency_name: &str,
+        state: &str,
+    ) -> StoredDependencyHealthSnapshot {
+        StoredDependencyHealthSnapshot {
+            dependency_type: dependency_type.to_owned(),
+            dependency_name: DependencyName::new(dependency_name).unwrap(),
+            state: state.to_owned(),
+            reason: None,
+            retry_after_ms: None,
+            failure_count: 0,
+            checked_at_ms: 1_000,
+        }
     }
 }

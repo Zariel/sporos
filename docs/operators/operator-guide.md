@@ -513,7 +513,8 @@ Scrape `GET /metrics` as Prometheus text. Important metric families include:
 - `sporos_workflow_enqueue_total` for accepted, rejected, deduplicated, and
   invalid workflow submissions.
 - `sporos_queue_depth` and related queue gauges for bounded in-memory queues.
-- `sporos_dependency_health_state` for dependency summaries.
+- `sporos_dependency_health_state` for dependency summaries and
+  `sporos_dependency_health_entries` for persisted dependency entry counts.
 - `sporos_announce_*` metrics for durable announce backlog, retries, leases,
   worker capacity, and dependency waits.
 - `sporos_search_attempts_total`, `sporos_decisions_total`, and
