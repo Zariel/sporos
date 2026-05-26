@@ -32,8 +32,9 @@ failure, unwritable state paths, or stopped workers require operator attention.
 `GET /v1/status` includes `announce_queue` when the durable queue is configured.
 The snapshot reports active work, max pending capacity, worker capacity,
 busy/idle workers, status and reason counts, retry delay, oldest active age,
-running leases, attempt classes, and dependency waits. It intentionally omits
-raw request bodies, cookies, API keys, passkeys, and full secret-bearing URLs.
+active raw fetch-material count and oldest age, running leases, attempt classes,
+and dependency waits. It intentionally omits raw request bodies, cookies, API
+keys, passkeys, and full secret-bearing URLs.
 
 ## Metrics
 
@@ -44,6 +45,9 @@ raw request bodies, cookies, API keys, passkeys, and full secret-bearing URLs.
 - `sporos_announce_work_total{status=...,reason=...}` for backlog shape.
 - `sporos_announce_active_work` and `sporos_announce_oldest_active_age_seconds`
   for queue age and accumulation.
+- `sporos_announce_active_fetch_material_rows` and
+  `sporos_announce_oldest_fetch_material_age_seconds` for the active sensitive
+  fetch-material window without exposing tracker labels or URLs.
 - `sporos_announce_next_retry_delay_seconds` for the nearest scheduled retry.
 - `sporos_announce_running_leases` plus worker busy/idle/capacity gauges for
   worker utilization.

@@ -3642,6 +3642,14 @@ async fn announce_queue_snapshot_queries_avoid_retained_table_scans() {
                 SELECT
                     COUNT(*) AS active_count,
                     MIN(received_at) AS oldest_received_at,
+                    COALESCE(SUM(CASE
+                        WHEN download_url IS NOT NULL OR cookie IS NOT NULL
+                        THEN 1 ELSE 0
+                    END), 0) AS active_fetch_material_count,
+                    MIN(CASE
+                        WHEN download_url IS NOT NULL OR cookie IS NOT NULL
+                        THEN received_at
+                    END) AS oldest_fetch_material_received_at,
                     MIN(CASE
                         WHEN status IN ('queued', 'retryable', 'waiting')
                         THEN next_attempt_at
@@ -3803,6 +3811,47 @@ async fn announce_queue_snapshot_aggregates_active_attempts_and_waits_in_sql() {
         ],
         snapshot.dependency_wait_counts
     );
+}
+
+#[tokio::test]
+async fn announce_queue_snapshot_exposes_active_fetch_material_window() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut old_fetch = test_announce_work("ann_fetch_old", "guid-fetch-old", 100);
+    old_fetch.fetch = Some(test_announce_fetch_material());
+    let mut new_fetch = test_announce_work("ann_fetch_new", "guid-fetch-new", 300);
+    new_fetch.fetch = Some(test_announce_fetch_material());
+    let no_fetch = test_announce_work("ann_no_fetch", "guid-no-fetch", 50);
+    let mut terminal_fetch = test_announce_work("ann_fetch_terminal", "guid-fetch-terminal", 10);
+    terminal_fetch.fetch = Some(test_announce_fetch_material());
+
+    for work in [&old_fetch, &new_fetch, &no_fetch, &terminal_fetch] {
+        repository
+            .insert_or_dedupe_announce_work(work, 10)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE announce_work SET cookie = NULL WHERE id = ?")
+        .bind(old_fetch.id.as_str())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE announce_work SET download_url = NULL WHERE id = ?")
+        .bind(new_fetch.id.as_str())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE announce_work SET status = 'succeeded', finished_at = 400 WHERE id = ?")
+        .bind(terminal_fetch.id.as_str())
+        .execute(repository.pool())
+        .await
+        .unwrap();
+
+    let snapshot = repository.announce_queue_snapshot(10, 500).await.unwrap();
+
+    assert_eq!(3, snapshot.active_count);
+    assert_eq!(Some(450), snapshot.oldest_active_age_ms);
+    assert_eq!(2, snapshot.active_fetch_material_count);
+    assert_eq!(Some(400), snapshot.oldest_fetch_material_age_ms);
 }
 
 #[tokio::test]

@@ -641,6 +641,14 @@ fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto
             "sporos_announce_oldest_active_age_seconds",
             "Oldest active announce work age.",
         );
+        let announce_active_fetch_material = int_gauge(
+            "sporos_announce_active_fetch_material_rows",
+            "Active announce work rows retaining raw fetch material.",
+        );
+        let announce_oldest_fetch_material_age = gauge(
+            "sporos_announce_oldest_fetch_material_age_seconds",
+            "Oldest active announce raw fetch material age.",
+        );
         let announce_next_retry = gauge(
             "sporos_announce_next_retry_delay_seconds",
             "Next announce retry delay.",
@@ -648,17 +656,28 @@ fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto
         let announce_running_leases =
             int_gauge("sporos_announce_running_leases", "Running announce leases.");
         announce_active.set(queue.active_count);
+        announce_active_fetch_material.set(queue.active_fetch_material_count);
         if let Some(age_ms) = queue.oldest_active_age_ms {
             announce_oldest_age.set(ms_to_seconds(i64_to_u64_floor(age_ms)));
+        }
+        if let Some(age_ms) = queue.oldest_fetch_material_age_ms {
+            announce_oldest_fetch_material_age.set(ms_to_seconds(i64_to_u64_floor(age_ms)));
         }
         if let Some(delay_ms) = queue.next_retry_delay_ms {
             announce_next_retry.set(ms_to_seconds(i64_to_u64_floor(delay_ms)));
         }
         announce_running_leases.set(queue.running_leases);
         register(&registry, Box::new(announce_active.clone()));
+        register(&registry, Box::new(announce_active_fetch_material.clone()));
         register(&registry, Box::new(announce_running_leases.clone()));
         if queue.oldest_active_age_ms.is_some() {
             register(&registry, Box::new(announce_oldest_age.clone()));
+        }
+        if queue.oldest_fetch_material_age_ms.is_some() {
+            register(
+                &registry,
+                Box::new(announce_oldest_fetch_material_age.clone()),
+            );
         }
         if queue.next_retry_delay_ms.is_some() {
             register(&registry, Box::new(announce_next_retry.clone()));
@@ -874,6 +893,8 @@ mod tests {
             announce_queue: Some(AnnounceQueueSnapshot {
                 active_count: 3,
                 oldest_active_age_ms: Some(4_000),
+                active_fetch_material_count: 2,
+                oldest_fetch_material_age_ms: Some(3_000),
                 next_retry_delay_ms: Some(2_000),
                 running_leases: 1,
                 status_counts: vec![AnnounceStatusCount {
@@ -944,6 +965,8 @@ mod tests {
         assert!(output.contains("sporos_prowlarr_refresh_deactivated_total{source=\"main\"} 1"));
         assert!(output.contains("sporos_announce_active_work 3"));
         assert!(output.contains("sporos_announce_oldest_active_age_seconds 4"));
+        assert!(output.contains("sporos_announce_active_fetch_material_rows 2"));
+        assert!(output.contains("sporos_announce_oldest_fetch_material_age_seconds 3"));
         assert!(output.contains("sporos_announce_worker_busy 1"));
         assert!(output.contains("sporos_announce_worker_idle 1"));
         assert!(output.contains("sporos_queue_depth{queue=\"search\"} 1"));
@@ -974,6 +997,8 @@ mod tests {
             announce_queue: Some(AnnounceQueueSnapshot {
                 active_count: 1,
                 oldest_active_age_ms: None,
+                active_fetch_material_count: 0,
+                oldest_fetch_material_age_ms: None,
                 next_retry_delay_ms: None,
                 running_leases: 0,
                 status_counts: vec![
@@ -1041,6 +1066,8 @@ mod tests {
 
         assert!(!output.contains("sporos_announce_active_work"));
         assert!(!output.contains("sporos_announce_oldest_active_age_seconds"));
+        assert!(!output.contains("sporos_announce_active_fetch_material_rows"));
+        assert!(!output.contains("sporos_announce_oldest_fetch_material_age_seconds"));
         assert!(!output.contains("sporos_announce_next_retry_delay_seconds"));
         assert!(!output.contains("sporos_announce_running_leases"));
         assert!(!output.contains("sporos_announce_worker_capacity"));

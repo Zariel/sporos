@@ -77,6 +77,8 @@ pub struct AnnounceDependencyWaitCount {
 pub struct AnnounceQueueSnapshot {
     pub active_count: i64,
     pub oldest_active_age_ms: Option<i64>,
+    pub active_fetch_material_count: i64,
+    pub oldest_fetch_material_age_ms: Option<i64>,
     pub next_retry_delay_ms: Option<i64>,
     pub running_leases: i64,
     pub status_counts: Vec<AnnounceStatusCount>,
@@ -3870,6 +3872,14 @@ impl Repository {
             SELECT
                 COUNT(*) AS active_count,
                 MIN(received_at) AS oldest_received_at,
+                COALESCE(SUM(CASE
+                    WHEN download_url IS NOT NULL OR cookie IS NOT NULL
+                    THEN 1 ELSE 0
+                END), 0) AS active_fetch_material_count,
+                MIN(CASE
+                    WHEN download_url IS NOT NULL OR cookie IS NOT NULL
+                    THEN received_at
+                END) AS oldest_fetch_material_received_at,
                 MIN(CASE
                     WHEN status IN ('queued', 'retryable', 'waiting')
                     THEN next_attempt_at
@@ -3887,10 +3897,15 @@ impl Repository {
         .map_err(|error| db_error("read announce queue summary", error))?;
         let active_count = summary.get("active_count");
         let oldest_received_at: Option<i64> = summary.get("oldest_received_at");
+        let active_fetch_material_count = summary.get("active_fetch_material_count");
+        let oldest_fetch_material_received_at: Option<i64> =
+            summary.get("oldest_fetch_material_received_at");
         let next_attempt_at: Option<i64> = summary.get("next_attempt_at");
         let running_leases = summary.get("running_leases");
         let oldest_active_age_ms =
             oldest_received_at.map(|received_at| now_ms.saturating_sub(received_at).max(0));
+        let oldest_fetch_material_age_ms = oldest_fetch_material_received_at
+            .map(|received_at| now_ms.saturating_sub(received_at).max(0));
         let next_retry_delay_ms =
             next_attempt_at.map(|next_attempt| next_attempt.saturating_sub(now_ms).max(0));
 
@@ -3900,6 +3915,8 @@ impl Repository {
         Ok(AnnounceQueueSnapshot {
             active_count,
             oldest_active_age_ms,
+            active_fetch_material_count,
+            oldest_fetch_material_age_ms,
             next_retry_delay_ms,
             running_leases,
             status_counts: self.announce_status_counts_limited(limit).await?,

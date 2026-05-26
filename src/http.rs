@@ -694,6 +694,8 @@ struct AnnounceQueueStatusResponse {
     worker_busy: i64,
     worker_idle: i64,
     oldest_active_age_ms: Option<i64>,
+    active_fetch_material_count: i64,
+    oldest_fetch_material_age_ms: Option<i64>,
     next_retry_delay_ms: Option<i64>,
     running_leases: i64,
     statuses: Vec<AnnounceStatusCountResponse>,
@@ -1860,6 +1862,8 @@ fn announce_queue_status_response(
         worker_busy,
         worker_idle,
         oldest_active_age_ms: snapshot.oldest_active_age_ms,
+        active_fetch_material_count: snapshot.active_fetch_material_count,
+        oldest_fetch_material_age_ms: snapshot.oldest_fetch_material_age_ms,
         next_retry_delay_ms: snapshot.next_retry_delay_ms,
         running_leases: snapshot.running_leases,
         statuses: snapshot
@@ -2837,6 +2841,15 @@ mod tests {
         let status_json: Value = serde_json::from_slice(&status_body).unwrap();
 
         assert_eq!(1, status_json["announce_queue"]["active_count"]);
+        assert_eq!(
+            1,
+            status_json["announce_queue"]["active_fetch_material_count"]
+        );
+        assert!(
+            status_json["announce_queue"]["oldest_fetch_material_age_ms"]
+                .as_i64()
+                .is_some_and(|age| age >= 0)
+        );
         assert_eq!(3, status_json["announce_queue"]["worker_capacity"]);
         assert_eq!(
             "queued",
@@ -2866,6 +2879,8 @@ mod tests {
         let metrics_text = std::str::from_utf8(&metrics_body).unwrap();
 
         assert!(metrics_text.contains("sporos_announce_active_work 1"));
+        assert!(metrics_text.contains("sporos_announce_active_fetch_material_rows 1"));
+        assert!(metrics_text.contains("sporos_announce_oldest_fetch_material_age_seconds"));
         assert!(metrics_text.contains("sporos_announce_worker_capacity 3"));
         assert!(
             metrics_text
