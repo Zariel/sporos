@@ -2604,6 +2604,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_client_items_pages_legacy_client_key_normalization() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let retained_hash = format!("{:040x}", 0);
+        insert_legacy_client_item(
+            &repository,
+            &format!("10:qbit.local:{retained_hash}"),
+            "Existing Normalized Qbit",
+        )
+        .await;
+        for index in 0..130 {
+            let hash = format!("{index:040x}");
+            insert_legacy_client_item(
+                &repository,
+                &format!("qbit.local:{hash}"),
+                &format!("Legacy Qbit {index}"),
+            )
+            .await;
+        }
+        insert_legacy_client_item(
+            &repository,
+            "rtorrent:5000:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Legacy Port",
+        )
+        .await;
+        insert_legacy_client_item(&repository, "qbit.local:tracker:123", "Legacy Qbit Tracker")
+            .await;
+        let qbit = ClientHost::new("qbit.local").unwrap();
+        let retained = client_item(
+            qbit.clone(),
+            &retained_hash,
+            "Current Qbit",
+            "current-qbit.mkv",
+            10,
+        );
+
+        let summary = worker
+            .refresh_client_items(qbit, &[retained])
+            .await
+            .unwrap();
+        let legacy_qbit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM local_items WHERE source_type = 'client' AND source_key LIKE 'qbit.local:%'",
+        )
+        .fetch_one(repository.pool())
+        .await
+        .unwrap();
+        let normalized_qbit_rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT source_key, title FROM local_items WHERE source_type = 'client' AND source_key LIKE '10:qbit.local:%'",
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+        let all_rows = repository
+            .local_items_by_media_type(MediaType::Movie, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.persisted_items);
+        assert_eq!(130, summary.pruned_items);
+        assert_eq!(0, legacy_qbit_count);
+        assert_eq!(
+            vec![(
+                format!("10:qbit.local:{retained_hash}"),
+                "Current Qbit".to_owned()
+            )],
+            normalized_qbit_rows
+        );
+        assert_eq!(2, all_rows.len());
+        assert!(all_rows.iter().any(|row| matches!(
+            &row.source,
+            LocalItemSource::Client { client_host, .. } if client_host.as_str() == "rtorrent:5000"
+        )));
+    }
+
+    #[tokio::test]
     async fn refresh_client_items_persists_large_inventory_with_pruning() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =

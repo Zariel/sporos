@@ -135,6 +135,7 @@ const ACTIVE_ANNOUNCE_STATUSES: [AnnounceStatus; 4] = [
     AnnounceStatus::Waiting,
     AnnounceStatus::Retryable,
 ];
+const LEGACY_CLIENT_SOURCE_KEY_NORMALIZE_PAGE_SIZE: i64 = 128;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StagedVirtualEpisodeCandidate {
@@ -5365,7 +5366,71 @@ async fn normalize_client_source_keys(
     client_host: &ClientHost,
 ) -> Result<(), DatabaseError> {
     let legacy_range = SourceKeyPrefixRange::new(format!("{}:", client_host.as_str()));
-    let rows = if let Some(end) = legacy_range.end {
+
+    loop {
+        let rows = read_legacy_client_source_key_page(transaction, &legacy_range).await?;
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            let id: i64 = row.get("id");
+            let old_source_key: String = row.get("source_key");
+            let Some(row_source_key) = old_source_key.strip_prefix(legacy_range.start.as_str())
+            else {
+                continue;
+            };
+
+            let row_source_key =
+                SourceKey::new(row_source_key).map_err(|error| DatabaseError::QueryFailed {
+                    operation: "normalize client inventory source key".to_owned(),
+                    message: error.to_string(),
+                })?;
+            let new_source_key = client_source_key(client_host, &row_source_key);
+            if new_source_key == old_source_key {
+                continue;
+            }
+
+            let existing_id: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM local_items WHERE source_type = 'client' AND source_key = ?",
+            )
+            .bind(&new_source_key)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|error| db_error("read normalized client inventory source key", error))?;
+            if matches!(existing_id, Some(existing_id) if existing_id != id) {
+                sqlx::query("DELETE FROM local_items WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|error| db_error("delete duplicate legacy client inventory", error))?;
+            } else {
+                sqlx::query("UPDATE local_items SET source_key = ? WHERE id = ?")
+                    .bind(&new_source_key)
+                    .bind(id)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|error| {
+                        db_error("normalize legacy client inventory source key", error)
+                    })?;
+                sqlx::query("UPDATE local_item_title_grams SET source_key = ? WHERE item_id = ?")
+                    .bind(new_source_key)
+                    .bind(id)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|error| db_error("normalize legacy client title gram key", error))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_legacy_client_source_key_page(
+    transaction: &mut Transaction<'_, Sqlite>,
+    legacy_range: &SourceKeyPrefixRange,
+) -> Result<Vec<SqliteRow>, DatabaseError> {
+    let rows = if let Some(end) = legacy_range.end.as_deref() {
         sqlx::query(
             r#"
             SELECT id, source_key
@@ -5373,10 +5438,13 @@ async fn normalize_client_source_keys(
             WHERE source_type = 'client'
               AND source_key >= ?
               AND source_key < ?
+            ORDER BY source_key, id
+            LIMIT ?
             "#,
         )
-        .bind(legacy_range.start)
+        .bind(legacy_range.start.as_str())
         .bind(end)
+        .bind(LEGACY_CLIENT_SOURCE_KEY_NORMALIZE_PAGE_SIZE)
         .fetch_all(&mut **transaction)
         .await
     } else {
@@ -5386,65 +5454,18 @@ async fn normalize_client_source_keys(
             FROM local_items
             WHERE source_type = 'client'
               AND source_key >= ?
+            ORDER BY source_key, id
+            LIMIT ?
             "#,
         )
-        .bind(legacy_range.start)
+        .bind(legacy_range.start.as_str())
+        .bind(LEGACY_CLIENT_SOURCE_KEY_NORMALIZE_PAGE_SIZE)
         .fetch_all(&mut **transaction)
         .await
     }
-    .map_err(|error| db_error("read client inventory source keys", error))?;
+    .map_err(|error| db_error("read client inventory source key page", error))?;
 
-    for row in rows {
-        let id: i64 = row.get("id");
-        let old_source_key: String = row.get("source_key");
-        let Some((row_client_host, row_source_key)) = parse_client_source_key(&old_source_key)
-        else {
-            continue;
-        };
-        if row_client_host != client_host.as_str() {
-            continue;
-        }
-
-        let row_source_key =
-            SourceKey::new(row_source_key).map_err(|error| DatabaseError::QueryFailed {
-                operation: "normalize client inventory source key".to_owned(),
-                message: error.to_string(),
-            })?;
-        let new_source_key = client_source_key(client_host, &row_source_key);
-        if new_source_key == old_source_key {
-            continue;
-        }
-
-        let existing_id: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM local_items WHERE source_type = 'client' AND source_key = ?",
-        )
-        .bind(&new_source_key)
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(|error| db_error("read normalized client inventory source key", error))?;
-        if matches!(existing_id, Some(existing_id) if existing_id != id) {
-            sqlx::query("DELETE FROM local_items WHERE id = ?")
-                .bind(id)
-                .execute(&mut **transaction)
-                .await
-                .map_err(|error| db_error("delete duplicate legacy client inventory", error))?;
-        } else {
-            sqlx::query("UPDATE local_items SET source_key = ? WHERE id = ?")
-                .bind(&new_source_key)
-                .bind(id)
-                .execute(&mut **transaction)
-                .await
-                .map_err(|error| db_error("normalize legacy client inventory source key", error))?;
-            sqlx::query("UPDATE local_item_title_grams SET source_key = ? WHERE item_id = ?")
-                .bind(new_source_key)
-                .bind(id)
-                .execute(&mut **transaction)
-                .await
-                .map_err(|error| db_error("normalize legacy client title gram key", error))?;
-        }
-    }
-
-    Ok(())
+    Ok(rows)
 }
 
 async fn clear_retained_keys(
