@@ -173,7 +173,7 @@ collect_sporos_json() {
   name="$1"
   shift
   collect_command "$diagnostics_dir/$name" \
-    compose exec -T sporos timeout "${diagnostic_timeout_seconds}s" sporos "$@"
+    compose exec -T sporos timeout "${diagnostic_timeout_seconds}s" sporos-system-test-support "$@"
 }
 
 collect_diagnostics() {
@@ -294,7 +294,7 @@ wait_for_http "Sporos readiness" "http://127.0.0.1:$http_port/readyz"
 wait_for_internal_http "qBittorrent Web API" "wget -qO- http://qbittorrent:8080/api/v2/app/version"
 wait_for_internal_http "rTorrent XML-RPC" "wget -qO- --header='Content-Type: text/xml' --post-data='<methodCall><methodName>download_list</methodName><params></params></methodCall>' http://rtorrent:8000/RPC2"
 wait_for_internal_http "Torznab fixture caps" "wget -qO- 'http://torznab-fixture:8080/api?t=caps'"
-compose exec -T sporos sporos system-test-seed \
+compose exec -T sporos sporos-system-test-support system-test-seed \
   --config /etc/sporos/config.toml \
   --manifest /system-fixtures/manifest.json \
   --indexer fixture

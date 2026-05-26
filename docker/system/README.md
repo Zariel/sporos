@@ -70,8 +70,11 @@ changes.
 
 ## Services
 
-- `sporos` builds the production image from the repository `Dockerfile` and
-  runs `sporos serve --config /etc/sporos/config.toml`.
+- `sporos` builds the system-test Docker target from the repository
+  `Dockerfile`, runs the production `sporos serve --config
+  /etc/sporos/config.toml` command, and includes the
+  `sporos-system-test-support` helper for harness-only setup and diagnostics.
+  The production runtime image target still copies only the `sporos` binary.
 - `qbittorrent` runs qBittorrent Web API on the private compose network only.
 - `rtorrent` runs rTorrent with XML-RPC exposed only on the private compose
   network.
@@ -144,8 +147,9 @@ It also gives the client UID/GID (`1000:1000`) ownership of client download and
 config/session directories while leaving the downloaded files world-readable for
 the Sporos runtime UID (`10001`).
 
-After Sporos is live, the runner executes the hidden `sporos system-test-seed`
-helper inside the Sporos container. The helper reads the mounted fixture
+After Sporos is live, the runner executes
+`sporos-system-test-support system-test-seed` inside the Sporos container. The
+helper reads the mounted fixture
 manifest, copies candidate torrents into `paths.torrent_cache_dir` using the
 normal cache filename format, and upserts matching `remote_candidates` rows
 through the Rust repository. The Torznab fixture still advertises private
@@ -172,9 +176,10 @@ On failure, the runner copies a scrubbed diagnostics directory under
 - `compose-ps.txt`
 - bounded tail of `compose-logs.txt`
 - authenticated `/livez`, `/readyz`, `/v1/status`, and `/metrics` probes
-- bounded SQLite snapshots from `sporos system-test-diagnostics`
+- bounded SQLite snapshots from
+  `sporos-system-test-support system-test-diagnostics`
 - direct qBittorrent and rTorrent fixture hash state from
-  `sporos system-test-client-state`
+  `sporos-system-test-support system-test-client-state`
 
 Generated bearer tokens, qBittorrent passwords, cookies, passkeys, and
 secret-bearing URLs are redacted before diagnostics are archived or uploaded.

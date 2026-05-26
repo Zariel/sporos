@@ -22,10 +22,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
+COPY crates/sporos-system-test-support/Cargo.toml crates/sporos-system-test-support/Cargo.toml
 
-RUN mkdir src \
+RUN mkdir -p src crates/sporos-system-test-support/src \
     && printf 'pub fn placeholder() {}\n' > src/lib.rs \
-    && printf 'fn main() {}\n' > src/main.rs
+    && printf 'fn main() {}\n' > src/main.rs \
+    && printf 'fn main() {}\n' > crates/sporos-system-test-support/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
@@ -35,7 +37,7 @@ RUN --network=none \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     CARGO_NET_OFFLINE=true cargo build --release --locked --bin sporos \
-    && rm -rf src
+    && rm -rf src crates/sporos-system-test-support/src
 
 COPY src ./src
 
@@ -49,6 +51,15 @@ RUN --network=none \
         target/release/sporos \
         target/release/sporos.d \
     && CARGO_NET_OFFLINE=true cargo build --release --locked --bin sporos
+
+FROM build AS system-test-build
+
+COPY crates ./crates
+
+RUN --network=none \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    CARGO_NET_OFFLINE=true cargo build --release --locked -p sporos-system-test-support
 
 FROM debian:${RUNTIME_DEBIAN_VERSION}-slim AS runtime
 
@@ -80,3 +91,9 @@ VOLUME ["/data/state", "/data/cache/torrents", "/data/output"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "sporos"]
 CMD ["serve", "--config", "/etc/sporos/config.toml"]
+
+FROM runtime AS system-test-support
+
+COPY --from=system-test-build /workspace/target/release/sporos-system-test-support /usr/local/bin/sporos-system-test-support
+
+FROM runtime AS production

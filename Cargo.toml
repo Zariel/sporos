@@ -35,9 +35,11 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 [workspace]
 members = [
     ".",
+    "crates/sporos-system-test-support",
 ]
 default-members = [
     ".",
+    "crates/sporos-system-test-support",
 ]
 resolver = "3"
 

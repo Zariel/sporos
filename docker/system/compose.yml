@@ -5,7 +5,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-      target: runtime
+      target: system-test-support
       args:
         RUST_VERSION: "1.95.0"
         RUNTIME_DEBIAN_VERSION: bookworm

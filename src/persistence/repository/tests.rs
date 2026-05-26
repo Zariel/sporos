@@ -185,41 +185,6 @@ async fn announce_candidate_material_treats_negative_size_as_absent() {
 }
 
 #[tokio::test]
-async fn system_test_snapshot_and_diagnostics_read_app_tables() {
-    let repository = Repository::connect_in_memory().await.unwrap();
-    let item = test_local_item("Diagnostic Example");
-    let file = LocalFile::new(
-        None,
-        PathBuf::from("Diagnostic Example/file.mkv"),
-        ByteSize::new(10),
-        FileIndex::new(0),
-    )
-    .unwrap();
-    repository
-        .upsert_local_item_with_files(&item, &[file])
-        .await
-        .unwrap();
-    repository
-        .upsert_remote_candidate(&test_remote_candidate("guid-diag", "Diagnostic Candidate"))
-        .await
-        .unwrap();
-
-    let snapshot = repository.system_test_snapshot(8).await.unwrap();
-    let diagnostics = repository.system_test_diagnostics(8).await.unwrap();
-
-    assert_eq!(1, snapshot.local_items);
-    assert_eq!(1, snapshot.local_files);
-    assert_eq!(1, snapshot.remote_candidates);
-    assert_eq!(1, snapshot.client_items.len());
-    assert_eq!("Diagnostic Example", diagnostics.local_items[0].title);
-    assert_eq!("file.mkv", diagnostics.local_files[0].file_name);
-    assert_eq!(
-        "Diagnostic Candidate",
-        diagnostics.remote_candidates[0].title
-    );
-}
-
-#[tokio::test]
 async fn file_backed_repository_reconciles_pre_prowlarr_schema() {
     let root = unique_temp_dir("sqlite-reconcile");
     let database = root.join("sporos.db");
