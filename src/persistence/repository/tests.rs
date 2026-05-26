@@ -3966,6 +3966,17 @@ async fn scheduled_indexer_pages_use_targeted_indexes() {
     let repository = Repository::connect_in_memory().await.unwrap();
     for (label, query, index_name, expected_search) in [
         (
+            "caps backoff summary",
+            r#"
+                SELECT COUNT(*) AS backoff_count, MIN(retry_after) AS next_retry_after
+                FROM indexers INDEXED BY idx_indexers_due_page
+                WHERE enabled = 1
+                  AND retry_after > 12345
+                "#,
+            "idx_indexers_due_page",
+            "enabled=? AND retry_after>?",
+        ),
+        (
             "due caps first page",
             r#"
                 SELECT id, name, retry_after, last_caps_refresh_at

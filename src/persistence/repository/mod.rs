@@ -2439,8 +2439,8 @@ impl Repository {
         let row = sqlx::query(
             r#"
             SELECT COUNT(*) AS backoff_count, MIN(retry_after) AS next_retry_after
-            FROM indexers
-            WHERE enabled != 0
+            FROM indexers INDEXED BY idx_indexers_due_page
+            WHERE enabled = 1
               AND retry_after > ?
             "#,
         )
