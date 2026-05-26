@@ -614,7 +614,10 @@ impl InjectionWorker {
             });
         }
 
-        let preparation = match self.prepare_injection_phase(&request, &target_name).await? {
+        let preparation = match self
+            .prepare_injection_phase(&request, &target_name, from_saved_retry)
+            .await?
+        {
             InjectionPreparationPhase::Ready(preparation) => preparation,
             InjectionPreparationPhase::Rejected(result) => return Ok(result),
             InjectionPreparationPhase::SourceIncomplete => {
@@ -630,8 +633,9 @@ impl InjectionWorker {
         };
 
         if should_stop() {
-            self.save_for_retry_phase(&request).await?;
+            let save_result = self.save_for_retry_phase(&request).await;
             let cleanup = preparation.cleanup_prepared_links_phase();
+            save_result?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
@@ -652,8 +656,9 @@ impl InjectionWorker {
 
         match mutation_result {
             InjectionMutationResult::SavedForShutdown => {
-                self.save_for_retry_phase(&request).await?;
+                let save_result = self.save_for_retry_phase(&request).await;
                 let cleanup = preparation.cleanup_prepared_links_phase();
+                save_result?;
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
@@ -740,7 +745,7 @@ impl InjectionWorker {
                 })
             }
             InjectionMutationResult::Injected(Err(error)) => {
-                self.save_for_retry_phase(&request).await?;
+                let save_result = self.save_for_retry_phase(&request).await;
                 let cleanup = preparation.cleanup_prepared_links_phase();
                 self.record_client_health(
                     target.descriptor(),
@@ -749,6 +754,7 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
+                save_result?;
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Failed,
                     target_client: Some(target_name),
@@ -758,7 +764,7 @@ impl InjectionWorker {
                 })
             }
             InjectionMutationResult::PreparedLinksInvalid(error) => {
-                self.save_for_retry_phase(&request).await?;
+                let save_result = self.save_for_retry_phase(&request).await;
                 let cleanup = preparation.cleanup_prepared_links_phase();
                 if cleanup.prepared_link_cleanup_incomplete {
                     Err(InjectionWorkerError::Link(
@@ -772,6 +778,7 @@ impl InjectionWorker {
                         },
                     ))
                 } else {
+                    save_result?;
                     Err(error.into())
                 }
             }
@@ -1246,6 +1253,7 @@ impl InjectionWorker {
         &self,
         request: &InjectionRequest,
         target_name: &DependencyName,
+        from_saved_retry: bool,
     ) -> Result<InjectionPreparationPhase, InjectionWorkerError> {
         let recheck_plan =
             recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
@@ -1266,6 +1274,10 @@ impl InjectionWorker {
                 linked_files: 0,
                 prepared_link_cleanup_incomplete: false,
             }));
+        }
+
+        if !from_saved_retry && request.link_type.is_some() && !request.link_dirs.is_empty() {
+            self.save_for_retry_phase(request).await?;
         }
 
         let link_result = self.prepare_links(request).await?;
@@ -2978,6 +2990,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_cleans_links_when_retry_save_fails_after_client_failure() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-failure-save");
+        let output_dir = root.join("output");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let target = Arc::new(
+            FakeClient::new(descriptor("target", "target"))
+                .with_inject_error()
+                .with_replace_path_with_file_on_inject(output_dir.clone(), b"not a dir".to_vec()),
+        );
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("links")];
+        fs::create_dir_all(&request.link_dirs[0]).unwrap();
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let error = worker.process(request).await.unwrap_err();
+
+        assert!(matches!(error, InjectionWorkerError::Save(_)));
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert!(output_dir.is_file());
+        assert!(!root.join("links/tracker.example/movie.mkv").exists());
+    }
+
+    #[tokio::test]
     async fn worker_cleans_links_when_locked_other_client_recheck_fails() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("injection-other-recheck-failure");
@@ -3172,6 +3211,42 @@ mod tests {
         assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
         assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
         assert_eq!(0, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_linked_below_threshold_without_retry_checkpoint() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-link-reject-below-threshold");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.metafile = metafile_with_files(&[("movie.mkv", 20)]);
+        request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("links")];
+        fs::create_dir_all(&request.link_dirs[0]).unwrap();
+        request.recheck = RecheckResumeConfig {
+            below_threshold_action: BelowThresholdAction::RejectWithoutInjecting,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::Rejected, result.outcome);
+        assert!(!result.saved_for_retry);
+        assert_eq!(0, result.linked_files);
+        assert_eq!(0, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, saved_torrent_count(&root.join("output")));
+        assert!(!root.join("links/tracker.example/movie.mkv").exists());
     }
 
     #[tokio::test]
@@ -3668,6 +3743,7 @@ mod tests {
             tokio::spawn(async move { worker.process_until_shutdown(request, signal).await });
 
         wait_for_calls(&target.inject_calls, 1).await;
+        assert_eq!(0, saved_torrent_count(&output_dir));
         shutdown.cancel_now("test shutdown").unwrap();
         let result = tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -3994,6 +4070,91 @@ mod tests {
                 .save_path_file_exists_at_inject
                 .load(Ordering::SeqCst)
         );
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_retry_reconciles_existing_prepared_links_after_restart() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-link-restart");
+        let output_dir = root.join("output");
+        let link_dir = root.join("links");
+        let prepared_dir = link_dir.join("tracker.example");
+        fs::create_dir_all(&prepared_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        fs::hard_link(root.join("movie.mkv"), prepared_dir.join("movie.mkv")).unwrap();
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        let parsed = parse_metafile(test_torrent_bytes()).unwrap();
+        let mut candidate = remote_candidate();
+        candidate.info_hash = Some(parsed.metafile.info_hash().clone());
+        save_candidate_torrent(
+            &output_dir,
+            &candidate_output_metadata(MediaType::Movie, &candidate, &parsed.metafile),
+            test_torrent_bytes(),
+        )
+        .unwrap();
+
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let worker = InjectionWorker::new(
+            repository.clone(),
+            vec![target.clone() as Arc<dyn InjectionClient>],
+        );
+        let summary = worker
+            .retry_saved_torrents(SavedTorrentRetryConfig {
+                directories: vec![output_dir.clone()],
+                link_dirs: vec![link_dir.clone()],
+                link_type: Some(LinkType::Hardlink),
+                recheck: skip_recheck_config(),
+                assessed_at_ms: 1_700_000_000_000,
+                ..SavedTorrentRetryConfig::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.scanned);
+        assert_eq!(1, summary.attempted);
+        assert_eq!(1, summary.injected);
+        assert_eq!(0, summary.deleted);
+        assert_eq!(1, summary.kept);
+        assert_eq!(1, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(Some(prepared_dir.clone()), target.last_save_path());
+        assert_eq!(
+            1,
+            target
+                .save_path_file_exists_at_inject
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        assert!(prepared_dir.join("movie.mkv").exists());
+
+        let restarted_target =
+            Arc::new(FakeClient::new(descriptor("target", "target")).with_existing(true));
+        let restarted_worker = InjectionWorker::new(
+            repository,
+            vec![restarted_target.clone() as Arc<dyn InjectionClient>],
+        );
+        let summary = restarted_worker
+            .retry_saved_torrents(SavedTorrentRetryConfig {
+                directories: vec![output_dir.clone()],
+                link_dirs: vec![link_dir],
+                link_type: Some(LinkType::Hardlink),
+                recheck: skip_recheck_config(),
+                assessed_at_ms: 1_700_000_000_000,
+                ..SavedTorrentRetryConfig::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.scanned);
+        assert_eq!(1, summary.attempted);
+        assert_eq!(1, summary.already_exists);
+        assert_eq!(1, summary.deleted);
+        assert_eq!(0, restarted_target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(1, restarted_target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, saved_torrent_count(&output_dir));
+        assert!(prepared_dir.join("movie.mkv").exists());
     }
 
     #[tokio::test]
@@ -5286,6 +5447,7 @@ mod tests {
         resume_calls: AtomicUsize,
         save_path_file_exists_at_inject: AtomicUsize,
         replace_save_path_file_on_has: StdMutex<Option<(PathBuf, Vec<u8>)>>,
+        replace_path_with_file_on_inject: StdMutex<Option<(PathBuf, Vec<u8>)>>,
         last_pause_for_recheck: StdMutex<Option<bool>>,
         last_save_path: StdMutex<Option<PathBuf>>,
     }
@@ -5572,6 +5734,7 @@ mod tests {
                 resume_calls: AtomicUsize::new(0),
                 save_path_file_exists_at_inject: AtomicUsize::new(0),
                 replace_save_path_file_on_has: StdMutex::new(None),
+                replace_path_with_file_on_inject: StdMutex::new(None),
                 last_pause_for_recheck: StdMutex::new(None),
                 last_save_path: StdMutex::new(None),
             }
@@ -5649,6 +5812,11 @@ mod tests {
             self
         }
 
+        fn with_replace_path_with_file_on_inject(self, path: PathBuf, contents: Vec<u8>) -> Self {
+            *self.replace_path_with_file_on_inject.lock().unwrap() = Some((path, contents));
+            self
+        }
+
         fn last_pause_for_recheck(&self) -> Option<bool> {
             *self.last_pause_for_recheck.lock().unwrap()
         }
@@ -5720,6 +5888,16 @@ mod tests {
             self.inject_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_pause_for_recheck.lock().unwrap() = Some(request.pause_for_recheck);
             *self.last_save_path.lock().unwrap() = request.save_path.map(Path::to_path_buf);
+            if let Some((path, contents)) =
+                self.replace_path_with_file_on_inject.lock().unwrap().take()
+            {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("remove directory before test replacement: {error}"),
+                }
+                std::fs::write(path, contents).unwrap();
+            }
             if request
                 .save_path
                 .is_some_and(|save_path| save_path.join("movie.mkv").exists())

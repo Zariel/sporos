@@ -236,6 +236,15 @@ flat_linking = false
 link directory; `true` writes prepared links directly under the selected link
 directory.
 
+Prepared links use the saved-torrent retry file as their durable recovery
+checkpoint. Controlled shutdown and client-side injection failures clean newly
+created links before returning. If the process exits after links were created,
+the next saved-torrent retry accepts existing matching prepared links, revalidates
+them before client mutation, and keeps the retry file until the client confirms
+that the torrent is complete or already owned. Replaced or unsafe prepared links
+block client mutation; cleanup failures are reported as warnings with
+`prepared_link_cleanup_incomplete` in the worker result.
+
 ## Injection Recheck And Auto-Resume
 
 `[injection.recheck]` controls how Sporos adds a matched torrent, waits for the
