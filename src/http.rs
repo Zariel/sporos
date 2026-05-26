@@ -27,7 +27,8 @@ use crate::announce::{
     AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
 use crate::domain::{
-    ByteSize, CandidateGuid, DependencyName, DownloadUrl, ItemTitle, JobName, TrackerName,
+    ByteSize, CandidateGuid, DependencyName, DependencyState, DownloadUrl, ItemTitle, JobName,
+    TrackerName,
 };
 use crate::errors::DatabaseError;
 use crate::inventory_refresh::InventoryRefreshRequest;
@@ -40,7 +41,9 @@ use crate::notifications::{
 };
 use crate::persistence::repository::{AnnounceInsertResult, AnnounceQueueSnapshot, Repository};
 use crate::runtime::announce_worker::unix_time_ms;
-use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
+use crate::runtime::health::{
+    DependencyHealthSnapshot as RuntimeDependencyHealthSnapshot, HealthRegistry,
+};
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
 use crate::runtime::scheduler::ScheduledJobRun;
 use crate::secrets::{CookieSecret, sanitize_url_for_logging};
@@ -285,7 +288,7 @@ impl HttpState {
         readiness
     }
 
-    fn dependency_health(&self) -> DependencyHealthSnapshot {
+    fn dependency_health(&self) -> RuntimeDependencyHealthSnapshot {
         self.health.snapshot()
     }
 
@@ -620,8 +623,22 @@ struct StatusResponse {
     status: &'static str,
     readiness: ReadinessResponse,
     runtime: RuntimeStatusResponse,
+    dependencies: Vec<DependencyStatusResponse>,
     announce_queue: Option<AnnounceQueueStatusResponse>,
     announce_queue_error: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct DependencyStatusResponse {
+    kind: String,
+    name: String,
+    state: String,
+    reason: Option<String>,
+    retry_after_ms: Option<i64>,
+    failure_count: u16,
+    checked_at_ms: Option<i64>,
+    source: &'static str,
+    stale: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1082,6 +1099,7 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
 
 async fn status(State(state): State<HttpState>) -> impl IntoResponse {
     let readiness = readiness_response(&state).await;
+    let dependencies = dependency_statuses(&state).await;
     let (announce_queue, announce_queue_error) = announce_queue_status(&state).await;
     state
         .metrics
@@ -1092,6 +1110,7 @@ async fn status(State(state): State<HttpState>) -> impl IntoResponse {
             status: "ok",
             readiness,
             runtime: state.runtime_status(),
+            dependencies,
             announce_queue,
             announce_queue_error,
         }),
@@ -1595,6 +1614,183 @@ async fn announce_queue_status(
     }
 }
 
+async fn dependency_statuses(state: &HttpState) -> Vec<DependencyStatusResponse> {
+    let memory = state.dependency_health();
+    let persisted = match state.announce_acceptor.as_ref() {
+        Some(acceptor) => acceptor
+            .repository
+            .dependency_health_snapshot(1_000)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    dependency_status_response(memory, persisted)
+}
+
+fn dependency_status_response(
+    memory: RuntimeDependencyHealthSnapshot,
+    persisted: Vec<crate::persistence::repository::DependencyHealthSnapshot>,
+) -> Vec<DependencyStatusResponse> {
+    let mut persisted_by_key = BTreeMap::new();
+    for entry in persisted {
+        persisted_by_key.insert(
+            (
+                entry.dependency_type.clone(),
+                entry.dependency_name.as_str().to_owned(),
+            ),
+            entry,
+        );
+    }
+    let mut memory_by_key = BTreeMap::new();
+    for entry in memory.entries {
+        memory_by_key.insert(
+            (
+                entry.key.kind.as_str().to_owned(),
+                entry.key.name.as_str().to_owned(),
+            ),
+            entry,
+        );
+    }
+
+    let mut keys = persisted_by_key.keys().cloned().collect::<BTreeSet<_>>();
+    keys.extend(memory_by_key.keys().cloned());
+
+    keys.into_iter()
+        .filter_map(|(kind, name)| {
+            let memory = memory_by_key.get(&(kind.clone(), name.clone()));
+            let persisted = persisted_by_key.get(&(kind.clone(), name.clone()));
+            Some(match (memory, persisted) {
+                (Some(memory), Some(persisted)) => {
+                    merged_dependency_status(&kind, &name, &memory.state, persisted)
+                }
+                (Some(memory), None) => memory_dependency_status(&kind, &name, &memory.state),
+                (None, Some(persisted)) => {
+                    persisted_dependency_status(&kind, &name, persisted, "persisted", false)
+                }
+                (None, None) => return None,
+            })
+        })
+        .collect()
+}
+
+fn memory_dependency_status(
+    kind: &str,
+    name: &str,
+    memory: &DependencyState,
+) -> DependencyStatusResponse {
+    let state = dependency_state_response(memory);
+    DependencyStatusResponse {
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+        state: state.state,
+        reason: state.reason,
+        retry_after_ms: state.retry_after_ms,
+        failure_count: 0,
+        checked_at_ms: state.checked_at_ms,
+        source: "memory",
+        stale: false,
+    }
+}
+
+fn merged_dependency_status(
+    kind: &str,
+    name: &str,
+    memory: &DependencyState,
+    persisted: &crate::persistence::repository::DependencyHealthSnapshot,
+) -> DependencyStatusResponse {
+    let memory_state = dependency_state_response(memory);
+    let persisted_state = persisted_dependency_state_response(persisted);
+    let stale = memory_state.state != persisted_state.state
+        || memory_state.reason != persisted_state.reason
+        || memory_state.retry_after_ms != persisted_state.retry_after_ms;
+
+    DependencyStatusResponse {
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+        state: memory_state.state,
+        reason: memory_state.reason,
+        retry_after_ms: memory_state.retry_after_ms,
+        failure_count: persisted.failure_count,
+        checked_at_ms: memory_state.checked_at_ms.or(Some(persisted.checked_at_ms)),
+        source: "memory_and_persisted",
+        stale,
+    }
+}
+
+fn persisted_dependency_status(
+    kind: &str,
+    name: &str,
+    persisted: &crate::persistence::repository::DependencyHealthSnapshot,
+    source: &'static str,
+    stale: bool,
+) -> DependencyStatusResponse {
+    let state = persisted_dependency_state_response(persisted);
+    DependencyStatusResponse {
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+        state: state.state,
+        reason: state.reason,
+        retry_after_ms: state.retry_after_ms,
+        failure_count: persisted.failure_count,
+        checked_at_ms: Some(persisted.checked_at_ms),
+        source,
+        stale,
+    }
+}
+
+struct DependencyStateResponse {
+    state: String,
+    reason: Option<String>,
+    retry_after_ms: Option<i64>,
+    checked_at_ms: Option<i64>,
+}
+
+fn dependency_state_response(state: &DependencyState) -> DependencyStateResponse {
+    match state {
+        DependencyState::Unknown => DependencyStateResponse {
+            state: "unknown".to_owned(),
+            reason: None,
+            retry_after_ms: None,
+            checked_at_ms: None,
+        },
+        DependencyState::Healthy { checked_at_ms } => DependencyStateResponse {
+            state: "healthy".to_owned(),
+            reason: None,
+            retry_after_ms: None,
+            checked_at_ms: Some(*checked_at_ms),
+        },
+        DependencyState::Degraded {
+            reason,
+            retry_after_ms,
+        } => DependencyStateResponse {
+            state: "degraded".to_owned(),
+            reason: Some(reason.as_str().to_owned()),
+            retry_after_ms: *retry_after_ms,
+            checked_at_ms: None,
+        },
+        DependencyState::Unavailable {
+            reason,
+            retry_after_ms,
+        } => DependencyStateResponse {
+            state: "unavailable".to_owned(),
+            reason: Some(reason.as_str().to_owned()),
+            retry_after_ms: *retry_after_ms,
+            checked_at_ms: None,
+        },
+    }
+}
+
+fn persisted_dependency_state_response(
+    persisted: &crate::persistence::repository::DependencyHealthSnapshot,
+) -> DependencyStateResponse {
+    DependencyStateResponse {
+        state: persisted.state.clone(),
+        reason: persisted.reason.clone(),
+        retry_after_ms: persisted.retry_after_ms,
+        checked_at_ms: Some(persisted.checked_at_ms),
+    }
+}
+
 fn announce_queue_status_response(
     snapshot: AnnounceQueueSnapshot,
     config: &AnnounceQueueConfig,
@@ -1836,6 +2032,111 @@ mod tests {
         assert_eq!(StatusCode::OK, status);
         assert_eq!("ok", json["status"]);
         assert_eq!("ready", json["readiness"]["status"]);
+    }
+
+    #[tokio::test]
+    async fn status_reports_dependency_health_entries_by_source() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .record_dependency_health(
+                DependencyKind::Arr,
+                &DependencyName::new("persisted-only").unwrap(),
+                &DependencyState::Degraded {
+                    reason: ReasonText::new("arr down").unwrap(),
+                    retry_after_ms: Some(500),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        repository
+            .record_dependency_health(
+                DependencyKind::TorrentClient,
+                &DependencyName::new("merged").unwrap(),
+                &DependencyState::Healthy { checked_at_ms: 100 },
+                100,
+            )
+            .await
+            .unwrap();
+        repository
+            .record_dependency_health(
+                DependencyKind::Notification,
+                &DependencyName::new("stale").unwrap(),
+                &DependencyState::Healthy { checked_at_ms: 90 },
+                90,
+            )
+            .await
+            .unwrap();
+        let health = HealthRegistry::new();
+        health.set_degraded(
+            DependencyKind::Indexer,
+            DependencyName::new("memory-only").unwrap(),
+            ReasonText::new("rate limited").unwrap(),
+            Some(300),
+        );
+        health.set_healthy(
+            DependencyKind::TorrentClient,
+            DependencyName::new("merged").unwrap(),
+            200,
+        );
+        health.set_unavailable(
+            DependencyKind::Notification,
+            DependencyName::new("stale").unwrap(),
+            ReasonText::new("webhook down").unwrap(),
+            Some(400),
+        );
+        let app = router(
+            HttpState::new(ReadinessState::ready(), health)
+                .with_announce_acceptor(repository, AnnounceQueueConfig::default()),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let memory = dependency_status(&json, "indexer", "memory-only");
+        assert_eq!("degraded", memory["state"]);
+        assert_eq!("rate limited", memory["reason"]);
+        assert_eq!(300, memory["retry_after_ms"]);
+        assert_eq!(0, memory["failure_count"]);
+        assert_eq!(Value::Null, memory["checked_at_ms"]);
+        assert_eq!("memory", memory["source"]);
+        assert_eq!(false, memory["stale"]);
+
+        let persisted = dependency_status(&json, "arr", "persisted-only");
+        assert_eq!("degraded", persisted["state"]);
+        assert_eq!("arr down", persisted["reason"]);
+        assert_eq!(500, persisted["retry_after_ms"]);
+        assert_eq!(1, persisted["failure_count"]);
+        assert_eq!(100, persisted["checked_at_ms"]);
+        assert_eq!("persisted", persisted["source"]);
+        assert_eq!(false, persisted["stale"]);
+
+        let merged = dependency_status(&json, "torrent_client", "merged");
+        assert_eq!("healthy", merged["state"]);
+        assert_eq!(0, merged["failure_count"]);
+        assert_eq!(200, merged["checked_at_ms"]);
+        assert_eq!("memory_and_persisted", merged["source"]);
+        assert_eq!(false, merged["stale"]);
+
+        let stale = dependency_status(&json, "notification", "stale");
+        assert_eq!("unavailable", stale["state"]);
+        assert_eq!("webhook down", stale["reason"]);
+        assert_eq!(400, stale["retry_after_ms"]);
+        assert_eq!(0, stale["failure_count"]);
+        assert_eq!(90, stale["checked_at_ms"]);
+        assert_eq!("memory_and_persisted", stale["source"]);
+        assert_eq!(true, stale["stale"]);
     }
 
     #[tokio::test]
@@ -2769,6 +3070,15 @@ mod tests {
             .iter()
             .find(|queue| queue["kind"] == kind)
             .unwrap_or_else(|| panic!("missing queue status for {kind}"))
+    }
+
+    fn dependency_status<'a>(json: &'a Value, kind: &str, name: &str) -> &'a Value {
+        json["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dependency| dependency["kind"] == kind && dependency["name"] == name)
+            .unwrap_or_else(|| panic!("missing dependency status for {kind} {name}"))
     }
 
     fn nonzero(value: usize) -> NonZeroUsize {
