@@ -4077,6 +4077,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_after_startup_media_refresh_matches_data_root_item() {
+        let root = unique_temp_dir("daemon-startup-media-search");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        let media_root = root.join("media");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&media_root).unwrap();
+        fs::write(media_root.join("movie.mkv"), b"0123456789").unwrap();
+        let indexer_url = spawn_daemon_torznab_search_download_server().await;
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        config.paths.torrent_cache_dir = cache_dir;
+        config.paths.media_dirs = vec![media_root];
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .record_job_status(
+                &JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: None,
+                    last_finished_at_ms: Some(unix_time_ms()),
+                    next_run_at_ms: Some(unix_time_ms() + 86_400_000),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(
+                &DependencyName::new("main").unwrap(),
+                &daemon_movie_caps(),
+                unix_time_ms(),
+            )
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let shutdown = state.shutdown.clone();
+        let shutdown_signal = state.shutdown_signal.clone();
+
+        let handles = start_background_tasks(runtime).await.unwrap();
+        wait_for_local_item_count(&repository, 1).await;
+        let summary = process_search_workflow(
+            state,
+            SearchWorkflowRequest {
+                query: ItemTitle::new("movie.mkv").unwrap(),
+            },
+            shutdown_signal,
+        )
+        .await
+        .unwrap();
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        assert_eq!(1, summary.saved);
+        assert_eq!(0, summary.rejected);
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn scheduled_media_inventory_shutdown_records_waiting_job() {
         let root = unique_temp_dir("daemon-scheduled-media-inventory-shutdown");
         for index in 0..128 {
@@ -4966,6 +5039,98 @@ mod tests {
         assert_eq!(1, download_requests.load(Ordering::SeqCst));
         assert_eq!(1, saved_torrent_count(&output_dir));
         assert_announce_fetch_columns_cleared(&repository, id.as_str()).await;
+    }
+
+    #[tokio::test]
+    async fn announce_without_inventory_waits_for_refresh_instead_of_failing() {
+        let root = unique_temp_dir("daemon-announce-unrefreshed-inventory");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let download_url = spawn_daemon_torrent_download_server().await;
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let id = AnnounceWorkId::new("ann_unrefreshed").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-unrefreshed",
+            "tracker.example",
+            &download_url,
+        )
+        .await;
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let result = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id,
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::InventoryRefreshing,
+                ..
+            }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_media_refresh_wakes_waiting_announce_work() {
+        let root = unique_temp_dir("daemon-startup-media-wakes-announce");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        let media_root = root.join("media");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&media_root).unwrap();
+        fs::write(media_root.join("movie.mkv"), b"0123456789").unwrap();
+        let download_url = spawn_daemon_torrent_download_server().await;
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        config.paths.torrent_cache_dir = cache_dir;
+        config.paths.media_dirs = vec![media_root];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let refreshing_id = AnnounceWorkId::new("ann_waiting_inventory").unwrap();
+        let incomplete_id = AnnounceWorkId::new("ann_source_incomplete").unwrap();
+        insert_announce_row(
+            &repository,
+            &refreshing_id,
+            "guid-waiting-inventory",
+            "tracker.example",
+            &download_url,
+        )
+        .await;
+        insert_announce_row(
+            &repository,
+            &incomplete_id,
+            "guid-source-incomplete",
+            "tracker.example",
+            &download_url,
+        )
+        .await;
+        set_announce_inventory_waiting(&repository, refreshing_id.as_str(), "inventory_refreshing")
+            .await;
+        set_announce_inventory_waiting(&repository, incomplete_id.as_str(), "source_incomplete")
+            .await;
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+
+        let handles = start_background_tasks(runtime).await.unwrap();
+        wait_for_announce_status(&repository, refreshing_id.as_str(), "succeeded").await;
+        wait_for_announce_status(&repository, incomplete_id.as_str(), "succeeded").await;
+        wait_for_saved_torrent_count(&output_dir, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -7109,6 +7274,31 @@ mod tests {
         .bind(download_url)
         .bind(now_ms)
         .bind(expires_at_ms)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn set_announce_inventory_waiting(repository: &Repository, id: &str, reason: &str) {
+        let now_ms = unix_time_ms();
+        sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'waiting',
+                reason = ?,
+                next_attempt_at = ?,
+                updated_at = ?,
+                lease_owner = NULL,
+                lease_until = NULL,
+                last_dependency_kind = NULL,
+                last_dependency_name = NULL
+            WHERE id = ?
+            "#,
+        )
+        .bind(reason)
+        .bind(now_ms + 86_400_000)
+        .bind(now_ms)
+        .bind(id)
         .execute(repository.pool())
         .await
         .unwrap();
