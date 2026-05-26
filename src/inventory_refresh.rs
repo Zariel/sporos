@@ -219,13 +219,15 @@ impl InventoryRefreshWorker {
         );
         let scanner = InventoryScanner::new(self.scan_options);
         let (sender, receiver) = mpsc::channel(DATA_ROOT_SCAN_BUFFER);
+        let media_dirs = request.media_dirs;
+        let scope_roots = media_dirs.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let scanner_cancelled = cancelled.clone();
         #[cfg(test)]
         let send_attempts = self.data_root_scan_send_attempts.clone();
         let scan_task = task::spawn_blocking(move || {
             let report = scanner.scan_media_dirs_until(
-                &request.media_dirs,
+                &media_dirs,
                 || !scanner_cancelled.load(Ordering::Relaxed),
                 |scanned| {
                     if scanner_cancelled.load(Ordering::Relaxed) {
@@ -252,7 +254,7 @@ impl InventoryRefreshWorker {
         let mut replace = Box::pin(
             self.repository
                 .replace_local_inventory_owned_receiver_with_staging_signal(
-                    LocalInventoryScope::DataRoot,
+                    LocalInventoryScope::DataRoots { roots: scope_roots },
                     receiver,
                     Some(staging_started.clone()),
                 ),
@@ -1783,6 +1785,135 @@ mod tests {
         assert_eq!(1, local_count);
         assert_eq!("Second.2026.1080p", display_name);
         assert_eq!(20, total_size);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_prunes_deleted_items_after_full_two_root_scan() {
+        let root = unique_temp_dir("two-root-clean-prune");
+        let first_root = root.join("mounted-a");
+        let second_root = root.join("mounted-b");
+        let first = first_root.join("First.2026.1080p");
+        let second = second_root.join("Second.2026.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("first.mkv"), 10);
+        write_file(&second.join("second.mkv"), 20);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let request = InventoryRefreshRequest {
+            media_dirs: vec![first_root.clone(), second_root.clone()],
+        };
+
+        let first_summary = worker.refresh_data_dirs(request.clone()).await.unwrap();
+        fs::remove_dir_all(&first).unwrap();
+        let second_summary = worker.refresh_data_dirs(request).await.unwrap();
+
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT display_name FROM local_items ORDER BY display_name",
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(2, first_summary.persisted_items);
+        assert_eq!(0, first_summary.pruned_items);
+        assert!(first_summary.scan_failures.is_empty());
+        assert_eq!(1, second_summary.scanned_items);
+        assert_eq!(1, second_summary.persisted_items);
+        assert_eq!(1, second_summary.pruned_items);
+        assert!(second_summary.scan_failures.is_empty());
+        assert_eq!(vec!["Second.2026.1080p"], names);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_retains_all_rows_after_two_root_scan_failure() {
+        let root = unique_temp_dir("two-root-partial-retain");
+        let first_root = root.join("mounted-a");
+        let second_root = root.join("mounted-b");
+        let first = first_root.join("First.2026.1080p");
+        let second = second_root.join("Second.2026.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("first.mkv"), 10);
+        write_file(&second.join("second.mkv"), 20);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let request = InventoryRefreshRequest {
+            media_dirs: vec![first_root.clone(), second_root.clone()],
+        };
+
+        let first_summary = worker.refresh_data_dirs(request.clone()).await.unwrap();
+        fs::remove_dir_all(&first_root).unwrap();
+        let second_summary = worker.refresh_data_dirs(request).await.unwrap();
+
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT display_name FROM local_items ORDER BY display_name",
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(2, first_summary.persisted_items);
+        assert_eq!(0, first_summary.pruned_items);
+        assert!(first_summary.scan_failures.is_empty());
+        assert_eq!(1, second_summary.scanned_items);
+        assert_eq!(0, second_summary.persisted_items);
+        assert_eq!(0, second_summary.pruned_items);
+        assert_eq!(1, second_summary.scan_failures.len());
+        assert_eq!(vec!["First.2026.1080p", "Second.2026.1080p"], names);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_partial_clean_root_cannot_prune_other_roots() {
+        let root = unique_temp_dir("two-root-partial-clean");
+        let first_root = root.join("mounted-a");
+        let second_root = root.join("mounted-b");
+        let first = first_root.join("First.2026.1080p");
+        let second = second_root.join("Second.2026.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("first.mkv"), 10);
+        write_file(&second.join("second.mkv"), 20);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+
+        let first_summary = worker
+            .refresh_data_dirs(InventoryRefreshRequest {
+                media_dirs: vec![first_root.clone(), second_root.clone()],
+            })
+            .await
+            .unwrap();
+        let second_summary = worker
+            .refresh_data_dirs(InventoryRefreshRequest {
+                media_dirs: vec![second_root],
+            })
+            .await
+            .unwrap();
+
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT display_name FROM local_items ORDER BY display_name",
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(2, first_summary.persisted_items);
+        assert_eq!(0, first_summary.pruned_items);
+        assert!(first_summary.scan_failures.is_empty());
+        assert_eq!(1, second_summary.scanned_items);
+        assert_eq!(1, second_summary.persisted_items);
+        assert_eq!(0, second_summary.pruned_items);
+        assert!(second_summary.scan_failures.is_empty());
+        assert_eq!(vec!["First.2026.1080p", "Second.2026.1080p"], names);
 
         fs::remove_dir_all(root).unwrap();
     }

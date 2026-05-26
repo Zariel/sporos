@@ -5239,12 +5239,16 @@ mod tests {
     #[tokio::test]
     async fn scheduled_media_inventory_refreshes_configured_media_dirs() {
         let root = unique_temp_dir("daemon-scheduled-media-inventory");
-        let media_root = root.join("media");
-        let release = media_root.join("Movie.2026.1080p");
-        fs::create_dir_all(&release).unwrap();
-        fs::write(release.join("movie.mkv"), b"0123456789").unwrap();
+        let first_root = root.join("media-a");
+        let second_root = root.join("media-b");
+        let first = first_root.join("First.2026.1080p");
+        let second = second_root.join("Second.2026.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("first.mkv"), b"0123456789").unwrap();
+        fs::write(second.join("second.mkv"), b"0123456789").unwrap();
         let mut config = SporosConfig::default();
-        config.paths.media_dirs = vec![media_root];
+        config.paths.media_dirs = vec![first_root, second_root];
         let repository = Repository::connect_in_memory().await.unwrap();
         let runtime = AppRuntime::from_repository(config, repository.clone())
             .await
@@ -5262,7 +5266,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(Ok(()), result);
-        assert_eq!(1, item_count);
+        assert_eq!(2, item_count);
         fs::remove_dir_all(root).unwrap();
     }
 

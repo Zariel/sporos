@@ -112,6 +112,7 @@ impl OwnedLocalInventoryMessage {
 pub enum LocalInventoryScope {
     Client { client_host: ClientHost },
     DataRoot,
+    DataRoots { roots: Vec<PathBuf> },
     TorrentCache,
     Virtual,
 }
@@ -181,6 +182,28 @@ impl SourceKeyPrefixRange {
     }
 }
 
+fn data_root_source_key_range(root: &Path) -> SourceKeyPrefixRange {
+    let mut prefix = path_to_string(root);
+    if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+        prefix.push(std::path::MAIN_SEPARATOR);
+    }
+    SourceKeyPrefixRange::new(prefix)
+}
+
+fn data_root_source_key_is_in_roots(source_key: &str, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| {
+        let root_key = path_to_string(root);
+        if source_key == root_key {
+            return true;
+        }
+        let range = data_root_source_key_range(root);
+        match range.end {
+            Some(end) => source_key >= range.start.as_str() && source_key < end.as_str(),
+            None => source_key >= range.start.as_str(),
+        }
+    })
+}
+
 impl LocalInventoryScope {
     fn accepts(&self, source_type: &str, source_key: &str) -> bool {
         match self {
@@ -189,6 +212,9 @@ impl LocalInventoryScope {
                     && source_key.starts_with(&client_source_key_prefix(client_host))
             }
             Self::DataRoot => source_type == "data_root",
+            Self::DataRoots { roots } => {
+                source_type == "data_root" && data_root_source_key_is_in_roots(source_key, roots)
+            }
             Self::TorrentCache => source_type == "torrent_cache",
             Self::Virtual => source_type == "virtual",
         }
@@ -197,18 +223,24 @@ impl LocalInventoryScope {
     fn source_type(&self) -> &'static str {
         match self {
             Self::Client { .. } => "client",
-            Self::DataRoot => "data_root",
+            Self::DataRoot | Self::DataRoots { .. } => "data_root",
             Self::TorrentCache => "torrent_cache",
             Self::Virtual => "virtual",
         }
     }
 
-    fn source_key_range(&self) -> Option<SourceKeyPrefixRange> {
+    fn source_key_ranges(&self) -> Vec<SourceKeyPrefixRange> {
         match self {
-            Self::Client { client_host } => Some(SourceKeyPrefixRange::new(
-                client_source_key_prefix(client_host),
-            )),
-            Self::DataRoot | Self::TorrentCache | Self::Virtual => None,
+            Self::Client { client_host } => {
+                vec![SourceKeyPrefixRange::new(client_source_key_prefix(
+                    client_host,
+                ))]
+            }
+            Self::DataRoots { roots } => roots
+                .iter()
+                .map(|root| data_root_source_key_range(root))
+                .collect::<Vec<_>>(),
+            Self::DataRoot | Self::TorrentCache | Self::Virtual => Vec::new(),
         }
     }
 }
@@ -5257,8 +5289,33 @@ async fn prune_local_items_not_retained(
     transaction: &mut Transaction<'_, Sqlite>,
     scope: &LocalInventoryScope,
 ) -> Result<u64, DatabaseError> {
-    let result = if let Some(range) = scope.source_key_range() {
-        if let Some(end) = range.end {
+    let ranges = scope.source_key_ranges();
+    if ranges.is_empty() {
+        if matches!(scope, LocalInventoryScope::DataRoots { .. }) {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            DELETE FROM local_items
+            WHERE source_type = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM retained_local_item_keys retained
+                  WHERE retained.source_key = local_items.source_key
+              )
+            "#,
+        )
+        .bind(scope.source_type())
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| db_error("prune missing local inventory", error))?;
+
+        return Ok(result.rows_affected());
+    }
+
+    let mut pruned = 0u64;
+    for range in ranges {
+        let result = if let Some(end) = range.end {
             sqlx::query(
                 r#"
                 DELETE FROM local_items
@@ -5295,25 +5352,12 @@ async fn prune_local_items_not_retained(
             .execute(&mut **transaction)
             .await
         }
-    } else {
-        sqlx::query(
-            r#"
-            DELETE FROM local_items
-            WHERE source_type = ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM retained_local_item_keys retained
-                  WHERE retained.source_key = local_items.source_key
-              )
-            "#,
-        )
-        .bind(scope.source_type())
-        .execute(&mut **transaction)
-        .await
-    }
-    .map_err(|error| db_error("prune missing local inventory", error))?;
+        .map_err(|error| db_error("prune missing local inventory", error))?;
 
-    Ok(result.rows_affected())
+        pruned = pruned.saturating_add(result.rows_affected());
+    }
+
+    Ok(pruned)
 }
 
 async fn normalize_client_source_keys(
