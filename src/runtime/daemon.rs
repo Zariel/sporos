@@ -64,7 +64,7 @@ use crate::runtime::injection_worker::{
 };
 use crate::runtime::scheduler::{
     CLEANUP_JOB_NAME, INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome, MEDIA_INVENTORY_JOB_NAME,
-    ScheduledJobRun, parse_interval_ms,
+    ScheduledJobRun, SchedulerError, parse_interval_ms,
 };
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
@@ -373,7 +373,40 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         }),
     );
 
+    if let Err(error) = enqueue_startup_media_inventory_refresh(&runtime.state).await {
+        warn!(error = %error, "failed to queue startup media inventory refresh");
+    }
+
     Ok(handles)
+}
+
+async fn enqueue_startup_media_inventory_refresh(state: &AppState) -> Result<(), SchedulerError> {
+    if state.config.paths.media_dirs.is_empty() {
+        return Ok(());
+    }
+
+    let job_name =
+        JobName::new(MEDIA_INVENTORY_JOB_NAME).map_err(|error| SchedulerError::InvalidConfig {
+            field: "job name",
+            message: error.to_string(),
+        })?;
+    match state
+        .scheduler
+        .enqueue_immediate_run(&job_name, unix_time_ms())
+        .await?
+    {
+        ImmediateRunOutcome::Queued => {
+            info!(job_name = %job_name, "queued startup media inventory refresh");
+        }
+        ImmediateRunOutcome::Coalesced => {
+            info!(job_name = %job_name, "startup media inventory refresh already queued or running");
+        }
+        ImmediateRunOutcome::Deferred => {
+            warn!(job_name = %job_name, "startup media inventory refresh deferred");
+        }
+    }
+
+    Ok(())
 }
 
 fn runtime_recheck_resume_config(config: &SporosConfig) -> RecheckResumeConfig {
@@ -1675,19 +1708,23 @@ async fn run_scheduled_media_inventory_job(
         return Ok(());
     }
 
+    let refresh_shutdown = shutdown.clone();
     let result = state
         .inventory_refresh
         .refresh_data_dirs_until_shutdown(
             InventoryRefreshRequest {
                 media_dirs: state.config.paths.media_dirs.clone(),
             },
-            shutdown,
+            refresh_shutdown,
         )
         .await;
 
     let summary = match result {
         Ok(summary) => summary,
         Err(error) => {
+            if shutdown.state().phase != ShutdownPhase::Running {
+                return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
+            }
             let reason = error.to_string();
             record_inventory_refresh_health(
                 &state.inventory_refresh,
@@ -3989,6 +4026,122 @@ mod tests {
             .unwrap();
         assert_eq!(1, file_count);
         assert_eq!(1, info_requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn background_tasks_run_startup_media_inventory_refresh() {
+        let root = unique_temp_dir("daemon-startup-media-inventory");
+        let first_root = root.join("media-a");
+        let second_root = root.join("media-b");
+        let first = first_root.join("First.2026.1080p");
+        let second = second_root.join("Second.2026.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("first.mkv"), b"0123456789").unwrap();
+        fs::write(second.join("second.mkv"), b"0123456789").unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.media_dirs = vec![first_root, second_root];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .record_job_status(
+                &JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: None,
+                    last_finished_at_ms: Some(unix_time_ms()),
+                    next_run_at_ms: Some(unix_time_ms() + 86_400_000),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+        let scheduler_queue = runtime.state.queues.scheduler.clone();
+
+        let handles = start_background_tasks(runtime).await.unwrap();
+        wait_for_local_item_count(&repository, 2).await;
+        wait_for_job_state(&repository, MEDIA_INVENTORY_JOB_NAME, "succeeded").await;
+        wait_for_queue_completed(&scheduler_queue, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        let file_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_files")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(2, file_count);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_media_inventory_shutdown_records_waiting_job() {
+        let root = unique_temp_dir("daemon-scheduled-media-inventory-shutdown");
+        for index in 0..128 {
+            let release = root.join(format!("Movie.{index:03}.2026.1080p"));
+            fs::create_dir_all(&release).unwrap();
+            fs::write(release.join("movie.mkv"), b"0123456789").unwrap();
+        }
+        let mut config = SporosConfig::default();
+        config.paths.media_dirs = vec![root.clone()];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let send_attempts = Arc::new(AtomicUsize::new(0));
+        let mut runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        runtime.state.inventory_refresh = runtime
+            .state
+            .inventory_refresh
+            .clone()
+            .with_data_root_scan_send_attempts(send_attempts.clone());
+        let state = runtime.state.clone();
+        let shutdown = state.shutdown.clone();
+        let signal = state.shutdown_signal.clone();
+        let job_name = JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap();
+        repository
+            .claim_immediate_job_run(&job_name, unix_time_ms())
+            .await
+            .unwrap();
+
+        let handle = tokio::spawn(async move {
+            process_scheduled_job_run(
+                &state,
+                ScheduledJobRun {
+                    job_name,
+                    scheduled_at_ms: unix_time_ms(),
+                },
+                signal,
+            )
+            .await;
+        });
+        wait_for_atomic_count(&send_attempts, 65).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let media_inventory = jobs
+            .iter()
+            .find(|job| job.name.as_str() == MEDIA_INVENTORY_JOB_NAME)
+            .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        let inventory_health = health.iter().find(|entry| {
+            entry.dependency_type == DependencyKind::LocalState.as_str()
+                && entry.dependency_name.as_str() == "inventory-refresh"
+        });
+
+        assert_eq!("waiting", media_inventory.state);
+        assert_eq!(
+            Some("scheduler shutting down".to_owned()),
+            media_inventory.last_error
+        );
+        assert!(media_inventory.next_run_at_ms.is_some());
+        assert!(inventory_health.is_none_or(|entry| entry.state != "degraded"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

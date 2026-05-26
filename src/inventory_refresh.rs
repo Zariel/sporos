@@ -176,7 +176,7 @@ impl InventoryRefreshWorker {
     }
 
     #[cfg(test)]
-    fn with_data_root_scan_send_attempts(
+    pub(crate) fn with_data_root_scan_send_attempts(
         mut self,
         attempts: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
