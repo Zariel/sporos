@@ -29,10 +29,10 @@ use crate::actions::{
 };
 use crate::clients::TorrentClientDescriptor;
 use crate::domain::{
-    ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyName, DependencyState,
-    DownloadUrl, IndexerId, InfoHash, InjectionOutcome, ItemTitle, LocalFile, LocalItem,
-    MatchDecision, ReasonText, RemoteCandidate, RemoteCandidateId, TorrentMetafile, TrackerName,
-    checked_file_total,
+    ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyKind, DependencyName,
+    DependencyState, DownloadUrl, IndexerId, InfoHash, InjectionOutcome, ItemTitle, LocalFile,
+    LocalItem, MatchDecision, ReasonText, RemoteCandidate, RemoteCandidateId, TorrentMetafile,
+    TrackerName, checked_file_total,
 };
 use crate::errors::{
     ClassifyFailure, DatabaseError, FailureClass, TorrentClientError, TorrentParseError,
@@ -1449,7 +1449,7 @@ impl InjectionWorker {
             }
         };
         self.repository
-            .record_dependency_health("client", &name, &state, checked_at_ms)
+            .record_dependency_health(DependencyKind::TorrentClient, &name, &state, checked_at_ms)
             .await
     }
 

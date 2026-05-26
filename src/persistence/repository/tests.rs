@@ -265,7 +265,10 @@ async fn file_backed_repository_reconciles_pre_prowlarr_schema() {
         .find(|indexer| indexer.name.as_str() == "legacy")
         .unwrap();
     let failure_count = repository
-        .dependency_failure_count("indexer", &DependencyName::new("legacy").unwrap())
+        .dependency_failure_count(
+            DependencyKind::Indexer,
+            &DependencyName::new("legacy").unwrap(),
+        )
         .await
         .unwrap();
 
@@ -2374,12 +2377,17 @@ async fn records_jobs_and_dependency_health() {
         .await
         .unwrap();
     repository
-        .record_dependency_health("indexer", &dependency_name, &dependency_state, 789)
+        .record_dependency_health(
+            DependencyKind::Indexer,
+            &dependency_name,
+            &dependency_state,
+            789,
+        )
         .await
         .unwrap();
     repository
         .record_dependency_health(
-            "client",
+            DependencyKind::TorrentClient,
             &DependencyName::new("qbit").unwrap(),
             &DependencyState::Healthy { checked_at_ms: 900 },
             900,
@@ -2389,7 +2397,7 @@ async fn records_jobs_and_dependency_health() {
 
     let ready = repository.ready_jobs(10, 10).await.unwrap();
     let jobs = repository.job_status_snapshot(10).await.unwrap();
-    let health = repository.dependency_health_snapshot(1).await.unwrap();
+    let health = repository.dependency_health_snapshot(10).await.unwrap();
 
     assert_eq!(vec![JobName::new("cleanup").unwrap()], ready);
     assert_eq!(3, jobs.len());
@@ -2399,9 +2407,12 @@ async fn records_jobs_and_dependency_health() {
     assert_eq!(Some(200), rss.last_finished_at_ms);
     assert_eq!(Some(456), rss.next_run_at_ms);
     assert_eq!(Some("rate limited".to_owned()), rss.last_error);
-    assert_eq!(1, health.len());
-    assert_eq!("client", health[0].dependency_type);
-    assert_eq!("healthy", health[0].state);
+    let client_health = health
+        .iter()
+        .find(|health| health.dependency_type == "torrent_client")
+        .unwrap();
+    assert_eq!("qbit", client_health.dependency_name.as_str());
+    assert_eq!("healthy", client_health.state);
 }
 
 #[tokio::test]
@@ -2698,7 +2709,10 @@ async fn non_terminal_announce_states_retain_sensitive_fetch_material() {
                 AnnounceReason::DependencyBackoff,
                 50,
                 2,
-                Some(("indexer", "tracker.example")),
+                Some(&AnnounceDependency::new(
+                    DependencyKind::Indexer,
+                    DependencyName::new("tracker.example").unwrap(),
+                )),
             )
             .await
             .unwrap()
@@ -3589,7 +3603,7 @@ async fn announce_queue_snapshot_aggregates_active_attempts_and_waits_in_sql() {
                 error_class: None,
                 action_outcome: None,
                 reason: "source_incomplete",
-                dependency: Some(("client", "qbit")),
+                dependency: Some(("torrent_client", "qbit")),
             },
         )
         .await;
@@ -3878,12 +3892,19 @@ async fn startup_indexer_health_query_uses_enabled_registry_index() {
                 health.checked_at
             FROM indexers INDEXED BY idx_indexers_enabled_name
             INNER JOIN dependency_health AS health
-                ON health.dependency_type = 'indexer'
+                ON health.dependency_type = ?
                AND health.dependency_name = indexers.name
             WHERE indexers.enabled = 1
             ORDER BY indexers.name
             "#;
-    let plan = explain_query_plan_raw(&repository, query).await;
+    let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {query}"))
+        .bind(DependencyKind::Indexer.as_str())
+        .fetch_all(repository.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get("detail"))
+        .collect::<Vec<String>>();
 
     assert!(
         !plan
@@ -4127,7 +4148,7 @@ async fn announce_wakeups_make_matching_waits_claimable() {
         "ann_32",
         AnnounceReason::ClientChecking,
         500,
-        Some(("client", "qbit.local")),
+        Some(("torrent_client", "qbit.local")),
     )
     .await;
     set_announce_waiting(
@@ -4152,7 +4173,7 @@ async fn announce_wakeups_make_matching_waits_claimable() {
         "ann_36",
         AnnounceReason::ClientChecking,
         500,
-        Some(("client", "other.local")),
+        Some(("torrent_client", "other.local")),
     )
     .await;
 
@@ -4178,7 +4199,7 @@ async fn announce_wakeups_make_matching_waits_claimable() {
         1,
         repository
             .wake_announce_dependency_recovery(
-                "indexer",
+                DependencyKind::Indexer,
                 &DependencyName::new("main").unwrap(),
                 102,
                 10
@@ -4246,7 +4267,7 @@ async fn healthy_dependency_record_wakes_matching_waits() {
 
     repository
         .record_dependency_health(
-            "indexer",
+            DependencyKind::Indexer,
             &DependencyName::new("main").unwrap(),
             &DependencyState::Healthy { checked_at_ms: 100 },
             100,

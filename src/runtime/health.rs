@@ -1,41 +1,9 @@
 use std::collections::BTreeMap;
-use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use crate::domain::{DependencyName, DependencyState, ReasonText};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum DependencyKind {
-    TorrentClient,
-    Indexer,
-    Prowlarr,
-    Arr,
-    Notification,
-    LocalState,
-    Database,
-    Worker,
-}
-
-impl DependencyKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::TorrentClient => "torrent_client",
-            Self::Indexer => "indexer",
-            Self::Prowlarr => "prowlarr",
-            Self::Arr => "arr",
-            Self::Notification => "notification",
-            Self::LocalState => "local_state",
-            Self::Database => "database",
-            Self::Worker => "worker",
-        }
-    }
-}
-
-impl fmt::Display for DependencyKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
+pub use crate::domain::DependencyKind;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct DependencyKey {

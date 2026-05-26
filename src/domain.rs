@@ -100,6 +100,53 @@ text_newtype!(ReasonText, "reason");
 text_newtype!(SourceKey, "source key");
 text_newtype!(TrackerName, "tracker name");
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum DependencyKind {
+    TorrentClient,
+    Indexer,
+    Prowlarr,
+    Arr,
+    Notification,
+    LocalState,
+    Database,
+    Worker,
+}
+
+impl DependencyKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TorrentClient => "torrent_client",
+            Self::Indexer => "indexer",
+            Self::Prowlarr => "prowlarr",
+            Self::Arr => "arr",
+            Self::Notification => "notification",
+            Self::LocalState => "local_state",
+            Self::Database => "database",
+            Self::Worker => "worker",
+        }
+    }
+
+    pub const fn from_persisted(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            b"torrent_client" => Some(Self::TorrentClient),
+            b"indexer" => Some(Self::Indexer),
+            b"prowlarr" => Some(Self::Prowlarr),
+            b"arr" => Some(Self::Arr),
+            b"notification" => Some(Self::Notification),
+            b"local_state" => Some(Self::LocalState),
+            b"database" => Some(Self::Database),
+            b"worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DependencyKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct InfoHash(String);
 
@@ -615,6 +662,25 @@ mod tests {
             }),
             ItemTitle::new("  ")
         );
+    }
+
+    #[test]
+    fn dependency_kind_round_trips_persisted_strings() {
+        for (kind, persisted) in [
+            (DependencyKind::TorrentClient, "torrent_client"),
+            (DependencyKind::Indexer, "indexer"),
+            (DependencyKind::Prowlarr, "prowlarr"),
+            (DependencyKind::Arr, "arr"),
+            (DependencyKind::Notification, "notification"),
+            (DependencyKind::LocalState, "local_state"),
+            (DependencyKind::Database, "database"),
+            (DependencyKind::Worker, "worker"),
+        ] {
+            assert_eq!(persisted, kind.as_str());
+            assert_eq!(Some(kind), DependencyKind::from_persisted(persisted));
+        }
+        assert_eq!(None, DependencyKind::from_persisted("client"));
+        assert_eq!(None, DependencyKind::from_persisted("unknown"));
     }
 
     #[test]

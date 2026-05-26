@@ -1022,12 +1022,7 @@ async fn record_inventory_refresh_health(
     };
     if let Err(error) = worker
         .repository
-        .record_dependency_health(
-            DependencyKind::LocalState.as_str(),
-            &name,
-            &state,
-            checked_at_ms,
-        )
+        .record_dependency_health(DependencyKind::LocalState, &name, &state, checked_at_ms)
         .await
     {
         warn!(error = ?error, "failed to record local inventory dependency health");
@@ -2137,7 +2132,7 @@ mod tests {
             "ann_client",
             "guid-client",
             AnnounceReason::ClientChecking,
-            Some(("client", "qbit.local")),
+            Some(("torrent_client", "qbit.local")),
         )
         .await;
         insert_waiting_announce(
@@ -2145,7 +2140,7 @@ mod tests {
             "ann_other",
             "guid-other",
             AnnounceReason::ClientChecking,
-            Some(("client", "other.local")),
+            Some(("torrent_client", "other.local")),
         )
         .await;
 
@@ -2192,7 +2187,7 @@ mod tests {
             "ann_client",
             "guid-client",
             AnnounceReason::ClientChecking,
-            Some(("client", "qbit.local")),
+            Some(("torrent_client", "qbit.local")),
         )
         .await;
 

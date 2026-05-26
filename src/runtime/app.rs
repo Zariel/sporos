@@ -190,7 +190,7 @@ impl AppState {
             .collect::<Vec<_>>();
         let persisted = self
             .repository
-            .dependency_health_for_type_names("prowlarr", &source_names)
+            .dependency_health_for_type_names(DependencyKind::Prowlarr, &source_names)
             .await?;
         let mut sources = Vec::new();
         let mut summary = ProwlarrRefreshSummary::default();
@@ -389,7 +389,7 @@ impl AppState {
                 );
                 let failure_count = self
                     .repository
-                    .dependency_failure_count("prowlarr", &source.source.name)
+                    .dependency_failure_count(DependencyKind::Prowlarr, &source.source.name)
                     .await
                     .map_err(ProwlarrRefreshError::Local)?;
                 let state = prowlarr_error_dependency_state(
@@ -417,7 +417,7 @@ impl AppState {
         now_ms: i64,
     ) -> Result<(), DatabaseError> {
         self.repository
-            .record_dependency_health("prowlarr", name, &state, now_ms)
+            .record_dependency_health(DependencyKind::Prowlarr, name, &state, now_ms)
             .await?;
         match state {
             DependencyState::Healthy { checked_at_ms } => {
@@ -782,7 +782,7 @@ impl AppState {
                 )?;
                 let failure_count = self
                     .repository
-                    .dependency_failure_count("indexer", &endpoint.name)
+                    .dependency_failure_count(DependencyKind::Indexer, &endpoint.name)
                     .await?;
                 let retry_after_ms = indexer_error_retry_after(
                     &error,
@@ -933,7 +933,7 @@ impl AppState {
                 )?;
                 let failure_count = self
                     .repository
-                    .dependency_failure_count("indexer", &name)
+                    .dependency_failure_count(DependencyKind::Indexer, &name)
                     .await?;
                 let retry_after_ms =
                     indexer_error_retry_after(&error, now_ms, failure_count, name.as_str());
@@ -1187,11 +1187,11 @@ impl AppRuntime {
             .cloned()
             .collect::<Vec<_>>();
         let mut persisted_health = repository
-            .dependency_health_for_type_names("arr", &arr_names)
+            .dependency_health_for_type_names(DependencyKind::Arr, &arr_names)
             .await?;
         persisted_health.extend(
             repository
-                .dependency_health_for_type_names("prowlarr", &prowlarr_names)
+                .dependency_health_for_type_names(DependencyKind::Prowlarr, &prowlarr_names)
                 .await?,
         );
         persisted_health.extend(repository.dependency_health_for_indexer_registry().await?);
@@ -1538,11 +1538,8 @@ fn looks_like_season_token(token: &str) -> bool {
 
 fn seed_runtime_health(health: &HealthRegistry, rows: &[DependencyHealthSnapshot]) {
     for row in rows {
-        let kind = match row.dependency_type.as_str() {
-            "arr" => DependencyKind::Arr,
-            "indexer" => DependencyKind::Indexer,
-            "prowlarr" => DependencyKind::Prowlarr,
-            _ => continue,
+        let Some(kind) = DependencyKind::from_persisted(row.dependency_type.as_str()) else {
+            continue;
         };
         match row.state.as_str() {
             "healthy" => health.set_healthy(kind, row.dependency_name.clone(), row.checked_at_ms),
@@ -2217,7 +2214,7 @@ mod tests {
         let source = DependencyName::new("main").unwrap();
         repository
             .record_dependency_health(
-                "prowlarr",
+                DependencyKind::Prowlarr,
                 &source,
                 &DependencyState::Unavailable {
                     reason: ReasonText::new("down").unwrap(),
@@ -2266,7 +2263,7 @@ mod tests {
             let name = DependencyName::new(format!("arr{index:04}")).unwrap();
             repository
                 .record_dependency_health(
-                    "arr",
+                    DependencyKind::Arr,
                     &name,
                     &DependencyState::Degraded {
                         reason: ReasonText::new("down").unwrap(),
@@ -2280,7 +2277,7 @@ mod tests {
         let source = DependencyName::new("main").unwrap();
         repository
             .record_dependency_health(
-                "prowlarr",
+                DependencyKind::Prowlarr,
                 &source,
                 &DependencyState::Unavailable {
                     reason: ReasonText::new("down").unwrap(),
@@ -2339,7 +2336,7 @@ mod tests {
             });
             repository
                 .record_dependency_health(
-                    "indexer",
+                    DependencyKind::Indexer,
                     &name,
                     &DependencyState::Unavailable {
                         reason: ReasonText::new("stale").unwrap(),
@@ -2356,7 +2353,7 @@ mod tests {
             .unwrap();
         repository
             .record_dependency_health(
-                "arr",
+                DependencyKind::Arr,
                 &DependencyName::new("radarr-main").unwrap(),
                 &DependencyState::Degraded {
                     reason: ReasonText::new("rate limited").unwrap(),
@@ -2368,7 +2365,7 @@ mod tests {
             .unwrap();
         repository
             .record_dependency_health(
-                "indexer",
+                DependencyKind::Indexer,
                 &DependencyName::new("main").unwrap(),
                 &DependencyState::Degraded {
                     reason: ReasonText::new("indexer backoff").unwrap(),
@@ -4370,7 +4367,7 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         repository
             .record_dependency_health(
-                "arr",
+                DependencyKind::Arr,
                 &DependencyName::new("radarr-main").unwrap(),
                 &DependencyState::Degraded {
                     reason: ReasonText::new("rate limited").unwrap(),

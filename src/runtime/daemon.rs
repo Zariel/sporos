@@ -1336,7 +1336,7 @@ async fn record_candidate_download_failure(
         })?;
     let failure_count = state
         .repository
-        .dependency_failure_count("indexer", &name)
+        .dependency_failure_count(DependencyKind::Indexer, &name)
         .await?;
     let retry_after_ms =
         candidate_download_retry_after(error, now_ms, failure_count, name.as_str());

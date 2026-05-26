@@ -155,7 +155,7 @@ impl RuntimeSearchPlanner {
             }
         }
         self.repository
-            .record_dependency_health("arr", name, state, checked_at_ms)
+            .record_dependency_health(DependencyKind::Arr, name, state, checked_at_ms)
             .await
     }
 
@@ -349,11 +349,11 @@ mod tests {
             retry_after_ms: Some(5_000),
         };
         repository
-            .record_dependency_health("arr", &name, &state, 100)
+            .record_dependency_health(DependencyKind::Arr, &name, &state, 100)
             .await
             .unwrap();
         repository
-            .record_dependency_health("arr", &name, &state, 200)
+            .record_dependency_health(DependencyKind::Arr, &name, &state, 200)
             .await
             .unwrap();
         let persisted = repository.dependency_health_snapshot(10).await.unwrap();
@@ -402,11 +402,11 @@ mod tests {
             retry_after_ms: Some(500),
         };
         repository
-            .record_dependency_health("arr", &name, &state, 100)
+            .record_dependency_health(DependencyKind::Arr, &name, &state, 100)
             .await
             .unwrap();
         repository
-            .record_dependency_health("arr", &name, &state, 200)
+            .record_dependency_health(DependencyKind::Arr, &name, &state, 200)
             .await
             .unwrap();
         let persisted = repository.dependency_health_snapshot(10).await.unwrap();

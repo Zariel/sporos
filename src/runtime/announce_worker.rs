@@ -6,10 +6,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug_span, info_span};
 
 use crate::announce::{AnnounceQueueConfig, AnnounceReason, AnnounceWorkId};
-use crate::domain::{DecisionReason, InjectionOutcome, MatchDecision, ReasonText};
+use crate::domain::{
+    DecisionReason, DependencyKind, DependencyName, InjectionOutcome, MatchDecision, ReasonText,
+};
 use crate::errors::{ClassifyFailure, DatabaseError, FailureClass, WorkerError};
 use crate::matching::{PersistedCandidateAssessment, ReverseLookupOutcome};
-use crate::persistence::repository::{AnnounceRetryUpdate, Repository};
+use crate::persistence::repository::{AnnounceDependency, AnnounceRetryUpdate, Repository};
 use crate::runtime::backoff::stable_jitter_ms;
 use crate::runtime::injection_worker::InjectionWorkResult;
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
@@ -80,7 +82,7 @@ pub enum AnnounceWorkOutcome {
     Waiting {
         reason: AnnounceReason,
         next_attempt_at_ms: i64,
-        dependency: Option<(String, String)>,
+        dependency: Option<AnnounceDependency>,
     },
     Retryable {
         reason: AnnounceReason,
@@ -169,12 +171,11 @@ pub enum AnnounceWorkflowResult {
     Injected,
     AlreadyExists,
     SourceIncomplete {
-        dependency: Option<(String, String)>,
+        dependency: Option<AnnounceDependency>,
     },
     CandidateDownloading,
     DependencyBackoff {
-        dependency_kind: String,
-        dependency_name: String,
+        dependency: AnnounceDependency,
         retry_after_ms: Option<i64>,
     },
     NoMatch,
@@ -228,8 +229,7 @@ pub fn classify_announce_result(
             dependency: None,
         },
         AnnounceWorkflowResult::DependencyBackoff {
-            dependency_kind,
-            dependency_name,
+            dependency,
             retry_after_ms,
         } => AnnounceWorkOutcome::Waiting {
             reason: retry_after_ms.map_or(AnnounceReason::DependencyBackoff, |_| {
@@ -241,7 +241,7 @@ pub fn classify_announce_result(
                 retry_after_ms,
                 jitter_key,
             ),
-            dependency: Some((dependency_kind, dependency_name)),
+            dependency: Some(dependency),
         },
         AnnounceWorkflowResult::NoMatch => AnnounceWorkOutcome::Waiting {
             reason: AnnounceReason::InventoryRefreshing,
@@ -298,18 +298,23 @@ pub fn classify_injection_result(
             dependency: result
                 .target_client
                 .as_ref()
-                .map(|name| ("client".to_owned(), name.as_str().to_owned())),
+                .map(|name| AnnounceDependency::new(DependencyKind::TorrentClient, name.clone())),
         },
-        InjectionOutcome::Failed if result.saved_for_retry => {
-            AnnounceWorkflowResult::DependencyBackoff {
-                dependency_kind: "client".to_owned(),
-                dependency_name: result
-                    .target_client
-                    .as_ref()
-                    .map_or_else(|| "unknown".to_owned(), ToString::to_string),
+        InjectionOutcome::Failed if result.saved_for_retry => match result
+            .target_client
+            .clone()
+            .or_else(|| DependencyName::new("unknown").ok())
+        {
+            Some(name) => AnnounceWorkflowResult::DependencyBackoff {
+                dependency: AnnounceDependency::new(DependencyKind::TorrentClient, name),
                 retry_after_ms: None,
-            }
-        }
+            },
+            None => AnnounceWorkflowResult::RetryableDependency {
+                retry_after_ms: None,
+                error_class: "dependency_name".to_owned(),
+                redacted_message: "missing torrent client dependency name".to_owned(),
+            },
+        },
         InjectionOutcome::Failed => AnnounceWorkflowResult::RetryableDependency {
             retry_after_ms: None,
             error_class: "torrent_client".to_owned(),
@@ -786,22 +791,18 @@ impl AnnounceWorker {
                 reason,
                 next_attempt_at_ms,
                 dependency,
-            } => {
-                let dependency = dependency
-                    .as_ref()
-                    .map(|(kind, name)| (kind.as_str(), name.as_str()));
-                self.repository
-                    .mark_announce_waiting(
-                        id,
-                        owner,
-                        reason,
-                        next_attempt_at_ms,
-                        now_ms,
-                        dependency,
-                    )
-                    .await
-                    .map_err(AnnounceWorkerError::from)
-            }
+            } => self
+                .repository
+                .mark_announce_waiting(
+                    id,
+                    owner,
+                    reason,
+                    next_attempt_at_ms,
+                    now_ms,
+                    dependency.as_ref(),
+                )
+                .await
+                .map_err(AnnounceWorkerError::from),
             AnnounceWorkOutcome::Retryable {
                 reason,
                 next_attempt_at_ms,
@@ -1557,7 +1558,7 @@ mod tests {
                     AnnounceWorkOutcome::Waiting {
                         reason: AnnounceReason::DependencyBackoff,
                         next_attempt_at_ms: 20,
-                        dependency: Some(("indexer".to_owned(), "main".to_owned())),
+                        dependency: Some(dependency(DependencyKind::Indexer, "main")),
                     },
                     10,
                 )
@@ -1566,7 +1567,7 @@ mod tests {
         );
         repository
             .record_dependency_health(
-                "indexer",
+                DependencyKind::Indexer,
                 &DependencyName::new("main").unwrap(),
                 &DependencyState::Unavailable {
                     reason: ReasonText::new("rate limited").unwrap(),
@@ -1591,6 +1592,52 @@ mod tests {
             )],
             dependency_rows(&repository).await
         );
+    }
+
+    #[tokio::test]
+    async fn worker_persists_and_wakes_torrent_client_dependency_waits() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_36", "guid-36", 1).await;
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+        let claimed = worker.claim_ready(10).await.unwrap();
+
+        assert!(
+            worker
+                .complete(
+                    &claimed[0],
+                    AnnounceWorkOutcome::Waiting {
+                        reason: AnnounceReason::SourceIncomplete,
+                        next_attempt_at_ms: 500,
+                        dependency: Some(dependency(DependencyKind::TorrentClient, "qbit.local")),
+                    },
+                    10,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            vec![(
+                "waiting".to_owned(),
+                "source_incomplete".to_owned(),
+                Some("torrent_client".to_owned()),
+                Some("qbit.local".to_owned())
+            )],
+            dependency_rows(&repository).await
+        );
+
+        repository
+            .record_dependency_health(
+                DependencyKind::TorrentClient,
+                &DependencyName::new("qbit.local").unwrap(),
+                &DependencyState::Healthy { checked_at_ms: 100 },
+                100,
+            )
+            .await
+            .unwrap();
+
+        let ready = worker.claim_ready(100).await.unwrap();
+
+        assert_eq!(vec![AnnounceWorkId::new("ann_36").unwrap()], ready);
     }
 
     #[tokio::test]
@@ -1643,11 +1690,11 @@ mod tests {
             AnnounceWorkOutcome::Waiting {
                 reason: AnnounceReason::SourceIncomplete,
                 next_attempt_at_ms: 110,
-                dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
+                dependency: Some(dependency(DependencyKind::TorrentClient, "qbit.local")),
             },
             classify_announce_result(
                 AnnounceWorkflowResult::SourceIncomplete {
-                    dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
+                    dependency: Some(dependency(DependencyKind::TorrentClient, "qbit.local")),
                 },
                 100,
                 1,
@@ -1659,12 +1706,11 @@ mod tests {
             AnnounceWorkOutcome::Waiting {
                 reason: AnnounceReason::RetryAfter,
                 next_attempt_at_ms: 500,
-                dependency: Some(("indexer".to_owned(), "main".to_owned())),
+                dependency: Some(dependency(DependencyKind::Indexer, "main")),
             },
             classify_announce_result(
                 AnnounceWorkflowResult::DependencyBackoff {
-                    dependency_kind: "indexer".to_owned(),
-                    dependency_name: "main".to_owned(),
+                    dependency: dependency(DependencyKind::Indexer, "main"),
                     retry_after_ms: Some(500),
                 },
                 100,
@@ -1845,7 +1891,7 @@ mod tests {
             AnnounceWorkOutcome::Waiting {
                 reason: AnnounceReason::SourceIncomplete,
                 next_attempt_at_ms: 110,
-                dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
+                dependency: Some(dependency(DependencyKind::TorrentClient, "qbit.local")),
             },
             classify_injection_result(&injection, 100, 1, "ann-1", config)
         );
@@ -1862,7 +1908,7 @@ mod tests {
             AnnounceWorkOutcome::Waiting {
                 reason: AnnounceReason::DependencyBackoff,
                 next_attempt_at_ms: 130,
-                dependency: Some(("client".to_owned(), "qbit.local".to_owned())),
+                dependency: Some(dependency(DependencyKind::TorrentClient, "qbit.local")),
             },
             classify_injection_result(&ambiguous_failure, 100, 1, "ann-1", config)
         );
@@ -1979,6 +2025,10 @@ mod tests {
             retry_max_delay_secs: 20,
             ..AnnounceQueueConfig::default()
         }
+    }
+
+    fn dependency(kind: DependencyKind, name: &str) -> AnnounceDependency {
+        AnnounceDependency::new(kind, DependencyName::new(name).unwrap())
     }
 
     async fn insert_work(repository: &Repository, id: &str, guid: &str, received_at_ms: i64) {

@@ -19,10 +19,10 @@ use crate::announce::{
 };
 use crate::config::ProwlarrRemovePolicy;
 use crate::domain::{
-    ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyName, DependencyState,
-    DisplayName, DownloadUrl, FileIndex, IndexerId, InfoHash, ItemTitle, JobName, JobState,
-    LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision, MediaType, ReasonText,
-    RemoteCandidate, RemoteCandidateId, SourceKey, TrackerName,
+    ByteSize, CandidateAssessment, CandidateGuid, ClientHost, DependencyKind, DependencyName,
+    DependencyState, DisplayName, DownloadUrl, FileIndex, IndexerId, InfoHash, ItemTitle, JobName,
+    JobState, LocalFile, LocalItem, LocalItemId, LocalItemSource, MatchDecision, MediaType,
+    ReasonText, RemoteCandidate, RemoteCandidateId, SourceKey, TrackerName,
 };
 use crate::errors::DatabaseError;
 use crate::indexers::{ConfiguredTorznabIndexer, ProwlarrIndexer, TorznabCaps};
@@ -397,13 +397,25 @@ pub struct AnnounceRetryUpdate<'a> {
     pub redacted_message: &'a str,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceDependency {
+    pub kind: DependencyKind,
+    pub name: DependencyName,
+}
+
+impl AnnounceDependency {
+    pub fn new(kind: DependencyKind, name: DependencyName) -> Self {
+        Self { kind, name }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct LeasedTransition<'a> {
     status: AnnounceStatus,
     reason: AnnounceReason,
     next_attempt_at_ms: Option<i64>,
     now_ms: i64,
-    dependency: Option<(&'a str, &'a str)>,
+    dependency: Option<&'a AnnounceDependency>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1714,7 +1726,7 @@ impl Repository {
 
     pub async fn record_dependency_health(
         &self,
-        dependency_type: &str,
+        dependency_type: DependencyKind,
         dependency_name: &DependencyName,
         state: &DependencyState,
         checked_at_ms: i64,
@@ -1730,7 +1742,7 @@ impl Repository {
         };
         let _span = debug_span!(
             "dependency_health.record",
-            dependency_type,
+            dependency_type = dependency_type.as_str(),
             dependency_name = %dependency_name,
             dependency_state = state_key
         );
@@ -1757,7 +1769,7 @@ impl Repository {
                 checked_at = excluded.checked_at
             "#,
         )
-        .bind(dependency_type)
+        .bind(dependency_type.as_str())
         .bind(dependency_name.as_str())
         .bind(state_key)
         .bind(reason)
@@ -1786,7 +1798,7 @@ impl Repository {
 
     pub async fn dependency_failure_count(
         &self,
-        dependency_type: &str,
+        dependency_type: DependencyKind,
         dependency_name: &DependencyName,
     ) -> Result<u16, DatabaseError> {
         let row = sqlx::query(
@@ -1797,7 +1809,7 @@ impl Repository {
               AND dependency_name = ?
             "#,
         )
-        .bind(dependency_type)
+        .bind(dependency_type.as_str())
         .bind(dependency_name.as_str())
         .fetch_optional(&self.pool)
         .await
@@ -1832,7 +1844,7 @@ impl Repository {
 
     pub async fn dependency_health_for_type_names(
         &self,
-        dependency_type: &str,
+        dependency_type: DependencyKind,
         dependency_names: &[DependencyName],
     ) -> Result<Vec<DependencyHealthSnapshot>, DatabaseError> {
         if dependency_names.is_empty() {
@@ -1847,7 +1859,7 @@ impl Repository {
             WHERE dependency_type = 
             "#,
         );
-        query.push_bind(dependency_type);
+        query.push_bind(dependency_type.as_str());
         query.push(" AND dependency_name IN (");
         let mut separated = query.separated(", ");
         for dependency_name in dependency_names {
@@ -1885,12 +1897,13 @@ impl Repository {
                 health.checked_at
             FROM indexers INDEXED BY idx_indexers_enabled_name
             INNER JOIN dependency_health AS health
-                ON health.dependency_type = 'indexer'
+                ON health.dependency_type = ?
                AND health.dependency_name = indexers.name
             WHERE indexers.enabled = 1
             ORDER BY indexers.name
             "#,
         )
+        .bind(DependencyKind::Indexer.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|error| db_error("read indexer registry dependency health", error))?;
@@ -2353,7 +2366,7 @@ impl Repository {
         .await
         .map_err(|error| db_error("record indexer caps success", error))?;
         self.record_dependency_health(
-            "indexer",
+            DependencyKind::Indexer,
             name,
             &DependencyState::Healthy {
                 checked_at_ms: refreshed_at_ms,
@@ -2557,7 +2570,7 @@ impl Repository {
         .await
         .map_err(|error| db_error("record indexer caps failure", error))?;
         self.record_dependency_health(
-            "indexer",
+            DependencyKind::Indexer,
             name,
             &DependencyState::Degraded {
                 reason: reason.clone(),
@@ -2609,8 +2622,13 @@ impl Repository {
                 retry_after_ms: Some(retry_after_ms),
             }
         };
-        self.record_dependency_health("indexer", name, &dependency_state, checked_at_ms)
-            .await
+        self.record_dependency_health(
+            DependencyKind::Indexer,
+            name,
+            &dependency_state,
+            checked_at_ms,
+        )
+        .await
     }
 
     pub async fn record_indexer_request_success(
@@ -2634,7 +2652,7 @@ impl Repository {
         .map_err(|error| db_error("record indexer request success", error))?;
 
         self.record_dependency_health(
-            "indexer",
+            DependencyKind::Indexer,
             name,
             &DependencyState::Healthy { checked_at_ms },
             checked_at_ms,
@@ -3019,7 +3037,7 @@ impl Repository {
                   AND (
                       last_dependency_kind IS NULL
                       OR (
-                          last_dependency_kind = 'client'
+                          last_dependency_kind = 'torrent_client'
                           AND last_dependency_name = ?
                       )
                   )
@@ -3042,14 +3060,14 @@ impl Repository {
 
     pub async fn wake_announce_dependency_recovery(
         &self,
-        dependency_type: &str,
+        dependency_type: DependencyKind,
         dependency_name: &DependencyName,
         now_ms: i64,
         limit: u16,
     ) -> Result<u64, DatabaseError> {
         let _span = debug_span!(
             "announce.wake_dependency_recovery",
-            dependency_type,
+            dependency_type = dependency_type.as_str(),
             dependency_name = %dependency_name,
             limit
         );
@@ -3075,7 +3093,7 @@ impl Repository {
         .bind(now_ms)
         .bind(now_ms)
         .bind(now_ms)
-        .bind(dependency_type)
+        .bind(dependency_type.as_str())
         .bind(dependency_name.as_str())
         .bind(i64::from(limit))
         .execute(&self.pool)
@@ -3223,7 +3241,7 @@ impl Repository {
         reason: AnnounceReason,
         next_attempt_at_ms: i64,
         now_ms: i64,
-        dependency: Option<(&str, &str)>,
+        dependency: Option<&AnnounceDependency>,
     ) -> Result<bool, DatabaseError> {
         self.transition_leased(
             id,
@@ -3800,7 +3818,14 @@ impl Repository {
         owner: &str,
         transition: LeasedTransition<'_>,
     ) -> Result<bool, DatabaseError> {
-        let (dependency_kind, dependency_name) = transition.dependency.unwrap_or(("", ""));
+        let dependency_kind = transition
+            .dependency
+            .map(|dependency| dependency.kind.as_str())
+            .unwrap_or_default();
+        let dependency_name = transition
+            .dependency
+            .map(|dependency| dependency.name.as_str())
+            .unwrap_or_default();
         let result = sqlx::query(
             r#"
             UPDATE announce_work
