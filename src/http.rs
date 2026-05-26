@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tracing::{Instrument, debug_span, info_span};
 
+use crate::actions::validate_link_dirs;
 use crate::announce::{
     AnnounceDedupeIdentity, AnnounceFetchMaterial, AnnounceQueueConfig, AnnounceReason,
     AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
@@ -408,6 +409,7 @@ pub struct ReadinessPaths {
     database_parent: PathBuf,
     torrent_cache_dir: PathBuf,
     output_dir: PathBuf,
+    link_dirs: Vec<PathBuf>,
 }
 
 impl ReadinessPaths {
@@ -419,13 +421,23 @@ impl ReadinessPaths {
                 .unwrap_or_else(|| PathBuf::from(".")),
             torrent_cache_dir: torrent_cache_dir.to_path_buf(),
             output_dir: output_dir.to_path_buf(),
+            link_dirs: Vec::new(),
         }
+    }
+
+    pub fn with_link_dirs(mut self, link_dirs: Vec<PathBuf>) -> Self {
+        self.link_dirs = link_dirs;
+        self
     }
 
     fn ensure_writable(&self) -> io::Result<()> {
         ensure_writable_directory(&self.database_parent)?;
         ensure_writable_directory(&self.torrent_cache_dir)?;
         ensure_writable_directory(&self.output_dir)
+    }
+
+    fn ensure_link_dirs_usable(&self) -> bool {
+        validate_link_dirs(&self.link_dirs).is_ok()
     }
 }
 
@@ -442,6 +454,7 @@ impl LiveReadinessChecks {
         readiness.database_available = database_available;
         readiness.schema_initialized = database_available && self.schema_initialized().await;
         readiness.state_paths_writable = self.state_paths_writable().await;
+        readiness.link_dirs_usable = self.link_dirs_usable().await;
     }
 
     async fn database_available(&self) -> bool {
@@ -467,6 +480,18 @@ impl LiveReadinessChecks {
             )
             .await,
             Ok(Ok(Ok(())))
+        )
+    }
+
+    async fn link_dirs_usable(&self) -> bool {
+        let paths = self.paths.clone();
+        matches!(
+            tokio::time::timeout(
+                self.timeout,
+                tokio::task::spawn_blocking(move || paths.ensure_link_dirs_usable())
+            )
+            .await,
+            Ok(Ok(true))
         )
     }
 }
@@ -583,6 +608,7 @@ pub struct ReadinessState {
     pub database_available: bool,
     pub schema_initialized: bool,
     pub state_paths_writable: bool,
+    pub link_dirs_usable: bool,
     pub workers_running: bool,
 }
 
@@ -593,6 +619,7 @@ impl ReadinessState {
             database_available: true,
             schema_initialized: true,
             state_paths_writable: true,
+            link_dirs_usable: true,
             workers_running: true,
         }
     }
@@ -602,6 +629,7 @@ impl ReadinessState {
             && self.database_available
             && self.schema_initialized
             && self.state_paths_writable
+            && self.link_dirs_usable
             && self.workers_running
     }
 }
@@ -729,6 +757,7 @@ struct ReadinessChecks {
     database_available: bool,
     schema_initialized: bool,
     state_paths_writable: bool,
+    link_dirs_usable: bool,
     workers_running: bool,
 }
 
@@ -1904,7 +1933,8 @@ async fn readiness_response(state: &HttpState) -> ReadinessResponse {
     let local_ready = readiness.config_loaded
         && readiness.database_available
         && readiness.schema_initialized
-        && readiness.state_paths_writable;
+        && readiness.state_paths_writable
+        && readiness.link_dirs_usable;
     let work_acceptors_configured = state.workflow_queues.is_some()
         || state.search_queue.is_some()
         || state.job_queue.is_some()
@@ -1927,6 +1957,7 @@ async fn readiness_response(state: &HttpState) -> ReadinessResponse {
             database_available: readiness.database_available,
             schema_initialized: readiness.schema_initialized,
             state_paths_writable: readiness.state_paths_writable,
+            link_dirs_usable: readiness.link_dirs_usable,
             workers_running: readiness.workers_running,
         },
         dependencies: state
@@ -1940,8 +1971,11 @@ async fn readiness_response(state: &HttpState) -> ReadinessResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::num::NonZeroUsize;
+    use std::path::{Path as StdPath, PathBuf};
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use axum::body::Body;
@@ -2068,6 +2102,7 @@ mod tests {
                 database_available: false,
                 schema_initialized: true,
                 state_paths_writable: true,
+                link_dirs_usable: true,
                 workers_running: true,
             },
             health,
@@ -2124,6 +2159,14 @@ mod tests {
                 "state_paths_writable",
             ),
             (
+                "link-dirs",
+                ReadinessState {
+                    link_dirs_usable: false,
+                    ..ReadinessState::ready()
+                },
+                "link_dirs_usable",
+            ),
+            (
                 "workers",
                 ReadinessState {
                     workers_running: false,
@@ -2153,6 +2196,56 @@ mod tests {
             assert_eq!("not_ready", json["status"], "{label}");
             assert_eq!(false, json["checks"][failed_check], "{label}");
         }
+    }
+
+    #[tokio::test]
+    async fn readyz_rechecks_configured_link_dirs_live() {
+        let root = TestTempDir::new("readyz-link-dirs");
+        let link_dir = root.path().join("links");
+        fs::create_dir_all(&link_dir).unwrap();
+        let state = live_readiness_state_with_link_dirs(root.path(), vec![link_dir.clone()]).await;
+
+        let (status, json) = readyz_json(state).await;
+        assert_eq!(StatusCode::OK, status);
+        assert_eq!(true, json["checks"]["link_dirs_usable"]);
+
+        fs::remove_dir_all(&link_dir).unwrap();
+        let state = live_readiness_state_with_link_dirs(root.path(), vec![link_dir]).await;
+        let (status, json) = readyz_json(state).await;
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["link_dirs_usable"]);
+    }
+
+    #[tokio::test]
+    async fn readyz_rejects_configured_link_dir_file() {
+        let root = TestTempDir::new("readyz-link-dir-file");
+        let link_dir = root.path().join("links-file");
+        fs::write(&link_dir, b"not a directory").unwrap();
+        let state = live_readiness_state_with_link_dirs(root.path(), vec![link_dir]).await;
+
+        let (status, json) = readyz_json(state).await;
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["link_dirs_usable"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readyz_rejects_configured_link_dir_symlink_redirect() {
+        let root = TestTempDir::new("readyz-link-dir-symlink");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(outside.join("links")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.path().join("redirect")).unwrap();
+        let state = live_readiness_state_with_link_dirs(
+            root.path(),
+            vec![root.path().join("redirect/links")],
+        )
+        .await;
+
+        let (status, json) = readyz_json(state).await;
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["link_dirs_usable"]);
     }
 
     #[tokio::test]
@@ -2341,6 +2434,7 @@ mod tests {
                 database_available: true,
                 schema_initialized: true,
                 state_paths_writable: true,
+                link_dirs_usable: true,
                 workers_running: false,
             },
             HealthRegistry::new(),
@@ -2374,6 +2468,7 @@ mod tests {
                 database_available: true,
                 schema_initialized: true,
                 state_paths_writable: true,
+                link_dirs_usable: true,
                 workers_running: false,
             },
             HealthRegistry::new(),
@@ -2416,6 +2511,7 @@ mod tests {
                     database_available: true,
                     schema_initialized: true,
                     state_paths_writable: true,
+                    link_dirs_usable: true,
                     workers_running: false,
                 },
                 HealthRegistry::new(),
@@ -3628,5 +3724,68 @@ mod tests {
 
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    async fn live_readiness_state_with_link_dirs(
+        root: &StdPath,
+        link_dirs: Vec<PathBuf>,
+    ) -> HttpState {
+        let database = root.join("state/sporos.db");
+        let torrent_cache = root.join("cache/torrents");
+        let output = root.join("output");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::create_dir_all(&torrent_cache).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        HttpState::new(ReadinessState::ready(), HealthRegistry::new()).with_live_readiness(
+            Repository::connect_in_memory().await.unwrap(),
+            ReadinessPaths::new(&database, &torrent_cache, &output).with_link_dirs(link_dirs),
+        )
+    }
+
+    async fn readyz_json(state: HttpState) -> (StatusCode, Value) {
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(label: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "sporos-http-test-{label}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            let path = fs::canonicalize(path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &StdPath {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.path));
+        }
     }
 }

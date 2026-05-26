@@ -1233,6 +1233,11 @@ impl AppRuntime {
         };
         let mut readiness = ReadinessState::ready();
         readiness.workers_running = false;
+        let readiness_link_dirs = if config.injection.link_type.is_some() {
+            config.injection.link_dirs.clone()
+        } else {
+            Vec::new()
+        };
         let mut http = HttpState::new(readiness, health.clone())
             .with_live_readiness(
                 repository.clone(),
@@ -1240,7 +1245,8 @@ impl AppRuntime {
                     &config.paths.database,
                     &config.paths.torrent_cache_dir,
                     &config.paths.output_dir,
-                ),
+                )
+                .with_link_dirs(readiness_link_dirs),
             )
             .with_metrics(metrics.clone())
             .with_search_queue(workflow.searches.clone())
@@ -1850,8 +1856,8 @@ mod tests {
     use crate::announce::AnnounceQueueConfig;
     use crate::clients::runtime::CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY;
     use crate::config::{
-        ArrInstanceConfig, ConfigTorrentClientKind, ProwlarrSourceConfig, TorrentClientConfig,
-        TorznabIndexerConfig,
+        ArrInstanceConfig, ConfigTorrentClientKind, InjectionLinkTypeConfig, ProwlarrSourceConfig,
+        TorrentClientConfig, TorznabIndexerConfig,
     };
     use crate::domain::{DependencyName, DependencyState, InfoHash, ItemTitle, ReasonText};
     use crate::errors::TorrentClientError;
@@ -1960,6 +1966,35 @@ mod tests {
             crate::runtime::shutdown::ShutdownPhase::Running,
             runtime.state.shutdown.state().phase
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_validates_configured_link_dirs_when_linking_enabled() {
+        let root = unique_temp_dir("runtime-link-readiness");
+        let mut config = runtime_test_config(&root);
+        config.injection.link_type = Some(InjectionLinkTypeConfig::Hardlink);
+        config.injection.link_dirs = vec![root.join("missing-links")];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let response = router(runtime.state.http.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+        assert_eq!(false, json["checks"]["link_dirs_usable"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

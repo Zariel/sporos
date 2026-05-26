@@ -1102,7 +1102,7 @@ impl RepresentativeSourceFile {
     }
 }
 
-fn validate_link_dirs(link_dirs: &[PathBuf]) -> Result<(), LinkActionError> {
+pub fn validate_link_dirs(link_dirs: &[PathBuf]) -> Result<(), LinkActionError> {
     for link_dir in link_dirs {
         validate_link_dir(link_dir)?;
     }
@@ -1122,6 +1122,7 @@ fn validate_link_dir(link_dir: &Path) -> Result<(), LinkActionError> {
 
 #[cfg(not(unix))]
 fn validate_link_dir(link_dir: &Path) -> Result<(), LinkActionError> {
+    validate_link_dir_components(link_dir)?;
     let metadata = fs::symlink_metadata(link_dir).map_err(|source| LinkActionError::Io {
         operation: "inspect link directory",
         path: link_dir.to_path_buf(),
@@ -1131,6 +1132,26 @@ fn validate_link_dir(link_dir: &Path) -> Result<(), LinkActionError> {
         return Err(LinkActionError::InvalidLinkDir {
             path: link_dir.to_path_buf(),
         });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_link_dir_components(link_dir: &Path) -> Result<(), LinkActionError> {
+    for component in link_dir
+        .ancestors()
+        .filter(|component| !component.as_os_str().is_empty())
+    {
+        let metadata = fs::symlink_metadata(component).map_err(|source| LinkActionError::Io {
+            operation: "inspect link directory component",
+            path: component.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(LinkActionError::InvalidLinkDir {
+                path: component.to_path_buf(),
+            });
+        }
     }
     Ok(())
 }

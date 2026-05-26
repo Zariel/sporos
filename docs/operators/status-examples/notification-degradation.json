@@ -9,6 +9,7 @@
       "database_available": true,
       "schema_initialized": true,
       "state_paths_writable": true,
+      "link_dirs_usable": true,
       "workers_running": true
     },
     "dependencies": {
