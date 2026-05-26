@@ -1997,6 +1997,49 @@ mod tests {
     }
 
     #[test]
+    fn announce_ttl_and_cleanup_bounds_are_validated_from_toml() {
+        let error = parse_config(
+            r#"
+            [announce]
+            default_ttl_secs = 604801
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidField {
+                field: "announce",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("default_ttl_secs"));
+        let retry_boundary_error = parse_config(
+            r#"
+            [announce]
+            retry_max_delay_secs = 3600
+            default_ttl_secs = 3600
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            retry_boundary_error
+                .to_string()
+                .contains("default_ttl_secs")
+        );
+        parse_config(
+            r#"
+            [announce]
+            default_ttl_secs = 604800
+            success_retention_secs = 2592000
+            failure_retention_secs = 2592000
+            remote_candidate_retention_secs = 7776000
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn runtime_rejects_out_of_range_thread_counts() {
         let worker_error = parse_config(
             r#"

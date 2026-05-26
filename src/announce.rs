@@ -8,6 +8,10 @@ use crate::domain::{
 };
 use crate::secrets::{CookieSecret, SanitizedUrl, SecretString, sanitize_url_for_logging};
 
+const MAX_DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_TERMINAL_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+const MAX_REMOTE_CANDIDATE_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum AnnounceError {
     EmptyField { field: &'static str },
@@ -441,6 +445,26 @@ impl AnnounceQueueConfig {
                 "must be greater than retry_max_delay_secs",
             ));
         }
+        require_at_most(
+            "default_ttl_secs",
+            self.default_ttl_secs,
+            MAX_DEFAULT_TTL_SECS,
+        )?;
+        require_at_most(
+            "success_retention_secs",
+            self.success_retention_secs,
+            MAX_TERMINAL_RETENTION_SECS,
+        )?;
+        require_at_most(
+            "failure_retention_secs",
+            self.failure_retention_secs,
+            MAX_TERMINAL_RETENTION_SECS,
+        )?;
+        require_at_most(
+            "remote_candidate_retention_secs",
+            self.remote_candidate_retention_secs,
+            MAX_REMOTE_CANDIDATE_RETENTION_SECS,
+        )?;
 
         Ok(())
     }
@@ -449,6 +473,17 @@ impl AnnounceQueueConfig {
 fn require_nonzero(field: &'static str, value: u64) -> Result<(), AnnounceError> {
     if value == 0 {
         return Err(config_error(field, "must be greater than zero"));
+    }
+
+    Ok(())
+}
+
+fn require_at_most(field: &'static str, value: u64, max: u64) -> Result<(), AnnounceError> {
+    if value > max {
+        return Err(config_error(
+            field,
+            format!("must be less than or equal to {max}"),
+        ));
     }
 
     Ok(())
@@ -655,6 +690,86 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn queue_config_validates_ttl_and_cleanup_bounds() {
+        for (field, invalid) in [
+            (
+                "default_ttl_secs",
+                AnnounceQueueConfig {
+                    default_ttl_secs: 0,
+                    ..AnnounceQueueConfig::default()
+                },
+            ),
+            (
+                "success_retention_secs",
+                AnnounceQueueConfig {
+                    success_retention_secs: 0,
+                    ..AnnounceQueueConfig::default()
+                },
+            ),
+            (
+                "failure_retention_secs",
+                AnnounceQueueConfig {
+                    failure_retention_secs: 0,
+                    ..AnnounceQueueConfig::default()
+                },
+            ),
+            (
+                "remote_candidate_retention_secs",
+                AnnounceQueueConfig {
+                    remote_candidate_retention_secs: 0,
+                    ..AnnounceQueueConfig::default()
+                },
+            ),
+            (
+                "default_ttl_secs",
+                AnnounceQueueConfig {
+                    default_ttl_secs: MAX_DEFAULT_TTL_SECS + 1,
+                    ..AnnounceQueueConfig::default()
+                },
+            ),
+            (
+                "success_retention_secs",
+                AnnounceQueueConfig {
+                    success_retention_secs: MAX_TERMINAL_RETENTION_SECS + 1,
+                    ..AnnounceQueueConfig::default()
+                },
+            ),
+            (
+                "failure_retention_secs",
+                AnnounceQueueConfig {
+                    failure_retention_secs: MAX_TERMINAL_RETENTION_SECS + 1,
+                    ..AnnounceQueueConfig::default()
+                },
+            ),
+            (
+                "remote_candidate_retention_secs",
+                AnnounceQueueConfig {
+                    remote_candidate_retention_secs: MAX_REMOTE_CANDIDATE_RETENTION_SECS + 1,
+                    ..AnnounceQueueConfig::default()
+                },
+            ),
+        ] {
+            assert!(matches!(
+                invalid.validate(),
+                Err(AnnounceError::InvalidConfig {
+                    field: actual,
+                    ..
+                }) if actual == field
+            ));
+        }
+
+        AnnounceQueueConfig {
+            default_ttl_secs: MAX_DEFAULT_TTL_SECS,
+            success_retention_secs: MAX_TERMINAL_RETENTION_SECS,
+            failure_retention_secs: MAX_TERMINAL_RETENTION_SECS,
+            remote_candidate_retention_secs: MAX_REMOTE_CANDIDATE_RETENTION_SECS,
+            ..AnnounceQueueConfig::default()
+        }
+        .validate()
+        .unwrap();
     }
 
     fn minimal_work() -> AnnounceWorkItem {

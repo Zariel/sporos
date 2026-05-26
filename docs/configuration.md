@@ -391,12 +391,18 @@ indexer URL query strings.
 `[scheduling].cleanup_interval` controls the scheduler-backed cleanup job for
 announce TTL expiry, retained terminal row cleanup, stale lease recovery, and
 stale remote candidate/torrent cache cleanup. The default is `24h`.
+`[announce].default_ttl_secs` must be greater than
+`retry_max_delay_secs` and no more than 7 days. It should usually stay at the 1
+day default so active fetch material expires promptly.
+`success_retention_secs` and `failure_retention_secs` must be between 1 second
+and 30 days; defaults are 7 and 14 days respectively.
 `[announce].remote_candidate_retention_secs` sets how long remote candidates and
-their canonical cached torrent files are retained after they were last seen.
-Candidates with recent match decisions may remain longer so operator-visible
-matching history is not removed early. Cleanup bounds row and cache-file counts,
-but SQLite database files may not shrink immediately after deletes because
-SQLite can retain freed pages for reuse.
+their canonical cached torrent files are retained after they were last seen. It
+must be between 1 second and 90 days, with a 30 day default. Candidates with
+recent match decisions may remain longer so operator-visible matching history is
+not removed early. Cleanup bounds row and cache-file counts, but SQLite database
+files may not shrink immediately after deletes because SQLite can retain freed
+pages for reuse.
 
 External automation can submit candidates to `POST /v1/announcements`. Accepted
 announcements are durable queued work: `202 Accepted` means the request was

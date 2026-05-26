@@ -315,6 +315,15 @@ so recent matching history stays available. Cleanup bounds row and canonical
 cache-file growth, but SQLite database files may not shrink immediately after
 deletes because freed pages can be reused by future writes.
 
+Keep active announce TTLs short in production. Sporos accepts
+`default_ttl_secs` values greater than `retry_max_delay_secs` and no more than
+7 days; the 1 day default is the recommended production value for expiring
+active fetch material. Terminal announce retention values, `success_retention_secs` and
+`failure_retention_secs`, must be 1 second through 30 days. Remote candidate and
+cached torrent retention must be 1 second through 90 days, with the 30 day
+default usually enough for matching history while bounding local sensitive
+state.
+
 `[scheduling].indexer_caps_interval` controls periodic indexer capability
 refresh. `client_inventory_interval` and `saved_retry_interval` control their
 own daemon maintenance loops and are documented in the printed config schema.
