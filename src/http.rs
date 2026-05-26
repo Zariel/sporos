@@ -1842,8 +1842,13 @@ async fn readiness_response(state: &HttpState) -> ReadinessResponse {
         && readiness.database_available
         && readiness.schema_initialized
         && readiness.state_paths_writable;
-    let work_acceptors_configured =
-        state.workflow_queues.is_some() || state.announce_acceptor.is_some();
+    let work_acceptors_configured = state.workflow_queues.is_some()
+        || state.search_queue.is_some()
+        || state.job_queue.is_some()
+        || state.scheduler_queue.is_some()
+        || state.inventory_refresh_queue.is_some()
+        || state.notification_queue.is_some()
+        || state.announce_acceptor.is_some();
     let accepting_work = local_ready && work_acceptors_configured;
     let processing_ready = accepting_work && readiness.workers_running;
     ReadinessResponse {
@@ -2004,6 +2009,97 @@ mod tests {
         assert_eq!("not_ready", json["status"]);
         assert_eq!(false, json["checks"]["database_available"]);
         assert_eq!("degraded", json["dependencies"]["torrent_client"]);
+    }
+
+    #[tokio::test]
+    async fn readyz_fails_for_each_local_readiness_failure() {
+        for (label, readiness, failed_check) in [
+            (
+                "database",
+                ReadinessState {
+                    database_available: false,
+                    schema_initialized: true,
+                    ..ReadinessState::ready()
+                },
+                "database_available",
+            ),
+            (
+                "schema",
+                ReadinessState {
+                    schema_initialized: false,
+                    ..ReadinessState::ready()
+                },
+                "schema_initialized",
+            ),
+            (
+                "state-paths",
+                ReadinessState {
+                    state_paths_writable: false,
+                    ..ReadinessState::ready()
+                },
+                "state_paths_writable",
+            ),
+            (
+                "workers",
+                ReadinessState {
+                    workers_running: false,
+                    ..ReadinessState::ready()
+                },
+                "workers_running",
+            ),
+        ] {
+            let app = router(HttpState::new(readiness, HealthRegistry::new()));
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status, "{label}");
+            assert_eq!("not_ready", json["status"], "{label}");
+            assert_eq!(false, json["checks"][failed_check], "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn readyz_stays_ready_for_degraded_external_dependencies() {
+        let health = HealthRegistry::new();
+        health.set_unavailable(
+            DependencyKind::Indexer,
+            DependencyName::new("torznab").unwrap(),
+            ReasonText::new("rate limited").unwrap(),
+            Some(1_000),
+        );
+        let app = router(HttpState::new(ReadinessState::ready(), health));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(StatusCode::OK, status);
+        assert_eq!("ready", json["status"]);
+        assert_eq!("unavailable", json["dependencies"]["indexer"]);
     }
 
     #[tokio::test]
@@ -2182,6 +2278,41 @@ mod tests {
         assert_eq!(true, json["readiness"]["accepting_work"]);
         assert_eq!(false, json["readiness"]["processing_ready"]);
         assert_eq!(false, json["readiness"]["checks"]["workers_running"]);
+    }
+
+    #[tokio::test]
+    async fn status_accepts_work_with_standalone_queues() {
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let app = router(
+            HttpState::new(
+                ReadinessState {
+                    config_loaded: true,
+                    database_available: true,
+                    schema_initialized: true,
+                    state_paths_writable: true,
+                    workers_running: false,
+                },
+                HealthRegistry::new(),
+            )
+            .with_search_queue(searches),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(true, json["readiness"]["accepting_work"]);
+        assert_eq!(false, json["readiness"]["processing_ready"]);
     }
 
     #[tokio::test]
