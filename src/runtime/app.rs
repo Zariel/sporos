@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU8, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use crate::arr::{ArrEndpoint, ArrRegistry};
 use crate::clients::TorrentClientRegistry;
 use crate::clients::runtime::build_injection_clients;
-use crate::config::{ProwlarrRemovePolicy, SporosConfig};
+use crate::config::{NotificationEndpointConfig, ProwlarrRemovePolicy, SporosConfig};
 use crate::domain::{
     ByteSize, DependencyName, DependencyState, DisplayName, IndexerId, ItemTitle, LocalItem,
     LocalItemSource, MediaType, ReasonText, RemoteCandidate, SourceKey,
@@ -31,7 +31,9 @@ use crate::inventory_refresh::{
     InventoryRefreshWorker, inventory_refresh_queue,
 };
 use crate::metrics::{ExternalOperation, ExternalOutcome, MetricsRegistry, ProwlarrRefreshOutcome};
-use crate::notifications::{NotificationJob, notification_queue};
+use crate::notifications::{
+    NotificationEndpoint, NotificationJob, NotificationRetryPolicy, notification_queue,
+};
 use crate::persistence::repository::{
     DependencyHealthSnapshot, IndexerRegistryRow, IndexerSearchCapsRow, Repository,
 };
@@ -79,6 +81,7 @@ pub struct AppState {
     pub scheduler: PersistedScheduler,
     pub inventory_refresh: InventoryRefreshWorker,
     pub injection_worker: InjectionWorker,
+    pub notification_endpoints: BTreeMap<DependencyName, NotificationEndpoint>,
     pub search_planner: RuntimeSearchPlanner,
     pub torznab_indexers: BTreeMap<DependencyName, ConfiguredTorznabIndexer>,
     pub prowlarr_sources: BTreeMap<DependencyName, RuntimeProwlarrSource>,
@@ -1107,6 +1110,7 @@ struct RuntimeConfigParts {
     torznab_indexers: BTreeMap<DependencyName, ConfiguredTorznabIndexer>,
     prowlarr_sources: BTreeMap<DependencyName, RuntimeProwlarrSource>,
     arr: ArrRegistry,
+    notification_endpoints: BTreeMap<DependencyName, NotificationEndpoint>,
     clients: TorrentClientRegistry,
     injection_clients: Vec<Arc<dyn InjectionClient>>,
     scheduler_config: SchedulerConfig,
@@ -1192,6 +1196,7 @@ impl AppRuntime {
         );
         persisted_health.extend(repository.dependency_health_for_indexer_registry().await?);
         seed_runtime_health(&health, &persisted_health);
+        seed_notification_health(&health, runtime_config.notification_endpoints.keys());
         seed_arr_endpoint_backoff(&mut arr_endpoints, &persisted_health, now_ms);
         let search_planner = RuntimeSearchPlanner::new(
             repository.clone(),
@@ -1242,6 +1247,7 @@ impl AppRuntime {
             scheduler,
             inventory_refresh,
             injection_worker,
+            notification_endpoints: runtime_config.notification_endpoints,
             search_planner,
             torznab_indexers: runtime_config.torznab_indexers,
             prowlarr_sources: runtime_config.prowlarr_sources,
@@ -1291,6 +1297,7 @@ fn build_runtime_config(
             message: error.to_string(),
         }
     })?;
+    let notification_endpoints = runtime_notification_endpoints(config)?;
     let clients = TorrentClientRegistry::from_config(&config.torrent_clients).map_err(|error| {
         DatabaseError::Unavailable {
             operation: "build torrent client registry".to_owned(),
@@ -1331,6 +1338,7 @@ fn build_runtime_config(
         torznab_indexers,
         prowlarr_sources,
         arr,
+        notification_endpoints,
         clients,
         injection_clients,
         scheduler_config,
@@ -1405,6 +1413,60 @@ fn runtime_prowlarr_sources(
         );
     }
     Ok(sources)
+}
+
+fn runtime_notification_endpoints(
+    config: &SporosConfig,
+) -> Result<BTreeMap<DependencyName, NotificationEndpoint>, DatabaseError> {
+    let mut endpoints = BTreeMap::new();
+    for (name, endpoint_config) in &config.notifications.endpoints {
+        let name =
+            DependencyName::new(name.clone()).map_err(|error| DatabaseError::Unavailable {
+                operation: "build notification endpoint".to_owned(),
+                message: error.to_string(),
+            })?;
+        endpoints.insert(
+            name.clone(),
+            notification_endpoint(name, endpoint_config).map_err(|message| {
+                DatabaseError::Unavailable {
+                    operation: "build notification endpoint".to_owned(),
+                    message,
+                }
+            })?,
+        );
+    }
+    Ok(endpoints)
+}
+
+fn notification_endpoint(
+    name: DependencyName,
+    config: &NotificationEndpointConfig,
+) -> Result<NotificationEndpoint, String> {
+    let timeout = interval_duration("notification timeout", &config.timeout)?;
+    let retry = NotificationRetryPolicy {
+        max_attempts: NonZeroU8::new(config.retry_max_attempts)
+            .ok_or_else(|| "notification retry max attempts must be nonzero".to_owned())?,
+        initial_delay: interval_duration(
+            "notification retry initial delay",
+            &config.retry_initial_delay,
+        )?,
+        max_delay: interval_duration("notification retry max delay", &config.retry_max_delay)?,
+    };
+    let mut endpoint = NotificationEndpoint::new(name, config.url.clone())
+        .with_timeout(timeout)
+        .with_retry_policy(retry);
+    if let Some(token) = config.token.clone() {
+        endpoint = endpoint.with_token(token);
+    }
+    Ok(endpoint)
+}
+
+fn interval_duration(operation: &'static str, value: &str) -> Result<Duration, String> {
+    let interval_ms = parse_interval_ms(value).map_err(|error| error.to_string())?;
+    let interval_ms = u64::try_from(interval_ms).map_err(|error| {
+        format!("{operation} must be a non-negative duration in milliseconds: {error}")
+    })?;
+    Ok(Duration::from_millis(interval_ms))
 }
 
 fn prowlarr_config_database_error(
@@ -1506,6 +1568,15 @@ fn seed_runtime_health(health: &HealthRegistry, rows: &[DependencyHealthSnapshot
             }
             _ => health.set_unknown(kind, row.dependency_name.clone()),
         }
+    }
+}
+
+fn seed_notification_health<'a>(
+    health: &HealthRegistry,
+    endpoint_names: impl IntoIterator<Item = &'a DependencyName>,
+) {
+    for name in endpoint_names {
+        health.set_unknown(DependencyKind::Notification, name.clone());
     }
 }
 
@@ -1745,7 +1816,7 @@ mod tests {
         SearchCaps, TorznabCaps, TorznabLimits,
     };
     use crate::metrics::ExternalOutcome;
-    use crate::secrets::{ApiKey, ApiToken};
+    use crate::secrets::{ApiKey, ApiToken, NotificationToken};
     use axum::body::{Body, to_bytes};
     use axum::http::{
         Request, StatusCode,
@@ -1844,6 +1915,97 @@ mod tests {
             crate::runtime::shutdown::ShutdownPhase::Running,
             runtime.state.shutdown.state().phase
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_registers_configured_notification_endpoints_as_unknown() {
+        let mut config = SporosConfig::default();
+        config.notifications.endpoints.insert(
+            "ops".to_owned(),
+            NotificationEndpointConfig {
+                url: "https://hooks.example/ops".to_owned(),
+                token: Some(NotificationToken::new("ops-secret").unwrap()),
+                timeout: "45s".to_owned(),
+                retry_max_attempts: 2,
+                retry_initial_delay: "5s".to_owned(),
+                retry_max_delay: "30s".to_owned(),
+                ..NotificationEndpointConfig::default()
+            },
+        );
+        config.notifications.endpoints.insert(
+            "audit".to_owned(),
+            NotificationEndpointConfig {
+                url: "https://hooks.example/audit".to_owned(),
+                timeout: "10s".to_owned(),
+                retry_max_attempts: 1,
+                retry_initial_delay: "1s".to_owned(),
+                retry_max_delay: "1s".to_owned(),
+                ..NotificationEndpointConfig::default()
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let endpoint_names = runtime
+            .state
+            .notification_endpoints
+            .keys()
+            .map(DependencyName::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["audit", "ops"], endpoint_names);
+        let ops = &runtime.state.notification_endpoints[&DependencyName::new("ops").unwrap()];
+        assert_eq!("https://hooks.example/ops", ops.url());
+        assert_eq!(Some(Duration::from_secs(45)), ops.timeout());
+        assert_eq!(
+            Some(NotificationRetryPolicy {
+                max_attempts: NonZeroU8::new(2).unwrap(),
+                initial_delay: Duration::from_secs(5),
+                max_delay: Duration::from_secs(30),
+            }),
+            ops.retry_policy()
+        );
+        assert!(!format!("{ops:?}").contains("ops-secret"));
+        let health = runtime.state.health.snapshot();
+        let notification_entries = health
+            .entries
+            .iter()
+            .filter(|entry| entry.key.kind == DependencyKind::Notification)
+            .collect::<Vec<_>>();
+        assert_eq!(2, notification_entries.len());
+        assert!(
+            notification_entries
+                .iter()
+                .all(|entry| entry.state == DependencyState::Unknown)
+        );
+        assert_eq!(
+            Some(&crate::runtime::health::DependencySummary::Unknown),
+            health.summaries.get(&DependencyKind::Notification)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_allows_zero_notification_endpoints() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        assert!(runtime.state.notification_endpoints.is_empty());
+        assert!(
+            runtime
+                .state
+                .health
+                .snapshot()
+                .entries
+                .iter()
+                .all(|entry| entry.key.kind != DependencyKind::Notification)
+        );
+        assert_eq!(0, runtime.state.queues.notifications.stats().depth);
     }
 
     #[tokio::test]

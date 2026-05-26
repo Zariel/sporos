@@ -65,6 +65,8 @@ pub struct NotificationEndpoint {
     pub name: DependencyName,
     url: String,
     token: Option<NotificationToken>,
+    timeout: Option<Duration>,
+    retry: Option<NotificationRetryPolicy>,
 }
 
 impl NotificationEndpoint {
@@ -73,6 +75,8 @@ impl NotificationEndpoint {
             name,
             url: url.into(),
             token: None,
+            timeout: None,
+            retry: None,
         }
     }
 
@@ -81,8 +85,26 @@ impl NotificationEndpoint {
         self
     }
 
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_retry_policy(mut self, retry: NotificationRetryPolicy) -> Self {
+        self.retry = Some(retry);
+        self
+    }
+
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    pub fn retry_policy(&self) -> Option<NotificationRetryPolicy> {
+        self.retry
     }
 
     pub fn sanitized_url(&self) -> SanitizedUrl {
@@ -101,6 +123,8 @@ impl fmt::Debug for NotificationEndpoint {
             .field("name", &self.name)
             .field("url", &self.sanitized_url())
             .field("token", &self.token)
+            .field("timeout", &self.timeout)
+            .field("retry", &self.retry)
             .finish()
     }
 }
@@ -159,6 +183,7 @@ pub struct NotificationWorker {
     client: reqwest::Client,
     health: HealthRegistry,
     metrics: MetricsRegistry,
+    timeout: Duration,
     retry: NotificationRetryPolicy,
 }
 
@@ -179,13 +204,13 @@ impl NotificationWorker {
         retry: NotificationRetryPolicy,
     ) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(timeout)
             .build()
             .unwrap_or_else(|_error| reqwest::Client::new());
         Self {
             client,
             health,
             metrics,
+            timeout,
             retry,
         }
     }
@@ -202,9 +227,10 @@ impl NotificationWorker {
         let attempts = Arc::new(Mutex::new(Vec::new()));
 
         let retry_attempts = Arc::clone(&attempts);
+        let retry = job.endpoint.retry_policy().unwrap_or(self.retry);
         let outcome = retry_with_backoff(
-            self.retry.max_attempts.get(),
-            self.retry_backoff_policy(),
+            retry.max_attempts.get(),
+            retry_backoff_policy(retry),
             job.endpoint.name.as_str(),
             shutdown,
             move |_attempt| {
@@ -249,19 +275,11 @@ impl NotificationWorker {
                 retryable: false,
                 error: Some("notification delivery was not attempted".to_owned()),
             });
-        self.record_health(&job.endpoint, &final_attempt);
+        self.record_health(&job.endpoint, retry, &final_attempt);
 
         NotificationDeliveryReport {
             attempts,
             final_outcome: final_attempt.outcome,
-        }
-    }
-
-    fn retry_backoff_policy(&self) -> JitteredBackoffPolicy {
-        JitteredBackoffPolicy {
-            base_delay_ms: i64::try_from(self.retry.initial_delay.as_millis()).unwrap_or(i64::MAX),
-            max_delay_ms: i64::try_from(self.retry.max_delay.as_millis()).unwrap_or(i64::MAX),
-            jitter_ms: 0,
         }
     }
 
@@ -283,6 +301,7 @@ impl NotificationWorker {
             .post(job.endpoint.url())
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(CONTENT_TYPE, "application/json")
+            .timeout(job.endpoint.timeout().unwrap_or(self.timeout))
             .body(body);
 
         if let Some(token) = job.endpoint.token() {
@@ -346,7 +365,12 @@ impl NotificationWorker {
         }
     }
 
-    fn record_health(&self, endpoint: &NotificationEndpoint, attempt: &NotificationAttemptReport) {
+    fn record_health(
+        &self,
+        endpoint: &NotificationEndpoint,
+        retry: NotificationRetryPolicy,
+        attempt: &NotificationAttemptReport,
+    ) {
         let name = endpoint.name.clone();
         match attempt.outcome {
             NotificationDeliveryOutcome::Succeeded => {
@@ -363,7 +387,7 @@ impl NotificationWorker {
                     .error
                     .as_deref()
                     .unwrap_or("notification delivery failed");
-                let retry_after_ms = retry_after_deadline(self.retry);
+                let retry_after_ms = retry_after_deadline(retry);
                 if let Some(reason) = reason_text(reason) {
                     self.health.set_degraded(
                         DependencyKind::Notification,
@@ -492,6 +516,14 @@ fn retry_after_deadline(policy: NotificationRetryPolicy) -> i64 {
     let now = crate::runtime::announce_worker::unix_time_ms();
     let delay_ms = i64::try_from(policy.max_delay.as_millis()).unwrap_or(i64::MAX);
     fixed_retry_deadline_ms(now, delay_ms, None)
+}
+
+fn retry_backoff_policy(policy: NotificationRetryPolicy) -> JitteredBackoffPolicy {
+    JitteredBackoffPolicy {
+        base_delay_ms: i64::try_from(policy.initial_delay.as_millis()).unwrap_or(i64::MAX),
+        max_delay_ms: i64::try_from(policy.max_delay.as_millis()).unwrap_or(i64::MAX),
+        jitter_ms: 0,
+    }
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

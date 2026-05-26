@@ -2763,17 +2763,18 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        ConfigTorrentClientKind, ProwlarrSourceConfig, SporosConfig, TorrentClientConfig,
-        TorznabIndexerConfig,
+        ConfigTorrentClientKind, NotificationEndpointConfig, ProwlarrSourceConfig, SporosConfig,
+        TorrentClientConfig, TorznabIndexerConfig,
     };
     use crate::domain::{
-        ByteSize, CandidateGuid, ClientHost, DependencyName, DisplayName, DownloadUrl, FileIndex,
-        IndexerId, InfoHash, ItemTitle, JobName, JobState, LocalFile, LocalItem, LocalItemSource,
-        MediaType, ReasonText, RemoteCandidate, SourceKey, TrackerName,
+        ByteSize, CandidateGuid, ClientHost, DependencyName, DependencyState, DisplayName,
+        DownloadUrl, FileIndex, IndexerId, InfoHash, ItemTitle, JobName, JobState, LocalFile,
+        LocalItem, LocalItemSource, MediaType, ReasonText, RemoteCandidate, SourceKey, TrackerName,
     };
     use crate::indexers::{CategoryCaps, RetryAfter, SearchCaps, TorznabCaps, TorznabLimits};
+    use crate::notifications::{NotificationEvent, NotificationJob, notification_dependency_key};
     use crate::persistence::repository::{JobStateUpdate, Repository};
-    use crate::secrets::ApiKey;
+    use crate::secrets::{ApiKey, NotificationToken};
     use axum::body::Body;
     use axum::http::{
         Request, StatusCode,
@@ -3556,6 +3557,50 @@ mod tests {
             .unwrap();
         assert_eq!(1, file_count);
         assert_eq!(1, info_requests.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn background_tasks_process_configured_notification_jobs() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let endpoint_url = spawn_daemon_notification_server(requests.clone()).await;
+        let mut config = SporosConfig::default();
+        config.notifications.endpoints.insert(
+            "ops".to_owned(),
+            NotificationEndpointConfig {
+                url: endpoint_url,
+                token: Some(NotificationToken::new("ops-secret").unwrap()),
+                timeout: "5s".to_owned(),
+                retry_max_attempts: 1,
+                retry_initial_delay: "1s".to_owned(),
+                retry_max_delay: "1s".to_owned(),
+                ..NotificationEndpointConfig::default()
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+        let queue = runtime.state.queues.notifications.clone();
+        let endpoint =
+            runtime.state.notification_endpoints[&DependencyName::new("ops").unwrap()].clone();
+        let health = runtime.state.health.clone();
+        let dependency_key = notification_dependency_key(&endpoint);
+
+        let handles = start_background_tasks(runtime).await.unwrap();
+        queue
+            .enqueue(NotificationJob::new(endpoint, NotificationEvent::test()))
+            .await
+            .unwrap();
+        wait_for_atomic_count(&requests, 1).await;
+        wait_for_queue_completed(&queue, 1).await;
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        assert!(matches!(
+            health.state(&dependency_key),
+            Some(DependencyState::Healthy { .. })
+        ));
     }
 
     #[tokio::test]
@@ -5782,6 +5827,25 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}/api")
+    }
+
+    async fn spawn_daemon_notification_server(requests: Arc<AtomicUsize>) -> String {
+        let app = axum::Router::new().route(
+            "/hook",
+            post(move || {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/hook")
     }
 
     async fn spawn_daemon_stalled_torznab_caps_server(requests: Arc<AtomicUsize>) -> String {
