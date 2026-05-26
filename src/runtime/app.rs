@@ -3760,6 +3760,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_workflow_capacity_streams_thousands_with_bounded_indexer_concurrency() {
+        const INDEXER_COUNT: usize = 20;
+        const PER_INDEXER_CANDIDATES: usize = 200;
+        const TOTAL_CANDIDATES: usize = INDEXER_COUNT * PER_INDEXER_CANDIDATES;
+
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let blocked_in_flight = Arc::new(AtomicBool::new(false));
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let release_blocked = Arc::new(tokio::sync::Notify::new());
+        let mut config = SporosConfig::default();
+        config.runtime.search_worker_concurrency = 4;
+        config.runtime.manual_search_per_indexer_result_limit = PER_INDEXER_CANDIDATES;
+        config.runtime.manual_search_workflow_result_limit = TOTAL_CANDIDATES;
+        let repository = Repository::connect_in_memory().await.unwrap();
+
+        for index in 0..INDEXER_COUNT {
+            let name = format!("indexer-{index:02}");
+            let blocked = (index == 1).then(|| {
+                (
+                    Arc::clone(&blocked_in_flight),
+                    Arc::clone(&blocked_started),
+                    Arc::clone(&release_blocked),
+                )
+            });
+            let torznab_url = spawn_runtime_torznab_capacity_search_server(
+                Arc::clone(&queries),
+                Arc::clone(&in_flight),
+                Arc::clone(&max_in_flight),
+                name.clone(),
+                PER_INDEXER_CANDIDATES,
+                blocked,
+            )
+            .await;
+            config.indexers.torznab.insert(
+                name,
+                TorznabIndexerConfig {
+                    url: torznab_url,
+                    api_key: Some(ApiKey::new("capacity").unwrap()),
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            );
+        }
+
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        for index in 0..INDEXER_COUNT {
+            let name = DependencyName::new(format!("indexer-{index:02}")).unwrap();
+            let mut caps = movie_caps();
+            caps.limits = TorznabLimits {
+                default: PER_INDEXER_CANDIDATES as u16,
+                max: PER_INDEXER_CANDIDATES as u16,
+            };
+            repository
+                .record_indexer_caps_success(&name, &caps, 100)
+                .await
+                .unwrap();
+        }
+
+        let (_shutdown, shutdown_signal) = shutdown_channel();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let state = runtime.state.clone();
+        let handle = tokio::spawn(async move {
+            state
+                .stream_search_workflow_candidates(
+                    SearchWorkflowRequest {
+                        query: ItemTitle::new("Example.Movie.1080p").unwrap(),
+                    },
+                    1_000,
+                    sender,
+                    shutdown_signal,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), blocked_started.notified())
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!("indexer-00-0", first.guid.as_str());
+        assert!(
+            blocked_in_flight.load(Ordering::SeqCst),
+            "expected streaming before the blocked early indexer finished"
+        );
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= 4,
+            "expected search requests to stay within configured concurrency"
+        );
+
+        release_blocked.notify_one();
+        let mut candidate_count = 1;
+        while candidate_count < TOTAL_CANDIDATES {
+            let candidate = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if candidate_count == TOTAL_CANDIDATES - 1 {
+                assert_eq!("indexer-19-199", candidate.guid.as_str());
+            }
+            candidate_count += 1;
+        }
+
+        let summary = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(INDEXER_COUNT, summary.plans.len());
+        assert_eq!(TOTAL_CANDIDATES, summary.candidate_count);
+        assert_eq!(TOTAL_CANDIDATES, candidate_count);
+        assert_eq!(INDEXER_COUNT, queries.lock().unwrap().len());
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= 4,
+            "expected search requests to stay within configured concurrency"
+        );
+        let text = runtime
+            .state
+            .metrics
+            .render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(text.contains(
+            "sporos_indexer_requests_total{operation=\"search\",outcome=\"succeeded\"} 20"
+        ));
+    }
+
+    #[tokio::test]
     async fn search_workflow_enforces_per_indexer_result_cap() {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let torznab_url =
@@ -6191,6 +6322,58 @@ mod tests {
                     (
                         StatusCode::OK,
                         search_rss(&guid, &format!("Example {guid}")),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    async fn spawn_runtime_torznab_capacity_search_server(
+        queries: Arc<Mutex<Vec<String>>>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        guid_prefix: String,
+        candidate_count: usize,
+        blocked: Option<(
+            Arc<AtomicBool>,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/api",
+            get(move |request: Request<Body>| {
+                let queries = Arc::clone(&queries);
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                let guid_prefix = guid_prefix.clone();
+                let blocked = blocked.clone();
+                async move {
+                    let query = request.uri().query().unwrap_or_default().to_owned();
+                    queries.lock().unwrap().push(query.clone());
+                    if query.contains("t=caps") {
+                        return (StatusCode::OK, torznab_caps_xml().to_owned());
+                    }
+                    let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    update_max_atomic(&max_in_flight, active);
+                    if let Some((blocked_in_flight, started, release)) = blocked {
+                        blocked_in_flight.store(true, Ordering::SeqCst);
+                        started.notify_one();
+                        release.notified().await;
+                        blocked_in_flight.store(false, Ordering::SeqCst);
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        search_rss_many(&guid_prefix, candidate_count),
                     )
                 }
             }),
