@@ -16,9 +16,13 @@ use tracing::{debug_span, info_span};
 
 pub const INDEXER_CAPS_JOB_NAME: &str = "indexer_caps";
 pub const CLEANUP_JOB_NAME: &str = "cleanup";
+pub const MEDIA_INVENTORY_JOB_NAME: &str = "media_inventory";
 
 pub fn scheduled_job_has_executor(job_name: &JobName) -> bool {
-    matches!(job_name.as_str(), INDEXER_CAPS_JOB_NAME | CLEANUP_JOB_NAME)
+    matches!(
+        job_name.as_str(),
+        INDEXER_CAPS_JOB_NAME | CLEANUP_JOB_NAME | MEDIA_INVENTORY_JOB_NAME
+    )
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -33,6 +37,7 @@ impl SchedulerConfig {
         Ok(Self {
             jobs: vec![
                 ScheduledJob::new(CLEANUP_JOB_NAME, &config.cleanup_interval)?,
+                ScheduledJob::new(MEDIA_INVENTORY_JOB_NAME, &config.media_inventory_interval)?,
                 ScheduledJob::new(INDEXER_CAPS_JOB_NAME, &config.indexer_caps_interval)?,
             ],
             claim_limit: 16,
@@ -690,16 +695,29 @@ mod tests {
         );
 
         let summary = scheduler.tick(100).await.unwrap();
-        let first = receiver.recv().await.unwrap();
-        let second = receiver.recv().await.unwrap();
+        let runs = [
+            receiver.recv().await.unwrap(),
+            receiver.recv().await.unwrap(),
+            receiver.recv().await.unwrap(),
+        ];
         let jobs = repository.job_status_snapshot(10).await.unwrap();
         let rss_job = jobs.iter().find(|job| job.name == rss).unwrap();
         let cleanup_job = jobs.iter().find(|job| job.name == cleanup).unwrap();
 
-        assert_eq!(1, summary.seeded);
-        assert_eq!(2, summary.enqueued);
-        assert_eq!(CLEANUP_JOB_NAME, first.job_name.as_str());
-        assert_eq!(INDEXER_CAPS_JOB_NAME, second.job_name.as_str());
+        assert_eq!(2, summary.seeded);
+        assert_eq!(3, summary.enqueued);
+        assert!(
+            runs.iter()
+                .any(|run| run.job_name.as_str() == CLEANUP_JOB_NAME)
+        );
+        assert!(
+            runs.iter()
+                .any(|run| run.job_name.as_str() == MEDIA_INVENTORY_JOB_NAME)
+        );
+        assert!(
+            runs.iter()
+                .any(|run| run.job_name.as_str() == INDEXER_CAPS_JOB_NAME)
+        );
         assert_eq!("disabled", rss_job.state);
         assert_eq!(None, rss_job.next_run_at_ms);
         assert_eq!(None, rss_job.last_error);
@@ -736,7 +754,7 @@ mod tests {
         let jobs = repository.job_status_snapshot(10).await.unwrap();
         let stale_job = jobs.iter().find(|job| job.name == stale).unwrap();
 
-        assert_eq!(2, summary.seeded);
+        assert_eq!(3, summary.seeded);
         assert_eq!("disabled", stale_job.state);
         assert_eq!(None, stale_job.next_run_at_ms);
         assert_eq!(None, stale_job.last_error);
@@ -770,12 +788,13 @@ mod tests {
         let runs = [
             receiver.recv().await.unwrap(),
             receiver.recv().await.unwrap(),
+            receiver.recv().await.unwrap(),
         ];
         let jobs = repository.job_status_snapshot(10).await.unwrap();
         let job = jobs.iter().find(|job| job.name == indexer_caps).unwrap();
 
-        assert_eq!(1, summary.seeded);
-        assert_eq!(2, summary.enqueued);
+        assert_eq!(2, summary.seeded);
+        assert_eq!(3, summary.enqueued);
         assert!(
             runs.iter()
                 .any(|run| run.job_name.as_str() == INDEXER_CAPS_JOB_NAME)
@@ -789,11 +808,13 @@ mod tests {
     fn default_scheduler_jobs_are_executable() {
         let config = SchedulerConfig::from_scheduling_config(&SchedulingConfig::default()).unwrap();
 
-        assert_eq!(2, config.jobs.len());
+        assert_eq!(3, config.jobs.len());
         assert_eq!(CLEANUP_JOB_NAME, config.jobs[0].name.as_str());
         assert_eq!(86_400_000, config.jobs[0].interval_ms);
-        assert_eq!(INDEXER_CAPS_JOB_NAME, config.jobs[1].name.as_str());
+        assert_eq!(MEDIA_INVENTORY_JOB_NAME, config.jobs[1].name.as_str());
         assert_eq!(86_400_000, config.jobs[1].interval_ms);
+        assert_eq!(INDEXER_CAPS_JOB_NAME, config.jobs[2].name.as_str());
+        assert_eq!(86_400_000, config.jobs[2].interval_ms);
         assert!(
             config
                 .jobs

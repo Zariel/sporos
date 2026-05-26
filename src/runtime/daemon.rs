@@ -33,7 +33,7 @@ use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
 use crate::indexers::{
     CachedCandidateTorrent, CandidateDownloadClient, CandidateDownloadError, IndexerBackoffPolicy,
 };
-use crate::inventory_refresh::run_inventory_refresh_worker;
+use crate::inventory_refresh::{InventoryRefreshRequest, run_inventory_refresh_worker};
 use crate::matching::{
     CandidateAssessmentConfig, CandidateAssessmentInput, CandidatePrecheckConfig,
     FileTreeMatchConfig, FileTreeMatchMode, PersistedCandidateAssessment, ReverseLookupConfig,
@@ -60,8 +60,8 @@ use crate::runtime::injection_worker::{
     InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
 use crate::runtime::scheduler::{
-    CLEANUP_JOB_NAME, INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome, ScheduledJobRun,
-    parse_interval_ms,
+    CLEANUP_JOB_NAME, INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome, MEDIA_INVENTORY_JOB_NAME,
+    ScheduledJobRun, parse_interval_ms,
 };
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
@@ -821,7 +821,7 @@ async fn preflight_search_candidate(
             })
             .await?
         };
-        resolve_search_candidate_preflight(prepared, database_gate).await
+        Box::pin(resolve_search_candidate_preflight(prepared, database_gate)).await
     })
     .await;
     (index, result)
@@ -1659,7 +1659,37 @@ async fn execute_scheduled_job(
             }
         }
         CLEANUP_JOB_NAME => run_scheduled_cleanup_job(state, &shutdown).await,
+        MEDIA_INVENTORY_JOB_NAME => run_scheduled_media_inventory_job(state, shutdown).await,
         other => Err(format!("unknown scheduled job {other}")),
+    }
+}
+
+async fn run_scheduled_media_inventory_job(
+    state: &AppState,
+    shutdown: ShutdownSignal,
+) -> Result<(), String> {
+    if state.config.paths.media_dirs.is_empty() {
+        return Ok(());
+    }
+
+    let summary = state
+        .inventory_refresh
+        .refresh_data_dirs_until_shutdown(
+            InventoryRefreshRequest {
+                media_dirs: state.config.paths.media_dirs.clone(),
+            },
+            shutdown,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if summary.scan_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "media inventory refresh completed with {} scan failure(s)",
+            summary.scan_failures.len()
+        ))
     }
 }
 
@@ -5181,6 +5211,59 @@ mod tests {
         .await;
 
         assert_eq!(Ok(()), result);
+    }
+
+    #[tokio::test]
+    async fn scheduled_media_inventory_noops_without_configured_media_dirs() {
+        let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let result = execute_scheduled_job(
+            &runtime.state,
+            &JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap(),
+            runtime.state.shutdown_signal.clone(),
+        )
+        .await;
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(Ok(()), result);
+        assert_eq!(0, item_count);
+    }
+
+    #[tokio::test]
+    async fn scheduled_media_inventory_refreshes_configured_media_dirs() {
+        let root = unique_temp_dir("daemon-scheduled-media-inventory");
+        let media_root = root.join("media");
+        let release = media_root.join("Movie.2026.1080p");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join("movie.mkv"), b"0123456789").unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.media_dirs = vec![media_root];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let result = execute_scheduled_job(
+            &runtime.state,
+            &JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap(),
+            runtime.state.shutdown_signal.clone(),
+        )
+        .await;
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(Ok(()), result);
+        assert_eq!(1, item_count);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

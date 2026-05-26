@@ -5245,6 +5245,17 @@ mod tests {
             )
             .await
             .unwrap();
+        let media_inventory_job_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/media_inventory/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let unsupported_search_job = app
             .clone()
             .oneshot(
@@ -5299,6 +5310,7 @@ mod tests {
         assert_eq!(StatusCode::ACCEPTED, job_run.status());
         assert_eq!(StatusCode::NOT_FOUND, unsupported_rss_job.status());
         assert_eq!(StatusCode::ACCEPTED, cleanup_job_run.status());
+        assert_eq!(StatusCode::ACCEPTED, media_inventory_job_run.status());
         assert_eq!(StatusCode::NOT_FOUND, unsupported_search_job.status());
         assert_eq!(StatusCode::ACCEPTED, announcement.status());
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());

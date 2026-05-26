@@ -389,6 +389,7 @@ pub enum BelowThresholdActionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulingConfig {
     pub client_inventory_interval: String,
+    pub media_inventory_interval: String,
     pub indexer_caps_interval: String,
     pub saved_retry_interval: String,
     pub cleanup_interval: String,
@@ -398,6 +399,7 @@ impl Default for SchedulingConfig {
     fn default() -> Self {
         Self {
             client_inventory_interval: "24h".to_owned(),
+            media_inventory_interval: "24h".to_owned(),
             indexer_caps_interval: "24h".to_owned(),
             saved_retry_interval: "30m".to_owned(),
             cleanup_interval: "24h".to_owned(),
@@ -1804,6 +1806,7 @@ below_threshold_action = "inject_and_start|inject_paused|reject_without_injectin
 
 [scheduling]
 client_inventory_interval = "24h"
+media_inventory_interval = "24h"
 indexer_caps_interval = "24h"
 saved_retry_interval = "30m"
 cleanup_interval = "24h"
@@ -1875,6 +1878,13 @@ mod tests {
             link_type = "hardlink"
             link_dirs = ["/links/fast", "/links/slow"]
             flat_linking = true
+
+            [scheduling]
+            client_inventory_interval = "12h"
+            media_inventory_interval = "6h"
+            indexer_caps_interval = "3h"
+            saved_retry_interval = "15m"
+            cleanup_interval = "2h"
             "#,
         )
         .unwrap();
@@ -1945,6 +1955,11 @@ mod tests {
             BelowThresholdActionConfig::InjectPaused,
             config.injection.recheck.below_threshold_action
         );
+        assert_eq!("12h", config.scheduling.client_inventory_interval);
+        assert_eq!("6h", config.scheduling.media_inventory_interval);
+        assert_eq!("3h", config.scheduling.indexer_caps_interval);
+        assert_eq!("15m", config.scheduling.saved_retry_interval);
+        assert_eq!("2h", config.scheduling.cleanup_interval);
     }
 
     #[test]
@@ -2917,6 +2932,7 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("flat_linking"));
         assert!(CONFIG_SCHEMA.contains("[injection.recheck]"));
         assert!(!CONFIG_SCHEMA.contains("rss_interval"));
+        assert!(CONFIG_SCHEMA.contains("media_inventory_interval"));
         assert!(CONFIG_SCHEMA.contains("default_tags = [\"sporos\"]"));
         assert!(CONFIG_SCHEMA.contains("below_threshold_action"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
@@ -2943,6 +2959,7 @@ mod tests {
         assert!(template.contains("link_type"));
         assert!(template.contains("link_dirs"));
         assert!(template.contains("flat_linking"));
+        assert!(template.contains("media_inventory_interval"));
     }
 
     #[test]
