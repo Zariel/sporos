@@ -428,6 +428,9 @@ fn fuzzy_size_threshold_permille(threshold: f64) -> Permille {
 fn saved_torrent_retry_config(config: &SporosConfig) -> SavedTorrentRetryConfig {
     SavedTorrentRetryConfig {
         directories: vec![config.paths.output_dir.clone()],
+        link_dirs: config.injection.link_dirs.clone(),
+        link_type: runtime_link_type(config),
+        flat_linking: config.injection.flat_linking,
         recheck: runtime_recheck_resume_config(config),
         reverse_lookup: runtime_reverse_lookup_config(config),
         ..SavedTorrentRetryConfig::default()
@@ -2891,6 +2894,12 @@ mod tests {
         config.injection.recheck.max_resume_wait_ms = 500;
         config.injection.recheck.below_threshold_action =
             crate::config::BelowThresholdActionConfig::RejectWithoutInjecting;
+        config.injection.link_type = Some(InjectionLinkTypeConfig::ReflinkOrCopy);
+        config.injection.link_dirs = vec![
+            PathBuf::from("/tmp/sporos-links/fast"),
+            PathBuf::from("/tmp/sporos-links/slow"),
+        ];
+        config.injection.flat_linking = true;
         config.matching.mode = MatchingMode::Exact;
         config.matching.fuzzy_size_threshold = 0.075;
         config.matching.include_single_episodes = true;
@@ -2919,6 +2928,15 @@ mod tests {
             vec![PathBuf::from("/tmp/sporos-output")],
             saved_retry.directories
         );
+        assert_eq!(
+            vec![
+                PathBuf::from("/tmp/sporos-links/fast"),
+                PathBuf::from("/tmp/sporos-links/slow")
+            ],
+            saved_retry.link_dirs
+        );
+        assert_eq!(Some(LinkType::ReflinkOrCopy), saved_retry.link_type);
+        assert!(saved_retry.flat_linking);
         assert_eq!(recheck, saved_retry.recheck);
         assert_eq!(
             FileTreeMatchMode::Strict,
