@@ -52,8 +52,11 @@ fn real_client_torrent_fixtures_are_deterministic_and_tiny() {
     assert_pair_equivalent_and_distinct(&by_slug, "rtorrent-source", "rtorrent-candidate");
     let search_xml =
         fs::read_to_string(root.parent().unwrap().join("torznab/www/search.xml")).unwrap();
+    let compose = fs::read_to_string(root.parent().unwrap().join("compose.yml")).unwrap();
+    let nginx = fs::read_to_string(root.parent().unwrap().join("torznab/nginx.conf")).unwrap();
     assert_search_fixture_matches_manifest(&search_xml, by_slug["qbittorrent-candidate"], "4096");
     assert_search_fixture_matches_manifest(&search_xml, by_slug["rtorrent-candidate"], "3329");
+    assert_torznab_mounts_do_not_nest_read_only_document_root(&compose, &nginx);
 
     for fixture in &manifest.fixtures {
         let torrent =
@@ -116,6 +119,13 @@ fn real_client_torrent_fixtures_are_deterministic_and_tiny() {
             expected_pieces(&piece_input, manifest.piece_length)
         );
     }
+}
+
+fn assert_torznab_mounts_do_not_nest_read_only_document_root(compose: &str, nginx: &str) {
+    assert!(compose.contains("./torznab/www:/usr/share/nginx/html:ro"));
+    assert!(compose.contains("./fixtures/torrents:/usr/share/nginx/torrents:ro"));
+    assert!(!compose.contains("./fixtures/torrents:/usr/share/nginx/html/torrents"));
+    assert!(nginx.contains("alias /usr/share/nginx/torrents/;"));
 }
 
 fn assert_search_fixture_matches_manifest(
