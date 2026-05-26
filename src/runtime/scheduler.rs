@@ -398,6 +398,10 @@ impl PersistedScheduler {
         Ok(())
     }
 
+    pub fn failure_backoff(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::try_from(self.failure_backoff_ms).unwrap_or(0))
+    }
+
     fn job(&self, job_name: &JobName) -> Result<&ScheduledJob, SchedulerError> {
         self.jobs
             .get(job_name)

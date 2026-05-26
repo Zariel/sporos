@@ -1000,7 +1000,7 @@ async fn run_inventory_refresh_with_retry(
     }
 }
 
-async fn record_inventory_refresh_health(
+pub(crate) async fn record_inventory_refresh_health(
     worker: &InventoryRefreshWorker,
     reason: Option<String>,
     retry_after: Option<Duration>,
@@ -1031,7 +1031,7 @@ async fn record_inventory_refresh_health(
     }
 }
 
-fn scan_failure_reason(failures: &[InventoryScanFailure]) -> String {
+pub(crate) fn scan_failure_reason(failures: &[InventoryScanFailure]) -> String {
     match failures {
         [] => "inventory refresh failed".to_owned(),
         [failure] => format!(

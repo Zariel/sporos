@@ -33,7 +33,10 @@ use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
 use crate::indexers::{
     CachedCandidateTorrent, CandidateDownloadClient, CandidateDownloadError, IndexerBackoffPolicy,
 };
-use crate::inventory_refresh::{InventoryRefreshRequest, run_inventory_refresh_worker};
+use crate::inventory_refresh::{
+    InventoryRefreshRequest, record_inventory_refresh_health, run_inventory_refresh_worker,
+    scan_failure_reason,
+};
 use crate::matching::{
     CandidateAssessmentConfig, CandidateAssessmentInput, CandidatePrecheckConfig,
     FileTreeMatchConfig, FileTreeMatchMode, PersistedCandidateAssessment, ReverseLookupConfig,
@@ -1672,7 +1675,7 @@ async fn run_scheduled_media_inventory_job(
         return Ok(());
     }
 
-    let summary = state
+    let result = state
         .inventory_refresh
         .refresh_data_dirs_until_shutdown(
             InventoryRefreshRequest {
@@ -1680,16 +1683,34 @@ async fn run_scheduled_media_inventory_job(
             },
             shutdown,
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await;
+
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(error) => {
+            let reason = error.to_string();
+            record_inventory_refresh_health(
+                &state.inventory_refresh,
+                Some(reason.clone()),
+                Some(state.scheduler.failure_backoff()),
+            )
+            .await;
+            return Err(reason);
+        }
+    };
 
     if summary.scan_failures.is_empty() {
+        record_inventory_refresh_health(&state.inventory_refresh, None, None).await;
         Ok(())
     } else {
-        Err(format!(
-            "media inventory refresh completed with {} scan failure(s)",
-            summary.scan_failures.len()
-        ))
+        let reason = scan_failure_reason(&summary.scan_failures);
+        record_inventory_refresh_health(
+            &state.inventory_refresh,
+            Some(reason.clone()),
+            Some(state.scheduler.failure_backoff()),
+        )
+        .await;
+        Err(reason)
     }
 }
 
@@ -5264,9 +5285,223 @@ mod tests {
             .fetch_one(repository.pool())
             .await
             .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        let inventory_health = health
+            .iter()
+            .find(|entry| {
+                entry.dependency_type == DependencyKind::LocalState.as_str()
+                    && entry.dependency_name.as_str() == "inventory-refresh"
+            })
+            .unwrap();
 
         assert_eq!(Ok(()), result);
         assert_eq!(2, item_count);
+        assert_eq!("healthy", inventory_health.state);
+        assert_eq!(0, inventory_health.failure_count);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_media_inventory_scan_failure_is_observable() {
+        let root = unique_temp_dir("daemon-scheduled-media-inventory-scan-failure");
+        let missing_root = root.join("missing");
+        let media_root = root.join("media");
+        let release = media_root.join("Movie.2026.1080p");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join("movie.mkv"), b"0123456789").unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.media_dirs = vec![missing_root, media_root];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let job_name = JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap();
+        repository
+            .claim_immediate_job_run(&job_name, unix_time_ms())
+            .await
+            .unwrap();
+
+        process_scheduled_job_run(
+            &state,
+            ScheduledJobRun {
+                job_name,
+                scheduled_at_ms: unix_time_ms(),
+            },
+            state.shutdown_signal.clone(),
+        )
+        .await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let media_inventory = jobs
+            .iter()
+            .find(|job| job.name.as_str() == MEDIA_INVENTORY_JOB_NAME)
+            .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        let inventory_health = health
+            .iter()
+            .find(|entry| {
+                entry.dependency_type == DependencyKind::LocalState.as_str()
+                    && entry.dependency_name.as_str() == "inventory-refresh"
+            })
+            .unwrap();
+        let app = router(state.http.clone());
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status_body = axum::body::to_bytes(status.into_body(), 65_536)
+            .await
+            .unwrap();
+        let status_json: Value = serde_json::from_slice(&status_body).unwrap();
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_body = axum::body::to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics_text = std::str::from_utf8(&metrics_body).unwrap();
+        let dependency = status_json["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dependency| {
+                dependency["kind"] == "local_state" && dependency["name"] == "inventory-refresh"
+            })
+            .unwrap();
+        let status_job = status_json["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["name"] == MEDIA_INVENTORY_JOB_NAME)
+            .unwrap();
+
+        assert_eq!("failed", media_inventory.state);
+        assert!(media_inventory.next_run_at_ms.is_some());
+        assert!(
+            media_inventory
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed for"))
+        );
+        assert_eq!("degraded", inventory_health.state);
+        assert_eq!(1, inventory_health.failure_count);
+        assert!(inventory_health.retry_after_ms.is_some());
+        assert!(
+            inventory_health
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("failed for"))
+        );
+        assert_eq!("degraded", dependency["state"]);
+        assert_eq!("persisted", dependency["source"]);
+        assert!(dependency["retry_after_ms"].as_i64().is_some());
+        assert_eq!("failed", status_job["state"]);
+        assert!(status_job["next_run_at_ms"].as_i64().is_some());
+        assert!(
+            status_job["last_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("failed for"))
+        );
+        assert!(metrics_text.contains(
+            "sporos_dependency_health_state{dependency=\"local_state\",state=\"degraded\"} 1"
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_media_inventory_database_failure_records_backoff_state() {
+        let root = unique_temp_dir("daemon-scheduled-media-inventory-db-failure");
+        let media_root = root.join("media");
+        let release = media_root.join("Movie.2026.1080p");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join("movie.mkv"), b"0123456789").unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.media_dirs = vec![media_root];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER abort_data_root_insert
+            BEFORE INSERT ON local_items
+            WHEN new.source_type = 'data_root'
+            BEGIN
+                SELECT RAISE(ABORT, 'abort data root insert');
+            END
+            "#,
+        )
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let job_name = JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap();
+        repository
+            .claim_immediate_job_run(&job_name, unix_time_ms())
+            .await
+            .unwrap();
+
+        process_scheduled_job_run(
+            &state,
+            ScheduledJobRun {
+                job_name,
+                scheduled_at_ms: unix_time_ms(),
+            },
+            state.shutdown_signal.clone(),
+        )
+        .await;
+
+        let jobs = repository.job_status_snapshot(10).await.unwrap();
+        let media_inventory = jobs
+            .iter()
+            .find(|job| job.name.as_str() == MEDIA_INVENTORY_JOB_NAME)
+            .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+        let inventory_health = health
+            .iter()
+            .find(|entry| {
+                entry.dependency_type == DependencyKind::LocalState.as_str()
+                    && entry.dependency_name.as_str() == "inventory-refresh"
+            })
+            .unwrap();
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!("failed", media_inventory.state);
+        assert!(media_inventory.next_run_at_ms.is_some());
+        assert!(
+            media_inventory
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("abort data root insert"))
+        );
+        assert_eq!("degraded", inventory_health.state);
+        assert_eq!(1, inventory_health.failure_count);
+        assert!(inventory_health.retry_after_ms.is_some());
+        assert!(
+            inventory_health
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("abort data root insert"))
+        );
+        assert_eq!(0, item_count);
         fs::remove_dir_all(root).unwrap();
     }
 

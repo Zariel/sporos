@@ -39,7 +39,9 @@ use crate::notifications::{
     NotificationEndpoint, NotificationEnqueueSummary, NotificationEvent, NotificationJob,
     enqueue_notification_event,
 };
-use crate::persistence::repository::{AnnounceInsertResult, AnnounceQueueSnapshot, Repository};
+use crate::persistence::repository::{
+    AnnounceInsertResult, AnnounceQueueSnapshot, JobStatusSnapshot, Repository,
+};
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{
     DependencyHealthSnapshot as RuntimeDependencyHealthSnapshot, HealthRegistry,
@@ -624,8 +626,20 @@ struct StatusResponse {
     readiness: ReadinessResponse,
     runtime: RuntimeStatusResponse,
     dependencies: Vec<DependencyStatusResponse>,
+    jobs: Vec<JobStatusResponse>,
+    jobs_error: Option<&'static str>,
     announce_queue: Option<AnnounceQueueStatusResponse>,
     announce_queue_error: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct JobStatusResponse {
+    name: String,
+    state: String,
+    last_started_at_ms: Option<i64>,
+    last_finished_at_ms: Option<i64>,
+    next_run_at_ms: Option<i64>,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1100,6 +1114,7 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
 async fn status(State(state): State<HttpState>) -> impl IntoResponse {
     let readiness = readiness_response(&state).await;
     let dependencies = dependency_statuses(&state).await;
+    let (jobs, jobs_error) = job_statuses(&state).await;
     let (announce_queue, announce_queue_error) = announce_queue_status(&state).await;
     state
         .metrics
@@ -1111,6 +1126,8 @@ async fn status(State(state): State<HttpState>) -> impl IntoResponse {
             readiness,
             runtime: state.runtime_status(),
             dependencies,
+            jobs,
+            jobs_error,
             announce_queue,
             announce_queue_error,
         }),
@@ -1613,6 +1630,27 @@ async fn announce_queue_status(
             None,
         ),
         Err(_error) => (None, Some("unavailable")),
+    }
+}
+
+async fn job_statuses(state: &HttpState) -> (Vec<JobStatusResponse>, Option<&'static str>) {
+    let Some(acceptor) = state.announce_acceptor.as_ref() else {
+        return (Vec::new(), None);
+    };
+    match acceptor.repository.job_status_snapshot(1_000).await {
+        Ok(jobs) => (jobs.into_iter().map(job_status_response).collect(), None),
+        Err(_error) => (Vec::new(), Some("unavailable")),
+    }
+}
+
+fn job_status_response(job: JobStatusSnapshot) -> JobStatusResponse {
+    JobStatusResponse {
+        name: job.name.as_str().to_owned(),
+        state: job.state,
+        last_started_at_ms: job.last_started_at_ms,
+        last_finished_at_ms: job.last_finished_at_ms,
+        next_run_at_ms: job.next_run_at_ms,
+        last_error: job.last_error,
     }
 }
 
