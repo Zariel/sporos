@@ -438,6 +438,10 @@ The service exposes:
 Workflow endpoints require bearer auth when an API token is configured. Startup
 rejects externally reachable binds without a configured token.
 
+Representative `/v1/status` responses are checked in under
+`docs/operators/status-examples/` and covered by HTTP tests so operator-facing
+JSON changes are deliberate.
+
 ## Readiness And Degraded Dependencies
 
 Readiness separates accepting work from processing health. The service can

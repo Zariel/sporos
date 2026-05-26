@@ -1,0 +1,81 @@
+{
+  "status": "ok",
+  "readiness": {
+    "status": "ready",
+    "accepting_work": true,
+    "processing_ready": true,
+    "checks": {
+      "config_loaded": true,
+      "database_available": true,
+      "schema_initialized": true,
+      "state_paths_writable": true,
+      "workers_running": true
+    },
+    "dependencies": {
+      "indexer": "degraded"
+    }
+  },
+  "runtime": {
+    "search_worker_concurrency": 4,
+    "queues": [
+      {
+        "kind": "announcement",
+        "capacity": 4,
+        "depth": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "completed": 0,
+        "cancelled": 0
+      },
+      {
+        "kind": "search",
+        "capacity": 4,
+        "depth": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "completed": 0,
+        "cancelled": 0
+      },
+      {
+        "kind": "indexing",
+        "capacity": 4,
+        "depth": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "completed": 0,
+        "cancelled": 0
+      }
+    ]
+  },
+  "dependencies": [
+    {
+      "kind": "indexer",
+      "name": "torznab-main",
+      "state": "degraded",
+      "reason": "rate limited",
+      "retry_after_ms": 600000,
+      "failure_count": 0,
+      "checked_at_ms": null,
+      "source": "memory",
+      "stale": false
+    }
+  ],
+  "jobs": [],
+  "jobs_error": null,
+  "announce_queue": {
+    "active_count": 0,
+    "max_pending": 1000,
+    "worker_capacity": 2,
+    "worker_busy": 0,
+    "worker_idle": 2,
+    "oldest_active_age_ms": null,
+    "active_fetch_material_count": 0,
+    "oldest_fetch_material_age_ms": null,
+    "next_retry_delay_ms": null,
+    "running_leases": 0,
+    "statuses": [],
+    "attempts": [],
+    "dependency_waits": []
+  },
+  "announce_queue_error": null
+}

@@ -2320,6 +2320,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_route_matches_operator_json_examples() {
+        let healthy =
+            status_example_json(ReadinessState::ready(), HealthRegistry::new(), false).await;
+        assert_status_fixture("healthy", &healthy);
+
+        let degraded_health = HealthRegistry::new();
+        degraded_health.set_degraded(
+            DependencyKind::Indexer,
+            DependencyName::new("torznab-main").unwrap(),
+            ReasonText::new("rate limited").unwrap(),
+            Some(600_000),
+        );
+        let degraded = status_example_json(ReadinessState::ready(), degraded_health, false).await;
+        assert_status_fixture("degraded-external-dependency", &degraded);
+
+        let worker_failure = status_example_json(
+            ReadinessState {
+                config_loaded: true,
+                database_available: true,
+                schema_initialized: true,
+                state_paths_writable: true,
+                workers_running: false,
+            },
+            HealthRegistry::new(),
+            false,
+        )
+        .await;
+        assert_status_fixture("worker-failure", &worker_failure);
+
+        let notification_health = HealthRegistry::new();
+        notification_health.set_degraded(
+            DependencyKind::Notification,
+            DependencyName::new("ops").unwrap(),
+            ReasonText::new("webhook 503").unwrap(),
+            Some(120_000),
+        );
+        let notification_degraded =
+            status_example_json(ReadinessState::ready(), notification_health, true).await;
+        assert_status_fixture("notification-degradation", &notification_degraded);
+    }
+
+    #[tokio::test]
     async fn status_distinguishes_accepting_work_from_processing() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let (announcements, _announcement_receiver) =
@@ -3508,6 +3550,63 @@ mod tests {
             .iter()
             .find(|dependency| dependency["kind"] == kind && dependency["name"] == name)
             .unwrap_or_else(|| panic!("missing dependency status for {kind} {name}"))
+    }
+
+    async fn status_example_json(
+        readiness: ReadinessState,
+        health: HealthRegistry,
+        include_notification_queue: bool,
+    ) -> Value {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let (announcements, _announcement_receiver) =
+            bounded_work_queue(QueueKind::Announcement, nonzero(4));
+        let (searches, _search_receiver) = bounded_work_queue(QueueKind::Search, nonzero(4));
+        let (jobs, _job_receiver) = bounded_work_queue(QueueKind::Indexing, nonzero(4));
+        let mut state = HttpState::new(readiness, health)
+            .with_workflow_queues(WorkflowQueues {
+                announcements,
+                searches,
+                jobs,
+            })
+            .with_announce_acceptor(repository, AnnounceQueueConfig::default());
+        if include_notification_queue {
+            let (notifications, _notification_receiver) =
+                bounded_work_queue::<NotificationJob>(QueueKind::Notification, nonzero(3));
+            state = state.with_notification_queue(notifications);
+        }
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn assert_status_fixture(name: &str, actual: &Value) {
+        let expected = match name {
+            "healthy" => include_str!("../docs/operators/status-examples/healthy.json"),
+            "degraded-external-dependency" => {
+                include_str!("../docs/operators/status-examples/degraded-external-dependency.json")
+            }
+            "worker-failure" => {
+                include_str!("../docs/operators/status-examples/worker-failure.json")
+            }
+            "notification-degradation" => {
+                include_str!("../docs/operators/status-examples/notification-degradation.json")
+            }
+            _ => panic!("unknown status fixture {name}"),
+        };
+        let expected: Value = serde_json::from_str(expected).unwrap();
+        assert_eq!(expected, *actual, "status fixture {name}");
     }
 
     fn assert_omits_fetch_secrets(text: &str) {
