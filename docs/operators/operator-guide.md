@@ -411,7 +411,8 @@ The service exposes:
 - `GET /readyz`: local readiness for config, database, schema, writable paths,
   and workers, plus dependency summaries.
 - `GET /metrics`: Prometheus text metrics.
-- `GET /v1/status`: readiness plus durable announce queue status.
+- `GET /v1/status`: readiness, dependency health, runtime queues, and durable
+  announce queue status.
 - `POST /v1/announcements`: accepts validated announcements as durable queued
   work.
 - `POST /v1/searches`: queues an explicit search workflow.
@@ -432,6 +433,10 @@ operator-actionable.
 Use `/readyz` for Kubernetes readiness. A degraded dependency can appear in
 readiness and metrics without requiring a restart. Sporos records retry and
 backoff state so workers can resume safely after dependency recovery.
+Notification endpoint delivery health is best-effort and memory-only. The
+latest in-process delivery success or failure appears in `/v1/status` and
+`sporos_dependency_health_state`, but configured endpoints return to `unknown`
+after restart rather than preserving webhook delivery history in SQLite.
 
 rTorrent HTTP authentication is not supported in this release. Configure
 authentication at a reverse proxy or use a private RPC endpoint; Sporos rejects

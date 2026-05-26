@@ -3685,6 +3685,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notification_delivery_health_is_memory_only_after_restart() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let endpoint_url = spawn_daemon_notification_status_server(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::clone(&requests),
+        )
+        .await;
+        let mut config = SporosConfig::default();
+        config.notifications.endpoints.insert(
+            "ops".to_owned(),
+            NotificationEndpointConfig {
+                url: endpoint_url,
+                timeout: "5s".to_owned(),
+                retry_max_attempts: 1,
+                retry_initial_delay: "1s".to_owned(),
+                retry_max_delay: "1s".to_owned(),
+                ..NotificationEndpointConfig::default()
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        repository
+            .record_dependency_health(
+                DependencyKind::Notification,
+                &DependencyName::new("ops").unwrap(),
+                &DependencyState::Unavailable {
+                    reason: ReasonText::new("stale persisted notification").unwrap(),
+                    retry_after_ms: Some(60_000),
+                },
+                100,
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config.clone(), repository.clone())
+            .await
+            .unwrap();
+        let shutdown = runtime.state.shutdown.clone();
+        let queue = runtime.state.queues.notifications.clone();
+        let endpoint =
+            runtime.state.notification_endpoints[&DependencyName::new("ops").unwrap()].clone();
+        let app = router(runtime.state.http.clone());
+
+        let handles = start_background_tasks(runtime).await.unwrap();
+        queue
+            .enqueue(NotificationJob::new(endpoint, NotificationEvent::test()))
+            .await
+            .unwrap();
+        wait_for_atomic_count(&requests, 1).await;
+        wait_for_queue_completed(&queue, 1).await;
+
+        let status = get_json(app.clone(), "/v1/status").await;
+        let notification = dependency_status(&status, "notification", "ops");
+        assert_eq!("degraded", notification["state"]);
+        assert_eq!("memory", notification["source"]);
+        assert_eq!(0, notification["failure_count"]);
+        assert!(
+            notification["reason"]
+                .as_str()
+                .unwrap()
+                .contains("returned HTTP 503")
+        );
+
+        let metrics = get_text(app, "/metrics").await;
+        assert!(metrics.contains(
+            "sporos_notification_requests_total{operation=\"notify\",outcome=\"failed\"} 1"
+        ));
+        assert!(metrics.contains(
+            "sporos_dependency_health_state{dependency=\"notification\",state=\"degraded\"} 1"
+        ));
+
+        shutdown.cancel_now("test shutdown").unwrap();
+        stop_background_tasks(handles).await;
+
+        let restarted = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+        let restarted_http = restarted.state.http.clone();
+        let restarted_status = get_json(router(restarted_http.clone()), "/v1/status").await;
+        let notification = dependency_status(&restarted_status, "notification", "ops");
+        assert_eq!("unknown", notification["state"]);
+        assert_eq!("memory", notification["source"]);
+        assert_eq!(Value::Null, notification["reason"]);
+        assert_eq!(0, notification["failure_count"]);
+
+        let restarted_metrics = get_text(router(restarted_http), "/metrics").await;
+        assert!(!restarted_metrics.contains(
+            "sporos_dependency_health_state{dependency=\"notification\",state=\"unavailable\"}"
+        ));
+    }
+
+    #[tokio::test]
     async fn client_inventory_refresh_uses_own_interval() {
         let mut config = SporosConfig::default();
         config.scheduling.client_inventory_interval = "5m".to_owned();
@@ -5945,6 +6035,28 @@ mod tests {
         spawn_daemon_notification_capture_server(requests, Arc::new(Mutex::new(Vec::new()))).await
     }
 
+    async fn spawn_daemon_notification_status_server(
+        status: StatusCode,
+        requests: Arc<AtomicUsize>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/hook",
+            post(move || {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    status
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/hook")
+    }
+
     async fn spawn_daemon_notification_capture_server(
         requests: Arc<AtomicUsize>,
         bodies: Arc<Mutex<Vec<Value>>>,
@@ -6392,6 +6504,39 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    async fn get_json(app: axum::Router, uri: &str) -> Value {
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn get_text(app: axum::Router, uri: &str) -> String {
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn dependency_status<'a>(json: &'a Value, kind: &str, name: &str) -> &'a Value {
+        json["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == kind && entry["name"] == name)
+            .unwrap()
     }
 
     fn saved_torrent_count(path: &Path) -> usize {

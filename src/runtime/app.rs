@@ -1212,11 +1212,6 @@ impl AppRuntime {
         );
         persisted_health.extend(
             repository
-                .dependency_health_for_type_names(DependencyKind::Notification, &notification_names)
-                .await?,
-        );
-        persisted_health.extend(
-            repository
                 .dependency_health_for_type_names(DependencyKind::LocalState, &local_state_names)
                 .await?,
         );
@@ -2552,10 +2547,7 @@ mod tests {
             &health,
             DependencyKind::Notification,
             "ops",
-            DependencyState::Degraded {
-                reason: ReasonText::new("webhook down").unwrap(),
-                retry_after_ms: Some(5_000),
-            },
+            DependencyState::Unknown,
         );
         assert_dependency_state(
             &health,

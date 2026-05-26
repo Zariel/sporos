@@ -214,6 +214,9 @@ retry_max_delay = "30s"
 
 Use `token_file`, `token_env`, or local-development `token`. URLs must use
 HTTP(S) and must not contain credentials, query parameters, or fragments.
+Delivery health is best-effort and memory-only: `/v1/status` and metrics show
+the latest in-process success or failure for each configured endpoint, and
+endpoints return to `unknown` after restart.
 
 ## Injection Recheck And Auto-Resume
 

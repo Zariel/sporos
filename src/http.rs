@@ -27,8 +27,8 @@ use crate::announce::{
     AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
 use crate::domain::{
-    ByteSize, CandidateGuid, DependencyName, DependencyState, DownloadUrl, ItemTitle, JobName,
-    TrackerName,
+    ByteSize, CandidateGuid, DependencyKind, DependencyName, DependencyState, DownloadUrl,
+    ItemTitle, JobName, TrackerName,
 };
 use crate::errors::DatabaseError;
 use crate::inventory_refresh::InventoryRefreshRequest;
@@ -1587,7 +1587,9 @@ async fn metrics_snapshot(state: &HttpState) -> MetricsSnapshot {
             Err(_error) => snapshot.snapshot_errors.push("jobs"),
         }
         match acceptor.repository.dependency_health_snapshot(1_000).await {
-            Ok(health) => snapshot.stored_dependency_health = health,
+            Ok(health) => {
+                snapshot.stored_dependency_health = persisted_status_health(health);
+            }
             Err(_error) => snapshot.snapshot_errors.push("dependency_health"),
         }
     }
@@ -1621,10 +1623,20 @@ async fn dependency_statuses(state: &HttpState) -> Vec<DependencyStatusResponse>
             .repository
             .dependency_health_snapshot(1_000)
             .await
+            .map(persisted_status_health)
             .unwrap_or_default(),
         None => Vec::new(),
     };
     dependency_status_response(memory, persisted)
+}
+
+fn persisted_status_health(
+    persisted: Vec<crate::persistence::repository::DependencyHealthSnapshot>,
+) -> Vec<crate::persistence::repository::DependencyHealthSnapshot> {
+    persisted
+        .into_iter()
+        .filter(|entry| entry.dependency_type != DependencyKind::Notification.as_str())
+        .collect()
 }
 
 fn dependency_status_response(
@@ -1889,7 +1901,6 @@ mod tests {
     use crate::domain::{DependencyName, ReasonText};
     use crate::notifications::{NotificationEndpoint, NotificationEvent, NotificationEventKind};
     use crate::persistence::repository::Repository;
-    use crate::runtime::health::DependencyKind;
     use crate::runtime::queue::{EnqueueError, QueueKind, WorkReceiver, bounded_work_queue};
 
     #[test]
@@ -2156,7 +2167,7 @@ mod tests {
             .unwrap();
         repository
             .record_dependency_health(
-                DependencyKind::Notification,
+                DependencyKind::Prowlarr,
                 &DependencyName::new("stale").unwrap(),
                 &DependencyState::Healthy { checked_at_ms: 90 },
                 90,
@@ -2176,9 +2187,9 @@ mod tests {
             200,
         );
         health.set_unavailable(
-            DependencyKind::Notification,
+            DependencyKind::Prowlarr,
             DependencyName::new("stale").unwrap(),
-            ReasonText::new("webhook down").unwrap(),
+            ReasonText::new("prowlarr down").unwrap(),
             Some(400),
         );
         let app = router(
@@ -2225,9 +2236,9 @@ mod tests {
         assert_eq!("memory_and_persisted", merged["source"]);
         assert_eq!(false, merged["stale"]);
 
-        let stale = dependency_status(&json, "notification", "stale");
+        let stale = dependency_status(&json, "prowlarr", "stale");
         assert_eq!("unavailable", stale["state"]);
-        assert_eq!("webhook down", stale["reason"]);
+        assert_eq!("prowlarr down", stale["reason"]);
         assert_eq!(400, stale["retry_after_ms"]);
         assert_eq!(0, stale["failure_count"]);
         assert_eq!(90, stale["checked_at_ms"]);
