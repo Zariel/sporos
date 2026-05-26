@@ -4281,6 +4281,195 @@ async fn healthy_dependency_record_wakes_matching_waits() {
     );
 }
 
+#[tokio::test]
+async fn torrent_client_degraded_health_blocks_or_probes_dependency_waits() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    for (id, guid) in [
+        ("ann_41", "guid-client-retry-after"),
+        ("ann_42", "guid-client-probe"),
+        ("ann_43", "guid-client-future-wait"),
+    ] {
+        repository
+            .insert_or_dedupe_announce_work(&test_announce_work(id, guid, 1), 10)
+            .await
+            .unwrap();
+    }
+    set_announce_waiting(
+        &repository,
+        "ann_41",
+        AnnounceReason::DependencyBackoff,
+        50,
+        Some(("torrent_client", "qbit.retry")),
+    )
+    .await;
+    set_announce_waiting(
+        &repository,
+        "ann_42",
+        AnnounceReason::DependencyBackoff,
+        50,
+        Some(("torrent_client", "qbit.probe")),
+    )
+    .await;
+    set_announce_waiting(
+        &repository,
+        "ann_43",
+        AnnounceReason::DependencyBackoff,
+        150,
+        Some(("torrent_client", "qbit.probe")),
+    )
+    .await;
+    repository
+        .record_dependency_health(
+            DependencyKind::TorrentClient,
+            &DependencyName::new("qbit.retry").unwrap(),
+            &DependencyState::Degraded {
+                reason: ReasonText::new("rate limited").unwrap(),
+                retry_after_ms: Some(250),
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    repository
+        .record_dependency_health(
+            DependencyKind::TorrentClient,
+            &DependencyName::new("qbit.probe").unwrap(),
+            &DependencyState::Degraded {
+                reason: ReasonText::new("unavailable").unwrap(),
+                retry_after_ms: None,
+            },
+            100,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        2,
+        repository
+            .schedule_announce_dependency_backoff(100, 25, 10)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(
+        vec![
+            (
+                "ann_41".to_owned(),
+                "waiting".to_owned(),
+                "retry_after".to_owned(),
+                250,
+                Some("torrent_client".to_owned()),
+                Some("qbit.retry".to_owned())
+            ),
+            (
+                "ann_42".to_owned(),
+                "queued".to_owned(),
+                "dependency_backoff".to_owned(),
+                100,
+                Some("torrent_client".to_owned()),
+                Some("qbit.probe".to_owned())
+            ),
+            (
+                "ann_43".to_owned(),
+                "waiting".to_owned(),
+                "dependency_backoff".to_owned(),
+                150,
+                Some("torrent_client".to_owned()),
+                Some("qbit.probe".to_owned())
+            ),
+        ],
+        announce_dependency_rows(&repository).await
+    );
+}
+
+#[tokio::test]
+async fn healthy_or_unknown_torrent_client_health_wakes_dependency_waits() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    for (id, guid) in [
+        ("ann_44", "guid-client-healthy"),
+        ("ann_45", "guid-client-unknown"),
+        ("ann_46", "guid-other-client"),
+    ] {
+        repository
+            .insert_or_dedupe_announce_work(&test_announce_work(id, guid, 1), 10)
+            .await
+            .unwrap();
+    }
+    set_announce_waiting(
+        &repository,
+        "ann_44",
+        AnnounceReason::DependencyBackoff,
+        500,
+        Some(("torrent_client", "qbit.healthy")),
+    )
+    .await;
+    set_announce_waiting(
+        &repository,
+        "ann_45",
+        AnnounceReason::DependencyBackoff,
+        500,
+        Some(("torrent_client", "qbit.unknown")),
+    )
+    .await;
+    set_announce_waiting(
+        &repository,
+        "ann_46",
+        AnnounceReason::DependencyBackoff,
+        500,
+        Some(("torrent_client", "qbit.other")),
+    )
+    .await;
+
+    repository
+        .record_dependency_health(
+            DependencyKind::TorrentClient,
+            &DependencyName::new("qbit.healthy").unwrap(),
+            &DependencyState::Healthy { checked_at_ms: 100 },
+            100,
+        )
+        .await
+        .unwrap();
+    repository
+        .record_dependency_health(
+            DependencyKind::TorrentClient,
+            &DependencyName::new("qbit.unknown").unwrap(),
+            &DependencyState::Unknown,
+            101,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        vec![
+            (
+                "ann_44".to_owned(),
+                "queued".to_owned(),
+                "dependency_backoff".to_owned(),
+                100,
+                None,
+                None
+            ),
+            (
+                "ann_45".to_owned(),
+                "queued".to_owned(),
+                "dependency_backoff".to_owned(),
+                101,
+                None,
+                None
+            ),
+            (
+                "ann_46".to_owned(),
+                "waiting".to_owned(),
+                "dependency_backoff".to_owned(),
+                500,
+                Some("torrent_client".to_owned()),
+                Some("qbit.other".to_owned())
+            ),
+        ],
+        announce_dependency_rows(&repository).await
+    );
+}
+
 fn test_local_item(title: &str) -> LocalItem {
     LocalItem {
         id: None,
@@ -4471,6 +4660,34 @@ async fn announce_status_reason(repository: &Repository, id: &str) -> Option<(St
         .await
         .unwrap()
         .map(|row| (row.get("status"), row.get("reason")))
+}
+
+async fn announce_dependency_rows(
+    repository: &Repository,
+) -> Vec<(String, String, String, i64, Option<String>, Option<String>)> {
+    sqlx::query(
+        r#"
+        SELECT id, status, reason, next_attempt_at, last_dependency_kind, last_dependency_name
+        FROM announce_work
+        WHERE id BETWEEN 'ann_41' AND 'ann_46'
+        ORDER BY id
+        "#,
+    )
+    .fetch_all(repository.pool())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.get("id"),
+            row.get("status"),
+            row.get("reason"),
+            row.get("next_attempt_at"),
+            row.get("last_dependency_kind"),
+            row.get("last_dependency_name"),
+        )
+    })
+    .collect()
 }
 
 async fn explain_query_plan(
