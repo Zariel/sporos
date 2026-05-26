@@ -1228,6 +1228,7 @@ impl AppRuntime {
             .with_scheduler_queue(scheduler_queue.clone())
             .with_inventory_refresh_queue(inventory_queue.clone())
             .with_notification_queue(notification_queue.clone())
+            .with_notification_endpoints(runtime_config.notification_endpoints.clone())
             .with_search_worker_concurrency(config.runtime.search_worker_concurrency)
             .with_allowed_jobs(runtime_config.http_jobs)
             .with_announce_acceptor(repository.clone(), config.announce.clone());

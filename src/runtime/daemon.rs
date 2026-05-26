@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use serde_json::Value;
 #[cfg(test)]
 use sqlx::Row;
 use tokio::net::TcpListener;
@@ -42,7 +43,10 @@ use crate::matching::{
 use crate::metrics::{
     ActionOutcome, DecisionOutcome, ExternalOperation, ExternalOutcome, SearchOutcome,
 };
-use crate::notifications::{NotificationWorker, run_notification_worker};
+use crate::notifications::{
+    NotificationEnqueueSummary, NotificationEvent, NotificationWorker, enqueue_notification_event,
+    run_notification_worker,
+};
 use crate::persistence::repository::Repository;
 use crate::persistence::torrent_cache::TorrentOutputMetadata;
 use crate::runtime::announce_worker::{
@@ -524,6 +528,7 @@ async fn run_search_receiver(
                             failed = summary.failed,
                             "search workflow completed"
                         );
+                        emit_search_result_notifications(&state, &summary);
                     }
                     Err(error) => {
                         state.metrics.record_search_attempt(SearchOutcome::Failed);
@@ -701,6 +706,83 @@ impl SearchWorkflowExecutionSummary {
             SearchCandidateOutcome::AlreadyPresent => self.already_present += 1,
             SearchCandidateOutcome::Rejected => self.rejected += 1,
         }
+    }
+}
+
+fn emit_search_result_notifications(state: &AppState, summary: &SearchWorkflowExecutionSummary) {
+    let enqueue = enqueue_notification_event(
+        &state.queues.notifications,
+        &state.notification_endpoints,
+        search_results_notification(summary),
+    );
+    record_notification_enqueue("search_results", enqueue);
+}
+
+fn search_results_notification(summary: &SearchWorkflowExecutionSummary) -> NotificationEvent {
+    NotificationEvent::results(
+        format!(
+            "search completed: {} candidates, {} saved, {} injected, {} already present, {} failed",
+            summary.candidates,
+            summary.saved,
+            summary.injected,
+            summary.already_present,
+            summary.failed
+        ),
+        BTreeMap::from([
+            ("workflow".to_owned(), Value::String("search".to_owned())),
+            (
+                "planned_indexers".to_owned(),
+                Value::from(u64::try_from(summary.planned_indexers).unwrap_or(u64::MAX)),
+            ),
+            (
+                "failed_indexers".to_owned(),
+                Value::from(u64::try_from(summary.failed_indexers).unwrap_or(u64::MAX)),
+            ),
+            (
+                "candidates".to_owned(),
+                Value::from(u64::try_from(summary.candidates).unwrap_or(u64::MAX)),
+            ),
+            (
+                "saved".to_owned(),
+                Value::from(u64::try_from(summary.saved).unwrap_or(u64::MAX)),
+            ),
+            (
+                "injected".to_owned(),
+                Value::from(u64::try_from(summary.injected).unwrap_or(u64::MAX)),
+            ),
+            (
+                "already_present".to_owned(),
+                Value::from(u64::try_from(summary.already_present).unwrap_or(u64::MAX)),
+            ),
+            (
+                "rejected".to_owned(),
+                Value::from(u64::try_from(summary.rejected).unwrap_or(u64::MAX)),
+            ),
+            (
+                "failed".to_owned(),
+                Value::from(u64::try_from(summary.failed).unwrap_or(u64::MAX)),
+            ),
+        ]),
+    )
+}
+
+fn record_notification_enqueue(event: &'static str, summary: NotificationEnqueueSummary) {
+    if summary.rejected() > 0 {
+        warn!(
+            event,
+            endpoints = summary.endpoints,
+            enqueued = summary.enqueued,
+            rejected_full = summary.rejected_full,
+            rejected_closed = summary.rejected_closed,
+            "notification enqueue rejected for one or more endpoints"
+        );
+    } else if summary.enqueued > 0 {
+        tracing::debug!(
+            event,
+            endpoints = summary.endpoints,
+            enqueued = summary.enqueued,
+            "notification jobs enqueued"
+        );
     }
 }
 
@@ -2756,8 +2838,8 @@ mod tests {
     use std::fs;
     use std::future::{Future, pending};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2775,14 +2857,13 @@ mod tests {
     use crate::notifications::{NotificationEvent, NotificationJob, notification_dependency_key};
     use crate::persistence::repository::{JobStateUpdate, Repository};
     use crate::secrets::{ApiKey, NotificationToken};
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::{
         Request, StatusCode,
         header::{CONTENT_LENGTH, SET_COOKIE},
     };
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
-    use serde_json::Value;
     use tower::ServiceExt;
 
     #[test]
@@ -3692,6 +3773,13 @@ mod tests {
         fs::create_dir_all(&cache_dir).unwrap();
         fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
         let indexer_url = spawn_daemon_torznab_search_download_server().await;
+        let notification_requests = Arc::new(AtomicUsize::new(0));
+        let notification_bodies = Arc::new(Mutex::new(Vec::new()));
+        let notification_url = spawn_daemon_notification_capture_server(
+            notification_requests.clone(),
+            notification_bodies.clone(),
+        )
+        .await;
         let mut config = SporosConfig::default();
         config.paths.output_dir = output_dir.clone();
         config.paths.torrent_cache_dir = cache_dir;
@@ -3702,6 +3790,18 @@ mod tests {
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
                 api_key_env: None,
+            },
+        );
+        config.notifications.endpoints.insert(
+            "ops".to_owned(),
+            NotificationEndpointConfig {
+                url: notification_url,
+                token: Some(NotificationToken::new("ops-secret").unwrap()),
+                timeout: "5s".to_owned(),
+                retry_max_attempts: 1,
+                retry_initial_delay: "1s".to_owned(),
+                retry_max_delay: "1s".to_owned(),
+                ..NotificationEndpointConfig::default()
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3724,6 +3824,7 @@ mod tests {
             .unwrap();
         let shutdown = runtime.state.shutdown.clone();
         let search_queue = runtime.state.queues.workflow.searches.clone();
+        let notification_queue = runtime.state.queues.notifications.clone();
         let metrics = runtime.state.metrics.clone();
         let app = router(runtime.state.http.clone());
         let handles = start_background_tasks(runtime).await.unwrap();
@@ -3739,6 +3840,7 @@ mod tests {
         assert_eq!(StatusCode::ACCEPTED, accepted.status());
         wait_for_saved_torrent_count(&output_dir, 1).await;
         wait_for_queue_completed(&search_queue, 1).await;
+        wait_for_queue_completed(&notification_queue, 1).await;
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
@@ -3753,6 +3855,16 @@ mod tests {
         assert_eq!(1, candidates);
         assert_eq!(1, decisions);
         assert_eq!(0, search_queue.stats().depth);
+        assert_eq!(1, notification_requests.load(Ordering::SeqCst));
+        let notification_body = notification_bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .first()
+            .cloned()
+            .unwrap();
+        assert_eq!("RESULTS", notification_body["extra"]["event"]);
+        assert_eq!("search", notification_body["extra"]["workflow"]);
+        assert_eq!(1, notification_body["extra"]["saved"]);
         let metrics = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
         assert!(metrics.contains("sporos_search_attempts_total{outcome=\"succeeded\"} 1"));
         assert!(metrics.contains(
@@ -5830,12 +5942,26 @@ mod tests {
     }
 
     async fn spawn_daemon_notification_server(requests: Arc<AtomicUsize>) -> String {
+        spawn_daemon_notification_capture_server(requests, Arc::new(Mutex::new(Vec::new()))).await
+    }
+
+    async fn spawn_daemon_notification_capture_server(
+        requests: Arc<AtomicUsize>,
+        bodies: Arc<Mutex<Vec<Value>>>,
+    ) -> String {
         let app = axum::Router::new().route(
             "/hook",
-            post(move || {
+            post(move |body: Bytes| {
                 let requests = Arc::clone(&requests);
+                let bodies = Arc::clone(&bodies);
                 async move {
                     requests.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(value) = serde_json::from_slice(&body) {
+                        bodies
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(value);
+                    }
                     StatusCode::NO_CONTENT
                 }
             }),

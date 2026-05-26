@@ -16,7 +16,9 @@ use crate::runtime::backoff::{
     JitteredBackoffPolicy, RetryOutcome, fixed_retry_deadline_ms, retry_with_backoff,
 };
 use crate::runtime::health::{DependencyKey, DependencyKind, HealthRegistry};
-use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
+use crate::runtime::queue::{
+    BoundedWorkQueue, EnqueueError, QueueKind, WorkReceiver, bounded_work_queue,
+};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::secrets::{NotificationToken, SanitizedUrl, sanitize_url_for_logging};
 
@@ -149,6 +151,39 @@ impl fmt::Debug for NotificationJob {
             .field("event", &self.event)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct NotificationEnqueueSummary {
+    pub endpoints: usize,
+    pub enqueued: usize,
+    pub rejected_full: usize,
+    pub rejected_closed: usize,
+}
+
+impl NotificationEnqueueSummary {
+    pub const fn rejected(self) -> usize {
+        self.rejected_full + self.rejected_closed
+    }
+}
+
+pub fn enqueue_notification_event(
+    queue: &BoundedWorkQueue<NotificationJob>,
+    endpoints: &BTreeMap<DependencyName, NotificationEndpoint>,
+    event: NotificationEvent,
+) -> NotificationEnqueueSummary {
+    let mut summary = NotificationEnqueueSummary {
+        endpoints: endpoints.len(),
+        ..NotificationEnqueueSummary::default()
+    };
+    for endpoint in endpoints.values() {
+        match queue.try_enqueue(NotificationJob::new(endpoint.clone(), event.clone())) {
+            Ok(()) => summary.enqueued += 1,
+            Err(EnqueueError::Full { .. }) => summary.rejected_full += 1,
+            Err(EnqueueError::Closed { .. }) => summary.rejected_closed += 1,
+        }
+    }
+    summary
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -561,6 +596,74 @@ mod tests {
     use super::*;
     use crate::runtime::health::DependencySummary;
     use crate::runtime::shutdown::shutdown_channel;
+
+    mod enqueue_contract {
+        use super::*;
+
+        #[tokio::test]
+        async fn enqueues_per_endpoint_and_records_full_rejections() {
+            let (queue, mut receiver) =
+                notification_queue(NonZeroUsize::new(1).unwrap_or(NonZeroUsize::MIN));
+            let endpoints = endpoints(["audit", "ops"]);
+
+            let summary = enqueue_notification_event(&queue, &endpoints, NotificationEvent::test());
+            let job = receiver.recv().await.unwrap();
+
+            assert_eq!(
+                NotificationEnqueueSummary {
+                    endpoints: 2,
+                    enqueued: 1,
+                    rejected_full: 1,
+                    rejected_closed: 0,
+                },
+                summary
+            );
+            assert_eq!(NotificationEventKind::Test, job.event.event);
+            assert_eq!(1, queue.stats().accepted);
+            assert_eq!(1, queue.stats().rejected);
+        }
+
+        #[test]
+        fn records_closed_rejections_without_blocking() {
+            let (queue, mut receiver) =
+                notification_queue(NonZeroUsize::new(1).unwrap_or(NonZeroUsize::MIN));
+            receiver.close();
+
+            let summary =
+                enqueue_notification_event(&queue, &endpoints(["ops"]), NotificationEvent::test());
+
+            assert_eq!(
+                NotificationEnqueueSummary {
+                    endpoints: 1,
+                    enqueued: 0,
+                    rejected_full: 0,
+                    rejected_closed: 1,
+                },
+                summary
+            );
+            assert_eq!(0, queue.stats().accepted);
+            assert_eq!(1, queue.stats().rejected);
+            assert_eq!(0, queue.stats().depth);
+        }
+
+        fn endpoints<const N: usize>(
+            names: [&str; N],
+        ) -> BTreeMap<DependencyName, NotificationEndpoint> {
+            names
+                .into_iter()
+                .map(|name| {
+                    let dependency = DependencyName::new(name).unwrap();
+                    (
+                        dependency.clone(),
+                        NotificationEndpoint::new(
+                            dependency,
+                            format!("https://hooks.example/{name}"),
+                        ),
+                    )
+                })
+                .collect()
+        }
+    }
 
     mod delivery_contract {
         use super::*;

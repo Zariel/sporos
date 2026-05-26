@@ -63,6 +63,7 @@ pub enum HttpRoute {
     Announcements,
     Searches,
     JobRuns,
+    NotificationTest,
 }
 
 impl HttpRoute {
@@ -75,6 +76,7 @@ impl HttpRoute {
             Self::Announcements => "/v1/announcements",
             Self::Searches => "/v1/searches",
             Self::JobRuns => "/v1/jobs/{job_name}/runs",
+            Self::NotificationTest => "/v1/notifications/test",
         }
     }
 }

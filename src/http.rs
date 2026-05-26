@@ -26,13 +26,18 @@ use crate::announce::{
     AnnounceDedupeIdentity, AnnounceFetchMaterial, AnnounceQueueConfig, AnnounceReason,
     AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
-use crate::domain::{ByteSize, CandidateGuid, DownloadUrl, ItemTitle, JobName, TrackerName};
+use crate::domain::{
+    ByteSize, CandidateGuid, DependencyName, DownloadUrl, ItemTitle, JobName, TrackerName,
+};
 use crate::errors::DatabaseError;
 use crate::inventory_refresh::InventoryRefreshRequest;
 use crate::metrics::{
     HttpMethod, HttpRoute, MetricsRegistry, MetricsSnapshot, WorkflowMetric, WorkflowOutcome,
 };
-use crate::notifications::NotificationJob;
+use crate::notifications::{
+    NotificationEndpoint, NotificationEnqueueSummary, NotificationEvent, NotificationJob,
+    enqueue_notification_event,
+};
 use crate::persistence::repository::{AnnounceInsertResult, AnnounceQueueSnapshot, Repository};
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{DependencyHealthSnapshot, HealthRegistry};
@@ -108,6 +113,7 @@ pub struct HttpState {
     scheduler_queue: Option<BoundedWorkQueue<ScheduledJobRun>>,
     inventory_refresh_queue: Option<BoundedWorkQueue<InventoryRefreshRequest>>,
     notification_queue: Option<BoundedWorkQueue<NotificationJob>>,
+    notification_endpoints: Arc<BTreeMap<DependencyName, NotificationEndpoint>>,
     search_worker_concurrency: usize,
     allowed_jobs: Option<Arc<BTreeSet<JobName>>>,
     announce_acceptor: Option<AnnounceAcceptor>,
@@ -130,6 +136,7 @@ impl HttpState {
             scheduler_queue: None,
             inventory_refresh_queue: None,
             notification_queue: None,
+            notification_endpoints: Arc::new(BTreeMap::new()),
             search_worker_concurrency: crate::config::DEFAULT_SEARCH_WORKER_CONCURRENCY,
             allowed_jobs: None,
             announce_acceptor: None,
@@ -188,6 +195,14 @@ impl HttpState {
         notification_queue: BoundedWorkQueue<NotificationJob>,
     ) -> Self {
         self.notification_queue = Some(notification_queue);
+        self
+    }
+
+    pub fn with_notification_endpoints(
+        mut self,
+        notification_endpoints: BTreeMap<DependencyName, NotificationEndpoint>,
+    ) -> Self {
+        self.notification_endpoints = Arc::new(notification_endpoints);
         self
     }
 
@@ -291,6 +306,14 @@ impl HttpState {
             .or(self.search_queue.as_ref())
             .ok_or(ApiErrorResponse::service_unavailable(
                 "search workflow queue is not running",
+            ))
+    }
+
+    fn notification_queue(&self) -> Result<&BoundedWorkQueue<NotificationJob>, ApiErrorResponse> {
+        self.notification_queue
+            .as_ref()
+            .ok_or(ApiErrorResponse::service_unavailable(
+                "notification queue is not running",
             ))
     }
 
@@ -868,6 +891,29 @@ struct AnnouncementAcceptedResponse {
     deduplicated: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct NotificationTestResponse {
+    status: &'static str,
+    workflow: &'static str,
+    endpoints: usize,
+    enqueued: usize,
+    rejected_full: usize,
+    rejected_closed: usize,
+}
+
+impl NotificationTestResponse {
+    fn from_summary(summary: NotificationEnqueueSummary) -> Self {
+        Self {
+            status: "queued",
+            workflow: "notification_test",
+            endpoints: summary.endpoints,
+            enqueued: summary.enqueued,
+            rejected_full: summary.rejected_full,
+            rejected_closed: summary.rejected_closed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum WorkflowKind {
     Search,
@@ -978,6 +1024,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/v1/announcements", post(post_announcement))
         .route("/v1/searches", post(post_search))
         .route("/v1/jobs/{job_name}/runs", post(post_job_run))
+        .route("/v1/notifications/test", post(post_notification_test))
         .layer(DefaultBodyLimit::max(WORKFLOW_BODY_LIMIT_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1331,6 +1378,36 @@ async fn post_job_run(State(state): State<HttpState>, Path(job_name): Path<Strin
     response
 }
 
+async fn post_notification_test(State(state): State<HttpState>) -> Response {
+    let queue = match state.notification_queue() {
+        Ok(queue) => queue,
+        Err(error) => {
+            state.metrics.record_http_request(
+                HttpMethod::Post,
+                HttpRoute::NotificationTest,
+                error.status.as_u16(),
+            );
+            return error.into_response();
+        }
+    };
+    let summary = enqueue_notification_event(
+        queue,
+        &state.notification_endpoints,
+        NotificationEvent::test(),
+    );
+    let response = (
+        StatusCode::ACCEPTED,
+        Json(NotificationTestResponse::from_summary(summary)),
+    )
+        .into_response();
+    state.metrics.record_http_request(
+        HttpMethod::Post,
+        HttpRoute::NotificationTest,
+        response.status().as_u16(),
+    );
+    response
+}
+
 async fn auth_middleware(
     State(state): State<HttpState>,
     request: Request<Body>,
@@ -1418,6 +1495,7 @@ fn workflow_route(path: &str) -> Option<HttpRoute> {
     match path {
         "/v1/announcements" => Some(HttpRoute::Announcements),
         "/v1/searches" => Some(HttpRoute::Searches),
+        "/v1/notifications/test" => Some(HttpRoute::NotificationTest),
         path if path.starts_with("/v1/jobs/") && path.ends_with("/runs") => {
             Some(HttpRoute::JobRuns)
         }
@@ -1430,7 +1508,11 @@ fn workflow_metric(route: HttpRoute) -> Option<WorkflowMetric> {
         HttpRoute::Announcements => Some(WorkflowMetric::Announcement),
         HttpRoute::Searches => Some(WorkflowMetric::Search),
         HttpRoute::JobRuns => Some(WorkflowMetric::JobRun),
-        HttpRoute::Livez | HttpRoute::Readyz | HttpRoute::Metrics | HttpRoute::Status => None,
+        HttpRoute::Livez
+        | HttpRoute::Readyz
+        | HttpRoute::Metrics
+        | HttpRoute::Status
+        | HttpRoute::NotificationTest => None,
     }
 }
 
@@ -1604,6 +1686,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::domain::{DependencyName, ReasonText};
+    use crate::notifications::{NotificationEndpoint, NotificationEventKind};
     use crate::persistence::repository::Repository;
     use crate::runtime::health::DependencyKind;
     use crate::runtime::queue::{QueueKind, WorkReceiver, bounded_work_queue};
@@ -2282,6 +2365,49 @@ mod tests {
         assert_eq!("Example Movie 2026", search_work.query.as_str());
         assert_eq!(StatusCode::ACCEPTED, job.status());
         assert_eq!("indexer_caps", job_work.job_name.as_str());
+    }
+
+    #[tokio::test]
+    async fn notification_test_endpoint_enqueues_test_events() {
+        let (notifications, mut receiver) =
+            bounded_work_queue::<NotificationJob>(QueueKind::Notification, nonzero(2));
+        let mut endpoints = BTreeMap::new();
+        endpoints.insert(
+            DependencyName::new("ops").unwrap(),
+            NotificationEndpoint::new(
+                DependencyName::new("ops").unwrap(),
+                "https://hooks.example/ops",
+            ),
+        );
+        let app = router(
+            HttpState::new(ReadinessState::ready(), HealthRegistry::new())
+                .with_notification_queue(notifications.clone())
+                .with_notification_endpoints(endpoints),
+        );
+
+        let response = app
+            .oneshot(json_post(
+                "/v1/notifications/test",
+                serde_json::json!({}),
+                None,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let job = receiver.recv().await.unwrap();
+
+        assert_eq!(StatusCode::ACCEPTED, status);
+        assert_eq!("notification_test", json["workflow"]);
+        assert_eq!(1, json["endpoints"]);
+        assert_eq!(1, json["enqueued"]);
+        assert_eq!(0, json["rejected_full"]);
+        assert_eq!(NotificationEventKind::Test, job.event.event);
+        assert_eq!("ops", job.endpoint.name.as_str());
+        assert_eq!(1, notifications.stats().accepted);
     }
 
     #[tokio::test]
