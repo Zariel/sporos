@@ -1995,10 +1995,20 @@ struct SavedTorrentIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    size: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
     #[cfg(windows)]
     volume_serial_number: Option<u32>,
     #[cfg(windows)]
     file_index: Option<u64>,
+    #[cfg(windows)]
+    file_size: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
 }
 
 fn saved_torrent_identity(metadata: &std::fs::Metadata) -> SavedTorrentIdentity {
@@ -2007,10 +2017,20 @@ fn saved_torrent_identity(metadata: &std::fs::Metadata) -> SavedTorrentIdentity 
         device: metadata.dev(),
         #[cfg(unix)]
         inode: metadata.ino(),
+        #[cfg(unix)]
+        size: metadata.len(),
+        #[cfg(unix)]
+        ctime: metadata.ctime(),
+        #[cfg(unix)]
+        ctime_nsec: metadata.ctime_nsec(),
         #[cfg(windows)]
         volume_serial_number: metadata.volume_serial_number(),
         #[cfg(windows)]
         file_index: metadata.file_index(),
+        #[cfg(windows)]
+        file_size: metadata.file_size(),
+        #[cfg(windows)]
+        last_write_time: metadata.last_write_time(),
     }
 }
 
@@ -2018,12 +2038,18 @@ impl SavedTorrentIdentity {
     fn matches(self, metadata: &std::fs::Metadata) -> bool {
         #[cfg(unix)]
         {
-            self.device == metadata.dev() && self.inode == metadata.ino()
+            self.device == metadata.dev()
+                && self.inode == metadata.ino()
+                && self.size == metadata.len()
+                && self.ctime == metadata.ctime()
+                && self.ctime_nsec == metadata.ctime_nsec()
         }
         #[cfg(windows)]
         {
             self.volume_serial_number == metadata.volume_serial_number()
                 && self.file_index == metadata.file_index()
+                && self.file_size == metadata.file_size()
+                && self.last_write_time == metadata.last_write_time()
         }
         #[cfg(not(any(unix, windows)))]
         {

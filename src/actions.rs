@@ -93,7 +93,7 @@ pub struct CreatedLink {
     #[cfg(unix)]
     parent_fd: Arc<OwnedFd>,
     #[cfg(unix)]
-    identity: FileIdentity,
+    identity: CleanupIdentity,
     #[cfg(unix)]
     symlink_target: Option<PathBuf>,
 }
@@ -116,7 +116,7 @@ pub struct PreparedLink {
     pub link_type: LinkType,
     expected_size: ByteSize,
     #[cfg(unix)]
-    source_identity: FileIdentity,
+    source_identity: FileFingerprint,
     destination_match_mode: DestinationMatchMode,
     parent: PathBuf,
     basename: PathBuf,
@@ -1003,7 +1003,7 @@ pub fn validate_prepared_links(links: &[PreparedLink]) -> Result<(), LinkActionE
                 source,
             })?;
         #[cfg(unix)]
-        if metadata_identity(&source_file.metadata) != link.source_identity {
+        if metadata_fingerprint(&source_file.metadata) != link.source_identity {
             return Err(LinkActionError::Io {
                 operation: "verify prepared link source identity",
                 path: link.source.clone(),
@@ -1085,6 +1085,23 @@ struct VerifiedSourceFile {
 struct FileIdentity {
     dev: u64,
     ino: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FileFingerprint {
+    identity: FileIdentity,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i128,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CleanupIdentity {
+    identity: FileIdentity,
+    ctime: i64,
+    ctime_nsec: i128,
 }
 
 #[derive(Debug)]
@@ -1566,6 +1583,16 @@ fn metadata_identity(metadata: &fs::Metadata) -> FileIdentity {
     }
 }
 
+#[cfg(unix)]
+fn metadata_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
+    FileFingerprint {
+        identity: metadata_identity(metadata),
+        len: metadata.len(),
+        mtime: metadata.mtime(),
+        mtime_nsec: i128::from(metadata.mtime_nsec()),
+    }
+}
+
 fn existing_link_destination_matches(
     source: &Path,
     source_file: &VerifiedSourceFile,
@@ -1913,7 +1940,7 @@ struct DestinationParent {
 #[derive(Debug)]
 struct CreatedEntry {
     #[cfg(unix)]
-    identity: FileIdentity,
+    identity: CleanupIdentity,
     #[cfg(unix)]
     symlink_target: Option<PathBuf>,
 }
@@ -2091,7 +2118,7 @@ fn verify_created_entry_path(
             source,
         })?;
         let path_identity = file_identity(&metadata)?;
-        if path_identity == entry.identity {
+        if path_identity == entry.identity.identity {
             Ok(())
         } else {
             Err(LinkActionError::Io {
@@ -2205,11 +2232,10 @@ fn cleanup_created_link(link: &CreatedLink) -> Result<(), LinkActionError> {
 fn cleanup_created_root(root: &CreatedRoot) -> Result<(), LinkActionError> {
     #[cfg(unix)]
     {
-        cleanup_created_entry_in_fd(
+        cleanup_created_root_in_fd(
             &root.parent_fd,
             &root.basename,
             root.identity,
-            None,
             &root.path,
             "prepared link root",
             AtFlags::REMOVEDIR,
@@ -2234,10 +2260,43 @@ fn cleanup_created_root(root: &CreatedRoot) -> Result<(), LinkActionError> {
 }
 
 #[cfg(unix)]
-fn cleanup_created_entry_in_fd(
+fn cleanup_created_root_in_fd(
     parent_fd: &OwnedFd,
     basename: &Path,
     identity: FileIdentity,
+    display_path: &Path,
+    label: &'static str,
+    unlink_flags: AtFlags,
+) -> Result<(), LinkActionError> {
+    match entry_identity_in_fd(parent_fd, basename) {
+        Ok(current) if current == identity => {
+            rustix::fs::unlinkat(parent_fd, basename, unlink_flags).map_err(|source| {
+                LinkActionError::Io {
+                    operation: "clean prepared link entry",
+                    path: display_path.to_path_buf(),
+                    source: io::Error::from(source),
+                }
+            })
+        }
+        Ok(_) => Err(LinkActionError::Io {
+            operation: "verify prepared link entry before cleanup",
+            path: display_path.to_path_buf(),
+            source: io::Error::other(format!("{label} was replaced before cleanup")),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(LinkActionError::Io {
+            operation: "inspect prepared link entry for cleanup",
+            path: display_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_created_entry_in_fd(
+    parent_fd: &OwnedFd,
+    basename: &Path,
+    identity: CleanupIdentity,
     symlink_target: Option<&Path>,
     display_path: &Path,
     label: &'static str,
@@ -2302,7 +2361,7 @@ fn prepared_link_manifest(
         link_type,
         expected_size,
         #[cfg(unix)]
-        source_identity: metadata_identity(&source_file.metadata),
+        source_identity: metadata_fingerprint(&source_file.metadata),
         destination_match_mode,
         parent: parent.path.clone(),
         basename: parent.basename.clone(),
@@ -2391,8 +2450,22 @@ fn entry_identity_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<FileIden
     let stat =
         rustix::fs::statat(parent_fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     Ok(FileIdentity {
-        dev: u64::try_from(stat.st_dev).map_err(io::Error::other)?,
+        dev: stat.st_dev,
         ino: stat.st_ino,
+    })
+}
+
+#[cfg(unix)]
+fn cleanup_identity_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<CleanupIdentity> {
+    let stat =
+        rustix::fs::statat(parent_fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    Ok(CleanupIdentity {
+        identity: FileIdentity {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        },
+        ctime: stat.st_ctime,
+        ctime_nsec: i128::from(stat.st_ctime_nsec),
     })
 }
 
@@ -2400,10 +2473,10 @@ fn entry_identity_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<FileIden
 fn entry_matches_cleanup_identity(
     parent_fd: &OwnedFd,
     path: &Path,
-    identity: FileIdentity,
+    identity: CleanupIdentity,
     symlink_target: Option<&Path>,
 ) -> io::Result<bool> {
-    if entry_identity_in_fd(parent_fd, path)? != identity {
+    if cleanup_identity_in_fd(parent_fd, path)? != identity {
         return Ok(false);
     }
     if let Some(expected) = symlink_target {
@@ -2598,10 +2671,7 @@ fn open_destination_parent_in_selected_root(
         .map_err(io::Error::from)?,
     );
     let metadata = root_file.metadata()?;
-    let root_identity = FileIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    };
+    let root_identity = metadata_identity(&metadata);
     if root_identity != link_root.identity {
         return Err(io::Error::other(
             "selected link root changed before link preparation",
@@ -2822,7 +2892,6 @@ fn create_symlink_staged_at(
             "symlink source changed before link publication",
         ));
     }
-    let identity = entry_identity_in_fd(&stage.fd, staged)?;
     rustix::fs::renameat_with(
         &stage.fd,
         staged,
@@ -2831,6 +2900,7 @@ fn create_symlink_staged_at(
         RenameFlags::NOREPLACE,
     )
     .map_err(io::Error::from)?;
+    let identity = cleanup_identity_in_fd(&parent.fd, &parent.basename)?;
     remove_empty_stage_dir_at(parent, &stage).or_else(|error| {
         cleanup_created_entry_at_io(
             parent,
@@ -2857,6 +2927,7 @@ fn create_reflink_staged_at(
     let staged = Path::new("data");
     if let Err(error) = create_staged_reflink(source_file, &stage, staged).or_else(|error| {
         if copy_fallback && should_fallback_to_copy(error.kind()) {
+            drop(remove_stage_entry_at(&stage, staged));
             copy_file_to_stage(source_file, &stage, staged).map(|_| ())
         } else {
             Err(error)
@@ -2986,7 +3057,6 @@ fn publish_staged_entry(
     stage: &PrivateStageDir,
     staged: &Path,
 ) -> io::Result<CreatedEntry> {
-    let identity = entry_identity_in_fd(&stage.fd, staged)?;
     rustix::fs::linkat(
         &stage.fd,
         staged,
@@ -2996,6 +3066,7 @@ fn publish_staged_entry(
     )
     .map_err(io::Error::from)?;
     remove_stage_dir_entry_at(parent, stage, staged).or_else(|error| {
+        let identity = cleanup_identity_in_fd(&parent.fd, &parent.basename)?;
         cleanup_created_entry_at_io(
             parent,
             &CreatedEntry {
@@ -3005,6 +3076,7 @@ fn publish_staged_entry(
         )?;
         Err(error)
     })?;
+    let identity = cleanup_identity_in_fd(&parent.fd, &parent.basename)?;
     Ok(CreatedEntry {
         identity,
         symlink_target: None,
@@ -3053,12 +3125,17 @@ fn remove_stage_dir_entry_at(
     stage: &PrivateStageDir,
     entry: &Path,
 ) -> io::Result<()> {
-    match rustix::fs::unlinkat(&stage.fd, entry, AtFlags::empty()) {
-        Ok(()) => {}
-        Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io::Error::from(error)),
-    }
+    remove_stage_entry_at(stage, entry)?;
     remove_empty_stage_dir_at(parent, stage)
+}
+
+#[cfg(unix)]
+fn remove_stage_entry_at(stage: &PrivateStageDir, entry: &Path) -> io::Result<()> {
+    match rustix::fs::unlinkat(&stage.fd, entry, AtFlags::empty()) {
+        Ok(()) => Ok(()),
+        Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io::Error::from(error)),
+    }
 }
 
 #[cfg(not(unix))]
