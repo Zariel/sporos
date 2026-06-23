@@ -2450,7 +2450,7 @@ fn entry_identity_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<FileIden
     let stat =
         rustix::fs::statat(parent_fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     Ok(FileIdentity {
-        dev: stat.st_dev,
+        dev: u64::try_from(stat.st_dev).map_err(|_error| io::Error::other("negative device id"))?,
         ino: stat.st_ino,
     })
 }
@@ -2461,7 +2461,8 @@ fn cleanup_identity_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<Cleanu
         rustix::fs::statat(parent_fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     Ok(CleanupIdentity {
         identity: FileIdentity {
-            dev: stat.st_dev,
+            dev: u64::try_from(stat.st_dev)
+                .map_err(|_error| io::Error::other("negative device id"))?,
             ino: stat.st_ino,
         },
         ctime: stat.st_ctime,

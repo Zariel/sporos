@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "Torrent automation service"
 license = "MIT"
+default-run = "sporos"
 
 [dependencies]
 base64 = "0.22.1"

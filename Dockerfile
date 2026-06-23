@@ -37,7 +37,7 @@ RUN --network=none \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     CARGO_NET_OFFLINE=true cargo build --release --locked --bin sporos \
-    && rm -rf src crates/sporos-system-test-support/src
+    && rm -rf src
 
 COPY src ./src
 

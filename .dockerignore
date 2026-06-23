@@ -2,5 +2,7 @@
 !Cargo.lock
 !Cargo.toml
 !Dockerfile
+!crates
+!crates/**
 !src
 !src/**

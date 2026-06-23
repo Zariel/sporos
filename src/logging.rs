@@ -11,10 +11,14 @@ pub fn init_from_env() -> Result<(), tracing_subscriber::util::TryInitError> {
 }
 
 fn default_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|error| {
-        eprintln!("sporos: ignoring invalid RUST_LOG: {error}");
+    if std::env::var_os("RUST_LOG").is_none() {
         EnvFilter::new(DEFAULT_FILTER)
-    })
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|error| {
+            eprintln!("sporos: ignoring invalid RUST_LOG: {error}");
+            EnvFilter::new(DEFAULT_FILTER)
+        })
+    }
 }
 
 fn subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync + 'static

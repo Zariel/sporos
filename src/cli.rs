@@ -3,11 +3,53 @@ use std::path::PathBuf;
 
 #[cfg(test)]
 use clap::CommandFactory;
+use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 
 use crate::config::{CONFIG_SCHEMA, DEFAULT_CONFIG_PATH, SporosConfig, load_config};
 use crate::runtime::app::validate_runtime_config;
 use crate::runtime::daemon;
+
+#[derive(Debug)]
+pub struct CliError {
+    message: String,
+    exit_code: u8,
+}
+
+impl CliError {
+    const FAILURE: u8 = 1;
+
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            exit_code: Self::FAILURE,
+        }
+    }
+
+    fn usage(error: clap::Error) -> Self {
+        Self {
+            exit_code: u8::try_from(error.exit_code()).unwrap_or(Self::FAILURE),
+            message: error.to_string(),
+        }
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        self.exit_code
+    }
+
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.message.contains(needle)
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
 
 #[derive(Debug, Parser)]
 #[command(name = "sporos", about = "Sporos torrent automation service")]
@@ -29,21 +71,35 @@ enum Command {
     PrintConfigSchema,
 }
 
-pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
-    let cli = Cli::try_parse_from(args).map_err(|error| error.to_string())?;
+pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, CliError> {
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            return Ok(error.to_string());
+        }
+        Err(error) => return Err(CliError::usage(error)),
+    };
 
     match cli.command {
         Command::Serve { config } => {
-            let loaded = load_config(&config).map_err(|error| error.to_string())?;
+            let loaded =
+                load_config(&config).map_err(|error| CliError::failure(error.to_string()))?;
             let runtime = build_serve_runtime(&loaded)?;
             runtime
                 .block_on(daemon::serve(loaded))
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| CliError::failure(error.to_string()))?;
             Ok(String::new())
         }
         Command::CheckConfig { config } => {
-            let loaded = load_config(&config).map_err(|error| error.to_string())?;
-            validate_runtime_config(&loaded).map_err(|error| error.to_string())?;
+            let loaded =
+                load_config(&config).map_err(|error| CliError::failure(error.to_string()))?;
+            validate_runtime_config(&loaded)
+                .map_err(|error| CliError::failure(error.to_string()))?;
             Ok(format!("sporos config ok: {}", config.display()))
         }
         Command::PrintConfigSchema => Ok(CONFIG_SCHEMA.to_owned()),
@@ -52,7 +108,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
 
 pub(crate) fn build_serve_runtime(
     config: &SporosConfig,
-) -> Result<tokio::runtime::Runtime, String> {
+) -> Result<tokio::runtime::Runtime, CliError> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     if let Some(worker_threads) = config.runtime.worker_threads {
@@ -61,7 +117,9 @@ pub(crate) fn build_serve_runtime(
     if let Some(max_blocking_threads) = config.runtime.max_blocking_threads {
         builder.max_blocking_threads(max_blocking_threads);
     }
-    builder.build().map_err(|error| error.to_string())
+    builder
+        .build()
+        .map_err(|error| CliError::failure(error.to_string()))
 }
 
 #[cfg(test)]
@@ -139,6 +197,21 @@ mod tests {
     }
 
     #[test]
+    fn help_is_successful_output() {
+        let output = run([OsString::from("sporos"), OsString::from("--help")]).unwrap();
+
+        assert!(output.contains("Usage: sporos <COMMAND>"));
+    }
+
+    #[test]
+    fn invalid_usage_exits_with_clap_usage_code() {
+        let error = run([OsString::from("sporos"), OsString::from("not-a-command")]).unwrap_err();
+
+        assert_eq!(2, error.exit_code());
+        assert!(error.contains("unrecognized subcommand"));
+    }
+
+    #[test]
     fn serve_runtime_uses_multi_thread_scheduler() {
         let mut config = SporosConfig::default();
         config.runtime.worker_threads = Some(2);
@@ -168,6 +241,7 @@ mod tests {
         ])
         .unwrap_err();
 
+        assert_eq!(2, error.exit_code());
         assert!(error.contains("unrecognized subcommand"));
     }
 

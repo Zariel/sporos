@@ -15,7 +15,7 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             eprintln!("sporos: {error}");
-            ExitCode::FAILURE
+            ExitCode::from(error.exit_code())
         }
     }
 }
