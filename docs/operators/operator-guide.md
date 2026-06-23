@@ -58,9 +58,9 @@ docker run --rm \
   -v ./secrets/qbit-password:/var/run/secrets/qbit-password:ro \
   -v ./secrets/indexer-api-key:/var/run/secrets/indexer-api-key:ro \
   -v ./secrets/prowlarr-api-key:/var/run/secrets/prowlarr-api-key:ro \
-  -v sporos-state:/data/state \
-  -v sporos-cache:/data/cache/torrents \
-  -v sporos-output:/data/output \
+  -v sporos-state:/app/state \
+  -v sporos-cache:/app/cache/torrents \
+  -v sporos-output:/app/output \
   -v /srv/media:/media:ro \
   sporos:local
 ```
@@ -68,7 +68,7 @@ docker run --rm \
 The image runs as UID/GID `10001`. Mounted writable paths for
 `paths.database`, `paths.torrent_cache_dir`, and `paths.output_dir` must be
 writable by that identity, or by a runtime user override chosen by the operator.
-Container defaults place those three paths under `/data` even when the mounted
+Container defaults place those three paths under `/app` even when the mounted
 config omits them.
 Mount secret files read-only and point config fields such as
 `server.api_token_file`, torrent-client password files, and indexer API key
@@ -84,9 +84,9 @@ absolute. Local defaults are resolved to absolute paths during startup.
 
 ```toml
 [paths]
-database = "/data/state/sporos.db"
-torrent_cache_dir = "/data/cache/torrents"
-output_dir = "/data/output"
+database = "/app/state/sporos.db"
+torrent_cache_dir = "/app/cache/torrents"
+output_dir = "/app/output"
 media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
@@ -342,7 +342,7 @@ set `paths.media_dirs` in TOML.
 
 ```bash
 SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/data/state/sporos.db"'
+SPOROS__PATHS__DATABASE='"/app/state/sporos.db"'
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD='0.02'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-password"'

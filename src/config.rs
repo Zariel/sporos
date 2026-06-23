@@ -1743,7 +1743,7 @@ api_key_env = "optional env var containing api key"
 [environment overrides]
 SPOROS__SERVER__BIND = "0.0.0.0:2468"
 SPOROS__SERVER__API_TOKEN_FILE = "/var/run/secrets/sporos-api-token"
-SPOROS__PATHS__DATABASE = "/data/state/sporos.db"
+SPOROS__PATHS__DATABASE = "/app/state/sporos.db"
 SPOROS__RUNTIME__WORKER_THREADS = "4"
 SPOROS__RUNTIME__MAX_BLOCKING_THREADS = "64"
 SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT = "100"
@@ -1840,9 +1840,9 @@ mod tests {
         let config = parse_config(
             r#"
             [paths]
-            database = "/data/state/sporos.db"
-            torrent_cache_dir = "/data/cache/torrents"
-            output_dir = "/data/output"
+            database = "/app/state/sporos.db"
+            torrent_cache_dir = "/app/cache/torrents"
+            output_dir = "/app/output"
             media_dirs = ["/media/movies"]
 
             [server]
@@ -2712,9 +2712,9 @@ mod tests {
     #[test]
     fn startup_config_env_overrides_resolve_container_style_paths() {
         let cwd = unique_temp_dir("env-container");
-        let database = cwd.join("data/state/sporos.db");
-        let torrent_cache_dir = cwd.join("data/cache/torrents");
-        let output_dir = cwd.join("data/output");
+        let database = cwd.join("app/state/sporos.db");
+        let torrent_cache_dir = cwd.join("app/cache/torrents");
+        let output_dir = cwd.join("app/output");
 
         let config = parse_startup_config_with_env(
             "",
@@ -3061,7 +3061,7 @@ mod tests {
         let config = parse_config_with_env(
             r#"
             [paths]
-            database = "/data/state/sporos.db"
+            database = "/app/state/sporos.db"
 
             [server]
             bind = "127.0.0.1:2468"

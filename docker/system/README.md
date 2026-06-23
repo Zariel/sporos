@@ -128,9 +128,9 @@ replace this with a password-hash seeding path if it needs auth-on coverage.
 Compose project names isolate runs. The runner sets a unique project name by
 default, which gives each run its own named volumes:
 
-- `sporos_state` -> `/data/state`
-- `torrent_cache` -> `/data/cache/torrents`
-- `output` -> `/data/output`
+- `sporos_state` -> `/app/state`
+- `torrent_cache` -> `/app/cache/torrents`
+- `output` -> `/app/output`
 - `downloads` -> `/downloads`
 - client config/session volumes for qBittorrent and rTorrent
 

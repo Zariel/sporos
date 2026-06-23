@@ -1,7 +1,7 @@
 [paths]
-database = "/data/state/sporos.db"
-torrent_cache_dir = "/data/cache/torrents"
-output_dir = "/data/output"
+database = "/app/state/sporos.db"
+torrent_cache_dir = "/app/cache/torrents"
+output_dir = "/app/output"
 media_dirs = ["/downloads"]
 
 [server]
@@ -38,7 +38,7 @@ include_non_video = true
 dry_run = false
 # Link preparation is disabled until link_type is set.
 # link_type = "hardlink" # hardlink, symlink, reflink, or reflink_or_copy
-# link_dirs = ["/data/links"]
+# link_dirs = ["/app/links"]
 flat_linking = false
 
 [injection.recheck]

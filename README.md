@@ -48,9 +48,9 @@ all supported fields, environment overrides, and secret handling.
 
 ```toml
 [paths]
-database = "/data/state/sporos.db"
-torrent_cache_dir = "/data/cache/torrents"
-output_dir = "/data/output"
+database = "/app/state/sporos.db"
+torrent_cache_dir = "/app/cache/torrents"
+output_dir = "/app/output"
 media_dirs = ["/media/movies", "/media/tv"]
 
 [server]

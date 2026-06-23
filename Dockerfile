@@ -68,8 +68,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 sporos \
     && useradd --system --uid 10001 --gid sporos --home-dir /var/lib/sporos sporos \
-    && mkdir -p /data/state /data/cache/torrents /data/output /etc/sporos /var/lib/sporos /var/run/secrets \
-    && chown -R sporos:sporos /data /var/lib/sporos
+    && mkdir -p /app/state /app/cache/torrents /app/output /etc/sporos /var/lib/sporos /var/run/secrets \
+    && chown -R sporos:sporos /app /var/lib/sporos
 
 COPY --from=build /workspace/target/release/sporos /usr/local/bin/sporos
 
@@ -79,15 +79,15 @@ LABEL org.opencontainers.image.title="Sporos" \
 
 ENV RUST_BACKTRACE=1 \
     RUST_LIB_BACKTRACE=1 \
-    SPOROS__PATHS__DATABASE=/data/state/sporos.db \
-    SPOROS__PATHS__TORRENT_CACHE_DIR=/data/cache/torrents \
-    SPOROS__PATHS__OUTPUT_DIR=/data/output
+    SPOROS__PATHS__DATABASE=/app/state/sporos.db \
+    SPOROS__PATHS__TORRENT_CACHE_DIR=/app/cache/torrents \
+    SPOROS__PATHS__OUTPUT_DIR=/app/output
 
 USER 10001:10001
 WORKDIR /var/lib/sporos
 
 EXPOSE 2468
-VOLUME ["/data/state", "/data/cache/torrents", "/data/output"]
+VOLUME ["/app/state", "/app/cache/torrents", "/app/output"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "sporos"]
 CMD ["serve", "--config", "/etc/sporos/config.toml"]

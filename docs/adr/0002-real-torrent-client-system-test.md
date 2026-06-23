@@ -104,9 +104,9 @@ Use Docker Compose or an equivalent CI service topology:
 system-runner
   -> sporos:local
        /etc/sporos/config.toml
-       /data/state/sporos.db
-       /data/cache/torrents
-       /data/output
+       /app/state/sporos.db
+       /app/cache/torrents
+       /app/output
        /downloads
   -> qbittorrent:version-or-digest
        /downloads

@@ -30,9 +30,9 @@ services:
     volumes:
       - ./config/sporos.toml.template:/etc/sporos/config.toml:ro
       - ./fixtures:/system-fixtures:ro
-      - sporos_state:/data/state
-      - torrent_cache:/data/cache/torrents
-      - output:/data/output
+      - sporos_state:/app/state
+      - torrent_cache:/app/cache/torrents
+      - output:/app/output
       - downloads:/downloads
     networks:
       - system
