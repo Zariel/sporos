@@ -2445,12 +2445,22 @@ fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, LinkActionErro
     })
 }
 
+#[cfg(all(unix, target_vendor = "apple"))]
+fn stat_device_id(dev: i32) -> io::Result<u64> {
+    u64::try_from(dev).map_err(|_error| io::Error::other("negative device id"))
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn stat_device_id(dev: u64) -> io::Result<u64> {
+    Ok(dev)
+}
+
 #[cfg(unix)]
 fn entry_identity_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<FileIdentity> {
     let stat =
         rustix::fs::statat(parent_fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     Ok(FileIdentity {
-        dev: u64::try_from(stat.st_dev).map_err(|_error| io::Error::other("negative device id"))?,
+        dev: stat_device_id(stat.st_dev)?,
         ino: stat.st_ino,
     })
 }
@@ -2461,8 +2471,7 @@ fn cleanup_identity_in_fd(parent_fd: &OwnedFd, path: &Path) -> io::Result<Cleanu
         rustix::fs::statat(parent_fd, path, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     Ok(CleanupIdentity {
         identity: FileIdentity {
-            dev: u64::try_from(stat.st_dev)
-                .map_err(|_error| io::Error::other("negative device id"))?,
+            dev: stat_device_id(stat.st_dev)?,
             ino: stat.st_ino,
         },
         ctime: stat.st_ctime,
