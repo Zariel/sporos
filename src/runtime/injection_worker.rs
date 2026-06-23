@@ -22,9 +22,10 @@ use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::actions::{
-    CreatedLink, CreatedRoot, LinkActionError, LinkDirOptions, LinkFilesOptions, LinkType,
-    PreparedLink, SaveTorrentError, candidate_output_metadata, cleanup_created_links_and_roots,
-    link_destination_dir, link_metafile_files, save_candidate_torrent, select_link_dir_pinned,
+    CreatedLink, CreatedRoot, DryRunLinkOptions, LinkActionError, LinkDirOptions, LinkFilesOptions,
+    LinkType, PreparedLink, SaveTorrentError, candidate_output_metadata,
+    cleanup_created_links_and_roots, link_destination_dir, link_metafile_files,
+    plan_metafile_link_dry_run, save_candidate_torrent, select_link_dir_pinned,
     validate_prepared_links,
 };
 use crate::clients::TorrentClientDescriptor;
@@ -122,9 +123,26 @@ pub struct InjectionRequest {
 pub struct InjectionWorkResult {
     pub outcome: InjectionOutcome,
     pub target_client: Option<DependencyName>,
+    pub dry_run_action: Option<DryRunAction>,
     pub saved_for_retry: bool,
     pub linked_files: usize,
     pub prepared_link_cleanup_incomplete: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DryRunAction {
+    SaveCandidateTorrent {
+        output_dir: PathBuf,
+    },
+    InjectTorrent {
+        save_path: Option<PathBuf>,
+        planned_link_destination: Option<PathBuf>,
+        link_type: Option<LinkType>,
+        link_dir_count: usize,
+        flat_linking: bool,
+        pause_for_recheck: bool,
+        would_recheck: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +186,7 @@ pub struct SavedTorrentRetrySummary {
     pub scanned: usize,
     pub attempted: usize,
     pub injected: usize,
+    pub dry_run: usize,
     pub already_exists: usize,
     pub source_incomplete: usize,
     pub failed: usize,
@@ -316,6 +335,7 @@ pub struct InjectionWorker {
     repository: Repository,
     clients: Vec<Arc<dyn InjectionClient>>,
     mutation_lock: Arc<Mutex<()>>,
+    dry_run: bool,
 }
 
 impl fmt::Debug for InjectionWorker {
@@ -374,7 +394,13 @@ impl InjectionWorker {
             repository,
             clients,
             mutation_lock: Arc::new(Mutex::new(())),
+            dry_run: false,
         }
+    }
+
+    pub const fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
     }
 
     pub fn client_count(&self) -> usize {
@@ -556,10 +582,21 @@ impl InjectionWorker {
             .ok_or(InjectionWorkerError::NoWritableClient)?;
         let target_name = dependency_name(target.descriptor())?;
         if should_stop() {
+            if self.dry_run {
+                return Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::DryRun,
+                    target_client: Some(target_name),
+                    dry_run_action: Some(dry_run_inject_action(&request, None)),
+                    saved_for_retry: false,
+                    linked_files: 0,
+                    prepared_link_cleanup_incomplete: false,
+                });
+            }
             self.save_for_retry_phase(&request).await?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
+                dry_run_action: None,
                 saved_for_retry: true,
                 linked_files: 0,
                 prepared_link_cleanup_incomplete: false,
@@ -585,6 +622,7 @@ impl InjectionWorker {
                 return Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::AlreadyExists,
                     target_client: Some(dependency_name(existing_client.descriptor())?),
+                    dry_run_action: None,
                     saved_for_retry: false,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: false,
@@ -592,10 +630,21 @@ impl InjectionWorker {
             }
             ExistingClientLookup::NotFound => {}
             ExistingClientLookup::Shutdown => {
+                if self.dry_run {
+                    return Ok(InjectionWorkResult {
+                        outcome: InjectionOutcome::DryRun,
+                        target_client: Some(target_name),
+                        dry_run_action: Some(dry_run_inject_action(&request, None)),
+                        saved_for_retry: false,
+                        linked_files: 0,
+                        prepared_link_cleanup_incomplete: false,
+                    });
+                }
                 self.save_for_retry_phase(&request).await?;
                 return Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
+                    dry_run_action: None,
                     saved_for_retry: true,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: false,
@@ -604,27 +653,52 @@ impl InjectionWorker {
         }
 
         if should_stop() {
+            if self.dry_run {
+                return Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::DryRun,
+                    target_client: Some(target_name),
+                    dry_run_action: Some(dry_run_inject_action(&request, None)),
+                    saved_for_retry: false,
+                    linked_files: 0,
+                    prepared_link_cleanup_incomplete: false,
+                });
+            }
             self.save_for_retry_phase(&request).await?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
+                dry_run_action: None,
                 saved_for_retry: true,
                 linked_files: 0,
                 prepared_link_cleanup_incomplete: false,
             });
         }
 
-        let preparation = match self
-            .prepare_injection_phase(&request, &target_name, from_saved_retry)
-            .await?
-        {
+        let preparation_phase = if self.dry_run {
+            self.dry_run_injection_phase(&request, &target_name)?
+        } else {
+            self.prepare_injection_phase(&request, &target_name, from_saved_retry)
+                .await?
+        };
+        let preparation = match preparation_phase {
             InjectionPreparationPhase::Ready(preparation) => preparation,
             InjectionPreparationPhase::Rejected(result) => return Ok(result),
             InjectionPreparationPhase::SourceIncomplete => {
+                if self.dry_run {
+                    return Ok(InjectionWorkResult {
+                        outcome: InjectionOutcome::SourceIncomplete,
+                        target_client: Some(target_name),
+                        dry_run_action: None,
+                        saved_for_retry: false,
+                        linked_files: 0,
+                        prepared_link_cleanup_incomplete: false,
+                    });
+                }
                 self.save_for_retry_phase(&request).await?;
                 return Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::SourceIncomplete,
                     target_client: Some(target_name),
+                    dry_run_action: None,
                     saved_for_retry: true,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: false,
@@ -633,12 +707,23 @@ impl InjectionWorker {
         };
 
         if should_stop() {
+            if self.dry_run {
+                return Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::DryRun,
+                    target_client: Some(target_name),
+                    dry_run_action: Some(dry_run_inject_action(&request, Some(&preparation))),
+                    saved_for_retry: false,
+                    linked_files: preparation.linked_files,
+                    prepared_link_cleanup_incomplete: false,
+                });
+            }
             let save_result = self.save_for_retry_phase(&request).await;
             let cleanup = preparation.cleanup_prepared_links_phase();
             save_result?;
             return Ok(InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
+                dry_run_action: None,
                 saved_for_retry: true,
                 linked_files: preparation.linked_files,
                 prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
@@ -656,12 +741,23 @@ impl InjectionWorker {
 
         match mutation_result {
             InjectionMutationResult::SavedForShutdown => {
+                if self.dry_run {
+                    return Ok(InjectionWorkResult {
+                        outcome: InjectionOutcome::DryRun,
+                        target_client: Some(target_name),
+                        dry_run_action: Some(dry_run_inject_action(&request, Some(&preparation))),
+                        saved_for_retry: false,
+                        linked_files: preparation.linked_files,
+                        prepared_link_cleanup_incomplete: false,
+                    });
+                }
                 let save_result = self.save_for_retry_phase(&request).await;
                 let cleanup = preparation.cleanup_prepared_links_phase();
                 save_result?;
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
+                    dry_run_action: None,
                     saved_for_retry: true,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
@@ -670,6 +766,16 @@ impl InjectionWorker {
             InjectionMutationResult::AlreadyExistsOnTarget => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
+                if self.dry_run {
+                    return Ok(InjectionWorkResult {
+                        outcome: InjectionOutcome::AlreadyExists,
+                        target_client: Some(target_name),
+                        dry_run_action: None,
+                        saved_for_retry: false,
+                        linked_files: 0,
+                        prepared_link_cleanup_incomplete: false,
+                    });
+                }
                 let mut saved_for_retry = false;
                 if preparation.has_prepared_links
                     || (from_saved_retry && preparation.recheck_plan.should_recheck)
@@ -694,6 +800,7 @@ impl InjectionWorker {
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::AlreadyExists,
                     target_client: Some(target_name),
+                    dry_run_action: None,
                     saved_for_retry,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: false,
@@ -711,6 +818,7 @@ impl InjectionWorker {
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::AlreadyExists,
                     target_client: Some(dependency_name(existing_client.descriptor())?),
+                    dry_run_action: None,
                     saved_for_retry: false,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
@@ -739,9 +847,23 @@ impl InjectionWorker {
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Injected,
                     target_client: Some(target_name),
+                    dry_run_action: None,
                     saved_for_retry: preparation.run_resume_after_inject,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: false,
+                })
+            }
+            InjectionMutationResult::DryRun => {
+                self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
+                    .await?;
+                let cleanup = preparation.cleanup_prepared_links_phase();
+                Ok(InjectionWorkResult {
+                    outcome: InjectionOutcome::DryRun,
+                    target_client: Some(target_name),
+                    dry_run_action: Some(dry_run_inject_action(&request, Some(&preparation))),
+                    saved_for_retry: false,
+                    linked_files: preparation.linked_files,
+                    prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
                 })
             }
             InjectionMutationResult::Injected(Err(error)) => {
@@ -758,6 +880,7 @@ impl InjectionWorker {
                 Ok(InjectionWorkResult {
                     outcome: InjectionOutcome::Failed,
                     target_client: Some(target_name),
+                    dry_run_action: None,
                     saved_for_retry: true,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
@@ -1075,6 +1198,13 @@ impl InjectionWorker {
                 Err(error) => return Err(error),
             };
             record_saved_retry_result(result.outcome, summary);
+            if self.dry_run {
+                summary.kept += 1;
+                if result.outcome == InjectionOutcome::SourceIncomplete {
+                    continue;
+                }
+                return Ok(());
+            }
             match result.outcome {
                 InjectionOutcome::SourceIncomplete => {
                     summary.kept += 1;
@@ -1100,6 +1230,10 @@ impl InjectionWorker {
                         }
                         Err(error) => return Err(error),
                     }
+                    return Ok(());
+                }
+                InjectionOutcome::DryRun => {
+                    summary.kept += 1;
                     return Ok(());
                 }
                 InjectionOutcome::Rejected => {
@@ -1270,6 +1404,7 @@ impl InjectionWorker {
             return Ok(InjectionPreparationPhase::Rejected(InjectionWorkResult {
                 outcome: InjectionOutcome::Rejected,
                 target_client: Some(target_name.clone()),
+                dry_run_action: None,
                 saved_for_retry: false,
                 linked_files: 0,
                 prepared_link_cleanup_incomplete: false,
@@ -1308,6 +1443,7 @@ impl InjectionWorker {
 
         Ok(InjectionPreparationPhase::Ready(PreparedInjectionPhase {
             save_path,
+            dry_run_link_destination: None,
             created_links,
             prepared_links,
             created_roots,
@@ -1315,6 +1451,92 @@ impl InjectionWorker {
             has_prepared_links,
             recheck_plan,
             recheck_after_linking,
+            pause_for_recheck,
+            run_resume_after_inject,
+        }))
+    }
+
+    fn dry_run_injection_phase(
+        &self,
+        request: &InjectionRequest,
+        target_name: &DependencyName,
+    ) -> Result<InjectionPreparationPhase, InjectionWorkerError> {
+        let recheck_plan =
+            recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
+        let below_threshold = is_below_resume_threshold(
+            &request.metafile,
+            &request.assessment,
+            request.recheck,
+            recheck_plan,
+        );
+        if below_threshold
+            && request.recheck.below_threshold_action
+                == BelowThresholdAction::RejectWithoutInjecting
+        {
+            return Ok(InjectionPreparationPhase::Rejected(InjectionWorkResult {
+                outcome: InjectionOutcome::Rejected,
+                target_client: Some(target_name.clone()),
+                dry_run_action: None,
+                saved_for_retry: false,
+                linked_files: 0,
+                prepared_link_cleanup_incomplete: false,
+            }));
+        }
+        let has_configured_links = request.link_type.is_some() && !request.link_dirs.is_empty();
+        let dry_run_link_plan = if has_configured_links {
+            let Some(source_root) = source_root(&request.local_item) else {
+                return Ok(InjectionPreparationPhase::SourceIncomplete);
+            };
+            let link_type = match request.link_type {
+                Some(link_type) => link_type,
+                None => return Ok(InjectionPreparationPhase::SourceIncomplete),
+            };
+            match plan_metafile_link_dry_run(
+                source_root,
+                &request.local_files,
+                request.metafile.files(),
+                request.assessment.decision,
+                DryRunLinkOptions {
+                    link_dirs: &request.link_dirs,
+                    tracker: request.candidate.tracker.as_str(),
+                    flat_linking: request.flat_linking,
+                    link_type,
+                },
+            ) {
+                Ok(plan) => Some(plan),
+                Err(LinkActionError::MissingSource { .. })
+                | Err(LinkActionError::NoSourceMatch { .. }) => {
+                    return Ok(InjectionPreparationPhase::SourceIncomplete);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let pause_for_recheck = has_configured_links
+            || (recheck_plan.should_recheck
+                && !(below_threshold
+                    && request.recheck.below_threshold_action
+                        == BelowThresholdAction::InjectAndStart));
+        let run_resume_after_inject = pause_for_recheck
+            && !(below_threshold
+                && request.recheck.below_threshold_action == BelowThresholdAction::InjectPaused);
+
+        Ok(InjectionPreparationPhase::Ready(PreparedInjectionPhase {
+            save_path: dry_run_save_path(request),
+            dry_run_link_destination: dry_run_link_plan
+                .as_ref()
+                .map(|plan| plan.destination_dir.clone()),
+            created_links: Vec::new(),
+            prepared_links: Vec::new(),
+            created_roots: Vec::new(),
+            linked_files: dry_run_link_plan
+                .as_ref()
+                .map(|plan| plan.linked_files)
+                .unwrap_or(0),
+            has_prepared_links: has_configured_links,
+            recheck_plan,
+            recheck_after_linking: recheck_plan,
             pause_for_recheck,
             run_resume_after_inject,
         }))
@@ -1368,21 +1590,29 @@ impl InjectionWorker {
                     ClientCall::Completed(Ok(false)) => {
                         match validate_prepared_links_for_inject(&preparation.prepared_links).await
                         {
-                            Ok(()) => match client_call_until_shutdown(shutdown, || {
-                                target.inject(ClientInjectionRequest {
-                                    info_hash: request.metafile.info_hash(),
-                                    torrent_bytes: &request.torrent_bytes,
-                                    save_path: preparation.save_path.as_deref(),
-                                    pause_for_recheck: preparation.pause_for_recheck,
-                                })
-                            })
-                            .await
-                            {
-                                ClientCall::Shutdown => InjectionMutationResult::SavedForShutdown,
-                                ClientCall::Completed(result) => {
-                                    InjectionMutationResult::Injected(result)
+                            Ok(()) => {
+                                if self.dry_run {
+                                    InjectionMutationResult::DryRun
+                                } else {
+                                    match client_call_until_shutdown(shutdown, || {
+                                        target.inject(ClientInjectionRequest {
+                                            info_hash: request.metafile.info_hash(),
+                                            torrent_bytes: &request.torrent_bytes,
+                                            save_path: preparation.save_path.as_deref(),
+                                            pause_for_recheck: preparation.pause_for_recheck,
+                                        })
+                                    })
+                                    .await
+                                    {
+                                        ClientCall::Shutdown => {
+                                            InjectionMutationResult::SavedForShutdown
+                                        }
+                                        ClientCall::Completed(result) => {
+                                            InjectionMutationResult::Injected(result)
+                                        }
+                                    }
                                 }
-                            },
+                            }
                             Err(error) => InjectionMutationResult::PreparedLinksInvalid(error),
                         }
                     }
@@ -2193,6 +2423,7 @@ fn actionable_saved_assessment(
 fn record_saved_retry_result(outcome: InjectionOutcome, summary: &mut SavedTorrentRetrySummary) {
     match outcome {
         InjectionOutcome::Injected => summary.injected += 1,
+        InjectionOutcome::DryRun => summary.dry_run += 1,
         InjectionOutcome::AlreadyExists => summary.already_exists += 1,
         InjectionOutcome::SourceIncomplete => summary.source_incomplete += 1,
         InjectionOutcome::Rejected => summary.no_match += 1,
@@ -2263,6 +2494,7 @@ enum InjectionPreparationPhase {
 
 struct PreparedInjectionPhase {
     save_path: Option<PathBuf>,
+    dry_run_link_destination: Option<PathBuf>,
     created_links: Vec<CreatedLink>,
     prepared_links: Vec<PreparedLink>,
     created_roots: Vec<CreatedRoot>,
@@ -2300,6 +2532,7 @@ enum InjectionMutationResult {
     AlreadyExistsOnTarget,
     AlreadyExistsOnOtherClient(Arc<dyn InjectionClient>),
     Injected(Result<(), TorrentClientError>),
+    DryRun,
     PreparedLinksInvalid(LinkActionError),
     ExistingLookupFailed(InjectionWorkerError),
     TargetPrecheckFailed(TorrentClientError),
@@ -2520,6 +2753,36 @@ fn dependency_name(
     })
 }
 
+fn dry_run_save_path(request: &InjectionRequest) -> Option<PathBuf> {
+    if request.link_type.is_some() && !request.link_dirs.is_empty() {
+        None
+    } else {
+        source_root(&request.local_item).map(Path::to_path_buf)
+    }
+}
+
+fn dry_run_inject_action(
+    request: &InjectionRequest,
+    preparation: Option<&PreparedInjectionPhase>,
+) -> DryRunAction {
+    DryRunAction::InjectTorrent {
+        save_path: preparation
+            .and_then(|preparation| preparation.save_path.clone())
+            .or_else(|| dry_run_save_path(request)),
+        planned_link_destination: preparation
+            .and_then(|preparation| preparation.dry_run_link_destination.clone()),
+        link_type: request.link_type,
+        link_dir_count: request.link_dirs.len(),
+        flat_linking: request.flat_linking,
+        pause_for_recheck: preparation
+            .map(|preparation| preparation.pause_for_recheck)
+            .unwrap_or(false),
+        would_recheck: preparation
+            .map(|preparation| preparation.run_resume_after_inject)
+            .unwrap_or(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2647,6 +2910,234 @@ mod tests {
         assert_eq!("degraded", health[0].state);
         assert_eq!("qbit.local", health[0].dependency_name.as_str());
         assert_eq!(Some(1_000), health[0].retry_after_ms);
+    }
+
+    #[tokio::test]
+    async fn worker_dry_run_validates_target_without_injecting() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-dry-run");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let worker = InjectionWorker::new(
+            repository.clone(),
+            vec![target.clone() as Arc<dyn InjectionClient>],
+        )
+        .with_dry_run(true);
+
+        let result = worker
+            .process(request(local, candidate, candidate_id, &root))
+            .await
+            .unwrap();
+        let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+        assert_eq!(InjectionOutcome::DryRun, result.outcome);
+        assert_eq!(
+            Some(DependencyName::new("target").unwrap()),
+            result.target_client
+        );
+        assert_eq!(
+            Some(DryRunAction::InjectTorrent {
+                save_path: Some(root.clone()),
+                planned_link_destination: None,
+                link_type: None,
+                link_dir_count: 0,
+                flat_linking: false,
+                pause_for_recheck: true,
+                would_recheck: true,
+            }),
+            result.dry_run_action
+        );
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!("healthy", health[0].state);
+    }
+
+    #[tokio::test]
+    async fn worker_dry_run_skips_link_preparation_and_retry_save() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-dry-run-link");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let link_dir = root.join("links");
+        fs::create_dir_all(&link_dir).unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![link_dir.clone()];
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>])
+                .with_dry_run(true);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::DryRun, result.outcome);
+        assert_eq!(
+            Some(DryRunAction::InjectTorrent {
+                save_path: None,
+                planned_link_destination: Some(link_dir.join("tracker.example")),
+                link_type: Some(LinkType::Hardlink),
+                link_dir_count: 1,
+                flat_linking: false,
+                pause_for_recheck: true,
+                would_recheck: true,
+            }),
+            result.dry_run_action
+        );
+        assert_eq!(1, result.linked_files);
+        assert!(!result.prepared_link_cleanup_incomplete);
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(
+            0,
+            target
+                .save_path_file_exists_at_inject
+                .load(Ordering::SeqCst)
+        );
+        assert!(!link_dir.join("tracker.example/movie.mkv").exists());
+        assert!(!root.join("output").exists());
+    }
+
+    #[tokio::test]
+    async fn worker_dry_run_reports_source_incomplete_without_retry_save() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-dry-run-missing-source");
+        let link_dir = root.join("links");
+        fs::create_dir_all(&link_dir).unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![link_dir.clone()];
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>])
+                .with_dry_run(true);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::SourceIncomplete, result.outcome);
+        assert!(!result.saved_for_retry);
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert!(!root.join("output").exists());
+        assert_eq!(0, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn worker_dry_run_rejects_missing_link_dir_without_retry_save() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-dry-run-missing-link-dir");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![root.join("missing-links")];
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>])
+                .with_dry_run(true);
+
+        let error = worker.process(request).await.unwrap_err();
+
+        assert!(matches!(error, InjectionWorkerError::Link(_)));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert!(!root.join("output").exists());
+    }
+
+    #[tokio::test]
+    async fn worker_dry_run_rejects_mismatched_existing_link_destination() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-dry-run-destination-mismatch");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let link_dir = root.join("links");
+        fs::create_dir_all(link_dir.join("tracker.example")).unwrap();
+        fs::write(link_dir.join("tracker.example/movie.mkv"), b"abcdefghij").unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![link_dir];
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>])
+                .with_dry_run(true);
+
+        let error = worker.process(request).await.unwrap_err();
+
+        assert!(matches!(error, InjectionWorkerError::Link(_)));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert!(!root.join("output").exists());
+    }
+
+    #[tokio::test]
+    async fn worker_dry_run_existing_target_does_not_recheck_or_resume() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-dry-run-existing-target");
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let link_dir = root.join("links");
+        fs::create_dir_all(&link_dir).unwrap();
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")).with_existing(true));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.link_type = Some(LinkType::Hardlink);
+        request.link_dirs = vec![link_dir];
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>])
+                .with_dry_run(true);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(InjectionOutcome::AlreadyExists, result.outcome);
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+        assert_eq!(0, saved_torrent_count(&root.join("output")));
+    }
+
+    #[tokio::test]
+    async fn worker_dry_run_reports_below_threshold_start_policy() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("injection-dry-run-start-policy");
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")));
+        let (local, candidate, candidate_id) = persisted_inputs(&repository, &root).await;
+        let mut request = request(local, candidate, candidate_id, &root);
+        request.metafile = metafile_with_files(&[("movie.mkv", 20)]);
+        request.assessment = CandidateAssessment {
+            decision: MatchDecision::Partial,
+            reason: crate::domain::DecisionReason::PartialOverlap,
+            matched_size: Some(ByteSize::new(10)),
+            matched_ratio: Some(MatchRatio::new(0.5).unwrap()),
+        };
+        request.recheck = RecheckResumeConfig {
+            below_threshold_action: BelowThresholdAction::InjectAndStart,
+            ..RecheckResumeConfig::default()
+        };
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>])
+                .with_dry_run(true);
+
+        let result = worker.process(request).await.unwrap();
+
+        assert_eq!(
+            Some(DryRunAction::InjectTorrent {
+                save_path: Some(root.clone()),
+                planned_link_destination: None,
+                link_type: None,
+                link_dir_count: 0,
+                flat_linking: false,
+                pause_for_recheck: false,
+                would_recheck: false,
+            }),
+            result.dry_run_action
+        );
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -3726,6 +4217,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_retry_dry_run_keeps_existing_retry_file_without_recheck() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let root = unique_temp_dir("saved-retry-dry-run-existing");
+        let output_dir = root.join("output");
+        repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        save_test_torrent(
+            &output_dir,
+            "movie.mkv",
+            test_torrent_bytes(),
+            MediaType::Movie,
+        );
+        let target = Arc::new(FakeClient::new(descriptor("target", "target")).with_existing(true));
+        let worker =
+            InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>])
+                .with_dry_run(true);
+
+        let summary = worker
+            .retry_saved_torrents(SavedTorrentRetryConfig {
+                directories: vec![output_dir.clone()],
+                assessed_at_ms: 1_700_000_000_000,
+                ..SavedTorrentRetryConfig::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(1, summary.scanned);
+        assert_eq!(1, summary.attempted);
+        assert_eq!(1, summary.already_exists);
+        assert_eq!(1, summary.kept);
+        assert_eq!(0, summary.deleted);
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        assert_eq!(1, target.has_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.inject_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
+        assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn worker_process_until_shutdown_stops_pending_has_torrent() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let root = unique_temp_dir("injection-shutdown-has");
@@ -3940,6 +4472,7 @@ mod tests {
         let result = InjectionWorkResult {
             outcome: InjectionOutcome::Injected,
             target_client: Some(DependencyName::new("target").unwrap()),
+            dry_run_action: None,
             saved_for_retry: false,
             linked_files: 0,
             prepared_link_cleanup_incomplete: false,

@@ -34,6 +34,8 @@ include_single_episodes = true
 include_non_video = true
 
 [injection]
+# Set to true to verify production behavior without adding torrents to clients.
+dry_run = false
 # Link preparation is disabled until link_type is set.
 # link_type = "hardlink" # hardlink, symlink, reflink, or reflink_or_copy
 # link_dirs = ["/data/links"]

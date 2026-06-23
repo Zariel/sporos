@@ -1170,7 +1170,8 @@ impl AppRuntime {
         )
         .with_season_from_episodes(config.matching.season_from_episodes);
         let injection_worker =
-            InjectionWorker::new(repository.clone(), runtime_config.injection_clients);
+            InjectionWorker::new(repository.clone(), runtime_config.injection_clients)
+                .with_dry_run(config.injection.dry_run);
         let mut arr_endpoints = runtime_config
             .arr
             .instances()

@@ -571,6 +571,7 @@ pub enum DependencyState {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum InjectionOutcome {
     Injected,
+    DryRun,
     Saved,
     AlreadyExists,
     SourceIncomplete,

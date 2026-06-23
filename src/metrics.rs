@@ -229,6 +229,7 @@ impl ProwlarrRefreshOutcome {
 pub enum ActionOutcome {
     Saved,
     Injected,
+    DryRun,
     AlreadyExisting,
     Rejected,
     Failed,
@@ -239,6 +240,7 @@ impl ActionOutcome {
         match self {
             Self::Saved => "saved",
             Self::Injected => "injected",
+            Self::DryRun => "dry_run",
             Self::AlreadyExisting => "already_existing",
             Self::Rejected => "rejected",
             Self::Failed => "failed",

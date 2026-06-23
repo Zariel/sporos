@@ -329,6 +329,7 @@ impl Default for InventoryConfig {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InjectionConfig {
+    pub dry_run: bool,
     pub link_type: Option<InjectionLinkTypeConfig>,
     pub link_dirs: Vec<PathBuf>,
     pub flat_linking: bool,
@@ -1788,6 +1789,7 @@ first_search_window_secs = 604800
 media_scan_max_depth = 3
 
 [injection]
+dry_run = false
 link_type = "optional hardlink|symlink|reflink|reflink_or_copy"
 link_dirs = ["optional path", "..."]
 flat_linking = false
@@ -1876,6 +1878,7 @@ mod tests {
             api_key_file = "/var/run/secrets/indexer-api-key"
 
             [injection]
+            dry_run = true
             link_type = "hardlink"
             link_dirs = ["/links/fast", "/links/slow"]
             flat_linking = true
@@ -1936,6 +1939,7 @@ mod tests {
             Some(InjectionLinkTypeConfig::Hardlink),
             config.injection.link_type
         );
+        assert!(config.injection.dry_run);
         assert_eq!(
             vec![PathBuf::from("/links/fast"), PathBuf::from("/links/slow")],
             config.injection.link_dirs
@@ -2436,6 +2440,7 @@ mod tests {
     fn injection_link_policy_defaults_to_disabled() {
         let config = parse_config("").unwrap();
 
+        assert!(!config.injection.dry_run);
         assert_eq!(None, config.injection.link_type);
         assert!(config.injection.link_dirs.is_empty());
         assert!(!config.injection.flat_linking);

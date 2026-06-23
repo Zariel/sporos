@@ -169,6 +169,7 @@ impl AnnounceOutcomeConfig {
 pub enum AnnounceWorkflowResult {
     Saved,
     Injected,
+    DryRun,
     AlreadyExists,
     SourceIncomplete {
         dependency: Option<AnnounceDependency>,
@@ -213,6 +214,10 @@ pub fn classify_announce_result(
         AnnounceWorkflowResult::Injected => AnnounceWorkOutcome::Succeeded {
             reason: AnnounceReason::Injected,
             outcome: "injected".to_owned(),
+        },
+        AnnounceWorkflowResult::DryRun => AnnounceWorkOutcome::Succeeded {
+            reason: AnnounceReason::DryRun,
+            outcome: "dry_run".to_owned(),
         },
         AnnounceWorkflowResult::AlreadyExists => AnnounceWorkOutcome::Succeeded {
             reason: AnnounceReason::AlreadyExists,
@@ -288,6 +293,7 @@ pub fn classify_injection_result(
 ) -> AnnounceWorkOutcome {
     let workflow = match result.outcome {
         InjectionOutcome::Injected => AnnounceWorkflowResult::Injected,
+        InjectionOutcome::DryRun => AnnounceWorkflowResult::DryRun,
         InjectionOutcome::Saved => AnnounceWorkflowResult::Saved,
         InjectionOutcome::AlreadyExists => AnnounceWorkflowResult::AlreadyExists,
         InjectionOutcome::Rejected => AnnounceWorkflowResult::TerminalFailure {
@@ -1867,6 +1873,7 @@ mod tests {
         let injection = crate::runtime::injection_worker::InjectionWorkResult {
             outcome: InjectionOutcome::SourceIncomplete,
             target_client: Some(DependencyName::new("qbit.local").unwrap()),
+            dry_run_action: None,
             saved_for_retry: true,
             linked_files: 0,
             prepared_link_cleanup_incomplete: false,
@@ -1899,6 +1906,7 @@ mod tests {
         let ambiguous_failure = crate::runtime::injection_worker::InjectionWorkResult {
             outcome: InjectionOutcome::Failed,
             target_client: Some(DependencyName::new("qbit.local").unwrap()),
+            dry_run_action: None,
             saved_for_retry: true,
             linked_files: 1,
             prepared_link_cleanup_incomplete: false,

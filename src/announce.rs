@@ -100,6 +100,7 @@ pub enum AnnounceReason {
     TransientDependencyFailure,
     Saved,
     Injected,
+    DryRun,
     AlreadyExists,
     NoMatchTerminal,
     InvalidRequest,

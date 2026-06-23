@@ -84,6 +84,20 @@ impl LinkFilesOptions {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DryRunLinkPlan {
+    pub destination_dir: PathBuf,
+    pub linked_files: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DryRunLinkOptions<'a> {
+    pub link_dirs: &'a [PathBuf],
+    pub tracker: &'a str,
+    pub flat_linking: bool,
+    pub link_type: LinkType,
+}
+
 #[derive(Debug)]
 pub struct CreatedLink {
     pub source: PathBuf,
@@ -898,6 +912,58 @@ pub fn link_metafile_files(
     Ok(outcome)
 }
 
+pub fn plan_metafile_link_dry_run(
+    source_root: &Path,
+    local_files: &[LocalFile],
+    candidate_files: &[TorrentFile],
+    decision: MatchDecision,
+    options: DryRunLinkOptions<'_>,
+) -> Result<DryRunLinkPlan, LinkActionError> {
+    validate_link_dirs(options.link_dirs)?;
+    let pairs = pair_link_files(source_root, local_files, candidate_files, decision)?;
+    let Some(link_dir) =
+        select_link_dir_read_only(source_root, options.link_dirs, options.link_type)?
+    else {
+        return Err(LinkActionError::EmptyLinkDirs);
+    };
+    let destination_dir = link_destination_dir(&link_dir, options.tracker, options.flat_linking)?;
+    for pair in &pairs {
+        let destination = safe_destination_path(&destination_dir, &pair.destination_relative_path)?;
+        let source_file =
+            match verified_source_file(&pair.source, pair.expected_size, options.link_type) {
+                Ok(source_file) => source_file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(LinkActionError::MissingSource {
+                        path: pair.source.clone(),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    return Err(LinkActionError::InvalidSourcePath {
+                        path: pair.source.clone(),
+                    });
+                }
+                Err(source) => {
+                    return Err(LinkActionError::Io {
+                        operation: "inspect source file",
+                        path: pair.source.clone(),
+                        source,
+                    });
+                }
+            };
+        existing_link_destination_matches(
+            &pair.source,
+            &source_file,
+            &destination,
+            options.link_type,
+            DestinationMatchMode::ReuseExisting,
+        )?;
+    }
+    Ok(DryRunLinkPlan {
+        destination_dir,
+        linked_files: pairs.len(),
+    })
+}
+
 pub fn cleanup_created_roots(roots: &[CreatedRoot]) -> Result<(), LinkActionError> {
     for root in roots.iter().rev() {
         cleanup_created_root(root)?;
@@ -1196,6 +1262,27 @@ fn select_link_dir_by_device(
         .iter()
         .zip(devices)
         .find_map(|(link_dir, device)| (device == source_device).then(|| link_dir.clone())))
+}
+
+fn select_link_dir_read_only(
+    source_path: &Path,
+    link_dirs: &[PathBuf],
+    link_type: LinkType,
+) -> Result<Option<PathBuf>, LinkActionError> {
+    if link_dirs.is_empty() {
+        return Ok(None);
+    }
+    if let Some(selected) = select_link_dir_by_device(source_path, link_dirs)? {
+        return Ok(Some(selected));
+    }
+    match link_type {
+        LinkType::Hardlink => Err(LinkActionError::NoCompatibleLinkDir {
+            source: source_path.to_path_buf(),
+        }),
+        LinkType::Symlink | LinkType::Reflink | LinkType::ReflinkOrCopy => {
+            Ok(link_dirs.first().cloned())
+        }
+    }
 }
 
 #[cfg(unix)]

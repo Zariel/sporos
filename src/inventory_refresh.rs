@@ -2949,6 +2949,7 @@ mod tests {
             AnnounceReason::TransientDependencyFailure => "transient_dependency_failure",
             AnnounceReason::Saved => "saved",
             AnnounceReason::Injected => "injected",
+            AnnounceReason::DryRun => "dry_run",
             AnnounceReason::AlreadyExists => "already_exists",
             AnnounceReason::NoMatchTerminal => "no_match_terminal",
             AnnounceReason::InvalidRequest => "invalid_request",

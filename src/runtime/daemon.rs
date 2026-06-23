@@ -63,7 +63,7 @@ use crate::runtime::announce_worker::{
 use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
 use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
-    InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
+    DryRunAction, InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
 use crate::runtime::scheduler::{
     CLEANUP_JOB_NAME, INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome, MEDIA_INVENTORY_JOB_NAME,
@@ -612,6 +612,7 @@ struct SearchWorkflowExecutionSummary {
     downloaded: usize,
     saved: usize,
     injected: usize,
+    dry_run: usize,
     already_present: usize,
     rejected: usize,
     failed: usize,
@@ -736,11 +737,12 @@ async fn process_search_candidate_vec(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum SearchCandidateOutcome {
     Persisted,
     Saved,
     Injected,
+    DryRun(DryRunAction),
     AlreadyPresent,
     Rejected,
 }
@@ -756,6 +758,10 @@ impl SearchWorkflowExecutionSummary {
             SearchCandidateOutcome::Injected => {
                 self.downloaded += 1;
                 self.injected += 1;
+            }
+            SearchCandidateOutcome::DryRun(_) => {
+                self.downloaded += 1;
+                self.dry_run += 1;
             }
             SearchCandidateOutcome::AlreadyPresent => self.already_present += 1,
             SearchCandidateOutcome::Rejected => self.rejected += 1,
@@ -775,10 +781,11 @@ fn emit_search_result_notifications(state: &AppState, summary: &SearchWorkflowEx
 fn search_results_notification(summary: &SearchWorkflowExecutionSummary) -> NotificationEvent {
     NotificationEvent::results(
         format!(
-            "search completed: {} candidates, {} saved, {} injected, {} already present, {} failed",
+            "search completed: {} candidates, {} saved, {} injected, {} dry-run, {} already present, {} failed",
             summary.candidates,
             summary.saved,
             summary.injected,
+            summary.dry_run,
             summary.already_present,
             summary.failed
         ),
@@ -803,6 +810,10 @@ fn search_results_notification(summary: &SearchWorkflowExecutionSummary) -> Noti
             (
                 "injected".to_owned(),
                 Value::from(u64::try_from(summary.injected).unwrap_or(u64::MAX)),
+            ),
+            (
+                "dry_run".to_owned(),
+                Value::from(u64::try_from(summary.dry_run).unwrap_or(u64::MAX)),
             ),
             (
                 "already_present".to_owned(),
@@ -904,7 +915,11 @@ fn record_failed_search_candidate(
 fn search_metric_outcome(summary: &SearchWorkflowExecutionSummary) -> SearchOutcome {
     if summary.failed > 0 || summary.failed_indexers > 0 {
         SearchOutcome::Failed
-    } else if summary.saved > 0 || summary.injected > 0 || summary.already_present > 0 {
+    } else if summary.saved > 0
+        || summary.injected > 0
+        || summary.dry_run > 0
+        || summary.already_present > 0
+    {
         SearchOutcome::Succeeded
     } else {
         SearchOutcome::NoMatch
@@ -1218,6 +1233,13 @@ async fn process_downloaded_search_candidate(
             return Err("search workflow is shutting down".to_owned());
         }
         if state.injection_worker.client_count() == 0 {
+            if state.config.injection.dry_run {
+                return Ok(SearchCandidatePreflight::Outcome(
+                    SearchCandidateOutcome::DryRun(DryRunAction::SaveCandidateTorrent {
+                        output_dir: state.config.paths.output_dir.clone(),
+                    }),
+                ));
+            }
             return Ok(SearchCandidatePreflight::Save {
                 metadata: candidate_output_metadata(
                     selected.local_item.media_type,
@@ -1260,7 +1282,16 @@ async fn execute_search_candidate_preflight(
     shutdown: &ShutdownSignal,
 ) -> Result<SearchCandidateOutcome, String> {
     match preflight {
-        SearchCandidatePreflight::Outcome(outcome) => Ok(outcome),
+        SearchCandidatePreflight::Outcome(outcome) => {
+            if let SearchCandidateOutcome::DryRun(action) = &outcome {
+                state.metrics.record_action(ActionOutcome::DryRun);
+                info!(
+                    action = ?action,
+                    "dry run skipped search candidate side effect"
+                );
+            }
+            Ok(outcome)
+        }
         SearchCandidatePreflight::Save {
             metadata,
             torrent_bytes,
@@ -1305,6 +1336,20 @@ async fn execute_search_candidate_preflight(
                 .record_action(injection_metric_outcome(result.outcome));
             Ok(match result.outcome {
                 InjectionOutcome::Injected => SearchCandidateOutcome::Injected,
+                InjectionOutcome::DryRun => {
+                    if let Some(action) = &result.dry_run_action {
+                        info!(
+                            target_client = result.target_client.as_ref().map(|name| name.as_str()),
+                            action = ?action,
+                            "dry run skipped search candidate side effect"
+                        );
+                    }
+                    SearchCandidateOutcome::DryRun(result.dry_run_action.unwrap_or_else(|| {
+                        DryRunAction::SaveCandidateTorrent {
+                            output_dir: state.config.paths.output_dir.clone(),
+                        }
+                    }))
+                }
                 InjectionOutcome::Saved => SearchCandidateOutcome::Saved,
                 InjectionOutcome::AlreadyExists => SearchCandidateOutcome::AlreadyPresent,
                 InjectionOutcome::SourceIncomplete
@@ -1344,6 +1389,7 @@ fn decision_metric_outcome(decision: MatchDecision) -> DecisionOutcome {
 fn injection_metric_outcome(outcome: InjectionOutcome) -> ActionOutcome {
     match outcome {
         InjectionOutcome::Injected => ActionOutcome::Injected,
+        InjectionOutcome::DryRun => ActionOutcome::DryRun,
         InjectionOutcome::Saved => ActionOutcome::Saved,
         InjectionOutcome::AlreadyExists => ActionOutcome::AlreadyExisting,
         InjectionOutcome::Rejected => ActionOutcome::Rejected,
@@ -2554,6 +2600,19 @@ async fn process_downloaded_announce_candidate(
                 next_attempt_at_ms: now_ms,
             });
         }
+        if state.config.injection.dry_run && state.injection_worker.client_count() == 0 {
+            state.metrics.record_action(ActionOutcome::DryRun);
+            info!(
+                action = ?DryRunAction::SaveCandidateTorrent {
+                    output_dir: state.config.paths.output_dir.clone()
+                },
+                "dry run skipped announce side effect"
+            );
+            return Ok(AnnounceWorkOutcome::Succeeded {
+                reason: AnnounceReason::DryRun,
+                outcome: "dry_run".to_owned(),
+            });
+        }
         if state.injection_worker.client_count() == 0 {
             let save = save_candidate_torrent_blocking(
                 state.config.paths.output_dir.clone(),
@@ -2615,6 +2674,15 @@ async fn process_downloaded_announce_candidate(
         state
             .metrics
             .record_action(injection_metric_outcome(result.outcome));
+        if result.outcome == InjectionOutcome::DryRun
+            && let Some(action) = &result.dry_run_action
+        {
+            info!(
+                target_client = result.target_client.as_ref().map(|name| name.as_str()),
+                action = ?action,
+                "dry run skipped announce side effect"
+            );
+        }
         return Ok(classify_injection_result(
             &result,
             now_ms,
@@ -3512,6 +3580,74 @@ mod tests {
         assert_eq!(SearchCandidateOutcome::Saved, outcome);
         assert_eq!(1, saved_torrent_count(&output_dir));
         assert_eq!("partial", decisions[0].decision);
+    }
+
+    #[tokio::test]
+    async fn downloaded_search_candidate_dry_run_skips_no_client_save() {
+        let root = unique_temp_dir("daemon-search-dry-run-no-save");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_dir.join("candidate.torrent");
+        fs::write(&cache_path, test_torrent_bytes()).unwrap();
+        let parsed = parse_metafile(test_torrent_bytes()).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        config.injection.dry_run = true;
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let item_id = repository
+            .upsert_local_item_with_files(&local_item(&root), &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let mut candidate = preexisting_indexer_candidate();
+        candidate.title = ItemTitle::new("movie.mkv").unwrap();
+        candidate.info_hash = Some(parsed.metafile.info_hash().clone());
+        candidate.torrent_cache_path = Some(cache_path.clone());
+
+        let outcome = process_downloaded_search_candidate(DownloadedSearchCandidateStage {
+            state: runtime.state.clone(),
+            cached: CachedCandidateTorrent {
+                candidate,
+                metafile: parsed.metafile,
+                tracker_hosts: parsed.tracker_hosts,
+                cache_path,
+            },
+            torrent_bytes: test_torrent_bytes().to_vec(),
+            now_ms: unix_time_ms(),
+            shutdown: runtime.state.shutdown_signal.clone(),
+        })
+        .await
+        .unwrap();
+        let outcome = execute_search_candidate_preflight(
+            runtime.state.clone(),
+            outcome,
+            &runtime.state.shutdown_signal,
+        )
+        .await
+        .unwrap();
+        let decisions = repository
+            .match_decisions_for_local_item(item_id, 10)
+            .await
+            .unwrap();
+        let metrics = runtime
+            .state
+            .metrics
+            .render_prometheus(&crate::metrics::MetricsSnapshot::default());
+
+        assert_eq!(
+            SearchCandidateOutcome::DryRun(DryRunAction::SaveCandidateTorrent {
+                output_dir: output_dir.clone()
+            }),
+            outcome
+        );
+        assert_eq!("exact", decisions[0].decision);
+        assert!(!output_dir.exists());
+        assert!(metrics.contains("sporos_actions_total{outcome=\"dry_run\"} 1"));
     }
 
     #[tokio::test]

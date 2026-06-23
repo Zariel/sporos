@@ -219,15 +219,20 @@ Delivery health is best-effort and memory-only: `/v1/status` and metrics show
 the latest in-process success or failure for each configured endpoint, and
 endpoints return to `unknown` after restart.
 
-## Injection Link Preparation
+## Injection
 
-`[injection]` can define a disabled-by-default link preparation policy. Leave
-`link_type` unset to keep the current behavior of injecting torrents directly
-into the client save path. When `link_type` is set, `link_dirs` must contain at
-least one trusted operator-controlled directory.
+`[injection]` can define disabled-by-default dry-run and link preparation
+policies. Set `dry_run = true` to run matching, download, and client preflight
+while skipping torrent-client mutations, saved-torrent writes, prepared-link
+creation, and saved-torrent deletion. Dry-run records and reports the action
+Sporos would have taken, such as saving a candidate torrent or injecting into a
+target client. Leave `link_type` unset to keep the current behavior of injecting
+torrents directly into the client save path. When `link_type` is set,
+`link_dirs` must contain at least one trusted operator-controlled directory.
 
 ```toml
 [injection]
+dry_run = false
 link_type = "hardlink" # hardlink, symlink, reflink, or reflink_or_copy
 link_dirs = ["/srv/sporos/links"]
 flat_linking = false
