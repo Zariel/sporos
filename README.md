@@ -33,11 +33,11 @@ preparation, torrent-client injection, and operator visibility.
 Create a TOML config, validate it, then start the daemon:
 
 ```bash
-sporos check-config --config /etc/sporos/config.toml
-sporos serve --config /etc/sporos/config.toml
+sporos check-config --config /app/config.toml
+sporos serve --config /app/config.toml
 ```
 
-The default config path is `./config.toml`. Use
+The default config path is `/app/config.toml`. Use
 `sporos print-config-schema` to print the supported config surface.
 
 ## Sample Config
@@ -48,27 +48,27 @@ all supported fields, environment overrides, and secret handling.
 
 ```toml
 [paths]
-database = "/app/state/sporos.db"
-torrent_cache_dir = "/app/cache/torrents"
+database = "/app/sporos.db"
+torrent_cache_dir = "/app/cache"
 output_dir = "/app/output"
 media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
 bind = "0.0.0.0:2468"
-api_token_file = "/var/run/secrets/sporos-api-token"
+api_token_env = "SPOROS_API_TOKEN"
 
 [torrent_clients.qbit_main]
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "sporos"
-password_file = "/var/run/secrets/qbit-password"
+password_env = "QBIT_PASSWORD"
 default_save_path = "/downloads"
 default_category = "cross-seed"
 default_tags = ["cross-seed"]
 
 [indexers.prowlarr.main]
 url = "http://prowlarr:9696"
-api_key_file = "/var/run/secrets/prowlarr-api-key"
+api_key_env = "PROWLARR_API_KEY"
 refresh_on_startup = true
 required = false
 remove_policy = "deactivate"

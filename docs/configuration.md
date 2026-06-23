@@ -1,11 +1,11 @@
 # Sporos Configuration
 
-Sporos reads TOML from `./config.toml` by default. Pass an explicit path with
+Sporos reads TOML from `/app/config.toml` by default. Pass an explicit path with
 `--config`:
 
 ```bash
-sporos check-config --config /etc/sporos/config.toml
-sporos serve --config /etc/sporos/config.toml
+sporos check-config --config /app/config.toml
+sporos serve --config /app/config.toml
 ```
 
 Use `sporos print-config-schema` to print the complete supported config shape.
@@ -17,14 +17,14 @@ paths.
 
 ```toml
 [paths]
-database = "/app/state/sporos.db"
-torrent_cache_dir = "/app/cache/torrents"
+database = "/app/sporos.db"
+torrent_cache_dir = "/app/cache"
 output_dir = "/app/output"
 media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
 bind = "0.0.0.0:2468"
-api_token_file = "/var/run/secrets/sporos-api-token"
+api_token_env = "SPOROS_API_TOKEN"
 
 [runtime]
 worker_threads = 4
@@ -38,7 +38,7 @@ manual_search_workflow_result_limit = 10000
 
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
-token_file = "/var/run/secrets/notification-token"
+token_env = "SPOROS_NOTIFICATION_TOKEN"
 timeout = "30s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
@@ -48,14 +48,14 @@ retry_max_delay = "30s"
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "sporos"
-password_file = "/var/run/secrets/qbit-password"
+password_env = "QBIT_PASSWORD"
 default_save_path = "/downloads"
 default_category = "cross-seed"
 default_tags = ["cross-seed", "sporos"]
 
 [indexers.torznab.main]
 url = "https://indexer.example/api"
-api_key_file = "/var/run/secrets/indexer-api-key"
+api_key_env = "INDEXER_API_KEY"
 
 [matching]
 mode = "partial"
@@ -164,7 +164,7 @@ qBittorrent supports username/password authentication:
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "sporos"
-password_file = "/var/run/secrets/qbit-password"
+password_env = "QBIT_PASSWORD"
 default_save_path = "/downloads"
 default_category = "cross-seed"
 default_tags = ["cross-seed", "sporos"]
@@ -206,7 +206,7 @@ request timeout, and bounded retry policy:
 ```toml
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
-token_file = "/var/run/secrets/notification-token"
+token_env = "SPOROS_NOTIFICATION_TOKEN"
 timeout = "30s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
@@ -315,7 +315,7 @@ Direct Torznab indexers live under `[indexers.torznab.<name>]`:
 ```toml
 [indexers.torznab.main]
 url = "https://indexer.example/api"
-api_key_file = "/var/run/secrets/indexer-api-key"
+api_key_env = "INDEXER_API_KEY"
 ```
 
 Prowlarr import is optional. Configure it when Sporos should import
@@ -324,7 +324,7 @@ Torznab-compatible torrent search endpoints from Prowlarr:
 ```toml
 [indexers.prowlarr.main]
 url = "https://prowlarr.example"
-api_key_file = "/var/run/secrets/prowlarr-api-key"
+api_key_env = "PROWLARR_API_KEY"
 update_interval = "24h"
 tags = ["movies", "hd"]
 tag_match = "any"
@@ -342,11 +342,11 @@ search planning:
 ```toml
 [indexers.arr.sonarr.main]
 url = "http://sonarr:8989"
-api_key_file = "/var/run/secrets/sonarr-api-key"
+api_key_env = "SONARR_API_KEY"
 
 [indexers.arr.radarr.main]
 url = "http://radarr:7878"
-api_key_file = "/var/run/secrets/radarr-api-key"
+api_key_env = "RADARR_API_KEY"
 ```
 
 ## Environment Overrides
@@ -356,7 +356,7 @@ underscores separate TOML path segments, and values are parsed as TOML scalars:
 
 ```bash
 SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/app/state/sporos.db"'
+SPOROS__PATHS__DATABASE='"/app/sporos.db"'
 SPOROS__RUNTIME__WORKER_THREADS='4'
 SPOROS__RUNTIME__MAX_BLOCKING_THREADS='64'
 SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT='100'
@@ -366,14 +366,14 @@ SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY='4'
 SPOROS__RUNTIME__MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT='1000'
 SPOROS__RUNTIME__MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT='10000'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-password"'
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_ENV='"QBIT_PASSWORD"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS='"cross-seed,sporos"'
 SPOROS__TORRENT_CLIENTS__RTORRENT_ARCHIVE__DEFAULT_LABEL='"cross-seed"'
 SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT='15.0'
 SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION='"inject_paused"'
-SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_FILE='"/var/run/secrets/indexer-api-key"'
-SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN_FILE='"/var/run/secrets/notification-token"'
+SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_ENV='"INDEXER_API_KEY"'
+SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN_ENV='"SPOROS_NOTIFICATION_TOKEN"'
 ```
 
 Arrays such as `paths.media_dirs` should be set in TOML. `default_tags` can be

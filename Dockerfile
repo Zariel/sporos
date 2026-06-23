@@ -67,33 +67,34 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 sporos \
-    && useradd --system --uid 10001 --gid sporos --home-dir /var/lib/sporos sporos \
-    && mkdir -p /app/state /app/cache/torrents /app/output /etc/sporos /var/lib/sporos /var/run/secrets \
-    && chown -R sporos:sporos /app /var/lib/sporos
+    && useradd --system --uid 10001 --gid sporos --home-dir /app sporos \
+    && mkdir -p /app/cache /app/output \
+    && chown -R sporos:sporos /app
 
-COPY --from=build /workspace/target/release/sporos /usr/local/bin/sporos
+COPY --from=build /workspace/target/release/sporos /app/sporos
 
 LABEL org.opencontainers.image.title="Sporos" \
       org.opencontainers.image.description="Torrent automation service" \
       org.opencontainers.image.licenses="MIT"
 
-ENV RUST_BACKTRACE=1 \
+ENV PATH=/app:$PATH \
+    RUST_BACKTRACE=1 \
     RUST_LIB_BACKTRACE=1 \
-    SPOROS__PATHS__DATABASE=/app/state/sporos.db \
-    SPOROS__PATHS__TORRENT_CACHE_DIR=/app/cache/torrents \
+    SPOROS__PATHS__DATABASE=/app/sporos.db \
+    SPOROS__PATHS__TORRENT_CACHE_DIR=/app/cache \
     SPOROS__PATHS__OUTPUT_DIR=/app/output
 
 USER 10001:10001
-WORKDIR /var/lib/sporos
+WORKDIR /app
 
 EXPOSE 2468
-VOLUME ["/app/state", "/app/cache/torrents", "/app/output"]
+VOLUME ["/app/cache", "/app/output"]
 
-ENTRYPOINT ["/usr/bin/tini", "--", "sporos"]
-CMD ["serve", "--config", "/etc/sporos/config.toml"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/sporos"]
+CMD ["serve"]
 
 FROM runtime AS system-test-support
 
-COPY --from=system-test-build /workspace/target/release/sporos-system-test-support /usr/local/bin/sporos-system-test-support
+COPY --from=system-test-build /workspace/target/release/sporos-system-test-support /app/sporos-system-test-support
 
 FROM runtime AS production

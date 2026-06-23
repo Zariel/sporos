@@ -71,10 +71,10 @@ changes.
 ## Services
 
 - `sporos` builds the system-test Docker target from the repository
-  `Dockerfile`, runs the production `sporos serve --config
-  /etc/sporos/config.toml` command, and includes the
+  `Dockerfile`, runs the production `/app/sporos serve` command with the
+  default `/app/config.toml` config path, and includes the
   `sporos-system-test-support` helper for harness-only setup and diagnostics.
-  The production runtime image target still copies only the `sporos` binary.
+  The production runtime image target still copies only `/app/sporos`.
 - `qbittorrent` runs qBittorrent Web API on the private compose network only.
 - `rtorrent` runs rTorrent with XML-RPC exposed only on the private compose
   network.
@@ -128,8 +128,8 @@ replace this with a password-hash seeding path if it needs auth-on coverage.
 Compose project names isolate runs. The runner sets a unique project name by
 default, which gives each run its own named volumes:
 
-- `sporos_state` -> `/app/state`
-- `torrent_cache` -> `/app/cache/torrents`
+- generated per-run `sporos.db` file -> `/app/sporos.db`
+- `torrent_cache` -> `/app/cache`
 - `output` -> `/app/output`
 - `downloads` -> `/downloads`
 - client config/session volumes for qBittorrent and rTorrent
@@ -212,9 +212,9 @@ docker compose --project-name "$SPOROS_SYSTEM_PROJECT" \
 ## Templates
 
 `config/sporos.toml.template` is a runnable Sporos config shape for the
-topology. The runner copies it into a unique run directory and overlays compose
-secrets with generated per-run values.
+topology. The runner copies it into a unique run directory, mounts a generated
+per-run database file at `/app/sporos.db`, and injects generated secret values
+through environment variables.
 
-`secrets/*.template` contain placeholder values only. They are not production
-secrets. They make `docker compose -f docker/system/compose.yml config` work
-without the runner.
+`secrets/*.template` contain legacy placeholder values only. They are not used
+by the current runner or compose topology.

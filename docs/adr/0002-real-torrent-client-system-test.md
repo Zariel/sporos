@@ -103,9 +103,9 @@ Use Docker Compose or an equivalent CI service topology:
 ```text
 system-runner
   -> sporos:local
-       /etc/sporos/config.toml
-       /app/state/sporos.db
-       /app/cache/torrents
+       /app/config.toml
+       /app/sporos.db
+       /app/cache
        /app/output
        /downloads
   -> qbittorrent:version-or-digest
@@ -188,7 +188,7 @@ covered separately.
 
 ### 1. Startup And Client Inventory
 
-Start `sporos serve --config /etc/sporos/config.toml` in the production image.
+Start `sporos serve --config /app/config.toml` in the production image.
 Wait for:
 
 - `GET /livez` to return `200`;

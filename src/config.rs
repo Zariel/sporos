@@ -11,7 +11,7 @@ use crate::announce::AnnounceQueueConfig;
 use crate::errors::ConfigError;
 use crate::secrets::{ApiKey, ApiToken, NotificationToken, Password};
 
-pub const DEFAULT_CONFIG_PATH: &str = "./config.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "/app/config.toml";
 pub const DEFAULT_INJECTION_METADATA: &str = "sporos";
 pub const MAX_RUNTIME_WORKER_THREADS: usize = 256;
 pub const MAX_RUNTIME_BLOCKING_THREADS: usize = 512;
@@ -57,8 +57,8 @@ pub struct PathsConfig {
 impl Default for PathsConfig {
     fn default() -> Self {
         Self {
-            database: PathBuf::from("state/sporos.db"),
-            torrent_cache_dir: PathBuf::from("cache/torrents"),
+            database: PathBuf::from("sporos.db"),
+            torrent_cache_dir: PathBuf::from("cache"),
             output_dir: PathBuf::from("output"),
             media_dirs: Vec::new(),
         }
@@ -1742,8 +1742,8 @@ api_key_env = "optional env var containing api key"
 
 [environment overrides]
 SPOROS__SERVER__BIND = "0.0.0.0:2468"
-SPOROS__SERVER__API_TOKEN_FILE = "/var/run/secrets/sporos-api-token"
-SPOROS__PATHS__DATABASE = "/app/state/sporos.db"
+SPOROS__SERVER__API_TOKEN_ENV = "SPOROS_API_TOKEN"
+SPOROS__PATHS__DATABASE = "/app/sporos.db"
 SPOROS__RUNTIME__WORKER_THREADS = "4"
 SPOROS__RUNTIME__MAX_BLOCKING_THREADS = "64"
 SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT = "100"
@@ -1753,7 +1753,7 @@ SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY = "4"
 SPOROS__RUNTIME__MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT = "1000"
 SPOROS__RUNTIME__MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT = "10000"
 SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__URL = "https://hooks.example/sporos"
-SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_FILE = "/var/run/secrets/notification-token"
+SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_ENV = "SPOROS_NOTIFICATION_TOKEN"
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
 SPOROS__INJECTION__RECHECK__SKIP_RECHECK = "false"
 SPOROS__INJECTION__RECHECK__MAX_REMAINING_BYTES = "104857600"
@@ -1768,13 +1768,13 @@ SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION = "inject_paused"
 SPOROS__INJECTION__LINK_TYPE = "hardlink"
 SPOROS__INJECTION__FLAT_LINKING = "true"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE = "/var/run/secrets/qbit-password"
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_ENV = "QBIT_PASSWORD"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY = "cross-seed"
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS = "cross-seed,sporos"
 SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL = "cross-seed"
-SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY_FILE = "/var/run/secrets/indexer-api-key"
-SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE = "/var/run/secrets/prowlarr-api-key"
-SPOROS__INDEXERS__ARR__SONARR__MAIN__API_KEY_FILE = "/var/run/secrets/sonarr-api-key"
+SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY_ENV = "INDEXER_API_KEY"
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV = "PROWLARR_API_KEY"
+SPOROS__INDEXERS__ARR__SONARR__MAIN__API_KEY_ENV = "SONARR_API_KEY"
 
 [matching]
 mode = "exact|partial"
@@ -1831,17 +1831,17 @@ remote_candidate_retention_secs = 2592000
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
 
     #[test]
     fn parses_typed_toml_config() {
-        let config = parse_config(
+        let config = parse_config_with_env(
             r#"
             [paths]
-            database = "/app/state/sporos.db"
-            torrent_cache_dir = "/app/cache/torrents"
+            database = "/app/sporos.db"
+            torrent_cache_dir = "/app/cache"
             output_dir = "/app/output"
             media_dirs = ["/media/movies"]
 
@@ -1870,12 +1870,12 @@ mod tests {
             kind = "qbittorrent"
             url = "http://qbittorrent:8080"
             username = "sporos"
-            password_file = "/var/run/secrets/qbit-password"
+            password_env = "QBIT_PASSWORD"
             default_save_path = "/downloads"
 
             [indexers.torznab.main]
             url = "https://indexer.example/api"
-            api_key_file = "/var/run/secrets/indexer-api-key"
+            api_key_env = "INDEXER_API_KEY"
 
             [injection]
             dry_run = true
@@ -1890,6 +1890,10 @@ mod tests {
             saved_retry_interval = "15m"
             cleanup_interval = "2h"
             "#,
+            vec![
+                ("QBIT_PASSWORD".to_owned(), "qbit-secret".to_owned()),
+                ("INDEXER_API_KEY".to_owned(), "indexer-secret".to_owned()),
+            ],
         )
         .unwrap();
 
@@ -1921,12 +1925,12 @@ mod tests {
         assert_eq!(1, config.torrent_clients.len());
         assert_eq!(1, config.indexers.torznab.len());
         assert_eq!(
-            Some("/var/run/secrets/qbit-password"),
+            Some("qbit-secret"),
             config
                 .torrent_clients
                 .get("qbit_main")
-                .and_then(|client| client.password_file.as_deref())
-                .and_then(Path::to_str)
+                .and_then(|client| client.password.as_ref())
+                .map(Password::expose_secret)
         );
         let client = &config.torrent_clients["qbit_main"];
         assert_eq!(None, client.default_category);
@@ -2606,8 +2610,8 @@ mod tests {
         let config = parse_startup_config("", &cwd).unwrap();
         let cwd = cwd.canonicalize().unwrap();
 
-        assert_eq!(cwd.join("state/sporos.db"), config.paths.database);
-        assert_eq!(cwd.join("cache/torrents"), config.paths.torrent_cache_dir);
+        assert_eq!(cwd.join("sporos.db"), config.paths.database);
+        assert_eq!(cwd.join("cache"), config.paths.torrent_cache_dir);
         assert_eq!(cwd.join("output"), config.paths.output_dir);
         assert!(config.paths.database.parent().unwrap().is_dir());
         assert!(config.paths.torrent_cache_dir.is_dir());
@@ -2622,7 +2626,7 @@ mod tests {
         let error = parse_startup_config(
             r#"
             [paths]
-            database = "state/sporos.db"
+            database = "sporos.db"
             "#,
             &cwd,
         )
@@ -2637,8 +2641,8 @@ mod tests {
     #[test]
     fn startup_config_creates_configured_state_directories() {
         let cwd = unique_temp_dir("configured-state");
-        let database = cwd.join("state/nested/sporos.db");
-        let torrent_cache_dir = cwd.join("cache/torrents");
+        let database = cwd.join("nested/sporos.db");
+        let torrent_cache_dir = cwd.join("cache");
         let output_dir = cwd.join("output");
         let contents = format!(
             r#"
@@ -2712,8 +2716,8 @@ mod tests {
     #[test]
     fn startup_config_env_overrides_resolve_container_style_paths() {
         let cwd = unique_temp_dir("env-container");
-        let database = cwd.join("app/state/sporos.db");
-        let torrent_cache_dir = cwd.join("app/cache/torrents");
+        let database = cwd.join("app/sporos.db");
+        let torrent_cache_dir = cwd.join("app/cache");
         let output_dir = cwd.join("app/output");
 
         let config = parse_startup_config_with_env(
@@ -2757,10 +2761,7 @@ mod tests {
         let error = parse_startup_config_with_env(
             "",
             &cwd,
-            vec![(
-                "SPOROS__PATHS__DATABASE".to_owned(),
-                "state/sporos.db".to_owned(),
-            )],
+            vec![("SPOROS__PATHS__DATABASE".to_owned(), "sporos.db".to_owned())],
         )
         .unwrap_err();
 
@@ -2776,8 +2777,8 @@ mod tests {
         let contents = format!(
             r#"
             [paths]
-            database = "{}/state/sporos.db"
-            torrent_cache_dir = "{}/cache/torrents"
+            database = "{}/sporos.db"
+            torrent_cache_dir = "{}/cache"
             output_dir = "{}/output"
 
             [server]
@@ -2814,8 +2815,8 @@ mod tests {
         let contents = format!(
             r#"
             [paths]
-            database = "{}/state/sporos.db"
-            torrent_cache_dir = "{}/cache/torrents"
+            database = "{}/sporos.db"
+            torrent_cache_dir = "{}/cache"
             output_dir = "{}/output"
 
             [server]
@@ -2910,8 +2911,8 @@ mod tests {
         let contents = format!(
             r#"
             [paths]
-            database = "{}/state/sporos.db"
-            torrent_cache_dir = "{}/cache/torrents"
+            database = "{}/sporos.db"
+            torrent_cache_dir = "{}/cache"
             output_dir = "{}/output"
 
             [torrent_clients.qbit_main]
@@ -2941,8 +2942,8 @@ mod tests {
         let contents = format!(
             r#"
             [paths]
-            database = "{}/state/sporos.db"
-            torrent_cache_dir = "{}/cache/torrents"
+            database = "{}/sporos.db"
+            torrent_cache_dir = "{}/cache"
             output_dir = "{}/output"
 
             [indexers.prowlarr.future]
@@ -2996,8 +2997,8 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS"));
         assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_FILE"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_ENV"));
     }
 
     #[test]
@@ -3017,17 +3018,30 @@ mod tests {
         let configuration = include_str!("../docs/configuration.md");
         let guide_example = notification_example(guide);
         let configuration_example = notification_example(configuration);
-        let config = parse_config(guide_example).unwrap();
+        let config = parse_config_with_env(
+            guide_example,
+            vec![(
+                "SPOROS_NOTIFICATION_TOKEN".to_owned(),
+                "notification-secret".to_owned(),
+            )],
+        )
+        .unwrap();
         let endpoint = &config.notifications.endpoints["ops"];
 
         assert_eq!(configuration_example.trim(), guide_example.trim());
         assert_eq!("https://hooks.example/sporos", endpoint.url);
+        assert_eq!(None, endpoint.token_file.as_deref());
         assert_eq!(
-            Some(Path::new("/var/run/secrets/notification-token")),
-            endpoint.token_file.as_deref()
+            Some("SPOROS_NOTIFICATION_TOKEN"),
+            endpoint.token_env.as_deref()
         );
-        assert_eq!(None, endpoint.token_env);
-        assert_eq!(None, endpoint.token);
+        assert_eq!(
+            Some("notification-secret"),
+            endpoint
+                .token
+                .as_ref()
+                .map(NotificationToken::expose_secret)
+        );
         assert_eq!("30s", endpoint.timeout);
         assert_eq!(3, endpoint.retry_max_attempts);
         assert_eq!("1s", endpoint.retry_initial_delay);
@@ -3061,7 +3075,7 @@ mod tests {
         let config = parse_config_with_env(
             r#"
             [paths]
-            database = "/app/state/sporos.db"
+            database = "/app/sporos.db"
 
             [server]
             bind = "127.0.0.1:2468"
@@ -3440,7 +3454,7 @@ mod tests {
                 [indexers.prowlarr.main]
                 url = "https://prowlarr.example"
                 api_key = "direct"
-                api_key_file = "/var/run/secrets/prowlarr"
+                api_key_file = "/tmp/prowlarr-api-key"
                 "#,
                 "only one",
             ),
@@ -3522,7 +3536,7 @@ mod tests {
             r#"
             [server]
             api_token = "direct"
-            api_token_file = "/var/run/secrets/sporos-api-token"
+            api_token_env = "SPOROS_API_TOKEN"
             "#,
         )
         .unwrap_err();
@@ -3586,7 +3600,7 @@ mod tests {
             [indexers.torznab.example]
             url = "https://indexer.example/api"
             api_key = "direct"
-            api_key_file = "/var/run/secrets/indexer-api-key"
+            api_key_env = "INDEXER_API_KEY"
             "#,
         )
         .unwrap_err();

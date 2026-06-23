@@ -63,7 +63,7 @@ esac
 mkdir -p "$run_root"
 run_dir=$(mktemp -d "$run_root/$project_name.XXXXXX")
 config_dir="$run_dir/config"
-secrets_dir="$run_dir/secrets"
+db_file="$run_dir/sporos.db"
 diagnostics_dir="$run_dir/diagnostics"
 diagnostics_archive=
 override_file="$run_dir/compose.override.yml"
@@ -183,10 +183,10 @@ collect_diagnostics() {
     collect_command "$diagnostics_dir/compose-logs.txt" compose logs --no-color --tail 300
     collect_sporos_json "database.json" \
       system-test-diagnostics \
-      --config /etc/sporos/config.toml
+      --config /app/config.toml
     collect_sporos_json "client-state.json" \
       system-test-client-state \
-      --config /etc/sporos/config.toml \
+      --config /app/config.toml \
       --manifest /system-fixtures/manifest.json
   fi
   collect_probe "livez.json" "/livez"
@@ -227,23 +227,20 @@ fi
 sporos_api_token=$(openssl rand -hex 24)
 qbittorrent_password=$(openssl rand -hex 24)
 
-mkdir -p "$config_dir" "$secrets_dir" "$diagnostics_dir"
+mkdir -p "$config_dir" "$diagnostics_dir"
 cp "$repo_root/docker/system/config/sporos.toml.template" "$config_dir/sporos.toml"
-printf '%s\n' "$sporos_api_token" > "$secrets_dir/sporos-api-token"
-printf '%s\n' "$qbittorrent_password" > "$secrets_dir/qbittorrent-password"
-chmod 600 "$secrets_dir/sporos-api-token" "$secrets_dir/qbittorrent-password"
+touch "$db_file"
+chmod 666 "$db_file"
 
 cat > "$override_file" <<EOF
 services:
   sporos:
+    environment:
+      SPOROS_API_TOKEN: "$sporos_api_token"
+      QBITTORRENT_PASSWORD: "$qbittorrent_password"
     volumes:
-      - "$config_dir/sporos.toml:/etc/sporos/config.toml:ro"
-
-secrets:
-  sporos_api_token:
-    file: "$secrets_dir/sporos-api-token"
-  qbittorrent_password:
-    file: "$secrets_dir/qbittorrent-password"
+      - "$config_dir/sporos.toml:/app/config.toml:ro"
+      - "$db_file:/app/sporos.db"
 EOF
 
 wait_for_http() {
@@ -295,7 +292,7 @@ wait_for_internal_http "qBittorrent Web API" "wget -qO- http://qbittorrent:8080/
 wait_for_internal_http "rTorrent XML-RPC" "wget -qO- --header='Content-Type: text/xml' --post-data='<methodCall><methodName>download_list</methodName><params></params></methodCall>' http://rtorrent:8000/RPC2"
 wait_for_internal_http "Torznab fixture caps" "wget -qO- 'http://torznab-fixture:8080/api?t=caps'"
 compose exec -T sporos sporos-system-test-support system-test-seed \
-  --config /etc/sporos/config.toml \
+  --config /app/config.toml \
   --manifest /system-fixtures/manifest.json \
   --indexer fixture
 
@@ -305,7 +302,7 @@ SPOROS_SYSTEM_API_TOKEN=$sporos_api_token
 SPOROS_SYSTEM_PROJECT=$project_name
 SPOROS_SYSTEM_COMPOSE_FILE=$compose_file
 SPOROS_SYSTEM_COMPOSE_OVERRIDE=$override_file
-SPOROS_SYSTEM_CONTAINER_CONFIG=/etc/sporos/config.toml
+SPOROS_SYSTEM_CONTAINER_CONFIG=/app/config.toml
 SPOROS_SYSTEM_CONTAINER_MANIFEST=/system-fixtures/manifest.json
 EOF
 export SPOROS_SYSTEM_HTTP_URL="http://127.0.0.1:$http_port"
@@ -313,7 +310,7 @@ export SPOROS_SYSTEM_API_TOKEN="$sporos_api_token"
 export SPOROS_SYSTEM_PROJECT="$project_name"
 export SPOROS_SYSTEM_COMPOSE_FILE="$compose_file"
 export SPOROS_SYSTEM_COMPOSE_OVERRIDE="$override_file"
-export SPOROS_SYSTEM_CONTAINER_CONFIG="/etc/sporos/config.toml"
+export SPOROS_SYSTEM_CONTAINER_CONFIG="/app/config.toml"
 export SPOROS_SYSTEM_CONTAINER_MANIFEST="/system-fixtures/manifest.json"
 
 cargo test --test system -- --ignored --nocapture

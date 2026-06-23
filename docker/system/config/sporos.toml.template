@@ -1,18 +1,18 @@
 [paths]
-database = "/app/state/sporos.db"
-torrent_cache_dir = "/app/cache/torrents"
+database = "/app/sporos.db"
+torrent_cache_dir = "/app/cache"
 output_dir = "/app/output"
 media_dirs = ["/downloads"]
 
 [server]
 bind = "0.0.0.0:2468"
-api_token_file = "/var/run/secrets/sporos-api-token"
+api_token_env = "SPOROS_API_TOKEN"
 
 [torrent_clients.qbittorrent]
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "admin"
-password_file = "/var/run/secrets/qbittorrent-password"
+password_env = "QBITTORRENT_PASSWORD"
 default_save_path = "/downloads/qbittorrent"
 default_category = "sporos-system"
 default_tags = ["sporos", "system-test"]

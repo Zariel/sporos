@@ -9,13 +9,13 @@ day-two operation.
 Run Sporos with an explicit config file:
 
 ```bash
-sporos serve --config /etc/sporos/config.toml
+sporos serve --config /app/config.toml
 ```
 
 Validate the same typed config path before deployment:
 
 ```bash
-sporos check-config --config /etc/sporos/config.toml
+sporos check-config --config /app/config.toml
 ```
 
 Print the supported config surface:
@@ -45,35 +45,39 @@ the runtime image enables Rust backtraces by default, so operator issue reports
 can include useful stack frames. Runtime image contents are limited to the
 binary, Debian CA certificates, a minimal init process, and the service user.
 
-Run the container with operator-owned config, state, cache, output, media, and
-secret mounts:
+Run the container with operator-owned config, database, cache, output, and media
+mounts. Provide secrets through environment variables supplied by the runtime:
 
 ```bash
 docker run --rm \
   --name sporos \
   --stop-timeout 60 \
   -p 2468:2468 \
-  -v ./config.toml:/etc/sporos/config.toml:ro \
-  -v ./secrets/sporos-api-token:/var/run/secrets/sporos-api-token:ro \
-  -v ./secrets/qbit-password:/var/run/secrets/qbit-password:ro \
-  -v ./secrets/indexer-api-key:/var/run/secrets/indexer-api-key:ro \
-  -v ./secrets/prowlarr-api-key:/var/run/secrets/prowlarr-api-key:ro \
-  -v sporos-state:/app/state \
-  -v sporos-cache:/app/cache/torrents \
+  -e SPOROS_API_TOKEN \
+  -e QBIT_PASSWORD \
+  -e INDEXER_API_KEY \
+  -e PROWLARR_API_KEY \
+  -v ./config.toml:/app/config.toml:ro \
+  -v ./sporos.db:/app/sporos.db \
+  -v sporos-cache:/app/cache \
   -v sporos-output:/app/output \
   -v /srv/media:/media:ro \
   sporos:local
 ```
+
+Create `./sporos.db` before using the Docker bind example. In Kubernetes, mount
+the database PVC at `/app/sporos.db` with `subPath` so the binary and
+`/app/config.toml` from the image or ConfigMap remain visible. Mount
+`/app/cache` and `/app/output` as separate directories when those should be
+backed up or managed independently.
 
 The image runs as UID/GID `10001`. Mounted writable paths for
 `paths.database`, `paths.torrent_cache_dir`, and `paths.output_dir` must be
 writable by that identity, or by a runtime user override chosen by the operator.
 Container defaults place those three paths under `/app` even when the mounted
 config omits them.
-Mount secret files read-only and point config fields such as
-`server.api_token_file`, torrent-client password files, and indexer API key
-files at those paths. Use a stop timeout long enough for graceful shutdown to
-drain in-flight work; 60 seconds is a conservative starting point for Docker.
+Use a stop timeout long enough for graceful shutdown to drain in-flight work; 60
+seconds is a conservative starting point for Docker.
 Deployment topology, orchestration, resource requests, and restart policy are
 intentionally left to the operator.
 
@@ -84,20 +88,20 @@ absolute. Local defaults are resolved to absolute paths during startup.
 
 ```toml
 [paths]
-database = "/app/state/sporos.db"
-torrent_cache_dir = "/app/cache/torrents"
+database = "/app/sporos.db"
+torrent_cache_dir = "/app/cache"
 output_dir = "/app/output"
 media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
 bind = "0.0.0.0:2468"
-api_token_file = "/var/run/secrets/sporos-api-token"
+api_token_env = "SPOROS_API_TOKEN"
 
 [torrent_clients.qbit_main]
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "sporos"
-password_file = "/var/run/secrets/qbit-password"
+password_env = "QBIT_PASSWORD"
 default_save_path = "/downloads"
 default_category = "cross-seed"
 default_tags = ["cross-seed", "sporos"]
@@ -115,11 +119,11 @@ download = "30s"
 
 [indexers.torznab.main]
 url = "https://indexer.example/api"
-api_key_file = "/var/run/secrets/indexer-api-key"
+api_key_env = "INDEXER_API_KEY"
 
 [indexers.prowlarr.main]
 url = "https://prowlarr.example"
-api_key_file = "/var/run/secrets/prowlarr-api-key"
+api_key_env = "PROWLARR_API_KEY"
 update_interval = "24h"
 tags = ["movies", "hd"]
 tag_match = "any"
@@ -130,7 +134,7 @@ remove_policy = "deactivate"
 
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
-token_file = "/var/run/secrets/notification-token"
+token_env = "SPOROS_NOTIFICATION_TOKEN"
 timeout = "30s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
@@ -238,7 +242,7 @@ from Prowlarr instead of listing every indexer under `indexers.torznab`.
 ```toml
 [indexers.prowlarr.main]
 url = "https://prowlarr.example"
-api_key_file = "/var/run/secrets/prowlarr-api-key"
+api_key_env = "PROWLARR_API_KEY"
 update_interval = "24h"
 tags = ["movies", "hd"]
 tag_match = "any"
@@ -255,11 +259,10 @@ query parameter. Sporos contacts `/api/v1/indexer`, reads tag labels from
 URLs through the configured Prowlarr source.
 
 Prowlarr API keys support `api_key_file`, `api_key_env`, and local-development
-`api_key`, with the same one-source-only rule as direct Torznab keys. For
-Kubernetes, mount the key as a secret file and point `api_key_file` at the
-mounted path. If the key is provided through the process environment instead,
-set the TOML field to `api_key_env = "PROWLARR_API_KEY"` or use an environment
-override such as:
+`api_key`, with the same one-source-only rule as direct Torznab keys. The
+container examples use environment-backed secrets for Kubernetes: set the TOML
+field to `api_key_env = "PROWLARR_API_KEY"` or use an environment override such
+as:
 
 ```bash
 SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV='"PROWLARR_API_KEY"'
@@ -342,15 +345,15 @@ set `paths.media_dirs` in TOML.
 
 ```bash
 SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/app/state/sporos.db"'
+SPOROS__PATHS__DATABASE='"/app/sporos.db"'
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD='0.02'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_FILE='"/var/run/secrets/qbit-password"'
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_ENV='"QBIT_PASSWORD"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS='"cross-seed,sporos"'
 SPOROS__TORRENT_CLIENTS__RTORRENT_ARCHIVE__DEFAULT_LABEL='"cross-seed"'
-SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_FILE='"/var/run/secrets/indexer-api-key"'
-SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_FILE='"/var/run/secrets/prowlarr-api-key"'
+SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_ENV='"INDEXER_API_KEY"'
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV='"PROWLARR_API_KEY"'
 ```
 
 Override values are parsed as TOML scalars first. Quote string values when the
@@ -371,7 +374,8 @@ Torrent client passwords support `password`, `password_file`, and
 `token_file`, and `token_env`; configure no endpoints to keep notification
 delivery disabled.
 
-Use file or environment-backed secrets in production. Inline `password`,
+Use environment-backed secrets in Kubernetes. File-backed secrets are still
+supported when an operator intentionally mounts secret files. Inline `password`,
 `api_key`, and notification `token` values are for local development. Secret
 wrappers redact debug and display output, and operator endpoints intentionally
 avoid exposing request cookies, API keys, passkeys, and secret-bearing URLs.
@@ -413,11 +417,13 @@ roots.
 
 Back up the SQLite database and any saved torrent/output directories together.
 For a consistent SQLite backup, stop the writer or use SQLite backup tooling
-against the mounted state volume. The torrent cache can be recreated from
-indexers, but preserving it avoids unnecessary redownloads. Protect backups
-with the same filesystem, host, and off-host access controls as production
-secrets because they may include plaintext URLs, cookies, tracker metadata,
-client paths, media titles, and cached torrent files.
+against the mounted database file. The default container paths are
+`/app/sporos.db`, `/app/cache`, and `/app/output`, which allows each state class
+to be mounted and backed up separately in Kubernetes. The torrent cache can be
+recreated from indexers, but preserving it avoids unnecessary redownloads.
+Protect backups with the same filesystem, host, and off-host access controls as
+production secrets because they may include plaintext URLs, cookies, tracker
+metadata, client paths, media titles, and cached torrent files.
 
 ## HTTP Surface
 
@@ -473,7 +479,7 @@ Notifications are optional webhook deliveries. Configure endpoints under
 ```toml
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
-token_file = "/var/run/secrets/notification-token"
+token_env = "SPOROS_NOTIFICATION_TOKEN"
 timeout = "30s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
@@ -567,7 +573,7 @@ Use read-only diagnostics first:
 Use side-effecting diagnostics when you want to validate writable state or
 trigger daemon work:
 
-- `sporos check-config --config /etc/sporos/config.toml`: parses and validates
+- `sporos check-config --config /app/config.toml`: parses and validates
   config, creates required local state directories, and probes writable state
   paths.
 - `POST /v1/jobs/indexer_caps/runs`: queues durable scheduler work and updates

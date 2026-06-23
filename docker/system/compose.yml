@@ -19,19 +19,16 @@ services:
         condition: service_started
       torznab-fixture:
         condition: service_started
-    command: ["serve", "--config", "/etc/sporos/config.toml"]
+    command: ["serve"]
     ports:
       - "127.0.0.1:${SPOROS_SYSTEM_HTTP_PORT:-2468}:2468"
-    secrets:
-      - source: sporos_api_token
-        target: /var/run/secrets/sporos-api-token
-      - source: qbittorrent_password
-        target: /var/run/secrets/qbittorrent-password
+    environment:
+      SPOROS_API_TOKEN: replace-me-sporos-api-token
+      QBITTORRENT_PASSWORD: replace-me-qbittorrent-password
     volumes:
-      - ./config/sporos.toml.template:/etc/sporos/config.toml:ro
+      - ./config/sporos.toml.template:/app/config.toml:ro
       - ./fixtures:/system-fixtures:ro
-      - sporos_state:/app/state
-      - torrent_cache:/app/cache/torrents
+      - torrent_cache:/app/cache
       - output:/app/output
       - downloads:/downloads
     networks:
@@ -119,16 +116,9 @@ networks:
     internal: true
 
 volumes:
-  sporos_state:
   torrent_cache:
   output:
   downloads:
   qbittorrent_config:
   rtorrent_data:
   rtorrent_passwd:
-
-secrets:
-  sporos_api_token:
-    file: ./secrets/sporos-api-token.template
-  qbittorrent_password:
-    file: ./secrets/qbittorrent-password.template
