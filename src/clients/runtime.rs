@@ -703,6 +703,10 @@ mod tests {
                 )
                 .route("/api/v2/app/version", get(|| async { "4.6.0" }))
                 .route(
+                    "/api/v2/torrents/categories",
+                    get(|| async { r#"{"movies":{"name":"movies","savePath":"/downloads"}}"# }),
+                )
+                .route(
                     "/api/v2/torrents/createTags",
                     post(move |request: Request<Body>| {
                         let seen_create_tag_bodies = seen_create_tag_bodies.clone();
@@ -710,7 +714,7 @@ mod tests {
                             let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
                             let body = String::from_utf8(body.to_vec()).unwrap();
                             seen_create_tag_bodies.lock().unwrap().push(body);
-                            StatusCode::OK
+                            StatusCode::CONFLICT
                         }
                     }),
                 )
@@ -722,7 +726,7 @@ mod tests {
                             let body = to_bytes(request.into_body(), 1_000_000).await.unwrap();
                             let body = String::from_utf8(body.to_vec()).unwrap();
                             *seen_create_category_body.lock().unwrap() = Some(body);
-                            StatusCode::OK
+                            StatusCode::CONFLICT
                         }
                     }),
                 )
@@ -770,6 +774,62 @@ mod tests {
             assert!(body.contains("name=\"category\"\r\n\r\nmovies"));
             assert!(body.contains("name=\"paused\"\r\n\r\ntrue"));
             assert!(body.contains("name=\"skip_checking\"\r\n\r\nfalse"));
+        }
+
+        #[tokio::test]
+        async fn qbittorrent_rejects_category_conflict_when_category_is_absent() {
+            let add_calls = Arc::new(AtomicUsize::new(0));
+            let add_call_counter = add_calls.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/api/v2/auth/login",
+                    post(|| async { ([(axum::http::header::SET_COOKIE, "SID=ok")], "Ok") }),
+                )
+                .route("/api/v2/app/version", get(|| async { "4.6.0" }))
+                .route(
+                    "/api/v2/torrents/categories",
+                    get(|| async { r#"{"other":{"name":"other","savePath":"/downloads"}}"# }),
+                )
+                .route(
+                    "/api/v2/torrents/createTags",
+                    post(|| async { StatusCode::OK }),
+                )
+                .route(
+                    "/api/v2/torrents/createCategory",
+                    post(|| async { StatusCode::CONFLICT }),
+                )
+                .route(
+                    "/api/v2/torrents/add",
+                    post(move || {
+                        let add_call_counter = add_call_counter.clone();
+                        async move {
+                            add_call_counter.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }),
+                );
+            let (base_url, handle) = spawn_contract_server(app).await;
+            let descriptor =
+                torrent_client_descriptor("qbit", TorrentClientKind::Qbittorrent, base_url.clone());
+            let mut config = torrent_client_config(ConfigTorrentClientKind::Qbittorrent, base_url);
+            config.default_category = Some("movies".to_owned());
+            let client =
+                RuntimeInjectionClient::new("qbit", &config, descriptor, MetricsRegistry::new());
+            let info_hash = test_info_hash();
+
+            let error = client
+                .inject(ClientInjectionRequest {
+                    info_hash: &info_hash,
+                    torrent_bytes: b"torrent bytes",
+                    save_path: None,
+                    pause_for_recheck: false,
+                })
+                .await
+                .unwrap_err();
+
+            handle.abort();
+            assert!(matches!(error, TorrentClientError::Unavailable { .. }));
+            assert_eq!(0, add_calls.load(Ordering::SeqCst));
         }
 
         #[tokio::test]

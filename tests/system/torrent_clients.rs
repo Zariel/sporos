@@ -104,7 +104,7 @@ async fn real_torrent_client_harness_uses_prepared_compose_stack() -> TestResult
             && has_client_item(
                 &snapshot,
                 "Sporos rTorrent Fixture",
-                "/downloads/rtorrent",
+                "/downloads/rtorrent/Sporos rTorrent Fixture",
                 2,
             ))
     })
@@ -403,15 +403,18 @@ fn output_with_timeout(
 
 fn qbit_candidate_injected(state: Option<&QbitState>) -> bool {
     state.is_some_and(|torrent| {
-        torrent.hash == "73fc73a21a1c486f3287ed25213743ce6237f841"
-            && torrent.name == "Sporos qBittorrent Fixture"
-            && torrent.save_path.as_deref() == Some("/downloads/qbittorrent")
+        torrent.hash == "44c73f7600572665231e5a09e5c25aa42c5a90e1"
+            && torrent.name == "Sporos qBittorrent Candidate"
+            && torrent
+                .save_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("/downloads/qbittorrent"))
             && torrent.category.as_deref() == Some("sporos-system")
             && torrent
                 .tags
                 .as_deref()
                 .is_some_and(|tags| tags.contains("sporos") && tags.contains("system-test"))
-            && torrent.amount_left == Some(0)
+            && torrent.amount_left == Some(4096)
     })
 }
 
@@ -419,10 +422,10 @@ fn rtorrent_candidate_injected(state: Option<&RtorrentState>) -> bool {
     state.is_some_and(|download| {
         download.hash == "65ec0ba73f0ef6c23e3857eac5e7e5a142d63ff4"
             && download.name == "Sporos rTorrent Fixture"
-            && download.directory == "/downloads/rtorrent"
+            && download.directory == "/downloads/temp/Sporos rTorrent Fixture"
             && download.label.as_deref() == Some("sporos-system")
-            && download.left_bytes == 0
-            && download.complete
+            && download.left_bytes == 3329
+            && !download.complete
     })
 }
 

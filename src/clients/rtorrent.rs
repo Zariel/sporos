@@ -1016,7 +1016,7 @@ fn is_missing_download_error(error: &TorrentClientError) -> bool {
 
 fn is_missing_download_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("could not find")
+    (lower.contains("could not find") || lower.contains("not found"))
         && (lower.contains("info-hash")
             || lower.contains("info hash")
             || lower.contains("download")
@@ -1370,6 +1370,25 @@ mod tests {
             std::iter::repeat_with(missing_download_fault)
                 .take(INVENTORY_METHODS.len())
                 .collect(),
+        );
+
+        let download = parse_optional_inventory_response("rtorrent", &hash, &rows).unwrap();
+
+        assert!(download.is_none());
+    }
+
+    #[test]
+    fn optional_inventory_response_maps_rtorrent_not_found_fault_to_none() {
+        let hash = InfoHash::new(SHA1).unwrap();
+        let rows = XmlRpcValue::Array(
+            std::iter::repeat_with(|| {
+                XmlRpcValue::Struct(BTreeMap::from([(
+                    "faultString".to_owned(),
+                    XmlRpcValue::String("invalid parameters: info-hash not found".to_owned()),
+                )]))
+            })
+            .take(INVENTORY_METHODS.len())
+            .collect(),
         );
 
         let download = parse_optional_inventory_response("rtorrent", &hash, &rows).unwrap();

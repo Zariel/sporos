@@ -84,11 +84,11 @@ changes.
   ownership before the long-running services start.
 
 The only published port is Sporos HTTP. The runner defaults
-`SPOROS_SYSTEM_HTTP_PORT` to `0`, so Docker chooses an ephemeral host port unless
-you set the variable explicitly. The resolved URL is exported to
-`SPOROS_SYSTEM_HTTP_URL` in the run directory's `system-test.env`.
+`SPOROS_SYSTEM_HTTP_PORT` to `2468`; set the variable explicitly when that host
+port is unavailable. The resolved URL is exported to `SPOROS_SYSTEM_HTTP_URL`
+in the run directory's `system-test.env`.
 qBittorrent, rTorrent XML-RPC, and the Torznab fixture are reachable only from
-containers on the private `system` network.
+containers on the `system` network and are not published to the host.
 
 ## Image Pins
 

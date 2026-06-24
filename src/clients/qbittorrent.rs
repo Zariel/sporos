@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -301,7 +302,7 @@ impl QbittorrentClient {
     }
 
     pub async fn create_tag(&self, tag: &str) -> Result<(), TorrentClientError> {
-        self.post_form("/api/v2/torrents/createTags", &[("tags", tag)])
+        self.post_form_accept_conflict("/api/v2/torrents/createTags", &[("tags", tag)])
             .await
     }
 
@@ -315,8 +316,23 @@ impl QbittorrentClient {
         if let Some(save_path) = save_path {
             fields.push(("savePath".to_owned(), save_path));
         }
-        self.post_owned_form("/api/v2/torrents/createCategory", &fields)
+        match self
+            .post_owned_form("/api/v2/torrents/createCategory", &fields)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if is_http_conflict(&error) => {
+                if self
+                    .category_exists(category, fields.iter().find_map(requested_save_path))
+                    .await?
+                {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn recheck(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
@@ -408,6 +424,22 @@ impl QbittorrentClient {
         read_client_text(response, &self.client_name, QBIT_RESPONSE_MAX_BYTES).await
     }
 
+    async fn category_exists(
+        &self,
+        category: &str,
+        expected_save_path: Option<&str>,
+    ) -> Result<bool, TorrentClientError> {
+        let text = self.get_text("/api/v2/torrents/categories").await?;
+        let categories: BTreeMap<String, QbitCategory> =
+            serde_json::from_str(&text).map_err(|error| TorrentClientError::BadResponse {
+                client: self.client_name.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(categories.get(category).is_some_and(|existing| {
+            expected_save_path.is_none_or(|save_path| existing.save_path == save_path)
+        }))
+    }
+
     async fn post_form(
         &self,
         path: &str,
@@ -437,6 +469,43 @@ impl QbittorrentClient {
                 }
                 request
             })
+            .await?;
+        drop(response);
+        Ok(())
+    }
+
+    async fn post_form_accept_conflict(
+        &self,
+        path: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<(), TorrentClientError> {
+        let owned = fields
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>();
+        self.post_owned_form_accept_conflict(path, &owned).await
+    }
+
+    async fn post_owned_form_accept_conflict(
+        &self,
+        path: &str,
+        fields: &[(String, String)],
+    ) -> Result<(), TorrentClientError> {
+        let response = self
+            .send_with_session_accepting(
+                |cookie| {
+                    let mut request = self
+                        .client
+                        .post(self.url(path))
+                        .timeout(self.timeout)
+                        .form(fields);
+                    if let Some(cookie) = cookie {
+                        request = request.header(COOKIE, cookie);
+                    }
+                    request
+                },
+                |status| status.is_success() || status == StatusCode::CONFLICT,
+            )
             .await?;
         drop(response);
         Ok(())
@@ -485,6 +554,37 @@ impl QbittorrentClient {
         success_response(&self.client_name, response)
     }
 
+    async fn send_with_session_accepting<F, A>(
+        &self,
+        build: F,
+        accept: A,
+    ) -> Result<reqwest::Response, TorrentClientError>
+    where
+        F: Fn(Option<&str>) -> reqwest::RequestBuilder,
+        A: Fn(StatusCode) -> bool,
+    {
+        self.ensure_session().await?;
+        let cookie = self.cookie.lock().await.clone();
+        let response = build(cookie.as_deref())
+            .send()
+            .await
+            .map_err(|error| unavailable(&self.client_name, request_error_message(error)))?;
+        if response.status() != StatusCode::FORBIDDEN
+            && response.status() != StatusCode::UNAUTHORIZED
+        {
+            return accepted_response(&self.client_name, response, &accept);
+        }
+
+        *self.cookie.lock().await = None;
+        self.login().await?;
+        let cookie = self.cookie.lock().await.clone();
+        let response = build(cookie.as_deref())
+            .send()
+            .await
+            .map_err(|error| unavailable(&self.client_name, request_error_message(error)))?;
+        accepted_response(&self.client_name, response, &accept)
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -519,6 +619,12 @@ pub struct QbitAddTorrent<'a> {
     pub tags: &'a [String],
     pub pause_for_recheck: bool,
     pub content_layout: QbitContentLayout,
+}
+
+#[derive(Debug, Deserialize)]
+struct QbitCategory {
+    #[serde(default, rename = "savePath")]
+    save_path: String,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -663,11 +769,30 @@ fn success_response(
     client: &str,
     response: reqwest::Response,
 ) -> Result<reqwest::Response, TorrentClientError> {
-    if response.status().is_success() {
+    accepted_response(client, response, &|status| status.is_success())
+}
+
+fn accepted_response(
+    client: &str,
+    response: reqwest::Response,
+    accept: &dyn Fn(StatusCode) -> bool,
+) -> Result<reqwest::Response, TorrentClientError> {
+    if accept(response.status()) {
         Ok(response)
     } else {
         Err(unavailable(client, format!("HTTP {}", response.status())))
     }
+}
+
+fn requested_save_path((key, value): &(String, String)) -> Option<&str> {
+    (key == "savePath").then_some(value.as_str())
+}
+
+fn is_http_conflict(error: &TorrentClientError) -> bool {
+    matches!(
+        error,
+        TorrentClientError::Unavailable { message, .. } if message == "HTTP 409 Conflict"
+    )
 }
 
 async fn read_client_text(

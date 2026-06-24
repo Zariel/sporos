@@ -9,7 +9,7 @@
       <enclosure url="http://torznab-fixture:8080/torrents/qbittorrent-candidate.torrent" length="4096" type="application/x-bittorrent"/>
       <torznab:attr name="category" value="2000"/>
       <torznab:attr name="size" value="4096"/>
-      <torznab:attr name="infohash" value="73fc73a21a1c486f3287ed25213743ce6237f841"/>
+      <torznab:attr name="infohash" value="44c73f7600572665231e5a09e5c25aa42c5a90e1"/>
     </item>
     <item>
       <title>Sporos rTorrent Fixture</title>

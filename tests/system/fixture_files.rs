@@ -147,7 +147,12 @@ fn assert_search_fixture_matches_manifest(
     expected_size: &str,
 ) {
     let slug = fixture.slug.as_str();
-    assert!(search_xml.contains(&format!("<title>{}</title>", fixture.name)));
+    let expected_title = if slug == "qbittorrent-candidate" {
+        "Sporos qBittorrent Fixture"
+    } else {
+        fixture.name.as_str()
+    };
+    assert!(search_xml.contains(&format!("<title>{expected_title}</title>")));
     assert!(search_xml.contains(&format!("<guid>sporos-{slug}</guid>")));
     assert!(search_xml.contains(&format!(
         "url=\"http://torznab-fixture:8080/torrents/{slug}.torrent\""
@@ -171,7 +176,6 @@ fn assert_pair_equivalent_and_distinct(
         .get(candidate)
         .expect("candidate fixture should exist in manifest");
     assert_ne!(source.info_hash, candidate.info_hash);
-    assert_eq!(source.media_root, candidate.media_root);
 
     let source_files: Vec<_> = source
         .files

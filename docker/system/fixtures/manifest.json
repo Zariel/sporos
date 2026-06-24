@@ -18,12 +18,12 @@
       "slug": "qbittorrent-candidate",
       "label": "qBittorrent candidate",
       "source_marker": "sporos-qbittorrent-candidate",
-      "name": "Sporos qBittorrent Fixture",
+      "name": "Sporos qBittorrent Candidate",
       "torrent_path": "torrents/qbittorrent-candidate.torrent",
-      "media_root": "media/qbittorrent",
-      "info_hash": "73fc73a21a1c486f3287ed25213743ce6237f841",
+      "media_root": "media/qbittorrent-candidate",
+      "info_hash": "44c73f7600572665231e5a09e5c25aa42c5a90e1",
       "files": [
-        { "path": "Sporos qBittorrent Fixture.mkv", "size": 4096, "sha1": "531c10249aa3f69be181963233909220c7f8a015" }
+        { "path": "Sporos qBittorrent Fixture.mkv", "size": 4096, "sha1": "f293552dbeec56c898feb3bd309063217d76314f" }
       ]
     },
     {

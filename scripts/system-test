@@ -68,7 +68,7 @@ diagnostics_dir="$run_dir/diagnostics"
 diagnostics_archive=
 override_file="$run_dir/compose.override.yml"
 env_file="$run_dir/system-test.env"
-http_port="${SPOROS_SYSTEM_HTTP_PORT:-0}"
+http_port="${SPOROS_SYSTEM_HTTP_PORT:-2468}"
 diagnostic_limit_bytes="${SPOROS_SYSTEM_DIAGNOSTIC_LIMIT_BYTES:-65536}"
 diagnostic_timeout_seconds="${SPOROS_SYSTEM_DIAGNOSTIC_TIMEOUT_SECONDS:-20}"
 sporos_api_token=
@@ -227,9 +227,9 @@ fi
 sporos_api_token=$(openssl rand -hex 24)
 qbittorrent_password=$(openssl rand -hex 24)
 
-mkdir -p "$config_dir" "$state_dir" "$diagnostics_dir"
+mkdir -p "$config_dir" "$state_dir/db" "$state_dir/cache" "$state_dir/output" "$diagnostics_dir"
 cp "$repo_root/docker/system/config/sporos.toml.template" "$config_dir/sporos.toml"
-chmod 777 "$state_dir"
+chmod 777 "$state_dir" "$state_dir/db" "$state_dir/cache" "$state_dir/output"
 
 cat > "$override_file" <<EOF
 services:
