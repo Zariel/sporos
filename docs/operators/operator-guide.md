@@ -59,16 +59,15 @@ docker run --rm \
   -e PROWLARR_API_KEY \
   -v ./config.toml:/app/config.toml:ro \
   -v sporos-state:/app/state \
-  -v sporos-cache:/app/cache \
-  -v sporos-output:/app/output \
   -v /srv/media:/media:ro \
   sporos:local
 ```
 
-Mount the database PVC at `/app/state` so SQLite's `sporos.db`,
-`sporos.db-wal`, and `sporos.db-shm` files are backed by the same volume.
-Mount `/app/cache` and `/app/output` as separate directories when those should
-be backed up or managed independently.
+Mount a PVC at `/app/state` for the simple Kubernetes layout. The default
+subdirectories are `/app/state/db`, `/app/state/cache`, and
+`/app/state/output`, so SQLite's `sporos.db`, `sporos.db-wal`, and
+`sporos.db-shm` files stay together while cache and output can still be mounted
+separately by operators who want independent storage classes or backup policy.
 
 The image runs as UID/GID `10001`. Mounted writable paths for
 `paths.database`, `paths.torrent_cache_dir`, and `paths.output_dir` must be
@@ -91,9 +90,9 @@ absolute. Local defaults are resolved to absolute paths during startup.
 
 ```toml
 [paths]
-database = "/app/state/sporos.db"
-torrent_cache_dir = "/app/cache"
-output_dir = "/app/output"
+database = "/app/state/db/sporos.db"
+torrent_cache_dir = "/app/state/cache"
+output_dir = "/app/state/output"
 media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
@@ -348,7 +347,7 @@ set `paths.media_dirs` in TOML.
 
 ```bash
 SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/app/state/sporos.db"'
+SPOROS__PATHS__DATABASE='"/app/state/db/sporos.db"'
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD='0.02'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_ENV='"QBIT_PASSWORD"'
@@ -421,7 +420,8 @@ roots.
 Back up the SQLite database and any saved torrent/output directories together.
 For a consistent SQLite backup, stop the writer or use SQLite backup tooling
 against the mounted database file. The default container paths are
-`/app/state/sporos.db`, `/app/cache`, and `/app/output`, which allows each
+`/app/state/db/sporos.db`, `/app/state/cache`, and `/app/state/output`, which
+allows all local state to share one PVC by default while still allowing each
 state class to be mounted and backed up separately in Kubernetes. The torrent
 cache can be recreated from indexers, but preserving it avoids unnecessary
 redownloads.

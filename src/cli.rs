@@ -252,9 +252,9 @@ mod tests {
         let contents = format!(
             r#"
             [paths]
-            database = "{}/state/sporos.db"
-            torrent_cache_dir = "{}/cache"
-            output_dir = "{}/output"
+            database = "{}/state/db/sporos.db"
+            torrent_cache_dir = "{}/state/cache"
+            output_dir = "{}/state/output"
 
             {contents}
             "#,

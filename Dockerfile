@@ -68,7 +68,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 sporos \
     && useradd --system --uid 10001 --gid sporos --home-dir /app sporos \
-    && mkdir -p /app/state /app/cache /app/output \
+    && mkdir -p /app/state/db /app/state/cache /app/state/output \
     && chown -R sporos:sporos /app
 
 COPY --from=build /workspace/target/release/sporos /app/sporos
@@ -81,15 +81,15 @@ ENV PATH=/app:$PATH \
     RUST_BACKTRACE=1 \
     RUST_LIB_BACKTRACE=1 \
     SPOROS__SERVER__BIND=0.0.0.0:2468 \
-    SPOROS__PATHS__DATABASE=/app/state/sporos.db \
-    SPOROS__PATHS__TORRENT_CACHE_DIR=/app/cache \
-    SPOROS__PATHS__OUTPUT_DIR=/app/output
+    SPOROS__PATHS__DATABASE=/app/state/db/sporos.db \
+    SPOROS__PATHS__TORRENT_CACHE_DIR=/app/state/cache \
+    SPOROS__PATHS__OUTPUT_DIR=/app/state/output
 
 USER 10001:10001
 WORKDIR /app
 
 EXPOSE 2468
-VOLUME ["/app/state", "/app/cache", "/app/output"]
+VOLUME ["/app/state"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/sporos"]
 CMD ["serve"]

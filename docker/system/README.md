@@ -129,8 +129,6 @@ Compose project names isolate runs. The runner sets a unique project name by
 default, which gives each run its own named volumes:
 
 - generated per-run state directory -> `/app/state`
-- `torrent_cache` -> `/app/cache`
-- `output` -> `/app/output`
 - `downloads` -> `/downloads`
 - client config/session volumes for qBittorrent and rTorrent
 

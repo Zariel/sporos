@@ -1,7 +1,7 @@
 [paths]
-database = "/app/state/sporos.db"
-torrent_cache_dir = "/app/cache"
-output_dir = "/app/output"
+database = "/app/state/db/sporos.db"
+torrent_cache_dir = "/app/state/cache"
+output_dir = "/app/state/output"
 media_dirs = ["/downloads"]
 
 [server]

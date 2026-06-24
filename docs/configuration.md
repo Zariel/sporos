@@ -17,9 +17,9 @@ paths.
 
 ```toml
 [paths]
-database = "/app/state/sporos.db"
-torrent_cache_dir = "/app/cache"
-output_dir = "/app/output"
+database = "/app/state/db/sporos.db"
+torrent_cache_dir = "/app/state/cache"
+output_dir = "/app/state/output"
 media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
@@ -358,7 +358,7 @@ underscores separate TOML path segments, and values are parsed as TOML scalars:
 
 ```bash
 SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/app/state/sporos.db"'
+SPOROS__PATHS__DATABASE='"/app/state/db/sporos.db"'
 SPOROS__RUNTIME__WORKER_THREADS='4'
 SPOROS__RUNTIME__MAX_BLOCKING_THREADS='64'
 SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT='100'
