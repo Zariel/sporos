@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug_span, info_span};
+use tracing::{debug, debug_span, info_span};
 
 use crate::announce::{AnnounceQueueConfig, AnnounceReason, AnnounceWorkId};
 use crate::domain::{
@@ -598,7 +598,14 @@ impl AnnounceWorker {
         let mut affected = 0_u64;
         for _ in 0..max_batches {
             ensure_cleanup_running(shutdown)?;
-            let batch_affected = cleanup().await?;
+            let batch_affected = match cleanup().await {
+                Ok(batch_affected) => batch_affected,
+                Err(error) if is_database_busy(&error) => {
+                    debug!(error = %error, "deferred announce cleanup while database is busy");
+                    break;
+                }
+                Err(error) => return Err(AnnounceWorkerError::from(error)),
+            };
             affected = affected.saturating_add(batch_affected);
             if batch_affected < u64::from(batch_size) {
                 break;
@@ -636,22 +643,33 @@ impl AnnounceWorker {
     ) -> Result<Vec<AnnounceWorkId>, AnnounceWorkerError> {
         let lease_until_ms = now_ms.saturating_add(duration_ms(self.config.lease_duration));
         let reconcile_limit = self.config.claim_batch_size.saturating_mul(4).max(1);
-        self.repository.expire_announce_work(now_ms).await?;
+        if let Err(error) = self.repository.expire_announce_work(now_ms).await {
+            return defer_claim_if_database_busy(error);
+        }
         self.cleanup_retained(now_ms, false).await?;
-        self.repository
-            .recover_stale_announce_leases(now_ms)
-            .await?;
-        self.repository
+        if let Err(error) = self.repository.recover_stale_announce_leases(now_ms).await {
+            return defer_claim_if_database_busy(error);
+        }
+        if let Err(error) = self
+            .repository
             .schedule_announce_dependency_backoff(
                 now_ms,
                 duration_ms(self.config.dependency_recovery_probe_interval),
                 reconcile_limit,
             )
-            .await?;
-        self.repository
+            .await
+        {
+            return defer_claim_if_database_busy(error);
+        }
+        if let Err(error) = self
+            .repository
             .wake_due_waiting_announce_work(now_ms, reconcile_limit)
-            .await?;
-        self.repository
+            .await
+        {
+            return defer_claim_if_database_busy(error);
+        }
+        match self
+            .repository
             .claim_announce_work(
                 self.config.owner.as_str(),
                 now_ms,
@@ -659,7 +677,10 @@ impl AnnounceWorker {
                 self.config.claim_batch_size,
             )
             .await
-            .map_err(AnnounceWorkerError::from)
+        {
+            Ok(claimed) => Ok(claimed),
+            Err(error) => defer_claim_if_database_busy(error),
+        }
     }
 
     async fn cleanup_retained(&self, now_ms: i64, force: bool) -> Result<u64, AnnounceWorkerError> {
@@ -717,6 +738,10 @@ impl AnnounceWorker {
                     self.retention_cleanup
                         .last_cleanup_ms
                         .store(previous_cleanup_ms, Ordering::Release);
+                    if is_database_busy(&error) && (!force || shutdown.is_some()) {
+                        debug!(error = %error, "deferred announce retention cleanup while database is busy");
+                        return Ok(deleted);
+                    }
                     return Err(AnnounceWorkerError::from(error));
                 }
             };
@@ -970,6 +995,21 @@ impl From<DatabaseError> for AnnounceWorkerError {
     }
 }
 
+fn is_database_busy(error: &DatabaseError) -> bool {
+    matches!(error, DatabaseError::Busy { .. })
+}
+
+fn defer_claim_if_database_busy(
+    error: DatabaseError,
+) -> Result<Vec<AnnounceWorkId>, AnnounceWorkerError> {
+    if is_database_busy(&error) {
+        debug!(error = %error, "deferred announce claim while database is busy");
+        Ok(Vec::new())
+    } else {
+        Err(AnnounceWorkerError::from(error))
+    }
+}
+
 impl fmt::Display for AnnounceWorkerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1043,6 +1083,46 @@ mod tests {
             ],
             status_rows(&repository).await
         );
+    }
+
+    #[tokio::test]
+    async fn worker_defers_claim_batch_when_database_is_busy() {
+        let root = unique_temp_dir("announce-busy-claim");
+        let database = root.join("sporos.db");
+        let repository = Repository::connect(&database).await.unwrap();
+        insert_work(&repository, "ann_busy", "guid-busy", 1).await;
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+        let mut connections = Vec::new();
+        for _ in 0..5 {
+            let mut connection = repository.pool().acquire().await.unwrap();
+            sqlx::query("PRAGMA busy_timeout = 10")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            connections.push(connection);
+        }
+        let mut writer = connections.remove(0);
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        drop(connections);
+
+        let claimed = worker.claim_ready(10).await.unwrap();
+
+        assert!(claimed.is_empty());
+        assert_eq!(
+            vec![("queued".to_owned(), "accepted".to_owned())],
+            status_rows(&repository).await
+        );
+        assert_eq!(0, leased_count(&repository).await);
+
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        drop(writer);
+        drop(worker);
+        repository.pool().close().await;
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

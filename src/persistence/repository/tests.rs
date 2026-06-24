@@ -882,6 +882,50 @@ async fn successful_owned_inventory_stream_clears_staged_rows() {
 }
 
 #[tokio::test]
+async fn unchanged_owned_inventory_stream_does_not_rewrite_child_rows() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut item = test_local_item("Stable");
+    item.source = LocalItemSource::DataRoot {
+        path: PathBuf::from("/media/stable"),
+    };
+    item.info_hash = None;
+    item.path = Some(PathBuf::from("/media/stable"));
+    let file = LocalFile::new(
+        None,
+        PathBuf::from("stable.mkv"),
+        ByteSize::new(20),
+        FileIndex::new(0),
+    )
+    .unwrap()
+    .with_mtime_ms(Some(1_700_000_000_123));
+    let batch = OwnedLocalItemFileBatch {
+        item,
+        files: vec![file],
+    };
+
+    replace_owned_inventory(
+        &repository,
+        LocalInventoryScope::DataRoot,
+        vec![batch.clone()],
+    )
+    .await
+    .unwrap();
+    install_local_inventory_mutation_log(&repository).await;
+
+    let summary = replace_owned_inventory(&repository, LocalInventoryScope::DataRoot, vec![batch])
+        .await
+        .unwrap();
+    let file_mutations = local_inventory_mutation_count(&repository, "local_files").await;
+    let title_gram_mutations =
+        local_inventory_mutation_count(&repository, "local_item_title_grams").await;
+
+    assert_eq!(1, summary.upserted);
+    assert_eq!(0, summary.pruned);
+    assert_eq!(0, file_mutations);
+    assert_eq!(0, title_gram_mutations);
+}
+
+#[tokio::test]
 async fn stalled_owned_inventory_stream_does_not_starve_main_pool() {
     let root = unique_temp_dir("sqlite-inventory-staging-pool");
     let database = root.join("sporos.db");
@@ -4724,6 +4768,80 @@ async fn staged_inventory_counts(repository: &Repository) -> (i64, i64) {
             .unwrap();
 
     (staged_count, staged_file_count)
+}
+
+async fn replace_owned_inventory(
+    repository: &Repository,
+    scope: LocalInventoryScope,
+    batches: Vec<OwnedLocalItemFileBatch>,
+) -> Result<LocalInventoryReplaceSummary, DatabaseError> {
+    let (sender, receiver) = mpsc::channel(batches.len().saturating_add(1));
+    for batch in batches {
+        sender
+            .send(OwnedLocalInventoryMessage::item(batch))
+            .await
+            .unwrap();
+    }
+    sender
+        .send(OwnedLocalInventoryMessage::Finished)
+        .await
+        .unwrap();
+    drop(sender);
+
+    repository
+        .replace_local_inventory_owned_receiver(scope, receiver)
+        .await
+}
+
+async fn install_local_inventory_mutation_log(repository: &Repository) {
+    for statement in [
+        "CREATE TABLE local_inventory_mutations (table_name TEXT NOT NULL, operation TEXT NOT NULL)",
+        r#"
+        CREATE TRIGGER count_local_files_insert
+        AFTER INSERT ON local_files
+        BEGIN
+            INSERT INTO local_inventory_mutations (table_name, operation)
+            VALUES ('local_files', 'insert');
+        END
+        "#,
+        r#"
+        CREATE TRIGGER count_local_files_delete
+        AFTER DELETE ON local_files
+        BEGIN
+            INSERT INTO local_inventory_mutations (table_name, operation)
+            VALUES ('local_files', 'delete');
+        END
+        "#,
+        r#"
+        CREATE TRIGGER count_local_title_grams_insert
+        AFTER INSERT ON local_item_title_grams
+        BEGIN
+            INSERT INTO local_inventory_mutations (table_name, operation)
+            VALUES ('local_item_title_grams', 'insert');
+        END
+        "#,
+        r#"
+        CREATE TRIGGER count_local_title_grams_delete
+        AFTER DELETE ON local_item_title_grams
+        BEGIN
+            INSERT INTO local_inventory_mutations (table_name, operation)
+            VALUES ('local_item_title_grams', 'delete');
+        END
+        "#,
+    ] {
+        sqlx::query(statement)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+    }
+}
+
+async fn local_inventory_mutation_count(repository: &Repository, table_name: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM local_inventory_mutations WHERE table_name = ?")
+        .bind(table_name)
+        .fetch_one(repository.pool())
+        .await
+        .unwrap()
 }
 
 fn test_remote_candidate(guid: &str, title: &str) -> RemoteCandidate {

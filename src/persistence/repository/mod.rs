@@ -599,40 +599,42 @@ impl Repository {
         I::IntoIter: Send,
     {
         let _span = info_span!("inventory.replace", source_type = scope.source_type());
-        let mut transaction = self
-            .pool
-            .begin()
+        let mut connection = self
+            .inventory_staging_pool
+            .acquire()
             .await
-            .map_err(|error| db_error("begin local inventory transaction", error))?;
-
-        if let LocalInventoryScope::Client { client_host } = &scope {
-            normalize_client_source_keys(&mut transaction, client_host).await?;
-        }
-        initialize_retained_keys(&mut transaction).await?;
+            .map_err(|error| db_error("acquire local inventory connection", error))?;
+        initialize_staged_local_inventory(&mut connection).await?;
 
         let mut upserted = 0usize;
         for batch in items {
             let (source_type, source_key) = local_source(&batch.item.source);
             if !scope.accepts(&source_type, &source_key) {
+                let _cleanup_result = clear_staged_local_inventory(&mut connection).await;
                 return Err(DatabaseError::QueryFailed {
                     operation: "validate local inventory refresh scope".to_owned(),
                     message: format!("item source {source_type}:{source_key} is outside {scope:?}"),
                 });
             }
 
-            upsert_local_item_with_files_in_transaction(&mut transaction, batch.item, batch.files)
-                .await?;
-            insert_retained_key(&mut transaction, &source_key).await?;
+            if let Err(error) =
+                stage_local_item_with_files(&mut connection, batch.item, batch.files).await
+            {
+                let _cleanup_result = clear_staged_local_inventory(&mut connection).await;
+                return Err(error);
+            }
             upserted = upserted.saturating_add(1);
         }
 
-        let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
-
-        clear_retained_keys(&mut transaction).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| db_error("commit local inventory transaction", error))?;
+        let _commit_guard = self.inventory_commit_lock.lock().await;
+        let replace_result = commit_staged_local_inventory(&mut connection, &scope).await;
+        let pruned = match replace_result {
+            Ok(pruned) => pruned,
+            Err(error) => {
+                let _cleanup_result = clear_staged_local_inventory(&mut connection).await;
+                return Err(error);
+            }
+        };
 
         Ok(LocalInventoryReplaceSummary { upserted, pruned })
     }
@@ -696,30 +698,7 @@ impl Repository {
         }
 
         let _commit_guard = self.inventory_commit_lock.lock().await;
-        let replace_result = async {
-            let mut transaction = connection
-                .begin()
-                .await
-                .map_err(|error| db_error("begin local inventory transaction", error))?;
-
-            if let LocalInventoryScope::Client { client_host } = &scope {
-                normalize_client_source_keys(&mut transaction, client_host).await?;
-            }
-            initialize_retained_keys(&mut transaction).await?;
-            upsert_staged_local_inventory(&mut transaction).await?;
-            insert_staged_retained_keys(&mut transaction).await?;
-            let pruned = prune_local_items_not_retained(&mut transaction, &scope).await?;
-
-            clear_staged_local_inventory_in_transaction(&mut transaction).await?;
-            clear_retained_keys(&mut transaction).await?;
-            transaction
-                .commit()
-                .await
-                .map_err(|error| db_error("commit local inventory transaction", error))?;
-
-            Ok(pruned)
-        }
-        .await;
+        let replace_result = commit_staged_local_inventory(&mut connection, &scope).await;
         match replace_result {
             Ok(pruned) => Ok(LocalInventoryReplaceSummary { upserted, pruned }),
             Err(error) => {
@@ -5059,6 +5038,8 @@ async fn initialize_staged_local_inventory(
     connection: &mut sqlx::pool::PoolConnection<Sqlite>,
 ) -> Result<(), DatabaseError> {
     for statement in [
+        "DROP TABLE IF EXISTS staged_local_inventory_changed_files",
+        "DROP TABLE IF EXISTS staged_local_inventory_changed_title_grams",
         "DROP TABLE IF EXISTS staged_local_inventory_items",
         "DROP TABLE IF EXISTS staged_local_inventory_files",
         "DROP TABLE IF EXISTS staged_local_inventory_title_grams",
@@ -5099,8 +5080,26 @@ async fn initialize_staged_local_inventory(
         )
         "#,
         r#"
+        CREATE TEMP TABLE staged_local_inventory_changed_files (
+            source_type TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            PRIMARY KEY (source_type, source_key)
+        ) WITHOUT ROWID
+        "#,
+        r#"
+        CREATE TEMP TABLE staged_local_inventory_changed_title_grams (
+            source_type TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            PRIMARY KEY (source_type, source_key)
+        ) WITHOUT ROWID
+        "#,
+        r#"
         CREATE INDEX staged_local_inventory_files_item_idx
             ON staged_local_inventory_files (source_type, source_key)
+        "#,
+        r#"
+        CREATE INDEX staged_local_inventory_files_item_file_idx
+            ON staged_local_inventory_files (source_type, source_key, file_index)
         "#,
         r#"
         CREATE INDEX staged_local_inventory_title_grams_item_idx
@@ -5129,7 +5128,9 @@ async fn clear_staged_local_inventory(
     Ok(())
 }
 
-const STAGED_LOCAL_INVENTORY_CLEAR_STATEMENTS: [&str; 3] = [
+const STAGED_LOCAL_INVENTORY_CLEAR_STATEMENTS: [&str; 5] = [
+    "DELETE FROM staged_local_inventory_changed_files",
+    "DELETE FROM staged_local_inventory_changed_title_grams",
     "DELETE FROM staged_local_inventory_files",
     "DELETE FROM staged_local_inventory_title_grams",
     "DELETE FROM staged_local_inventory_items",
@@ -5271,9 +5272,112 @@ async fn stage_local_item_with_files(
     Ok(())
 }
 
+async fn commit_staged_local_inventory(
+    connection: &mut sqlx::pool::PoolConnection<Sqlite>,
+    scope: &LocalInventoryScope,
+) -> Result<u64, DatabaseError> {
+    let mut transaction = connection
+        .begin()
+        .await
+        .map_err(|error| db_error("begin local inventory transaction", error))?;
+
+    if let LocalInventoryScope::Client { client_host } = scope {
+        normalize_client_source_keys(&mut transaction, client_host).await?;
+    }
+    initialize_retained_keys(&mut transaction).await?;
+    upsert_staged_local_inventory(&mut transaction).await?;
+    insert_staged_retained_keys(&mut transaction).await?;
+    let pruned = prune_local_items_not_retained(&mut transaction, scope).await?;
+
+    clear_staged_local_inventory_in_transaction(&mut transaction).await?;
+    clear_retained_keys(&mut transaction).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| db_error("commit local inventory transaction", error))?;
+
+    Ok(pruned)
+}
+
+async fn mark_staged_local_inventory_changes(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DatabaseError> {
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO staged_local_inventory_changed_title_grams (
+            source_type,
+            source_key
+        )
+        SELECT
+            staged.source_type,
+            staged.source_key
+        FROM staged_local_inventory_items staged
+        LEFT JOIN local_items existing
+            ON existing.source_type = staged.source_type
+           AND existing.source_key = staged.source_key
+        WHERE existing.id IS NULL
+           OR existing.title IS NOT staged.title
+           OR existing.media_type IS NOT staged.media_type
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("mark changed local title grams", error))?;
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO staged_local_inventory_changed_files (
+            source_type,
+            source_key
+        )
+        SELECT
+            staged.source_type,
+            staged.source_key
+        FROM staged_local_inventory_items staged
+        LEFT JOIN local_items existing
+            ON existing.source_type = staged.source_type
+           AND existing.source_key = staged.source_key
+        WHERE existing.id IS NULL
+           OR EXISTS (
+                SELECT 1
+                FROM staged_local_inventory_files staged_file
+                LEFT JOIN local_files existing_file
+                    ON existing_file.item_id = existing.id
+                   AND existing_file.file_index = staged_file.file_index
+                WHERE staged_file.source_type = staged.source_type
+                  AND staged_file.source_key = staged.source_key
+                  AND (
+                        existing_file.item_id IS NULL
+                     OR existing_file.relative_path IS NOT staged_file.relative_path
+                     OR existing_file.file_name IS NOT staged_file.file_name
+                     OR existing_file.size IS NOT staged_file.size
+                     OR existing_file.mtime_ms IS NOT staged_file.mtime_ms
+                  )
+            )
+           OR EXISTS (
+                SELECT 1
+                FROM local_files existing_file
+                LEFT JOIN staged_local_inventory_files staged_file
+                    ON staged_file.source_type = staged.source_type
+                   AND staged_file.source_key = staged.source_key
+                   AND staged_file.file_index = existing_file.file_index
+                WHERE existing_file.item_id = existing.id
+                  AND staged_file.source_type IS NULL
+            )
+        "#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| db_error("mark changed local files", error))?;
+
+    Ok(())
+}
+
 async fn upsert_staged_local_inventory(
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), DatabaseError> {
+    mark_staged_local_inventory_changes(transaction).await?;
+
     sqlx::query(
         r#"
         INSERT INTO local_items (
@@ -5315,6 +5419,14 @@ async fn upsert_staged_local_inventory(
             total_size = excluded.total_size,
             mtime_ms = excluded.mtime_ms,
             updated_at = excluded.updated_at
+        WHERE local_items.title IS NOT excluded.title
+           OR local_items.display_name IS NOT excluded.display_name
+           OR local_items.media_type IS NOT excluded.media_type
+           OR local_items.info_hash IS NOT excluded.info_hash
+           OR local_items.path IS NOT excluded.path
+           OR local_items.save_path IS NOT excluded.save_path
+           OR local_items.total_size IS NOT excluded.total_size
+           OR local_items.mtime_ms IS NOT excluded.mtime_ms
         "#,
     )
     .execute(&mut **transaction)
@@ -5327,9 +5439,9 @@ async fn upsert_staged_local_inventory(
         WHERE item_id IN (
             SELECT local_items.id
             FROM local_items
-            INNER JOIN staged_local_inventory_items staged
-                ON staged.source_type = local_items.source_type
-               AND staged.source_key = local_items.source_key
+            INNER JOIN staged_local_inventory_changed_files changed
+                ON changed.source_type = local_items.source_type
+               AND changed.source_key = local_items.source_key
         )
         "#,
     )
@@ -5355,6 +5467,9 @@ async fn upsert_staged_local_inventory(
             staged.mtime_ms,
             staged.file_index
         FROM staged_local_inventory_files staged
+        INNER JOIN staged_local_inventory_changed_files changed
+            ON changed.source_type = staged.source_type
+           AND changed.source_key = staged.source_key
         INNER JOIN local_items
             ON local_items.source_type = staged.source_type
            AND local_items.source_key = staged.source_key
@@ -5370,9 +5485,9 @@ async fn upsert_staged_local_inventory(
         WHERE item_id IN (
             SELECT local_items.id
             FROM local_items
-            INNER JOIN staged_local_inventory_items staged
-                ON staged.source_type = local_items.source_type
-               AND staged.source_key = local_items.source_key
+            INNER JOIN staged_local_inventory_changed_title_grams changed
+                ON changed.source_type = local_items.source_type
+               AND changed.source_key = local_items.source_key
         )
         "#,
     )
@@ -5400,6 +5515,9 @@ async fn upsert_staged_local_inventory(
             staged_grams.source_type,
             staged_grams.source_key
         FROM staged_local_inventory_title_grams staged_grams
+        INNER JOIN staged_local_inventory_changed_title_grams changed
+            ON changed.source_type = staged_grams.source_type
+           AND changed.source_key = staged_grams.source_key
         INNER JOIN local_items
             ON local_items.source_type = staged_grams.source_type
            AND local_items.source_key = staged_grams.source_key
