@@ -128,7 +128,7 @@ replace this with a password-hash seeding path if it needs auth-on coverage.
 Compose project names isolate runs. The runner sets a unique project name by
 default, which gives each run its own named volumes:
 
-- generated per-run `sporos.db` file -> `/app/sporos.db`
+- generated per-run state directory -> `/app/state`
 - `torrent_cache` -> `/app/cache`
 - `output` -> `/app/output`
 - `downloads` -> `/downloads`
@@ -213,7 +213,7 @@ docker compose --project-name "$SPOROS_SYSTEM_PROJECT" \
 
 `config/sporos.toml.template` is a runnable Sporos config shape for the
 topology. The runner copies it into a unique run directory, mounts a generated
-per-run database file at `/app/sporos.db`, and injects generated secret values
+per-run state directory at `/app/state`, and injects generated secret values
 through environment variables.
 
 `secrets/*.template` contain legacy placeholder values only. They are not used

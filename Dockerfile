@@ -68,7 +68,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 sporos \
     && useradd --system --uid 10001 --gid sporos --home-dir /app sporos \
-    && mkdir -p /app/cache /app/output \
+    && mkdir -p /app/state /app/cache /app/output \
     && chown -R sporos:sporos /app
 
 COPY --from=build /workspace/target/release/sporos /app/sporos
@@ -80,7 +80,8 @@ LABEL org.opencontainers.image.title="Sporos" \
 ENV PATH=/app:$PATH \
     RUST_BACKTRACE=1 \
     RUST_LIB_BACKTRACE=1 \
-    SPOROS__PATHS__DATABASE=/app/sporos.db \
+    SPOROS__SERVER__BIND=0.0.0.0:2468 \
+    SPOROS__PATHS__DATABASE=/app/state/sporos.db \
     SPOROS__PATHS__TORRENT_CACHE_DIR=/app/cache \
     SPOROS__PATHS__OUTPUT_DIR=/app/output
 
@@ -88,7 +89,7 @@ USER 10001:10001
 WORKDIR /app
 
 EXPOSE 2468
-VOLUME ["/app/cache", "/app/output"]
+VOLUME ["/app/state", "/app/cache", "/app/output"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/sporos"]
 CMD ["serve"]

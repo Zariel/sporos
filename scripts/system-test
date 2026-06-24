@@ -63,7 +63,7 @@ esac
 mkdir -p "$run_root"
 run_dir=$(mktemp -d "$run_root/$project_name.XXXXXX")
 config_dir="$run_dir/config"
-db_file="$run_dir/sporos.db"
+state_dir="$run_dir/state"
 diagnostics_dir="$run_dir/diagnostics"
 diagnostics_archive=
 override_file="$run_dir/compose.override.yml"
@@ -227,10 +227,9 @@ fi
 sporos_api_token=$(openssl rand -hex 24)
 qbittorrent_password=$(openssl rand -hex 24)
 
-mkdir -p "$config_dir" "$diagnostics_dir"
+mkdir -p "$config_dir" "$state_dir" "$diagnostics_dir"
 cp "$repo_root/docker/system/config/sporos.toml.template" "$config_dir/sporos.toml"
-touch "$db_file"
-chmod 666 "$db_file"
+chmod 777 "$state_dir"
 
 cat > "$override_file" <<EOF
 services:
@@ -240,7 +239,7 @@ services:
       QBITTORRENT_PASSWORD: "$qbittorrent_password"
     volumes:
       - "$config_dir/sporos.toml:/app/config.toml:ro"
-      - "$db_file:/app/sporos.db"
+      - "$state_dir:/app/state"
 EOF
 
 wait_for_http() {

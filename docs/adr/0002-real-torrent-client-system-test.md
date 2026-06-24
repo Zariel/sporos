@@ -104,7 +104,7 @@ Use Docker Compose or an equivalent CI service topology:
 system-runner
   -> sporos:local
        /app/config.toml
-       /app/sporos.db
+       /app/state/sporos.db
        /app/cache
        /app/output
        /downloads

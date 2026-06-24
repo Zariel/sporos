@@ -58,24 +58,27 @@ docker run --rm \
   -e INDEXER_API_KEY \
   -e PROWLARR_API_KEY \
   -v ./config.toml:/app/config.toml:ro \
-  -v ./sporos.db:/app/sporos.db \
+  -v sporos-state:/app/state \
   -v sporos-cache:/app/cache \
   -v sporos-output:/app/output \
   -v /srv/media:/media:ro \
   sporos:local
 ```
 
-Create `./sporos.db` before using the Docker bind example. In Kubernetes, mount
-the database PVC at `/app/sporos.db` with `subPath` so the binary and
-`/app/config.toml` from the image or ConfigMap remain visible. Mount
-`/app/cache` and `/app/output` as separate directories when those should be
-backed up or managed independently.
+Mount the database PVC at `/app/state` so SQLite's `sporos.db`,
+`sporos.db-wal`, and `sporos.db-shm` files are backed by the same volume.
+Mount `/app/cache` and `/app/output` as separate directories when those should
+be backed up or managed independently.
 
 The image runs as UID/GID `10001`. Mounted writable paths for
 `paths.database`, `paths.torrent_cache_dir`, and `paths.output_dir` must be
 writable by that identity, or by a runtime user override chosen by the operator.
 Container defaults place those three paths under `/app` even when the mounted
-config omits them.
+config omits them. The image also sets
+`SPOROS__SERVER__BIND=0.0.0.0:2468` so Kubernetes Services and probes can reach
+the Pod IP; container deployments must provide exactly one API token source,
+for example `server.api_token_env = "SPOROS_API_TOKEN"` plus a Secret-backed
+environment variable.
 Use a stop timeout long enough for graceful shutdown to drain in-flight work; 60
 seconds is a conservative starting point for Docker.
 Deployment topology, orchestration, resource requests, and restart policy are
@@ -88,7 +91,7 @@ absolute. Local defaults are resolved to absolute paths during startup.
 
 ```toml
 [paths]
-database = "/app/sporos.db"
+database = "/app/state/sporos.db"
 torrent_cache_dir = "/app/cache"
 output_dir = "/app/output"
 media_dirs = ["/media/movies", "/media/tv"]
@@ -345,7 +348,7 @@ set `paths.media_dirs` in TOML.
 
 ```bash
 SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/app/sporos.db"'
+SPOROS__PATHS__DATABASE='"/app/state/sporos.db"'
 SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD='0.02'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
 SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_ENV='"QBIT_PASSWORD"'
@@ -418,9 +421,10 @@ roots.
 Back up the SQLite database and any saved torrent/output directories together.
 For a consistent SQLite backup, stop the writer or use SQLite backup tooling
 against the mounted database file. The default container paths are
-`/app/sporos.db`, `/app/cache`, and `/app/output`, which allows each state class
-to be mounted and backed up separately in Kubernetes. The torrent cache can be
-recreated from indexers, but preserving it avoids unnecessary redownloads.
+`/app/state/sporos.db`, `/app/cache`, and `/app/output`, which allows each
+state class to be mounted and backed up separately in Kubernetes. The torrent
+cache can be recreated from indexers, but preserving it avoids unnecessary
+redownloads.
 Protect backups with the same filesystem, host, and off-host access controls as
 production secrets because they may include plaintext URLs, cookies, tracker
 metadata, client paths, media titles, and cached torrent files.

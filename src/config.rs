@@ -57,7 +57,7 @@ pub struct PathsConfig {
 impl Default for PathsConfig {
     fn default() -> Self {
         Self {
-            database: PathBuf::from("sporos.db"),
+            database: PathBuf::from("state/sporos.db"),
             torrent_cache_dir: PathBuf::from("cache"),
             output_dir: PathBuf::from("output"),
             media_dirs: Vec::new(),
@@ -1743,7 +1743,7 @@ api_key_env = "optional env var containing api key"
 [environment overrides]
 SPOROS__SERVER__BIND = "0.0.0.0:2468"
 SPOROS__SERVER__API_TOKEN_ENV = "SPOROS_API_TOKEN"
-SPOROS__PATHS__DATABASE = "/app/sporos.db"
+SPOROS__PATHS__DATABASE = "/app/state/sporos.db"
 SPOROS__RUNTIME__WORKER_THREADS = "4"
 SPOROS__RUNTIME__MAX_BLOCKING_THREADS = "64"
 SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT = "100"
@@ -1840,7 +1840,7 @@ mod tests {
         let config = parse_config_with_env(
             r#"
             [paths]
-            database = "/app/sporos.db"
+            database = "/app/state/sporos.db"
             torrent_cache_dir = "/app/cache"
             output_dir = "/app/output"
             media_dirs = ["/media/movies"]
@@ -2610,7 +2610,7 @@ mod tests {
         let config = parse_startup_config("", &cwd).unwrap();
         let cwd = cwd.canonicalize().unwrap();
 
-        assert_eq!(cwd.join("sporos.db"), config.paths.database);
+        assert_eq!(cwd.join("state/sporos.db"), config.paths.database);
         assert_eq!(cwd.join("cache"), config.paths.torrent_cache_dir);
         assert_eq!(cwd.join("output"), config.paths.output_dir);
         assert!(config.paths.database.parent().unwrap().is_dir());
@@ -2716,7 +2716,7 @@ mod tests {
     #[test]
     fn startup_config_env_overrides_resolve_container_style_paths() {
         let cwd = unique_temp_dir("env-container");
-        let database = cwd.join("app/sporos.db");
+        let database = cwd.join("app/state/sporos.db");
         let torrent_cache_dir = cwd.join("app/cache");
         let output_dir = cwd.join("app/output");
 
@@ -3075,7 +3075,7 @@ mod tests {
         let config = parse_config_with_env(
             r#"
             [paths]
-            database = "/app/sporos.db"
+            database = "/app/state/sporos.db"
 
             [server]
             bind = "127.0.0.1:2468"

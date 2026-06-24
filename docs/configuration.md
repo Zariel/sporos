@@ -17,7 +17,7 @@ paths.
 
 ```toml
 [paths]
-database = "/app/sporos.db"
+database = "/app/state/sporos.db"
 torrent_cache_dir = "/app/cache"
 output_dir = "/app/output"
 media_dirs = ["/media/movies", "/media/tv"]
@@ -143,7 +143,9 @@ notification delivery disabled.
 
 ## Server And Auth
 
-`server.bind` defaults to `127.0.0.1:2468`. Use `server.api_token_file`,
+`server.bind` defaults to `127.0.0.1:2468` in the Rust config. The container
+image sets `SPOROS__SERVER__BIND=0.0.0.0:2468` so Kubernetes Services and
+probes can reach the Pod IP. Use `server.api_token_file`,
 `server.api_token_env`, or `server.api_token` to protect mutating workflow
 endpoints. Non-loopback binds require one API token source.
 
@@ -356,7 +358,7 @@ underscores separate TOML path segments, and values are parsed as TOML scalars:
 
 ```bash
 SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/app/sporos.db"'
+SPOROS__PATHS__DATABASE='"/app/state/sporos.db"'
 SPOROS__RUNTIME__WORKER_THREADS='4'
 SPOROS__RUNTIME__MAX_BLOCKING_THREADS='64'
 SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT='100'

@@ -28,6 +28,7 @@ services:
     volumes:
       - ./config/sporos.toml.template:/app/config.toml:ro
       - ./fixtures:/system-fixtures:ro
+      - state:/app/state
       - torrent_cache:/app/cache
       - output:/app/output
       - downloads:/downloads
@@ -116,6 +117,7 @@ networks:
     internal: true
 
 volumes:
+  state:
   torrent_cache:
   output:
   downloads:
