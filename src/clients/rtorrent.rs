@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -1071,7 +1072,23 @@ fn unavailable(client: &str, message: String) -> TorrentClientError {
 }
 
 fn request_error_message(error: reqwest::Error) -> String {
-    sanitize_url_for_logging(error.to_string()).to_string()
+    let url = error
+        .url()
+        .map(|url| sanitize_url_for_logging(url.as_str()).to_string());
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut source = StdError::source(&error);
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    if let Some(url) = url {
+        message.push_str(" for url (");
+        message.push_str(&url);
+        message.push(')');
+    }
+    sanitize_url_for_logging(message).to_string()
 }
 
 fn torrent_client_http_client() -> reqwest::Client {
@@ -1166,6 +1183,30 @@ mod tests {
         let error = client.validate().await.unwrap_err();
 
         assert!(error.to_string().contains("HTTP 302"));
+    }
+
+    #[tokio::test]
+    async fn request_errors_include_source_chain_and_sanitize_url() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = torrent_client_http_client()
+            .get(format!(
+                "http://user:password@{address}/RPC2?apikey=secret&ok=1"
+            ))
+            .send()
+            .await
+            .unwrap_err();
+
+        let message = request_error_message(error);
+
+        assert!(message.contains("error sending request"));
+        assert!(message.contains("tcp connect error"));
+        assert!(message.contains("127.0.0.1"));
+        assert!(message.contains("ok=1"));
+        assert!(!message.contains("user"));
+        assert!(!message.contains("password"));
+        assert!(!message.contains("secret"));
     }
 
     #[tokio::test]
