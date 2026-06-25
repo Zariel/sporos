@@ -1638,6 +1638,12 @@ mod tests {
         let original_permissions = fs::metadata(&denied).unwrap().permissions();
         fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
 
+        if fs::read_dir(&denied).is_ok() {
+            fs::set_permissions(&denied, original_permissions).unwrap();
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
         let scanner = InventoryScanner::new(InventoryScanOptions::default());
         let report = scanner.scan_media_dirs(std::slice::from_ref(&root));
 

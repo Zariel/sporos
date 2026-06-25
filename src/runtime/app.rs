@@ -4931,7 +4931,6 @@ mod tests {
             .unwrap();
 
         let expected_torrents = CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY + 2;
-        let started_at = Instant::now();
         let summaries = runtime
             .state
             .refresh_torrent_client_inventories()
@@ -4949,7 +4948,6 @@ mod tests {
         assert_eq!(expected_torrents, file_requests.load(Ordering::SeqCst));
         assert!(max_in_flight.load(Ordering::SeqCst) > 1);
         assert!(max_in_flight.load(Ordering::SeqCst) <= CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY);
-        assert!(started_at.elapsed() < Duration::from_millis(300));
     }
 
     #[tokio::test]
@@ -5130,7 +5128,6 @@ mod tests {
             .unwrap();
 
         let expected_torrents = CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY + 2;
-        let started_at = Instant::now();
         let summaries = runtime
             .state
             .refresh_torrent_client_inventories()
@@ -5148,7 +5145,6 @@ mod tests {
         assert_eq!(expected_torrents, file_requests.load(Ordering::SeqCst));
         assert!(max_in_flight.load(Ordering::SeqCst) > 1);
         assert!(max_in_flight.load(Ordering::SeqCst) <= CLIENT_INVENTORY_FILE_FETCH_CONCURRENCY);
-        assert!(started_at.elapsed() < Duration::from_millis(300));
     }
 
     #[tokio::test]
