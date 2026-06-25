@@ -1,6 +1,8 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, debug_span, info_span};
@@ -22,6 +24,8 @@ pub struct AnnounceWorker {
     repository: Repository,
     config: AnnounceWorkerConfig,
     retention_cleanup: AnnounceRetentionCleanup,
+    #[cfg(test)]
+    progress: Option<AnnounceWorkerProgress>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +40,41 @@ impl Default for AnnounceRetentionCleanup {
         Self {
             last_cleanup_ms: Arc::new(AtomicI64::new(i64::MIN)),
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct AnnounceWorkerProgress {
+    renewals: Arc<AtomicUsize>,
+    renewed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl AnnounceWorkerProgress {
+    fn new() -> Self {
+        Self {
+            renewals: Arc::new(AtomicUsize::new(0)),
+            renewed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn record_renewal(&self) {
+        self.renewals.fetch_add(1, Ordering::SeqCst);
+        self.renewed.notify_waiters();
+    }
+
+    async fn wait_for_renewals(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if self.renewals.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                self.renewed.notified().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expected} announce lease renewals"));
     }
 }
 
@@ -504,6 +543,8 @@ impl AnnounceWorker {
             repository,
             config,
             retention_cleanup: AnnounceRetentionCleanup::default(),
+            #[cfg(test)]
+            progress: None,
         })
     }
 
@@ -806,10 +847,16 @@ impl AnnounceWorker {
         now_ms: i64,
     ) -> Result<bool, AnnounceWorkerError> {
         let lease_until_ms = now_ms.saturating_add(duration_ms(self.config.lease_duration));
-        self.repository
+        let renewed = self
+            .repository
             .renew_announce_lease(id, self.config.owner.as_str(), lease_until_ms, now_ms)
             .await
-            .map_err(AnnounceWorkerError::from)
+            .map_err(AnnounceWorkerError::from)?;
+        #[cfg(test)]
+        if renewed && let Some(progress) = &self.progress {
+            progress.record_renewal();
+        }
+        Ok(renewed)
     }
 
     pub async fn complete(
@@ -1533,25 +1580,48 @@ mod tests {
             lease_renewal_secs: 1,
             ..test_config()
         };
-        let first_worker = AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        let mut first_worker =
+            AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        first_worker.config.lease_renewal = Duration::from_millis(1);
+        let progress = AnnounceWorkerProgress::new();
+        first_worker.progress = Some(progress.clone());
         let second_worker = AnnounceWorker::new(repository.clone(), "worker-2", &config).unwrap();
         let (_controller, signal) = shutdown_channel();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (finish_sender, finish_receiver) = tokio::sync::oneshot::channel();
 
         let handle = tokio::spawn(async move {
+            let mut started_sender = Some(started_sender);
+            let mut finish_receiver = Some(finish_receiver);
             first_worker
-                .run_batch(10, signal, |_id, _shutdown| async move {
-                    tokio::time::sleep(Duration::from_millis(2_500)).await;
-                    AnnounceWorkOutcome::Succeeded {
-                        reason: AnnounceReason::Saved,
-                        outcome: "saved".to_owned(),
+                .run_batch(10, signal, move |_id, _shutdown| {
+                    let started_sender = started_sender.take();
+                    let finish_receiver = finish_receiver.take().expect("single claimed item");
+                    async move {
+                        if let Some(started_sender) = started_sender {
+                            match started_sender.send(()) {
+                                Ok(()) | Err(()) => {}
+                            }
+                        }
+                        match finish_receiver.await {
+                            Ok(()) | Err(_) => {}
+                        }
+                        AnnounceWorkOutcome::Succeeded {
+                            reason: AnnounceReason::Saved,
+                            outcome: "saved".to_owned(),
+                        }
                     }
                 })
                 .await
                 .unwrap()
         });
 
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        started_receiver.await.unwrap();
+        progress.wait_for_renewals(2).await;
         let duplicate = second_worker.claim_ready(unix_time_ms()).await.unwrap();
+        match finish_sender.send(()) {
+            Ok(()) | Err(()) => {}
+        }
         let summary = handle.await.unwrap();
 
         assert!(duplicate.is_empty());
@@ -1600,15 +1670,30 @@ mod tests {
         let (_controller, signal) = shutdown_channel();
         let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let processed_by_first = processed.clone();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (finish_sender, finish_receiver) = tokio::sync::oneshot::channel();
 
         let handle = tokio::spawn(async move {
+            let mut started_sender = Some(started_sender);
+            let mut finish_receiver = Some(finish_receiver);
             first_worker
                 .run_batch(10, signal, move |id, _shutdown| {
                     let processed = processed_by_first.clone();
+                    let started_sender = started_sender.take();
+                    let finish_receiver = finish_receiver.take();
                     async move {
                         processed.lock().unwrap().push(id.as_str().to_owned());
                         if id.as_str() == "ann_34" {
-                            tokio::time::sleep(Duration::from_millis(2_500)).await;
+                            if let Some(started_sender) = started_sender {
+                                match started_sender.send(()) {
+                                    Ok(()) | Err(()) => {}
+                                }
+                            }
+                            if let Some(finish_receiver) = finish_receiver {
+                                match finish_receiver.await {
+                                    Ok(()) | Err(_) => {}
+                                }
+                            }
                         }
                         AnnounceWorkOutcome::Succeeded {
                             reason: AnnounceReason::Saved,
@@ -1620,8 +1705,11 @@ mod tests {
                 .unwrap()
         });
 
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        started_receiver.await.unwrap();
         let reclaimed = second_worker.claim_ready(2_020).await.unwrap();
+        match finish_sender.send(()) {
+            Ok(()) | Err(()) => {}
+        }
         let summary = handle.await.unwrap();
 
         assert_eq!(vec![AnnounceWorkId::new("ann_35").unwrap()], reclaimed);
@@ -2056,13 +2144,22 @@ mod tests {
     async fn worker_shutdown_keeps_stalled_in_flight_work_leased() {
         let repository = Repository::connect_in_memory().await.unwrap();
         insert_work(&repository, "ann_42", "guid-42", 1).await;
+        let ttl_expires_at = unix_time_ms().saturating_add(60_000);
+        sqlx::query("UPDATE announce_work SET expires_at = ? WHERE id = 'ann_42'")
+            .bind(ttl_expires_at)
+            .execute(repository.pool())
+            .await
+            .unwrap();
         let config = AnnounceQueueConfig {
             claim_batch_size: 1,
             lease_duration_secs: 2,
             lease_renewal_secs: 1,
             ..test_config()
         };
-        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        let mut worker = AnnounceWorker::new(repository.clone(), "worker-1", &config).unwrap();
+        worker.config.lease_renewal = Duration::from_millis(1);
+        let progress = AnnounceWorkerProgress::new();
+        worker.progress = Some(progress.clone());
         let second_worker = AnnounceWorker::new(repository.clone(), "worker-2", &config).unwrap();
         let (controller, signal) = shutdown_channel();
         let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
@@ -2088,26 +2185,22 @@ mod tests {
         });
 
         started_receiver.await.unwrap();
-        let lease_after_shutdown: i64 =
-            sqlx::query_scalar("SELECT lease_until FROM announce_work WHERE id = 'ann_42'")
-                .fetch_one(repository.pool())
-                .await
-                .unwrap();
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
-        let lease_after_renewal_intervals: i64 =
-            sqlx::query_scalar("SELECT lease_until FROM announce_work WHERE id = 'ann_42'")
-                .fetch_one(repository.pool())
-                .await
-                .unwrap();
+        progress.wait_for_renewals(2).await;
         let duplicate = second_worker.claim_ready(unix_time_ms()).await.unwrap();
+        let row = sqlx::query("SELECT status, lease_owner FROM announce_work WHERE id = 'ann_42'")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        let status: String = row.get("status");
+        let lease_owner: Option<String> = row.get("lease_owner");
 
-        assert!(
-            lease_after_renewal_intervals > lease_after_shutdown,
-            "active in-flight work must keep its lease until it records an outcome"
-        );
         assert!(duplicate.is_empty());
-        assert!(!handle.is_finished());
+        assert_eq!("running", status);
+        assert_eq!(Some("worker-1".to_owned()), lease_owner);
         handle.abort();
+        match handle.await {
+            Ok(_) | Err(_) => {}
+        }
     }
 
     fn test_config() -> AnnounceQueueConfig {
