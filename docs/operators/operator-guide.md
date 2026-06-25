@@ -447,6 +447,11 @@ operator-actionable.
 Use `/readyz` for Kubernetes readiness. A degraded dependency can appear in
 readiness and metrics without requiring a restart. Sporos records retry and
 backoff state so workers can resume safely after dependency recovery.
+`/v1/status.dependencies` lists dependency entries with stable `kind`, `name`,
+`state`, retry, failure, and timestamp fields. `source` is `memory`,
+`persisted`, or `memory_and_persisted`; `stale = true` means in-process health
+and persisted health disagree, so operators should treat the in-process state as
+current while preserving the persisted row for restart and audit context.
 Notification endpoint delivery health is best-effort and memory-only. The
 latest in-process delivery success or failure appears in `/v1/status` and
 `sporos_dependency_health_state`, but configured endpoints return to `unknown`
