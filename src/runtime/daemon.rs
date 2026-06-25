@@ -73,6 +73,7 @@ use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
 };
 use crate::secrets::sanitize_url_for_logging;
+use crate::time::unix_ms_to_rfc3339_seconds;
 use crate::torrent::parse_metafile;
 
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1664,7 +1665,7 @@ async fn process_scheduled_job_run(
             );
             tracing::info!(
                 job_name = %job_name,
-                scheduled_at_ms = run.scheduled_at_ms,
+                scheduled_at = %unix_ms_to_rfc3339_seconds(run.scheduled_at_ms),
                 "scheduled job completed"
             );
         }

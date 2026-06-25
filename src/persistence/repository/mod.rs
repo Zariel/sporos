@@ -27,6 +27,7 @@ use crate::domain::{
 use crate::errors::DatabaseError;
 use crate::indexers::{ConfiguredTorznabIndexer, ProwlarrIndexer, TorznabCaps};
 use crate::secrets::{CookieSecret, sanitize_url_for_logging};
+use crate::time::unix_ms_to_rfc3339_seconds;
 
 use super::schema::{CONNECTION_PRAGMAS, REQUIRED_TABLES, initial_schema_statements};
 
@@ -2877,7 +2878,7 @@ impl Repository {
             "announce.claim",
             lease_owner = owner,
             claim_limit = limit,
-            lease_until_ms
+            lease_until = %unix_ms_to_rfc3339_seconds(lease_until_ms)
         );
         let mut transaction = self
             .pool

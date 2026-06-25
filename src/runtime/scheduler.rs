@@ -11,6 +11,7 @@ use crate::runtime::backoff::fixed_retry_deadline_ms;
 use crate::runtime::queue::{
     BoundedWorkQueue, EnqueueError, QueueKind, WorkReceiver, bounded_work_queue,
 };
+use crate::time::unix_ms_to_rfc3339_seconds;
 use tokio::sync::Mutex;
 use tracing::{debug_span, info_span};
 
@@ -200,7 +201,11 @@ impl PersistedScheduler {
     }
 
     pub async fn tick(&self, now_ms: i64) -> Result<SchedulerTickSummary, SchedulerError> {
-        let _span = info_span!("scheduler.tick", now_ms, claim_limit = self.claim_limit);
+        let _span = info_span!(
+            "scheduler.tick",
+            now = %unix_ms_to_rfc3339_seconds(now_ms),
+            claim_limit = self.claim_limit
+        );
         let _claim_guard = self.claim_lock.lock().await;
         let seeded = self.seed_jobs(now_ms).await?;
         let ready_jobs = self.repository.ready_jobs(now_ms, self.claim_limit).await?;

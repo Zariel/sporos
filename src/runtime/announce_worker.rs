@@ -15,6 +15,7 @@ use crate::persistence::repository::{AnnounceDependency, AnnounceRetryUpdate, Re
 use crate::runtime::backoff::stable_jitter_ms;
 use crate::runtime::injection_worker::InjectionWorkResult;
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
+use crate::time::unix_ms_to_rfc3339_seconds;
 
 #[derive(Debug, Clone)]
 pub struct AnnounceWorker {
@@ -523,7 +524,10 @@ impl AnnounceWorker {
         &self,
         now_ms: i64,
     ) -> Result<AnnounceStartupSummary, AnnounceWorkerError> {
-        let _span = info_span!("announce.recover_startup", now_ms);
+        let _span = info_span!(
+            "announce.recover_startup",
+            now = %unix_ms_to_rfc3339_seconds(now_ms)
+        );
         let batch_size = self.config.retention_cleanup_batch_size;
         let max_batches = self.config.retention_cleanup_max_batches.max(1);
         let expired = self.repository.expire_announce_work(now_ms).await?;
@@ -549,7 +553,10 @@ impl AnnounceWorker {
         now_ms: i64,
         shutdown: &ShutdownSignal,
     ) -> Result<AnnounceMaintenanceSummary, AnnounceWorkerError> {
-        let _span = info_span!("announce.scheduled_cleanup", now_ms);
+        let _span = info_span!(
+            "announce.scheduled_cleanup",
+            now = %unix_ms_to_rfc3339_seconds(now_ms)
+        );
         let batch_size = self.config.retention_cleanup_batch_size;
         let max_batches = self.config.retention_cleanup_max_batches.max(1);
         ensure_cleanup_running(shutdown)?;

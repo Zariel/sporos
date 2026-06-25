@@ -18,4 +18,5 @@ pub mod notifications;
 pub mod persistence;
 pub mod runtime;
 pub mod secrets;
+pub mod time;
 pub mod torrent;
