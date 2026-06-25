@@ -395,9 +395,9 @@ for client injection or retry. `paths.media_dirs` are read-only media inventory
 roots.
 
 On startup Sporos creates parent directories for the database, torrent cache,
-and output paths, then checks that local state paths are writable. Media
-directories must already exist and be readable; Sporos does not create media
-roots.
+output paths, and configured injection link directories, then checks that local
+state and link paths are writable. Media directories must already exist and be
+readable; Sporos does not create media roots.
 
 Back up the SQLite database and any saved torrent/output directories together.
 For a consistent SQLite backup, stop the writer or use SQLite backup tooling

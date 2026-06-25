@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Deserializer};
 use toml::Value;
 
+use crate::actions::prepare_link_dirs as prepare_injection_link_dirs;
 use crate::announce::AnnounceQueueConfig;
 use crate::errors::ConfigError;
 use crate::secrets::{ApiKey, ApiToken, NotificationToken, Password};
@@ -454,6 +455,7 @@ where
     config.paths.resolve(cwd.as_ref(), supplied_paths)?;
     config.paths.prepare_local_state()?;
     config.paths.validate_media_dirs()?;
+    config.injection.prepare_link_dirs(cwd.as_ref())?;
     resolve_secret_files(&mut config)?;
     validate_server_auth(&config)?;
 
@@ -1510,6 +1512,45 @@ impl PathsConfig {
             validated.push(absolute);
         }
         self.media_dirs = validated;
+
+        Ok(())
+    }
+}
+
+impl InjectionConfig {
+    fn prepare_link_dirs(&mut self, cwd: &Path) -> Result<(), ConfigError> {
+        if self.link_type.is_none() {
+            return Ok(());
+        }
+
+        let mut link_dirs = Vec::with_capacity(self.link_dirs.len());
+        for link_dir in &self.link_dirs {
+            reject_relative_operator_path("injection.link_dirs", link_dir)?;
+            link_dirs.push(absolutize(link_dir, cwd));
+        }
+        if self.dry_run {
+            self.link_dirs = link_dirs;
+            return Ok(());
+        }
+
+        prepare_injection_link_dirs(&link_dirs).map_err(|error| {
+            path_error(
+                "injection.link_dirs",
+                format!("cannot prepare configured link directories: {error}"),
+            )
+        })?;
+
+        self.link_dirs = link_dirs
+            .iter()
+            .map(|path| {
+                path.canonicalize().map_err(|error| {
+                    path_error(
+                        "injection.link_dirs",
+                        format!("cannot resolve {}: {error}", path.display()),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(())
     }
@@ -2610,6 +2651,79 @@ mod tests {
         assert!(config.paths.torrent_cache_dir.is_dir());
         assert!(config.paths.output_dir.is_dir());
 
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn startup_config_creates_configured_link_directories() {
+        let cwd = unique_temp_dir("configured-link-dirs")
+            .canonicalize()
+            .unwrap();
+        let link_dir = cwd.join("links");
+        let contents = format!(
+            r#"
+            [injection]
+            link_type = "symlink"
+            link_dirs = ["{}"]
+            "#,
+            link_dir.display()
+        );
+
+        let config = parse_startup_config(&contents, &cwd).unwrap();
+
+        assert_eq!(
+            vec![link_dir.canonicalize().unwrap()],
+            config.injection.link_dirs
+        );
+        assert!(link_dir.is_dir());
+
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn startup_config_dry_run_does_not_create_configured_link_directories() {
+        let cwd = unique_temp_dir("dry-run-link-dirs").canonicalize().unwrap();
+        let link_dir = cwd.join("links");
+        let contents = format!(
+            r#"
+            [injection]
+            dry_run = true
+            link_type = "symlink"
+            link_dirs = ["{}"]
+            "#,
+            link_dir.display()
+        );
+
+        let config = parse_startup_config(&contents, &cwd).unwrap();
+
+        assert_eq!(vec![link_dir.clone()], config.injection.link_dirs);
+        assert!(!link_dir.exists());
+
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn startup_config_rejects_configured_link_directory_file() {
+        let cwd = unique_temp_dir("configured-link-dir-file")
+            .canonicalize()
+            .unwrap();
+        let link_dir = cwd.join("links");
+        fs::write(&link_dir, b"not a directory").unwrap();
+        let contents = format!(
+            r#"
+            [injection]
+            link_type = "symlink"
+            link_dirs = ["{}"]
+            "#,
+            link_dir.display()
+        );
+
+        let error = parse_startup_config(&contents, &cwd).unwrap_err();
+
+        assert!(error.to_string().contains("injection.link_dirs"));
+        assert!(error.to_string().contains("cannot prepare"));
+
+        fs::remove_file(link_dir).unwrap();
         fs::remove_dir_all(cwd).unwrap();
     }
 

@@ -463,7 +463,7 @@ pub fn select_link_dir_pinned(
     if link_dirs.is_empty() {
         return Err(LinkActionError::EmptyLinkDirs);
     }
-    validate_link_dirs(link_dirs)?;
+    prepare_link_dirs(link_dirs)?;
 
     if let Some(selected) = select_link_dir_by_device(source_path, link_dirs)? {
         return selected_link_dir(selected);
@@ -1190,6 +1190,97 @@ pub fn validate_link_dirs(link_dirs: &[PathBuf]) -> Result<(), LinkActionError> 
         validate_link_dir(link_dir)?;
     }
     Ok(())
+}
+
+pub fn prepare_link_dirs(link_dirs: &[PathBuf]) -> Result<(), LinkActionError> {
+    for link_dir in link_dirs {
+        prepare_link_dir(link_dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_link_dir(link_dir: &Path) -> Result<(), LinkActionError> {
+    let dir = open_or_create_directory_path(link_dir).map_err(|source| LinkActionError::Io {
+        operation: "open or create link directory",
+        path: link_dir.to_path_buf(),
+        source,
+    })?;
+    ensure_writable_link_dir_at(link_dir, &dir)
+}
+
+#[cfg(not(unix))]
+fn prepare_link_dir(link_dir: &Path) -> Result<(), LinkActionError> {
+    fs::create_dir_all(link_dir).map_err(|source| LinkActionError::Io {
+        operation: "create link directory",
+        path: link_dir.to_path_buf(),
+        source,
+    })?;
+    validate_link_dir(link_dir)?;
+    ensure_writable_link_dir(link_dir)
+}
+
+#[cfg(unix)]
+fn ensure_writable_link_dir_at(link_dir: &Path, dir: &OwnedFd) -> Result<(), LinkActionError> {
+    let probe_id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    ensure_writable_link_dir_at_with_name(link_dir, dir, &link_dir_probe_name(probe_id))
+}
+
+#[cfg(unix)]
+fn ensure_writable_link_dir_at_with_name(
+    link_dir: &Path,
+    dir: &OwnedFd,
+    probe_name: &Path,
+) -> Result<(), LinkActionError> {
+    let probe = link_dir.join(probe_name);
+    let file = rustix::fs::openat(
+        dir,
+        probe_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(io::Error::from)
+    .map_err(|source| LinkActionError::Io {
+        operation: "write link directory probe",
+        path: probe.clone(),
+        source,
+    })?;
+    drop(file);
+    rustix::fs::unlinkat(dir, probe_name, AtFlags::empty())
+        .map_err(io::Error::from)
+        .map_err(|source| LinkActionError::Io {
+            operation: "remove link directory probe",
+            path: probe,
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn ensure_writable_link_dir(link_dir: &Path) -> Result<(), LinkActionError> {
+    let probe_id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let probe_name = link_dir_probe_name(probe_id);
+    let probe = link_dir.join(&probe_name);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|source| LinkActionError::Io {
+            operation: "write link directory probe",
+            path: probe.clone(),
+            source,
+        })?;
+    fs::remove_file(&probe).map_err(|source| LinkActionError::Io {
+        operation: "remove link directory probe",
+        path: probe,
+        source,
+    })
+}
+
+fn link_dir_probe_name(probe_id: u64) -> PathBuf {
+    PathBuf::from(format!(
+        "sporos-link-dir-write-test-{}-{probe_id}",
+        std::process::id()
+    ))
 }
 
 #[cfg(unix)]
@@ -2907,9 +2998,20 @@ fn open_directory_path(path: &Path, create_missing: bool) -> io::Result<OwnedFd>
         let child = Path::new(name);
         match open_child_directory(&current, child) {
             Ok(next) => current = next,
-            Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
-                rustix::fs::mkdirat(&current, child, Mode::from_raw_mode(0o777))
-                    .map_err(io::Error::from)?;
+            Err(error)
+                if create_missing
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+            {
+                match rustix::fs::mkdirat(&current, child, Mode::from_raw_mode(0o777))
+                    .map_err(io::Error::from)
+                {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
                 current = open_child_directory(&current, child)?;
             }
             Err(error) => return Err(error),
@@ -4735,6 +4837,62 @@ mod tests {
             link_dir,
             link_destination_dir(Path::new("/links"), "tracker/example", true).unwrap()
         );
+    }
+
+    #[test]
+    fn link_dry_run_does_not_create_missing_link_dirs() {
+        let root = unique_temp_dir("dry-run-missing-link-dir");
+        let source = root.join("source");
+        let link_dir = root.join("links");
+        fs::create_dir_all(&source).unwrap();
+
+        let error = plan_metafile_link_dry_run(
+            &source,
+            &[local_file("movie.mkv", 4, 0)],
+            &[torrent_file("movie.mkv", 4, 0)],
+            MatchDecision::Exact,
+            DryRunLinkOptions {
+                link_dirs: std::slice::from_ref(&link_dir),
+                tracker: "tracker",
+                flat_linking: false,
+                link_type: LinkType::Symlink,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert!(!link_dir.exists());
+
+        remove_temp_dir(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_dir_write_probe_does_not_follow_or_remove_existing_symlink() {
+        let root = unique_temp_dir("link-dir-probe-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let link_dir = root.join("links");
+        let target = root.join("target");
+        let probe_name = Path::new("sporos-link-dir-write-test-fixed");
+        let probe = link_dir.join(probe_name);
+        fs::create_dir_all(&link_dir).unwrap();
+        fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &probe).unwrap();
+        let dir = open_or_create_directory_path(&link_dir).unwrap();
+
+        let error = ensure_writable_link_dir_at_with_name(&link_dir, &dir, probe_name).unwrap_err();
+
+        assert!(matches!(error, LinkActionError::Io { .. }));
+        assert_eq!(b"keep", fs::read(&target).unwrap().as_slice());
+        assert!(
+            fs::symlink_metadata(&probe)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        remove_temp_dir(&root);
     }
 
     fn test_metadata() -> TorrentOutputMetadata {

@@ -103,6 +103,10 @@ backups with host, filesystem, and backup access controls.
 `paths.media_dirs` are read-only media inventory roots. They must already
 exist and be readable; Sporos does not create media roots.
 
+When injection linking is enabled, `injection.link_dirs` are writable
+Sporos-managed directories. Sporos creates missing link directories and fails
+startup/readiness if a configured link directory cannot be created or written.
+
 ## Required And Optional Settings
 
 For a network-facing daemon, configure:
@@ -226,7 +230,8 @@ creation, and saved-torrent deletion. Dry-run records and reports the action
 Sporos would have taken, such as saving a candidate torrent or injecting into a
 target client. Leave `link_type` unset to keep the current behavior of injecting
 torrents directly into the client save path. When `link_type` is set,
-`link_dirs` must contain at least one trusted operator-controlled directory.
+`link_dirs` must contain at least one trusted operator-controlled writable path.
+Sporos creates the configured link directories if their parents are writable.
 
 ```toml
 [injection]

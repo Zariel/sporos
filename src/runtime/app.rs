@@ -1234,11 +1234,12 @@ impl AppRuntime {
         };
         let mut readiness = ReadinessState::ready();
         readiness.workers_running = false;
-        let readiness_link_dirs = if config.injection.link_type.is_some() {
-            config.injection.link_dirs.clone()
-        } else {
-            Vec::new()
-        };
+        let readiness_link_dirs =
+            if config.injection.link_type.is_some() && !config.injection.dry_run {
+                config.injection.link_dirs.clone()
+            } else {
+                Vec::new()
+            };
         let mut http = HttpState::new(readiness, health.clone())
             .with_live_readiness(
                 repository.clone(),
@@ -1969,11 +1970,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_readiness_validates_configured_link_dirs_when_linking_enabled() {
-        let root = unique_temp_dir("runtime-link-readiness");
+    async fn runtime_readiness_creates_configured_link_dirs_when_linking_enabled() {
+        let root = unique_temp_dir("runtime-link-readiness")
+            .canonicalize()
+            .unwrap();
         let mut config = runtime_test_config(&root);
         config.injection.link_type = Some(InjectionLinkTypeConfig::Hardlink);
-        config.injection.link_dirs = vec![root.join("missing-links")];
+        let link_dir = root.join("missing-links");
+        config.injection.link_dirs = vec![link_dir.clone()];
         let repository = Repository::connect_in_memory().await.unwrap();
         let runtime = AppRuntime::from_repository(config, repository)
             .await
@@ -1988,12 +1992,45 @@ mod tests {
             )
             .await
             .unwrap();
-        let status = response.status();
+        let _status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
-        assert_eq!(false, json["checks"]["link_dirs_usable"]);
+        assert_eq!(true, json["checks"]["link_dirs_usable"]);
+        assert!(link_dir.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_dry_run_does_not_create_configured_link_dirs() {
+        let root = unique_temp_dir("runtime-dry-run-link-readiness")
+            .canonicalize()
+            .unwrap();
+        let mut config = runtime_test_config(&root);
+        config.injection.dry_run = true;
+        config.injection.link_type = Some(InjectionLinkTypeConfig::Hardlink);
+        let link_dir = root.join("missing-links");
+        config.injection.link_dirs = vec![link_dir.clone()];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let response = router(runtime.state.http.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(true, json["checks"]["link_dirs_usable"]);
+        assert!(!link_dir.exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 

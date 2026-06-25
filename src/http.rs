@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tracing::{Instrument, debug_span, info_span};
 
-use crate::actions::validate_link_dirs;
+use crate::actions::prepare_link_dirs;
 use crate::announce::{
     AnnounceDedupeIdentity, AnnounceFetchMaterial, AnnounceQueueConfig, AnnounceReason,
     AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
@@ -437,7 +437,7 @@ impl ReadinessPaths {
     }
 
     fn ensure_link_dirs_usable(&self) -> bool {
-        validate_link_dirs(&self.link_dirs).is_ok()
+        prepare_link_dirs(&self.link_dirs).is_ok()
     }
 }
 
@@ -2202,14 +2202,15 @@ mod tests {
     async fn readyz_rechecks_configured_link_dirs_live() {
         let root = TestTempDir::new("readyz-link-dirs");
         let link_dir = root.path().join("links");
-        fs::create_dir_all(&link_dir).unwrap();
         let state = live_readiness_state_with_link_dirs(root.path(), vec![link_dir.clone()]).await;
 
         let (status, json) = readyz_json(state).await;
         assert_eq!(StatusCode::OK, status);
         assert_eq!(true, json["checks"]["link_dirs_usable"]);
+        assert!(link_dir.is_dir());
 
         fs::remove_dir_all(&link_dir).unwrap();
+        fs::write(&link_dir, b"not a directory").unwrap();
         let state = live_readiness_state_with_link_dirs(root.path(), vec![link_dir]).await;
         let (status, json) = readyz_json(state).await;
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
