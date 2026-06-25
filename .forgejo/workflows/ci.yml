@@ -134,8 +134,6 @@ jobs:
 
       - name: Build and push image
         env:
-          FORGEJO_REGISTRY_USER: ${{ vars.FORGEJO_REGISTRY_USER }}
-          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
           FORGEJO_REPOSITORY: ${{ forgejo.repository }}
         run: scripts/ci/publish-forgejo-image "$FORGEJO_REF_NAME"
 
@@ -151,7 +149,5 @@ jobs:
 
       - name: Build and push latest image
         env:
-          FORGEJO_REGISTRY_USER: ${{ vars.FORGEJO_REGISTRY_USER }}
-          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
           FORGEJO_REPOSITORY: ${{ forgejo.repository }}
         run: scripts/ci/publish-forgejo-image latest

@@ -9,11 +9,12 @@ Usage:
 Builds and pushes the Sporos container image to a Forgejo container registry.
 
 Required environment:
-  FORGEJO_REGISTRY_USER   Registry username.
-  FORGEJO_REGISTRY_TOKEN  Registry token or password.
+  Forgejo Actions automatically provides FORGEJO_ACTOR and FORGEJO_TOKEN.
 
 Optional environment:
   FORGEJO_REGISTRY        Registry host. Defaults to FORGEJO_IMAGE or FORGEJO_SERVER_URL host.
+  FORGEJO_REGISTRY_USER   Registry username. Defaults to FORGEJO_ACTOR/GITHUB_ACTOR.
+  FORGEJO_REGISTRY_TOKEN  Registry token or password. Defaults to FORGEJO_TOKEN/GITHUB_TOKEN.
   FORGEJO_IMAGE           Full image name. Defaults to <registry>/<repository>.
   FORGEJO_REPOSITORY      Owner/repository. Defaults to CI repository context.
 USAGE
@@ -47,8 +48,8 @@ if [ -z "$registry" ] && [ -n "${FORGEJO_SERVER_URL:-}" ]; then
 fi
 repository="${FORGEJO_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
 repository=$(printf "%s" "$repository" | tr "[:upper:]" "[:lower:]")
-user="${FORGEJO_REGISTRY_USER:-}"
-token="${FORGEJO_REGISTRY_TOKEN:-}"
+user="${FORGEJO_REGISTRY_USER:-${FORGEJO_ACTOR:-${GITHUB_ACTOR:-}}}"
+token="${FORGEJO_REGISTRY_TOKEN:-${FORGEJO_TOKEN:-${GITHUB_TOKEN:-}}}"
 
 if [ -z "$registry" ]; then
   echo "FORGEJO_REGISTRY or FORGEJO_SERVER_URL is required" >&2
@@ -60,11 +61,11 @@ if [ -z "$repository" ] && [ -z "${FORGEJO_IMAGE:-}" ]; then
 fi
 image="${FORGEJO_IMAGE:-$registry/$repository}"
 if [ -z "$user" ]; then
-  echo "FORGEJO_REGISTRY_USER is required" >&2
+  echo "FORGEJO_REGISTRY_USER or FORGEJO_ACTOR is required" >&2
   exit 1
 fi
 if [ -z "$token" ]; then
-  echo "FORGEJO_REGISTRY_TOKEN is required" >&2
+  echo "FORGEJO_REGISTRY_TOKEN or FORGEJO_TOKEN is required" >&2
   exit 1
 fi
 
