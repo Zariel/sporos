@@ -19,7 +19,7 @@ use std::os::windows::fs::MetadataExt;
 
 use tokio::sync::{Mutex, MutexGuard, mpsc};
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::actions::{
     CreatedLink, CreatedRoot, DryRunLinkOptions, LinkActionError, LinkDirOptions, LinkFilesOptions,
@@ -50,6 +50,7 @@ use crate::persistence::repository::Repository;
 use crate::persistence::torrent_cache::{TorrentOutputMetadata, parse_torrent_output_filename};
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal, shutdown_channel};
+use crate::secrets::sanitize_url_for_logging;
 use crate::torrent::parse_metafile;
 
 const MAX_SAVED_TORRENT_BYTES: u64 = 32 * 1024 * 1024;
@@ -388,6 +389,287 @@ fn spawn_client_inventory_refreshes(
     }
 }
 
+fn redacted_operator_text(value: impl AsRef<str>) -> String {
+    sanitize_url_for_logging(value).to_string()
+}
+
+fn operator_workflow(from_saved_retry: bool) -> &'static str {
+    if from_saved_retry {
+        "saved_retry"
+    } else {
+        "injection"
+    }
+}
+
+fn local_item_source_kind(item: &LocalItem) -> &'static str {
+    match &item.source {
+        crate::domain::LocalItemSource::Client { .. } => "client",
+        crate::domain::LocalItemSource::TorrentCache { .. } => "torrent_cache",
+        crate::domain::LocalItemSource::DataRoot { .. } => "data_root",
+        crate::domain::LocalItemSource::Virtual { .. } => "virtual",
+    }
+}
+
+fn local_item_id(item: &LocalItem) -> Option<u64> {
+    item.id.map(|id| id.get())
+}
+
+fn candidate_id(candidate: &RemoteCandidate) -> Option<u64> {
+    candidate.id.map(|id| id.get())
+}
+
+fn candidate_info_hash(candidate: &RemoteCandidate) -> Option<&str> {
+    candidate
+        .info_hash
+        .as_ref()
+        .map(|info_hash| info_hash.as_str())
+}
+
+fn log_injection_target_selected(
+    request: &InjectionRequest,
+    target_name: &DependencyName,
+    from_saved_retry: bool,
+    dry_run: bool,
+) {
+    let candidate_title = redacted_operator_text(request.candidate.title.as_str());
+    let candidate_tracker = redacted_operator_text(request.candidate.tracker.as_str());
+    let candidate_guid = redacted_operator_text(request.candidate.guid.as_str());
+    let local_title = redacted_operator_text(request.local_item.title.as_str());
+    info!(
+        workflow = operator_workflow(from_saved_retry),
+        dry_run,
+        target_client = %target_name,
+        candidate_id = request.candidate_id.get(),
+        remote_candidate_id = candidate_id(&request.candidate),
+        candidate_title = %candidate_title,
+        candidate_tracker = %candidate_tracker,
+        candidate_guid = %candidate_guid,
+        candidate_info_hash = candidate_info_hash(&request.candidate),
+        local_item_id = local_item_id(&request.local_item),
+        local_title = %local_title,
+        local_source = local_item_source_kind(&request.local_item),
+        decision = ?request.assessment.decision,
+        reason = ?request.assessment.reason,
+        matched_size_bytes = request.assessment.matched_size.map(|size| size.get()),
+        matched_ratio = request.assessment.matched_ratio.map(|ratio| ratio.get()),
+        link_type = ?request.link_type,
+        link_dir_count = request.link_dirs.len(),
+        "injection target selected"
+    );
+}
+
+fn log_injection_preparation_planned(
+    request: &InjectionRequest,
+    preparation: &PreparedInjectionPhase,
+    target_name: &DependencyName,
+    from_saved_retry: bool,
+    dry_run: bool,
+) {
+    let candidate_title = redacted_operator_text(request.candidate.title.as_str());
+    let candidate_tracker = redacted_operator_text(request.candidate.tracker.as_str());
+    info!(
+        workflow = operator_workflow(from_saved_retry),
+        dry_run,
+        target_client = %target_name,
+        candidate_id = request.candidate_id.get(),
+        candidate_title = %candidate_title,
+        candidate_tracker = %candidate_tracker,
+        candidate_info_hash = request.metafile.info_hash().as_str(),
+        has_save_path = preparation.save_path.is_some(),
+        has_planned_link_destination = preparation.dry_run_link_destination.is_some(),
+        linked_files = preparation.linked_files,
+        has_prepared_links = preparation.has_prepared_links,
+        link_type = ?request.link_type,
+        link_dir_count = request.link_dirs.len(),
+        pause_for_recheck = preparation.pause_for_recheck,
+        would_recheck = preparation.run_resume_after_inject,
+        "injection preparation planned"
+    );
+}
+
+struct DryRunActionLogSummary {
+    action: Option<&'static str>,
+    has_save_path: Option<bool>,
+    has_planned_link_destination: Option<bool>,
+    link_type: Option<LinkType>,
+    link_dir_count: Option<usize>,
+    flat_linking: Option<bool>,
+    pause_for_recheck: Option<bool>,
+    would_recheck: Option<bool>,
+}
+
+fn dry_run_action_summary(action: Option<&DryRunAction>) -> DryRunActionLogSummary {
+    match action {
+        Some(DryRunAction::SaveCandidateTorrent { .. }) => DryRunActionLogSummary {
+            action: Some("save_candidate_torrent"),
+            has_save_path: None,
+            has_planned_link_destination: None,
+            link_type: None,
+            link_dir_count: None,
+            flat_linking: None,
+            pause_for_recheck: None,
+            would_recheck: None,
+        },
+        Some(DryRunAction::InjectTorrent {
+            save_path,
+            planned_link_destination,
+            link_type,
+            link_dir_count,
+            flat_linking,
+            pause_for_recheck,
+            would_recheck,
+        }) => DryRunActionLogSummary {
+            action: Some("inject_torrent"),
+            has_save_path: Some(save_path.is_some()),
+            has_planned_link_destination: Some(planned_link_destination.is_some()),
+            link_type: *link_type,
+            link_dir_count: Some(*link_dir_count),
+            flat_linking: Some(*flat_linking),
+            pause_for_recheck: Some(*pause_for_recheck),
+            would_recheck: Some(*would_recheck),
+        },
+        None => DryRunActionLogSummary {
+            action: None,
+            has_save_path: None,
+            has_planned_link_destination: None,
+            link_type: None,
+            link_dir_count: None,
+            flat_linking: None,
+            pause_for_recheck: None,
+            would_recheck: None,
+        },
+    }
+}
+
+fn log_injection_result(
+    request: &InjectionRequest,
+    result: &InjectionWorkResult,
+    from_saved_retry: bool,
+    dry_run: bool,
+) {
+    let candidate_title = redacted_operator_text(request.candidate.title.as_str());
+    let dry_run_summary = dry_run_action_summary(result.dry_run_action.as_ref());
+    info!(
+        workflow = operator_workflow(from_saved_retry),
+        dry_run,
+        target_client = result.target_client.as_ref().map(|name| name.as_str()),
+        outcome = ?result.outcome,
+        candidate_id = request.candidate_id.get(),
+        candidate_title = %candidate_title,
+        candidate_info_hash = request.metafile.info_hash().as_str(),
+        saved_for_retry = result.saved_for_retry,
+        linked_files = result.linked_files,
+        dry_run_action = dry_run_summary.action,
+        dry_run_has_save_path = dry_run_summary.has_save_path,
+        dry_run_has_planned_link_destination = dry_run_summary.has_planned_link_destination,
+        dry_run_link_type = ?dry_run_summary.link_type,
+        dry_run_link_dir_count = dry_run_summary.link_dir_count,
+        dry_run_flat_linking = dry_run_summary.flat_linking,
+        dry_run_pause_for_recheck = dry_run_summary.pause_for_recheck,
+        dry_run_would_recheck = dry_run_summary.would_recheck,
+        prepared_link_cleanup_incomplete = result.prepared_link_cleanup_incomplete,
+        "injection action completed"
+    );
+}
+
+fn logged_injection_result(
+    request: &InjectionRequest,
+    result: InjectionWorkResult,
+    from_saved_retry: bool,
+    dry_run: bool,
+) -> InjectionWorkResult {
+    log_injection_result(request, &result, from_saved_retry, dry_run);
+    result
+}
+
+struct InjectionFailureLog<'a> {
+    request: &'a InjectionRequest,
+    target_name: &'a DependencyName,
+    outcome: InjectionOutcome,
+    linked_files: usize,
+    prepared_link_cleanup_incomplete: bool,
+    failure_reason: &'static str,
+    from_saved_retry: bool,
+    dry_run: bool,
+}
+
+fn log_injection_action_failed(context: InjectionFailureLog<'_>) {
+    let request = context.request;
+    let candidate_title = redacted_operator_text(request.candidate.title.as_str());
+    info!(
+        workflow = operator_workflow(context.from_saved_retry),
+        dry_run = context.dry_run,
+        target_client = %context.target_name,
+        outcome = ?context.outcome,
+        candidate_id = request.candidate_id.get(),
+        candidate_title = %candidate_title,
+        candidate_info_hash = request.metafile.info_hash().as_str(),
+        linked_files = context.linked_files,
+        prepared_link_cleanup_incomplete = context.prepared_link_cleanup_incomplete,
+        failure_reason = context.failure_reason,
+        "injection action failed"
+    );
+}
+
+fn log_saved_retry_assessment(
+    candidate: &RemoteCandidate,
+    local_item: &LocalItem,
+    assessment: &PersistedCandidateAssessment,
+    next_action: &'static str,
+) {
+    let candidate_title = redacted_operator_text(candidate.title.as_str());
+    let candidate_tracker = redacted_operator_text(candidate.tracker.as_str());
+    let local_title = redacted_operator_text(local_item.title.as_str());
+    match assessment {
+        PersistedCandidateAssessment::Assessed {
+            candidate_id: persisted_candidate_id,
+            assessment,
+            ..
+        }
+        | PersistedCandidateAssessment::Rejected {
+            candidate_id: persisted_candidate_id,
+            assessment,
+            ..
+        } => {
+            info!(
+                workflow = "saved_retry",
+                next_action,
+                candidate_id = persisted_candidate_id.get(),
+                remote_candidate_id = candidate_id(candidate),
+                candidate_title = %candidate_title,
+                candidate_tracker = %candidate_tracker,
+                candidate_info_hash = candidate_info_hash(candidate),
+                local_item_id = local_item_id(local_item),
+                local_title = %local_title,
+                local_source = local_item_source_kind(local_item),
+                decision = ?assessment.decision,
+                reason = ?assessment.reason,
+                matched_size_bytes = assessment.matched_size.map(|size| size.get()),
+                matched_ratio = assessment.matched_ratio.map(|ratio| ratio.get()),
+                "saved torrent retry match decision selected"
+            );
+        }
+        PersistedCandidateAssessment::NeedsTorrentDownload {
+            candidate_id: persisted_candidate_id,
+            ..
+        } => {
+            info!(
+                workflow = "saved_retry",
+                next_action,
+                candidate_id = persisted_candidate_id.get(),
+                remote_candidate_id = candidate_id(candidate),
+                candidate_title = %candidate_title,
+                candidate_tracker = %candidate_tracker,
+                candidate_info_hash = candidate_info_hash(candidate),
+                local_item_id = local_item_id(local_item),
+                local_title = %local_title,
+                local_source = local_item_source_kind(local_item),
+                "saved torrent retry needs torrent metadata"
+            );
+        }
+    }
+}
+
 impl InjectionWorker {
     pub fn new(repository: Repository, clients: Vec<Arc<dyn InjectionClient>>) -> Self {
         Self {
@@ -581,26 +863,39 @@ impl InjectionWorker {
             .select_target(&request.local_item)
             .ok_or(InjectionWorkerError::NoWritableClient)?;
         let target_name = dependency_name(target.descriptor())?;
+        log_injection_target_selected(&request, &target_name, from_saved_retry, self.dry_run);
         if should_stop() {
             if self.dry_run {
-                return Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::DryRun,
                     target_client: Some(target_name),
                     dry_run_action: Some(dry_run_inject_action(&request, None)),
                     saved_for_retry: false,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: false,
-                });
+                };
+                return Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ));
             }
             self.save_for_retry_phase(&request).await?;
-            return Ok(InjectionWorkResult {
+            let result = InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
                 dry_run_action: None,
                 saved_for_retry: true,
                 linked_files: 0,
                 prepared_link_cleanup_incomplete: false,
-            });
+            };
+            return Ok(logged_injection_result(
+                &request,
+                result,
+                from_saved_retry,
+                self.dry_run,
+            ));
         }
         let existing = self
             .find_existing_client(
@@ -619,59 +914,89 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
-                return Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::AlreadyExists,
                     target_client: Some(dependency_name(existing_client.descriptor())?),
                     dry_run_action: None,
                     saved_for_retry: false,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: false,
-                });
+                };
+                return Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ));
             }
             ExistingClientLookup::NotFound => {}
             ExistingClientLookup::Shutdown => {
                 if self.dry_run {
-                    return Ok(InjectionWorkResult {
+                    let result = InjectionWorkResult {
                         outcome: InjectionOutcome::DryRun,
                         target_client: Some(target_name),
                         dry_run_action: Some(dry_run_inject_action(&request, None)),
                         saved_for_retry: false,
                         linked_files: 0,
                         prepared_link_cleanup_incomplete: false,
-                    });
+                    };
+                    return Ok(logged_injection_result(
+                        &request,
+                        result,
+                        from_saved_retry,
+                        self.dry_run,
+                    ));
                 }
                 self.save_for_retry_phase(&request).await?;
-                return Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
                     dry_run_action: None,
                     saved_for_retry: true,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: false,
-                });
+                };
+                return Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ));
             }
         }
 
         if should_stop() {
             if self.dry_run {
-                return Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::DryRun,
                     target_client: Some(target_name),
                     dry_run_action: Some(dry_run_inject_action(&request, None)),
                     saved_for_retry: false,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: false,
-                });
+                };
+                return Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ));
             }
             self.save_for_retry_phase(&request).await?;
-            return Ok(InjectionWorkResult {
+            let result = InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
                 dry_run_action: None,
                 saved_for_retry: true,
                 linked_files: 0,
                 prepared_link_cleanup_incomplete: false,
-            });
+            };
+            return Ok(logged_injection_result(
+                &request,
+                result,
+                from_saved_retry,
+                self.dry_run,
+            ));
         }
 
         let preparation_phase = if self.dry_run {
@@ -682,52 +1007,90 @@ impl InjectionWorker {
         };
         let preparation = match preparation_phase {
             InjectionPreparationPhase::Ready(preparation) => preparation,
-            InjectionPreparationPhase::Rejected(result) => return Ok(result),
+            InjectionPreparationPhase::Rejected(result) => {
+                return Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ));
+            }
             InjectionPreparationPhase::SourceIncomplete => {
                 if self.dry_run {
-                    return Ok(InjectionWorkResult {
+                    let result = InjectionWorkResult {
                         outcome: InjectionOutcome::SourceIncomplete,
                         target_client: Some(target_name),
                         dry_run_action: None,
                         saved_for_retry: false,
                         linked_files: 0,
                         prepared_link_cleanup_incomplete: false,
-                    });
+                    };
+                    return Ok(logged_injection_result(
+                        &request,
+                        result,
+                        from_saved_retry,
+                        self.dry_run,
+                    ));
                 }
                 self.save_for_retry_phase(&request).await?;
-                return Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::SourceIncomplete,
                     target_client: Some(target_name),
                     dry_run_action: None,
                     saved_for_retry: true,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: false,
-                });
+                };
+                return Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ));
             }
         };
+        log_injection_preparation_planned(
+            &request,
+            &preparation,
+            &target_name,
+            from_saved_retry,
+            self.dry_run,
+        );
 
         if should_stop() {
             if self.dry_run {
-                return Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::DryRun,
                     target_client: Some(target_name),
                     dry_run_action: Some(dry_run_inject_action(&request, Some(&preparation))),
                     saved_for_retry: false,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: false,
-                });
+                };
+                return Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ));
             }
             let save_result = self.save_for_retry_phase(&request).await;
             let cleanup = preparation.cleanup_prepared_links_phase();
             save_result?;
-            return Ok(InjectionWorkResult {
+            let result = InjectionWorkResult {
                 outcome: InjectionOutcome::Saved,
                 target_client: Some(target_name),
                 dry_run_action: None,
                 saved_for_retry: true,
                 linked_files: preparation.linked_files,
                 prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
-            });
+            };
+            return Ok(logged_injection_result(
+                &request,
+                result,
+                from_saved_retry,
+                self.dry_run,
+            ));
         }
         let mutation_result = self
             .run_mutation_phase(
@@ -742,39 +1105,57 @@ impl InjectionWorker {
         match mutation_result {
             InjectionMutationResult::SavedForShutdown => {
                 if self.dry_run {
-                    return Ok(InjectionWorkResult {
+                    let result = InjectionWorkResult {
                         outcome: InjectionOutcome::DryRun,
                         target_client: Some(target_name),
                         dry_run_action: Some(dry_run_inject_action(&request, Some(&preparation))),
                         saved_for_retry: false,
                         linked_files: preparation.linked_files,
                         prepared_link_cleanup_incomplete: false,
-                    });
+                    };
+                    return Ok(logged_injection_result(
+                        &request,
+                        result,
+                        from_saved_retry,
+                        self.dry_run,
+                    ));
                 }
                 let save_result = self.save_for_retry_phase(&request).await;
                 let cleanup = preparation.cleanup_prepared_links_phase();
                 save_result?;
-                Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::Saved,
                     target_client: Some(target_name),
                     dry_run_action: None,
                     saved_for_retry: true,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
-                })
+                };
+                Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ))
             }
             InjectionMutationResult::AlreadyExistsOnTarget => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
                 if self.dry_run {
-                    return Ok(InjectionWorkResult {
+                    let result = InjectionWorkResult {
                         outcome: InjectionOutcome::AlreadyExists,
                         target_client: Some(target_name),
                         dry_run_action: None,
                         saved_for_retry: false,
                         linked_files: 0,
                         prepared_link_cleanup_incomplete: false,
-                    });
+                    };
+                    return Ok(logged_injection_result(
+                        &request,
+                        result,
+                        from_saved_retry,
+                        self.dry_run,
+                    ));
                 }
                 let mut saved_for_retry = false;
                 if preparation.has_prepared_links
@@ -797,14 +1178,20 @@ impl InjectionWorker {
                         saved_for_retry = true;
                     }
                 }
-                Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::AlreadyExists,
                     target_client: Some(target_name),
                     dry_run_action: None,
                     saved_for_retry,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: false,
-                })
+                };
+                Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ))
             }
             InjectionMutationResult::AlreadyExistsOnOtherClient(existing_client) => {
                 let cleanup = preparation.cleanup_prepared_links_phase();
@@ -815,14 +1202,20 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
-                Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::AlreadyExists,
                     target_client: Some(dependency_name(existing_client.descriptor())?),
                     dry_run_action: None,
                     saved_for_retry: false,
                     linked_files: 0,
                     prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
-                })
+                };
+                Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ))
             }
             InjectionMutationResult::Injected(Ok(())) => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
@@ -844,27 +1237,39 @@ impl InjectionWorker {
                     save_result?;
                     resume_result?;
                 }
-                Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::Injected,
                     target_client: Some(target_name),
                     dry_run_action: None,
                     saved_for_retry: preparation.run_resume_after_inject,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: false,
-                })
+                };
+                Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ))
             }
             InjectionMutationResult::DryRun => {
                 self.record_client_health(target.descriptor(), true, None, request.assessed_at_ms)
                     .await?;
                 let cleanup = preparation.cleanup_prepared_links_phase();
-                Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::DryRun,
                     target_client: Some(target_name),
                     dry_run_action: Some(dry_run_inject_action(&request, Some(&preparation))),
                     saved_for_retry: false,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
-                })
+                };
+                Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ))
             }
             InjectionMutationResult::Injected(Err(error)) => {
                 let save_result = self.save_for_retry_phase(&request).await;
@@ -877,18 +1282,34 @@ impl InjectionWorker {
                 )
                 .await?;
                 save_result?;
-                Ok(InjectionWorkResult {
+                let result = InjectionWorkResult {
                     outcome: InjectionOutcome::Failed,
                     target_client: Some(target_name),
                     dry_run_action: None,
                     saved_for_retry: true,
                     linked_files: preparation.linked_files,
                     prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
-                })
+                };
+                Ok(logged_injection_result(
+                    &request,
+                    result,
+                    from_saved_retry,
+                    self.dry_run,
+                ))
             }
             InjectionMutationResult::PreparedLinksInvalid(error) => {
                 let save_result = self.save_for_retry_phase(&request).await;
                 let cleanup = preparation.cleanup_prepared_links_phase();
+                log_injection_action_failed(InjectionFailureLog {
+                    request: &request,
+                    target_name: &target_name,
+                    outcome: InjectionOutcome::Failed,
+                    linked_files: preparation.linked_files,
+                    prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
+                    failure_reason: "prepared_links_invalid",
+                    from_saved_retry,
+                    dry_run: self.dry_run,
+                });
                 if cleanup.prepared_link_cleanup_incomplete {
                     Err(InjectionWorkerError::Link(
                         LinkActionError::CleanupIncomplete {
@@ -907,6 +1328,16 @@ impl InjectionWorker {
             }
             InjectionMutationResult::ExistingLookupFailed(error) => {
                 let cleanup = preparation.cleanup_prepared_links_phase();
+                log_injection_action_failed(InjectionFailureLog {
+                    request: &request,
+                    target_name: &target_name,
+                    outcome: InjectionOutcome::Failed,
+                    linked_files: preparation.linked_files,
+                    prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
+                    failure_reason: "existing_client_lookup_failed",
+                    from_saved_retry,
+                    dry_run: self.dry_run,
+                });
                 if cleanup.prepared_link_cleanup_incomplete {
                     match error {
                         InjectionWorkerError::Client(source) => {
@@ -931,6 +1362,16 @@ impl InjectionWorker {
                     request.assessed_at_ms,
                 )
                 .await?;
+                log_injection_action_failed(InjectionFailureLog {
+                    request: &request,
+                    target_name: &target_name,
+                    outcome: InjectionOutcome::Failed,
+                    linked_files: preparation.linked_files,
+                    prepared_link_cleanup_incomplete: cleanup.prepared_link_cleanup_incomplete,
+                    failure_reason: "target_precheck_failed",
+                    from_saved_retry,
+                    dry_run: self.dry_run,
+                });
                 if cleanup.prepared_link_cleanup_incomplete {
                     Err(InjectionWorkerError::ClientWithPreparedLinkCleanup {
                         source: error,
@@ -1161,6 +1602,18 @@ impl InjectionWorker {
             )
             .await
             .map_err(saved_retry_assessment_error)?;
+            let next_action = match &assessment {
+                PersistedCandidateAssessment::Assessed { assessment, .. }
+                    if matches!(
+                        assessment.decision,
+                        MatchDecision::Exact | MatchDecision::SizeOnly | MatchDecision::Partial
+                    ) =>
+                {
+                    "inject_candidate"
+                }
+                _ => "keep_saved_torrent",
+            };
+            log_saved_retry_assessment(&candidate, &lookup.local_item, &assessment, next_action);
             let Some((candidate_id, assessment)) = actionable_saved_assessment(assessment) else {
                 continue;
             };
@@ -1256,6 +1709,13 @@ impl InjectionWorker {
         }
 
         if !attempted_match {
+            let candidate_title = redacted_operator_text(candidate.title.as_str());
+            info!(
+                workflow = "saved_retry",
+                candidate_title = %candidate_title,
+                candidate_info_hash = candidate_info_hash(&candidate),
+                "saved torrent retry found no actionable match; keeping file"
+            );
             summary.no_match += 1;
             summary.kept += 1;
         }
@@ -1651,6 +2111,14 @@ impl InjectionWorker {
         request: &InjectionRequest,
     ) -> Result<RetrySavePhaseResult, InjectionWorkerError> {
         self.save_for_retry(request).await?;
+        let candidate_title = redacted_operator_text(request.candidate.title.as_str());
+        info!(
+            candidate_id = request.candidate_id.get(),
+            candidate_title = %candidate_title,
+            candidate_info_hash = request.metafile.info_hash().as_str(),
+            output_dir_configured = !request.output_dir.as_os_str().is_empty(),
+            "candidate torrent saved for retry"
+        );
         Ok(RetrySavePhaseResult::Saved)
     }
 
@@ -2845,6 +3313,7 @@ fn dry_run_inject_action(
 mod tests {
     use std::fs;
     use std::future::pending;
+    use std::io::{self, Write};
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2860,8 +3329,49 @@ mod tests {
     use crate::persistence::repository::Repository;
     use crate::runtime::shutdown::ShutdownController;
     use tokio::sync::Barrier;
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::MakeWriter;
 
     static SAVED_TORRENT_READ_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        captured: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn captured(&self) -> Arc<StdMutex<Vec<u8>>> {
+            Arc::clone(&self.captured)
+        }
+    }
+
+    struct SharedWriteGuard {
+        captured: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedWriteGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.captured
+                .lock()
+                .map_err(|_poisoned| io::Error::other("captured log buffer mutex poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriteGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriteGuard {
+                captured: Arc::clone(&self.captured),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn worker_checks_other_clients_before_mutating_target() {
@@ -3010,6 +3520,88 @@ mod tests {
         assert_eq!(0, target.recheck_calls.load(Ordering::SeqCst));
         assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
         assert_eq!("healthy", health[0].state);
+    }
+
+    #[test]
+    fn operator_logs_injection_plan_outcome_and_redacts_candidate_text() {
+        let writer = SharedWriter::default();
+        let captured = writer.captured();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("sporos=info"))
+            .with_writer(writer)
+            .with_ansi(false)
+            .finish();
+        let root = PathBuf::from("/downloads/movie");
+        let mut candidate = remote_candidate();
+        candidate.title =
+            ItemTitle::new("https://tracker.example/release?apikey=title-secret&id=release-1")
+                .unwrap();
+        candidate.guid =
+            CandidateGuid::new("https://tracker.example/guid?passkey=guid-secret").unwrap();
+        candidate.tracker =
+            TrackerName::new("https://tracker.example/rss?authkey=tracker-secret").unwrap();
+        let request = request(
+            local_item(&root),
+            candidate,
+            RemoteCandidateId::new(42).unwrap(),
+            &root,
+        );
+        let target_name = DependencyName::new("qbit-main").unwrap();
+        let recheck_plan = RecheckResumePlan {
+            should_recheck: true,
+            max_remaining_bytes: ByteSize::new(0),
+            min_completion_percent: None,
+            max_remaining_percent: None,
+        };
+        let preparation = PreparedInjectionPhase {
+            save_path: Some(root.clone()),
+            dry_run_link_destination: Some(PathBuf::from(
+                "/links/https___tracker.example_rss_authkey_tracker-secret",
+            )),
+            created_links: Vec::new(),
+            prepared_links: Vec::new(),
+            created_roots: Vec::new(),
+            linked_files: 1,
+            has_prepared_links: true,
+            recheck_plan,
+            recheck_after_linking: recheck_plan,
+            pause_for_recheck: true,
+            run_resume_after_inject: true,
+        };
+        let result = InjectionWorkResult {
+            outcome: InjectionOutcome::DryRun,
+            target_client: Some(target_name.clone()),
+            dry_run_action: Some(dry_run_inject_action(&request, Some(&preparation))),
+            saved_for_retry: false,
+            linked_files: preparation.linked_files,
+            prepared_link_cleanup_incomplete: false,
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_injection_target_selected(&request, &target_name, false, true);
+            log_injection_preparation_planned(&request, &preparation, &target_name, false, true);
+            log_injection_result(&request, &result, false, true);
+        });
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("injection target selected"));
+        assert!(output.contains("injection preparation planned"));
+        assert!(output.contains("injection action completed"));
+        assert!(output.contains(
+            "candidate_title=https://tracker.example/release?apikey=[REDACTED]&id=release-1"
+        ));
+        assert!(output.contains("target_client=qbit-main"));
+        assert!(output.contains("linked_files=1"));
+        assert!(output.contains("has_planned_link_destination=true"));
+        assert!(
+            output.contains("dry_run_action=inject_torrent")
+                || output.contains("dry_run_action=\"inject_torrent\"")
+        );
+        assert!(output.contains("dry_run_has_planned_link_destination=true"));
+        assert!(!output.contains("/links/"));
+        assert!(!output.contains("title-secret"));
+        assert!(!output.contains("guid-secret"));
+        assert!(!output.contains("tracker-secret"));
     }
 
     #[tokio::test]

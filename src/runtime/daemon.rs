@@ -26,8 +26,8 @@ use crate::config::{MatchingMode, SporosConfig, validate_server_auth};
 use crate::content_filter::{ContentFilterConfig, ContentFilterContext, Permille};
 use crate::domain::{
     CandidateAssessment, CandidateGuid, DependencyName, DownloadUrl, IndexerId, InfoHash,
-    InjectionOutcome, JobName, LocalFile, LocalItem, MatchDecision, ReasonText, RemoteCandidate,
-    RemoteCandidateId, TrackerName,
+    InjectionOutcome, JobName, LocalFile, LocalItem, LocalItemSource, MatchDecision, ReasonText,
+    RemoteCandidate, RemoteCandidateId, TrackerName,
 };
 use crate::errors::{ConfigError, DatabaseError};
 use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
@@ -970,6 +970,170 @@ struct ActionableLookup {
     assessment: CandidateAssessment,
 }
 
+fn redacted_operator_text(value: impl AsRef<str>) -> String {
+    sanitize_url_for_logging(value).to_string()
+}
+
+fn local_item_source_kind(item: &LocalItem) -> &'static str {
+    match &item.source {
+        LocalItemSource::Client { .. } => "client",
+        LocalItemSource::TorrentCache { .. } => "torrent_cache",
+        LocalItemSource::DataRoot { .. } => "data_root",
+        LocalItemSource::Virtual { .. } => "virtual",
+    }
+}
+
+fn local_item_id(item: &LocalItem) -> Option<u64> {
+    item.id.map(|id| id.get())
+}
+
+fn candidate_id(candidate: &RemoteCandidate) -> Option<u64> {
+    candidate.id.map(|id| id.get())
+}
+
+fn candidate_info_hash(candidate: &RemoteCandidate) -> Option<&str> {
+    candidate
+        .info_hash
+        .as_ref()
+        .map(|info_hash| info_hash.as_str())
+}
+
+fn assessment_fields(
+    assessment: &PersistedCandidateAssessment,
+) -> Option<(
+    MatchDecision,
+    crate::domain::DecisionReason,
+    Option<u64>,
+    Option<f64>,
+)> {
+    match assessment {
+        PersistedCandidateAssessment::Assessed { assessment, .. }
+        | PersistedCandidateAssessment::Rejected { assessment, .. } => Some((
+            assessment.decision,
+            assessment.reason,
+            assessment.matched_size.map(|size| size.get()),
+            assessment.matched_ratio.map(|ratio| ratio.get()),
+        )),
+        PersistedCandidateAssessment::NeedsTorrentDownload { .. } => None,
+    }
+}
+
+fn log_reverse_lookup_outcome(
+    workflow: &'static str,
+    candidate: &RemoteCandidate,
+    outcome: &ReverseLookupOutcome,
+    next_action: &'static str,
+) {
+    let title = redacted_operator_text(candidate.title.as_str());
+    let tracker = redacted_operator_text(candidate.tracker.as_str());
+    let guid = redacted_operator_text(candidate.guid.as_str());
+    match outcome {
+        ReverseLookupOutcome::Matched {
+            local_item,
+            assessment,
+        }
+        | ReverseLookupOutcome::AlreadyPresent {
+            local_item,
+            assessment,
+        }
+        | ReverseLookupOutcome::BestFailure {
+            local_item,
+            assessment,
+        } => {
+            let local_title = redacted_operator_text(local_item.title.as_str());
+            let fields = assessment_fields(assessment);
+            let (decision, reason, matched_size_bytes, matched_ratio) = fields
+                .map(|(decision, reason, matched_size_bytes, matched_ratio)| {
+                    (
+                        Some(decision),
+                        Some(reason),
+                        matched_size_bytes,
+                        matched_ratio,
+                    )
+                })
+                .unwrap_or((None, None, None, None));
+            info!(
+                workflow,
+                next_action,
+                candidate_id = candidate_id(candidate),
+                candidate_title = %title,
+                candidate_tracker = %tracker,
+                candidate_guid = %guid,
+                candidate_info_hash = candidate_info_hash(candidate),
+                local_item_id = local_item_id(local_item),
+                local_title = %local_title,
+                local_source = local_item_source_kind(local_item),
+                decision = ?decision,
+                reason = ?reason,
+                matched_size_bytes,
+                matched_ratio,
+                "candidate reverse lookup assessed"
+            );
+        }
+        ReverseLookupOutcome::NeedsTorrentDownload {
+            local_item,
+            candidate_id: matched_candidate_id,
+        } => {
+            let local_title = redacted_operator_text(local_item.title.as_str());
+            info!(
+                workflow,
+                next_action,
+                candidate_id = matched_candidate_id.get(),
+                candidate_title = %title,
+                candidate_tracker = %tracker,
+                candidate_guid = %guid,
+                candidate_info_hash = candidate_info_hash(candidate),
+                local_item_id = local_item_id(local_item),
+                local_title = %local_title,
+                local_source = local_item_source_kind(local_item),
+                "candidate needs torrent metadata before matching"
+            );
+        }
+        ReverseLookupOutcome::NoCandidates => {
+            info!(
+                workflow,
+                next_action,
+                candidate_id = candidate_id(candidate),
+                candidate_title = %title,
+                candidate_tracker = %tracker,
+                candidate_guid = %guid,
+                candidate_info_hash = candidate_info_hash(candidate),
+                "candidate did not match any local item"
+            );
+        }
+    }
+}
+
+fn log_candidate_assessment(
+    workflow: &'static str,
+    candidate: &RemoteCandidate,
+    local_item: &LocalItem,
+    assessment: &CandidateAssessment,
+    next_action: &'static str,
+) {
+    let title = redacted_operator_text(candidate.title.as_str());
+    let tracker = redacted_operator_text(candidate.tracker.as_str());
+    let guid = redacted_operator_text(candidate.guid.as_str());
+    let local_title = redacted_operator_text(local_item.title.as_str());
+    info!(
+        workflow,
+        next_action,
+        candidate_id = candidate_id(candidate),
+        candidate_title = %title,
+        candidate_tracker = %tracker,
+        candidate_guid = %guid,
+        candidate_info_hash = candidate_info_hash(candidate),
+        local_item_id = local_item_id(local_item),
+        local_title = %local_title,
+        local_source = local_item_source_kind(local_item),
+        decision = ?assessment.decision,
+        reason = ?assessment.reason,
+        matched_size_bytes = assessment.matched_size.map(|size| size.get()),
+        matched_ratio = assessment.matched_ratio.map(|ratio| ratio.get()),
+        "candidate match decision selected"
+    );
+}
+
 async fn prepare_search_candidate(
     input: SearchCandidateStage,
 ) -> Result<PreparedSearchCandidateStage, String> {
@@ -1021,7 +1185,8 @@ async fn resolve_search_candidate_preflight(
     } = input;
 
     match initial {
-        ReverseLookupOutcome::NeedsTorrentDownload { .. } => {
+        outcome @ ReverseLookupOutcome::NeedsTorrentDownload { .. } => {
+            log_reverse_lookup_outcome("search", &candidate, &outcome, "download_candidate");
             if shutdown.state().phase != ShutdownPhase::Running {
                 return Err("search workflow is shutting down".to_owned());
             }
@@ -1083,9 +1248,12 @@ async fn resolve_search_candidate_preflight(
             })
             .await
         }
-        ReverseLookupOutcome::Matched { assessment, .. } => {
+        outcome @ ReverseLookupOutcome::Matched { .. } => {
             let Some((cached, torrent_bytes)) = cached_search_candidate(&candidate).await? else {
-                record_persisted_decision(&state, &assessment);
+                log_reverse_lookup_outcome("search", &candidate, &outcome, "persist_decision");
+                if let ReverseLookupOutcome::Matched { assessment, .. } = &outcome {
+                    record_persisted_decision(&state, assessment);
+                }
                 return Ok(SearchCandidatePreflight::Outcome(
                     SearchCandidateOutcome::Persisted,
                 ));
@@ -1103,21 +1271,30 @@ async fn resolve_search_candidate_preflight(
             })
             .await
         }
-        ReverseLookupOutcome::AlreadyPresent { assessment, .. } => {
-            record_persisted_decision(&state, &assessment);
+        outcome @ ReverseLookupOutcome::AlreadyPresent { .. } => {
+            log_reverse_lookup_outcome("search", &candidate, &outcome, "already_present");
+            if let ReverseLookupOutcome::AlreadyPresent { assessment, .. } = &outcome {
+                record_persisted_decision(&state, assessment);
+            }
             Ok(SearchCandidatePreflight::Outcome(
                 SearchCandidateOutcome::AlreadyPresent,
             ))
         }
-        ReverseLookupOutcome::BestFailure { assessment, .. } => {
-            record_persisted_decision(&state, &assessment);
+        outcome @ ReverseLookupOutcome::BestFailure { .. } => {
+            log_reverse_lookup_outcome("search", &candidate, &outcome, "reject_candidate");
+            if let ReverseLookupOutcome::BestFailure { assessment, .. } = &outcome {
+                record_persisted_decision(&state, assessment);
+            }
             Ok(SearchCandidatePreflight::Outcome(
                 SearchCandidateOutcome::Rejected,
             ))
         }
-        ReverseLookupOutcome::NoCandidates => Ok(SearchCandidatePreflight::Outcome(
-            SearchCandidateOutcome::Persisted,
-        )),
+        outcome @ ReverseLookupOutcome::NoCandidates => {
+            log_reverse_lookup_outcome("search", &candidate, &outcome, "persist_candidate");
+            Ok(SearchCandidatePreflight::Outcome(
+                SearchCandidateOutcome::Persisted,
+            ))
+        }
     }
 }
 
@@ -1186,7 +1363,7 @@ async fn process_downloaded_search_candidate(
     .await
     .map_err(|error| format!("{error:?}"))?;
     let mut best_actionable: Option<ActionableLookup> = None;
-    let mut best_failure = None;
+    let mut best_failure: Option<(LocalItem, PersistedCandidateAssessment)> = None;
 
     for lookup in lookups {
         if shutdown.state().phase != ShutdownPhase::Running {
@@ -1208,6 +1385,17 @@ async fn process_downloaded_search_candidate(
         .map_err(|error| format!("{error:?}"))?;
         record_persisted_decision(&state, &assessment);
         if persisted_assessment_is_already_present(&assessment) {
+            if let PersistedCandidateAssessment::Assessed { assessment, .. }
+            | PersistedCandidateAssessment::Rejected { assessment, .. } = &assessment
+            {
+                log_candidate_assessment(
+                    "search",
+                    &cached.candidate,
+                    &lookup.local_item,
+                    assessment,
+                    "already_present",
+                );
+            }
             return Ok(SearchCandidatePreflight::Outcome(
                 SearchCandidateOutcome::AlreadyPresent,
             ));
@@ -1226,10 +1414,23 @@ async fn process_downloaded_search_candidate(
             }
             continue;
         }
-        best_failure = Some(assessment);
+        best_failure = Some((lookup.local_item, assessment));
     }
 
     if let Some(selected) = best_actionable {
+        log_candidate_assessment(
+            "search",
+            &cached.candidate,
+            &selected.local_item,
+            &selected.assessment,
+            if state.config.injection.dry_run {
+                "dry_run"
+            } else if state.injection_worker.client_count() == 0 {
+                "save_candidate"
+            } else {
+                "inject_candidate"
+            },
+        );
         if shutdown.state().phase != ShutdownPhase::Running {
             return Err("search workflow is shutting down".to_owned());
         }
@@ -1268,6 +1469,28 @@ async fn process_downloaded_search_candidate(
                 recheck,
             }),
         });
+    }
+
+    if let Some((
+        local_item,
+        PersistedCandidateAssessment::Assessed { assessment, .. }
+        | PersistedCandidateAssessment::Rejected { assessment, .. },
+    )) = &best_failure
+    {
+        log_candidate_assessment(
+            "search",
+            &cached.candidate,
+            local_item,
+            assessment,
+            "reject_candidate",
+        );
+    } else {
+        log_reverse_lookup_outcome(
+            "search",
+            &cached.candidate,
+            &ReverseLookupOutcome::NoCandidates,
+            "no_match",
+        );
     }
 
     Ok(SearchCandidatePreflight::Outcome(
@@ -2294,24 +2517,51 @@ async fn initial_announce_lookup_stage(
     };
 
     match initial {
-        ReverseLookupOutcome::NeedsTorrentDownload { .. } => {
+        outcome @ ReverseLookupOutcome::NeedsTorrentDownload { .. } => {
+            log_reverse_lookup_outcome(
+                "announce",
+                &input.candidate.candidate,
+                &outcome,
+                "download_candidate",
+            );
             AnnounceInitialLookupStage::NeedsDownload(Box::new(input))
         }
-        ReverseLookupOutcome::Matched { .. }
+        outcome @ ReverseLookupOutcome::Matched { .. }
             if input.candidate.candidate.torrent_cache_path.is_some() =>
         {
+            log_reverse_lookup_outcome(
+                "announce",
+                &input.candidate.candidate,
+                &outcome,
+                "use_cached_candidate",
+            );
             match cached_announce_candidate_stage(input).await {
                 Ok(downloaded) => AnnounceInitialLookupStage::Cached(Box::new(downloaded)),
                 Err(outcome) => AnnounceInitialLookupStage::Finished(outcome),
             }
         }
-        outcome => AnnounceInitialLookupStage::Finished(classify_reverse_lookup_outcome(
-            &outcome,
-            input.context.now_ms,
-            input.context.attempt_count,
-            input.context.jitter_key.as_str(),
-            input.context.outcome_config,
-        )),
+        outcome => {
+            let next_action = match &outcome {
+                ReverseLookupOutcome::Matched { .. } => "wait_for_candidate_download",
+                ReverseLookupOutcome::AlreadyPresent { .. } => "already_present",
+                ReverseLookupOutcome::BestFailure { .. } => "reject_candidate",
+                ReverseLookupOutcome::NoCandidates => "no_match",
+                ReverseLookupOutcome::NeedsTorrentDownload { .. } => "download_candidate",
+            };
+            log_reverse_lookup_outcome(
+                "announce",
+                &input.candidate.candidate,
+                &outcome,
+                next_action,
+            );
+            AnnounceInitialLookupStage::Finished(classify_reverse_lookup_outcome(
+                &outcome,
+                input.context.now_ms,
+                input.context.attempt_count,
+                input.context.jitter_key.as_str(),
+                input.context.outcome_config,
+            ))
+        }
     }
 }
 
@@ -2563,6 +2813,17 @@ async fn process_downloaded_announce_candidate(
         .await
         .map_err(|error| format!("{error:?}"))?;
         if persisted_assessment_is_already_present(&assessment) {
+            if let PersistedCandidateAssessment::Assessed { assessment, .. }
+            | PersistedCandidateAssessment::Rejected { assessment, .. } = &assessment
+            {
+                log_candidate_assessment(
+                    "announce",
+                    &cached.candidate,
+                    &lookup.local_item,
+                    assessment,
+                    "already_present",
+                );
+            }
             return Ok(classify_reverse_lookup_outcome(
                 &ReverseLookupOutcome::AlreadyPresent {
                     local_item: lookup.local_item,
@@ -2595,6 +2856,19 @@ async fn process_downloaded_announce_candidate(
     }
 
     if let Some(selected) = best_actionable {
+        log_candidate_assessment(
+            "announce",
+            &cached.candidate,
+            &selected.local_item,
+            &selected.assessment,
+            if state.config.injection.dry_run {
+                "dry_run"
+            } else if state.injection_worker.client_count() == 0 {
+                "save_candidate"
+            } else {
+                "inject_candidate"
+            },
+        );
         if shutdown.state().phase != ShutdownPhase::Running {
             return Ok(AnnounceWorkOutcome::Release {
                 reason: AnnounceReason::DependencyBackoff,
@@ -2691,6 +2965,29 @@ async fn process_downloaded_announce_candidate(
             jitter_key,
             outcome_config,
         ));
+    }
+
+    if let Some(ReverseLookupOutcome::BestFailure {
+        local_item,
+        assessment:
+            PersistedCandidateAssessment::Assessed { assessment, .. }
+            | PersistedCandidateAssessment::Rejected { assessment, .. },
+    }) = &best_failure
+    {
+        log_candidate_assessment(
+            "announce",
+            &cached.candidate,
+            local_item,
+            assessment,
+            "reject_candidate",
+        );
+    } else if best_failure.is_none() {
+        log_reverse_lookup_outcome(
+            "announce",
+            &cached.candidate,
+            &ReverseLookupOutcome::NoCandidates,
+            "no_match",
+        );
     }
 
     Ok(best_failure.map_or_else(
@@ -3351,6 +3648,7 @@ impl std::error::Error for DaemonError {
 mod tests {
     use std::fs;
     use std::future::{Future, pending};
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -3379,6 +3677,133 @@ mod tests {
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
     use tower::ServiceExt;
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn captured(&self) -> Arc<Mutex<Vec<u8>>> {
+            Arc::clone(&self.captured)
+        }
+    }
+
+    struct SharedWriteGuard {
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedWriteGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.captured
+                .lock()
+                .map_err(|_poisoned| std::io::Error::other("captured log buffer mutex poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriteGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriteGuard {
+                captured: Arc::clone(&self.captured),
+            }
+        }
+    }
+
+    #[test]
+    fn operator_logs_match_reject_and_no_candidate_outcomes_with_redaction() {
+        let writer = SharedWriter::default();
+        let captured = writer.captured();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("sporos=info"))
+            .with_writer(writer)
+            .with_ansi(false)
+            .finish();
+        let root = PathBuf::from("/media/movie");
+        let local = local_item(&root);
+        let mut candidate = search_candidate(
+            1,
+            "https://tracker.example/guid?passkey=guid-secret",
+            "https://tracker.example/download?apikey=download-secret",
+            &InfoHash::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        );
+        candidate.title =
+            ItemTitle::new("https://tracker.example/release?apikey=title-secret&id=release-1")
+                .unwrap();
+        candidate.tracker =
+            TrackerName::new("https://tracker.example/rss?authkey=tracker-secret").unwrap();
+        let candidate_id = RemoteCandidateId::new(42).unwrap();
+        let matched = ReverseLookupOutcome::Matched {
+            local_item: local.clone(),
+            assessment: PersistedCandidateAssessment::Assessed {
+                candidate_id,
+                assessment: CandidateAssessment {
+                    decision: MatchDecision::Exact,
+                    reason: crate::domain::DecisionReason::FileTreeMatched,
+                    matched_size: Some(ByteSize::new(10)),
+                    matched_ratio: Some(crate::domain::MatchRatio::new(1.0).unwrap()),
+                },
+                cache_status: crate::matching::CandidateCacheStatus::Reused,
+            },
+        };
+        let rejected = ReverseLookupOutcome::BestFailure {
+            local_item: local,
+            assessment: PersistedCandidateAssessment::Rejected {
+                candidate_id,
+                assessment: CandidateAssessment {
+                    decision: MatchDecision::NoMatch,
+                    reason: crate::domain::DecisionReason::NameMismatch,
+                    matched_size: None,
+                    matched_ratio: None,
+                },
+                cache_status: crate::matching::CandidateCacheStatus::NotAvailable,
+            },
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_reverse_lookup_outcome("search", &candidate, &matched, "inject_candidate");
+            log_reverse_lookup_outcome("announce", &candidate, &rejected, "reject_candidate");
+            log_reverse_lookup_outcome(
+                "search",
+                &candidate,
+                &ReverseLookupOutcome::NoCandidates,
+                "no_match",
+            );
+        });
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("candidate reverse lookup assessed"));
+        assert!(output.contains("candidate did not match any local item"));
+        assert!(output.contains("workflow=search") || output.contains("workflow=\"search\""));
+        assert!(output.contains("workflow=announce") || output.contains("workflow=\"announce\""));
+        assert!(
+            output.contains("next_action=inject_candidate")
+                || output.contains("next_action=\"inject_candidate\"")
+        );
+        assert!(
+            output.contains("next_action=reject_candidate")
+                || output.contains("next_action=\"reject_candidate\"")
+        );
+        assert!(
+            output.contains("next_action=no_match") || output.contains("next_action=\"no_match\"")
+        );
+        assert!(output.contains(
+            "candidate_title=https://tracker.example/release?apikey=[REDACTED]&id=release-1"
+        ));
+        assert!(!output.contains("title-secret"));
+        assert!(!output.contains("guid-secret"));
+        assert!(!output.contains("tracker-secret"));
+        assert!(!output.contains("download-secret"));
+    }
 
     #[test]
     fn runtime_recheck_config_uses_auto_resume_settings() {
