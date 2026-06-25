@@ -27,6 +27,16 @@ pub enum RetryOutcome<T> {
     Shutdown,
 }
 
+pub const TRANSIENT_IO_RETRY_MAX_ATTEMPTS: u8 = 3;
+
+pub const fn transient_io_retry_policy() -> JitteredBackoffPolicy {
+    JitteredBackoffPolicy {
+        base_delay_ms: 100,
+        max_delay_ms: 1_000,
+        jitter_ms: 100,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RetryErrorKind {
     TransientNetwork,
@@ -402,6 +412,37 @@ where
         }
     }
     RetryOutcome::Exhausted
+}
+
+pub async fn retry_transient_io<T, E, MakeFuture, Fut, Classify>(
+    jitter_key: &str,
+    mut make_future: MakeFuture,
+    mut classify: Classify,
+) -> Result<T, E>
+where
+    MakeFuture: FnMut(u8) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    Classify: FnMut(&E) -> RetryDecision,
+{
+    let attempts = TRANSIENT_IO_RETRY_MAX_ATTEMPTS.max(1);
+    let policy = transient_io_retry_policy();
+    let mut attempt = 1;
+    loop {
+        match make_future(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let decision = classify(&error);
+                if !decision.should_retry() || attempt == attempts {
+                    return Err(error);
+                }
+                let delay = retry_delay_after_decision(policy, attempt, jitter_key, decision);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
 }
 
 pub async fn retry_with_backoff<T, E, MakeFuture, Fut, ShouldRetry>(

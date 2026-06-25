@@ -26,7 +26,10 @@ use crate::domain::{
 };
 use crate::matching::{TorznabSearchPlan, TorznabSearchType};
 use crate::persistence::torrent_cache::{cached_torrent_path, with_cached_torrent_path_lock};
-use crate::runtime::backoff::{BackoffProbePolicy, JitteredBackoffPolicy};
+use crate::runtime::backoff::{
+    BackoffProbePolicy, JitteredBackoffPolicy, RetryDecision, RetryErrorKind, classify_http_status,
+    retry_transient_io,
+};
 use crate::secrets::{ApiKey, sanitize_url_for_logging};
 use crate::torrent::parse_metafile;
 
@@ -361,10 +364,23 @@ impl TorznabHttpClient {
             params.push(("apikey".to_owned(), api_key.to_owned()));
         }
 
+        retry_transient_io(
+            url,
+            |_attempt| async { self.request_parts_once(url, &params).await },
+            classify_torznab_request_error,
+        )
+        .await
+    }
+
+    async fn request_parts_once(
+        &self,
+        url: &str,
+        params: &[(String, String)],
+    ) -> Result<String, TorznabRequestError> {
         let response = self
             .client
             .get(url)
-            .query(&params)
+            .query(params)
             .timeout(self.timeout)
             .send()
             .await
@@ -554,9 +570,23 @@ impl ProwlarrHttpClient {
         limit: u64,
     ) -> Result<Vec<u8>, ProwlarrRequestError> {
         let url = format!("{}{}", source.url, path);
+        retry_transient_io(
+            source.name.as_str(),
+            |_attempt| async { self.get_bytes_once(source, &url, limit).await },
+            classify_prowlarr_request_error,
+        )
+        .await
+    }
+
+    async fn get_bytes_once(
+        &self,
+        source: &ProwlarrSource,
+        url: &str,
+        limit: u64,
+    ) -> Result<Vec<u8>, ProwlarrRequestError> {
         let response = self
             .client
-            .get(&url)
+            .get(url)
             .header("X-Api-Key", source.api_key.expose_secret())
             .header(USER_AGENT, concat!("Sporos/", env!("CARGO_PKG_VERSION")))
             .timeout(self.timeout)
@@ -656,6 +686,34 @@ impl fmt::Display for ProwlarrRequestError {
 }
 
 impl std::error::Error for ProwlarrRequestError {}
+
+fn classify_prowlarr_request_error(error: &ProwlarrRequestError) -> RetryDecision {
+    match error {
+        ProwlarrRequestError::HttpStatus {
+            status,
+            retry_after: Some(_),
+        } if matches!(*status, 408 | 429 | 502 | 503 | 504) => {
+            RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff)
+        }
+        ProwlarrRequestError::HttpStatus {
+            status,
+            retry_after,
+        } => classify_http_status(*status, retry_after_duration(*retry_after), true),
+        ProwlarrRequestError::Timeout => RetryDecision::retry(RetryErrorKind::Timeout),
+        ProwlarrRequestError::Request { .. } => {
+            RetryDecision::retry(RetryErrorKind::TransientNetwork)
+        }
+        ProwlarrRequestError::InvalidResponse { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
+        }
+        ProwlarrRequestError::InvalidIndexer { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::BadRequest)
+        }
+        ProwlarrRequestError::ResponseTooLarge { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
+        }
+    }
+}
 
 fn source_accepts_prowlarr_tags(source: &ProwlarrSource, tags: &[String]) -> bool {
     if source.tags.is_empty() {
@@ -799,6 +857,40 @@ impl fmt::Display for TorznabRequestError {
 
 impl std::error::Error for TorznabRequestError {}
 
+fn classify_torznab_request_error(error: &TorznabRequestError) -> RetryDecision {
+    match error {
+        TorznabRequestError::Backoff { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff)
+        }
+        TorznabRequestError::RateLimited {
+            retry_after: Some(_),
+        } => RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff),
+        TorznabRequestError::RateLimited { retry_after } => {
+            retry_decision_with_retry_after(RetryErrorKind::RateLimited, *retry_after)
+        }
+        TorznabRequestError::HttpStatus {
+            status,
+            retry_after: Some(_),
+        } if matches!(*status, 408 | 429 | 502 | 503 | 504) => {
+            RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff)
+        }
+        TorznabRequestError::HttpStatus {
+            status,
+            retry_after,
+        } => classify_http_status(*status, retry_after_duration(*retry_after), true),
+        TorznabRequestError::Timeout => RetryDecision::retry(RetryErrorKind::Timeout),
+        TorznabRequestError::Request { .. } => {
+            RetryDecision::retry(RetryErrorKind::TransientNetwork)
+        }
+        TorznabRequestError::InvalidXml { .. } | TorznabRequestError::InvalidCandidate { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
+        }
+        TorznabRequestError::ResponseTooLarge { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CandidateDownloadClient {
     client: reqwest::Client,
@@ -850,6 +942,37 @@ impl CandidateDownloadClient {
             validate_candidate_download_url(&candidate.download_url)?;
         }
 
+        let bytes = retry_transient_io(
+            candidate.download_url.as_str(),
+            |_attempt| async { self.download_bytes(candidate, cookie).await },
+            classify_candidate_download_error,
+        )
+        .await?;
+
+        let parsed =
+            parse_metafile(&bytes).map_err(|error| CandidateDownloadError::InvalidContents {
+                message: error.to_string(),
+            })?;
+        let cache_path = cached_torrent_path(cache_dir, parsed.metafile.info_hash());
+        write_cached_torrent_blocking(cache_path.clone(), bytes).await?;
+
+        let mut updated_candidate = candidate.clone();
+        updated_candidate.info_hash = Some(parsed.metafile.info_hash().clone());
+        updated_candidate.torrent_cache_path = Some(cache_path.clone());
+
+        Ok(CachedCandidateTorrent {
+            candidate: updated_candidate,
+            metafile: parsed.metafile,
+            tracker_hosts: parsed.tracker_hosts,
+            cache_path,
+        })
+    }
+
+    async fn download_bytes(
+        &self,
+        candidate: &RemoteCandidate,
+        cookie: Option<&str>,
+    ) -> Result<Vec<u8>, CandidateDownloadError> {
         let mut request = self
             .client
             .get(candidate.download_url.as_str())
@@ -898,24 +1021,7 @@ impl CandidateDownloadClient {
             });
         }
 
-        let bytes = read_candidate_response(response, CANDIDATE_TORRENT_MAX_BYTES).await?;
-        let parsed =
-            parse_metafile(&bytes).map_err(|error| CandidateDownloadError::InvalidContents {
-                message: error.to_string(),
-            })?;
-        let cache_path = cached_torrent_path(cache_dir, parsed.metafile.info_hash());
-        write_cached_torrent_blocking(cache_path.clone(), bytes).await?;
-
-        let mut updated_candidate = candidate.clone();
-        updated_candidate.info_hash = Some(parsed.metafile.info_hash().clone());
-        updated_candidate.torrent_cache_path = Some(cache_path.clone());
-
-        Ok(CachedCandidateTorrent {
-            candidate: updated_candidate,
-            metafile: parsed.metafile,
-            tracker_hosts: parsed.tracker_hosts,
-            cache_path,
-        })
+        read_candidate_response(response, CANDIDATE_TORRENT_MAX_BYTES).await
     }
 }
 
@@ -1233,6 +1339,41 @@ impl fmt::Display for CandidateDownloadError {
 }
 
 impl std::error::Error for CandidateDownloadError {}
+
+fn classify_candidate_download_error(error: &CandidateDownloadError) -> RetryDecision {
+    match error {
+        CandidateDownloadError::InvalidUrl { .. } | CandidateDownloadError::MagnetLink => {
+            RetryDecision::do_not_retry(RetryErrorKind::BadRequest)
+        }
+        CandidateDownloadError::RateLimited {
+            retry_after: Some(_),
+        } => RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff),
+        CandidateDownloadError::RateLimited { retry_after } => {
+            retry_decision_with_retry_after(RetryErrorKind::RateLimited, *retry_after)
+        }
+        CandidateDownloadError::HttpStatus {
+            status,
+            retry_after: Some(_),
+        } if matches!(*status, 408 | 429 | 502 | 503 | 504) => {
+            RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff)
+        }
+        CandidateDownloadError::HttpStatus {
+            status,
+            retry_after,
+        } => classify_http_status(*status, retry_after_duration(*retry_after), true),
+        CandidateDownloadError::Timeout => RetryDecision::retry(RetryErrorKind::Timeout),
+        CandidateDownloadError::Request { .. } => {
+            RetryDecision::retry(RetryErrorKind::TransientNetwork)
+        }
+        CandidateDownloadError::InvalidContents { .. }
+        | CandidateDownloadError::ResponseTooLarge { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
+        }
+        CandidateDownloadError::CacheWrite { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::FatalLocal)
+        }
+    }
+}
 
 pub fn parse_torznab_rss(
     xml: &str,
@@ -1554,6 +1695,37 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<RetryAfter> {
         .ok()
         .map(|seconds| RetryAfter::DelayMs(seconds.saturating_mul(1_000)))
         .or_else(|| parse_http_date_ms(value).map(RetryAfter::DeadlineMs))
+}
+
+fn retry_decision_with_retry_after(
+    kind: RetryErrorKind,
+    retry_after: Option<RetryAfter>,
+) -> RetryDecision {
+    retry_after_duration(retry_after)
+        .map(|delay| RetryDecision::retry_after(kind, delay))
+        .unwrap_or_else(|| RetryDecision::retry(kind))
+}
+
+pub(crate) fn retry_after_duration(retry_after: Option<RetryAfter>) -> Option<Duration> {
+    retry_after.map(|retry_after| match retry_after {
+        RetryAfter::DelayMs(delay_ms) => duration_from_ms(delay_ms),
+        RetryAfter::DeadlineMs(deadline_ms) => {
+            let now_ms = unix_time_ms();
+            duration_from_ms(deadline_ms.saturating_sub(now_ms))
+        }
+    })
+}
+
+fn unix_time_ms() -> i64 {
+    let duration = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration,
+        Err(_) => Duration::ZERO,
+    };
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn duration_from_ms(milliseconds: i64) -> Duration {
+    Duration::from_millis(u64::try_from(milliseconds.max(0)).unwrap_or_default())
 }
 
 async fn read_torznab_response(
@@ -2180,7 +2352,7 @@ mod tests {
     use std::net::TcpListener as StdTcpListener;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     };
 
     use crate::config::{IndexerTimeoutsConfig, IndexersConfig};
@@ -2615,6 +2787,81 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn prowlarr_client_retries_transient_indexer_catalog_failure() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let server_attempts = attempts.clone();
+            let url = spawn_prowlarr_server(move |_request| {
+                let server_attempts = server_attempts.clone();
+                async move {
+                    if server_attempts.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                        return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again").into_response();
+                    }
+                    (
+                        AxumStatusCode::OK,
+                        r#"
+                        [
+                          {
+                            "id": 1,
+                            "name": "Main",
+                            "enable": true,
+                            "protocol": "torrent",
+                            "supportsRss": true,
+                            "supportsSearch": true,
+                            "tags": []
+                          }
+                        ]
+                        "#,
+                    )
+                        .into_response()
+                }
+            })
+            .await;
+            let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+
+            let indexers = client
+                .indexers(&test_prowlarr_source(url, &[], ProwlarrTagMatch::Any, true))
+                .await
+                .unwrap();
+
+            assert_eq!(1, indexers.len());
+            assert_eq!(2, attempts.load(AtomicOrdering::Relaxed));
+        }
+
+        #[tokio::test]
+        async fn prowlarr_client_preserves_retry_after_without_inner_retry() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let server_attempts = attempts.clone();
+            let url = spawn_prowlarr_server(move |_request| {
+                let server_attempts = server_attempts.clone();
+                async move {
+                    server_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                    (
+                        AxumStatusCode::SERVICE_UNAVAILABLE,
+                        [("Retry-After", "5")],
+                        "try later",
+                    )
+                        .into_response()
+                }
+            })
+            .await;
+            let client = ProwlarrHttpClient::new(Duration::from_secs(5));
+
+            let error = client
+                .indexers(&test_prowlarr_source(url, &[], ProwlarrTagMatch::Any, true))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                ProwlarrRequestError::HttpStatus {
+                    status: 503,
+                    retry_after: Some(RetryAfter::DelayMs(5_000))
+                }
+            ));
+            assert_eq!(1, attempts.load(AtomicOrdering::Relaxed));
+        }
+
+        #[tokio::test]
         async fn prowlarr_client_does_not_forward_api_key_on_redirect() {
             let saw_redirected_key = Arc::new(AtomicBool::new(false));
             let target_saw_redirected_key = saw_redirected_key.clone();
@@ -2732,6 +2979,83 @@ mod tests {
 
             assert_eq!(1, candidates.len());
             assert_eq!("candidate-1", candidates[0].guid.as_str());
+        }
+
+        #[tokio::test]
+        async fn search_client_retries_transient_status_before_parsing_rss() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let server_attempts = attempts.clone();
+            let endpoint = test_endpoint(
+                spawn_torznab_server(move |_request| {
+                    let server_attempts = server_attempts.clone();
+                    async move {
+                        if server_attempts.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                            return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+                                .into_response();
+                        }
+                        (
+                            AxumStatusCode::OK,
+                            search_rss("candidate-1", "Example Movie"),
+                        )
+                            .into_response()
+                    }
+                })
+                .await,
+            );
+            let client = TorznabHttpClient::new(Duration::from_secs(5));
+
+            let candidates = client
+                .search(
+                    &endpoint,
+                    MediaType::Movie,
+                    &generic_plan(),
+                    1_700_000_000_000,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(1, candidates.len());
+            assert_eq!(2, attempts.load(AtomicOrdering::Relaxed));
+        }
+
+        #[tokio::test]
+        async fn search_client_preserves_retry_after_without_inner_retry() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let server_attempts = attempts.clone();
+            let endpoint = test_endpoint(
+                spawn_torznab_server(move |_request| {
+                    let server_attempts = server_attempts.clone();
+                    async move {
+                        server_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                        (
+                            AxumStatusCode::TOO_MANY_REQUESTS,
+                            [("Retry-After", "5")],
+                            "limited",
+                        )
+                            .into_response()
+                    }
+                })
+                .await,
+            );
+            let client = TorznabHttpClient::new(Duration::from_secs(5));
+
+            let error = client
+                .search(
+                    &endpoint,
+                    MediaType::Movie,
+                    &generic_plan(),
+                    1_700_000_000_000,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                TorznabRequestError::RateLimited {
+                    retry_after: Some(RetryAfter::DelayMs(5_000))
+                }
+            ));
+            assert_eq!(1, attempts.load(AtomicOrdering::Relaxed));
         }
 
         #[tokio::test]
@@ -3080,6 +3404,74 @@ mod tests {
         );
         assert_eq!(test_torrent_bytes(), fs::read(&cached.cache_path).unwrap());
 
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_retries_transient_status_before_caching() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let url = spawn_torznab_server(move |_request| {
+            let server_attempts = server_attempts.clone();
+            async move {
+                if server_attempts.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                    return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again").into_response();
+                }
+                (
+                    AxumStatusCode::OK,
+                    String::from_utf8(test_torrent_bytes()).unwrap(),
+                )
+                    .into_response()
+            }
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-cache-retry");
+        let candidate = test_candidate(&url);
+        let client = test_candidate_download_client();
+
+        let cached = client
+            .download_and_cache(&candidate, &cache_dir, None)
+            .await
+            .unwrap();
+
+        assert_eq!(2, attempts.load(AtomicOrdering::Relaxed));
+        assert_eq!(test_torrent_bytes(), fs::read(&cached.cache_path).unwrap());
+        remove_temp_dir(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_download_preserves_retry_after_without_inner_retry() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let url = spawn_torznab_server(move |_request| {
+            let server_attempts = server_attempts.clone();
+            async move {
+                server_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                (
+                    AxumStatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", "5")],
+                    "limited",
+                )
+                    .into_response()
+            }
+        })
+        .await;
+        let cache_dir = unique_temp_dir("candidate-cache-retry-after");
+        let candidate = test_candidate(&url);
+        let client = test_candidate_download_client();
+
+        let error = client
+            .download_and_cache(&candidate, &cache_dir, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CandidateDownloadError::RateLimited {
+                retry_after: Some(RetryAfter::DelayMs(5_000))
+            }
+        ));
+        assert_eq!(1, attempts.load(AtomicOrdering::Relaxed));
         remove_temp_dir(&cache_dir);
     }
 

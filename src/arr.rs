@@ -8,8 +8,13 @@ use serde::Deserialize;
 
 use crate::config::{ArrInstanceConfig, ArrServicesConfig};
 use crate::domain::{DependencyName, ItemTitle, MediaType};
-use crate::indexers::{ApiKeySource, IndexerBackoffPolicy, RetryAfter, parse_retry_after};
+use crate::indexers::{
+    ApiKeySource, IndexerBackoffPolicy, RetryAfter, parse_retry_after, retry_after_duration,
+};
 use crate::matching::SearchIds;
+use crate::runtime::backoff::{
+    RetryDecision, RetryErrorKind, classify_http_status, retry_transient_io,
+};
 
 const ARR_PARSE_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -321,9 +326,27 @@ impl ArrHttpClient {
         }
 
         let parse_title = arr_parse_title(endpoint.kind, media_type, title.as_str());
+        let url = format!("{}/api/v3/parse", endpoint.url.as_str());
+        retry_transient_io(
+            endpoint.name.as_str(),
+            |_attempt| async {
+                self.lookup_endpoint_once(endpoint, &url, &parse_title)
+                    .await
+            },
+            classify_arr_request_error,
+        )
+        .await
+    }
+
+    async fn lookup_endpoint_once(
+        &self,
+        endpoint: &ArrEndpoint,
+        url: &str,
+        parse_title: &str,
+    ) -> Result<SearchIds, ArrRequestError> {
         let response = self
             .client
-            .get(format!("{}/api/v3/parse", endpoint.url.as_str()))
+            .get(url)
             .header(USER_AGENT, concat!("Sporos/", env!("CARGO_PKG_VERSION")))
             .header("X-Api-Key", endpoint.api_key.expose_secret())
             .query(&[("title", parse_title)])
@@ -511,6 +534,38 @@ impl fmt::Display for ArrRequestError {
 
 impl std::error::Error for ArrRequestError {}
 
+fn classify_arr_request_error(error: &ArrRequestError) -> RetryDecision {
+    match error {
+        ArrRequestError::Backoff { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff)
+        }
+        ArrRequestError::RateLimited {
+            retry_after: Some(_),
+        } => RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff),
+        ArrRequestError::RateLimited { retry_after } => retry_after_duration(*retry_after)
+            .map(|delay| RetryDecision::retry_after(RetryErrorKind::RateLimited, delay))
+            .unwrap_or_else(|| RetryDecision::retry(RetryErrorKind::RateLimited)),
+        ArrRequestError::Unauthorized => {
+            RetryDecision::do_not_retry(RetryErrorKind::Authentication)
+        }
+        ArrRequestError::HttpStatus {
+            status,
+            retry_after: Some(_),
+        } if matches!(*status, 408 | 429 | 502 | 503 | 504) => {
+            RetryDecision::do_not_retry(RetryErrorKind::DependencyBackoff)
+        }
+        ArrRequestError::HttpStatus {
+            status,
+            retry_after,
+        } => classify_http_status(*status, retry_after_duration(*retry_after), true),
+        ArrRequestError::Timeout => RetryDecision::retry(RetryErrorKind::Timeout),
+        ArrRequestError::Request { .. } => RetryDecision::retry(RetryErrorKind::TransientNetwork),
+        ArrRequestError::InvalidJson { .. } | ArrRequestError::ResponseTooLarge { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ArrParseResponse {
     #[serde(default)]
@@ -669,7 +724,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::convert::Infallible;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
     use axum::Router;
     use axum::body::Body;
@@ -914,6 +969,81 @@ mod tests {
                 result.attempts[1].outcome,
                 ArrLookupOutcome::Found { .. }
             ));
+        }
+
+        #[tokio::test]
+        async fn lookup_endpoint_retries_transient_status_before_decoding_ids() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let server_attempts = attempts.clone();
+            let endpoint = endpoint(
+                ArrKind::Radarr,
+                spawn_arr_server(move |_request| {
+                    let server_attempts = server_attempts.clone();
+                    async move {
+                        if server_attempts.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                            return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+                                .into_response();
+                        }
+                        (AxumStatusCode::OK, r#"{"movie":{"tmdbId":99}}"#).into_response()
+                    }
+                })
+                .await,
+            );
+            let client = ArrHttpClient::new(Duration::from_secs(5));
+
+            let ids = client
+                .lookup_endpoint(
+                    &endpoint,
+                    MediaType::Movie,
+                    &ItemTitle::new("Example.Movie.2160p.WEB-DL").unwrap(),
+                    1_000,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(Some("99"), ids.tmdb_id.as_deref());
+            assert_eq!(2, attempts.load(AtomicOrdering::Relaxed));
+        }
+
+        #[tokio::test]
+        async fn lookup_endpoint_preserves_retry_after_without_inner_retry() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let server_attempts = attempts.clone();
+            let endpoint = endpoint(
+                ArrKind::Radarr,
+                spawn_arr_server(move |_request| {
+                    let server_attempts = server_attempts.clone();
+                    async move {
+                        server_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                        (
+                            AxumStatusCode::TOO_MANY_REQUESTS,
+                            [("Retry-After", "5")],
+                            "{}",
+                        )
+                            .into_response()
+                    }
+                })
+                .await,
+            );
+            let client = ArrHttpClient::new(Duration::from_secs(5));
+
+            let error = client
+                .lookup_endpoint(
+                    &endpoint,
+                    MediaType::Movie,
+                    &ItemTitle::new("Example.Movie.2160p.WEB-DL").unwrap(),
+                    1_000,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                ArrRequestError::RateLimited {
+                    retry_after: Some(RetryAfter::DelayMs(5_000))
+                }
+            ));
+            assert_eq!(1, attempts.load(AtomicOrdering::Relaxed));
         }
 
         #[tokio::test]
