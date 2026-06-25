@@ -304,11 +304,33 @@ impl QbittorrentClient {
     }
 
     pub async fn create_tag(&self, tag: &str) -> Result<(), TorrentClientError> {
+        retry_transient_io(
+            "/api/v2/torrents/createTags",
+            |_attempt| async { self.create_tag_once(tag).await },
+            classify_qbit_idempotent_error,
+        )
+        .await
+    }
+
+    async fn create_tag_once(&self, tag: &str) -> Result<(), TorrentClientError> {
         self.post_form_accept_conflict("/api/v2/torrents/createTags", &[("tags", tag)])
             .await
     }
 
     pub async fn create_category(
+        &self,
+        category: &str,
+        save_path: Option<&PathBuf>,
+    ) -> Result<(), TorrentClientError> {
+        retry_transient_io(
+            "/api/v2/torrents/createCategory",
+            |_attempt| async { self.create_category_once(category, save_path).await },
+            classify_qbit_idempotent_error,
+        )
+        .await
+    }
+
+    async fn create_category_once(
         &self,
         category: &str,
         save_path: Option<&PathBuf>,
@@ -338,9 +360,16 @@ impl QbittorrentClient {
     }
 
     pub async fn recheck(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
-        self.post_form(
+        retry_transient_io(
             "/api/v2/torrents/recheck",
-            &[("hashes", info_hash.as_str())],
+            |_attempt| async {
+                self.post_form(
+                    "/api/v2/torrents/recheck",
+                    &[("hashes", info_hash.as_str())],
+                )
+                .await
+            },
+            classify_qbit_idempotent_error,
         )
         .await
     }
@@ -352,8 +381,15 @@ impl QbittorrentClient {
         } else {
             "/api/v2/torrents/resume"
         };
-        self.post_form(endpoint, &[("hashes", info_hash.as_str())])
-            .await
+        retry_transient_io(
+            endpoint,
+            |_attempt| async {
+                self.post_form(endpoint, &[("hashes", info_hash.as_str())])
+                    .await
+            },
+            classify_qbit_idempotent_error,
+        )
+        .await
     }
 
     pub async fn pause(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
@@ -363,8 +399,15 @@ impl QbittorrentClient {
         } else {
             "/api/v2/torrents/pause"
         };
-        self.post_form(endpoint, &[("hashes", info_hash.as_str())])
-            .await
+        retry_transient_io(
+            endpoint,
+            |_attempt| async {
+                self.post_form(endpoint, &[("hashes", info_hash.as_str())])
+                    .await
+            },
+            classify_qbit_idempotent_error,
+        )
+        .await
     }
 
     async fn ensure_session(&self) -> Result<(), TorrentClientError> {
@@ -417,7 +460,7 @@ impl QbittorrentClient {
         retry_transient_io(
             path,
             |_attempt| async { self.get_text_once(path).await },
-            classify_qbit_read_error,
+            classify_qbit_idempotent_error,
         )
         .await
     }
@@ -806,7 +849,7 @@ fn is_http_conflict(error: &TorrentClientError) -> bool {
     )
 }
 
-fn classify_qbit_read_error(error: &TorrentClientError) -> RetryDecision {
+fn classify_qbit_idempotent_error(error: &TorrentClientError) -> RetryDecision {
     match error {
         TorrentClientError::Unavailable { message, .. } if is_transient_http_error(message) => {
             RetryDecision::retry(RetryErrorKind::TransientNetwork)
@@ -1284,6 +1327,88 @@ mod tests {
         assert!(seen.contains("/api/v2/torrents/recheck"));
         assert!(seen.contains("/api/v2/torrents/pause"));
         assert!(seen.contains("/api/v2/torrents/resume"));
+    }
+
+    #[tokio::test]
+    async fn client_retries_idempotent_mutations_but_not_inject() {
+        let tag_attempts = Arc::new(AtomicUsize::new(0));
+        let category_attempts = Arc::new(AtomicUsize::new(0));
+        let recheck_attempts = Arc::new(AtomicUsize::new(0));
+        let inject_attempts = Arc::new(AtomicUsize::new(0));
+        let server_tag_attempts = tag_attempts.clone();
+        let server_category_attempts = category_attempts.clone();
+        let server_recheck_attempts = recheck_attempts.clone();
+        let server_inject_attempts = inject_attempts.clone();
+        let endpoint = spawn_qbit_server(move |request| {
+            let tag_attempts = server_tag_attempts.clone();
+            let category_attempts = server_category_attempts.clone();
+            let recheck_attempts = server_recheck_attempts.clone();
+            let inject_attempts = server_inject_attempts.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                match path.as_str() {
+                    "/api/v2/auth/login" => {
+                        response_with_cookie(AxumStatusCode::OK, "Ok.", "SID=ok")
+                    }
+                    "/api/v2/app/version" => (AxumStatusCode::OK, "5.0.0").into_response(),
+                    "/api/v2/torrents/createTags" => {
+                        if tag_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+                                .into_response();
+                        }
+                        (AxumStatusCode::OK, "").into_response()
+                    }
+                    "/api/v2/torrents/createCategory" => {
+                        if category_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+                                .into_response();
+                        }
+                        (AxumStatusCode::OK, "").into_response()
+                    }
+                    "/api/v2/torrents/recheck" => {
+                        if recheck_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+                                .into_response();
+                        }
+                        (AxumStatusCode::OK, "").into_response()
+                    }
+                    "/api/v2/torrents/add" => {
+                        inject_attempts.fetch_add(1, Ordering::Relaxed);
+                        (AxumStatusCode::SERVICE_UNAVAILABLE, "try again").into_response()
+                    }
+                    _ => (AxumStatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+        let save_path = PathBuf::from("/downloads");
+        let tags = vec!["sporos".to_owned()];
+        let hash = InfoHash::new(SHA1).unwrap();
+
+        client.create_tag("sporos").await.unwrap();
+        client
+            .create_category("movies", Some(&save_path))
+            .await
+            .unwrap();
+        client.recheck(&hash).await.unwrap();
+        let error = client
+            .inject(QbitAddTorrent {
+                torrent_bytes: b"torrent-bytes",
+                save_path: Some(&save_path),
+                category: Some("movies"),
+                tags: &tags,
+                pause_for_recheck: true,
+                content_layout: QbitContentLayout::Original,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TorrentClientError::Unavailable { .. }));
+        assert_eq!(2, tag_attempts.load(Ordering::Relaxed));
+        assert_eq!(2, category_attempts.load(Ordering::Relaxed));
+        assert_eq!(2, recheck_attempts.load(Ordering::Relaxed));
+        assert_eq!(1, inject_attempts.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

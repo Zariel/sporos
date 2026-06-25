@@ -245,39 +245,67 @@ impl RtorrentClient {
         info_hash: &InfoHash,
         label: &str,
     ) -> Result<(), TorrentClientError> {
-        self.call(
+        retry_transient_io(
             "d.custom1.set",
-            vec![
-                XmlRpcValue::String(info_hash.as_str().to_owned()),
-                XmlRpcValue::String(label.to_owned()),
-            ],
+            |_attempt| async {
+                self.call(
+                    "d.custom1.set",
+                    vec![
+                        XmlRpcValue::String(info_hash.as_str().to_owned()),
+                        XmlRpcValue::String(label.to_owned()),
+                    ],
+                )
+                .await
+            },
+            classify_rtorrent_idempotent_error,
         )
         .await
         .map(|_| ())
     }
 
     pub async fn recheck(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
-        self.call(
+        retry_transient_io(
             "d.check_hash",
-            vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+            |_attempt| async {
+                self.call(
+                    "d.check_hash",
+                    vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+                )
+                .await
+            },
+            classify_rtorrent_idempotent_error,
         )
         .await
         .map(|_| ())
     }
 
     pub async fn resume(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
-        self.call(
+        retry_transient_io(
             "d.resume",
-            vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+            |_attempt| async {
+                self.call(
+                    "d.resume",
+                    vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+                )
+                .await
+            },
+            classify_rtorrent_idempotent_error,
         )
         .await
         .map(|_| ())
     }
 
     pub async fn pause(&self, info_hash: &InfoHash) -> Result<(), TorrentClientError> {
-        self.call(
+        retry_transient_io(
             "d.pause",
-            vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+            |_attempt| async {
+                self.call(
+                    "d.pause",
+                    vec![XmlRpcValue::String(info_hash.as_str().to_owned())],
+                )
+                .await
+            },
+            classify_rtorrent_idempotent_error,
         )
         .await
         .map(|_| ())
@@ -309,7 +337,7 @@ impl RtorrentClient {
         retry_transient_io(
             method,
             |_attempt| async { self.call_text(method, params.clone()).await },
-            classify_rtorrent_read_error,
+            classify_rtorrent_idempotent_error,
         )
         .await
     }
@@ -1096,7 +1124,7 @@ fn unavailable(client: &str, message: String) -> TorrentClientError {
     }
 }
 
-fn classify_rtorrent_read_error(error: &TorrentClientError) -> RetryDecision {
+fn classify_rtorrent_idempotent_error(error: &TorrentClientError) -> RetryDecision {
     match error {
         TorrentClientError::Unavailable { message, .. } if is_transient_http_error(message) => {
             RetryDecision::retry(RetryErrorKind::TransientNetwork)
@@ -1872,6 +1900,46 @@ mod tests {
         client.recheck(&hash).await.unwrap();
         client.pause(&hash).await.unwrap();
         client.resume(&hash).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_retries_idempotent_mutations() {
+        let attempts = Arc::new(StdMutex::new(BTreeMap::<String, usize>::new()));
+        let server_attempts = attempts.clone();
+        let endpoint = spawn_rtorrent_server(move |request| {
+            let attempts = server_attempts.clone();
+            async move {
+                let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                for method in ["d.custom1.set", "d.check_hash", "d.pause", "d.resume"] {
+                    if body.contains(&format!("<methodName>{method}</methodName>")) {
+                        let mut attempts = attempts.lock().unwrap();
+                        let attempt = attempts.entry(method.to_owned()).or_insert(0);
+                        *attempt += 1;
+                        if *attempt == 1 {
+                            return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+                                .into_response();
+                        }
+                        return (AxumStatusCode::OK, xml_response("<i8>0</i8>")).into_response();
+                    }
+                }
+                (AxumStatusCode::BAD_REQUEST, body).into_response()
+            }
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+        let hash = InfoHash::new(SHA1).unwrap();
+
+        client.set_label(&hash, "cross-seed").await.unwrap();
+        client.recheck(&hash).await.unwrap();
+        client.pause(&hash).await.unwrap();
+        client.resume(&hash).await.unwrap();
+
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(Some(&2), attempts.get("d.custom1.set"));
+        assert_eq!(Some(&2), attempts.get("d.check_hash"));
+        assert_eq!(Some(&2), attempts.get("d.pause"));
+        assert_eq!(Some(&2), attempts.get("d.resume"));
     }
 
     fn row(value: XmlRpcValue) -> XmlRpcValue {

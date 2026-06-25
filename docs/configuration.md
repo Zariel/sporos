@@ -38,7 +38,8 @@ manual_search_workflow_result_limit = 10000
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
 timeout = "30s"
-retry_max_attempts = 3
+allow_duplicate_delivery = false
+retry_max_attempts = 1
 retry_initial_delay = "1s"
 retry_max_delay = "30s"
 
@@ -203,13 +204,14 @@ tags; rTorrent uses only `default_label` with `label_field = "custom1"`.
 Configure optional webhook destinations under
 `[notifications.endpoints.<name>]`. Endpoints are disabled when no entries are
 configured. Each endpoint accepts a URL, one optional bearer token source, a
-request timeout, and bounded retry policy:
+request timeout, and a duplicate-safe retry policy:
 
 ```toml
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
 timeout = "30s"
-retry_max_attempts = 3
+allow_duplicate_delivery = false
+retry_max_attempts = 1
 retry_initial_delay = "1s"
 retry_max_delay = "30s"
 ```
@@ -217,6 +219,9 @@ retry_max_delay = "30s"
 Use `token_file`, the fixed `SPOROS__NOTIFICATIONS__ENDPOINTS__<NAME>__TOKEN`
 environment variable, or local-development `token`. URLs must use HTTP(S) and
 must not contain credentials, query parameters, or fragments.
+Notification POSTs default to one attempt because a timeout after send can mean
+the webhook already accepted the event. Set `allow_duplicate_delivery = true`
+before setting `retry_max_attempts` above `1`.
 Delivery health is best-effort and memory-only: `/v1/status` and metrics show
 the latest in-process success or failure for each configured endpoint, and
 endpoints return to `unknown` after restart.

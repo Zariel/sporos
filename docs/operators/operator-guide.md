@@ -132,7 +132,8 @@ remove_policy = "deactivate"
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
 timeout = "30s"
-retry_max_attempts = 3
+allow_duplicate_delivery = false
+retry_max_attempts = 1
 retry_initial_delay = "1s"
 retry_max_delay = "30s"
 
@@ -471,7 +472,8 @@ Notifications are optional webhook deliveries. Configure endpoints under
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
 timeout = "30s"
-retry_max_attempts = 3
+allow_duplicate_delivery = false
+retry_max_attempts = 1
 retry_initial_delay = "1s"
 retry_max_delay = "30s"
 ```
@@ -488,13 +490,15 @@ blocking without bound. Queue depth, capacity, accepted, rejected, completed,
 and cancelled counters are visible in `/v1/status` under the `notification`
 runtime queue and in the `sporos_queue_*` metrics.
 
-Each delivery uses the endpoint timeout and bounded retry policy. 2xx responses
-are success. 429 and 5xx responses are retryable; other non-2xx responses fail
-without retry. Request timeouts and transport failures are retryable until the
-retry budget or shutdown is reached. Delivery health is best-effort and
-memory-only: `/v1/status` and `sporos_dependency_health_state` expose the
-latest in-process endpoint state, but notification health returns to `unknown`
-after restart.
+Each delivery uses the endpoint timeout and bounded retry policy. Notification
+POSTs default to one attempt because a timeout after send can mean the webhook
+already accepted the event. Set `allow_duplicate_delivery = true` before
+setting `retry_max_attempts` above `1`. 2xx responses are success. 429 and 5xx
+responses, request timeouts, and transport failures are retryable only when the
+configured retry budget permits another attempt. Other non-2xx responses fail
+without retry. Delivery health is best-effort and memory-only: `/v1/status` and
+`sporos_dependency_health_state` expose the latest in-process endpoint state,
+but notification health returns to `unknown` after restart.
 
 Use `POST /v1/notifications/test` after changing endpoint config. The response
 reports the number of endpoints, enqueued jobs, full-queue rejections, and

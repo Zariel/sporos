@@ -110,6 +110,7 @@ pub struct NotificationEndpointConfig {
     pub token: Option<NotificationToken>,
     pub token_file: Option<PathBuf>,
     pub timeout: String,
+    pub allow_duplicate_delivery: bool,
     pub retry_max_attempts: u8,
     pub retry_initial_delay: String,
     pub retry_max_delay: String,
@@ -122,7 +123,8 @@ impl Default for NotificationEndpointConfig {
             token: None,
             token_file: None,
             timeout: "300s".to_owned(),
-            retry_max_attempts: 3,
+            allow_duplicate_delivery: false,
+            retry_max_attempts: 1,
             retry_initial_delay: "1s".to_owned(),
             retry_max_delay: "30s".to_owned(),
         }
@@ -1033,6 +1035,14 @@ fn validate_notifications_config(config: &SporosConfig) -> Result<(), ConfigErro
                 ),
             });
         }
+        if endpoint.retry_max_attempts > 1 && !endpoint.allow_duplicate_delivery {
+            return Err(ConfigError::InvalidField {
+                field: "notifications.endpoints.allow_duplicate_delivery",
+                reason: format!(
+                    "{name}: allow_duplicate_delivery must be true when retry_max_attempts is greater than 1"
+                ),
+            });
+        }
         let initial_delay_ms = interval_ms(
             "notifications.endpoints.retry_initial_delay",
             name,
@@ -1694,7 +1704,8 @@ url = "https://hooks.example/sporos"
 token = "optional local-development bearer token"
 token_file = "optional path"
 timeout = "300s"
-retry_max_attempts = 3
+allow_duplicate_delivery = false
+retry_max_attempts = 1
 retry_initial_delay = "1s"
 retry_max_delay = "30s"
 
@@ -1840,6 +1851,7 @@ mod tests {
             url = "https://hooks.example/sporos"
             token = "notification-secret"
             timeout = "30s"
+            allow_duplicate_delivery = true
             retry_max_attempts = 4
             retry_initial_delay = "2s"
             retry_max_delay = "20s"
@@ -2140,6 +2152,7 @@ mod tests {
             url = "https://hooks.example/sporos"
             token = "notification-secret"
             timeout = "45s"
+            allow_duplicate_delivery = true
             retry_max_attempts = 2
             retry_initial_delay = "5s"
             retry_max_delay = "30s"
@@ -2157,6 +2170,7 @@ mod tests {
                 .map(NotificationToken::expose_secret)
         );
         assert_eq!("45s", endpoint.timeout);
+        assert!(endpoint.allow_duplicate_delivery);
         assert_eq!(2, endpoint.retry_max_attempts);
         assert_eq!("5s", endpoint.retry_initial_delay);
         assert_eq!("30s", endpoint.retry_max_delay);
@@ -2218,6 +2232,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(max_before_initial.to_string().contains("retry_max_delay"));
+
+        let duplicate_delivery_required = parse_config(
+            r#"
+            [notifications.endpoints.ops]
+            url = "https://hooks.example/sporos"
+            retry_max_attempts = 2
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            duplicate_delivery_required
+                .to_string()
+                .contains("allow_duplicate_delivery")
+        );
     }
 
     #[test]
@@ -3092,7 +3120,8 @@ mod tests {
                 .map(NotificationToken::expose_secret)
         );
         assert_eq!("30s", endpoint.timeout);
-        assert_eq!(3, endpoint.retry_max_attempts);
+        assert!(!endpoint.allow_duplicate_delivery);
+        assert_eq!(1, endpoint.retry_max_attempts);
         assert_eq!("1s", endpoint.retry_initial_delay);
         assert_eq!("30s", endpoint.retry_max_delay);
 

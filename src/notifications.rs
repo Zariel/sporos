@@ -24,8 +24,6 @@ use crate::secrets::{NotificationToken, SanitizedUrl, sanitize_url_for_logging};
 
 const USER_AGENT_VALUE: &str = concat!("Sporos/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
-const DEFAULT_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
-const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -205,11 +203,7 @@ impl NotificationRetryPolicy {
 
 impl Default for NotificationRetryPolicy {
     fn default() -> Self {
-        Self {
-            max_attempts: NonZeroU8::new(3).unwrap_or(NonZeroU8::MIN),
-            initial_delay: DEFAULT_INITIAL_RETRY_DELAY,
-            max_delay: DEFAULT_MAX_RETRY_DELAY,
-        }
+        Self::single_attempt()
     }
 }
 
@@ -761,6 +755,25 @@ mod tests {
             run_notification_worker(worker, receiver, signal).await;
 
             assert_eq!(2, server.requests().len());
+        }
+
+        #[tokio::test]
+        async fn single_attempt_policy_does_not_duplicate_timeout_after_send() {
+            let server = TestServer::new(TestBehavior::Slow(Duration::from_millis(100))).await;
+            let health = HealthRegistry::new();
+            let worker = NotificationWorker::with_config(
+                health,
+                MetricsRegistry::new(),
+                Duration::from_millis(10),
+                NotificationRetryPolicy::single_attempt(),
+            );
+            let job = NotificationJob::new(endpoint(server.url()), NotificationEvent::test());
+
+            let report = worker.deliver(&job).await;
+
+            assert_eq!(NotificationDeliveryOutcome::TimedOut, report.final_outcome);
+            assert_eq!(1, report.attempts.len());
+            assert_eq!(1, server.requests().len());
         }
 
         #[tokio::test]
