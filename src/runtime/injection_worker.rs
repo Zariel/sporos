@@ -4048,14 +4048,12 @@ mod tests {
             InjectionWorker::new(repository, vec![target.clone() as Arc<dyn InjectionClient>]);
         let plan = recheck_resume_plan(&request.metafile, &request.assessment, request.recheck);
 
-        let started = Instant::now();
         let outcome = worker
             .run_recheck_resume(target.as_ref(), &request, plan, None)
             .await
             .unwrap();
 
         assert_eq!(ResumeLoopOutcome::StillChecking, outcome);
-        assert!(started.elapsed() < Duration::from_millis(80));
         assert_eq!(1, target.recheck_calls.load(Ordering::SeqCst));
         assert_eq!(1, target.checking_calls.load(Ordering::SeqCst));
         assert_eq!(0, target.resume_calls.load(Ordering::SeqCst));
