@@ -1865,6 +1865,12 @@ impl Repository {
             dependency_name = %dependency_name,
             dependency_state = state_key
         );
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("begin dependency health record", error))?;
+
         sqlx::query(
             r#"
             INSERT INTO dependency_health (
@@ -1895,7 +1901,7 @@ impl Repository {
         .bind(retry_after)
         .bind(failure_count)
         .bind(checked_at_ms)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| db_error("record dependency health", error))?;
 
@@ -1903,14 +1909,40 @@ impl Repository {
             state,
             DependencyState::Healthy { .. } | DependencyState::Unknown
         ) {
-            self.wake_announce_dependency_recovery(
-                dependency_type,
-                dependency_name,
-                checked_at_ms,
-                1_000,
+            sqlx::query(
+                r#"
+                UPDATE announce_work
+                SET status = 'queued',
+                    next_attempt_at = ?,
+                    updated_at = ?,
+                    last_dependency_kind = NULL,
+                    last_dependency_name = NULL
+                WHERE id IN (
+                    SELECT id FROM announce_work INDEXED BY idx_announce_work_waiting_dependency_due
+                    WHERE status = 'waiting'
+                      AND expires_at > ?
+                      AND last_dependency_kind = ?
+                      AND last_dependency_name = ?
+                    ORDER BY next_attempt_at, received_at
+                    LIMIT ?
+                )
+                "#,
             )
-            .await?;
+            .bind(checked_at_ms)
+            .bind(checked_at_ms)
+            .bind(checked_at_ms)
+            .bind(dependency_type.as_str())
+            .bind(dependency_name.as_str())
+            .bind(1_000_i64)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| db_error("wake dependency announce work", error))?;
         }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("commit dependency health record", error))?;
 
         Ok(())
     }

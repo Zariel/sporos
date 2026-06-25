@@ -6470,6 +6470,12 @@ mod tests {
         let runtime = AppRuntime::from_repository(config, repository.clone())
             .await
             .unwrap();
+        runtime.state.health.set_degraded(
+            DependencyKind::LocalState,
+            DependencyName::new("inventory-refresh").unwrap(),
+            ReasonText::new("previous refresh failed").unwrap(),
+            Some(unix_time_ms().saturating_add(60_000)),
+        );
 
         let result = execute_scheduled_job(
             &runtime.state,
@@ -6522,11 +6528,37 @@ mod tests {
                     && entry.dependency_name.as_str() == "inventory-refresh"
             })
             .unwrap();
+        let app = router(runtime.state.http.clone());
+        let status = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status_body = axum::body::to_bytes(status.into_body(), 65_536)
+            .await
+            .unwrap();
+        let status_json: Value = serde_json::from_slice(&status_body).unwrap();
+        let dependency = status_json["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dependency| {
+                dependency["kind"] == "local_state" && dependency["name"] == "inventory-refresh"
+            })
+            .unwrap();
 
         assert_eq!(Ok(()), result);
         assert_eq!(2, item_count);
         assert_eq!("healthy", inventory_health.state);
         assert_eq!(0, inventory_health.failure_count);
+        assert_eq!("healthy", dependency["state"]);
+        assert_eq!("memory_and_persisted", dependency["source"]);
+        assert_eq!(false, dependency["stale"]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6637,7 +6669,8 @@ mod tests {
                 .is_some_and(|reason| reason.contains("failed for"))
         );
         assert_eq!("degraded", dependency["state"]);
-        assert_eq!("persisted", dependency["source"]);
+        assert_eq!("memory_and_persisted", dependency["source"]);
+        assert_eq!(false, dependency["stale"]);
         assert!(dependency["retry_after_ms"].as_i64().is_some());
         assert_eq!("failed", status_job["state"]);
         assert!(status_job["next_run_at_ms"].as_i64().is_some());

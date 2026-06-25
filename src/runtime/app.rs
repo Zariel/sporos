@@ -1168,7 +1168,8 @@ impl AppRuntime {
                 max_depth: config.inventory.media_scan_max_depth,
             },
         )
-        .with_season_from_episodes(config.matching.season_from_episodes);
+        .with_season_from_episodes(config.matching.season_from_episodes)
+        .with_health_registry(health.clone());
         let injection_worker =
             InjectionWorker::new(repository.clone(), runtime_config.injection_clients)
                 .with_dry_run(config.injection.dry_run);

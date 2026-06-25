@@ -4550,6 +4550,53 @@ async fn healthy_dependency_record_wakes_matching_waits() {
 }
 
 #[tokio::test]
+async fn dependency_health_rolls_back_when_dependency_wake_fails() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    repository
+        .insert_or_dedupe_announce_work(&test_announce_work("ann_40", "guid-40", 1), 10)
+        .await
+        .unwrap();
+    set_announce_waiting(
+        &repository,
+        "ann_40",
+        AnnounceReason::DependencyBackoff,
+        500,
+        Some(("indexer", "main")),
+    )
+    .await;
+    sqlx::query(
+        r#"
+        CREATE TRIGGER abort_dependency_wake
+        BEFORE UPDATE ON announce_work
+        WHEN new.status = 'queued'
+        BEGIN
+            SELECT RAISE(ABORT, 'abort dependency wake');
+        END
+        "#,
+    )
+    .execute(repository.pool())
+    .await
+    .unwrap();
+
+    let result = repository
+        .record_dependency_health(
+            DependencyKind::Indexer,
+            &DependencyName::new("main").unwrap(),
+            &DependencyState::Healthy { checked_at_ms: 100 },
+            100,
+        )
+        .await;
+    let health = repository.dependency_health_snapshot(10).await.unwrap();
+
+    assert!(result.is_err());
+    assert!(health.is_empty());
+    assert_eq!(
+        Some(("waiting".to_owned(), "dependency_backoff".to_owned())),
+        announce_status_reason(&repository, "ann_40").await
+    );
+}
+
+#[tokio::test]
 async fn torrent_client_degraded_health_blocks_or_probes_dependency_waits() {
     let repository = Repository::connect_in_memory().await.unwrap();
     for (id, guid) in [

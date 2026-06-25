@@ -28,7 +28,7 @@ use crate::persistence::repository::{
     StagedVirtualSeason, StagedVirtualSeasonCursor,
 };
 use crate::runtime::announce_worker::unix_time_ms;
-use crate::runtime::health::DependencyKind;
+use crate::runtime::health::{DependencyKey, DependencyKind, HealthRegistry};
 use crate::runtime::queue::{BoundedWorkQueue, QueueKind, WorkReceiver, bounded_work_queue};
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 
@@ -134,6 +134,7 @@ pub enum InventoryRefreshError {
 #[derive(Debug, Clone)]
 pub struct InventoryRefreshWorker {
     repository: Repository,
+    health: Option<HealthRegistry>,
     scan_options: InventoryScanOptions,
     season_from_episodes: f64,
     run_client_post_refresh_work: bool,
@@ -147,6 +148,7 @@ impl InventoryRefreshWorker {
     pub fn new(repository: Repository, scan_options: InventoryScanOptions) -> Self {
         Self {
             repository,
+            health: None,
             scan_options,
             season_from_episodes: 1.0,
             run_client_post_refresh_work: true,
@@ -162,9 +164,15 @@ impl InventoryRefreshWorker {
         self
     }
 
+    pub fn with_health_registry(mut self, health: HealthRegistry) -> Self {
+        self.health = Some(health);
+        self
+    }
+
     pub(crate) fn without_client_post_refresh_work(&self) -> Self {
         Self {
             repository: self.repository.clone(),
+            health: self.health.clone(),
             scan_options: self.scan_options,
             season_from_episodes: self.season_from_episodes,
             run_client_post_refresh_work: false,
@@ -1022,12 +1030,22 @@ pub(crate) async fn record_inventory_refresh_health(
     } else {
         DependencyState::Healthy { checked_at_ms }
     };
-    if let Err(error) = worker
+    match worker
         .repository
         .record_dependency_health(DependencyKind::LocalState, &name, &state, checked_at_ms)
         .await
     {
-        warn!(error = ?error, "failed to record local inventory dependency health");
+        Ok(()) => {
+            if let Some(health) = &worker.health {
+                health.set_state(
+                    DependencyKey::new(DependencyKind::LocalState, name),
+                    state.clone(),
+                );
+            }
+        }
+        Err(error) => {
+            warn!(error = ?error, "failed to record local inventory dependency health");
+        }
     }
 }
 
