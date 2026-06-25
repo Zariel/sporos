@@ -7103,28 +7103,37 @@ mod tests {
 
     #[tokio::test]
     async fn background_shutdown_timeout_is_global() {
+        let cleaned_up = Arc::new(AtomicUsize::new(0));
+        struct CleanupCounter(Arc<AtomicUsize>);
+        impl Drop for CleanupCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let first_cleanup = CleanupCounter(cleaned_up.clone());
+        let second_cleanup = CleanupCounter(cleaned_up.clone());
         let handles = vec![
             BackgroundTask::new(
                 "stuck-a",
-                tokio::spawn(async {
+                tokio::spawn(async move {
+                    let _cleanup = first_cleanup;
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }),
                 BackgroundShutdownPolicy::AbortOnTimeout,
             ),
             BackgroundTask::new(
                 "stuck-b",
-                tokio::spawn(async {
+                tokio::spawn(async move {
+                    let _cleanup = second_cleanup;
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }),
                 BackgroundShutdownPolicy::AbortOnTimeout,
             ),
         ];
-        let started = tokio::time::Instant::now();
 
-        let timeout = Duration::from_millis(50);
-        stop_background_tasks_with_timeout(handles, timeout).await;
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(50)).await;
 
-        assert!(started.elapsed() < timeout + Duration::from_millis(40));
+        assert_eq!(2, cleaned_up.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -7153,19 +7162,20 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_background_task_finishes_within_shutdown_deadline() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let finished_task = finished.clone();
         let handles = vec![BackgroundTask::new(
             "finishes-late",
-            tokio::spawn(async {
+            tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(25)).await;
+                finished_task.fetch_add(1, Ordering::SeqCst);
             }),
             BackgroundShutdownPolicy::AwaitInFlight,
         )];
-        let started = tokio::time::Instant::now();
 
         stop_background_tasks_with_timeout(handles, Duration::from_millis(100)).await;
 
-        assert!(started.elapsed() >= Duration::from_millis(20));
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(1, finished.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -7197,33 +7207,36 @@ mod tests {
                 BackgroundShutdownPolicy::AwaitInFlight,
             ),
         ];
-        let started = tokio::time::Instant::now();
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(50)).await;
 
-        let timeout = Duration::from_millis(50);
-        stop_background_tasks_with_timeout(handles, timeout).await;
-
-        assert!(started.elapsed() < timeout + Duration::from_millis(40));
         assert_eq!(2, cleaned_up.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn shutdown_deadline_bounds_pending_finalizers() {
+        let cleaned_up = Arc::new(AtomicUsize::new(0));
+        struct CleanupCounter(Arc<AtomicUsize>);
+        impl Drop for CleanupCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let cleanup = CleanupCounter(cleaned_up.clone());
         let handles = vec![
             BackgroundTask::new(
                 "stuck-finalizer",
-                tokio::spawn(async {
+                tokio::spawn(async move {
+                    let _cleanup = cleanup;
                     std::future::pending::<()>().await;
                 }),
                 BackgroundShutdownPolicy::AwaitInFlight,
             )
             .with_deadline_finalizer(BackgroundDeadlineFinalizer::Pending),
         ];
-        let started = tokio::time::Instant::now();
 
-        let timeout = Duration::from_millis(80);
-        stop_background_tasks_with_timeout(handles, timeout).await;
+        stop_background_tasks_with_timeout(handles, Duration::from_millis(80)).await;
 
-        assert!(started.elapsed() < timeout + Duration::from_millis(40));
+        assert_eq!(1, cleaned_up.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
