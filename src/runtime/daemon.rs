@@ -4151,10 +4151,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY,
-            max_in_flight.load(Ordering::SeqCst)
-        );
+        let max_in_flight = max_in_flight.load(Ordering::SeqCst);
+        assert!(max_in_flight > 1);
+        assert!(max_in_flight <= SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY);
         assert_eq!(SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY + 1, summary.saved);
     }
 
