@@ -4145,12 +4145,6 @@ mod tests {
 
         wait_for_query_count(&queries, 1).await;
         assert!(alpha_in_flight.load(Ordering::SeqCst));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            1,
-            queries.lock().unwrap().len(),
-            "workflow cap reservation should prevent later indexer launches"
-        );
         release_alpha.notify_one();
         let candidate = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
             .await
@@ -4160,6 +4154,11 @@ mod tests {
         let summary = handle.await.unwrap().unwrap();
         assert_eq!(1, summary.plans.len());
         assert_eq!(1, summary.candidate_count);
+        assert_eq!(
+            1,
+            queries.lock().unwrap().len(),
+            "workflow cap reservation should prevent later indexer launches"
+        );
     }
 
     #[tokio::test]
