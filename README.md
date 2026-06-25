@@ -25,8 +25,8 @@ preparation, torrent-client injection, and operator visibility.
   retained outcomes, stale lease recovery, and scheduled cleanup.
 - Operator visibility: `/livez`, `/readyz`, `/v1/status`, Prometheus metrics,
   dependency health, queue state, and explicit cleanup/indexer-cap jobs.
-- Production configuration: TOML config, environment overrides, file/env-backed
-  secrets, bounded queues, and redacted logs/metrics.
+- Production configuration: TOML config, fixed-name environment secrets,
+  file-backed secrets, bounded queues, and redacted logs/metrics.
 
 ## Quick Start
 
@@ -44,7 +44,7 @@ The default config path is `/app/config.toml`. Use
 
 This is a compact starting point for qBittorrent plus Prowlarr-backed indexer
 import. See [Configuration](docs/configuration.md) for the full config guide,
-all supported fields, environment overrides, and secret handling.
+all supported fields, fixed environment secret names, and secret handling.
 
 ```toml
 [paths]
@@ -55,20 +55,17 @@ media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
 bind = "0.0.0.0:2468"
-api_token_env = "SPOROS_API_TOKEN"
 
 [torrent_clients.qbit_main]
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "sporos"
-password_env = "QBIT_PASSWORD"
 default_save_path = "/downloads"
 default_category = "cross-seed"
 default_tags = ["cross-seed"]
 
 [indexers.prowlarr.main]
 url = "http://prowlarr:9696"
-api_key_env = "PROWLARR_API_KEY"
 refresh_on_startup = true
 required = false
 remove_policy = "deactivate"

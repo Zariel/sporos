@@ -114,7 +114,9 @@ fn configured_arr_instance(
         .ok_or_else(|| ArrConfigError::MissingApiKey {
             name: name.as_str().to_owned(),
         })?;
-    let api_key_source = if instance.api_key_file.is_some() {
+    let api_key_source = if let Some(env_name) = &instance.api_key_env_source {
+        ApiKeySource::Env(env_name.clone())
+    } else if instance.api_key_file.is_some() {
         ApiKeySource::File(
             instance
                 .api_key_file
@@ -122,8 +124,6 @@ fn configured_arr_instance(
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
         )
-    } else if let Some(env) = instance.api_key_env.as_ref() {
-        ApiKeySource::Env(env.clone())
     } else {
         ApiKeySource::Direct
     };
@@ -692,7 +692,7 @@ mod tests {
                 url: "http://sonarr:8989/".to_owned(),
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let config = ArrServicesConfig {
@@ -717,7 +717,7 @@ mod tests {
                     url: "http://sonarr:8989".to_owned(),
                     api_key: None,
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             )]
             .into_iter()
@@ -731,7 +731,7 @@ mod tests {
                     url: "http://arr:8989".to_owned(),
                     api_key: Some(ApiKey::new("secret").unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             )]
             .into_iter()
@@ -742,7 +742,7 @@ mod tests {
                     url: "http://arr:8989/".to_owned(),
                     api_key: Some(ApiKey::new("secret").unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             )]
             .into_iter()

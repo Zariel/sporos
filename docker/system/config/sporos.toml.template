@@ -6,13 +6,11 @@ media_dirs = ["/downloads"]
 
 [server]
 bind = "0.0.0.0:2468"
-api_token_env = "SPOROS_API_TOKEN"
 
 [torrent_clients.qbittorrent]
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "admin"
-password_env = "QBITTORRENT_PASSWORD"
 default_save_path = "/downloads/qbittorrent"
 default_category = "sporos-system"
 default_tags = ["sporos", "system-test"]

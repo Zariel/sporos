@@ -1786,8 +1786,9 @@ fn configured_torznab_indexer(
 ) -> Result<ConfiguredTorznabIndexer, IndexerConfigError> {
     if url_has_apikey_query(&config.url) {
         return Err(IndexerConfigError::InvalidUrl {
-            message: "URL query apikey is not supported; use api_key, api_key_file, or api_key_env"
-                .to_owned(),
+            message:
+                "URL query apikey is not supported; use api_key, api_key_file, or the fixed API key environment variable"
+                    .to_owned(),
         });
     }
     let name =
@@ -1804,24 +1805,24 @@ fn configured_torznab_indexer(
 }
 
 fn api_key_source(config: &TorznabIndexerConfig) -> ApiKeySource {
-    if config.api_key.is_some() {
+    if let Some(env_name) = &config.api_key_env_source {
+        ApiKeySource::Env(env_name.clone())
+    } else if config.api_key.is_some() {
         ApiKeySource::Direct
     } else if let Some(path) = &config.api_key_file {
         ApiKeySource::File(display_path(path))
-    } else if let Some(name) = &config.api_key_env {
-        ApiKeySource::Env(name.clone())
     } else {
         ApiKeySource::Missing
     }
 }
 
 fn prowlarr_api_key_source(config: &ProwlarrSourceConfig) -> ApiKeySource {
-    if config.api_key.is_some() {
+    if let Some(env_name) = &config.api_key_env_source {
+        ApiKeySource::Env(env_name.clone())
+    } else if config.api_key.is_some() {
         ApiKeySource::Direct
     } else if let Some(path) = &config.api_key_file {
         ApiKeySource::File(display_path(path))
-    } else if let Some(name) = &config.api_key_env {
-        ApiKeySource::Env(name.clone())
     } else {
         ApiKeySource::Missing
     }
@@ -2203,8 +2204,8 @@ mod tests {
             TorznabIndexerConfig {
                 url: "https://indexer.example//Case/api?t=caps#fragment".to_owned(),
                 api_key: None,
-                api_key_file: None,
-                api_key_env: Some("MAIN_INDEXER_KEY".to_owned()),
+                api_key_file: Some(PathBuf::from("/run/credentials/main-indexer-key")),
+                api_key_env_source: None,
             },
         );
         torznab.insert(
@@ -2213,7 +2214,7 @@ mod tests {
                 url: "https://backup.example/prowlarr/api".to_owned(),
                 api_key: Some(ApiKey::new("direct-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let config = IndexersConfig {
@@ -2233,7 +2234,7 @@ mod tests {
             .unwrap();
         assert_eq!("https://indexer.example//Case/api", main.url.as_str());
         assert_eq!(
-            ApiKeySource::Env("MAIN_INDEXER_KEY".to_owned()),
+            ApiKeySource::File("/run/credentials/main-indexer-key".to_owned()),
             main.api_key_source
         );
         assert!(!format!("{registry:?}").contains("secret"));
@@ -2287,7 +2288,7 @@ mod tests {
                 url: "https://indexer.example/api?apikey=secret".to_owned(),
                 api_key: None,
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let config = IndexersConfig {
@@ -2312,7 +2313,7 @@ mod tests {
                     url: "https://indexer.example/api?t=caps".to_owned(),
                     api_key: None,
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }

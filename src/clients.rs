@@ -478,7 +478,6 @@ mod tests {
             username: None,
             password: None,
             password_file: None,
-            password_env: None,
             default_save_path: PathBuf::from("/downloads"),
             default_category: None,
             default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],

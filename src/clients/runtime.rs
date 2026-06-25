@@ -521,8 +521,7 @@ pub(crate) fn build_injection_clients(
         if descriptor.kind == crate::domain::TorrentClientKind::Rtorrent
             && (client_config.username.is_some()
                 || client_config.password.is_some()
-                || client_config.password_file.is_some()
-                || client_config.password_env.is_some())
+                || client_config.password_file.is_some())
         {
             return Err(DatabaseError::Unavailable {
                 operation: "build injection client".to_owned(),
@@ -962,7 +961,6 @@ mod tests {
             username: None,
             password: None,
             password_file: None,
-            password_env: None,
             default_save_path: "/downloads".into(),
             default_category: None,
             default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],

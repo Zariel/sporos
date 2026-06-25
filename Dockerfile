@@ -79,11 +79,7 @@ LABEL org.opencontainers.image.title="Sporos" \
 
 ENV PATH=/app:$PATH \
     RUST_BACKTRACE=1 \
-    RUST_LIB_BACKTRACE=1 \
-    SPOROS__SERVER__BIND=0.0.0.0:2468 \
-    SPOROS__PATHS__DATABASE=/app/state/db/sporos.db \
-    SPOROS__PATHS__TORRENT_CACHE_DIR=/app/state/cache \
-    SPOROS__PATHS__OUTPUT_DIR=/app/state/output
+    RUST_LIB_BACKTRACE=1
 
 USER 10001:10001
 WORKDIR /app

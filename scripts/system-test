@@ -235,8 +235,8 @@ cat > "$override_file" <<EOF
 services:
   sporos:
     environment:
-      SPOROS_API_TOKEN: "$sporos_api_token"
-      QBITTORRENT_PASSWORD: "$qbittorrent_password"
+      SPOROS__SERVER__API_TOKEN: "$sporos_api_token"
+      SPOROS__TORRENT_CLIENTS__QBITTORRENT__PASSWORD: "$qbittorrent_password"
     volumes:
       - "$config_dir/sporos.toml:/app/config.toml:ro"
       - "$state_dir:/app/state"

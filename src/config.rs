@@ -26,7 +26,6 @@ pub const MAX_RUNTIME_QUEUE_LIMIT: usize = 1_000_000;
 pub const MAX_SEARCH_WORKER_CONCURRENCY: usize = 256;
 pub const MAX_MANUAL_SEARCH_RESULT_LIMIT: usize = 1_000_000;
 pub const MAX_NOTIFICATION_RETRY_ATTEMPTS: u8 = 10;
-const ENV_PREFIX: &str = "SPOROS__";
 static WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -71,7 +70,6 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub api_token: Option<ApiToken>,
     pub api_token_file: Option<PathBuf>,
-    pub api_token_env: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -80,7 +78,6 @@ impl Default for ServerConfig {
             bind: SocketAddr::from(([127, 0, 0, 1], 2468)),
             api_token: None,
             api_token_file: None,
-            api_token_env: None,
         }
     }
 }
@@ -110,7 +107,6 @@ pub struct NotificationEndpointConfig {
     pub url: String,
     pub token: Option<NotificationToken>,
     pub token_file: Option<PathBuf>,
-    pub token_env: Option<String>,
     pub timeout: String,
     pub retry_max_attempts: u8,
     pub retry_initial_delay: String,
@@ -123,7 +119,6 @@ impl Default for NotificationEndpointConfig {
             url: String::new(),
             token: None,
             token_file: None,
-            token_env: None,
             timeout: "300s".to_owned(),
             retry_max_attempts: 3,
             retry_initial_delay: "1s".to_owned(),
@@ -155,7 +150,6 @@ pub struct TorrentClientConfig {
     pub username: Option<String>,
     pub password: Option<Password>,
     pub password_file: Option<PathBuf>,
-    pub password_env: Option<String>,
     pub default_save_path: PathBuf,
     #[serde(default)]
     pub default_category: Option<String>,
@@ -207,7 +201,8 @@ pub struct TorznabIndexerConfig {
     pub url: String,
     pub api_key: Option<ApiKey>,
     pub api_key_file: Option<PathBuf>,
-    pub api_key_env: Option<String>,
+    #[serde(skip)]
+    pub api_key_env_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
@@ -218,7 +213,8 @@ pub struct ProwlarrSourceConfig {
     pub url: String,
     pub api_key: Option<ApiKey>,
     pub api_key_file: Option<PathBuf>,
-    pub api_key_env: Option<String>,
+    #[serde(skip)]
+    pub api_key_env_source: Option<String>,
     pub update_interval: String,
     pub tags: Vec<String>,
     pub tag_match: ProwlarrTagMatch,
@@ -235,7 +231,7 @@ impl Default for ProwlarrSourceConfig {
             url: String::new(),
             api_key: None,
             api_key_file: None,
-            api_key_env: None,
+            api_key_env_source: None,
             update_interval: "24h".to_owned(),
             tags: Vec::new(),
             tag_match: ProwlarrTagMatch::Any,
@@ -276,7 +272,8 @@ pub struct ArrInstanceConfig {
     pub url: String,
     pub api_key: Option<ApiKey>,
     pub api_key_file: Option<PathBuf>,
-    pub api_key_env: Option<String>,
+    #[serde(skip)]
+    pub api_key_env_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -467,8 +464,7 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let env = env.into_iter().collect::<BTreeMap<_, _>>();
-    let mut raw = parse_raw_config(contents)?;
-    apply_env_overrides(&mut raw, &env)?;
+    let raw = parse_raw_config(contents)?;
     let mut config: SporosConfig =
         raw.clone()
             .try_into()
@@ -491,7 +487,8 @@ where
     validate_injection_config(&config)?;
     validate_prowlarr_sources(&config, &raw)?;
     validate_arr_secret_source_counts(&config)?;
-    resolve_secret_env(&mut config, &env)?;
+    validate_fixed_secret_env_names(&config)?;
+    resolve_fixed_secret_env(&mut config, &env)?;
     validate_integration_api_keys(&config)?;
 
     Ok((config, raw))
@@ -535,147 +532,23 @@ fn parse_raw_config(contents: &str) -> Result<Value, ConfigError> {
     })
 }
 
-fn apply_env_overrides(raw: &mut Value, env: &BTreeMap<String, String>) -> Result<(), ConfigError> {
-    for (key, value) in env {
-        let Some(suffix) = key.strip_prefix(ENV_PREFIX) else {
-            continue;
-        };
-        let path = env_key_path(key, suffix)?;
-        reject_array_env_path(key, &path)?;
-        let value = parse_env_scalar(key, value)?;
-        insert_env_value(raw, &path, &path, value, key)?;
-    }
-
-    Ok(())
-}
-
-fn env_key_path(key: &str, suffix: &str) -> Result<Vec<String>, ConfigError> {
-    if suffix.is_empty() {
-        return Err(env_error(key, "missing config path after SPOROS__"));
-    }
-
-    suffix
-        .split("__")
-        .map(|segment| env_segment_to_key(key, segment))
-        .collect()
-}
-
-fn env_segment_to_key(key: &str, segment: &str) -> Result<String, ConfigError> {
-    if segment.is_empty() {
-        return Err(env_error(key, "empty path segment"));
-    }
-    if segment.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(env_error(key, "indexed env overrides are not supported"));
-    }
-    if !segment
-        .bytes()
-        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(env_error(
-            key,
-            "path segments must be uppercase ASCII, digits, or underscores",
-        ));
-    }
-
-    Ok(segment.to_ascii_lowercase())
-}
-
-fn reject_array_env_path(key: &str, path: &[String]) -> Result<(), ConfigError> {
-    if path == ["paths", "media_dirs"] {
-        return Err(env_error(
-            key,
-            "array config values are not settable through env",
-        ));
-    }
-
-    Ok(())
-}
-
-fn parse_env_scalar(key: &str, value: &str) -> Result<Value, ConfigError> {
-    let document = format!("value = {value}");
-    let parsed = toml::from_str::<Value>(&document)
-        .ok()
-        .and_then(|value| value.get("value").cloned())
-        .unwrap_or_else(|| Value::String(value.to_owned()));
-
-    match parsed {
-        Value::Array(_) | Value::Table(_) => {
-            Err(env_error(key, "env overrides must be scalar values"))
-        }
-        value => Ok(value),
-    }
-}
-
-fn insert_env_value(
-    current: &mut Value,
-    path: &[String],
-    full_path: &[String],
-    value: Value,
-    key: &str,
-) -> Result<(), ConfigError> {
-    let Some((segment, rest)) = path.split_first() else {
-        return Err(env_error(key, "missing config path"));
-    };
-    let Value::Table(table) = current else {
-        return Err(env_error(
-            key,
-            "cannot override inside a scalar config value",
-        ));
-    };
-
-    if rest.is_empty() {
-        if matches!(table.get(segment), Some(Value::Array(_)))
-            && !is_torrent_client_default_tags_path(full_path)
-        {
-            return Err(env_error(
-                key,
-                "array config values are not settable through env",
-            ));
-        }
-        table.insert(segment.clone(), value);
-        return Ok(());
-    }
-
-    let child = table
-        .entry(segment.clone())
-        .or_insert_with(|| Value::Table(toml::Table::new()));
-    if matches!(child, Value::Array(_)) {
-        return Err(env_error(key, "indexed env overrides are not supported"));
-    }
-
-    insert_env_value(child, rest, full_path, value, key)
-}
-
-fn is_torrent_client_default_tags_path(path: &[String]) -> bool {
-    matches!(
-        path,
-        [section, _client_name, field]
-            if section == "torrent_clients" && field == "default_tags"
-    )
-}
-
-fn resolve_secret_env(
+fn resolve_fixed_secret_env(
     config: &mut SporosConfig,
     env: &BTreeMap<String, String>,
 ) -> Result<(), ConfigError> {
     if config.server.api_token.is_none()
-        && let Some(env_name) = nonempty_secret_env(
-            "server.api_token_env",
-            "server",
-            &config.server.api_token_env,
-        )?
+        && config.server.api_token_file.is_none()
+        && let Some(value) = fixed_secret_env_value(env, &["server", "api_token"])
     {
-        let value = secret_env_value(env, env_name, "server.api_token_env", "server")?;
         config.server.api_token = Some(
             ApiToken::new(value.clone()).map_err(|source| ConfigError::InvalidSecret { source })?,
         );
     }
     for (name, client) in &mut config.torrent_clients {
         if client.password.is_none()
-            && let Some(env_name) =
-                nonempty_secret_env("torrent_clients.password_env", name, &client.password_env)?
+            && client.password_file.is_none()
+            && let Some(value) = fixed_secret_env_value(env, &["torrent_clients", name, "password"])
         {
-            let value = secret_env_value(env, env_name, "torrent_clients.password_env", name)?;
             client.password = Some(
                 Password::new(value.clone())
                     .map_err(|source| ConfigError::InvalidSecret { source })?,
@@ -683,57 +556,165 @@ fn resolve_secret_env(
         }
     }
     for (name, indexer) in &mut config.indexers.torznab {
-        if indexer.api_key.is_none()
-            && let Some(env_name) =
-                nonempty_secret_env("indexers.torznab.api_key_env", name, &indexer.api_key_env)?
-        {
-            let value = secret_env_value(env, env_name, "indexers.torznab.api_key_env", name)?;
-            indexer.api_key = Some(
-                ApiKey::new(value.clone())
-                    .map_err(|source| ConfigError::InvalidSecret { source })?,
-            );
+        if indexer.api_key.is_none() && indexer.api_key_file.is_none() {
+            let env_name = fixed_secret_env_name(&["indexers", "torznab", name, "api_key"]);
+            if let Some(value) = env.get(&env_name) {
+                indexer.api_key = Some(
+                    ApiKey::new(value.clone())
+                        .map_err(|source| ConfigError::InvalidSecret { source })?,
+                );
+                indexer.api_key_env_source = Some(env_name);
+            }
         }
     }
     for (name, source) in &mut config.indexers.prowlarr {
-        if source.api_key.is_none()
-            && let Some(env_name) =
-                nonempty_secret_env("indexers.prowlarr.api_key_env", name, &source.api_key_env)?
-        {
-            if !source.enabled {
-                continue;
+        if source.enabled && source.api_key.is_none() && source.api_key_file.is_none() {
+            let env_name = fixed_secret_env_name(&["indexers", "prowlarr", name, "api_key"]);
+            if let Some(value) = env.get(&env_name) {
+                source.api_key = Some(
+                    ApiKey::new(value.clone())
+                        .map_err(|source| ConfigError::InvalidSecret { source })?,
+                );
+                source.api_key_env_source = Some(env_name);
             }
-            let value = secret_env_value(env, env_name, "indexers.prowlarr.api_key_env", name)?;
-            source.api_key = Some(
-                ApiKey::new(value.clone())
-                    .map_err(|source| ConfigError::InvalidSecret { source })?,
-            );
         }
     }
     for (name, endpoint) in &mut config.notifications.endpoints {
         if endpoint.token.is_none()
-            && let Some(env_name) = nonempty_secret_env(
-                "notifications.endpoints.token_env",
-                name,
-                &endpoint.token_env,
-            )?
+            && endpoint.token_file.is_none()
+            && let Some(value) =
+                fixed_secret_env_value(env, &["notifications", "endpoints", name, "token"])
         {
-            let value = secret_env_value(env, env_name, "notifications.endpoints.token_env", name)?;
             endpoint.token = Some(
                 NotificationToken::new(value.clone())
                     .map_err(|source| ConfigError::InvalidSecret { source })?,
             );
         }
     }
-    resolve_arr_secret_env(
-        "indexers.arr.sonarr.api_key_env",
-        &mut config.indexers.arr.sonarr,
-        env,
+    resolve_arr_fixed_secret_env("sonarr", &mut config.indexers.arr.sonarr, env)?;
+    resolve_arr_fixed_secret_env("radarr", &mut config.indexers.arr.radarr, env)?;
+
+    Ok(())
+}
+
+fn resolve_arr_fixed_secret_env(
+    kind: &'static str,
+    instances: &mut BTreeMap<String, ArrInstanceConfig>,
+    env: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (name, instance) in instances {
+        if instance.api_key.is_none() && instance.api_key_file.is_none() {
+            let env_name = fixed_secret_env_name(&["indexers", "arr", kind, name, "api_key"]);
+            if let Some(value) = env.get(&env_name) {
+                instance.api_key = Some(
+                    ApiKey::new(value.clone())
+                        .map_err(|source| ConfigError::InvalidSecret { source })?,
+                );
+                instance.api_key_env_source = Some(env_name);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn fixed_secret_env_value<'a>(
+    env: &'a BTreeMap<String, String>,
+    path: &[&str],
+) -> Option<&'a String> {
+    env.get(&fixed_secret_env_name(path))
+}
+
+fn fixed_secret_env_name(path: &[&str]) -> String {
+    let mut name = String::from("SPOROS");
+    for segment in path {
+        name.push_str("__");
+        name.push_str(&env_name_segment(segment));
+    }
+    name
+}
+
+fn env_name_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn validate_fixed_secret_env_names(config: &SporosConfig) -> Result<(), ConfigError> {
+    let mut names = BTreeMap::new();
+    register_fixed_secret_env_name(
+        &mut names,
+        "server",
+        fixed_secret_env_name(&["server", "api_token"]),
     )?;
-    resolve_arr_secret_env(
-        "indexers.arr.radarr.api_key_env",
-        &mut config.indexers.arr.radarr,
-        env,
-    )?;
+    for name in config.torrent_clients.keys() {
+        register_fixed_secret_env_name(
+            &mut names,
+            &format!("torrent_clients.{name}.password"),
+            fixed_secret_env_name(&["torrent_clients", name, "password"]),
+        )?;
+    }
+    for name in config.indexers.torznab.keys() {
+        register_fixed_secret_env_name(
+            &mut names,
+            &format!("indexers.torznab.{name}.api_key"),
+            fixed_secret_env_name(&["indexers", "torznab", name, "api_key"]),
+        )?;
+    }
+    for name in config.indexers.prowlarr.keys() {
+        register_fixed_secret_env_name(
+            &mut names,
+            &format!("indexers.prowlarr.{name}.api_key"),
+            fixed_secret_env_name(&["indexers", "prowlarr", name, "api_key"]),
+        )?;
+    }
+    register_arr_fixed_secret_env_names("sonarr", &config.indexers.arr.sonarr, &mut names)?;
+    register_arr_fixed_secret_env_names("radarr", &config.indexers.arr.radarr, &mut names)?;
+    for name in config.notifications.endpoints.keys() {
+        register_fixed_secret_env_name(
+            &mut names,
+            &format!("notifications.endpoints.{name}.token"),
+            fixed_secret_env_name(&["notifications", "endpoints", name, "token"]),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn register_arr_fixed_secret_env_names(
+    kind: &'static str,
+    instances: &BTreeMap<String, ArrInstanceConfig>,
+    names: &mut BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for name in instances.keys() {
+        register_fixed_secret_env_name(
+            names,
+            &format!("indexers.arr.{kind}.{name}.api_key"),
+            fixed_secret_env_name(&["indexers", "arr", kind, name, "api_key"]),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn register_fixed_secret_env_name(
+    names: &mut BTreeMap<String, String>,
+    field: &str,
+    env_name: String,
+) -> Result<(), ConfigError> {
+    if let Some(existing) = names.insert(env_name.clone(), field.to_owned()) {
+        return Err(ConfigError::InvalidField {
+            field: "fixed_secret_env",
+            reason: format!("{field} and {existing} both map to {env_name}"),
+        });
+    }
 
     Ok(())
 }
@@ -799,26 +780,6 @@ fn resolve_secret_files(config: &mut SporosConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn resolve_arr_secret_env(
-    field: &'static str,
-    instances: &mut BTreeMap<String, ArrInstanceConfig>,
-    env: &BTreeMap<String, String>,
-) -> Result<(), ConfigError> {
-    for (name, instance) in instances {
-        if instance.api_key.is_none()
-            && let Some(env_name) = nonempty_secret_env(field, name, &instance.api_key_env)?
-        {
-            let value = secret_env_value(env, env_name, field, name)?;
-            instance.api_key = Some(
-                ApiKey::new(value.clone())
-                    .map_err(|source| ConfigError::InvalidSecret { source })?,
-            );
-        }
-    }
-
-    Ok(())
-}
-
 fn resolve_arr_secret_files(
     field: &'static str,
     instances: &mut BTreeMap<String, ArrInstanceConfig>,
@@ -860,7 +821,6 @@ fn validate_prowlarr_sources(config: &SporosConfig, raw: &Value) -> Result<(), C
             [
                 ("api_key", source.api_key.is_some()),
                 ("api_key_file", source.api_key_file.is_some()),
-                ("api_key_env", source.api_key_env.is_some()),
             ],
         )?;
         for tag in &source.tags {
@@ -1020,7 +980,6 @@ fn validate_notifications_config(config: &SporosConfig) -> Result<(), ConfigErro
             [
                 ("token", endpoint.token.is_some()),
                 ("token_file", endpoint.token_file.is_some()),
-                ("token_env", endpoint.token_env.is_some()),
             ],
         )?;
         if !(1..=MAX_NOTIFICATION_RETRY_ATTEMPTS).contains(&endpoint.retry_max_attempts) {
@@ -1141,9 +1100,7 @@ fn validate_injection_metadata_value(
 
 fn validate_integration_api_keys(config: &SporosConfig) -> Result<(), ConfigError> {
     for (name, source) in &config.indexers.prowlarr {
-        if source.enabled
-            && !has_api_key_source(&source.api_key, &source.api_key_file, &source.api_key_env)
-        {
+        if source.enabled && !has_api_key_source(&source.api_key, &source.api_key_file) {
             return Err(missing_api_key_source("indexers.prowlarr.api_key", name));
         }
     }
@@ -1160,7 +1117,6 @@ fn validate_secret_source_counts(config: &SporosConfig) -> Result<(), ConfigErro
         [
             ("api_token", config.server.api_token.is_some()),
             ("api_token_file", config.server.api_token_file.is_some()),
-            ("api_token_env", config.server.api_token_env.is_some()),
         ],
     )?;
     for (name, client) in &config.torrent_clients {
@@ -1170,7 +1126,6 @@ fn validate_secret_source_counts(config: &SporosConfig) -> Result<(), ConfigErro
             [
                 ("password", client.password.is_some()),
                 ("password_file", client.password_file.is_some()),
-                ("password_env", client.password_env.is_some()),
             ],
         )?;
     }
@@ -1181,7 +1136,6 @@ fn validate_secret_source_counts(config: &SporosConfig) -> Result<(), ConfigErro
             [
                 ("api_key", indexer.api_key.is_some()),
                 ("api_key_file", indexer.api_key_file.is_some()),
-                ("api_key_env", indexer.api_key_env.is_some()),
             ],
         )?;
     }
@@ -1204,7 +1158,6 @@ fn validate_arr_secret_source_count(
             [
                 ("api_key", instance.api_key.is_some()),
                 ("api_key_file", instance.api_key_file.is_some()),
-                ("api_key_env", instance.api_key_env.is_some()),
             ],
         )?;
     }
@@ -1218,11 +1171,7 @@ fn validate_arr_api_key_sources(
 ) -> Result<(), ConfigError> {
     for (name, instance) in instances {
         validate_arr_url(name, &instance.url)?;
-        if !has_api_key_source(
-            &instance.api_key,
-            &instance.api_key_file,
-            &instance.api_key_env,
-        ) {
+        if !has_api_key_source(&instance.api_key, &instance.api_key_file) {
             return Err(missing_api_key_source(field, name));
         }
     }
@@ -1262,18 +1211,32 @@ fn validate_arr_url(name: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn has_api_key_source(
-    direct: &Option<ApiKey>,
-    file: &Option<PathBuf>,
-    env: &Option<String>,
-) -> bool {
-    direct.is_some() || file.is_some() || env.is_some()
+fn has_api_key_source(direct: &Option<ApiKey>, file: &Option<PathBuf>) -> bool {
+    direct.is_some() || file.is_some()
 }
 
 fn missing_api_key_source(field: &'static str, name: &str) -> ConfigError {
     ConfigError::InvalidField {
         field,
-        reason: format!("{name} must configure api_key, api_key_file, or api_key_env"),
+        reason: format!(
+            "{name} must configure api_key, api_key_file, or {}",
+            fixed_api_key_env_name(field, name)
+        ),
+    }
+}
+
+fn fixed_api_key_env_name(field: &str, name: &str) -> String {
+    match field {
+        "indexers.prowlarr.api_key" => {
+            fixed_secret_env_name(&["indexers", "prowlarr", name, "api_key"])
+        }
+        "indexers.arr.sonarr.api_key" => {
+            fixed_secret_env_name(&["indexers", "arr", "sonarr", name, "api_key"])
+        }
+        "indexers.arr.radarr.api_key" => {
+            fixed_secret_env_name(&["indexers", "arr", "radarr", name, "api_key"])
+        }
+        _ => fixed_secret_env_name(&["indexers", name, "api_key"]),
     }
 }
 
@@ -1365,10 +1328,10 @@ fn interval_ms(field: &'static str, name: &str, value: &str) -> Result<i64, Conf
         })
 }
 
-fn validate_secret_source_count(
+fn validate_secret_source_count<const N: usize>(
     field: &'static str,
     name: &str,
-    sources: [(&str, bool); 3],
+    sources: [(&str, bool); N],
 ) -> Result<(), ConfigError> {
     let count = sources
         .iter()
@@ -1393,8 +1356,9 @@ pub(crate) fn validate_server_auth(config: &SporosConfig) -> Result<(), ConfigEr
     Err(ConfigError::InvalidField {
         field: "server.api_token",
         reason: format!(
-            "non-loopback bind {} requires api_token, api_token_file, or api_token_env",
-            config.server.bind
+            "non-loopback bind {} requires api_token, api_token_file, or {}",
+            config.server.bind,
+            fixed_secret_env_name(&["server", "api_token"])
         ),
     })
 }
@@ -1407,43 +1371,6 @@ fn secret_file_value(field: &'static str, name: &str, path: &Path) -> Result<Str
     })?;
 
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
-}
-
-fn nonempty_secret_env<'a>(
-    field: &'static str,
-    name: &str,
-    value: &'a Option<String>,
-) -> Result<Option<&'a str>, ConfigError> {
-    let Some(value) = value.as_deref() else {
-        return Ok(None);
-    };
-    if value.trim().is_empty() {
-        return Err(ConfigError::InvalidField {
-            field,
-            reason: format!("{name} references an empty environment variable name"),
-        });
-    }
-
-    Ok(Some(value))
-}
-
-fn secret_env_value<'a>(
-    env: &'a BTreeMap<String, String>,
-    env_name: &str,
-    field: &'static str,
-    config_name: &str,
-) -> Result<&'a String, ConfigError> {
-    env.get(env_name).ok_or_else(|| ConfigError::InvalidField {
-        field,
-        reason: format!("{config_name} references unset environment variable {env_name}"),
-    })
-}
-
-fn env_error(key: &str, reason: impl Into<String>) -> ConfigError {
-    ConfigError::InvalidField {
-        field: "environment",
-        reason: format!("{key}: {}", reason.into()),
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -1669,7 +1596,6 @@ media_dirs = ["path", "..."]
 bind = "127.0.0.1:2468"
 api_token = "optional local-development bearer token"
 api_token_file = "optional path"
-api_token_env = "optional env var containing bearer token"
 
 [runtime]
 worker_threads = "optional 1-256 integer; defaults to Tokio"
@@ -1685,7 +1611,6 @@ manual_search_workflow_result_limit = 10000
 url = "https://hooks.example/sporos"
 token = "optional local-development bearer token"
 token_file = "optional path"
-token_env = "optional env var containing bearer token"
 timeout = "300s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
@@ -1697,7 +1622,6 @@ url = "http://client.example"
 username = "optional"
 password = "optional local-development secret"
 password_file = "optional path"
-password_env = "optional env var containing password"
 default_save_path = "path"
 default_category = "optional qbittorrent category"
 default_tags = ["sporos"]
@@ -1712,14 +1636,12 @@ download = "30s"
 url = "https://indexer.example/api"
 api_key = "optional local-development secret"
 api_key_file = "optional path"
-api_key_env = "optional env var containing api key"
 
 [indexers.prowlarr.<name>]
 enabled = true
 url = "https://prowlarr.example"
 api_key = "optional local-development secret"
 api_key_file = "optional path"
-api_key_env = "optional env var containing api key"
 update_interval = "24h"
 tags = ["optional", "tag"]
 tag_match = "any|all"
@@ -1732,49 +1654,20 @@ remove_policy = "deactivate|ignore"
 url = "http://sonarr:8989"
 api_key = "optional local-development secret"
 api_key_file = "optional path"
-api_key_env = "optional env var containing api key"
 
 [indexers.arr.radarr.<name>]
 url = "http://radarr:7878"
 api_key = "optional local-development secret"
 api_key_file = "optional path"
-api_key_env = "optional env var containing api key"
 
-[environment overrides]
-SPOROS__SERVER__BIND = "0.0.0.0:2468"
-SPOROS__SERVER__API_TOKEN_ENV = "SPOROS_API_TOKEN"
-SPOROS__PATHS__DATABASE = "/app/state/db/sporos.db"
-SPOROS__RUNTIME__WORKER_THREADS = "4"
-SPOROS__RUNTIME__MAX_BLOCKING_THREADS = "64"
-SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT = "100"
-SPOROS__RUNTIME__INDEXING_QUEUE_LIMIT = "50"
-SPOROS__RUNTIME__NOTIFICATION_QUEUE_LIMIT = "500"
-SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY = "4"
-SPOROS__RUNTIME__MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT = "1000"
-SPOROS__RUNTIME__MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT = "10000"
-SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__URL = "https://hooks.example/sporos"
-SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_ENV = "SPOROS_NOTIFICATION_TOKEN"
-SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD = "0.02"
-SPOROS__INJECTION__RECHECK__SKIP_RECHECK = "false"
-SPOROS__INJECTION__RECHECK__MAX_REMAINING_BYTES = "104857600"
-SPOROS__INJECTION__RECHECK__MIN_COMPLETION_PERCENT = "85.0"
-SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT = "15.0"
-SPOROS__INJECTION__RECHECK__IGNORE_NON_RELEVANT_FILES_TO_RESUME = "true"
-SPOROS__INJECTION__RECHECK__NON_RELEVANT_MAX_REMAINING_BYTES = "209715200"
-SPOROS__INJECTION__RECHECK__PIECE_SLACK_MULTIPLIER = "2"
-SPOROS__INJECTION__RECHECK__POLL_INTERVAL_MS = "5000"
-SPOROS__INJECTION__RECHECK__MAX_RESUME_WAIT_MS = "3600000"
-SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION = "inject_paused"
-SPOROS__INJECTION__LINK_TYPE = "hardlink"
-SPOROS__INJECTION__FLAT_LINKING = "true"
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL = "http://qbittorrent:8080"
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_ENV = "QBIT_PASSWORD"
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY = "cross-seed"
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS = "cross-seed,sporos"
-SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL = "cross-seed"
-SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY_ENV = "INDEXER_API_KEY"
-SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV = "PROWLARR_API_KEY"
-SPOROS__INDEXERS__ARR__SONARR__MAIN__API_KEY_ENV = "SONARR_API_KEY"
+[fixed secret environment variables]
+SPOROS__SERVER__API_TOKEN = "server api token"
+SPOROS__TORRENT_CLIENTS__<NAME>__PASSWORD = "torrent client password"
+SPOROS__INDEXERS__TORZNAB__<NAME>__API_KEY = "Torznab API key"
+SPOROS__INDEXERS__PROWLARR__<NAME>__API_KEY = "Prowlarr API key"
+SPOROS__INDEXERS__ARR__SONARR__<NAME>__API_KEY = "Sonarr API key"
+SPOROS__INDEXERS__ARR__RADARR__<NAME>__API_KEY = "Radarr API key"
+SPOROS__NOTIFICATIONS__ENDPOINTS__<NAME>__TOKEN = "notification bearer token"
 
 [matching]
 mode = "exact|partial"
@@ -1870,12 +1763,10 @@ mod tests {
             kind = "qbittorrent"
             url = "http://qbittorrent:8080"
             username = "sporos"
-            password_env = "QBIT_PASSWORD"
             default_save_path = "/downloads"
 
             [indexers.torznab.main]
             url = "https://indexer.example/api"
-            api_key_env = "INDEXER_API_KEY"
 
             [injection]
             dry_run = true
@@ -1891,8 +1782,14 @@ mod tests {
             cleanup_interval = "2h"
             "#,
             vec![
-                ("QBIT_PASSWORD".to_owned(), "qbit-secret".to_owned()),
-                ("INDEXER_API_KEY".to_owned(), "indexer-secret".to_owned()),
+                (
+                    "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD".to_owned(),
+                    "qbit-secret".to_owned(),
+                ),
+                (
+                    "SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY".to_owned(),
+                    "indexer-secret".to_owned(),
+                ),
             ],
         )
         .unwrap();
@@ -2245,7 +2142,7 @@ mod tests {
             [notifications.endpoints.ops]
             url = "https://hooks.example/sporos"
             token = "direct"
-            token_env = "SPOROS_NOTIFICATION_TOKEN"
+            token_file = "/run/secrets/notification-token"
             "#,
         )
         .unwrap_err();
@@ -2256,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_thread_counts_support_env_overrides() {
+    fn runtime_thread_counts_ignore_config_env_overrides() {
         let config = parse_config_with_env(
             "",
             [
@@ -2293,14 +2190,32 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(Some(3), config.runtime.worker_threads);
-        assert_eq!(Some(16), config.runtime.max_blocking_threads);
-        assert_eq!(250, config.runtime.search_queue_limit);
-        assert_eq!(75, config.runtime.indexing_queue_limit);
-        assert_eq!(800, config.runtime.notification_queue_limit);
-        assert_eq!(8, config.runtime.search_worker_concurrency);
-        assert_eq!(333, config.runtime.manual_search_per_indexer_result_limit);
-        assert_eq!(444, config.runtime.manual_search_workflow_result_limit);
+        assert_eq!(None, config.runtime.worker_threads);
+        assert_eq!(None, config.runtime.max_blocking_threads);
+        assert_eq!(
+            DEFAULT_SEARCH_QUEUE_LIMIT,
+            config.runtime.search_queue_limit
+        );
+        assert_eq!(
+            DEFAULT_INDEXING_QUEUE_LIMIT,
+            config.runtime.indexing_queue_limit
+        );
+        assert_eq!(
+            DEFAULT_NOTIFICATION_QUEUE_LIMIT,
+            config.runtime.notification_queue_limit
+        );
+        assert_eq!(
+            DEFAULT_SEARCH_WORKER_CONCURRENCY,
+            config.runtime.search_worker_concurrency
+        );
+        assert_eq!(
+            DEFAULT_MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT,
+            config.runtime.manual_search_per_indexer_result_limit
+        );
+        assert_eq!(
+            DEFAULT_MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT,
+            config.runtime.manual_search_workflow_result_limit
+        );
     }
 
     #[test]
@@ -2714,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_config_env_overrides_resolve_container_style_paths() {
+    fn startup_config_ignores_config_env_path_overrides() {
         let cwd = unique_temp_dir("env-container");
         let database = cwd.join("app/state/db/sporos.db");
         let torrent_cache_dir = cwd.join("app/state/cache");
@@ -2741,32 +2656,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            database
-                .parent()
-                .unwrap()
+            cwd.join("state/db")
                 .canonicalize()
                 .unwrap()
                 .join("sporos.db"),
             config.paths.database
         );
-        assert!(config.paths.torrent_cache_dir.is_dir());
-        assert!(config.paths.output_dir.is_dir());
+        assert_eq!(
+            cwd.join("state/cache").canonicalize().unwrap(),
+            config.paths.torrent_cache_dir
+        );
+        assert_eq!(
+            cwd.join("state/output").canonicalize().unwrap(),
+            config.paths.output_dir
+        );
+        assert!(!database.exists());
+        assert!(!torrent_cache_dir.exists());
+        assert!(!output_dir.exists());
 
         fs::remove_dir_all(cwd).unwrap();
     }
 
     #[test]
-    fn startup_config_rejects_relative_env_paths() {
+    fn startup_config_ignores_relative_env_paths() {
         let cwd = unique_temp_dir("relative-env");
-        let error = parse_startup_config_with_env(
+        let config = parse_startup_config_with_env(
             "",
             &cwd,
             vec![("SPOROS__PATHS__DATABASE".to_owned(), "sporos.db".to_owned())],
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("paths.database"));
-        assert!(error.to_string().contains("must be absolute"));
+        assert_eq!(
+            cwd.join("state/db")
+                .canonicalize()
+                .unwrap()
+                .join("sporos.db"),
+            config.paths.database
+        );
 
         fs::remove_dir_all(cwd).unwrap();
     }
@@ -2985,20 +2912,15 @@ mod tests {
         assert!(CONFIG_SCHEMA.contains("media_inventory_interval"));
         assert!(CONFIG_SCHEMA.contains("default_tags = [\"sporos\"]"));
         assert!(CONFIG_SCHEMA.contains("below_threshold_action"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__LINK_TYPE"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__FLAT_LINKING"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__SKIP_RECHECK"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__MIN_COMPLETION_PERCENT"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__POLL_INTERVAL_MS"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__MAX_RESUME_WAIT_MS"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__TORRENT_CLIENTS__RTORRENT_MAIN__DEFAULT_LABEL"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV"));
-        assert!(CONFIG_SCHEMA.contains("SPOROS__NOTIFICATIONS__ENDPOINTS__MAIN__TOKEN_ENV"));
+        assert!(!CONFIG_SCHEMA.contains("SPOROS__SERVER__BIND"));
+        assert!(!CONFIG_SCHEMA.contains("SPOROS__PATHS__DATABASE"));
+        assert!(!CONFIG_SCHEMA.contains("SPOROS__INJECTION__LINK_TYPE"));
+        assert!(!CONFIG_SCHEMA.contains("api_key_env"));
+        assert!(!CONFIG_SCHEMA.contains("password_env"));
+        assert!(!CONFIG_SCHEMA.contains("token_env"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__SERVER__API_TOKEN"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__INDEXERS__PROWLARR__<NAME>__API_KEY"));
+        assert!(CONFIG_SCHEMA.contains("SPOROS__NOTIFICATIONS__ENDPOINTS__<NAME>__TOKEN"));
     }
 
     #[test]
@@ -3021,7 +2943,7 @@ mod tests {
         let config = parse_config_with_env(
             guide_example,
             vec![(
-                "SPOROS_NOTIFICATION_TOKEN".to_owned(),
+                "SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN".to_owned(),
                 "notification-secret".to_owned(),
             )],
         )
@@ -3031,10 +2953,6 @@ mod tests {
         assert_eq!(configuration_example.trim(), guide_example.trim());
         assert_eq!("https://hooks.example/sporos", endpoint.url);
         assert_eq!(None, endpoint.token_file.as_deref());
-        assert_eq!(
-            Some("SPOROS_NOTIFICATION_TOKEN"),
-            endpoint.token_env.as_deref()
-        );
         assert_eq!(
             Some("notification-secret"),
             endpoint
@@ -3071,7 +2989,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_overrides_scalar_fields_before_typed_parse() {
+    fn config_env_overrides_do_not_mutate_config_fields() {
         let config = parse_config_with_env(
             r#"
             [paths]
@@ -3079,7 +2997,6 @@ mod tests {
 
             [server]
             bind = "127.0.0.1:2468"
-            api_token_env = "SPOROS_API_TOKEN"
 
             [matching]
             fuzzy_size_threshold = 0.02
@@ -3112,24 +3029,27 @@ mod tests {
                     "reject_without_injecting".to_owned(),
                 ),
                 ("SPOROS__ANNOUNCE__MAX_PENDING".to_owned(), "42".to_owned()),
-                ("SPOROS_API_TOKEN".to_owned(), "api-token".to_owned()),
+                (
+                    "SPOROS__SERVER__API_TOKEN".to_owned(),
+                    "api-token".to_owned(),
+                ),
             ],
         )
         .unwrap();
 
         assert_eq!(
-            "0.0.0.0:9876".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:2468".parse::<SocketAddr>().unwrap(),
             config.server.bind
         );
-        assert!((config.matching.fuzzy_size_threshold - 0.05).abs() < f64::EPSILON);
-        assert!(config.matching.include_non_video);
-        assert_eq!(Some(86_400), config.matching.recent_search_cooldown_secs);
-        assert_eq!(Some(85.0), config.injection.recheck.min_completion_percent);
+        assert!((config.matching.fuzzy_size_threshold - 0.02).abs() < f64::EPSILON);
+        assert!(!config.matching.include_non_video);
+        assert_eq!(Some(259_200), config.matching.recent_search_cooldown_secs);
+        assert_eq!(None, config.injection.recheck.min_completion_percent);
         assert_eq!(
-            BelowThresholdActionConfig::RejectWithoutInjecting,
+            BelowThresholdActionConfig::InjectPaused,
             config.injection.recheck.below_threshold_action
         );
-        assert_eq!(42, config.announce.max_pending);
+        assert_eq!(1000, config.announce.max_pending);
         assert_eq!(
             Some("api-token"),
             config
@@ -3141,66 +3061,47 @@ mod tests {
     }
 
     #[test]
-    fn environment_overrides_keyed_table_scalars_and_secrets() {
+    fn fixed_secret_env_names_resolve_configured_integrations() {
         let config = parse_config_with_env(
             r#"
             [torrent_clients.qbit_main]
             kind = "qbittorrent"
-            url = "http://old:8080"
+            url = "http://qbittorrent:8080"
             default_save_path = "/downloads"
-            password_env = "QBIT_PASSWORD"
+            default_category = "cross-seed"
+            default_tags = ["cross-seed", "sporos"]
 
             [indexers.torznab.example]
-            url = "https://old.example/api"
-            api_key_env = "INDEXER_API_KEY"
+            url = "https://indexer.example/api"
 
             [indexers.prowlarr.main]
-            url = "https://old-prowlarr.example"
-            api_key_env = "PROWLARR_API_KEY"
+            url = "https://prowlarr.example"
 
             [indexers.arr.radarr.main]
-            url = "http://old-radarr:7878"
-            api_key_env = "RADARR_API_KEY"
+            url = "http://radarr:7878"
 
             [notifications.endpoints.ops]
-            url = "https://old-hooks.example/sporos"
-            token_env = "SPOROS_NOTIFICATION_TOKEN"
+            url = "https://hooks.example/sporos"
             "#,
             vec![
                 (
-                    "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL".to_owned(),
-                    "http://qbittorrent:8080".to_owned(),
+                    "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD".to_owned(),
+                    "super-secret".to_owned(),
                 ),
                 (
-                    "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY".to_owned(),
-                    "cross-seed".to_owned(),
+                    "SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY".to_owned(),
+                    "api-secret".to_owned(),
                 ),
                 (
-                    "SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS".to_owned(),
-                    "cross-seed,sporos".to_owned(),
+                    "SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY".to_owned(),
+                    "prowlarr-secret".to_owned(),
                 ),
                 (
-                    "SPOROS__INDEXERS__TORZNAB__EXAMPLE__URL".to_owned(),
-                    "https://indexer.example/api".to_owned(),
+                    "SPOROS__INDEXERS__ARR__RADARR__MAIN__API_KEY".to_owned(),
+                    "radarr-secret".to_owned(),
                 ),
                 (
-                    "SPOROS__INDEXERS__PROWLARR__MAIN__URL".to_owned(),
-                    "https://prowlarr.example".to_owned(),
-                ),
-                (
-                    "SPOROS__INDEXERS__ARR__RADARR__MAIN__URL".to_owned(),
-                    "http://radarr:7878".to_owned(),
-                ),
-                (
-                    "SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__URL".to_owned(),
-                    "https://hooks.example/sporos".to_owned(),
-                ),
-                ("QBIT_PASSWORD".to_owned(), "super-secret".to_owned()),
-                ("INDEXER_API_KEY".to_owned(), "api-secret".to_owned()),
-                ("PROWLARR_API_KEY".to_owned(), "prowlarr-secret".to_owned()),
-                ("RADARR_API_KEY".to_owned(), "radarr-secret".to_owned()),
-                (
-                    "SPOROS_NOTIFICATION_TOKEN".to_owned(),
+                    "SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN".to_owned(),
                     "notification-secret".to_owned(),
                 ),
             ],
@@ -3231,15 +3132,27 @@ mod tests {
             Some("api-secret"),
             indexer.api_key.as_ref().map(ApiKey::expose_secret)
         );
+        assert_eq!(
+            Some("SPOROS__INDEXERS__TORZNAB__EXAMPLE__API_KEY"),
+            indexer.api_key_env_source.as_deref()
+        );
         assert_eq!("https://prowlarr.example", prowlarr.url);
         assert_eq!(
             Some("prowlarr-secret"),
             prowlarr.api_key.as_ref().map(ApiKey::expose_secret)
         );
+        assert_eq!(
+            Some("SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY"),
+            prowlarr.api_key_env_source.as_deref()
+        );
         assert_eq!("http://radarr:7878", radarr.url);
         assert_eq!(
             Some("radarr-secret"),
             radarr.api_key.as_ref().map(ApiKey::expose_secret)
+        );
+        assert_eq!(
+            Some("SPOROS__INDEXERS__ARR__RADARR__MAIN__API_KEY"),
+            radarr.api_key_env_source.as_deref()
         );
         assert_eq!("https://hooks.example/sporos", endpoint.url);
         assert_eq!(
@@ -3252,7 +3165,33 @@ mod tests {
     }
 
     #[test]
-    fn environment_overrides_default_tags_array_with_comma_list() {
+    fn fixed_secret_env_names_reject_colliding_resource_names() {
+        let error = parse_config_with_env(
+            r#"
+            [torrent_clients.qbit-main]
+            kind = "qbittorrent"
+            url = "http://qbittorrent-main:8080"
+            default_save_path = "/downloads/main"
+
+            [torrent_clients.qbit_main]
+            kind = "qbittorrent"
+            url = "http://qbittorrent-alt:8080"
+            default_save_path = "/downloads/alt"
+            "#,
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fixed_secret_env"));
+        assert!(
+            error
+                .to_string()
+                .contains("SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD")
+        );
+    }
+
+    #[test]
+    fn config_env_overrides_do_not_mutate_arrays() {
         let config = parse_config_with_env(
             r#"
             [torrent_clients.qbit_main]
@@ -3269,10 +3208,7 @@ mod tests {
         .unwrap();
         let client = &config.torrent_clients["qbit_main"];
 
-        assert_eq!(
-            vec!["cross-seed".to_owned(), "sporos".to_owned()],
-            client.default_tags
-        );
+        assert_eq!(vec!["sporos".to_owned()], client.default_tags);
     }
 
     #[test]
@@ -3328,7 +3264,6 @@ mod tests {
             r#"
             [indexers.prowlarr.future]
             enabled = false
-            api_key_env = "FUTURE_PROWLARR_API_KEY"
             "#,
         )
         .unwrap();
@@ -3337,10 +3272,6 @@ mod tests {
         assert!(!source.enabled);
         assert_eq!("", source.url);
         assert_eq!(None, source.api_key);
-        assert_eq!(
-            Some("FUTURE_PROWLARR_API_KEY"),
-            source.api_key_env.as_deref()
-        );
         assert_eq!("24h", source.update_interval);
 
         for (contents, expected) in [
@@ -3373,10 +3304,13 @@ mod tests {
     #[test]
     fn env_disabled_prowlarr_sources_can_be_placeholders() {
         let config = parse_config_with_env(
-            "",
+            r#"
+            [indexers.prowlarr.future]
+            enabled = false
+            "#,
             vec![(
-                "SPOROS__INDEXERS__PROWLARR__FUTURE__ENABLED".to_owned(),
-                "false".to_owned(),
+                "SPOROS__INDEXERS__PROWLARR__FUTURE__URL".to_owned(),
+                "file:///tmp/prowlarr".to_owned(),
             )],
         )
         .unwrap();
@@ -3386,17 +3320,15 @@ mod tests {
         assert_eq!("", source.url);
 
         let error = parse_config_with_env(
-            "",
-            vec![
-                (
-                    "SPOROS__INDEXERS__PROWLARR__FUTURE__ENABLED".to_owned(),
-                    "false".to_owned(),
-                ),
-                (
-                    "SPOROS__INDEXERS__PROWLARR__FUTURE__URL".to_owned(),
-                    "file:///tmp/prowlarr".to_owned(),
-                ),
-            ],
+            r#"
+            [indexers.prowlarr.future]
+            enabled = false
+            url = "file:///tmp/prowlarr"
+            "#,
+            vec![(
+                "SPOROS__INDEXERS__PROWLARR__FUTURE__ENABLED".to_owned(),
+                "true".to_owned(),
+            )],
         )
         .unwrap_err();
 
@@ -3515,7 +3447,7 @@ mod tests {
             [indexers.arr.radarr.main]
             url = "http://radarr:7878"
             api_key = "direct"
-            api_key_env = "RADARR_API_KEY"
+            api_key_file = "/run/secrets/radarr-api-key"
             "#,
         )
         .unwrap_err();
@@ -3536,14 +3468,14 @@ mod tests {
             r#"
             [server]
             api_token = "direct"
-            api_token_env = "SPOROS_API_TOKEN"
+            api_token_file = "/run/secrets/sporos-api-token"
             "#,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("server.api_token"));
         assert!(error.to_string().contains("only one"));
-        assert!(error.to_string().contains("api_token_env"));
+        assert!(error.to_string().contains("api_token_file"));
     }
 
     #[test]
@@ -3554,7 +3486,7 @@ mod tests {
             kind = "qbittorrent"
             url = "http://qbittorrent:8080"
             password = "direct"
-            password_env = "QBIT_PASSWORD"
+            password_file = "/run/secrets/qbit-password"
             default_save_path = "/downloads"
             "#,
         )
@@ -3600,14 +3532,14 @@ mod tests {
             [indexers.torznab.example]
             url = "https://indexer.example/api"
             api_key = "direct"
-            api_key_env = "INDEXER_API_KEY"
+            api_key_file = "/run/secrets/indexer-api-key"
             "#,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("indexers.torznab.api_key"));
         assert!(error.to_string().contains("only one"));
-        assert!(error.to_string().contains("api_key_env"));
+        assert!(error.to_string().contains("api_key_file"));
     }
 
     #[test]
@@ -3638,26 +3570,24 @@ mod tests {
     }
 
     #[test]
-    fn environment_rejects_arrays_and_indexed_paths() {
-        let media_error = parse_config_with_env(
+    fn config_env_overrides_ignore_arrays_and_indexed_paths() {
+        let config = parse_config_with_env(
             "",
-            vec![(
-                "SPOROS__PATHS__MEDIA_DIRS".to_owned(),
-                "[\"/media\"]".to_owned(),
-            )],
+            vec![
+                (
+                    "SPOROS__PATHS__MEDIA_DIRS".to_owned(),
+                    "[\"/media\"]".to_owned(),
+                ),
+                (
+                    "SPOROS__TORRENT_CLIENTS__0__URL".to_owned(),
+                    "http://client".to_owned(),
+                ),
+            ],
         )
-        .unwrap_err();
-        let indexed_error = parse_config_with_env(
-            "",
-            vec![(
-                "SPOROS__TORRENT_CLIENTS__0__URL".to_owned(),
-                "http://client".to_owned(),
-            )],
-        )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(media_error.to_string().contains("array config values"));
-        assert!(indexed_error.to_string().contains("indexed env overrides"));
+        assert!(config.paths.media_dirs.is_empty());
+        assert!(config.torrent_clients.is_empty());
     }
 
     #[test]

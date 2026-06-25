@@ -4482,7 +4482,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -4578,7 +4577,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4937,7 +4936,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.notifications.endpoints.insert(
@@ -5063,7 +5062,7 @@ mod tests {
                     url: indexer_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -5134,7 +5133,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -5193,7 +5192,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -5261,7 +5260,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -5316,7 +5315,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -5780,7 +5779,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -5857,7 +5856,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -6422,7 +6421,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -6767,7 +6766,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -6870,7 +6869,7 @@ mod tests {
                 url: indexer_url,
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -7624,7 +7623,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: Vec::new(),

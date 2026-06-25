@@ -1895,7 +1895,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -1909,7 +1908,7 @@ mod tests {
                 url: "https://indexer.example/api".to_owned(),
                 api_key: Some(ApiKey::new("secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -2393,7 +2392,7 @@ mod tests {
                 url: "https://indexer.example/api".to_owned(),
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.prowlarr.insert(
@@ -2406,7 +2405,7 @@ mod tests {
                 url: "https://radarr.example".to_owned(),
                 api_key: Some(ApiKey::new("arr-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.torrent_clients.insert(
@@ -2417,7 +2416,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -2795,7 +2793,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.arr.radarr.insert(
@@ -2804,7 +2802,7 @@ mod tests {
                 url: arr_url,
                 api_key: Some(ApiKey::new("arr-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -2897,7 +2895,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -2934,7 +2932,7 @@ mod tests {
                     url: format!("https://unrefreshed-{index:04}.example/api"),
                     api_key: None,
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -2944,7 +2942,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -2989,7 +2987,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3044,7 +3042,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3102,7 +3100,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3151,7 +3149,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
             insert_indexer_row(&repository, name, true, None, None, "{}").await;
@@ -3207,7 +3205,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
             insert_indexer_row(&repository, name, true, None, None, "{}").await;
@@ -3259,7 +3257,7 @@ mod tests {
                     url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -3331,7 +3329,7 @@ mod tests {
                 url: ok_url,
                 api_key: Some(ApiKey::new("ok-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.prowlarr.insert(
@@ -3375,7 +3373,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3419,7 +3417,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3452,7 +3450,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3498,7 +3496,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -3581,7 +3579,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -3644,7 +3642,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -3738,7 +3736,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -3837,7 +3835,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new("capacity").unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -3946,7 +3944,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4000,7 +3998,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -4075,7 +4073,7 @@ mod tests {
                     url: torznab_url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -4138,7 +4136,7 @@ mod tests {
                 url: "https://zero.example/api".to_owned(),
                 api_key: Some(ApiKey::new("zero-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.torznab.insert(
@@ -4147,7 +4145,7 @@ mod tests {
                 url: ok_url,
                 api_key: Some(ApiKey::new("ok-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4204,7 +4202,7 @@ mod tests {
                 url: ok_url,
                 api_key: Some(ApiKey::new("ok-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.torznab.insert(
@@ -4213,7 +4211,7 @@ mod tests {
                 url: failing_url,
                 api_key: Some(ApiKey::new("failing-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4327,7 +4325,7 @@ mod tests {
                     url,
                     api_key: Some(ApiKey::new(name).unwrap()),
                     api_key_file: None,
-                    api_key_env: None,
+                    api_key_env_source: None,
                 },
             );
         }
@@ -4391,7 +4389,7 @@ mod tests {
                 url: failing_url,
                 api_key: Some(ApiKey::new("failing-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4474,7 +4472,7 @@ mod tests {
                 url: first_url,
                 api_key: Some(ApiKey::new("alpha-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.torznab.insert(
@@ -4483,7 +4481,7 @@ mod tests {
                 url: second_url,
                 api_key: Some(ApiKey::new("bravo-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4554,7 +4552,7 @@ mod tests {
                 url: first_url,
                 api_key: Some(ApiKey::new("alpha-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.torznab.insert(
@@ -4563,7 +4561,7 @@ mod tests {
                 url: second_url,
                 api_key: Some(ApiKey::new("bravo-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4623,7 +4621,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4699,7 +4697,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.arr.radarr.insert(
@@ -4708,7 +4706,7 @@ mod tests {
                 url: arr_url,
                 api_key: Some(ApiKey::new("arr-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4780,7 +4778,7 @@ mod tests {
                 url: torznab_url,
                 api_key: Some(ApiKey::new("indexer-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         config.indexers.arr.sonarr.insert(
@@ -4789,7 +4787,7 @@ mod tests {
                 url: arr_url,
                 api_key: Some(ApiKey::new("arr-secret").unwrap()),
                 api_key_file: None,
-                api_key_env: None,
+                api_key_env_source: None,
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -4859,7 +4857,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -4921,7 +4918,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -4969,7 +4965,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -5010,7 +5005,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -5069,7 +5063,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -5124,7 +5117,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -5172,7 +5164,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -5212,7 +5203,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -5252,7 +5242,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads/default".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -5306,7 +5295,6 @@ mod tests {
                 username: None,
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
@@ -5334,7 +5322,6 @@ mod tests {
                 username: Some("sporos".to_owned()),
                 password: None,
                 password_file: None,
-                password_env: None,
                 default_save_path: "/downloads".into(),
                 default_category: None,
                 default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],

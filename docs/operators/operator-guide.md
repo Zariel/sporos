@@ -1,7 +1,7 @@
 # Sporos Operator Guide
 
 This guide covers the supported operator surface: TOML configuration,
-`SPOROS__` environment overrides, local state paths, HTTP probes, metrics, and
+fixed-name environment secrets, local state paths, HTTP probes, metrics, and
 day-two operation.
 
 ## Commands
@@ -53,10 +53,9 @@ docker run --rm \
   --name sporos \
   --stop-timeout 60 \
   -p 2468:2468 \
-  -e SPOROS_API_TOKEN \
-  -e QBIT_PASSWORD \
-  -e INDEXER_API_KEY \
-  -e PROWLARR_API_KEY \
+  -e SPOROS__SERVER__API_TOKEN \
+  -e SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD \
+  -e SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY \
   -v ./config.toml:/app/config.toml:ro \
   -v sporos-state:/app/state \
   -v /srv/media:/media:ro \
@@ -73,11 +72,11 @@ The image runs as UID/GID `10001`. Mounted writable paths for
 `paths.database`, `paths.torrent_cache_dir`, and `paths.output_dir` must be
 writable by that identity, or by a runtime user override chosen by the operator.
 Container defaults place those three paths under `/app` even when the mounted
-config omits them. The image also sets
-`SPOROS__SERVER__BIND=0.0.0.0:2468` so Kubernetes Services and probes can reach
-the Pod IP; container deployments must provide exactly one API token source,
-for example `server.api_token_env = "SPOROS_API_TOKEN"` plus a Secret-backed
-environment variable.
+config omits them. Set `server.bind = "0.0.0.0:2468"` in container and
+Kubernetes configs so Services and probes can reach the Pod IP. Container
+deployments must provide exactly one API token source, such as
+`server.api_token_file` or the fixed Secret-backed
+`SPOROS__SERVER__API_TOKEN` environment variable.
 Use a stop timeout long enough for graceful shutdown to drain in-flight work; 60
 seconds is a conservative starting point for Docker.
 Deployment topology, orchestration, resource requests, and restart policy are
@@ -97,13 +96,11 @@ media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
 bind = "0.0.0.0:2468"
-api_token_env = "SPOROS_API_TOKEN"
 
 [torrent_clients.qbit_main]
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "sporos"
-password_env = "QBIT_PASSWORD"
 default_save_path = "/downloads"
 default_category = "cross-seed"
 default_tags = ["cross-seed", "sporos"]
@@ -121,11 +118,9 @@ download = "30s"
 
 [indexers.torznab.main]
 url = "https://indexer.example/api"
-api_key_env = "INDEXER_API_KEY"
 
 [indexers.prowlarr.main]
 url = "https://prowlarr.example"
-api_key_env = "PROWLARR_API_KEY"
 update_interval = "24h"
 tags = ["movies", "hd"]
 tag_match = "any"
@@ -136,7 +131,6 @@ remove_policy = "deactivate"
 
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
-token_env = "SPOROS_NOTIFICATION_TOKEN"
 timeout = "30s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
@@ -232,8 +226,8 @@ outcome, which is useful when external automation should handle low-completion
 candidates outside Sporos.
 
 Supported indexers are Torznab-compatible endpoints. Put API keys in
-`api_key_file`, `api_key_env`, or development-only `api_key`; do not put API
-keys in the indexer URL query string.
+`api_key_file`, fixed path-derived environment secrets, or development-only
+`api_key`; do not put API keys in the indexer URL query string.
 
 ## Prowlarr Discovery
 
@@ -244,7 +238,6 @@ from Prowlarr instead of listing every indexer under `indexers.torznab`.
 ```toml
 [indexers.prowlarr.main]
 url = "https://prowlarr.example"
-api_key_env = "PROWLARR_API_KEY"
 update_interval = "24h"
 tags = ["movies", "hd"]
 tag_match = "any"
@@ -260,14 +253,13 @@ query parameter. Sporos contacts `/api/v1/indexer`, reads tag labels from
 `/api/v1/tag` when tag names need resolving, and builds imported Torznab proxy
 URLs through the configured Prowlarr source.
 
-Prowlarr API keys support `api_key_file`, `api_key_env`, and local-development
-`api_key`, with the same one-source-only rule as direct Torznab keys. The
-container examples use environment-backed secrets for Kubernetes: set the TOML
-field to `api_key_env = "PROWLARR_API_KEY"` or use an environment override such
-as:
+Prowlarr API keys support `api_key_file`, the fixed path-derived environment
+secret, and local-development `api_key`, with the same one-source-only rule as
+direct Torznab keys. The container examples use environment-backed secrets for
+Kubernetes; for `[indexers.prowlarr.main]`, provide:
 
 ```bash
-SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV='"PROWLARR_API_KEY"'
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY
 ```
 
 `update_interval` controls the periodic refresh cadence. `refresh_on_startup`
@@ -338,49 +330,28 @@ Operators can queue an immediate supported job run with
 `POST /v1/jobs/cleanup/runs`. A posted run updates durable job state and should
 be treated as a mutating operation.
 
-## Environment Overrides
-
-Scalar config fields can be overridden with `SPOROS__` environment variables.
-Double underscores separate TOML path segments, and segments are converted to
-lowercase. Arrays are not settable through indexed environment variables, so
-set `paths.media_dirs` in TOML.
-
-```bash
-SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/app/state/db/sporos.db"'
-SPOROS__MATCHING__FUZZY_SIZE_THRESHOLD='0.02'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_ENV='"QBIT_PASSWORD"'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS='"cross-seed,sporos"'
-SPOROS__TORRENT_CLIENTS__RTORRENT_ARCHIVE__DEFAULT_LABEL='"cross-seed"'
-SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_ENV='"INDEXER_API_KEY"'
-SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY_ENV='"PROWLARR_API_KEY"'
-```
-
-Override values are parsed as TOML scalars first. Quote string values when the
-shell value should be interpreted as a TOML string. `default_tags` is the only
-array-like client metadata value that can be overridden as a scalar; use a
-comma-separated value such as `"cross-seed,sporos"`.
-
 ## Secrets
 
-HTTP workflow authentication uses `server.api_token`, `server.api_token_file`,
-or `server.api_token_env`. A non-loopback bind requires one of these token
-sources. Callers must send it as `Authorization: Bearer <token>` when using
-mutating workflow endpoints.
+Normal config values are TOML-only. HTTP workflow authentication uses
+`server.api_token`, `server.api_token_file`, or the fixed
+`SPOROS__SERVER__API_TOKEN` environment variable. A non-loopback bind requires
+one of these token sources. Callers must send it as
+`Authorization: Bearer <token>` when using mutating workflow endpoints.
 
-Torrent client passwords support `password`, `password_file`, and
-`password_env`. Torznab and Prowlarr indexer keys support `api_key`,
-`api_key_file`, and `api_key_env`. Notification endpoints support `token`,
-`token_file`, and `token_env`; configure no endpoints to keep notification
-delivery disabled.
+Torrent client passwords support `password`, `password_file`, and fixed
+environment secrets such as `SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD`.
+Torznab and Prowlarr indexer keys support `api_key`, `api_key_file`, and fixed
+environment secrets such as `SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY`.
+Notification endpoints support `token`, `token_file`, and fixed environment
+secrets such as `SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN`; configure no
+endpoints to keep notification delivery disabled.
 
-Use environment-backed secrets in Kubernetes. File-backed secrets are still
-supported when an operator intentionally mounts secret files. Inline `password`,
-`api_key`, and notification `token` values are for local development. Secret
-wrappers redact debug and display output, and operator endpoints intentionally
-avoid exposing request cookies, API keys, passkeys, and secret-bearing URLs.
+Use fixed environment-backed secrets in Kubernetes. File-backed secrets are
+still supported when an operator intentionally mounts secret files. Inline
+`password`, `api_key`, and notification `token` values are for local
+development. Secret wrappers redact debug and display output, and operator
+endpoints intentionally avoid exposing request cookies, API keys, passkeys, and
+secret-bearing URLs.
 Prowlarr API keys and the keys attached to imported Prowlarr indexers are
 redacted from logs, metrics, status, support output, and validation errors.
 
@@ -472,7 +443,7 @@ after restart rather than preserving webhook delivery history in SQLite.
 
 rTorrent HTTP authentication is not supported in this release. Configure
 authentication at a reverse proxy or use a private RPC endpoint; Sporos rejects
-rTorrent `username`, `password`, `password_file`, and `password_env` settings so
+rTorrent `username`, `password`, and `password_file` settings so
 credentials are not silently ignored.
 
 ## Notification Operations
@@ -483,14 +454,14 @@ Notifications are optional webhook deliveries. Configure endpoints under
 ```toml
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
-token_env = "SPOROS_NOTIFICATION_TOKEN"
 timeout = "30s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
 retry_max_delay = "30s"
 ```
 
-Use one token source per endpoint: `token_file`, `token_env`, or
+Use one token source per endpoint: `token_file`, the fixed
+`SPOROS__NOTIFICATIONS__ENDPOINTS__<NAME>__TOKEN` environment variable, or
 local-development `token`. The token is sent as a bearer token and is redacted
 from debug output, errors, and metrics. Endpoint URLs must use HTTP(S) and must
 not contain credentials, query parameters, or fragments.

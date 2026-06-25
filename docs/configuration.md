@@ -9,9 +9,9 @@ sporos serve --config /app/config.toml
 ```
 
 Use `sporos print-config-schema` to print the complete supported config shape.
-`check-config` parses the file, applies environment overrides, validates typed
-settings, creates required local state directories, and probes writable state
-paths.
+`check-config` parses the file, resolves fixed-name environment secrets,
+validates typed settings, creates required local state directories, and probes
+writable state paths.
 
 ## Example
 
@@ -24,7 +24,6 @@ media_dirs = ["/media/movies", "/media/tv"]
 
 [server]
 bind = "0.0.0.0:2468"
-api_token_env = "SPOROS_API_TOKEN"
 
 [runtime]
 worker_threads = 4
@@ -38,7 +37,6 @@ manual_search_workflow_result_limit = 10000
 
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
-token_env = "SPOROS_NOTIFICATION_TOKEN"
 timeout = "30s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
@@ -48,14 +46,12 @@ retry_max_delay = "30s"
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "sporos"
-password_env = "QBIT_PASSWORD"
 default_save_path = "/downloads"
 default_category = "cross-seed"
 default_tags = ["cross-seed", "sporos"]
 
 [indexers.torznab.main]
 url = "https://indexer.example/api"
-api_key_env = "INDEXER_API_KEY"
 
 [matching]
 mode = "partial"
@@ -143,11 +139,12 @@ notification delivery disabled.
 
 ## Server And Auth
 
-`server.bind` defaults to `127.0.0.1:2468` in the Rust config. The container
-image sets `SPOROS__SERVER__BIND=0.0.0.0:2468` so Kubernetes Services and
-probes can reach the Pod IP. Use `server.api_token_file`,
-`server.api_token_env`, or `server.api_token` to protect mutating workflow
-endpoints. Non-loopback binds require one API token source.
+`server.bind` defaults to `127.0.0.1:2468` in the Rust config. Set
+`server.bind = "0.0.0.0:2468"` in container and Kubernetes configs when
+Services and probes must reach the Pod IP. Use `server.api_token_file`, the
+fixed `SPOROS__SERVER__API_TOKEN` environment variable, or local-development
+`server.api_token` to protect mutating workflow endpoints. Non-loopback binds
+require one API token source.
 
 Callers send the token as:
 
@@ -166,7 +163,6 @@ qBittorrent supports username/password authentication:
 kind = "qbittorrent"
 url = "http://qbittorrent:8080"
 username = "sporos"
-password_env = "QBIT_PASSWORD"
 default_save_path = "/downloads"
 default_category = "cross-seed"
 default_tags = ["cross-seed", "sporos"]
@@ -208,15 +204,15 @@ request timeout, and bounded retry policy:
 ```toml
 [notifications.endpoints.ops]
 url = "https://hooks.example/sporos"
-token_env = "SPOROS_NOTIFICATION_TOKEN"
 timeout = "30s"
 retry_max_attempts = 3
 retry_initial_delay = "1s"
 retry_max_delay = "30s"
 ```
 
-Use `token_file`, `token_env`, or local-development `token`. URLs must use
-HTTP(S) and must not contain credentials, query parameters, or fragments.
+Use `token_file`, the fixed `SPOROS__NOTIFICATIONS__ENDPOINTS__<NAME>__TOKEN`
+environment variable, or local-development `token`. URLs must use HTTP(S) and
+must not contain credentials, query parameters, or fragments.
 Delivery health is best-effort and memory-only: `/v1/status` and metrics show
 the latest in-process success or failure for each configured endpoint, and
 endpoints return to `unknown` after restart.
@@ -317,7 +313,6 @@ Direct Torznab indexers live under `[indexers.torznab.<name>]`:
 ```toml
 [indexers.torznab.main]
 url = "https://indexer.example/api"
-api_key_env = "INDEXER_API_KEY"
 ```
 
 Prowlarr import is optional. Configure it when Sporos should import
@@ -326,7 +321,6 @@ Torznab-compatible torrent search endpoints from Prowlarr:
 ```toml
 [indexers.prowlarr.main]
 url = "https://prowlarr.example"
-api_key_env = "PROWLARR_API_KEY"
 update_interval = "24h"
 tags = ["movies", "hd"]
 tag_match = "any"
@@ -344,54 +338,35 @@ search planning:
 ```toml
 [indexers.arr.sonarr.main]
 url = "http://sonarr:8989"
-api_key_env = "SONARR_API_KEY"
 
 [indexers.arr.radarr.main]
 url = "http://radarr:7878"
-api_key_env = "RADARR_API_KEY"
 ```
-
-## Environment Overrides
-
-Scalar fields can be overridden with `SPOROS__` environment variables. Double
-underscores separate TOML path segments, and values are parsed as TOML scalars:
-
-```bash
-SPOROS__SERVER__BIND='"0.0.0.0:2468"'
-SPOROS__PATHS__DATABASE='"/app/state/db/sporos.db"'
-SPOROS__RUNTIME__WORKER_THREADS='4'
-SPOROS__RUNTIME__MAX_BLOCKING_THREADS='64'
-SPOROS__RUNTIME__SEARCH_QUEUE_LIMIT='100'
-SPOROS__RUNTIME__INDEXING_QUEUE_LIMIT='50'
-SPOROS__RUNTIME__NOTIFICATION_QUEUE_LIMIT='500'
-SPOROS__RUNTIME__SEARCH_WORKER_CONCURRENCY='4'
-SPOROS__RUNTIME__MANUAL_SEARCH_PER_INDEXER_RESULT_LIMIT='1000'
-SPOROS__RUNTIME__MANUAL_SEARCH_WORKFLOW_RESULT_LIMIT='10000'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL='"http://qbittorrent:8080"'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD_ENV='"QBIT_PASSWORD"'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_CATEGORY='"cross-seed"'
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS='"cross-seed,sporos"'
-SPOROS__TORRENT_CLIENTS__RTORRENT_ARCHIVE__DEFAULT_LABEL='"cross-seed"'
-SPOROS__INJECTION__RECHECK__MAX_REMAINING_PERCENT='15.0'
-SPOROS__INJECTION__RECHECK__BELOW_THRESHOLD_ACTION='"inject_paused"'
-SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY_ENV='"INDEXER_API_KEY"'
-SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN_ENV='"SPOROS_NOTIFICATION_TOKEN"'
-```
-
-Arrays such as `paths.media_dirs` should be set in TOML. `default_tags` can be
-overridden as a comma-separated scalar environment value.
 
 ## Secrets
 
-Secret-bearing fields generally support three forms:
+Normal config values are TOML-only. Secret-bearing fields support three forms:
 
 - inline local-development value, such as `api_key`, `password`, or `token`
 - file path, such as `api_key_file`, `password_file`, or `token_file`
-- environment variable name, such as `api_key_env`, `password_env`, or
-  `token_env`
+- fixed environment variable derived from the config path
 
-Use file or environment-backed secrets for production. Do not place API keys in
-indexer URL query strings.
+Sporos does not read arbitrary env var names from config. When direct and file
+values are absent, it checks the fixed secret name formed by uppercasing the
+config path and separating path segments with double underscores:
+
+```bash
+SPOROS__SERVER__API_TOKEN
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD
+SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY
+SPOROS__INDEXERS__ARR__SONARR__MAIN__API_KEY
+SPOROS__INDEXERS__ARR__RADARR__MAIN__API_KEY
+SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN
+```
+
+Use file or fixed environment-backed secrets for production. Do not place API
+keys in indexer URL query strings.
 
 ## Scheduling And Announcements
 

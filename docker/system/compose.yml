@@ -23,8 +23,8 @@ services:
     ports:
       - "127.0.0.1:${SPOROS_SYSTEM_HTTP_PORT:-2468}:2468"
     environment:
-      SPOROS_API_TOKEN: replace-me-sporos-api-token
-      QBITTORRENT_PASSWORD: replace-me-qbittorrent-password
+      SPOROS__SERVER__API_TOKEN: replace-me-sporos-api-token
+      SPOROS__TORRENT_CLIENTS__QBITTORRENT__PASSWORD: replace-me-qbittorrent-password
     volumes:
       - ./config/sporos.toml.template:/app/config.toml:ro
       - ./fixtures:/system-fixtures:ro

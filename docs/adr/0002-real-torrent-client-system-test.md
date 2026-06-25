@@ -127,7 +127,7 @@ Sporos selected as source data. A path that exists only in the Sporos container
 is a test bug.
 
 rTorrent auth fields are not configured because Sporos currently rejects
-rTorrent `username`, `password`, `password_file`, and `password_env` settings.
+rTorrent `username`, `password`, and `password_file` settings.
 The XML-RPC endpoint is protected by the private test network.
 
 ## Harness Files
