@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+cargo fmt --check
+cargo build --workspace --locked
+cargo check --workspace --locked
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --locked

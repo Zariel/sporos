@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+image="${SPOROS_CI_IMAGE:-sporos-ci:test}"
+dockerfile="${SPOROS_CI_DOCKERFILE:-Dockerfile}"
+context="${SPOROS_CI_CONTEXT:-.}"
+
+DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build -t "$image" -f "$dockerfile" "$context"
+docker image inspect "$image" >/dev/null
+docker run --rm "$image" --help
+
+set +e
+docker run --rm "$image" not-a-command
+exit_code="$?"
+set -e
+if [ "$exit_code" -ne 2 ]; then
+  echo "expected invalid command to exit 2, got $exit_code" >&2
+  exit 1
+fi

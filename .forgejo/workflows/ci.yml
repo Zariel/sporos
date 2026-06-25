@@ -1,0 +1,157 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: https://code.forgejo.org/actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Restore cargo cache
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cargo gates
+        run: scripts/ci/cargo-gates
+
+  image:
+    needs:
+      - test
+    runs-on: docker
+    steps:
+      - name: Check out repository
+        uses: https://code.forgejo.org/actions/checkout@v6
+
+      - name: Build and smoke test image
+        run: scripts/ci/image-smoke
+
+  system-torrent-clients:
+    if: ${{ forgejo.event_name == 'workflow_dispatch' || forgejo.ref_type == 'tag' }}
+    needs:
+      - test
+    runs-on: docker
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: https://code.forgejo.org/actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Run real-client system test
+        env:
+          DOCKER_BUILDKIT: "1"
+          SPOROS_SYSTEM_RUN_ROOT: ${{ runner.temp }}/sporos-system
+        run: |
+          set -euo pipefail
+          mkdir -p "$SPOROS_SYSTEM_RUN_ROOT"
+          scripts/system-test torrent-clients
+
+      - name: Upload system diagnostics
+        if: failure()
+        uses: https://code.forgejo.org/actions/upload-artifact@v4
+        with:
+          name: system-torrent-client-diagnostics
+          path: ${{ runner.temp }}/sporos-system/*diagnostics*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  system-torrent-clients-compatibility:
+    if: ${{ forgejo.event_name == 'workflow_dispatch' || forgejo.event_name == 'schedule' }}
+    needs:
+      - test
+    runs-on: docker
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: https://code.forgejo.org/actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Run floating-client compatibility test
+        env:
+          DOCKER_BUILDKIT: "1"
+          SPOROS_SYSTEM_RUN_ROOT: ${{ runner.temp }}/sporos-system-compatibility
+          SPOROS_SYSTEM_QBITTORRENT_IMAGE: lscr.io/linuxserver/qbittorrent:latest
+          SPOROS_SYSTEM_RTORRENT_IMAGE: ghcr.io/crazy-max/rtorrent-rutorrent:latest
+        run: |
+          set -euo pipefail
+          mkdir -p "$SPOROS_SYSTEM_RUN_ROOT"
+          scripts/system-test torrent-clients
+
+      - name: Upload compatibility diagnostics
+        if: failure()
+        uses: https://code.forgejo.org/actions/upload-artifact@v4
+        with:
+          name: system-torrent-client-compatibility-diagnostics
+          path: ${{ runner.temp }}/sporos-system-compatibility/*diagnostics*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    if: ${{ forgejo.event_name == 'push' && forgejo.ref_type == 'tag' }}
+    needs:
+      - test
+      - image
+      - system-torrent-clients
+    runs-on: docker
+    steps:
+      - name: Check out repository
+        uses: https://code.forgejo.org/actions/checkout@v6
+
+      - name: Build and push image
+        env:
+          FORGEJO_REGISTRY_USER: ${{ vars.FORGEJO_REGISTRY_USER }}
+          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+          FORGEJO_REPOSITORY: ${{ forgejo.repository }}
+        run: scripts/ci/publish-forgejo-image "$FORGEJO_REF_NAME"
+
+  publish-latest:
+    if: ${{ forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main' }}
+    needs:
+      - test
+      - image
+    runs-on: docker
+    steps:
+      - name: Check out repository
+        uses: https://code.forgejo.org/actions/checkout@v6
+
+      - name: Build and push latest image
+        env:
+          FORGEJO_REGISTRY_USER: ${{ vars.FORGEJO_REGISTRY_USER }}
+          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+          FORGEJO_REPOSITORY: ${{ forgejo.repository }}
+        run: scripts/ci/publish-forgejo-image latest
