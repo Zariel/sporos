@@ -17,6 +17,7 @@ use reqwest::redirect::Policy;
 
 use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
 use crate::errors::TorrentClientError;
+use crate::runtime::backoff::{RetryDecision, RetryErrorKind, retry_transient_io};
 use crate::secrets::sanitize_url_for_logging;
 
 const RTORRENT_RESPONSE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -68,17 +69,19 @@ impl RtorrentClient {
     }
 
     pub async fn validate(&self) -> Result<(), TorrentClientError> {
-        self.call("download_list", Vec::new()).await.map(|_| ())
+        self.call_read("download_list", Vec::new())
+            .await
+            .map(|_| ())
     }
 
     pub async fn list_inventory(&self) -> Result<Vec<RtorrentDownload>, TorrentClientError> {
-        let response = self.call_text("download_list", Vec::new()).await?;
+        let response = self.call_text_read("download_list", Vec::new()).await?;
         let mut hash_chunks =
             DownloadHashChunks::new(&self.client_name, &response, RTORRENT_INVENTORY_CHUNK_SIZE);
         let mut downloads = Vec::new();
         while let Some(chunk) = hash_chunks.next_chunk()? {
             let response = self
-                .call("system.multicall", vec![inventory_multicall_param(&chunk)])
+                .call_read("system.multicall", vec![inventory_multicall_param(&chunk)])
                 .await?;
             downloads.extend(parse_inventory_response(
                 &self.client_name,
@@ -97,13 +100,13 @@ impl RtorrentClient {
         F: FnMut(Vec<RtorrentDownload>) -> Fut,
         Fut: Future<Output = Result<(), TorrentClientError>>,
     {
-        let response = self.call_text("download_list", Vec::new()).await?;
+        let response = self.call_text_read("download_list", Vec::new()).await?;
         let mut hash_chunks =
             DownloadHashChunks::new(&self.client_name, &response, RTORRENT_INVENTORY_CHUNK_SIZE);
         let mut total = 0usize;
         while let Some(chunk) = hash_chunks.next_chunk()? {
             let response = self
-                .call("system.multicall", vec![inventory_multicall_param(&chunk)])
+                .call_read("system.multicall", vec![inventory_multicall_param(&chunk)])
                 .await?;
             let downloads = parse_inventory_response(&self.client_name, &chunk, &response)?;
             let chunk_len = downloads.len();
@@ -129,7 +132,7 @@ impl RtorrentClient {
         let response = tokio::select! {
             biased;
             () = cancelled() => return Err(cancelled_error(&self.client_name)),
-            response = self.call_text("download_list", Vec::new()) => response?,
+            response = self.call_text_read("download_list", Vec::new()) => response?,
         };
         let mut hash_chunks =
             DownloadHashChunks::new(&self.client_name, &response, RTORRENT_INVENTORY_CHUNK_SIZE);
@@ -138,7 +141,7 @@ impl RtorrentClient {
             let response = tokio::select! {
                 biased;
                 () = cancelled() => return Err(cancelled_error(&self.client_name)),
-                response = self.call("system.multicall", vec![inventory_multicall_param(&chunk)]) => response?,
+                response = self.call_read("system.multicall", vec![inventory_multicall_param(&chunk)]) => response?,
             };
             let downloads = parse_inventory_response(&self.client_name, &chunk, &response)?;
             let chunk_len = downloads.len();
@@ -159,7 +162,7 @@ impl RtorrentClient {
         info_hash: &InfoHash,
     ) -> Result<Option<RtorrentDownload>, TorrentClientError> {
         let response = match self
-            .call(
+            .call_read(
                 "system.multicall",
                 vec![inventory_multicall_param(std::slice::from_ref(info_hash))],
             )
@@ -177,7 +180,7 @@ impl RtorrentClient {
         info_hash: &InfoHash,
     ) -> Result<Vec<TorrentFile>, TorrentClientError> {
         let response = self
-            .call(
+            .call_read(
                 "f.multicall",
                 vec![
                     XmlRpcValue::String(info_hash.as_str().to_owned()),
@@ -211,7 +214,7 @@ impl RtorrentClient {
         info_hash: &InfoHash,
     ) -> Result<Vec<RtorrentTracker>, TorrentClientError> {
         let response = self
-            .call(
+            .call_read(
                 "t.multicall",
                 vec![
                     XmlRpcValue::String(info_hash.as_str().to_owned()),
@@ -287,6 +290,28 @@ impl RtorrentClient {
     ) -> Result<XmlRpcValue, TorrentClientError> {
         let body = self.call_text(method, params).await?;
         parse_method_response(&self.client_name, &body)
+    }
+
+    async fn call_read(
+        &self,
+        method: &str,
+        params: Vec<XmlRpcValue>,
+    ) -> Result<XmlRpcValue, TorrentClientError> {
+        let body = self.call_text_read(method, params).await?;
+        parse_method_response(&self.client_name, &body)
+    }
+
+    async fn call_text_read(
+        &self,
+        method: &str,
+        params: Vec<XmlRpcValue>,
+    ) -> Result<String, TorrentClientError> {
+        retry_transient_io(
+            method,
+            |_attempt| async { self.call_text(method, params.clone()).await },
+            classify_rtorrent_read_error,
+        )
+        .await
     }
 
     async fn call_text(
@@ -1071,6 +1096,53 @@ fn unavailable(client: &str, message: String) -> TorrentClientError {
     }
 }
 
+fn classify_rtorrent_read_error(error: &TorrentClientError) -> RetryDecision {
+    match error {
+        TorrentClientError::Unavailable { message, .. } if is_transient_http_error(message) => {
+            RetryDecision::retry(RetryErrorKind::TransientNetwork)
+        }
+        TorrentClientError::Unavailable { message, .. } if is_transport_error(message) => {
+            RetryDecision::retry(RetryErrorKind::TransientNetwork)
+        }
+        TorrentClientError::Unavailable { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::BadRequest)
+        }
+        TorrentClientError::Unauthorized { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::Authentication)
+        }
+        TorrentClientError::Cancelled { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::Cancelled)
+        }
+        TorrentClientError::BadResponse { .. } | TorrentClientError::ApiChanged { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
+        }
+        TorrentClientError::UnsupportedCapability { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::Unsupported)
+        }
+    }
+}
+
+fn is_transient_http_error(message: &str) -> bool {
+    message.starts_with("HTTP 408")
+        || message.starts_with("HTTP 429")
+        || message.starts_with("HTTP 502")
+        || message.starts_with("HTTP 503")
+        || message.starts_with("HTTP 504")
+}
+
+fn is_transport_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("error sending request")
+        || lower.contains("error decoding response body")
+        || lower.contains("request timed out")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("connection closed")
+        || lower.contains("connection aborted")
+        || lower.contains("broken pipe")
+        || lower.contains("timed out")
+}
+
 fn request_error_message(error: reqwest::Error) -> String {
     let url = error
         .url()
@@ -1315,6 +1387,29 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn client_does_not_retry_transient_injection_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let endpoint = spawn_rtorrent_server(move |_request| {
+            let attempts = server_attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+            }
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        let error = client
+            .inject(b"torrent-bytes", None, "sporos", false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TorrentClientError::Unavailable { .. }));
+        assert_eq!(1, attempts.load(Ordering::Relaxed));
+    }
+
     fn assert_xml_order(xml: &str, needles: &[&str]) {
         assert!(
             xml_contains_order(xml, needles),
@@ -1524,6 +1619,100 @@ mod tests {
         let hash = InfoHash::new(SHA1).unwrap();
 
         assert!(client.download_info(&hash).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn client_retries_transient_inventory_file_reads() {
+        let file_attempts = Arc::new(AtomicUsize::new(0));
+        let server_file_attempts = file_attempts.clone();
+        let endpoint = spawn_rtorrent_server(move |request| {
+            let file_attempts = server_file_attempts.clone();
+            async move {
+                let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                if body.contains("<methodName>f.multicall</methodName>") {
+                    if file_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                        return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again").into_response();
+                    }
+                    return (
+                        AxumStatusCode::OK,
+                        xml_response(
+                            r#"<array><data><value><array><data>
+                              <value><string>Show/Episode.mkv</string></value>
+                              <value><i8>123</i8></value>
+                            </data></array></value></data></array>"#,
+                        ),
+                    )
+                        .into_response();
+                }
+                (AxumStatusCode::BAD_REQUEST, body).into_response()
+            }
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+        let hash = InfoHash::new(SHA1).unwrap();
+
+        let files = client.fetch_files(&hash).await.unwrap();
+
+        assert_eq!(PathBuf::from("Show/Episode.mkv"), files[0].relative_path);
+        assert_eq!(2, file_attempts.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn client_does_not_retry_terminal_inventory_http_statuses() {
+        let download_list_attempts = Arc::new(AtomicUsize::new(0));
+        let server_download_list_attempts = download_list_attempts.clone();
+        let endpoint = spawn_rtorrent_server(move |_request| {
+            let attempts = server_download_list_attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                (AxumStatusCode::BAD_REQUEST, "bad request").into_response()
+            }
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        let error = client.list_inventory().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            TorrentClientError::Unavailable { message, .. } if message == "HTTP 400 Bad Request"
+        ));
+        assert_eq!(1, download_list_attempts.load(Ordering::Relaxed));
+
+        let multicall_attempts = Arc::new(AtomicUsize::new(0));
+        let server_multicall_attempts = multicall_attempts.clone();
+        let endpoint = spawn_rtorrent_server(move |request| {
+            let attempts = server_multicall_attempts.clone();
+            async move {
+                let body = to_bytes(request.into_body(), 65_536).await.unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                if body.contains("<methodName>download_list</methodName>") {
+                    return (
+                        AxumStatusCode::OK,
+                        xml_response(
+                            r#"<array><data><value><string>0123456789abcdef0123456789abcdef01234567</string></value></data></array>"#,
+                        ),
+                    )
+                        .into_response();
+                }
+                if body.contains("<methodName>system.multicall</methodName>") {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    return (AxumStatusCode::NOT_FOUND, "missing method").into_response();
+                }
+                (AxumStatusCode::BAD_REQUEST, body).into_response()
+            }
+        })
+        .await;
+        let client = RtorrentClient::new("rtorrent", endpoint, Duration::from_secs(5));
+
+        let error = client.list_inventory().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            TorrentClientError::Unavailable { message, .. } if message == "HTTP 404 Not Found"
+        ));
+        assert_eq!(1, multicall_attempts.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

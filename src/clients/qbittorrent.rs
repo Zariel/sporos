@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::domain::{ByteSize, DisplayName, FileIndex, InfoHash, TorrentFile};
 use crate::errors::TorrentClientError;
+use crate::runtime::backoff::{RetryDecision, RetryErrorKind, retry_transient_io};
 use crate::secrets::sanitize_url_for_logging;
 
 const MIN_QBIT_VERSION: QbitVersion = QbitVersion {
@@ -413,6 +414,15 @@ impl QbittorrentClient {
     }
 
     async fn get_text(&self, path: &str) -> Result<String, TorrentClientError> {
+        retry_transient_io(
+            path,
+            |_attempt| async { self.get_text_once(path).await },
+            classify_qbit_read_error,
+        )
+        .await
+    }
+
+    async fn get_text_once(&self, path: &str) -> Result<String, TorrentClientError> {
         let response = self
             .send_with_session(|cookie| {
                 let mut request = self.client.get(self.url(path)).timeout(self.timeout);
@@ -794,6 +804,53 @@ fn is_http_conflict(error: &TorrentClientError) -> bool {
         error,
         TorrentClientError::Unavailable { message, .. } if message == "HTTP 409 Conflict"
     )
+}
+
+fn classify_qbit_read_error(error: &TorrentClientError) -> RetryDecision {
+    match error {
+        TorrentClientError::Unavailable { message, .. } if is_transient_http_error(message) => {
+            RetryDecision::retry(RetryErrorKind::TransientNetwork)
+        }
+        TorrentClientError::Unavailable { message, .. } if is_transport_error(message) => {
+            RetryDecision::retry(RetryErrorKind::TransientNetwork)
+        }
+        TorrentClientError::Unavailable { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::BadRequest)
+        }
+        TorrentClientError::Unauthorized { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::Authentication)
+        }
+        TorrentClientError::Cancelled { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::Cancelled)
+        }
+        TorrentClientError::BadResponse { .. } | TorrentClientError::ApiChanged { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
+        }
+        TorrentClientError::UnsupportedCapability { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::Unsupported)
+        }
+    }
+}
+
+fn is_transient_http_error(message: &str) -> bool {
+    message.starts_with("HTTP 408")
+        || message.starts_with("HTTP 429")
+        || message.starts_with("HTTP 502")
+        || message.starts_with("HTTP 503")
+        || message.starts_with("HTTP 504")
+}
+
+fn is_transport_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("error sending request")
+        || lower.contains("error decoding response body")
+        || lower.contains("request timed out")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("connection closed")
+        || lower.contains("connection aborted")
+        || lower.contains("broken pipe")
+        || lower.contains("timed out")
 }
 
 async fn read_client_text(
@@ -1340,6 +1397,106 @@ mod tests {
         assert_eq!("Example", inventory[0].name);
         assert_eq!(PathBuf::from("Example/file.mkv"), files[0].relative_path);
         assert_eq!("https://tracker.example/announce", trackers[0].url);
+    }
+
+    #[tokio::test]
+    async fn client_retries_transient_inventory_and_file_reads() {
+        let inventory_attempts = Arc::new(AtomicUsize::new(0));
+        let file_attempts = Arc::new(AtomicUsize::new(0));
+        let server_inventory_attempts = inventory_attempts.clone();
+        let server_file_attempts = file_attempts.clone();
+        let endpoint = spawn_qbit_server(move |request| {
+            let inventory_attempts = server_inventory_attempts.clone();
+            let file_attempts = server_file_attempts.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                match path.as_str() {
+                    "/api/v2/auth/login" => {
+                        response_with_cookie(AxumStatusCode::OK, "Ok.", "SID=ok")
+                    }
+                    "/api/v2/torrents/info" => {
+                        if inventory_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+                                .into_response();
+                        }
+                        (
+                            AxumStatusCode::OK,
+                            r#"[{"hash":"0123456789abcdef0123456789abcdef01234567","name":"Example","amount_left":0,"progress":1.0}]"#,
+                        )
+                            .into_response()
+                    }
+                    "/api/v2/torrents/files" => {
+                        if file_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return (AxumStatusCode::SERVICE_UNAVAILABLE, "try again")
+                                .into_response();
+                        }
+                        (
+                            AxumStatusCode::OK,
+                            r#"[{"name":"Example/file.mkv","size":42,"progress":1.0,"priority":1}]"#,
+                        )
+                            .into_response()
+                    }
+                    _ => (AxumStatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+        let hash = InfoHash::new(SHA1).unwrap();
+
+        let inventory = client.list_inventory().await.unwrap();
+        let files = client.fetch_files(&hash).await.unwrap();
+
+        assert_eq!("Example", inventory[0].name);
+        assert_eq!(PathBuf::from("Example/file.mkv"), files[0].relative_path);
+        assert_eq!(2, inventory_attempts.load(Ordering::Relaxed));
+        assert_eq!(2, file_attempts.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn client_does_not_retry_terminal_inventory_http_statuses() {
+        let inventory_attempts = Arc::new(AtomicUsize::new(0));
+        let file_attempts = Arc::new(AtomicUsize::new(0));
+        let server_inventory_attempts = inventory_attempts.clone();
+        let server_file_attempts = file_attempts.clone();
+        let endpoint = spawn_qbit_server(move |request| {
+            let inventory_attempts = server_inventory_attempts.clone();
+            let file_attempts = server_file_attempts.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                match path.as_str() {
+                    "/api/v2/auth/login" => {
+                        response_with_cookie(AxumStatusCode::OK, "Ok.", "SID=ok")
+                    }
+                    "/api/v2/torrents/info" => {
+                        inventory_attempts.fetch_add(1, Ordering::Relaxed);
+                        (AxumStatusCode::BAD_REQUEST, "bad info").into_response()
+                    }
+                    "/api/v2/torrents/files" => {
+                        file_attempts.fetch_add(1, Ordering::Relaxed);
+                        (AxumStatusCode::NOT_FOUND, "missing files").into_response()
+                    }
+                    _ => (AxumStatusCode::NOT_FOUND, path).into_response(),
+                }
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new("qbit", endpoint, None, None, Duration::from_secs(5));
+        let hash = InfoHash::new(SHA1).unwrap();
+
+        let inventory_error = client.list_inventory().await.unwrap_err();
+        let file_error = client.fetch_files(&hash).await.unwrap_err();
+
+        assert!(matches!(
+            inventory_error,
+            TorrentClientError::Unavailable { message, .. } if message == "HTTP 400 Bad Request"
+        ));
+        assert!(matches!(
+            file_error,
+            TorrentClientError::Unavailable { message, .. } if message == "HTTP 404 Not Found"
+        ));
+        assert_eq!(1, inventory_attempts.load(Ordering::Relaxed));
+        assert_eq!(1, file_attempts.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
