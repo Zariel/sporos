@@ -1971,6 +1971,46 @@ struct SavedTorrentPathScan {
     cancelled: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Default)]
+struct SavedTorrentScanProgress {
+    #[cfg(test)]
+    send_attempts: Arc<AtomicUsize>,
+    #[cfg(test)]
+    send_attempted: Arc<tokio::sync::Notify>,
+}
+
+impl SavedTorrentScanProgress {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self {
+            send_attempts: Arc::new(AtomicUsize::new(0)),
+            send_attempted: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_send_attempts(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if self.send_attempts.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                self.send_attempted.notified().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expected} saved torrent scan sends"));
+    }
+
+    fn before_send(&self) {
+        #[cfg(test)]
+        {
+            self.send_attempts.fetch_add(1, Ordering::SeqCst);
+            self.send_attempted.notify_waiters();
+        }
+    }
+}
+
 impl SavedTorrentPathScan {
     #[cfg(test)]
     async fn next_path(&mut self) -> Result<Option<PathBuf>, InjectionWorkerError> {
@@ -2035,6 +2075,14 @@ impl SavedTorrentPathScan {
 }
 
 fn saved_torrent_path_scan(directory: &Path, limit: usize) -> SavedTorrentPathScan {
+    saved_torrent_path_scan_with_progress(directory, limit, None)
+}
+
+fn saved_torrent_path_scan_with_progress(
+    directory: &Path,
+    limit: usize,
+    progress: Option<SavedTorrentScanProgress>,
+) -> SavedTorrentPathScan {
     let directory = directory.to_path_buf();
     let blocking_directory = directory.clone();
     let (sender, receiver) = mpsc::channel(SAVED_TORRENT_SCAN_BATCH);
@@ -2077,7 +2125,13 @@ fn saved_torrent_path_scan(directory: &Path, limit: usize) -> SavedTorrentPathSc
             if is_direct_saved_torrent_file(&blocking_directory, &path) {
                 batch.push(path);
                 if batch.len() >= SAVED_TORRENT_SCAN_BATCH {
-                    if !send_saved_torrent_scan_batch(&sender, &mut batch, limit, &mut sent) {
+                    if !send_saved_torrent_scan_batch(
+                        &sender,
+                        &mut batch,
+                        limit,
+                        &mut sent,
+                        progress.as_ref(),
+                    ) {
                         return;
                     }
                     if blocking_cancelled.load(Ordering::Relaxed) {
@@ -2089,7 +2143,7 @@ fn saved_torrent_path_scan(directory: &Path, limit: usize) -> SavedTorrentPathSc
                 }
             }
         }
-        send_saved_torrent_scan_batch(&sender, &mut batch, limit, &mut sent);
+        send_saved_torrent_scan_batch(&sender, &mut batch, limit, &mut sent, progress.as_ref());
     });
 
     SavedTorrentPathScan {
@@ -2105,11 +2159,15 @@ fn send_saved_torrent_scan_batch(
     batch: &mut Vec<PathBuf>,
     limit: usize,
     sent: &mut usize,
+    progress: Option<&SavedTorrentScanProgress>,
 ) -> bool {
     batch.sort();
     for path in batch.drain(..) {
         if *sent >= limit {
             return true;
+        }
+        if let Some(progress) = progress {
+            progress.before_send();
         }
         if sender.blocking_send(Ok(path)).is_err() {
             return false;
@@ -4838,10 +4896,17 @@ mod tests {
                 MediaType::Movie,
             );
         }
-        let mut scan = saved_torrent_path_scan(&output_dir, SAVED_TORRENT_SCAN_BATCH * 4);
+        let progress = SavedTorrentScanProgress::new();
+        let mut scan = saved_torrent_path_scan_with_progress(
+            &output_dir,
+            SAVED_TORRENT_SCAN_BATCH * 4,
+            Some(progress.clone()),
+        );
 
         assert!(scan.next_path().await.unwrap().is_some());
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        progress
+            .wait_for_send_attempts(SAVED_TORRENT_SCAN_BATCH + 2)
+            .await;
         scan.cancel();
 
         tokio::time::timeout(Duration::from_secs(1), scan.finish())
