@@ -25,7 +25,7 @@ preparation, torrent-client injection, and operator visibility.
   retained outcomes, stale lease recovery, and scheduled cleanup.
 - Operator visibility: `/livez`, `/readyz`, `/v1/status`, Prometheus metrics,
   dependency health, queue state, and explicit cleanup/indexer-cap jobs.
-- Production configuration: TOML config, fixed-name environment secrets,
+- Production configuration: TOML config, `SPOROS__` environment overrides,
   file-backed secrets, bounded queues, and redacted logs/metrics.
 
 ## Quick Start
@@ -44,7 +44,7 @@ The default config path is `/app/config.toml`. Use
 
 This is a compact starting point for qBittorrent plus Prowlarr-backed indexer
 import. See [Configuration](docs/configuration.md) for the full config guide,
-all supported fields, fixed environment secret names, and secret handling.
+all supported fields, environment overrides, and secret handling.
 
 ```toml
 [paths]

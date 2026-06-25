@@ -9,7 +9,7 @@ sporos serve --config /app/config.toml
 ```
 
 Use `sporos print-config-schema` to print the complete supported config shape.
-`check-config` parses the file, resolves fixed-name environment secrets,
+`check-config` parses the file, applies `SPOROS__` environment overrides,
 validates typed settings, creates required local state directories, and probes
 writable state paths.
 
@@ -343,30 +343,35 @@ url = "http://sonarr:8989"
 url = "http://radarr:7878"
 ```
 
-## Secrets
+## Environment Overrides And Secrets
 
-Normal config values are TOML-only. Secret-bearing fields support three forms:
-
-- inline local-development value, such as `api_key`, `password`, or `token`
-- file path, such as `api_key_file`, `password_file`, or `token_file`
-- fixed environment variable derived from the config path
-
-Sporos does not read arbitrary env var names from config. When direct and file
-values are absent, it checks the fixed secret name formed by uppercasing the
-config path and separating path segments with double underscores:
+Any config value can be supplied by TOML or by a `SPOROS__` environment
+override. Environment names are formed from the config path by uppercasing each
+path segment and joining segments with double underscores:
 
 ```bash
-SPOROS__SERVER__API_TOKEN
-SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD
-SPOROS__INDEXERS__TORZNAB__MAIN__API_KEY
-SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY
-SPOROS__INDEXERS__ARR__SONARR__MAIN__API_KEY
-SPOROS__INDEXERS__ARR__RADARR__MAIN__API_KEY
-SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN
+SPOROS__SERVER__BIND=0.0.0.0:2468
+SPOROS__PATHS__DATABASE=/app/state/db/sporos.db
+SPOROS__PATHS__MEDIA_DIRS=/media/tv,/media/movies
+SPOROS__RUNTIME__WORKER_THREADS=4
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__URL=http://qbittorrent:8080
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD=...
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__DEFAULT_TAGS=cross-seed,sporos
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY=...
+SPOROS__INJECTION__LINK_DIRS=/links/fast,/links/slow
 ```
 
-Use file or fixed environment-backed secrets for production. Do not place API
-keys in indexer URL query strings.
+Environment overrides are scalar values. Known list fields use comma-separated
+values: `paths.media_dirs`, `torrent_clients.<name>.default_tags`,
+`indexers.prowlarr.<name>.tags`, and `injection.link_dirs`. Secret value fields,
+such as `api_token`, `api_key`, `password`, and `token`, are interpreted as raw
+strings.
+
+Secret-bearing fields also support file paths, such as `api_key_file`,
+`password_file`, or `token_file`. Configure only one source for a secret: direct
+value, file path, or environment override. Sporos does not read arbitrary env var
+names from config, and `*_env` config fields are rejected. Do not place API keys
+in indexer URL query strings.
 
 ## Scheduling And Announcements
 

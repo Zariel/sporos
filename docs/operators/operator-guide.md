@@ -1,7 +1,7 @@
 # Sporos Operator Guide
 
 This guide covers the supported operator surface: TOML configuration,
-fixed-name environment secrets, local state paths, HTTP probes, metrics, and
+`SPOROS__` environment overrides, local state paths, HTTP probes, metrics, and
 day-two operation.
 
 ## Commands
@@ -226,8 +226,8 @@ outcome, which is useful when external automation should handle low-completion
 candidates outside Sporos.
 
 Supported indexers are Torznab-compatible endpoints. Put API keys in
-`api_key_file`, fixed path-derived environment secrets, or development-only
-`api_key`; do not put API keys in the indexer URL query string.
+`api_key_file`, `SPOROS__...__API_KEY` environment overrides, or
+development-only `api_key`; do not put API keys in the indexer URL query string.
 
 ## Prowlarr Discovery
 
@@ -253,10 +253,11 @@ query parameter. Sporos contacts `/api/v1/indexer`, reads tag labels from
 `/api/v1/tag` when tag names need resolving, and builds imported Torznab proxy
 URLs through the configured Prowlarr source.
 
-Prowlarr API keys support `api_key_file`, the fixed path-derived environment
-secret, and local-development `api_key`, with the same one-source-only rule as
-direct Torznab keys. The container examples use environment-backed secrets for
-Kubernetes; for `[indexers.prowlarr.main]`, provide:
+Prowlarr API keys support `api_key_file`, the matching `SPOROS__...__API_KEY`
+environment override, and local-development `api_key`, with the same
+one-source-only rule as direct Torznab keys. The container examples use
+environment-backed secrets for Kubernetes; for `[indexers.prowlarr.main]`,
+provide:
 
 ```bash
 SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY
@@ -330,28 +331,38 @@ Operators can queue an immediate supported job run with
 `POST /v1/jobs/cleanup/runs`. A posted run updates durable job state and should
 be treated as a mutating operation.
 
-## Secrets
+## Environment Overrides And Secrets
 
-Normal config values are TOML-only. HTTP workflow authentication uses
-`server.api_token`, `server.api_token_file`, or the fixed
-`SPOROS__SERVER__API_TOKEN` environment variable. A non-loopback bind requires
-one of these token sources. Callers must send it as
+Any config value can be supplied by TOML or by a `SPOROS__` environment
+override. Environment names are formed from the config path by uppercasing each
+path segment and joining segments with double underscores. For example:
+
+```bash
+SPOROS__SERVER__BIND=0.0.0.0:2468
+SPOROS__PATHS__DATABASE=/app/state/db/sporos.db
+SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD=...
+SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY=...
+SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN=...
+```
+
+HTTP workflow authentication uses `server.api_token`,
+`server.api_token_file`, or `SPOROS__SERVER__API_TOKEN`. A non-loopback bind
+requires one of these token sources. Callers must send it as
 `Authorization: Bearer <token>` when using mutating workflow endpoints.
 
-Torrent client passwords support `password`, `password_file`, and fixed
-environment secrets such as `SPOROS__TORRENT_CLIENTS__QBIT_MAIN__PASSWORD`.
-Torznab and Prowlarr indexer keys support `api_key`, `api_key_file`, and fixed
-environment secrets such as `SPOROS__INDEXERS__PROWLARR__MAIN__API_KEY`.
-Notification endpoints support `token`, `token_file`, and fixed environment
-secrets such as `SPOROS__NOTIFICATIONS__ENDPOINTS__OPS__TOKEN`; configure no
-endpoints to keep notification delivery disabled.
+Known list fields use comma-separated environment values:
+`paths.media_dirs`, `torrent_clients.<name>.default_tags`,
+`indexers.prowlarr.<name>.tags`, and `injection.link_dirs`. Secret fields such
+as `api_token`, `password`, `api_key`, and `token` are interpreted as raw
+strings. Configure only one source for a secret: direct value, file path, or
+environment override. Sporos does not read arbitrary env var names from config,
+and `*_env` config fields are rejected.
 
-Use fixed environment-backed secrets in Kubernetes. File-backed secrets are
-still supported when an operator intentionally mounts secret files. Inline
-`password`, `api_key`, and notification `token` values are for local
-development. Secret wrappers redact debug and display output, and operator
-endpoints intentionally avoid exposing request cookies, API keys, passkeys, and
-secret-bearing URLs.
+Use environment-backed secrets in Kubernetes. File-backed secrets are still
+supported when an operator intentionally mounts secret files. Inline `password`,
+`api_key`, and notification `token` values are for local development. Secret
+wrappers redact debug and display output, and operator endpoints intentionally
+avoid exposing request cookies, API keys, passkeys, and secret-bearing URLs.
 Prowlarr API keys and the keys attached to imported Prowlarr indexers are
 redacted from logs, metrics, status, support output, and validation errors.
 
