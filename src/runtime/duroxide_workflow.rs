@@ -15,6 +15,7 @@ use crate::announce::{
     AnnounceQueueConfig, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
 use crate::domain::{DependencyKind, DependencyName, JobName};
+use crate::errors::DatabaseError;
 use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshSummary, InventoryRefreshWorker,
     record_inventory_refresh_health, scan_failure_reason,
@@ -26,6 +27,10 @@ use crate::persistence::repository::{
 use crate::runtime::announce_worker::{
     AnnounceWorkOutcome, AnnounceWorker, retry_database_call, unix_time_ms,
 };
+use crate::runtime::backoff::{
+    RetryDecision, RetryErrorKind, RetryOutcome, TRANSIENT_IO_RETRY_MAX_ATTEMPTS,
+    classify_database_error, retry_with_classification, transient_io_retry_policy,
+};
 use crate::runtime::daemon::{
     AnnounceInventoryRefreshMode, AnnounceProcessor, execute_scheduled_job,
     process_announce_work_with_processor_mode,
@@ -33,7 +38,7 @@ use crate::runtime::daemon::{
 use crate::runtime::injection_worker::InjectionWorker;
 use crate::runtime::scheduler::{
     CLIENT_INVENTORY_JOB_NAME, MEDIA_INVENTORY_JOB_NAME, PersistedScheduler,
-    ScheduledJobClaimOutcome,
+    ScheduledJobClaimOutcome, SchedulerError,
 };
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 use crate::runtime::workflow_contracts::{
@@ -73,6 +78,7 @@ pub struct DuroxideWorkflowRuntime {
     inventory_completion_events: InventoryCompletionEventBridge,
     scheduled_job_state: Option<ScheduledJobStateHandle>,
     scheduled_job_scheduler: Option<PersistedScheduler>,
+    scheduled_job_shutdown: Option<ShutdownSignal>,
 }
 
 impl DuroxideWorkflowRuntime {
@@ -141,6 +147,10 @@ impl DuroxideWorkflowRuntime {
             .as_ref()
             .and_then(|activities| activities.scheduled_jobs.as_ref())
             .map(|activities| activities.scheduler.clone());
+        let scheduled_job_shutdown = activities
+            .as_ref()
+            .and_then(|activities| activities.scheduled_jobs.as_ref())
+            .map(|activities| activities.shutdown.clone());
         let active_inventory_refreshes = Arc::new(Mutex::new(BTreeSet::new()));
         let inventory_completion_events =
             InventoryCompletionEventBridge::new(Arc::clone(&store), repository.clone());
@@ -175,6 +185,7 @@ impl DuroxideWorkflowRuntime {
             inventory_completion_events,
             scheduled_job_state,
             scheduled_job_scheduler,
+            scheduled_job_shutdown,
         };
         if let Err(error) = runtime
             .inventory_completion_events
@@ -208,6 +219,7 @@ impl DuroxideWorkflowRuntime {
             inventory_completion_events: self.inventory_completion_events.clone(),
             scheduled_job_state: None,
             scheduled_job_scheduler: self.scheduled_job_scheduler.clone(),
+            scheduled_job_shutdown: self.scheduled_job_shutdown.clone(),
         }
     }
 
@@ -218,13 +230,24 @@ impl DuroxideWorkflowRuntime {
         requested_at_ms: i64,
     ) -> Result<(), DuroxideWorkflowRuntimeError> {
         let claimed_scheduled_at_ms = if let Some(scheduler) = &self.scheduled_job_scheduler {
-            match scheduler
-                .claim_manual_run(job_name, requested_at_ms, forced)
-                .await
-                .map_err(|error| DuroxideWorkflowRuntimeError::StartSupervisor {
-                    instance_id: job_name.as_str().to_owned(),
-                    message: error.to_string(),
-                })? {
+            match retry_scheduler_call(
+                "claim manual scheduled job run",
+                self.scheduled_job_shutdown.as_ref(),
+                || {
+                    let scheduler = scheduler.clone();
+                    let job_name = job_name.clone();
+                    async move {
+                        scheduler
+                            .claim_manual_run(&job_name, requested_at_ms, forced)
+                            .await
+                    }
+                },
+            )
+            .await
+            .map_err(|message| DuroxideWorkflowRuntimeError::StartSupervisor {
+                instance_id: job_name.as_str().to_owned(),
+                message,
+            })? {
                 ScheduledJobClaimOutcome::Claimed => Some(requested_at_ms),
                 ScheduledJobClaimOutcome::Coalesced
                 | ScheduledJobClaimOutcome::BackingOff { .. } => return Ok(()),
@@ -253,13 +276,20 @@ impl DuroxideWorkflowRuntime {
         if enqueue_result.is_err()
             && claimed_scheduled_at_ms.is_some()
             && let Some(scheduler) = &self.scheduled_job_scheduler
-            && let Err(error) = scheduler
-                .complete_failure(
-                    job_name,
-                    unix_time_ms(),
-                    "scheduled job trigger enqueue failed",
-                )
-                .await
+            && let Err(error) = retry_scheduler_call("complete scheduled job failure", None, || {
+                let scheduler = scheduler.clone();
+                let job_name = job_name.clone();
+                async move {
+                    scheduler
+                        .complete_failure(
+                            &job_name,
+                            unix_time_ms(),
+                            "scheduled job trigger enqueue failed",
+                        )
+                        .await
+                }
+            })
+            .await
         {
             tracing::warn!(
                 job_name = %job_name,
@@ -2400,15 +2430,26 @@ async fn run_scheduled_job_claim_activity(
 ) -> Result<ScheduledJobClaimActivityOutput, String> {
     let job_name = JobName::new(&input.job_name).map_err(|error| error.to_string())?;
     if let Some(manual) = input.manual {
-        let outcome = activities
-            .scheduler
-            .claim_manual_run(&job_name, manual.requested_at_ms, manual.forced)
-            .await
-            .map_err(|error| error.to_string())?;
+        let requested_at_ms = manual.requested_at_ms;
+        let forced = manual.forced;
+        let outcome = retry_scheduler_call(
+            "claim manual scheduled job run",
+            Some(&activities.shutdown),
+            || {
+                let scheduler = activities.scheduler.clone();
+                let job_name = job_name.clone();
+                async move {
+                    scheduler
+                        .claim_manual_run(&job_name, requested_at_ms, forced)
+                        .await
+                }
+            },
+        )
+        .await?;
         return Ok(match outcome {
             ScheduledJobClaimOutcome::Claimed => ScheduledJobClaimActivityOutput {
                 job_name: input.job_name,
-                scheduled_at_ms: Some(manual.requested_at_ms),
+                scheduled_at_ms: Some(requested_at_ms),
                 next_run_at_ms: None,
                 coalesced: false,
                 backing_off: false,
@@ -2432,20 +2473,30 @@ async fn run_scheduled_job_claim_activity(
         });
     }
 
-    let claimed = activities
-        .scheduler
-        .claim_due_run(&job_name, input.now_ms)
-        .await
-        .map_err(|error| error.to_string())?;
+    let claimed = retry_scheduler_call(
+        "claim due scheduled job run",
+        Some(&activities.shutdown),
+        || {
+            let scheduler = activities.scheduler.clone();
+            let job_name = job_name.clone();
+            async move { scheduler.claim_due_run(&job_name, input.now_ms).await }
+        },
+    )
+    .await?;
     let scheduled_at_ms = claimed.map(|run| run.scheduled_at_ms);
     let next_run_at_ms = if scheduled_at_ms.is_some() {
         None
     } else {
-        activities
-            .scheduler
-            .next_run_at(&job_name)
-            .await
-            .map_err(|error| error.to_string())?
+        retry_scheduler_call(
+            "read next scheduled job run",
+            Some(&activities.shutdown),
+            || {
+                let scheduler = activities.scheduler.clone();
+                let job_name = job_name.clone();
+                async move { scheduler.next_run_at(&job_name).await }
+            },
+        )
+        .await?
     };
     Ok(ScheduledJobClaimActivityOutput {
         job_name: input.job_name,
@@ -2463,37 +2514,91 @@ async fn run_scheduled_job_complete_activity(
 ) -> Result<ScheduledJobRunActivityOutput, String> {
     let job_name = JobName::new(&input.job_name).map_err(|error| error.to_string())?;
     if activities.shutdown.state().phase != ShutdownPhase::Running {
-        activities
-            .scheduler
-            .complete_shutdown(&job_name, input.finished_at_ms)
-            .await
-            .map_err(|error| error.to_string())?;
+        retry_scheduler_call("complete scheduled job shutdown", None, || {
+            let scheduler = activities.scheduler.clone();
+            let job_name = job_name.clone();
+            async move {
+                scheduler
+                    .complete_shutdown(&job_name, input.finished_at_ms)
+                    .await
+            }
+        })
+        .await?;
         return Ok(ScheduledJobRunActivityOutput {
             succeeded: false,
             error: Some("scheduler is shutting down".to_owned()),
         });
     }
     if input.succeeded {
-        activities
-            .scheduler
-            .complete_success(&job_name, input.finished_at_ms)
-            .await
-            .map_err(|error| error.to_string())?;
+        retry_scheduler_call("complete scheduled job success", None, || {
+            let scheduler = activities.scheduler.clone();
+            let job_name = job_name.clone();
+            async move {
+                scheduler
+                    .complete_success(&job_name, input.finished_at_ms)
+                    .await
+            }
+        })
+        .await?;
     } else {
-        activities
-            .scheduler
-            .complete_failure(
-                &job_name,
-                input.finished_at_ms,
-                input.error.as_deref().unwrap_or("scheduled job failed"),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        retry_scheduler_call("complete scheduled job failure", None, || {
+            let scheduler = activities.scheduler.clone();
+            let job_name = job_name.clone();
+            let error = input.error.clone();
+            async move {
+                scheduler
+                    .complete_failure(
+                        &job_name,
+                        input.finished_at_ms,
+                        error.as_deref().unwrap_or("scheduled job failed"),
+                    )
+                    .await
+            }
+        })
+        .await?;
     }
     Ok(ScheduledJobRunActivityOutput {
         succeeded: input.succeeded,
         error: input.error,
     })
+}
+
+async fn retry_scheduler_call<T, F, Fut>(
+    operation: &'static str,
+    shutdown: Option<&ShutdownSignal>,
+    mut call: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SchedulerError>>,
+{
+    match retry_with_classification(
+        TRANSIENT_IO_RETRY_MAX_ATTEMPTS,
+        transient_io_retry_policy(),
+        operation,
+        shutdown,
+        |_attempt| call(),
+        classify_scheduler_error,
+    )
+    .await
+    {
+        RetryOutcome::Completed(result) => result.map_err(|error| error.to_string()),
+        RetryOutcome::Shutdown => Err("scheduler is shutting down".to_owned()),
+        RetryOutcome::Exhausted => Err(DatabaseError::Busy {
+            operation: operation.to_owned(),
+            retry_after_ms: None,
+        }
+        .to_string()),
+    }
+}
+
+fn classify_scheduler_error(error: &SchedulerError) -> RetryDecision {
+    match error {
+        SchedulerError::Database { source } => classify_database_error(source),
+        SchedulerError::InvalidConfig { .. } | SchedulerError::UnknownJob { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::FatalLocal)
+        }
+    }
 }
 
 async fn run_scheduled_job_activity(
@@ -3483,7 +3588,8 @@ fn stable_hash_hex(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use duroxide::runtime::OrchestrationStatus;
@@ -3606,6 +3712,107 @@ mod tests {
         wait_for_orchestration_running(&runtime.client(), cleanup_id.as_str()).await;
 
         runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_job_retry_retries_transient_database_failures_before_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_call = Arc::clone(&attempts);
+
+        let result = retry_scheduler_call("test scheduled retry", None, move || {
+            let attempts = Arc::clone(&attempts_for_call);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(SchedulerError::Database {
+                        source: DatabaseError::Busy {
+                            operation: "test scheduled retry".to_owned(),
+                            retry_after_ms: Some(1),
+                        },
+                    })
+                } else {
+                    Ok("claimed")
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!("claimed", result);
+        assert_eq!(2, attempts.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn scheduled_job_retry_retries_completion_write_before_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_call = Arc::clone(&attempts);
+
+        retry_scheduler_call("complete scheduled job failure", None, move || {
+            let attempts = Arc::clone(&attempts_for_call);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(SchedulerError::Database {
+                        source: DatabaseError::Unavailable {
+                            operation: "complete scheduled job failure".to_owned(),
+                            message: "pool closed".to_owned(),
+                        },
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(2, attempts.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn scheduled_job_retry_does_not_retry_terminal_scheduler_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_call = Arc::clone(&attempts);
+        let missing = JobName::new("missing").unwrap();
+
+        let error = retry_scheduler_call("test scheduled terminal", None, move || {
+            let attempts = Arc::clone(&attempts_for_call);
+            let missing = missing.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(SchedulerError::UnknownJob { name: missing })
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("unknown scheduled job missing"));
+        assert_eq!(1, attempts.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn scheduled_job_retry_respects_shutdown_before_claim_attempt() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_call = Arc::clone(&attempts);
+        let (shutdown, shutdown_signal) = shutdown_channel();
+        shutdown.begin_draining("test shutdown").unwrap();
+
+        let error = retry_scheduler_call(
+            "claim manual scheduled job run",
+            Some(&shutdown_signal),
+            move || {
+                let attempts = Arc::clone(&attempts_for_call);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, SchedulerError>("claimed")
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!("scheduler is shutting down", error);
+        assert_eq!(0, attempts.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

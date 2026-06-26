@@ -5533,22 +5533,11 @@ mod tests {
             },
         );
         let repository = Repository::connect_in_memory().await.unwrap();
-        repository
-            .record_job_status(
-                &JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap(),
-                JobStateUpdate {
-                    state: JobState::Succeeded,
-                    last_started_at_ms: None,
-                    last_finished_at_ms: Some(unix_time_ms()),
-                    next_run_at_ms: Some(unix_time_ms() + 86_400_000),
-                    last_error: None,
-                },
-            )
-            .await
-            .unwrap();
+        record_succeeded_job_for_later(&repository, MEDIA_INVENTORY_JOB_NAME).await;
         let runtime = AppRuntime::from_repository(config, repository.clone())
             .await
             .unwrap();
+        record_succeeded_job_for_later(&repository, INDEXER_CAPS_JOB_NAME).await;
         repository
             .record_indexer_caps_success(
                 &DependencyName::new("main").unwrap(),
@@ -5564,6 +5553,7 @@ mod tests {
         let handles = start_background_tasks(runtime).await.unwrap();
         wait_for_local_item_count(&repository, 1).await;
         wait_for_local_file_count(&repository, 1).await;
+        wait_for_workflow_projection_state(&repository, "inventory:media:full", "succeeded").await;
         let summary = process_search_workflow(
             state,
             SearchWorkflowRequest {
@@ -5576,8 +5566,8 @@ mod tests {
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
-        assert_eq!(1, summary.saved);
-        assert_eq!(0, summary.rejected);
+        assert_eq!(1, summary.saved, "{summary:?}");
+        assert_eq!(0, summary.rejected, "{summary:?}");
         assert_eq!(1, saved_torrent_count(&output_dir));
         fs::remove_dir_all(root).unwrap();
     }
@@ -7405,6 +7395,7 @@ mod tests {
         let runtime = AppRuntime::from_repository(config, repository.clone())
             .await
             .unwrap();
+        record_waiting_job_for_later(&repository, CLEANUP_JOB_NAME).await;
         insert_cleanup_fixture_rows(&repository).await;
         let shutdown = runtime.state.shutdown.clone();
         let job_queue = runtime.state.queues.workflow.jobs.clone();
@@ -9098,6 +9089,40 @@ mod tests {
         assert_eq!(expected, count);
     }
 
+    async fn record_succeeded_job_for_later(repository: &Repository, name: &str) {
+        let now_ms = unix_time_ms();
+        repository
+            .record_job_status(
+                &JobName::new(name).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: None,
+                    last_finished_at_ms: Some(now_ms),
+                    next_run_at_ms: Some(now_ms + 86_400_000),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn record_waiting_job_for_later(repository: &Repository, name: &str) {
+        let now_ms = unix_time_ms();
+        repository
+            .record_job_status(
+                &JobName::new(name).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Waiting,
+                    last_started_at_ms: None,
+                    last_finished_at_ms: Some(now_ms),
+                    next_run_at_ms: Some(now_ms + 86_400_000),
+                    last_error: Some("parked test job"),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     async fn wait_for_announce_status(repository: &Repository, id: &str, expected: &str) {
         for _attempt in 0..50 {
             let status: String =
@@ -9120,7 +9145,7 @@ mod tests {
     }
 
     async fn wait_for_job_state(repository: &Repository, name: &str, expected: &str) {
-        for _attempt in 0..50 {
+        for _attempt in 0..200 {
             let status = sqlx::query_scalar::<_, String>("SELECT state FROM jobs WHERE name = ?")
                 .bind(name)
                 .fetch_optional(repository.pool())
