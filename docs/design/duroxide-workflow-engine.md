@@ -250,7 +250,7 @@ tokens, passkeys, or API keys.
 
 ## Testing Strategy
 
-### Spike Tests
+### Runtime Evaluation Tests
 
 - Start a Duroxide runtime with SQLite provider.
 - Register one activity and one orchestration.
@@ -309,7 +309,7 @@ tokens, passkeys, or API keys.
 
 ## Implementation Phases
 
-1. **Dependency spike**
+1. **Dependency evaluation**
    - Add Duroxide behind a short-lived evaluation branch.
    - Prove SQLite provider, runtime startup, timers, events, and restart.
 
