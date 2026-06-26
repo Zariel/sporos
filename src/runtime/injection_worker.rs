@@ -805,9 +805,7 @@ impl InjectionWorker {
         if let Some(error) = cancellation_error {
             return Err(error);
         }
-        if summaries.is_empty()
-            && let Some(error) = last_error
-        {
+        if let Some(error) = last_error {
             return Err(error);
         }
         Ok(summaries)
@@ -3801,20 +3799,19 @@ mod tests {
             2,
         ));
         let worker = InjectionWorker::new(
-            repository,
+            repository.clone(),
             vec![
                 failing.clone() as Arc<dyn InjectionClient>,
                 successful.clone() as Arc<dyn InjectionClient>,
             ],
         );
 
-        let summaries = worker
+        let error = worker
             .refresh_client_inventories(&refresh_worker)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(1, summaries.len());
-        assert_eq!(2, summaries[0].persisted_items);
+        assert!(error.to_string().contains("failing"));
         assert_eq!(1, failing.calls.load(Ordering::SeqCst));
         assert_eq!(1, successful.calls.load(Ordering::SeqCst));
     }

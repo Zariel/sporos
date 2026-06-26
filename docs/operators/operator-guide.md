@@ -301,6 +301,8 @@ through bounded in-memory queues. Supported scheduled jobs are:
 - `cleanup`: runs local maintenance for durable announce work and search state,
   including stale lease recovery, TTL expiry, retained terminal row cleanup, and
   stale remote candidate/torrent cache cleanup.
+- `media_inventory`: refreshes configured media directory inventory.
+- `client_inventory`: refreshes configured torrent client inventory.
 - `indexer_caps`: refreshes imported indexer capability metadata.
 
 `[scheduling].cleanup_interval` controls how often the cleanup job is due. The
@@ -324,8 +326,10 @@ default usually enough for matching history while bounding local sensitive
 state.
 
 `[scheduling].indexer_caps_interval` controls periodic indexer capability
-refresh. `client_inventory_interval` and `saved_retry_interval` control their
-own daemon maintenance loops and are documented in the printed config schema.
+refresh. `media_inventory_interval` and `client_inventory_interval` control
+periodic inventory refresh backstops; announce no-match processing can also
+queue stale inventory refreshes immediately. `saved_retry_interval` controls
+its own daemon maintenance loop and is documented in the printed config schema.
 
 Operators can queue an immediate supported job run with
 `POST /v1/jobs/{job_name}/runs`, for example
@@ -426,7 +430,8 @@ The service exposes:
   work.
 - `POST /v1/searches`: queues an explicit search workflow.
 - `POST /v1/jobs/{job_name}/runs`: queues a supported scheduler job run.
-  Supported jobs are `cleanup` and `indexer_caps`.
+  Supported jobs are `cleanup`, `media_inventory`, `client_inventory`, and
+  `indexer_caps`.
 - `POST /v1/notifications/test`: queues one test delivery for each configured
   notification endpoint.
 
@@ -573,6 +578,10 @@ trigger daemon work:
   paths.
 - `POST /v1/jobs/indexer_caps/runs`: queues durable scheduler work and updates
   job/dependency state.
+- `POST /v1/jobs/media_inventory/runs`: queues a media directory inventory
+  refresh.
+- `POST /v1/jobs/client_inventory/runs`: queues a torrent client inventory
+  refresh.
 - `POST /v1/jobs/cleanup/runs`: queues durable cleanup work and updates job
   state while applying announce TTL, retention, and stale lease maintenance.
 

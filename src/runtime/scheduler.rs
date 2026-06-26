@@ -18,11 +18,15 @@ use tracing::{debug_span, info_span};
 pub const INDEXER_CAPS_JOB_NAME: &str = "indexer_caps";
 pub const CLEANUP_JOB_NAME: &str = "cleanup";
 pub const MEDIA_INVENTORY_JOB_NAME: &str = "media_inventory";
+pub const CLIENT_INVENTORY_JOB_NAME: &str = "client_inventory";
 
 pub fn scheduled_job_has_executor(job_name: &JobName) -> bool {
     matches!(
         job_name.as_str(),
-        INDEXER_CAPS_JOB_NAME | CLEANUP_JOB_NAME | MEDIA_INVENTORY_JOB_NAME
+        INDEXER_CAPS_JOB_NAME
+            | CLEANUP_JOB_NAME
+            | MEDIA_INVENTORY_JOB_NAME
+            | CLIENT_INVENTORY_JOB_NAME
     )
 }
 
@@ -39,6 +43,7 @@ impl SchedulerConfig {
             jobs: vec![
                 ScheduledJob::new(CLEANUP_JOB_NAME, &config.cleanup_interval)?,
                 ScheduledJob::new(MEDIA_INVENTORY_JOB_NAME, &config.media_inventory_interval)?,
+                ScheduledJob::new(CLIENT_INVENTORY_JOB_NAME, &config.client_inventory_interval)?,
                 ScheduledJob::new(INDEXER_CAPS_JOB_NAME, &config.indexer_caps_interval)?,
             ],
             claim_limit: 16,
@@ -60,8 +65,24 @@ impl ScheduledJob {
                 field: "job name",
                 message: error.to_string(),
             })?,
-            interval_ms: parse_interval_ms(interval)?,
+            interval_ms: parse_interval_ms(interval).map_err(|error| match error {
+                SchedulerError::InvalidConfig { message, .. } => SchedulerError::InvalidConfig {
+                    field: scheduling_interval_field(name),
+                    message,
+                },
+                error => error,
+            })?,
         })
+    }
+}
+
+const fn scheduling_interval_field(job_name: &str) -> &'static str {
+    match job_name.as_bytes() {
+        b"cleanup" => "cleanup interval",
+        b"media_inventory" => "media inventory interval",
+        b"client_inventory" => "client inventory interval",
+        b"indexer_caps" => "indexer caps interval",
+        _ => "interval",
     }
 }
 
@@ -83,6 +104,14 @@ pub enum ImmediateRunOutcome {
     Queued,
     Coalesced,
     Deferred,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum OpportunisticRunOutcome {
+    Queued,
+    Coalesced,
+    BackingOff { next_run_at_ms: i64 },
+    Deferred { next_run_at_ms: i64 },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -331,6 +360,56 @@ impl PersistedScheduler {
                     )
                     .await?;
                 Ok(ImmediateRunOutcome::Deferred)
+            }
+        }
+    }
+
+    pub async fn enqueue_opportunistic_run(
+        &self,
+        job_name: &JobName,
+        now_ms: i64,
+    ) -> Result<OpportunisticRunOutcome, SchedulerError> {
+        let _claim_guard = self.claim_lock.lock().await;
+        self.job(job_name)?;
+        if let Some(snapshot) = self.repository.job_status(job_name).await? {
+            if snapshot.state == "running" || snapshot.state == "disabled" {
+                return Ok(OpportunisticRunOutcome::Coalesced);
+            }
+            if matches!(snapshot.state.as_str(), "failed" | "waiting")
+                && let Some(next_run_at_ms) = snapshot.next_run_at_ms
+                && next_run_at_ms > now_ms
+            {
+                return Ok(OpportunisticRunOutcome::BackingOff { next_run_at_ms });
+            }
+        }
+        if !self
+            .repository
+            .claim_immediate_job_run(job_name, now_ms)
+            .await?
+        {
+            return Ok(OpportunisticRunOutcome::Coalesced);
+        }
+
+        match self.queue.try_enqueue(ScheduledJobRun {
+            job_name: job_name.clone(),
+            scheduled_at_ms: now_ms,
+        }) {
+            Ok(()) => Ok(OpportunisticRunOutcome::Queued),
+            Err(EnqueueError::Full { .. } | EnqueueError::Closed { .. }) => {
+                let next_run_at_ms = fixed_retry_deadline_ms(now_ms, self.failure_backoff_ms, None);
+                self.repository
+                    .record_job_status(
+                        job_name,
+                        JobStateUpdate {
+                            state: JobState::Waiting,
+                            last_started_at_ms: None,
+                            last_finished_at_ms: Some(now_ms),
+                            next_run_at_ms: Some(next_run_at_ms),
+                            last_error: Some("scheduler queue unavailable"),
+                        },
+                    )
+                    .await?;
+                Ok(OpportunisticRunOutcome::Deferred { next_run_at_ms })
             }
         }
     }
@@ -592,6 +671,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_opportunistic_run_respects_existing_backoff() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let (queue, _receiver) = scheduler_queue(nonzero(4));
+        let scheduler = PersistedScheduler::new(repository.clone(), queue, test_config());
+        let cleanup = JobName::new(CLEANUP_JOB_NAME).unwrap();
+        repository
+            .record_job_status(
+                &cleanup,
+                JobStateUpdate {
+                    state: JobState::Failed,
+                    last_started_at_ms: Some(100),
+                    last_finished_at_ms: Some(150),
+                    next_run_at_ms: Some(60_150),
+                    last_error: Some("temporary failure"),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = scheduler
+            .enqueue_opportunistic_run(&cleanup, 1_000)
+            .await
+            .unwrap();
+        let job = repository.job_status(&cleanup).await.unwrap().unwrap();
+
+        assert_eq!(
+            OpportunisticRunOutcome::BackingOff {
+                next_run_at_ms: 60_150
+            },
+            outcome
+        );
+        assert_eq!("failed", job.state);
+        assert_eq!(Some(60_150), job.next_run_at_ms);
+        assert_eq!(0, scheduler.queue.stats().depth);
+    }
+
+    #[tokio::test]
+    async fn scheduler_opportunistic_run_bypasses_success_interval() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let (queue, mut receiver) = scheduler_queue(nonzero(4));
+        let scheduler = PersistedScheduler::new(repository.clone(), queue, test_config());
+        let cleanup = JobName::new(CLEANUP_JOB_NAME).unwrap();
+        repository
+            .record_job_status(
+                &cleanup,
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: Some(100),
+                    last_finished_at_ms: Some(150),
+                    next_run_at_ms: Some(60_150),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = scheduler
+            .enqueue_opportunistic_run(&cleanup, 1_000)
+            .await
+            .unwrap();
+        let run = receiver.recv().await.unwrap();
+        let job = repository.job_status(&cleanup).await.unwrap().unwrap();
+
+        assert_eq!(OpportunisticRunOutcome::Queued, outcome);
+        assert_eq!(CLEANUP_JOB_NAME, run.job_name.as_str());
+        assert_eq!("running", job.state);
+        assert_eq!(None, job.next_run_at_ms);
+    }
+
+    #[tokio::test]
     async fn scheduler_coalesces_concurrent_tick_and_immediate_run() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let (queue, _receiver) = scheduler_queue(nonzero(4));
@@ -708,13 +857,14 @@ mod tests {
             receiver.recv().await.unwrap(),
             receiver.recv().await.unwrap(),
             receiver.recv().await.unwrap(),
+            receiver.recv().await.unwrap(),
         ];
         let jobs = repository.job_status_snapshot(10).await.unwrap();
         let rss_job = jobs.iter().find(|job| job.name == rss).unwrap();
         let cleanup_job = jobs.iter().find(|job| job.name == cleanup).unwrap();
 
-        assert_eq!(2, summary.seeded);
-        assert_eq!(3, summary.enqueued);
+        assert_eq!(3, summary.seeded);
+        assert_eq!(4, summary.enqueued);
         assert!(
             runs.iter()
                 .any(|run| run.job_name.as_str() == CLEANUP_JOB_NAME)
@@ -726,6 +876,10 @@ mod tests {
         assert!(
             runs.iter()
                 .any(|run| run.job_name.as_str() == INDEXER_CAPS_JOB_NAME)
+        );
+        assert!(
+            runs.iter()
+                .any(|run| run.job_name.as_str() == CLIENT_INVENTORY_JOB_NAME)
         );
         assert_eq!("disabled", rss_job.state);
         assert_eq!(None, rss_job.next_run_at_ms);
@@ -763,7 +917,7 @@ mod tests {
         let jobs = repository.job_status_snapshot(10).await.unwrap();
         let stale_job = jobs.iter().find(|job| job.name == stale).unwrap();
 
-        assert_eq!(3, summary.seeded);
+        assert_eq!(4, summary.seeded);
         assert_eq!("disabled", stale_job.state);
         assert_eq!(None, stale_job.next_run_at_ms);
         assert_eq!(None, stale_job.last_error);
@@ -798,12 +952,13 @@ mod tests {
             receiver.recv().await.unwrap(),
             receiver.recv().await.unwrap(),
             receiver.recv().await.unwrap(),
+            receiver.recv().await.unwrap(),
         ];
         let jobs = repository.job_status_snapshot(10).await.unwrap();
         let job = jobs.iter().find(|job| job.name == indexer_caps).unwrap();
 
-        assert_eq!(2, summary.seeded);
-        assert_eq!(3, summary.enqueued);
+        assert_eq!(3, summary.seeded);
+        assert_eq!(4, summary.enqueued);
         assert!(
             runs.iter()
                 .any(|run| run.job_name.as_str() == INDEXER_CAPS_JOB_NAME)
@@ -817,13 +972,15 @@ mod tests {
     fn default_scheduler_jobs_are_executable() {
         let config = SchedulerConfig::from_scheduling_config(&SchedulingConfig::default()).unwrap();
 
-        assert_eq!(3, config.jobs.len());
+        assert_eq!(4, config.jobs.len());
         assert_eq!(CLEANUP_JOB_NAME, config.jobs[0].name.as_str());
         assert_eq!(86_400_000, config.jobs[0].interval_ms);
         assert_eq!(MEDIA_INVENTORY_JOB_NAME, config.jobs[1].name.as_str());
         assert_eq!(86_400_000, config.jobs[1].interval_ms);
-        assert_eq!(INDEXER_CAPS_JOB_NAME, config.jobs[2].name.as_str());
+        assert_eq!(CLIENT_INVENTORY_JOB_NAME, config.jobs[2].name.as_str());
         assert_eq!(86_400_000, config.jobs[2].interval_ms);
+        assert_eq!(INDEXER_CAPS_JOB_NAME, config.jobs[3].name.as_str());
+        assert_eq!(86_400_000, config.jobs[3].interval_ms);
         assert!(
             config
                 .jobs

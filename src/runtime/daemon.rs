@@ -66,8 +66,8 @@ use crate::runtime::injection_worker::{
     DryRunAction, InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
 use crate::runtime::scheduler::{
-    CLEANUP_JOB_NAME, INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome, MEDIA_INVENTORY_JOB_NAME,
-    ScheduledJobRun, SchedulerError, parse_interval_ms,
+    CLEANUP_JOB_NAME, CLIENT_INVENTORY_JOB_NAME, INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome,
+    MEDIA_INVENTORY_JOB_NAME, OpportunisticRunOutcome, ScheduledJobRun, SchedulerError,
 };
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
@@ -277,20 +277,6 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
             ),
         ),
         BackgroundShutdownPolicy::AwaitInFlight,
-    ));
-    let client_inventory_interval = runtime_client_inventory_interval(&runtime.state);
-    handles.push(BackgroundTask::new(
-        "client-inventory-refresh",
-        spawn_supervised_background(
-            "client-inventory-refresh",
-            &runtime.state,
-            run_client_inventory_refresh_loop(
-                runtime.state.clone(),
-                client_inventory_interval,
-                runtime.state.shutdown_signal.clone(),
-            ),
-        ),
-        BackgroundShutdownPolicy::AbortOnTimeout,
     ));
     if let Some(interval) = runtime_prowlarr_refresh_interval(&runtime.state) {
         handles.push(BackgroundTask::new(
@@ -1971,6 +1957,7 @@ async fn execute_scheduled_job(
         }
         CLEANUP_JOB_NAME => run_scheduled_cleanup_job(state, &shutdown).await,
         MEDIA_INVENTORY_JOB_NAME => run_scheduled_media_inventory_job(state, shutdown).await,
+        CLIENT_INVENTORY_JOB_NAME => run_scheduled_client_inventory_job(state, shutdown).await,
         other => Err(format!("unknown scheduled job {other}")),
     }
 }
@@ -2024,6 +2011,36 @@ async fn run_scheduled_media_inventory_job(
         .await;
         Err(reason)
     }
+}
+
+async fn run_scheduled_client_inventory_job(
+    state: &AppState,
+    mut shutdown: ShutdownSignal,
+) -> Result<(), String> {
+    let result = tokio::select! {
+        _state = shutdown.cancelled() => {
+            return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
+        }
+        result = state.refresh_torrent_client_inventories() => result,
+    };
+    let summaries = match result {
+        Ok(summaries) => summaries,
+        Err(_) if shutdown.state().phase != ShutdownPhase::Running => {
+            return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let scanned: usize = summaries.iter().map(|summary| summary.scanned_items).sum();
+    let persisted: usize = summaries
+        .iter()
+        .map(|summary| summary.persisted_items)
+        .sum();
+    let pruned: u64 = summaries.iter().map(|summary| summary.pruned_items).sum();
+    info!(
+        clients = summaries.len(),
+        scanned, persisted, pruned, "client inventory refresh completed"
+    );
+    Ok(())
 }
 
 async fn run_scheduled_cleanup_job(
@@ -2423,11 +2440,9 @@ async fn process_announce_work(
             );
         }
     };
-    let inventory_fresh_after_announce =
-        match media_inventory_fresh_after_announce(&state.repository, candidate.received_at_ms)
-            .await
-        {
-            Ok(fresh) => fresh,
+    let inventory_freshness =
+        match inventory_freshness_after_announce(&state, candidate.received_at_ms).await {
+            Ok(freshness) => freshness,
             Err(error) => {
                 return retryable_database_outcome(
                     error,
@@ -2444,7 +2459,7 @@ async fn process_announce_work(
         jitter_key: id.as_str().to_owned(),
         outcome_config: announce_outcome_config(&state.config.announce),
         reverse_lookup_config: runtime_reverse_lookup_config(&state.config),
-        inventory_fresh_after_announce,
+        inventory_freshness,
     };
     let prepared = PreparedAnnounceCandidateStage {
         state,
@@ -2485,14 +2500,67 @@ struct AnnounceWorkflowContext {
     jitter_key: String,
     outcome_config: AnnounceOutcomeConfig,
     reverse_lookup_config: ReverseLookupConfig,
-    inventory_fresh_after_announce: bool,
+    inventory_freshness: AnnounceInventoryFreshness,
 }
 
-async fn media_inventory_fresh_after_announce(
+#[derive(Debug, Clone, Copy, Default)]
+struct AnnounceInventoryFreshness {
+    media_required: bool,
+    media_fresh: bool,
+    client_required: bool,
+    client_fresh: bool,
+}
+
+impl AnnounceInventoryFreshness {
+    const fn all_required_fresh(self) -> bool {
+        (self.media_required || self.client_required)
+            && (!self.media_required || self.media_fresh)
+            && (!self.client_required || self.client_fresh)
+    }
+
+    const fn media_stale(self) -> bool {
+        self.media_required && !self.media_fresh
+    }
+
+    const fn client_stale(self) -> bool {
+        self.client_required && !self.client_fresh
+    }
+
+    const fn any_stale(self) -> bool {
+        self.media_stale() || self.client_stale()
+    }
+}
+
+async fn inventory_freshness_after_announce(
+    state: &AppState,
+    received_at_ms: i64,
+) -> Result<AnnounceInventoryFreshness, DatabaseError> {
+    let media_required = !state.config.paths.media_dirs.is_empty();
+    let client_required = state.injection_worker.client_count() > 0;
+    Ok(AnnounceInventoryFreshness {
+        media_required,
+        media_fresh: if media_required {
+            job_fresh_after_announce(&state.repository, MEDIA_INVENTORY_JOB_NAME, received_at_ms)
+                .await?
+        } else {
+            false
+        },
+        client_required,
+        client_fresh: if client_required {
+            job_fresh_after_announce(&state.repository, CLIENT_INVENTORY_JOB_NAME, received_at_ms)
+                .await?
+        } else {
+            false
+        },
+    })
+}
+
+async fn job_fresh_after_announce(
     repository: &Repository,
+    job_name: &str,
     received_at_ms: i64,
 ) -> Result<bool, DatabaseError> {
-    let job_name = JobName::new(MEDIA_INVENTORY_JOB_NAME).map_err(domain_database_error)?;
+    let job_name = JobName::new(job_name).map_err(domain_database_error)?;
     Ok(repository.job_status(&job_name).await?.is_some_and(|job| {
         job.state == "succeeded"
             && job
@@ -2504,7 +2572,8 @@ async fn media_inventory_fresh_after_announce(
     }))
 }
 
-fn classify_announce_lookup_outcome(
+async fn classify_announce_lookup_outcome(
+    state: &AppState,
     outcome: &ReverseLookupOutcome,
     context: &AnnounceWorkflowContext,
 ) -> AnnounceWorkOutcome {
@@ -2516,7 +2585,7 @@ fn classify_announce_lookup_outcome(
         context.outcome_config,
     );
     if matches!(outcome, ReverseLookupOutcome::NoCandidates)
-        && context.inventory_fresh_after_announce
+        && context.inventory_freshness.all_required_fresh()
         && matches!(
             classified,
             AnnounceWorkOutcome::Waiting {
@@ -2529,8 +2598,112 @@ fn classify_announce_lookup_outcome(
             reason: AnnounceReason::NoMatchTerminal,
             redacted_message: "candidate did not match after refreshed inventory".to_owned(),
         }
+    } else if matches!(outcome, ReverseLookupOutcome::NoCandidates) {
+        if context.inventory_freshness.any_stale() {
+            let stale_refresh_retry_at = trigger_stale_inventory_refreshes(
+                state,
+                context.inventory_freshness,
+                context.now_ms,
+            )
+            .await;
+            match classified {
+                AnnounceWorkOutcome::Waiting {
+                    reason: AnnounceReason::InventoryRefreshing,
+                    dependency,
+                    ..
+                } => AnnounceWorkOutcome::Waiting {
+                    reason: AnnounceReason::InventoryRefreshing,
+                    next_attempt_at_ms: stale_refresh_retry_at
+                        .unwrap_or_else(|| context.now_ms.saturating_add(1_000)),
+                    dependency,
+                },
+                outcome => outcome,
+            }
+        } else {
+            classified
+        }
     } else {
         classified
+    }
+}
+
+async fn trigger_stale_inventory_refreshes(
+    state: &AppState,
+    freshness: AnnounceInventoryFreshness,
+    now_ms: i64,
+) -> Option<i64> {
+    let mut next_attempt_at_ms = None;
+    if freshness.media_stale() {
+        next_attempt_at_ms = min_optional_deadline(
+            next_attempt_at_ms,
+            trigger_inventory_refresh_job(state, MEDIA_INVENTORY_JOB_NAME, "media", now_ms).await,
+        );
+    }
+    if freshness.client_stale() {
+        next_attempt_at_ms = min_optional_deadline(
+            next_attempt_at_ms,
+            trigger_inventory_refresh_job(state, CLIENT_INVENTORY_JOB_NAME, "client", now_ms).await,
+        );
+    }
+    next_attempt_at_ms
+}
+
+fn min_optional_deadline(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
+async fn trigger_inventory_refresh_job(
+    state: &AppState,
+    job_name: &str,
+    inventory: &str,
+    now_ms: i64,
+) -> Option<i64> {
+    let job_name = match JobName::new(job_name) {
+        Ok(job_name) => job_name,
+        Err(error) => {
+            warn!(inventory, error = %error, "stale inventory refresh job name is invalid");
+            return None;
+        }
+    };
+    match state
+        .scheduler
+        .enqueue_opportunistic_run(&job_name, now_ms)
+        .await
+    {
+        Ok(OpportunisticRunOutcome::Queued) => {
+            info!(inventory, job_name = %job_name, "queued stale inventory refresh for announce no-match");
+            Some(now_ms.saturating_add(1_000))
+        }
+        Ok(OpportunisticRunOutcome::Coalesced) => {
+            info!(inventory, job_name = %job_name, "stale inventory refresh already queued or running for announce no-match");
+            Some(now_ms.saturating_add(1_000))
+        }
+        Ok(OpportunisticRunOutcome::BackingOff { next_run_at_ms }) => {
+            info!(
+                inventory,
+                job_name = %job_name,
+                next_run_at = %unix_ms_to_rfc3339_seconds(next_run_at_ms),
+                "stale inventory refresh is waiting for scheduler backoff"
+            );
+            Some(next_run_at_ms)
+        }
+        Ok(OpportunisticRunOutcome::Deferred { next_run_at_ms }) => {
+            warn!(
+                inventory,
+                job_name = %job_name,
+                next_run_at = %unix_ms_to_rfc3339_seconds(next_run_at_ms),
+                "stale inventory refresh deferred for announce no-match"
+            );
+            Some(next_run_at_ms)
+        }
+        Err(error) => {
+            warn!(inventory, job_name = %job_name, error = %error, "failed to queue stale inventory refresh for announce no-match");
+            None
+        }
     }
 }
 
@@ -2617,10 +2790,9 @@ async fn initial_announce_lookup_stage(
                 &outcome,
                 next_action,
             );
-            AnnounceInitialLookupStage::Finished(classify_announce_lookup_outcome(
-                &outcome,
-                &input.context,
-            ))
+            AnnounceInitialLookupStage::Finished(
+                classify_announce_lookup_outcome(&input.state, &outcome, &input.context).await,
+            )
         }
     }
 }
@@ -3050,10 +3222,13 @@ async fn process_downloaded_announce_candidate(
         );
     }
 
-    Ok(best_failure.map_or_else(
-        || classify_announce_lookup_outcome(&ReverseLookupOutcome::NoCandidates, &context),
-        |outcome| classify_announce_lookup_outcome(&outcome, &context),
-    ))
+    Ok(match best_failure {
+        Some(outcome) => classify_announce_lookup_outcome(&state, &outcome, &context).await,
+        None => {
+            classify_announce_lookup_outcome(&state, &ReverseLookupOutcome::NoCandidates, &context)
+                .await
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -3362,12 +3537,6 @@ fn domain_database_error(error: crate::domain::DomainError) -> DatabaseError {
     }
 }
 
-fn runtime_client_inventory_interval(state: &AppState) -> Duration {
-    let interval_ms =
-        parse_interval_ms(&state.config.scheduling.client_inventory_interval).unwrap_or(86_400_000);
-    Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
-}
-
 fn runtime_prowlarr_refresh_interval(state: &AppState) -> Option<Duration> {
     state
         .prowlarr_sources
@@ -3404,48 +3573,6 @@ async fn run_prowlarr_refresh_loop(
                 }
             }
             Err(error) => warn!(error = %error, "Prowlarr refresh failed"),
-        }
-
-        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
-            break;
-        }
-
-        tokio::select! {
-            _state = shutdown.cancelled() => {
-                break;
-            }
-            () = tokio::time::sleep(interval) => {}
-        }
-    }
-}
-
-async fn run_client_inventory_refresh_loop(
-    state: AppState,
-    interval: Duration,
-    mut shutdown: ShutdownSignal,
-) {
-    loop {
-        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
-            break;
-        }
-
-        match state.refresh_torrent_client_inventories().await {
-            Ok(summaries) => {
-                let scanned: usize = summaries.iter().map(|summary| summary.scanned_items).sum();
-                let persisted: usize = summaries
-                    .iter()
-                    .map(|summary| summary.persisted_items)
-                    .sum();
-                let pruned: u64 = summaries.iter().map(|summary| summary.pruned_items).sum();
-                tracing::info!(
-                    clients = summaries.len(),
-                    scanned,
-                    persisted,
-                    pruned,
-                    "client inventory refresh completed"
-                );
-            }
-            Err(error) => warn!(error = %error, "client inventory refresh failed"),
         }
 
         if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
@@ -4220,7 +4347,7 @@ mod tests {
             jitter_key: "announce-already-present".to_owned(),
             outcome_config: announce_outcome_config(&config.announce),
             reverse_lookup_config: runtime_reverse_lookup_config(&config),
-            inventory_fresh_after_announce: false,
+            inventory_freshness: AnnounceInventoryFreshness::default(),
         };
         let repository = Repository::connect(root.join("sporos.sqlite"))
             .await
@@ -4471,7 +4598,7 @@ mod tests {
             jitter_key: "announce-link-policy".to_owned(),
             outcome_config: announce_outcome_config(&config.announce),
             reverse_lookup_config: runtime_reverse_lookup_config(&config),
-            inventory_fresh_after_announce: false,
+            inventory_freshness: AnnounceInventoryFreshness::default(),
         };
         let repository = Repository::connect_in_memory().await.unwrap();
         repository
@@ -4970,6 +5097,7 @@ mod tests {
 
         let handles = start_background_tasks(runtime).await.unwrap();
         wait_for_local_item_count(&repository, 1).await;
+        wait_for_job_state(&repository, CLIENT_INVENTORY_JOB_NAME, "succeeded").await;
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
@@ -5302,21 +5430,6 @@ mod tests {
         assert!(!restarted_metrics.contains(
             "sporos_dependency_health_state{dependency=\"notification\",state=\"unavailable\"}"
         ));
-    }
-
-    #[tokio::test]
-    async fn client_inventory_refresh_uses_own_interval() {
-        let mut config = SporosConfig::default();
-        config.scheduling.client_inventory_interval = "5m".to_owned();
-        let repository = Repository::connect_in_memory().await.unwrap();
-        let runtime = AppRuntime::from_repository(config, repository)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            Duration::from_secs(300),
-            runtime_client_inventory_interval(&runtime.state)
-        );
     }
 
     #[tokio::test]
@@ -6023,13 +6136,16 @@ mod tests {
         ))
         .await;
 
-        assert!(matches!(
-            result,
-            AnnounceWorkOutcome::Waiting {
-                reason: AnnounceReason::InventoryRefreshing,
-                ..
-            }
-        ));
+        let AnnounceWorkOutcome::Waiting {
+            reason: AnnounceReason::InventoryRefreshing,
+            next_attempt_at_ms,
+            ..
+        } = result
+        else {
+            panic!("expected inventory refreshing wait");
+        };
+        assert!(next_attempt_at_ms > unix_time_ms().saturating_add(1_000));
+        assert_eq!(0, runtime.state.queues.scheduler.stats().depth);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6037,9 +6153,12 @@ mod tests {
     async fn announce_no_match_after_fresh_media_inventory_is_terminal() {
         let root = unique_temp_dir("daemon-announce-fresh-inventory-no-match");
         let cache_dir = root.join("cache");
+        let media_dir = root.join("media");
         fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&media_dir).unwrap();
         let mut config = SporosConfig::default();
         config.paths.torrent_cache_dir = cache_dir;
+        config.paths.media_dirs = vec![media_dir];
         let repository = Repository::connect_in_memory().await.unwrap();
         let id = AnnounceWorkId::new("ann_fresh_no_match").unwrap();
         insert_announce_row(
@@ -6094,9 +6213,12 @@ mod tests {
     async fn announce_no_match_after_stale_media_inventory_waits_for_refresh() {
         let root = unique_temp_dir("daemon-announce-stale-inventory-no-match");
         let cache_dir = root.join("cache");
+        let media_dir = root.join("media");
         fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&media_dir).unwrap();
         let mut config = SporosConfig::default();
         config.paths.torrent_cache_dir = cache_dir;
+        config.paths.media_dirs = vec![media_dir];
         let repository = Repository::connect_in_memory().await.unwrap();
         let id = AnnounceWorkId::new("ann_stale_no_match").unwrap();
         insert_announce_row(
@@ -6137,13 +6259,15 @@ mod tests {
         ))
         .await;
 
-        assert!(matches!(
-            result,
-            AnnounceWorkOutcome::Waiting {
-                reason: AnnounceReason::InventoryRefreshing,
-                ..
-            }
-        ));
+        let AnnounceWorkOutcome::Waiting {
+            reason: AnnounceReason::InventoryRefreshing,
+            next_attempt_at_ms,
+            ..
+        } = result
+        else {
+            panic!("expected inventory refreshing wait");
+        };
+        assert!(next_attempt_at_ms <= unix_time_ms().saturating_add(1_000));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6151,9 +6275,12 @@ mod tests {
     async fn announce_no_match_after_overlapping_media_inventory_waits_for_refresh() {
         let root = unique_temp_dir("daemon-announce-overlap-inventory-no-match");
         let cache_dir = root.join("cache");
+        let media_dir = root.join("media");
         fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&media_dir).unwrap();
         let mut config = SporosConfig::default();
         config.paths.torrent_cache_dir = cache_dir;
+        config.paths.media_dirs = vec![media_dir];
         let repository = Repository::connect_in_memory().await.unwrap();
         let id = AnnounceWorkId::new("ann_overlap_no_match").unwrap();
         insert_announce_row(
@@ -6204,20 +6331,249 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn fresh_inventory_only_terminalizes_no_candidate_announce_lookup() {
+    #[tokio::test]
+    async fn announce_no_match_with_stale_media_inventory_queues_refresh() {
+        let root = unique_temp_dir("daemon-announce-queues-media-refresh");
+        let cache_dir = root.join("cache");
+        let media_dir = root.join("media");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&media_dir).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        config.paths.media_dirs = vec![media_dir];
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let id = AnnounceWorkId::new("ann_queue_media_refresh").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-queue-media-refresh",
+            "tracker.example",
+            "https://tracker.example/download/queue-media-refresh",
+        )
+        .await;
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let result = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id,
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::InventoryRefreshing,
+                ..
+            }
+        ));
+        let job = repository
+            .job_status(&JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!("running", job.state);
+        assert_eq!(1, runtime.state.queues.scheduler.stats().depth);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_no_match_with_stale_client_inventory_queues_refresh() {
+        let root = unique_temp_dir("daemon-announce-queues-client-refresh");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        configure_qbit_client(&mut config, "http://127.0.0.1:9".to_owned());
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let id = AnnounceWorkId::new("ann_queue_client_refresh").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-queue-client-refresh",
+            "tracker.example",
+            "https://tracker.example/download/queue-client-refresh",
+        )
+        .await;
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let result = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id,
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::InventoryRefreshing,
+                ..
+            }
+        ));
+        let job = repository
+            .job_status(&JobName::new(CLIENT_INVENTORY_JOB_NAME).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!("running", job.state);
+        assert_eq!(1, runtime.state.queues.scheduler.stats().depth);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_no_match_with_failed_client_inventory_waits_for_backoff() {
+        let root = unique_temp_dir("daemon-announce-client-refresh-backoff");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        configure_qbit_client(&mut config, "http://127.0.0.1:9".to_owned());
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let id = AnnounceWorkId::new("ann_client_refresh_backoff").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-client-refresh-backoff",
+            "tracker.example",
+            "https://tracker.example/download/client-refresh-backoff",
+        )
+        .await;
+        let retry_at_ms = unix_time_ms().saturating_add(60_000);
+        repository
+            .record_job_status(
+                &JobName::new(CLIENT_INVENTORY_JOB_NAME).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Failed,
+                    last_started_at_ms: Some(retry_at_ms.saturating_sub(5_000)),
+                    last_finished_at_ms: Some(retry_at_ms.saturating_sub(4_000)),
+                    next_run_at_ms: Some(retry_at_ms),
+                    last_error: Some("torrent client unavailable"),
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+
+        let result = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id,
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        let AnnounceWorkOutcome::Waiting {
+            reason: AnnounceReason::InventoryRefreshing,
+            next_attempt_at_ms,
+            ..
+        } = result
+        else {
+            panic!("expected inventory refresh wait");
+        };
+        let job = repository
+            .job_status(&JobName::new(CLIENT_INVENTORY_JOB_NAME).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(retry_at_ms, next_attempt_at_ms);
+        assert_eq!("failed", job.state);
+        assert_eq!(Some(retry_at_ms), job.next_run_at_ms);
+        assert_eq!(0, runtime.state.queues.scheduler.stats().depth);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_no_match_after_fresh_client_inventory_is_terminal() {
+        let root = unique_temp_dir("daemon-announce-fresh-client-no-match");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        configure_qbit_client(&mut config, "http://127.0.0.1:9".to_owned());
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let id = AnnounceWorkId::new("ann_fresh_client_no_match").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-fresh-client-no-match",
+            "tracker.example",
+            "https://tracker.example/download/fresh-client-no-match",
+        )
+        .await;
+        let received_at_ms: i64 =
+            sqlx::query_scalar("SELECT received_at FROM announce_work WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        repository
+            .record_job_status(
+                &JobName::new(CLIENT_INVENTORY_JOB_NAME).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: Some(received_at_ms),
+                    last_finished_at_ms: Some(received_at_ms.saturating_add(1)),
+                    next_run_at_ms: Some(received_at_ms.saturating_add(60_000)),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let result = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id,
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            AnnounceWorkOutcome::TerminalFailed {
+                reason: AnnounceReason::NoMatchTerminal,
+                ..
+            }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_inventory_only_terminalizes_no_candidate_announce_lookup() {
         let config = SporosConfig::default();
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config.clone(), repository)
+            .await
+            .unwrap();
         let context = AnnounceWorkflowContext {
             now_ms: 1_000,
             attempt_count: 1,
             jitter_key: "ann-classify-no-match".to_owned(),
             outcome_config: announce_outcome_config(&config.announce),
             reverse_lookup_config: runtime_reverse_lookup_config(&config),
-            inventory_fresh_after_announce: true,
+            inventory_freshness: AnnounceInventoryFreshness {
+                media_required: true,
+                media_fresh: true,
+                client_required: false,
+                client_fresh: false,
+            },
         };
 
-        let no_candidates =
-            classify_announce_lookup_outcome(&ReverseLookupOutcome::NoCandidates, &context);
+        let no_candidates = classify_announce_lookup_outcome(
+            &runtime.state,
+            &ReverseLookupOutcome::NoCandidates,
+            &context,
+        )
+        .await;
         assert!(matches!(
             no_candidates,
             AnnounceWorkOutcome::TerminalFailed {
@@ -6240,7 +6596,8 @@ mod tests {
             },
         };
 
-        let rejected = classify_announce_lookup_outcome(&name_mismatch, &context);
+        let rejected =
+            classify_announce_lookup_outcome(&runtime.state, &name_mismatch, &context).await;
         assert!(matches!(
             rejected,
             AnnounceWorkOutcome::Waiting {
@@ -7456,6 +7813,82 @@ mod tests {
         );
         assert_eq!(0, item_count);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_client_inventory_fails_when_any_client_fails() {
+        let ok_requests = Arc::new(AtomicUsize::new(0));
+        let ok_endpoint = spawn_daemon_qbit_inventory_server(ok_requests.clone()).await;
+        let mut config = SporosConfig::default();
+        config.torrent_clients.insert(
+            "ok".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Qbittorrent,
+                url: ok_endpoint,
+                username: None,
+                password: None,
+                password_file: None,
+                default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: None,
+            },
+        );
+        config.torrent_clients.insert(
+            "failing".to_owned(),
+            TorrentClientConfig {
+                kind: ConfigTorrentClientKind::Qbittorrent,
+                url: "http://127.0.0.1:9".to_owned(),
+                username: None,
+                password: None,
+                password_file: None,
+                default_save_path: "/downloads/default".into(),
+                default_category: None,
+                default_tags: vec![crate::config::DEFAULT_INJECTION_METADATA.to_owned()],
+                default_label: crate::config::DEFAULT_INJECTION_METADATA.to_owned(),
+                label_field: None,
+            },
+        );
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let job_name = JobName::new(CLIENT_INVENTORY_JOB_NAME).unwrap();
+        repository
+            .claim_immediate_job_run(&job_name, unix_time_ms())
+            .await
+            .unwrap();
+
+        process_scheduled_job_run(
+            &state,
+            ScheduledJobRun {
+                job_name,
+                scheduled_at_ms: unix_time_ms(),
+            },
+            state.shutdown_signal.clone(),
+        )
+        .await;
+
+        let job = repository
+            .job_status(&JobName::new(CLIENT_INVENTORY_JOB_NAME).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let local_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!("failed", job.state);
+        assert!(
+            job.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failing"))
+        );
+        assert_eq!(1, ok_requests.load(Ordering::SeqCst));
+        assert_eq!(1, local_items);
     }
 
     #[tokio::test]

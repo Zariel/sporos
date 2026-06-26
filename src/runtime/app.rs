@@ -1344,12 +1344,6 @@ fn build_runtime_config(
         })?;
     let scheduler_config = daemon_scheduler_config(scheduler_config);
     let http_jobs = http_supported_jobs(&scheduler_config);
-    parse_interval_ms(&config.scheduling.client_inventory_interval).map_err(|error| {
-        DatabaseError::Unavailable {
-            operation: "build client inventory interval".to_owned(),
-            message: error.to_string(),
-        }
-    })?;
     let saved_retry_interval_ms = parse_interval_ms(&config.scheduling.saved_retry_interval)
         .map_err(|error| DatabaseError::Unavailable {
             operation: "build saved retry interval".to_owned(),
@@ -5445,6 +5439,17 @@ mod tests {
             )
             .await
             .unwrap();
+        let client_inventory_job_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/client_inventory/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let unsupported_search_job = app
             .clone()
             .oneshot(
@@ -5500,6 +5505,7 @@ mod tests {
         assert_eq!(StatusCode::NOT_FOUND, unsupported_rss_job.status());
         assert_eq!(StatusCode::ACCEPTED, cleanup_job_run.status());
         assert_eq!(StatusCode::ACCEPTED, media_inventory_job_run.status());
+        assert_eq!(StatusCode::ACCEPTED, client_inventory_job_run.status());
         assert_eq!(StatusCode::NOT_FOUND, unsupported_search_job.status());
         assert_eq!(StatusCode::ACCEPTED, announcement.status());
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());
