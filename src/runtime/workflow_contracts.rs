@@ -86,6 +86,9 @@ pub enum ActivityKind {
     ActionsSaveTorrent,
     NotificationsDeliver,
     CleanupRun,
+    ScheduledJobClaim,
+    ScheduledJobComplete,
+    ScheduledJobRun,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -135,7 +138,7 @@ impl ActivityRetryContract {
 }
 
 impl ActivityKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 14] = [
         Self::RepositoryRead,
         Self::RepositoryWrite,
         Self::InventoryScanMedia,
@@ -147,6 +150,9 @@ impl ActivityKind {
         Self::ActionsSaveTorrent,
         Self::NotificationsDeliver,
         Self::CleanupRun,
+        Self::ScheduledJobClaim,
+        Self::ScheduledJobComplete,
+        Self::ScheduledJobRun,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -162,6 +168,9 @@ impl ActivityKind {
             Self::ActionsSaveTorrent => "sporos.actions.save_torrent.v1",
             Self::NotificationsDeliver => "sporos.notifications.deliver.v1",
             Self::CleanupRun => "sporos.cleanup.run.v1",
+            Self::ScheduledJobClaim => "sporos.scheduled_job.claim.v1",
+            Self::ScheduledJobComplete => "sporos.scheduled_job.complete.v1",
+            Self::ScheduledJobRun => "sporos.scheduled_job.run.v1",
         }
     }
 
@@ -247,6 +256,27 @@ impl ActivityKind {
                 duplicate_safety: DuplicateSafety::RepeatAcceptedByContract,
                 retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
                 contract: "cleanup activities delete or mark deterministic stale records and files, and repeating cleanup must leave retained state unchanged",
+            },
+            Self::ScheduledJobClaim => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "scheduled job claims use durable job rows and stable job names; ambiguous retries must observe the row before claiming again",
+            },
+            Self::ScheduledJobComplete => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "scheduled job completion updates durable job rows and must preserve terminal status across ambiguous retries",
+            },
+            Self::ScheduledJobRun => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "scheduled job run activities perform job-specific side effects and rely on the workflow checkpoint before repeating work",
             },
         }
     }

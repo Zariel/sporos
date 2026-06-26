@@ -64,9 +64,11 @@ use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
     DryRunAction, InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
 };
+#[cfg(test)]
+use crate::runtime::scheduler::ScheduledJobRun;
 use crate::runtime::scheduler::{
-    CLEANUP_JOB_NAME, CLIENT_INVENTORY_JOB_NAME, INDEXER_CAPS_JOB_NAME, ImmediateRunOutcome,
-    MEDIA_INVENTORY_JOB_NAME, OpportunisticRunOutcome, ScheduledJobRun, SchedulerError,
+    CLEANUP_JOB_NAME, CLIENT_INVENTORY_JOB_NAME, INDEXER_CAPS_JOB_NAME, MEDIA_INVENTORY_JOB_NAME,
+    OpportunisticRunOutcome,
 };
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
@@ -79,7 +81,6 @@ use crate::torrent::parse_metafile;
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKGROUND_ABORT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 const WORKFLOW_RUNTIME_SHUTDOWN_TIMEOUT_MS: u64 = 100;
-const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
 const ANNOUNCE_WORKFLOW_RECOVERY_MAX: u16 = u16::MAX;
 const SCHEDULER_SHUTDOWN_ERROR: &str = "scheduler is shutting down";
@@ -189,7 +190,7 @@ pub enum DaemonError {
 pub async fn serve(config: SporosConfig) -> Result<(), DaemonError> {
     validate_server_auth(&config).map_err(|source| DaemonError::Config { source })?;
     let bind = config.server.bind;
-    let runtime = AppRuntime::build(config)
+    let runtime = Box::pin(AppRuntime::build(config))
         .await
         .map_err(|source| DaemonError::BuildRuntime { source })?;
     let listener = TcpListener::bind(bind)
@@ -198,7 +199,7 @@ pub async fn serve(config: SporosConfig) -> Result<(), DaemonError> {
             message: format!("cannot bind {bind}: {error}"),
         })?;
 
-    serve_with_listener(runtime, listener).await
+    Box::pin(serve_with_listener(runtime, listener)).await
 }
 
 pub async fn serve_with_listener(
@@ -260,6 +261,13 @@ enum BackgroundShutdownPolicy {
     AwaitInFlight,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "deadline finalizers are retained for test-only legacy scheduler helpers"
+    )
+)]
 #[derive(Debug, Clone)]
 enum BackgroundDeadlineFinalizer {
     SafeJobShutdown {
@@ -290,6 +298,13 @@ impl BackgroundTask {
         )
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "deadline finalizers are retained for test-only legacy scheduler helpers"
+        )
+    )]
     fn with_deadline_finalizer(mut self, finalizer: BackgroundDeadlineFinalizer) -> Self {
         self.deadline_finalizer = Some(finalizer);
         self
@@ -334,7 +349,7 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         announcements,
         searches,
         jobs,
-        scheduler,
+        scheduler: _scheduler,
         inventory_refresh,
         notifications,
     } = runtime.receivers;
@@ -448,43 +463,6 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         ),
         BackgroundShutdownPolicy::AwaitInFlight,
     ));
-    handles.push(
-        BackgroundTask::new(
-            "scheduler-tick",
-            spawn_supervised_background(
-                "scheduler-tick",
-                &runtime.state,
-                run_scheduler_tick_loop(
-                    runtime.state.clone(),
-                    SCHEDULER_TICK_INTERVAL,
-                    runtime.state.shutdown_signal.clone(),
-                ),
-            ),
-            BackgroundShutdownPolicy::AbortOnTimeout,
-        )
-        .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
-            repository: runtime.state.repository.clone(),
-        }),
-    );
-    handles.push(
-        BackgroundTask::new(
-            "scheduler-receiver",
-            spawn_supervised_background(
-                "scheduler-receiver",
-                &runtime.state,
-                run_scheduler_receiver(
-                    runtime.state.clone(),
-                    scheduler,
-                    runtime.state.shutdown_signal.clone(),
-                ),
-            ),
-            BackgroundShutdownPolicy::AwaitInFlight,
-        )
-        .with_deadline_finalizer(BackgroundDeadlineFinalizer::SafeJobShutdown {
-            repository: runtime.state.repository.clone(),
-        }),
-    );
-
     if let Err(error) = enqueue_startup_media_inventory_refresh(&runtime.state).await {
         warn!(error = %error, "failed to queue startup media inventory refresh");
     }
@@ -547,31 +525,18 @@ async fn submit_active_announce_workflows(
     Ok(summary)
 }
 
-async fn enqueue_startup_media_inventory_refresh(state: &AppState) -> Result<(), SchedulerError> {
+async fn enqueue_startup_media_inventory_refresh(state: &AppState) -> Result<(), String> {
     if state.config.paths.media_dirs.is_empty() {
         return Ok(());
     }
 
-    let job_name =
-        JobName::new(MEDIA_INVENTORY_JOB_NAME).map_err(|error| SchedulerError::InvalidConfig {
-            field: "job name",
-            message: error.to_string(),
-        })?;
-    match state
-        .scheduler
-        .enqueue_immediate_run(&job_name, unix_time_ms())
-        .await?
-    {
-        ImmediateRunOutcome::Queued => {
-            info!(job_name = %job_name, "queued startup media inventory refresh");
-        }
-        ImmediateRunOutcome::Coalesced => {
-            info!(job_name = %job_name, "startup media inventory refresh already queued or running");
-        }
-        ImmediateRunOutcome::Deferred => {
-            warn!(job_name = %job_name, "startup media inventory refresh deferred");
-        }
-    }
+    let job_name = JobName::new(MEDIA_INVENTORY_JOB_NAME).map_err(|error| error.to_string())?;
+    state
+        .workflow_runtime
+        .submit_scheduled_job_run(&job_name, true, unix_time_ms())
+        .await
+        .map_err(|error| error.to_string())?;
+    info!(job_name = %job_name, "queued startup media inventory refresh");
 
     Ok(())
 }
@@ -708,6 +673,11 @@ async fn run_inventory_refresh_workflow_ingress(
     }
 }
 
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "legacy scheduler tick loop is retained for focused scheduler tests"
+)]
 async fn run_scheduler_tick_loop(
     state: AppState,
     interval: Duration,
@@ -2009,18 +1979,12 @@ async fn run_job_receiver(
                 };
                 let job_name = request.job_name.clone();
                 match state
-                    .scheduler
-                    .enqueue_immediate_run(&request.job_name, unix_time_ms())
+                    .workflow_runtime
+                    .submit_scheduled_job_run(&request.job_name, true, unix_time_ms())
                     .await
                 {
-                    Ok(ImmediateRunOutcome::Queued) => {
+                    Ok(()) => {
                         tracing::info!(job_name = %job_name, "scheduled job run queued");
-                    }
-                    Ok(ImmediateRunOutcome::Coalesced) => {
-                        tracing::info!(job_name = %job_name, "scheduled job run already active");
-                    }
-                    Ok(ImmediateRunOutcome::Deferred) => {
-                        warn!(job_name = %job_name, "scheduled job run deferred");
                     }
                     Err(error) => warn!(job_name = %job_name, error = %error, "scheduled job trigger failed"),
                 }
@@ -2051,6 +2015,7 @@ async fn release_queued_job_requests(
     }
 }
 
+#[cfg(test)]
 async fn run_scheduler_receiver(
     state: AppState,
     mut receiver: crate::runtime::queue::WorkReceiver<ScheduledJobRun>,
@@ -2074,6 +2039,7 @@ async fn run_scheduler_receiver(
     }
 }
 
+#[cfg(test)]
 async fn release_queued_scheduler_runs(
     state: &AppState,
     receiver: &mut crate::runtime::queue::WorkReceiver<ScheduledJobRun>,
@@ -2095,6 +2061,7 @@ async fn release_queued_scheduler_runs(
     }
 }
 
+#[cfg(test)]
 async fn process_scheduled_job_run(
     state: &AppState,
     run: ScheduledJobRun,
@@ -2169,7 +2136,7 @@ async fn process_scheduled_job_run(
     }
 }
 
-async fn execute_scheduled_job(
+pub(crate) async fn execute_scheduled_job(
     state: &AppState,
     job_name: &JobName,
     mut shutdown: ShutdownSignal,
@@ -5319,7 +5286,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
 
-        let handle = tokio::spawn(async move { serve_with_listener(runtime, listener).await });
+        let handle =
+            tokio::spawn(async move { Box::pin(serve_with_listener(runtime, listener)).await });
         let response = wait_for_livez(address).await;
 
         handle.abort();
@@ -5338,7 +5306,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
 
-        let handle = tokio::spawn(async move { serve_with_listener(runtime, listener).await });
+        let handle =
+            tokio::spawn(async move { Box::pin(serve_with_listener(runtime, listener)).await });
         let response = wait_for_livez(address).await;
         let ready = wait_for_readyz(address).await;
         shutdown.cancel_now("test shutdown").unwrap();
@@ -5527,7 +5496,7 @@ mod tests {
         let handles = start_background_tasks(runtime).await.unwrap();
         wait_for_local_item_count(&repository, 2).await;
         wait_for_job_state(&repository, MEDIA_INVENTORY_JOB_NAME, "succeeded").await;
-        wait_for_queue_completed(&scheduler_queue, 1).await;
+        assert_eq!(0, scheduler_queue.stats().completed);
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
@@ -5594,6 +5563,7 @@ mod tests {
 
         let handles = start_background_tasks(runtime).await.unwrap();
         wait_for_local_item_count(&repository, 1).await;
+        wait_for_local_file_count(&repository, 1).await;
         let summary = process_search_workflow(
             state,
             SearchWorkflowRequest {
@@ -7401,7 +7371,7 @@ mod tests {
         assert_eq!(StatusCode::ACCEPTED, accepted.status());
         wait_for_job_state(&repository, "indexer_caps", "succeeded").await;
         wait_for_queue_completed(&job_queue, 1).await;
-        wait_for_queue_completed(&scheduler_queue, 1).await;
+        assert_eq!(0, scheduler_queue.stats().completed);
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
@@ -7456,7 +7426,7 @@ mod tests {
         assert_eq!(StatusCode::ACCEPTED, accepted.status());
         wait_for_job_state(&repository, CLEANUP_JOB_NAME, "succeeded").await;
         wait_for_queue_completed(&job_queue, 1).await;
-        wait_for_queue_completed(&scheduler_queue, 1).await;
+        assert_eq!(0, scheduler_queue.stats().completed);
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
@@ -7486,8 +7456,8 @@ mod tests {
         assert_eq!(
             vec![(
                 "ann_running".to_owned(),
-                "queued".to_owned(),
-                "dependency_backoff".to_owned()
+                "waiting".to_owned(),
+                "inventory_refreshing".to_owned()
             )],
             rows
         );
@@ -8468,7 +8438,7 @@ mod tests {
         let handles = start_background_tasks(runtime).await.unwrap();
 
         wait_for_job_state(&repository, "indexer_caps", "succeeded").await;
-        wait_for_queue_completed(&scheduler_queue, 1).await;
+        assert_eq!(0, scheduler_queue.stats().completed);
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
@@ -9104,6 +9074,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(expected, count);
+    }
+
+    async fn wait_for_local_file_count(repository: &Repository, expected: i64) {
+        for _attempt in 0..50 {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_files")
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+            if count == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_files")
             .fetch_one(repository.pool())
             .await
             .unwrap();

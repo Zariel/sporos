@@ -3,6 +3,7 @@ use std::num::{NonZeroU8, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -46,7 +47,8 @@ use crate::runtime::backoff::stable_jitter_seed;
 use crate::runtime::daemon::AnnounceProcessor;
 use crate::runtime::duroxide_workflow::{
     AnnounceWorkflowActivities, DuroxideWorkflowRuntime, DuroxideWorkflowRuntimeError,
-    workflow_database_path, workflow_runtime_dependency_name,
+    ScheduledJobStateHandle, ScheduledJobWorkflowActivities, workflow_database_path,
+    workflow_runtime_dependency_name,
 };
 use crate::runtime::health::{DependencyKind, HealthRegistry};
 use crate::runtime::injection_worker::{InjectionClient, InjectionWorker};
@@ -1140,7 +1142,14 @@ impl AppRuntime {
         Self::from_repository(config, repository).await
     }
 
-    pub async fn from_repository(
+    pub fn from_repository(
+        config: SporosConfig,
+        repository: Repository,
+    ) -> BoxFuture<'static, Result<Self, DatabaseError>> {
+        Box::pin(Self::from_repository_inner(config, repository))
+    }
+
+    async fn from_repository_inner(
         config: SporosConfig,
         repository: Repository,
     ) -> Result<Self, DatabaseError> {
@@ -1248,6 +1257,7 @@ impl AppRuntime {
             scheduler.clone(),
             injection_worker.clone(),
         );
+        let scheduled_job_state = ScheduledJobStateHandle::new();
         let workflow_runtime = map_workflow_runtime_error(
             DuroxideWorkflowRuntime::start_with_activities(
                 runtime_workflow_database_path(&config),
@@ -1263,6 +1273,11 @@ impl AppRuntime {
                     announce_processor,
                     config.announce.clone(),
                     shutdown_signal.clone(),
+                ),
+                ScheduledJobWorkflowActivities::new(
+                    scheduler.clone(),
+                    shutdown_signal.clone(),
+                    scheduled_job_state.clone(),
                 ),
             )
             .await,
@@ -1344,6 +1359,15 @@ impl AppRuntime {
             shutdown,
             shutdown_signal,
         };
+        let mut scheduled_job_activity_state = state.clone();
+        scheduled_job_activity_state.workflow_runtime = scheduled_job_activity_state
+            .workflow_runtime
+            .without_scheduled_job_state();
+        scheduled_job_activity_state.http = HttpState::new(
+            ReadinessState::ready(),
+            scheduled_job_activity_state.health.clone(),
+        );
+        let _ = scheduled_job_state.bind(scheduled_job_activity_state);
         if let Err(error) = state.refresh_startup_prowlarr_sources(now_ms).await {
             state.workflow_runtime.shutdown(Some(1_000)).await;
             return Err(error);

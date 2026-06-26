@@ -107,6 +107,13 @@ pub enum ImmediateRunOutcome {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ScheduledJobClaimOutcome {
+    Claimed,
+    Coalesced,
+    BackingOff { next_run_at_ms: i64 },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum OpportunisticRunOutcome {
     Queued,
     Coalesced,
@@ -285,6 +292,75 @@ impl PersistedScheduler {
             enqueued,
             deferred,
         })
+    }
+
+    pub async fn claim_due_run(
+        &self,
+        job_name: &JobName,
+        now_ms: i64,
+    ) -> Result<Option<ScheduledJobRun>, SchedulerError> {
+        let _claim_guard = self.claim_lock.lock().await;
+        self.seed_jobs(now_ms).await?;
+        self.job(job_name)?;
+        if !self
+            .repository
+            .ready_jobs(now_ms, self.claim_limit)
+            .await?
+            .iter()
+            .any(|ready_job| ready_job == job_name)
+        {
+            return Ok(None);
+        }
+        if !self
+            .repository
+            .claim_scheduled_job_run(job_name, now_ms)
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(ScheduledJobRun {
+            job_name: job_name.clone(),
+            scheduled_at_ms: now_ms,
+        }))
+    }
+
+    pub async fn claim_manual_run(
+        &self,
+        job_name: &JobName,
+        now_ms: i64,
+        forced: bool,
+    ) -> Result<ScheduledJobClaimOutcome, SchedulerError> {
+        let _claim_guard = self.claim_lock.lock().await;
+        self.seed_jobs(now_ms).await?;
+        self.job(job_name)?;
+        if !forced && let Some(snapshot) = self.repository.job_status(job_name).await? {
+            if snapshot.state == "running" || snapshot.state == "disabled" {
+                return Ok(ScheduledJobClaimOutcome::Coalesced);
+            }
+            if matches!(snapshot.state.as_str(), "failed" | "waiting")
+                && let Some(next_run_at_ms) = snapshot.next_run_at_ms
+                && next_run_at_ms > now_ms
+            {
+                return Ok(ScheduledJobClaimOutcome::BackingOff { next_run_at_ms });
+            }
+        }
+        if !self
+            .repository
+            .claim_immediate_job_run(job_name, now_ms)
+            .await?
+        {
+            return Ok(ScheduledJobClaimOutcome::Coalesced);
+        }
+        Ok(ScheduledJobClaimOutcome::Claimed)
+    }
+
+    pub async fn next_run_at(&self, job_name: &JobName) -> Result<Option<i64>, SchedulerError> {
+        self.job(job_name)?;
+        Ok(self
+            .repository
+            .job_status(job_name)
+            .await?
+            .and_then(|snapshot| snapshot.next_run_at_ms))
     }
 
     pub async fn trigger_now(
@@ -668,6 +744,29 @@ mod tests {
         assert_eq!(CLEANUP_JOB_NAME, run.job_name.as_str());
         assert_eq!(1, jobs.len());
         assert_eq!("running", jobs[0].state);
+    }
+
+    #[tokio::test]
+    async fn scheduler_manual_claim_coalesces_running_job_even_when_forced() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let (queue, _receiver) = scheduler_queue(nonzero(4));
+        let scheduler = PersistedScheduler::new(repository.clone(), queue, test_config());
+        let cleanup = JobName::new(CLEANUP_JOB_NAME).unwrap();
+
+        let first = scheduler
+            .claim_manual_run(&cleanup, 100, true)
+            .await
+            .unwrap();
+        let second = scheduler
+            .claim_manual_run(&cleanup, 200, true)
+            .await
+            .unwrap();
+        let job = repository.job_status(&cleanup).await.unwrap().unwrap();
+
+        assert_eq!(ScheduledJobClaimOutcome::Claimed, first);
+        assert_eq!(ScheduledJobClaimOutcome::Coalesced, second);
+        assert_eq!("running", job.state);
+        assert_eq!(Some(100), job.last_started_at_ms);
     }
 
     #[tokio::test]

@@ -2,19 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use duroxide::providers::Provider;
 use duroxide::providers::sqlite::SqliteProvider;
 use duroxide::runtime::registry::ActivityRegistry;
 use duroxide::runtime::{OrchestrationStatus, Runtime, RuntimeOptions};
-use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry};
+use duroxide::{ActivityContext, Client, Either2, OrchestrationContext, OrchestrationRegistry};
 use serde::{Deserialize, Serialize};
 
 use crate::announce::{
     AnnounceQueueConfig, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
-use crate::domain::{DependencyKind, DependencyName};
+use crate::domain::{DependencyKind, DependencyName, JobName};
 use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshSummary, InventoryRefreshWorker,
     record_inventory_refresh_health, scan_failure_reason,
@@ -27,14 +27,19 @@ use crate::runtime::announce_worker::{
     AnnounceWorkOutcome, AnnounceWorker, retry_database_call, unix_time_ms,
 };
 use crate::runtime::daemon::{
-    AnnounceInventoryRefreshMode, AnnounceProcessor, process_announce_work_with_processor_mode,
+    AnnounceInventoryRefreshMode, AnnounceProcessor, execute_scheduled_job,
+    process_announce_work_with_processor_mode,
 };
 use crate::runtime::injection_worker::InjectionWorker;
+use crate::runtime::scheduler::{
+    CLIENT_INVENTORY_JOB_NAME, MEDIA_INVENTORY_JOB_NAME, PersistedScheduler,
+    ScheduledJobClaimOutcome,
+};
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 use crate::runtime::workflow_contracts::{
     ActivityInputEnvelope, ActivityKind, AnnounceWorkflowInput, InventoryRefreshKind,
-    InventoryRefreshWorkflowInput, WorkflowCustomStatus, WorkflowEventName, WorkflowInstanceId,
-    WorkflowKind, WorkflowReason, WorkflowState,
+    InventoryRefreshWorkflowInput, ScheduledJobWorkflowInput, WorkflowCustomStatus,
+    WorkflowEventName, WorkflowInstanceId, WorkflowKind, WorkflowReason, WorkflowState,
 };
 
 pub const WORKFLOW_RUNTIME_DEPENDENCY: &str = "workflow-runtime";
@@ -43,7 +48,12 @@ const DEFAULT_DATABASE_DIR: &str = "db";
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STARTUP_LONG_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const INVENTORY_REFRESH_QUEUE: &str = "inventory_refresh_requests";
+const SCHEDULED_JOB_RUN_ORCHESTRATION: &str = "sporos.scheduled_job.run.v1";
+const SCHEDULED_JOB_MANUAL_QUEUE: &str = "manual_job_requests";
 const INVENTORY_REFRESH_ACTIVITY_ID: &str = "inventory-refresh";
+const SCHEDULED_JOB_CLAIM_ACTIVITY_ID: &str = "scheduled-job-claim";
+const SCHEDULED_JOB_COMPLETE_ACTIVITY_ID: &str = "scheduled-job-complete";
+const SCHEDULED_JOB_RUN_ACTIVITY_ID: &str = "scheduled-job-run";
 const ANNOUNCE_PROCESS_ACTIVITY_ID: &str = "announce-process";
 const ANNOUNCE_WAIT_ACTIVITY_ID: &str = "announce-wait";
 const ANNOUNCE_WORKFLOW_OWNER: &str = "sporos-announce-workflow";
@@ -61,6 +71,8 @@ pub struct DuroxideWorkflowRuntime {
     seeded_supervisors: Arc<Mutex<BTreeSet<String>>>,
     active_inventory_refreshes: Arc<Mutex<BTreeSet<String>>>,
     inventory_completion_events: InventoryCompletionEventBridge,
+    scheduled_job_state: Option<ScheduledJobStateHandle>,
+    scheduled_job_scheduler: Option<PersistedScheduler>,
 }
 
 impl DuroxideWorkflowRuntime {
@@ -79,6 +91,7 @@ impl DuroxideWorkflowRuntime {
                 repository,
                 inventory: Some(activities),
                 announce: None,
+                scheduled_jobs: None,
             }),
         )
         .await
@@ -88,6 +101,7 @@ impl DuroxideWorkflowRuntime {
         database_path: PathBuf,
         inventory: InventoryWorkflowActivities,
         announce: AnnounceWorkflowActivities,
+        scheduled_jobs: ScheduledJobWorkflowActivities,
     ) -> Result<Self, DuroxideWorkflowRuntimeError> {
         let repository = inventory.repository.clone();
         Self::start_inner(
@@ -96,6 +110,7 @@ impl DuroxideWorkflowRuntime {
                 repository,
                 inventory: Some(inventory),
                 announce: Some(announce),
+                scheduled_jobs: Some(scheduled_jobs),
             }),
         )
         .await
@@ -118,6 +133,14 @@ impl DuroxideWorkflowRuntime {
         let repository = activities
             .as_ref()
             .map(|activities| activities.repository.clone());
+        let scheduled_job_state = activities
+            .as_ref()
+            .and_then(|activities| activities.scheduled_jobs.as_ref())
+            .map(|activities| activities.state.clone());
+        let scheduled_job_scheduler = activities
+            .as_ref()
+            .and_then(|activities| activities.scheduled_jobs.as_ref())
+            .map(|activities| activities.scheduler.clone());
         let active_inventory_refreshes = Arc::new(Mutex::new(BTreeSet::new()));
         let inventory_completion_events =
             InventoryCompletionEventBridge::new(Arc::clone(&store), repository.clone());
@@ -150,6 +173,8 @@ impl DuroxideWorkflowRuntime {
             seeded_supervisors: Arc::new(Mutex::new(BTreeSet::new())),
             active_inventory_refreshes,
             inventory_completion_events,
+            scheduled_job_state,
+            scheduled_job_scheduler,
         };
         if let Err(error) = runtime
             .inventory_completion_events
@@ -170,6 +195,79 @@ impl DuroxideWorkflowRuntime {
 
     pub fn client(&self) -> Client {
         Client::new(Arc::clone(&self.store))
+    }
+
+    pub fn without_scheduled_job_state(&self) -> Self {
+        Self {
+            database_path: self.database_path.clone(),
+            repository: self.repository.clone(),
+            store: Arc::clone(&self.store),
+            runtime: Arc::clone(&self.runtime),
+            seeded_supervisors: Arc::clone(&self.seeded_supervisors),
+            active_inventory_refreshes: Arc::clone(&self.active_inventory_refreshes),
+            inventory_completion_events: self.inventory_completion_events.clone(),
+            scheduled_job_state: None,
+            scheduled_job_scheduler: self.scheduled_job_scheduler.clone(),
+        }
+    }
+
+    pub async fn submit_scheduled_job_run(
+        &self,
+        job_name: &JobName,
+        forced: bool,
+        requested_at_ms: i64,
+    ) -> Result<(), DuroxideWorkflowRuntimeError> {
+        let claimed_scheduled_at_ms = if let Some(scheduler) = &self.scheduled_job_scheduler {
+            match scheduler
+                .claim_manual_run(job_name, requested_at_ms, forced)
+                .await
+                .map_err(|error| DuroxideWorkflowRuntimeError::StartSupervisor {
+                    instance_id: job_name.as_str().to_owned(),
+                    message: error.to_string(),
+                })? {
+                ScheduledJobClaimOutcome::Claimed => Some(requested_at_ms),
+                ScheduledJobClaimOutcome::Coalesced
+                | ScheduledJobClaimOutcome::BackingOff { .. } => return Ok(()),
+            }
+        } else {
+            None
+        };
+        let instance_id = WorkflowInstanceId::scheduled_job_supervisor(job_name.as_str())
+            .map_err(DuroxideWorkflowRuntimeError::InvalidSupervisorId)?;
+        let enqueue_result = self
+            .client()
+            .enqueue_event_typed(
+                instance_id.as_str(),
+                SCHEDULED_JOB_MANUAL_QUEUE,
+                &ScheduledJobManualRequest {
+                    requested_at_ms,
+                    forced,
+                    claimed_scheduled_at_ms,
+                },
+            )
+            .await
+            .map_err(|error| DuroxideWorkflowRuntimeError::StartSupervisor {
+                instance_id: instance_id.to_string(),
+                message: error.to_string(),
+            });
+        if enqueue_result.is_err()
+            && claimed_scheduled_at_ms.is_some()
+            && let Some(scheduler) = &self.scheduled_job_scheduler
+            && let Err(error) = scheduler
+                .complete_failure(
+                    job_name,
+                    unix_time_ms(),
+                    "scheduled job trigger enqueue failed",
+                )
+                .await
+        {
+            tracing::warn!(
+                job_name = %job_name,
+                error = %error,
+                "failed to release scheduled job claim after trigger enqueue failure"
+            );
+        }
+        enqueue_result
     }
 
     pub async fn register_inventory_completion_waiter(
@@ -410,6 +508,9 @@ impl DuroxideWorkflowRuntime {
 
     pub async fn shutdown(&self, timeout_ms: Option<u64>) {
         self.runtime.clone().shutdown(timeout_ms).await;
+        if let Some(handle) = &self.scheduled_job_state {
+            handle.clear();
+        }
     }
 
     async fn seed_supervisor(
@@ -545,6 +646,21 @@ impl fmt::Debug for DuroxideWorkflowRuntime {
             .debug_struct("DuroxideWorkflowRuntime")
             .field("database_path", &self.database_path)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DuroxideWorkflowRuntime {
+    fn drop(&mut self) {
+        let is_last_runtime_owner = Arc::strong_count(&self.runtime) == 1;
+        if is_last_runtime_owner && let Some(handle) = &self.scheduled_job_state {
+            handle.clear();
+        }
+        if is_last_runtime_owner && let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let runtime = Arc::clone(&self.runtime);
+            handle.spawn(async move {
+                runtime.shutdown(Some(0)).await;
+            });
+        }
     }
 }
 
@@ -839,11 +955,56 @@ struct WorkflowShellActivityOutput {
     accepted: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ScheduledJobManualRequest {
+    requested_at_ms: i64,
+    forced: bool,
+    claimed_scheduled_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ScheduledJobClaimActivityInput {
+    job_name: String,
+    now_ms: i64,
+    manual: Option<ScheduledJobManualRequest>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ScheduledJobClaimActivityOutput {
+    job_name: String,
+    scheduled_at_ms: Option<i64>,
+    next_run_at_ms: Option<i64>,
+    coalesced: bool,
+    backing_off: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ScheduledJobCompleteActivityInput {
+    job_name: String,
+    scheduled_at_ms: i64,
+    succeeded: bool,
+    error: Option<String>,
+    finished_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ScheduledJobRunActivityInput {
+    job_name: String,
+    scheduled_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ScheduledJobRunActivityOutput {
+    succeeded: bool,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct WorkflowRuntimeActivities {
     repository: Repository,
     inventory: Option<InventoryWorkflowActivities>,
     announce: Option<AnnounceWorkflowActivities>,
+    scheduled_jobs: Option<ScheduledJobWorkflowActivities>,
 }
 
 impl WorkflowRuntimeActivities {
@@ -859,6 +1020,73 @@ impl WorkflowRuntimeActivities {
             self.announce = Some(announce.with_completion_event_bridge(completion_events));
         }
         self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduledJobWorkflowActivities {
+    scheduler: PersistedScheduler,
+    shutdown: ShutdownSignal,
+    state: ScheduledJobStateHandle,
+    inventory: Option<InventoryWorkflowActivities>,
+    active_inventory_refreshes: Option<Arc<Mutex<BTreeSet<String>>>>,
+}
+
+impl ScheduledJobWorkflowActivities {
+    pub fn new(
+        scheduler: PersistedScheduler,
+        shutdown: ShutdownSignal,
+        state: ScheduledJobStateHandle,
+    ) -> Self {
+        Self {
+            scheduler,
+            shutdown,
+            state,
+            inventory: None,
+            active_inventory_refreshes: None,
+        }
+    }
+
+    fn with_inventory_runtime(
+        mut self,
+        inventory: InventoryWorkflowActivities,
+        active_inventory_refreshes: Arc<Mutex<BTreeSet<String>>>,
+    ) -> Self {
+        self.inventory = Some(inventory);
+        self.active_inventory_refreshes = Some(active_inventory_refreshes);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScheduledJobStateHandle {
+    state: Arc<Mutex<Option<crate::runtime::app::AppState>>>,
+}
+
+impl ScheduledJobStateHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bind(&self, state: crate::runtime::app::AppState) -> bool {
+        let Ok(mut guard) = self.state.lock() else {
+            return false;
+        };
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(state);
+        true
+    }
+
+    fn get(&self) -> Option<crate::runtime::app::AppState> {
+        self.state.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            *guard = None;
+        }
     }
 }
 
@@ -1692,23 +1920,75 @@ async fn prepare_workflow_database(path: &Path) -> Result<(), DuroxideWorkflowRu
 fn activity_registry() -> ActivityRegistry {
     let mut builder = ActivityRegistry::builder();
     for activity in ActivityKind::ALL {
-        builder = builder.register_typed(
-            activity.as_str(),
-            move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
-                Ok(WorkflowShellActivityOutput {
-                    activity: input.activity,
-                    accepted: input.activity == activity,
-                })
-            },
-        );
+        match activity {
+            ActivityKind::ScheduledJobClaim => {
+                builder = builder.register_typed(
+                    activity.as_str(),
+                    move |_ctx: ActivityContext,
+                          input: ActivityInputEnvelope<ScheduledJobClaimActivityInput>| async move {
+                        Ok(ScheduledJobClaimActivityOutput {
+                            job_name: input.payload.job_name,
+                            scheduled_at_ms: None,
+                            next_run_at_ms: Some(input.payload.now_ms.saturating_add(60_000)),
+                            coalesced: false,
+                            backing_off: false,
+                        })
+                    },
+                );
+            }
+            ActivityKind::ScheduledJobComplete => {
+                builder = builder.register_typed(
+                    activity.as_str(),
+                    move |_ctx: ActivityContext,
+                          input: ActivityInputEnvelope<ScheduledJobCompleteActivityInput>| async move {
+                        Ok(ScheduledJobRunActivityOutput {
+                            succeeded: input.payload.succeeded,
+                            error: input.payload.error,
+                        })
+                    },
+                );
+            }
+            ActivityKind::ScheduledJobRun => {
+                builder = builder.register_typed(
+                    activity.as_str(),
+                    move |_ctx: ActivityContext,
+                          _input: ActivityInputEnvelope<ScheduledJobRunActivityInput>| async move {
+                        Ok(ScheduledJobRunActivityOutput {
+                            succeeded: true,
+                            error: None,
+                        })
+                    },
+                );
+            }
+            _ => {
+                builder = builder.register_typed(
+                    activity.as_str(),
+                    move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                        Ok(WorkflowShellActivityOutput {
+                            activity: input.activity,
+                            accepted: input.activity == activity,
+                        })
+                    },
+                );
+            }
+        }
     }
     builder.build()
 }
 
 fn activity_registry_with_runtime_activities(
-    activities: WorkflowRuntimeActivities,
+    mut activities: WorkflowRuntimeActivities,
     active_inventory_refreshes: Arc<Mutex<BTreeSet<String>>>,
 ) -> ActivityRegistry {
+    if let (Some(scheduled_jobs), Some(inventory)) = (
+        activities.scheduled_jobs.take(),
+        activities.inventory.clone(),
+    ) {
+        activities.scheduled_jobs = Some(
+            scheduled_jobs
+                .with_inventory_runtime(inventory, Arc::clone(&active_inventory_refreshes)),
+        );
+    }
     let mut builder = ActivityRegistry::builder();
     for activity in ActivityKind::ALL {
         match activity {
@@ -1784,6 +2064,96 @@ fn activity_registry_with_runtime_activities(
                             async move {
                                 run_announce_queue_inventory_activity(
                                     announce,
+                                    input.workflow_id,
+                                    input.payload,
+                                )
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::ScheduledJobClaim => {
+                if let Some(scheduled_jobs) = activities.scheduled_jobs.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<ScheduledJobClaimActivityInput>| {
+                            let scheduled_jobs = scheduled_jobs.clone();
+                            async move {
+                                run_scheduled_job_claim_activity(
+                                    scheduled_jobs,
+                                    input.workflow_id,
+                                    input.payload,
+                                )
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::ScheduledJobComplete => {
+                if let Some(scheduled_jobs) = activities.scheduled_jobs.clone() {
+                    builder =
+                        builder.register_typed(
+                            activity.as_str(),
+                            move |_ctx: ActivityContext,
+                                  input: ActivityInputEnvelope<
+                                ScheduledJobCompleteActivityInput,
+                            >| {
+                                let scheduled_jobs = scheduled_jobs.clone();
+                                async move {
+                                    run_scheduled_job_complete_activity(
+                                        scheduled_jobs,
+                                        input.workflow_id,
+                                        input.payload,
+                                    )
+                                    .await
+                                }
+                            },
+                        );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::ScheduledJobRun => {
+                if let Some(scheduled_jobs) = activities.scheduled_jobs.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<ScheduledJobRunActivityInput>| {
+                            let scheduled_jobs = scheduled_jobs.clone();
+                            async move {
+                                run_scheduled_job_activity(
+                                    scheduled_jobs,
                                     input.workflow_id,
                                     input.payload,
                                 )
@@ -2021,6 +2391,193 @@ async fn run_inventory_activity(
         active.remove(&workflow_id);
     }
     output
+}
+
+async fn run_scheduled_job_claim_activity(
+    activities: ScheduledJobWorkflowActivities,
+    _workflow_id: String,
+    input: ScheduledJobClaimActivityInput,
+) -> Result<ScheduledJobClaimActivityOutput, String> {
+    let job_name = JobName::new(&input.job_name).map_err(|error| error.to_string())?;
+    if let Some(manual) = input.manual {
+        let outcome = activities
+            .scheduler
+            .claim_manual_run(&job_name, manual.requested_at_ms, manual.forced)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(match outcome {
+            ScheduledJobClaimOutcome::Claimed => ScheduledJobClaimActivityOutput {
+                job_name: input.job_name,
+                scheduled_at_ms: Some(manual.requested_at_ms),
+                next_run_at_ms: None,
+                coalesced: false,
+                backing_off: false,
+            },
+            ScheduledJobClaimOutcome::Coalesced => ScheduledJobClaimActivityOutput {
+                job_name: input.job_name,
+                scheduled_at_ms: None,
+                next_run_at_ms: None,
+                coalesced: true,
+                backing_off: false,
+            },
+            ScheduledJobClaimOutcome::BackingOff { next_run_at_ms } => {
+                ScheduledJobClaimActivityOutput {
+                    job_name: input.job_name,
+                    scheduled_at_ms: None,
+                    next_run_at_ms: Some(next_run_at_ms),
+                    coalesced: false,
+                    backing_off: true,
+                }
+            }
+        });
+    }
+
+    let claimed = activities
+        .scheduler
+        .claim_due_run(&job_name, input.now_ms)
+        .await
+        .map_err(|error| error.to_string())?;
+    let scheduled_at_ms = claimed.map(|run| run.scheduled_at_ms);
+    let next_run_at_ms = if scheduled_at_ms.is_some() {
+        None
+    } else {
+        activities
+            .scheduler
+            .next_run_at(&job_name)
+            .await
+            .map_err(|error| error.to_string())?
+    };
+    Ok(ScheduledJobClaimActivityOutput {
+        job_name: input.job_name,
+        scheduled_at_ms,
+        next_run_at_ms,
+        coalesced: false,
+        backing_off: false,
+    })
+}
+
+async fn run_scheduled_job_complete_activity(
+    activities: ScheduledJobWorkflowActivities,
+    _workflow_id: String,
+    input: ScheduledJobCompleteActivityInput,
+) -> Result<ScheduledJobRunActivityOutput, String> {
+    let job_name = JobName::new(&input.job_name).map_err(|error| error.to_string())?;
+    if activities.shutdown.state().phase != ShutdownPhase::Running {
+        activities
+            .scheduler
+            .complete_shutdown(&job_name, input.finished_at_ms)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(ScheduledJobRunActivityOutput {
+            succeeded: false,
+            error: Some("scheduler is shutting down".to_owned()),
+        });
+    }
+    if input.succeeded {
+        activities
+            .scheduler
+            .complete_success(&job_name, input.finished_at_ms)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        activities
+            .scheduler
+            .complete_failure(
+                &job_name,
+                input.finished_at_ms,
+                input.error.as_deref().unwrap_or("scheduled job failed"),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(ScheduledJobRunActivityOutput {
+        succeeded: input.succeeded,
+        error: input.error,
+    })
+}
+
+async fn run_scheduled_job_activity(
+    activities: ScheduledJobWorkflowActivities,
+    _workflow_id: String,
+    input: ScheduledJobRunActivityInput,
+) -> Result<ScheduledJobRunActivityOutput, String> {
+    if activities.shutdown.state().phase != ShutdownPhase::Running {
+        return Ok(ScheduledJobRunActivityOutput {
+            succeeded: false,
+            error: Some("scheduler is shutting down".to_owned()),
+        });
+    }
+    let Some(state) = activities.state.get() else {
+        return Ok(ScheduledJobRunActivityOutput {
+            succeeded: false,
+            error: Some("scheduled job state handle is not bound".to_owned()),
+        });
+    };
+    let job_name = JobName::new(&input.job_name).map_err(|error| error.to_string())?;
+    if input.job_name == MEDIA_INVENTORY_JOB_NAME || input.job_name == CLIENT_INVENTORY_JOB_NAME {
+        let Some(inventory) = activities.inventory.clone() else {
+            return Ok(ScheduledJobRunActivityOutput {
+                succeeded: false,
+                error: Some("scheduled job inventory activities are not registered".to_owned()),
+            });
+        };
+        let Some(active_inventory_refreshes) = activities.active_inventory_refreshes.clone() else {
+            return Ok(ScheduledJobRunActivityOutput {
+                succeeded: false,
+                error: Some("scheduled job inventory tracker is not registered".to_owned()),
+            });
+        };
+        let request = if input.job_name == MEDIA_INVENTORY_JOB_NAME {
+            InventoryWorkflowRequest::media_full(
+                state.config.paths.media_dirs.clone(),
+                input.scheduled_at_ms,
+            )
+        } else {
+            InventoryWorkflowRequest::client(input.scheduled_at_ms)
+        };
+        let workflow_id = request
+            .instance_id()
+            .map_err(|error| error.to_string())?
+            .to_string();
+        {
+            let Ok(mut active) = active_inventory_refreshes.lock() else {
+                return Ok(ScheduledJobRunActivityOutput {
+                    succeeded: false,
+                    error: Some("inventory refresh tracker is poisoned".to_owned()),
+                });
+            };
+            if !active.insert(workflow_id.clone()) {
+                return Ok(ScheduledJobRunActivityOutput {
+                    succeeded: true,
+                    error: None,
+                });
+            }
+        }
+        let output = run_inventory_activity(
+            inventory,
+            active_inventory_refreshes,
+            workflow_id,
+            InventoryActivityInput {
+                request,
+                started_at_ms: input.scheduled_at_ms,
+            },
+        )
+        .await?;
+        return Ok(ScheduledJobRunActivityOutput {
+            succeeded: output.scan_failure_count == 0,
+            error: (output.scan_failure_count > 0).then(|| "inventory refresh failed".to_owned()),
+        });
+    }
+    match execute_scheduled_job(&state, &job_name, activities.shutdown.clone()).await {
+        Ok(()) => Ok(ScheduledJobRunActivityOutput {
+            succeeded: true,
+            error: None,
+        }),
+        Err(error) => Ok(ScheduledJobRunActivityOutput {
+            succeeded: false,
+            error: Some(error),
+        }),
+    }
 }
 
 async fn record_inventory_activity_projection(
@@ -2469,6 +3026,11 @@ fn orchestration_registry() -> OrchestrationRegistry {
             );
         } else if workflow == WorkflowKind::Announce {
             builder = builder.register_typed(workflow.orchestration_name(), announce_orchestration);
+        } else if workflow == WorkflowKind::ScheduledJob {
+            builder = builder.register_typed(
+                workflow.orchestration_name(),
+                scheduled_job_supervisor_orchestration,
+            );
         } else {
             builder = builder.register_typed(
                 workflow.orchestration_name(),
@@ -2504,7 +3066,158 @@ fn orchestration_registry() -> OrchestrationRegistry {
             },
         );
     }
+    builder = builder.register_typed(
+        SCHEDULED_JOB_RUN_ORCHESTRATION,
+        scheduled_job_run_orchestration,
+    );
     builder.build()
+}
+
+async fn scheduled_job_supervisor_orchestration(
+    ctx: OrchestrationContext,
+    input: WorkflowSupervisorInput,
+) -> Result<WorkflowSupervisorOutput, String> {
+    if input.kind != WorkflowKind::ScheduledJob {
+        return Err(format!(
+            "scheduled job supervisor received {} input",
+            input.kind.as_str()
+        ));
+    }
+    loop {
+        let now_ms = orchestration_now_ms(&ctx).await?;
+        let claim = claim_scheduled_job(&ctx, &input.public_id, now_ms, None).await?;
+        if let Some(scheduled_at_ms) = claim.scheduled_at_ms {
+            let run_input = ScheduledJobWorkflowInput {
+                job_name: input.public_id.clone(),
+                forced: false,
+                requested_at_ms: scheduled_at_ms,
+            };
+            run_scheduled_job_child(&ctx, &input.public_id, scheduled_at_ms, &run_input).await?;
+            continue;
+        }
+
+        let wait_ms = claim
+            .next_run_at_ms
+            .map(|next_run_at_ms| next_run_at_ms.saturating_sub(now_ms).max(1))
+            .unwrap_or(60_000);
+        let timer = ctx.schedule_timer(Duration::from_millis(
+            u64::try_from(wait_ms).map_err(|error| error.to_string())?,
+        ));
+        let manual =
+            ctx.dequeue_event_typed::<ScheduledJobManualRequest>(SCHEDULED_JOB_MANUAL_QUEUE);
+        match ctx.select2(timer, manual).await {
+            Either2::First(()) => {}
+            Either2::Second(manual) => {
+                let scheduled_at_ms = if let Some(scheduled_at_ms) = manual.claimed_scheduled_at_ms
+                {
+                    Some(scheduled_at_ms)
+                } else {
+                    claim_scheduled_job(&ctx, &input.public_id, now_ms, Some(manual.clone()))
+                        .await?
+                        .scheduled_at_ms
+                };
+                if let Some(scheduled_at_ms) = scheduled_at_ms {
+                    let run_input = ScheduledJobWorkflowInput {
+                        job_name: input.public_id.clone(),
+                        forced: manual.forced,
+                        requested_at_ms: scheduled_at_ms,
+                    };
+                    run_scheduled_job_child(&ctx, &input.public_id, scheduled_at_ms, &run_input)
+                        .await?;
+                }
+            }
+        }
+    }
+}
+
+async fn claim_scheduled_job(
+    ctx: &OrchestrationContext,
+    job_name: &str,
+    now_ms: i64,
+    manual: Option<ScheduledJobManualRequest>,
+) -> Result<ScheduledJobClaimActivityOutput, String> {
+    let input = ActivityInputEnvelope::new(
+        ctx.instance_id(),
+        SCHEDULED_JOB_CLAIM_ACTIVITY_ID,
+        ScheduledJobClaimActivityInput {
+            job_name: job_name.to_owned(),
+            now_ms,
+            manual,
+        },
+    );
+    ctx.schedule_activity_typed(ActivityKind::ScheduledJobClaim.as_str(), &input)
+        .await
+}
+
+async fn run_scheduled_job_child(
+    ctx: &OrchestrationContext,
+    job_name: &str,
+    scheduled_at_ms: i64,
+    input: &ScheduledJobWorkflowInput,
+) -> Result<(), String> {
+    let scheduled_at_ms_u64 = u64::try_from(scheduled_at_ms)
+        .map_err(|_error| format!("scheduled_at_ms must be non-negative: {scheduled_at_ms}"))?;
+    let child_id = WorkflowInstanceId::scheduled_job_run(job_name, scheduled_at_ms_u64)
+        .map_err(|error| error.to_string())?;
+    let result: ScheduledJobRunActivityOutput = ctx
+        .schedule_sub_orchestration_with_id_typed(
+            SCHEDULED_JOB_RUN_ORCHESTRATION,
+            child_id.as_str(),
+            input,
+        )
+        .await?;
+    if !result.succeeded {
+        ctx.trace_warn(format!(
+            "Scheduled job `{job_name}` run finished unsuccessfully: {}",
+            result
+                .error
+                .unwrap_or_else(|| "scheduled job failed".to_owned())
+        ));
+    }
+    Ok(())
+}
+
+async fn scheduled_job_run_orchestration(
+    ctx: OrchestrationContext,
+    input: ScheduledJobWorkflowInput,
+) -> Result<ScheduledJobRunActivityOutput, String> {
+    let scheduled_at_ms = input.requested_at_ms;
+    let run_input = ActivityInputEnvelope::new(
+        ctx.instance_id(),
+        SCHEDULED_JOB_RUN_ACTIVITY_ID,
+        ScheduledJobRunActivityInput {
+            job_name: input.job_name.clone(),
+            scheduled_at_ms,
+        },
+    );
+    let result: ScheduledJobRunActivityOutput = ctx
+        .schedule_activity_typed(ActivityKind::ScheduledJobRun.as_str(), &run_input)
+        .await?;
+    let finished_at_ms = orchestration_now_ms(&ctx).await?;
+    let complete_input = ActivityInputEnvelope::new(
+        ctx.instance_id(),
+        SCHEDULED_JOB_COMPLETE_ACTIVITY_ID,
+        ScheduledJobCompleteActivityInput {
+            job_name: input.job_name,
+            scheduled_at_ms,
+            succeeded: result.succeeded,
+            error: result.error.clone(),
+            finished_at_ms,
+        },
+    );
+    ctx.schedule_activity_typed(ActivityKind::ScheduledJobComplete.as_str(), &complete_input)
+        .await
+}
+
+async fn orchestration_now_ms(ctx: &OrchestrationContext) -> Result<i64, String> {
+    system_time_to_unix_ms(ctx.utc_now().await?)
+}
+
+fn system_time_to_unix_ms(time: SystemTime) -> Result<i64, String> {
+    let duration = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?;
+    i64::try_from(duration.as_millis()).map_err(|error| error.to_string())
 }
 
 async fn announce_orchestration(
@@ -2890,7 +3603,7 @@ mod tests {
         );
 
         let cleanup_id = WorkflowInstanceId::scheduled_job_supervisor(CLEANUP_JOB_NAME).unwrap();
-        wait_for_supervisor_completion(&runtime.client(), cleanup_id.as_str()).await;
+        wait_for_orchestration_running(&runtime.client(), cleanup_id.as_str()).await;
 
         runtime.shutdown(Some(1_000)).await;
     }
@@ -3824,31 +4537,6 @@ mod tests {
             WORKFLOW_RUNTIME_DEPENDENCY,
             workflow_runtime_dependency_name().unwrap().as_str()
         );
-    }
-
-    async fn wait_for_supervisor_completion(client: &Client, instance_id: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match client
-                .get_orchestration_status(instance_id)
-                .await
-                .expect("supervisor status should be readable")
-            {
-                OrchestrationStatus::Completed { .. } => return,
-                OrchestrationStatus::Failed { details, .. } => {
-                    panic!(
-                        "supervisor failed unexpectedly: {}",
-                        details.display_message()
-                    );
-                }
-                OrchestrationStatus::NotFound | OrchestrationStatus::Running { .. } => {}
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for supervisor completion"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
     }
 
     async fn wait_for_supervisor_failure(client: &Client, instance_id: &str) {
