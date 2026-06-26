@@ -14,7 +14,10 @@ use crate::domain::{
 use crate::errors::{ClassifyFailure, DatabaseError, FailureClass, WorkerError};
 use crate::matching::{PersistedCandidateAssessment, ReverseLookupOutcome};
 use crate::persistence::repository::{AnnounceDependency, AnnounceRetryUpdate, Repository};
-use crate::runtime::backoff::stable_jitter_ms;
+use crate::runtime::backoff::{
+    RetryOutcome, TRANSIENT_IO_RETRY_MAX_ATTEMPTS, classify_database_error,
+    retry_with_classification, stable_jitter_ms, transient_io_retry_policy,
+};
 use crate::runtime::injection_worker::InjectionWorkResult;
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 use crate::time::unix_ms_to_rfc3339_seconds;
@@ -571,17 +574,20 @@ impl AnnounceWorker {
         );
         let batch_size = self.config.retention_cleanup_batch_size;
         let max_batches = self.config.retention_cleanup_max_batches.max(1);
-        let expired = self.repository.expire_announce_work(now_ms).await?;
+        let expired = retry_database_call("expire announce work", None, || {
+            self.repository.expire_announce_work(now_ms)
+        })
+        .await?;
         self.run_batched_cleanup_no_shutdown(batch_size, max_batches, || {
             self.repository
                 .scrub_stale_announce_fetch_material_batch(now_ms, batch_size)
         })
         .await?;
         self.cleanup_retained(now_ms, true).await?;
-        let recovered_leases = self
-            .repository
-            .recover_stale_announce_leases(now_ms)
-            .await?;
+        let recovered_leases = retry_database_call("recover stale announce leases", None, || {
+            self.repository.recover_stale_announce_leases(now_ms)
+        })
+        .await?;
 
         Ok(AnnounceStartupSummary {
             expired,
@@ -646,14 +652,20 @@ impl AnnounceWorker {
         let mut affected = 0_u64;
         for _ in 0..max_batches {
             ensure_cleanup_running(shutdown)?;
-            let batch_affected = match cleanup().await {
-                Ok(batch_affected) => batch_affected,
-                Err(error) if is_database_busy(&error) => {
-                    debug!(error = %error, "deferred announce cleanup while database is busy");
-                    break;
-                }
-                Err(error) => return Err(AnnounceWorkerError::from(error)),
-            };
+            let batch_affected =
+                match retry_database_call("run announce cleanup batch", Some(shutdown), || {
+                    cleanup()
+                })
+                .await
+                {
+                    Ok(batch_affected) => batch_affected,
+                    Err(AnnounceWorkerError::Database { source }) if is_database_busy(&source) => {
+                        let error = source;
+                        debug!(error = %error, "deferred announce cleanup while database is busy");
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
             affected = affected.saturating_add(batch_affected);
             if batch_affected < u64::from(batch_size) {
                 break;
@@ -675,7 +687,9 @@ impl AnnounceWorker {
     {
         let mut affected = 0_u64;
         for _ in 0..max_batches {
-            let batch_affected = cleanup().await?;
+            let batch_affected =
+                retry_database_call("run announce startup cleanup batch", None, &mut cleanup)
+                    .await?;
             affected = affected.saturating_add(batch_affected);
             if batch_affected < u64::from(batch_size) {
                 break;
@@ -689,42 +703,68 @@ impl AnnounceWorker {
         &self,
         now_ms: i64,
     ) -> Result<Vec<AnnounceWorkId>, AnnounceWorkerError> {
+        self.claim_ready_inner(now_ms, None).await
+    }
+
+    async fn claim_ready_until_shutdown(
+        &self,
+        now_ms: i64,
+        shutdown: &ShutdownSignal,
+    ) -> Result<Vec<AnnounceWorkId>, AnnounceWorkerError> {
+        self.claim_ready_inner(now_ms, Some(shutdown)).await
+    }
+
+    async fn claim_ready_inner(
+        &self,
+        now_ms: i64,
+        shutdown: Option<&ShutdownSignal>,
+    ) -> Result<Vec<AnnounceWorkId>, AnnounceWorkerError> {
         let lease_until_ms = now_ms.saturating_add(duration_ms(self.config.lease_duration));
         let reconcile_limit = self.config.claim_batch_size.saturating_mul(4).max(1);
-        if let Err(error) = self.repository.expire_announce_work(now_ms).await {
+        if let Err(error) = retry_database_call("expire announce work", shutdown, || {
+            self.repository.expire_announce_work(now_ms)
+        })
+        .await
+        {
             return defer_claim_if_database_busy(error);
         }
-        self.cleanup_retained(now_ms, false).await?;
-        if let Err(error) = self.repository.recover_stale_announce_leases(now_ms).await {
+        self.cleanup_retained_inner(now_ms, false, shutdown).await?;
+        if let Err(error) = retry_database_call("recover stale announce leases", shutdown, || {
+            self.repository.recover_stale_announce_leases(now_ms)
+        })
+        .await
+        {
             return defer_claim_if_database_busy(error);
         }
-        if let Err(error) = self
-            .repository
-            .schedule_announce_dependency_backoff(
-                now_ms,
-                duration_ms(self.config.dependency_recovery_probe_interval),
-                reconcile_limit,
-            )
+        if let Err(error) =
+            retry_database_call("schedule announce dependency backoff", shutdown, || {
+                self.repository.schedule_announce_dependency_backoff(
+                    now_ms,
+                    duration_ms(self.config.dependency_recovery_probe_interval),
+                    reconcile_limit,
+                )
+            })
             .await
         {
             return defer_claim_if_database_busy(error);
         }
-        if let Err(error) = self
-            .repository
-            .wake_due_waiting_announce_work(now_ms, reconcile_limit)
-            .await
+        if let Err(error) = retry_database_call("wake due waiting announce work", shutdown, || {
+            self.repository
+                .wake_due_waiting_announce_work(now_ms, reconcile_limit)
+        })
+        .await
         {
             return defer_claim_if_database_busy(error);
         }
-        match self
-            .repository
-            .claim_announce_work(
+        match retry_database_call("claim announce work", shutdown, || {
+            self.repository.claim_announce_work(
                 self.config.owner.as_str(),
                 now_ms,
                 lease_until_ms,
                 self.config.claim_batch_size,
             )
-            .await
+        })
+        .await
         {
             Ok(claimed) => Ok(claimed),
             Err(error) => defer_claim_if_database_busy(error),
@@ -776,21 +816,32 @@ impl AnnounceWorker {
                     .store(previous_cleanup_ms, Ordering::Release);
                 return Err(error);
             }
-            let batch_deleted = match self
-                .repository
-                .cleanup_terminal_announce_work(success_cutoff_ms, failure_cutoff_ms, batch_size)
-                .await
+            let batch_deleted = match retry_database_call(
+                "cleanup terminal announce work",
+                shutdown,
+                || {
+                    self.repository.cleanup_terminal_announce_work(
+                        success_cutoff_ms,
+                        failure_cutoff_ms,
+                        batch_size,
+                    )
+                },
+            )
+            .await
             {
                 Ok(batch_deleted) => batch_deleted,
                 Err(error) => {
                     self.retention_cleanup
                         .last_cleanup_ms
                         .store(previous_cleanup_ms, Ordering::Release);
-                    if is_database_busy(&error) && (!force || shutdown.is_some()) {
+                    if let AnnounceWorkerError::Database { source } = &error
+                        && is_database_busy(source)
+                        && (!force || shutdown.is_some())
+                    {
                         debug!(error = %error, "deferred announce retention cleanup while database is busy");
                         return Ok(deleted);
                     }
-                    return Err(AnnounceWorkerError::from(error));
+                    return Err(error);
                 }
             };
             deleted = deleted.saturating_add(batch_deleted);
@@ -847,11 +898,15 @@ impl AnnounceWorker {
         now_ms: i64,
     ) -> Result<bool, AnnounceWorkerError> {
         let lease_until_ms = now_ms.saturating_add(duration_ms(self.config.lease_duration));
-        let renewed = self
-            .repository
-            .renew_announce_lease(id, self.config.owner.as_str(), lease_until_ms, now_ms)
-            .await
-            .map_err(AnnounceWorkerError::from)?;
+        let renewed = retry_database_call("renew announce lease", None, || {
+            self.repository.renew_announce_lease(
+                id,
+                self.config.owner.as_str(),
+                lease_until_ms,
+                now_ms,
+            )
+        })
+        .await?;
         #[cfg(test)]
         if renewed && let Some(progress) = &self.progress {
             progress.record_renewal();
@@ -867,63 +922,81 @@ impl AnnounceWorker {
     ) -> Result<bool, AnnounceWorkerError> {
         let owner = self.config.owner.as_str();
         match outcome {
-            AnnounceWorkOutcome::Succeeded { reason, outcome } => self
-                .repository
-                .mark_announce_succeeded(id, owner, reason, &outcome, now_ms)
+            AnnounceWorkOutcome::Succeeded { reason, outcome } => {
+                retry_database_call("mark announce succeeded", None, || {
+                    self.repository
+                        .mark_announce_succeeded(id, owner, reason, &outcome, now_ms)
+                })
                 .await
-                .map_err(AnnounceWorkerError::from),
+            }
             AnnounceWorkOutcome::Waiting {
                 reason,
                 next_attempt_at_ms,
                 dependency,
-            } => self
-                .repository
-                .mark_announce_waiting(
-                    id,
-                    owner,
-                    reason,
-                    next_attempt_at_ms,
-                    now_ms,
-                    dependency.as_ref(),
-                )
+            } => {
+                retry_database_call("mark announce waiting", None, || {
+                    self.repository.mark_announce_waiting(
+                        id,
+                        owner,
+                        reason,
+                        next_attempt_at_ms,
+                        now_ms,
+                        dependency.as_ref(),
+                    )
+                })
                 .await
-                .map_err(AnnounceWorkerError::from),
+            }
             AnnounceWorkOutcome::Retryable {
                 reason,
                 next_attempt_at_ms,
                 error_class,
                 redacted_message,
-            } => self
-                .repository
-                .mark_announce_retryable(
-                    id,
-                    owner,
-                    AnnounceRetryUpdate {
-                        reason,
-                        next_attempt_at_ms,
-                        now_ms,
-                        error_class: &error_class,
-                        redacted_message: &redacted_message,
-                    },
-                )
+            } => {
+                retry_database_call("mark announce retryable", None, || {
+                    self.repository.mark_announce_retryable(
+                        id,
+                        owner,
+                        AnnounceRetryUpdate {
+                            reason,
+                            next_attempt_at_ms,
+                            now_ms,
+                            error_class: &error_class,
+                            redacted_message: &redacted_message,
+                        },
+                    )
+                })
                 .await
-                .map_err(AnnounceWorkerError::from),
+            }
             AnnounceWorkOutcome::TerminalFailed {
                 reason,
                 redacted_message,
-            } => self
-                .repository
-                .mark_announce_terminal_failed(id, owner, reason, &redacted_message, now_ms)
+            } => {
+                retry_database_call("mark announce terminal failed", None, || {
+                    self.repository.mark_announce_terminal_failed(
+                        id,
+                        owner,
+                        reason,
+                        &redacted_message,
+                        now_ms,
+                    )
+                })
                 .await
-                .map_err(AnnounceWorkerError::from),
+            }
             AnnounceWorkOutcome::Release {
                 reason,
                 next_attempt_at_ms,
-            } => self
-                .repository
-                .release_announce_lease(id, owner, reason, next_attempt_at_ms, now_ms)
+            } => {
+                retry_database_call("release announce lease", None, || {
+                    self.repository.release_announce_lease(
+                        id,
+                        owner,
+                        reason,
+                        next_attempt_at_ms,
+                        now_ms,
+                    )
+                })
                 .await
-                .map_err(AnnounceWorkerError::from),
+            }
         }
     }
 
@@ -945,7 +1018,7 @@ impl AnnounceWorker {
             lease_owner = %self.config.owner,
             claim_batch_size = self.config.claim_batch_size
         );
-        let claimed = self.claim_ready(now_ms).await?;
+        let claimed = self.claim_ready_until_shutdown(now_ms, &shutdown).await?;
         let mut summary = AnnounceWorkerSummary {
             claimed: claimed.len(),
             ..AnnounceWorkerSummary::default()
@@ -998,16 +1071,16 @@ impl AnnounceWorker {
         id: &AnnounceWorkId,
         now_ms: i64,
     ) -> Result<bool, AnnounceWorkerError> {
-        self.repository
-            .release_announce_lease(
+        retry_database_call("release announce lease for shutdown", None, || {
+            self.repository.release_announce_lease(
                 id,
                 self.config.owner.as_str(),
                 AnnounceReason::DependencyBackoff,
                 now_ms,
                 now_ms,
             )
-            .await
-            .map_err(AnnounceWorkerError::from)
+        })
+        .await
     }
 }
 
@@ -1054,13 +1127,44 @@ fn is_database_busy(error: &DatabaseError) -> bool {
 }
 
 fn defer_claim_if_database_busy(
-    error: DatabaseError,
+    error: AnnounceWorkerError,
 ) -> Result<Vec<AnnounceWorkId>, AnnounceWorkerError> {
-    if is_database_busy(&error) {
-        debug!(error = %error, "deferred announce claim while database is busy");
-        Ok(Vec::new())
-    } else {
-        Err(AnnounceWorkerError::from(error))
+    match error {
+        AnnounceWorkerError::Database { source } if is_database_busy(&source) => {
+            debug!(error = %source, "deferred announce claim while database is busy");
+            Ok(Vec::new())
+        }
+        error => Err(error),
+    }
+}
+
+async fn retry_database_call<T, F, Fut>(
+    operation: &'static str,
+    shutdown: Option<&ShutdownSignal>,
+    mut call: F,
+) -> Result<T, AnnounceWorkerError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, DatabaseError>>,
+{
+    match retry_with_classification(
+        TRANSIENT_IO_RETRY_MAX_ATTEMPTS,
+        transient_io_retry_policy(),
+        operation,
+        shutdown,
+        |_attempt| call(),
+        classify_database_error,
+    )
+    .await
+    {
+        RetryOutcome::Completed(result) => result.map_err(AnnounceWorkerError::from),
+        RetryOutcome::Shutdown => Err(AnnounceWorkerError::Shutdown),
+        RetryOutcome::Exhausted => Err(AnnounceWorkerError::Database {
+            source: DatabaseError::Busy {
+                operation: operation.to_owned(),
+                retry_after_ms: None,
+            },
+        }),
     }
 }
 
@@ -1100,6 +1204,51 @@ mod tests {
     use crate::matching::{CandidateCacheStatus, PersistedCandidateAssessment};
     use crate::persistence::repository::AnnounceInsertResult;
     use crate::runtime::shutdown::shutdown_channel;
+
+    #[tokio::test]
+    async fn database_retry_helper_retries_busy_before_success() {
+        let attempts = AtomicUsize::new(0);
+
+        let result = retry_database_call("test busy retry", None, || {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(DatabaseError::Busy {
+                        operation: "test busy retry".to_owned(),
+                        retry_after_ms: Some(0),
+                    })
+                } else {
+                    Ok(42_u8)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(42, result);
+        assert_eq!(2, attempts.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn database_retry_helper_stops_during_shutdown() {
+        let attempts = AtomicUsize::new(0);
+        let (controller, signal) = shutdown_channel();
+
+        let result = retry_database_call("test busy shutdown", Some(&signal), || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            controller.cancel_now("test shutdown").unwrap();
+            async {
+                Err::<(), _>(DatabaseError::Busy {
+                    operation: "test busy shutdown".to_owned(),
+                    retry_after_ms: None,
+                })
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Err(AnnounceWorkerError::Shutdown)));
+        assert_eq!(1, attempts.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn worker_claims_and_completes_bounded_batches() {
@@ -1428,6 +1577,27 @@ mod tests {
         controller.cancel_now("test shutdown").unwrap();
 
         let result = worker.run_scheduled_cleanup(100_000, &signal).await;
+
+        assert!(matches!(result, Err(AnnounceWorkerError::Shutdown)));
+        assert_eq!(
+            vec![("queued".to_owned(), "accepted".to_owned())],
+            status_rows(&repository).await
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_batch_reports_shutdown_before_claiming_work() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        insert_work(&repository, "ann_shutdown", "guid-shutdown", 1).await;
+        let worker = AnnounceWorker::new(repository.clone(), "worker-1", &test_config()).unwrap();
+        let (controller, signal) = shutdown_channel();
+        controller.cancel_now("test shutdown").unwrap();
+
+        let result = worker
+            .run_batch(10, signal, |_id, _shutdown| async {
+                panic!("work should not be processed after shutdown")
+            })
+            .await;
 
         assert!(matches!(result, Err(AnnounceWorkerError::Shutdown)));
         assert_eq!(
