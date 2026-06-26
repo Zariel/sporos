@@ -343,6 +343,37 @@ impl InventoryScanner {
         }
     }
 
+    pub fn scan_item_roots_until<F, C>(
+        &self,
+        item_roots: &[PathBuf],
+        mut should_continue: C,
+        mut on_item: F,
+    ) -> InventoryScanStreamReport
+    where
+        F: FnMut(ScannedLocalItem) -> bool,
+        C: FnMut() -> bool,
+    {
+        let mut report = InventoryScanReport::default();
+        let mut scanned_items = 0usize;
+        for item_root in item_roots {
+            if !should_continue() {
+                break;
+            }
+            if let Some(item) =
+                self.scan_item_root_until(item_root, &mut report, &mut should_continue)
+            {
+                scanned_items = scanned_items.saturating_add(1);
+                if !on_item(item) {
+                    break;
+                }
+            }
+        }
+        InventoryScanStreamReport {
+            scanned_items,
+            failures: report.failures,
+        }
+    }
+
     fn discover_roots_until<F, C>(
         &self,
         root: &Path,

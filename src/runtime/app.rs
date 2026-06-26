@@ -4868,9 +4868,7 @@ mod tests {
             .state
             .queues
             .inventory_refresh
-            .try_enqueue(InventoryRefreshRequest {
-                media_dirs: Vec::new(),
-            })
+            .try_enqueue(InventoryRefreshRequest::full(Vec::new()))
             .unwrap();
         let received = runtime.receivers.inventory_refresh.recv().await.unwrap();
 

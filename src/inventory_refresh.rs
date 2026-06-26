@@ -1,15 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::io::ErrorKind;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 
+use notify::{Config as NotifyConfig, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tokio::task;
-use tracing::{info_span, warn};
+use tracing::{info, info_span, warn};
 
 use crate::domain::{
     ByteSize, ClientHost, DependencyName, DependencyState, DisplayName, InfoHash, ItemTitle,
@@ -40,10 +43,155 @@ const CLIENT_INVENTORY_BUFFER: usize = 64;
 const VIRTUAL_SEASON_PAGE_SIZE: u16 = 512;
 const VIRTUAL_SEASON_MIN_EPISODES: usize = 3;
 const VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
+const MEDIA_WATCH_STOP_POLL: Duration = Duration::from_millis(500);
+const MEDIA_WATCH_DEBOUNCE: Duration = Duration::from_millis(250);
+const MEDIA_WATCH_MAX_BATCH_AGE: Duration = Duration::from_secs(2);
+const MEDIA_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const MEDIA_WATCH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MEDIA_WATCH_MAX_PENDING_PATHS: usize = 1_024;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InventoryRefreshRequest {
     pub media_dirs: Vec<PathBuf>,
+    pub changed_paths: Vec<PathBuf>,
+}
+
+impl InventoryRefreshRequest {
+    pub fn full(media_dirs: Vec<PathBuf>) -> Self {
+        Self {
+            media_dirs,
+            changed_paths: Vec::new(),
+        }
+    }
+
+    pub fn changed_paths(media_dirs: Vec<PathBuf>, changed_paths: Vec<PathBuf>) -> Self {
+        Self {
+            media_dirs,
+            changed_paths,
+        }
+    }
+}
+
+fn extend_unique_paths(paths: &mut Vec<PathBuf>, additional: Vec<PathBuf>) {
+    let mut seen = paths.iter().cloned().collect::<BTreeSet<_>>();
+    for path in additional {
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ChangedMediaRoot {
+    media_dir: PathBuf,
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct DataDirRefreshPlan {
+    scan_media_dirs: Vec<PathBuf>,
+    scan_item_roots: Vec<PathBuf>,
+    prune_roots: Vec<PathBuf>,
+}
+
+fn data_dir_refresh_plan(request: &InventoryRefreshRequest) -> DataDirRefreshPlan {
+    if request.changed_paths.is_empty() {
+        return DataDirRefreshPlan {
+            scan_media_dirs: request.media_dirs.clone(),
+            scan_item_roots: Vec::new(),
+            prune_roots: Vec::new(),
+        };
+    }
+
+    let mut plan = DataDirRefreshPlan::default();
+    for changed in changed_media_roots(&request.media_dirs, &request.changed_paths) {
+        match std::fs::symlink_metadata(&changed.root) {
+            Ok(_) => plan_scan_existing_changed_root(&mut plan, changed),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                plan_missing_changed_root(&mut plan, changed);
+            }
+            Err(_) => plan_scan_existing_changed_root(&mut plan, changed),
+        }
+    }
+    plan
+}
+
+fn plan_scan_existing_changed_root(plan: &mut DataDirRefreshPlan, changed: ChangedMediaRoot) {
+    if changed.root == changed.media_dir {
+        plan.scan_media_dirs.push(changed.root);
+    } else {
+        plan.scan_item_roots.push(changed.root);
+    }
+}
+
+fn plan_missing_changed_root(plan: &mut DataDirRefreshPlan, changed: ChangedMediaRoot) {
+    if changed.root == changed.media_dir {
+        plan.scan_media_dirs.push(changed.root);
+        return;
+    }
+    match std::fs::symlink_metadata(&changed.media_dir) {
+        Ok(_) => plan.prune_roots.push(changed.root),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            plan.scan_media_dirs.push(changed.root)
+        }
+        Err(_) => plan.scan_item_roots.push(changed.root),
+    }
+}
+
+fn changed_media_roots(media_dirs: &[PathBuf], changed_paths: &[PathBuf]) -> Vec<ChangedMediaRoot> {
+    let mut media_dirs = media_dirs.iter().collect::<Vec<_>>();
+    media_dirs.sort_by_key(|media_dir| std::cmp::Reverse(media_dir.components().count()));
+    let mut roots = Vec::new();
+    for changed_path in changed_paths {
+        for media_dir in &media_dirs {
+            if let Some(root) = changed_media_root(media_dir, changed_path) {
+                roots.push(ChangedMediaRoot {
+                    media_dir: media_dir.to_path_buf(),
+                    root,
+                });
+                break;
+            }
+        }
+    }
+    collapse_changed_media_roots(roots)
+}
+
+fn changed_media_root(media_dir: &Path, changed_path: &Path) -> Option<PathBuf> {
+    if changed_path == media_dir {
+        return Some(media_dir.to_path_buf());
+    }
+    let relative = changed_path.strip_prefix(media_dir).ok()?;
+    let mut components = relative.components();
+    let component = components.next()?;
+    match component {
+        Component::Normal(name) => Some(media_dir.join(name)),
+        _ => None,
+    }
+}
+
+fn collapse_changed_media_roots(mut roots: Vec<ChangedMediaRoot>) -> Vec<ChangedMediaRoot> {
+    roots.sort_by(|left, right| {
+        left.root
+            .components()
+            .count()
+            .cmp(&right.root.components().count())
+            .then_with(|| left.root.cmp(&right.root))
+    });
+    let mut collapsed = Vec::<ChangedMediaRoot>::new();
+    for root in roots {
+        if collapsed
+            .iter()
+            .any(|existing| path_contains_or_equals(&existing.root, &root.root))
+        {
+            continue;
+        }
+        collapsed.push(root);
+    }
+    collapsed
+}
+
+fn path_contains_or_equals(parent: &Path, child: &Path) -> bool {
+    child == parent || child.strip_prefix(parent).is_ok()
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -223,18 +371,44 @@ impl InventoryRefreshWorker {
     ) -> Result<InventoryRefreshSummary, InventoryRefreshError> {
         let _span = info_span!(
             "inventory.refresh_data_dirs",
-            media_dir_count = request.media_dirs.len()
+            media_dir_count = request.media_dirs.len(),
+            changed_path_count = request.changed_paths.len()
         );
         let scanner = InventoryScanner::new(self.scan_options);
+        let plan = data_dir_refresh_plan(&request);
+        let mut pruned = if plan.prune_roots.is_empty() {
+            0
+        } else {
+            self.prune_missing_data_roots(plan.prune_roots.clone())
+                .await?
+                .pruned
+        };
+        if plan.scan_media_dirs.is_empty() && plan.scan_item_roots.is_empty() {
+            let now_ms = unix_time_ms();
+            self.refresh_virtual_seasons(now_ms).await?;
+            self.repository
+                .wake_announce_inventory_refresh(now_ms, 1_000)
+                .await?;
+
+            return Ok(InventoryRefreshSummary {
+                scanned_items: 0,
+                persisted_items: 0,
+                pruned_items: pruned,
+                scan_failures: Vec::new(),
+            });
+        }
+
         let (sender, receiver) = mpsc::channel(DATA_ROOT_SCAN_BUFFER);
-        let media_dirs = request.media_dirs;
-        let scope_roots = media_dirs.clone();
+        let media_dirs = plan.scan_media_dirs;
+        let item_roots = plan.scan_item_roots;
+        let mut scope_roots = media_dirs.clone();
+        scope_roots.extend(item_roots.clone());
         let cancelled = Arc::new(AtomicBool::new(false));
         let scanner_cancelled = cancelled.clone();
         #[cfg(test)]
         let send_attempts = self.data_root_scan_send_attempts.clone();
         let scan_task = task::spawn_blocking(move || {
-            let report = scanner.scan_media_dirs_until(
+            let mut report = scanner.scan_media_dirs_until(
                 &media_dirs,
                 || !scanner_cancelled.load(Ordering::Relaxed),
                 |scanned| {
@@ -253,6 +427,33 @@ impl InventoryRefreshWorker {
                         .is_ok()
                 },
             );
+            if !scanner_cancelled.load(Ordering::Relaxed) && report.failures.is_empty() {
+                let item_report = scanner.scan_item_roots_until(
+                    &item_roots,
+                    || !scanner_cancelled.load(Ordering::Relaxed),
+                    |scanned| {
+                        if scanner_cancelled.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        #[cfg(test)]
+                        if let Some(send_attempts) = &send_attempts {
+                            send_attempts.fetch_add(1, Ordering::SeqCst);
+                        }
+                        sender
+                            .blocking_send(OwnedLocalInventoryMessage::item(
+                                OwnedLocalItemFileBatch {
+                                    item: scanned.item,
+                                    files: scanned.files,
+                                },
+                            ))
+                            .is_ok()
+                    },
+                );
+                report.scanned_items = report
+                    .scanned_items
+                    .saturating_add(item_report.scanned_items);
+                report.failures.extend(item_report.failures);
+            }
             if !scanner_cancelled.load(Ordering::Relaxed) && report.failures.is_empty() {
                 drop(sender.blocking_send(OwnedLocalInventoryMessage::Finished));
             }
@@ -311,7 +512,10 @@ impl InventoryRefreshWorker {
         } else {
             replace.await
         };
-        let LocalInventoryReplaceSummary { upserted, pruned } = match replace_result {
+        let LocalInventoryReplaceSummary {
+            upserted,
+            pruned: scan_pruned,
+        } = match replace_result {
             Ok(summary) => summary,
             Err(error) => {
                 cancelled.store(true, Ordering::Relaxed);
@@ -334,6 +538,7 @@ impl InventoryRefreshWorker {
                 return Err(error.into());
             }
         };
+        pruned = pruned.saturating_add(scan_pruned);
         let scan_report =
             scan_task
                 .await
@@ -352,6 +557,19 @@ impl InventoryRefreshWorker {
             pruned_items: pruned,
             scan_failures: scan_report.failures,
         })
+    }
+
+    async fn prune_missing_data_roots(
+        &self,
+        roots: Vec<PathBuf>,
+    ) -> Result<LocalInventoryReplaceSummary, InventoryRefreshError> {
+        self.repository
+            .replace_local_inventory_stream(
+                LocalInventoryScope::DataRoots { roots },
+                std::iter::empty(),
+            )
+            .await
+            .map_err(InventoryRefreshError::from)
     }
 
     pub async fn refresh_client_items(
@@ -971,6 +1189,228 @@ pub async fn run_inventory_refresh_worker(
     }
 }
 
+pub async fn run_media_inventory_watcher(
+    media_dirs: Vec<PathBuf>,
+    queue: BoundedWorkQueue<InventoryRefreshRequest>,
+    mut shutdown: ShutdownSignal,
+) {
+    if media_dirs.is_empty() {
+        return;
+    }
+    let (stop_sender, stop_receiver) = std_mpsc::channel();
+    let watch_task = task::spawn_blocking(move || {
+        run_media_inventory_watcher_blocking(media_dirs, queue, stop_receiver);
+    });
+    tokio::pin!(watch_task);
+
+    tokio::select! {
+        result = &mut watch_task => {
+            if let Err(error) = result {
+                warn!(error = %error, "media inventory watcher task failed");
+            }
+        }
+        _state = shutdown.cancelled() => {
+            if stop_sender.send(()).is_err() {
+                warn!("media inventory watcher stop signal receiver was closed");
+            }
+            match tokio::time::timeout(MEDIA_WATCH_SHUTDOWN_TIMEOUT, &mut watch_task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(error = %error, "media inventory watcher task failed during shutdown");
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_ms = u64::try_from(MEDIA_WATCH_SHUTDOWN_TIMEOUT.as_millis())
+                            .unwrap_or(u64::MAX),
+                        "media inventory watcher did not stop before timeout"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn run_media_inventory_watcher_blocking(
+    media_dirs: Vec<PathBuf>,
+    queue: BoundedWorkQueue<InventoryRefreshRequest>,
+    stop_receiver: std_mpsc::Receiver<()>,
+) {
+    let (event_sender, event_receiver) = std_mpsc::channel::<notify::Result<Event>>();
+    let mut native_watcher = match notify::recommended_watcher({
+        let event_sender = event_sender.clone();
+        move |event| {
+            drop(event_sender.send(event));
+        }
+    }) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            warn!(error = %error, "failed to start native media inventory watcher");
+            None
+        }
+    };
+    let mut poll_watcher = match PollWatcher::new(
+        {
+            let event_sender = event_sender.clone();
+            move |event| {
+                drop(event_sender.send(event));
+            }
+        },
+        NotifyConfig::default().with_poll_interval(MEDIA_WATCH_POLL_INTERVAL),
+    ) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            warn!(error = %error, "failed to start polling media inventory watcher");
+            None
+        }
+    };
+
+    let mut native_watched_dirs = 0usize;
+    let mut polling_watched_dirs = 0usize;
+    for media_dir in &media_dirs {
+        if let Some(watcher) = native_watcher.as_mut() {
+            match watcher.watch(media_dir, RecursiveMode::Recursive) {
+                Ok(()) => native_watched_dirs = native_watched_dirs.saturating_add(1),
+                Err(error) => {
+                    warn!(path = %media_dir.display(), error = %error, "failed to watch media dir with native watcher");
+                }
+            }
+        }
+        if let Some(watcher) = poll_watcher.as_mut() {
+            match watcher.watch(media_dir, RecursiveMode::Recursive) {
+                Ok(()) => polling_watched_dirs = polling_watched_dirs.saturating_add(1),
+                Err(error) => {
+                    warn!(path = %media_dir.display(), error = %error, "failed to watch media dir with polling watcher");
+                }
+            }
+        }
+    }
+    if native_watcher.is_none() && poll_watcher.is_none() {
+        warn!("media inventory watcher unavailable");
+        return;
+    }
+    if native_watched_dirs == 0 && polling_watched_dirs == 0 {
+        warn!(
+            media_dir_count = media_dirs.len(),
+            "media inventory watcher has no watched media dirs"
+        );
+        return;
+    }
+    info!(
+        media_dir_count = media_dirs.len(),
+        native_watched_dirs,
+        polling_watched_dirs,
+        poll_interval_ms = u64::try_from(MEDIA_WATCH_POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX),
+        "media inventory watcher started"
+    );
+
+    let mut pending_paths = Vec::<PathBuf>::new();
+    let mut pending_since = None::<Instant>;
+    loop {
+        if stop_receiver.try_recv().is_ok() {
+            break;
+        }
+        let timeout = if pending_paths.is_empty() {
+            MEDIA_WATCH_STOP_POLL
+        } else {
+            MEDIA_WATCH_DEBOUNCE
+        };
+        match event_receiver.recv_timeout(timeout) {
+            Ok(Ok(event)) => {
+                if collect_media_watch_event(&mut pending_paths, event) && pending_since.is_none() {
+                    pending_since = Some(Instant::now());
+                }
+                if pending_paths.len() >= MEDIA_WATCH_MAX_PENDING_PATHS
+                    || pending_since
+                        .is_some_and(|started| started.elapsed() >= MEDIA_WATCH_MAX_BATCH_AGE)
+                {
+                    pending_since = flush_media_changed_paths(
+                        &media_dirs,
+                        &queue,
+                        &mut pending_paths,
+                        pending_since,
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                warn!(error = %error, "media inventory watcher reported an error");
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                pending_since = flush_media_changed_paths(
+                    &media_dirs,
+                    &queue,
+                    &mut pending_paths,
+                    pending_since,
+                );
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = try_enqueue_media_changed_paths(&media_dirs, &queue, pending_paths);
+}
+
+fn collect_media_watch_event(pending_paths: &mut Vec<PathBuf>, event: Event) -> bool {
+    if matches!(&event.kind, EventKind::Access(_) | EventKind::Other) || event.paths.is_empty() {
+        return false;
+    }
+    extend_unique_paths(pending_paths, event.paths);
+    true
+}
+
+fn flush_media_changed_paths(
+    media_dirs: &[PathBuf],
+    queue: &BoundedWorkQueue<InventoryRefreshRequest>,
+    pending_paths: &mut Vec<PathBuf>,
+    pending_since: Option<Instant>,
+) -> Option<Instant> {
+    match try_enqueue_media_changed_paths(media_dirs, queue, std::mem::take(pending_paths)) {
+        ChangedPathEnqueue::Enqueued | ChangedPathEnqueue::Empty | ChangedPathEnqueue::Closed => {
+            None
+        }
+        ChangedPathEnqueue::Full { changed_paths } => {
+            extend_unique_paths(pending_paths, changed_paths);
+            pending_since.or_else(|| Some(Instant::now()))
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ChangedPathEnqueue {
+    Empty,
+    Enqueued,
+    Full { changed_paths: Vec<PathBuf> },
+    Closed,
+}
+
+fn try_enqueue_media_changed_paths(
+    media_dirs: &[PathBuf],
+    queue: &BoundedWorkQueue<InventoryRefreshRequest>,
+    changed_paths: Vec<PathBuf>,
+) -> ChangedPathEnqueue {
+    if changed_paths.is_empty() {
+        return ChangedPathEnqueue::Empty;
+    }
+    let request = InventoryRefreshRequest::changed_paths(media_dirs.to_vec(), changed_paths);
+    if request.changed_paths.is_empty() {
+        return ChangedPathEnqueue::Empty;
+    }
+    if let Err(error) = queue.try_enqueue(request) {
+        match error {
+            crate::runtime::queue::EnqueueError::Full { item } => {
+                warn!("media inventory changed-path refresh queue is full");
+                ChangedPathEnqueue::Full {
+                    changed_paths: item.changed_paths,
+                }
+            }
+            crate::runtime::queue::EnqueueError::Closed { .. } => {
+                warn!("media inventory changed-path refresh queue is closed");
+                ChangedPathEnqueue::Closed
+            }
+        }
+    } else {
+        ChangedPathEnqueue::Enqueued
+    }
+}
+
 async fn run_inventory_refresh_with_retry(
     worker: &InventoryRefreshWorker,
     request: InventoryRefreshRequest,
@@ -1143,9 +1583,7 @@ mod tests {
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
 
         let summary = worker
-            .refresh_data_dirs(InventoryRefreshRequest {
-                media_dirs: vec![root.clone()],
-            })
+            .refresh_data_dirs(InventoryRefreshRequest::full(vec![root.clone()]))
             .await
             .unwrap();
         let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
@@ -1638,9 +2076,7 @@ mod tests {
 
         let error = worker
             .refresh_data_dirs_until_shutdown(
-                InventoryRefreshRequest {
-                    media_dirs: vec![root.clone()],
-                },
+                InventoryRefreshRequest::full(vec![root.clone()]),
                 signal,
             )
             .await
@@ -1674,9 +2110,7 @@ mod tests {
         let refresh = tokio::spawn(async move {
             worker
                 .refresh_data_dirs_until_shutdown(
-                    InventoryRefreshRequest {
-                        media_dirs: vec![scan_root],
-                    },
+                    InventoryRefreshRequest::full(vec![scan_root]),
                     signal,
                 )
                 .await
@@ -1738,9 +2172,7 @@ mod tests {
         let refresh = tokio::spawn(async move {
             worker
                 .refresh_data_dirs_until_shutdown(
-                    InventoryRefreshRequest {
-                        media_dirs: vec![scan_root],
-                    },
+                    InventoryRefreshRequest::full(vec![scan_root]),
                     signal,
                 )
                 .await
@@ -1778,9 +2210,7 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
-        let request = InventoryRefreshRequest {
-            media_dirs: vec![root.clone()],
-        };
+        let request = InventoryRefreshRequest::full(vec![root.clone()]);
 
         let first_summary = worker.refresh_data_dirs(request.clone()).await.unwrap();
         fs::remove_dir_all(&first).unwrap();
@@ -1808,6 +2238,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_data_dirs_changed_path_refreshes_only_changed_item_root() {
+        let root = unique_temp_dir("changed-path");
+        let first = root.join("First.2026.1080p");
+        let second = root.join("Second.2026.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first_file = first.join("first.mkv");
+        write_file(&first_file, 10);
+        write_file(&second.join("second.mkv"), 20);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+
+        worker
+            .refresh_data_dirs(InventoryRefreshRequest::full(vec![root.clone()]))
+            .await
+            .unwrap();
+        write_file(&first_file, 30);
+        let summary = worker
+            .refresh_data_dirs(InventoryRefreshRequest::changed_paths(
+                vec![root.clone()],
+                vec![first_file],
+            ))
+            .await
+            .unwrap();
+
+        let rows =
+            sqlx::query("SELECT display_name, total_size FROM local_items ORDER BY display_name")
+                .fetch_all(repository.pool())
+                .await
+                .unwrap();
+        let values = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("display_name"),
+                    row.get::<i64, _>("total_size"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(1, summary.scanned_items);
+        assert_eq!(1, summary.persisted_items);
+        assert_eq!(0, summary.pruned_items);
+        assert_eq!(
+            vec![
+                ("First.2026.1080p".to_owned(), 30),
+                ("Second.2026.1080p".to_owned(), 20),
+            ],
+            values
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_changed_path_prefers_nested_media_root() {
+        let root = unique_temp_dir("changed-nested-root");
+        let child_root = root.join("movies");
+        let first = child_root.join("First.2026.1080p");
+        let second = child_root.join("Second.2026.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first_file = first.join("first.mkv");
+        write_file(&first_file, 10);
+        write_file(&second.join("second.mkv"), 20);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+
+        worker
+            .refresh_data_dirs(InventoryRefreshRequest::full(vec![child_root.clone()]))
+            .await
+            .unwrap();
+        write_file(&first_file, 30);
+        let summary = worker
+            .refresh_data_dirs(InventoryRefreshRequest::changed_paths(
+                vec![root.clone(), child_root],
+                vec![first_file],
+            ))
+            .await
+            .unwrap();
+
+        let rows =
+            sqlx::query("SELECT display_name, total_size FROM local_items ORDER BY display_name")
+                .fetch_all(repository.pool())
+                .await
+                .unwrap();
+        let values = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("display_name"),
+                    row.get::<i64, _>("total_size"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(1, summary.scanned_items);
+        assert_eq!(1, summary.persisted_items);
+        assert_eq!(0, summary.pruned_items);
+        assert_eq!(
+            vec![
+                ("First.2026.1080p".to_owned(), 30),
+                ("Second.2026.1080p".to_owned(), 20),
+            ],
+            values
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_changed_deleted_root_prunes_without_full_scan() {
+        let root = unique_temp_dir("changed-delete-root");
+        let first = root.join("First.2026.1080p");
+        let second = root.join("Second.2026.1080p");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("first.mkv"), 10);
+        write_file(&second.join("second.mkv"), 20);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+
+        worker
+            .refresh_data_dirs(InventoryRefreshRequest::full(vec![root.clone()]))
+            .await
+            .unwrap();
+        fs::remove_dir_all(&first).unwrap();
+        let summary = worker
+            .refresh_data_dirs(InventoryRefreshRequest::changed_paths(
+                vec![root.clone()],
+                vec![first],
+            ))
+            .await
+            .unwrap();
+
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT display_name FROM local_items ORDER BY display_name",
+        )
+        .fetch_all(repository.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(0, summary.scanned_items);
+        assert_eq!(0, summary.persisted_items);
+        assert_eq!(1, summary.pruned_items);
+        assert_eq!(vec!["Second.2026.1080p"], names);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_dirs_changed_deleted_direct_file_prunes_exact_root() {
+        let root = unique_temp_dir("changed-delete-file");
+        let movie = root.join("Standalone.2026.mkv");
+        write_file(&movie, 10);
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let worker =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+
+        worker
+            .refresh_data_dirs(InventoryRefreshRequest::full(vec![root.clone()]))
+            .await
+            .unwrap();
+        fs::remove_file(&movie).unwrap();
+        let summary = worker
+            .refresh_data_dirs(InventoryRefreshRequest::changed_paths(
+                vec![root.clone()],
+                vec![movie],
+            ))
+            .await
+            .unwrap();
+
+        let local_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM local_items")
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(0, summary.scanned_items);
+        assert_eq!(0, summary.persisted_items);
+        assert_eq!(1, summary.pruned_items);
+        assert_eq!(0, local_count);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn refresh_data_dirs_prunes_deleted_items_after_full_two_root_scan() {
         let root = unique_temp_dir("two-root-clean-prune");
         let first_root = root.join("mounted-a");
@@ -1821,9 +2440,7 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
-        let request = InventoryRefreshRequest {
-            media_dirs: vec![first_root.clone(), second_root.clone()],
-        };
+        let request = InventoryRefreshRequest::full(vec![first_root.clone(), second_root.clone()]);
 
         let first_summary = worker.refresh_data_dirs(request.clone()).await.unwrap();
         fs::remove_dir_all(&first).unwrap();
@@ -1862,9 +2479,7 @@ mod tests {
         let repository = Repository::connect_in_memory().await.unwrap();
         let worker =
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
-        let request = InventoryRefreshRequest {
-            media_dirs: vec![first_root.clone(), second_root.clone()],
-        };
+        let request = InventoryRefreshRequest::full(vec![first_root.clone(), second_root.clone()]);
 
         let first_summary = worker.refresh_data_dirs(request.clone()).await.unwrap();
         fs::remove_dir_all(&first_root).unwrap();
@@ -1905,15 +2520,14 @@ mod tests {
             InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
 
         let first_summary = worker
-            .refresh_data_dirs(InventoryRefreshRequest {
-                media_dirs: vec![first_root.clone(), second_root.clone()],
-            })
+            .refresh_data_dirs(InventoryRefreshRequest::full(vec![
+                first_root.clone(),
+                second_root.clone(),
+            ]))
             .await
             .unwrap();
         let second_summary = worker
-            .refresh_data_dirs(InventoryRefreshRequest {
-                media_dirs: vec![second_root],
-            })
+            .refresh_data_dirs(InventoryRefreshRequest::full(vec![second_root]))
             .await
             .unwrap();
 
@@ -1979,9 +2593,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let request = InventoryRefreshRequest {
-            media_dirs: vec![first_root.clone(), second_root.clone()],
-        };
+        let request = InventoryRefreshRequest::full(vec![first_root.clone(), second_root.clone()]);
 
         worker
             .refresh_virtual_seasons(VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS + 1_000)
@@ -2045,9 +2657,7 @@ mod tests {
         .await;
 
         worker
-            .refresh_data_dirs(InventoryRefreshRequest {
-                media_dirs: vec![root.clone()],
-            })
+            .refresh_data_dirs(InventoryRefreshRequest::full(vec![root.clone()]))
             .await
             .unwrap();
 
@@ -2073,9 +2683,7 @@ mod tests {
         let (queue, receiver) = inventory_refresh_queue(NonZeroUsize::new(1).unwrap());
 
         queue
-            .try_enqueue(InventoryRefreshRequest {
-                media_dirs: vec![root.clone()],
-            })
+            .try_enqueue(InventoryRefreshRequest::full(vec![root.clone()]))
             .unwrap();
         drop(queue);
         let (_shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
@@ -2089,6 +2697,56 @@ mod tests {
         assert_eq!(1, local_count);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn media_watch_event_collection_deduplicates_changed_paths() {
+        let first = PathBuf::from("/media/First.2026.1080p/first.mkv");
+        let second = PathBuf::from("/media/Second.2026.1080p/second.mkv");
+        let mut pending = Vec::new();
+
+        assert!(collect_media_watch_event(
+            &mut pending,
+            Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![first.clone(), second.clone(), first.clone()],
+                attrs: notify::event::EventAttributes::new(),
+            },
+        ));
+
+        assert_eq!(vec![first, second], pending);
+    }
+
+    #[tokio::test]
+    async fn media_watch_changed_paths_are_retained_when_queue_is_full() {
+        let media_dir = PathBuf::from("/media");
+        let changed = PathBuf::from("/media/First.2026.1080p/first.mkv");
+        let (queue, mut receiver) = inventory_refresh_queue(NonZeroUsize::new(1).unwrap());
+        queue
+            .try_enqueue(InventoryRefreshRequest::full(vec![media_dir.clone()]))
+            .unwrap();
+        let mut pending = Vec::new();
+
+        let outcome = try_enqueue_media_changed_paths(
+            std::slice::from_ref(&media_dir),
+            &queue,
+            vec![changed.clone()],
+        );
+        match outcome {
+            ChangedPathEnqueue::Full { changed_paths } => {
+                extend_unique_paths(&mut pending, changed_paths);
+            }
+            other => panic!("expected full queue, got {other:?}"),
+        }
+        assert_eq!(vec![changed.clone()], pending);
+
+        let _queued = receiver.recv().await.unwrap();
+        let pending_since =
+            flush_media_changed_paths(&[media_dir], &queue, &mut pending, Some(Instant::now()));
+        assert!(pending_since.is_none());
+        assert!(pending.is_empty());
+        let request = receiver.recv().await.unwrap();
+        assert_eq!(vec![changed], request.changed_paths);
     }
 
     #[tokio::test]
@@ -2105,14 +2763,10 @@ mod tests {
         let (queue, receiver) = inventory_refresh_queue(NonZeroUsize::new(2).unwrap());
 
         queue
-            .try_enqueue(InventoryRefreshRequest {
-                media_dirs: vec![missing],
-            })
+            .try_enqueue(InventoryRefreshRequest::full(vec![missing]))
             .unwrap();
         queue
-            .try_enqueue(InventoryRefreshRequest {
-                media_dirs: vec![root.clone()],
-            })
+            .try_enqueue(InventoryRefreshRequest::full(vec![root.clone()]))
             .unwrap();
         drop(queue);
         let (_shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
@@ -2143,9 +2797,7 @@ mod tests {
         let (queue, receiver) = inventory_refresh_queue(NonZeroUsize::new(1).unwrap());
 
         queue
-            .try_enqueue(InventoryRefreshRequest {
-                media_dirs: vec![root.clone()],
-            })
+            .try_enqueue(InventoryRefreshRequest::full(vec![root.clone()]))
             .unwrap();
         let (_shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
         let handle = tokio::spawn(run_inventory_refresh_worker(worker, receiver, signal));
@@ -2172,9 +2824,7 @@ mod tests {
         let (queue, receiver) = inventory_refresh_queue(NonZeroUsize::new(1).unwrap());
 
         queue
-            .try_enqueue(InventoryRefreshRequest {
-                media_dirs: vec![root.clone()],
-            })
+            .try_enqueue(InventoryRefreshRequest::full(vec![root.clone()]))
             .unwrap();
         let (shutdown, signal) = crate::runtime::shutdown::shutdown_channel();
         let handle = tokio::spawn(run_inventory_refresh_worker(worker, receiver, signal));

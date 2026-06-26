@@ -422,6 +422,7 @@ fn source_key_prefix_range_uses_exclusive_text_bound() {
     assert_eq!(
         SourceKeyPrefixRange::new("12:qbit-a.local:".to_owned()),
         SourceKeyPrefixRange {
+            exact: "12:qbit-a.local:".to_owned(),
             start: "12:qbit-a.local:".to_owned(),
             end: Some("12:qbit-a.local;".to_owned()),
         }
@@ -429,6 +430,7 @@ fn source_key_prefix_range_uses_exclusive_text_bound() {
     assert_eq!(
         SourceKeyPrefixRange::new("rtorrent:5000:".to_owned()),
         SourceKeyPrefixRange {
+            exact: "rtorrent:5000:".to_owned(),
             start: "rtorrent:5000:".to_owned(),
             end: Some("rtorrent:5000;".to_owned()),
         }

@@ -36,7 +36,7 @@ use crate::indexers::{
 };
 use crate::inventory_refresh::{
     InventoryRefreshRequest, record_inventory_refresh_health, run_inventory_refresh_worker,
-    scan_failure_reason,
+    run_media_inventory_watcher, scan_failure_reason,
 };
 use crate::matching::{
     CandidateAssessmentConfig, CandidateAssessmentInput, CandidatePrecheckConfig,
@@ -248,6 +248,21 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         ),
         BackgroundShutdownPolicy::AbortOnTimeout,
     ));
+    if !runtime.state.config.paths.media_dirs.is_empty() {
+        handles.push(BackgroundTask::new(
+            "media-inventory-watch",
+            spawn_supervised_background(
+                "media-inventory-watch",
+                &runtime.state,
+                run_media_inventory_watcher(
+                    runtime.state.config.paths.media_dirs.clone(),
+                    runtime.state.queues.inventory_refresh.clone(),
+                    runtime.state.shutdown_signal.clone(),
+                ),
+            ),
+            BackgroundShutdownPolicy::AbortOnTimeout,
+        ));
+    }
     handles.push(BackgroundTask::new(
         "notifications",
         spawn_supervised_background(
@@ -1974,9 +1989,7 @@ async fn run_scheduled_media_inventory_job(
     let result = state
         .inventory_refresh
         .refresh_data_dirs_until_shutdown(
-            InventoryRefreshRequest {
-                media_dirs: state.config.paths.media_dirs.clone(),
-            },
+            InventoryRefreshRequest::full(state.config.paths.media_dirs.clone()),
             refresh_shutdown,
         )
         .await;

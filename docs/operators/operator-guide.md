@@ -330,6 +330,12 @@ refresh. `media_inventory_interval` and `client_inventory_interval` control
 periodic inventory refresh backstops; announce no-match processing can also
 queue stale inventory refreshes immediately. `saved_retry_interval` controls
 its own daemon maintenance loop and is documented in the printed config schema.
+When `paths.media_dirs` are configured, Sporos also watches those roots and
+queues changed-path media inventory refreshes. Native filesystem events provide
+fast updates on local filesystems; a polling watcher also runs so NFS/PVC-backed
+media can still converge when native events are unavailable. The polling watcher
+uses metadata comparison and does not replace the periodic full `media_inventory`
+job, which remains the safety backstop.
 
 Operators can queue an immediate supported job run with
 `POST /v1/jobs/{job_name}/runs`, for example
@@ -397,7 +403,9 @@ Sensitive local state can include:
 `paths.database` stores SQLite state. `paths.torrent_cache_dir` stores cached
 candidate torrents. `paths.output_dir` stores saved candidate torrents prepared
 for client injection or retry. `paths.media_dirs` are read-only media inventory
-roots.
+roots. Changed-path refreshes map a file event to the top-level item under the
+configured media root, so `/media/movies/Example/movie.mkv` refreshes
+`/media/movies/Example` instead of rescanning every configured media directory.
 
 On startup Sporos creates parent directories for the database, torrent cache,
 output paths, and configured injection link directories, then checks that local

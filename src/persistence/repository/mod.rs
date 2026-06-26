@@ -175,23 +175,35 @@ pub struct StagedVirtualSeason {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct SourceKeyPrefixRange {
+    exact: String,
     start: String,
     end: Option<String>,
 }
 
 impl SourceKeyPrefixRange {
     fn new(prefix: String) -> Self {
+        let exact = prefix.clone();
         let end = next_text_prefix(&prefix);
-        Self { start: prefix, end }
+        Self {
+            exact,
+            start: prefix,
+            end,
+        }
     }
 }
 
 fn data_root_source_key_range(root: &Path) -> SourceKeyPrefixRange {
-    let mut prefix = path_to_string(root);
+    let exact = path_to_string(root);
+    let mut prefix = exact.clone();
     if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
         prefix.push(std::path::MAIN_SEPARATOR);
     }
-    SourceKeyPrefixRange::new(prefix)
+    let end = next_text_prefix(&prefix);
+    SourceKeyPrefixRange {
+        exact,
+        start: prefix,
+        end,
+    }
 }
 
 fn data_root_source_key_is_in_roots(source_key: &str, roots: &[PathBuf]) -> bool {
@@ -5663,8 +5675,9 @@ async fn prune_local_items_not_retained(
                 r#"
                 DELETE FROM local_items
                 WHERE source_type = ?
-                  AND source_key >= ?
+                  AND (source_key = ? OR (source_key >= ?
                   AND source_key < ?
+                  ))
                   AND NOT EXISTS (
                       SELECT 1
                       FROM retained_local_item_keys retained
@@ -5673,6 +5686,7 @@ async fn prune_local_items_not_retained(
                 "#,
             )
             .bind(scope.source_type())
+            .bind(range.exact)
             .bind(range.start)
             .bind(end)
             .execute(&mut **transaction)
@@ -5682,7 +5696,7 @@ async fn prune_local_items_not_retained(
                 r#"
                 DELETE FROM local_items
                 WHERE source_type = ?
-                  AND source_key >= ?
+                  AND (source_key = ? OR source_key >= ?)
                   AND NOT EXISTS (
                       SELECT 1
                       FROM retained_local_item_keys retained
@@ -5691,6 +5705,7 @@ async fn prune_local_items_not_retained(
                 "#,
             )
             .bind(scope.source_type())
+            .bind(range.exact)
             .bind(range.start)
             .execute(&mut **transaction)
             .await
