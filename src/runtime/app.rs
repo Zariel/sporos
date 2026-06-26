@@ -7,6 +7,10 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
+#[cfg(test)]
+static TEST_WORKFLOW_DATABASE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 use crate::arr::{ArrEndpoint, ArrRegistry};
 use crate::clients::TorrentClientRegistry;
 use crate::clients::runtime::build_injection_clients;
@@ -39,6 +43,10 @@ use crate::persistence::repository::{
 };
 use crate::runtime::announce_worker::AnnounceWorker;
 use crate::runtime::backoff::stable_jitter_seed;
+use crate::runtime::duroxide_workflow::{
+    DuroxideWorkflowRuntime, DuroxideWorkflowRuntimeError, workflow_database_path,
+    workflow_runtime_dependency_name,
+};
 use crate::runtime::health::{DependencyKind, HealthRegistry};
 use crate::runtime::injection_worker::{InjectionClient, InjectionWorker};
 use crate::runtime::queue::{QueueKind, RuntimeQueueConfig, WorkReceiver, bounded_work_queue};
@@ -83,6 +91,7 @@ pub struct AppState {
     pub injection_worker: InjectionWorker,
     pub notification_endpoints: BTreeMap<DependencyName, NotificationEndpoint>,
     pub search_planner: RuntimeSearchPlanner,
+    pub workflow_runtime: DuroxideWorkflowRuntime,
     pub torznab_indexers: BTreeMap<DependencyName, ConfiguredTorznabIndexer>,
     pub prowlarr_sources: BTreeMap<DependencyName, RuntimeProwlarrSource>,
     pub torznab_client: TorznabHttpClient,
@@ -1194,7 +1203,13 @@ impl AppRuntime {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        let local_state_names = vec![inventory_refresh_dependency_name()?];
+        let local_state_names = vec![
+            inventory_refresh_dependency_name()?,
+            map_workflow_runtime_error(
+                workflow_runtime_dependency_name(),
+                "build workflow runtime dependency name",
+            )?,
+        ];
         let mut persisted_health = repository
             .dependency_health_for_type_names(DependencyKind::Arr, &arr_names)
             .await?;
@@ -1220,6 +1235,15 @@ impl AppRuntime {
         seed_runtime_health(&health, &persisted_health);
         seed_unknown_health_for_missing(&health, DependencyKind::Notification, &notification_names);
         seed_arr_endpoint_backoff(&mut arr_endpoints, &persisted_health, now_ms);
+        let workflow_runtime = map_workflow_runtime_error(
+            DuroxideWorkflowRuntime::start(runtime_workflow_database_path(&config)).await,
+            "start workflow runtime",
+        )?;
+        let workflow_runtime_name = map_workflow_runtime_error(
+            workflow_runtime_dependency_name(),
+            "build workflow runtime dependency name",
+        )?;
+        health.set_healthy(DependencyKind::LocalState, workflow_runtime_name, now_ms);
         let search_planner = RuntimeSearchPlanner::new(
             repository.clone(),
             health.clone(),
@@ -1279,6 +1303,7 @@ impl AppRuntime {
             injection_worker,
             notification_endpoints: runtime_config.notification_endpoints,
             search_planner,
+            workflow_runtime,
             torznab_indexers: runtime_config.torznab_indexers,
             prowlarr_sources: runtime_config.prowlarr_sources,
             torznab_client: TorznabHttpClient::new(Duration::from_secs(120)),
@@ -1287,7 +1312,10 @@ impl AppRuntime {
             shutdown,
             shutdown_signal,
         };
-        state.refresh_startup_prowlarr_sources(now_ms).await?;
+        if let Err(error) = state.refresh_startup_prowlarr_sources(now_ms).await {
+            state.workflow_runtime.shutdown(Some(1_000)).await;
+            return Err(error);
+        }
 
         Ok(Self {
             state,
@@ -1628,6 +1656,36 @@ fn inventory_refresh_dependency_name() -> Result<DependencyName, DatabaseError> 
     })
 }
 
+fn map_workflow_runtime_error<T>(
+    result: Result<T, DuroxideWorkflowRuntimeError>,
+    operation: &'static str,
+) -> Result<T, DatabaseError> {
+    result.map_err(|error| DatabaseError::Unavailable {
+        operation: operation.to_owned(),
+        message: error.to_string(),
+    })
+}
+
+#[cfg(not(test))]
+fn runtime_workflow_database_path(config: &SporosConfig) -> std::path::PathBuf {
+    workflow_database_path(&config.paths.database)
+}
+
+#[cfg(test)]
+fn runtime_workflow_database_path(config: &SporosConfig) -> std::path::PathBuf {
+    if !config.paths.database.is_relative() {
+        return workflow_database_path(&config.paths.database);
+    }
+
+    let unique = TEST_WORKFLOW_DATABASE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::env::temp_dir()
+        .join(format!(
+            "sporos-workflow-runtime-{}-{unique}",
+            std::process::id()
+        ))
+        .join("sporos-workflows.db")
+}
+
 fn health_reason(value: Option<&str>, fallback: &'static str) -> Option<ReasonText> {
     value
         .and_then(|reason| ReasonText::new(reason).ok())
@@ -1877,7 +1935,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_composes_services_from_config_and_repository() {
-        let mut config = SporosConfig::default();
+        let root = unique_temp_dir("runtime-compose").canonicalize().unwrap();
+        let mut config = runtime_test_config(&root);
         config.scheduling.saved_retry_interval = "5m".to_owned();
         config.runtime.search_queue_limit = 12;
         config.runtime.indexing_queue_limit = 13;
@@ -1950,6 +2009,18 @@ mod tests {
         assert_eq!(13, status_queue_capacity(queues, "inventory_refresh"));
         assert_eq!(14, status_queue_capacity(queues, "notification"));
         assert!(!queues.iter().any(|queue| queue["kind"] == "announcement"));
+        let workflow_dependency = status_json["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dependency| {
+                dependency["kind"] == DependencyKind::LocalState.as_str()
+                    && dependency["name"]
+                        == crate::runtime::duroxide_workflow::WORKFLOW_RUNTIME_DEPENDENCY
+            })
+            .expect("status should expose workflow runtime dependency health");
+        assert_eq!("healthy", workflow_dependency["state"]);
+        assert_eq!("memory", workflow_dependency["source"]);
         assert_eq!(
             u64::from(AnnounceQueueConfig::default().max_pending),
             status_json["announce_queue"]["max_pending"]
@@ -1962,6 +2033,18 @@ mod tests {
             crate::runtime::shutdown::ShutdownPhase::Running,
             runtime.state.shutdown.state().phase
         );
+        let workflow_runtime_name = workflow_runtime_dependency_name().unwrap();
+        assert!(matches!(
+            runtime
+                .state
+                .health
+                .state(&crate::runtime::health::DependencyKey::new(
+                    DependencyKind::LocalState,
+                    workflow_runtime_name
+                )),
+            Some(DependencyState::Healthy { .. })
+        ));
+        runtime.state.workflow_runtime.shutdown(Some(1_000)).await;
     }
 
     #[tokio::test]
@@ -2623,7 +2706,13 @@ mod tests {
             INVENTORY_REFRESH_DEPENDENCY,
             DependencyState::Healthy { checked_at_ms: 100 },
         );
-        assert_eq!(6, health.entries.len());
+        assert!(health.entries.iter().any(|entry| {
+            entry.key.kind == DependencyKind::LocalState
+                && entry.key.name.as_str()
+                    == crate::runtime::duroxide_workflow::WORKFLOW_RUNTIME_DEPENDENCY
+                && matches!(entry.state, DependencyState::Healthy { .. })
+        }));
+        assert_eq!(7, health.entries.len());
         for (kind, name) in [
             (DependencyKind::Indexer, "indexer0000"),
             (DependencyKind::Notification, "ghost"),
@@ -5509,6 +5598,7 @@ mod tests {
         assert_eq!(StatusCode::SERVICE_UNAVAILABLE, readyz.status());
         assert_eq!(true, status_json["readiness"]["accepting_work"]);
         assert_eq!(false, status_json["readiness"]["processing_ready"]);
+        runtime.state.workflow_runtime.shutdown(Some(1_000)).await;
         fs::remove_dir_all(root).unwrap();
     }
 

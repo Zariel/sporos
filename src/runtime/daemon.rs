@@ -61,6 +61,7 @@ use crate::runtime::announce_worker::{
     classify_injection_result, classify_reverse_lookup_outcome, unix_time_ms,
 };
 use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
+use crate::runtime::duroxide_workflow::DuroxideWorkflowRuntimeError;
 use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
     DryRunAction, InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
@@ -78,6 +79,7 @@ use crate::torrent::parse_metafile;
 
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKGROUND_ABORT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+const WORKFLOW_RUNTIME_SHUTDOWN_TIMEOUT_MS: u64 = 100;
 const ANNOUNCE_IDLE_SLEEP: Duration = Duration::from_millis(500);
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
@@ -92,11 +94,24 @@ static NO_CLIENT_SAVE_THREADS: std::sync::Mutex<Vec<(PathBuf, std::thread::Threa
 
 #[derive(Debug)]
 pub enum DaemonError {
-    Config { source: ConfigError },
-    BuildRuntime { source: DatabaseError },
-    Bind { message: String },
-    Serve { message: String },
-    AnnounceStartup { source: AnnounceWorkerError },
+    Config {
+        source: ConfigError,
+    },
+    BuildRuntime {
+        source: DatabaseError,
+    },
+    Bind {
+        message: String,
+    },
+    Serve {
+        message: String,
+    },
+    AnnounceStartup {
+        source: AnnounceWorkerError,
+    },
+    WorkflowRuntime {
+        source: DuroxideWorkflowRuntimeError,
+    },
 }
 
 pub async fn serve(config: SporosConfig) -> Result<(), DaemonError> {
@@ -120,10 +135,23 @@ pub async fn serve_with_listener(
 ) -> Result<(), DaemonError> {
     let shutdown = runtime.state.shutdown.clone();
     let shutdown_signal = runtime.state.shutdown_signal.clone();
+    let workflow_runtime = runtime.state.workflow_runtime.clone();
     let http = runtime.state.http.clone();
     let app = router(http.clone());
     http.set_workers_running(true);
-    let background = start_background_tasks(runtime).await?;
+    let background = match start_background_tasks(runtime).await {
+        Ok(background) => background,
+        Err(error) => {
+            http.set_workers_running(false);
+            if let Err(shutdown_error) = shutdown.cancel_now("background startup failed") {
+                warn!(error = %shutdown_error, "failed to publish startup failure shutdown signal");
+            }
+            workflow_runtime
+                .shutdown(Some(WORKFLOW_RUNTIME_SHUTDOWN_TIMEOUT_MS))
+                .await;
+            return Err(error);
+        }
+    };
     let signal_task = tokio::spawn(process_shutdown_signal(shutdown.clone()));
 
     let serve_result = axum::serve(listener, app)
@@ -138,6 +166,9 @@ pub async fn serve_with_listener(
     }
     http.set_workers_running(false);
     stop_background_tasks(background).await;
+    workflow_runtime
+        .shutdown(Some(WORKFLOW_RUNTIME_SHUTDOWN_TIMEOUT_MS))
+        .await;
     serve_result
 }
 
@@ -200,6 +231,23 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         .recover_startup(unix_time_ms())
         .await
         .map_err(|source| DaemonError::AnnounceStartup { source })?;
+    let workflow_supervisors = [
+        CLEANUP_JOB_NAME,
+        MEDIA_INVENTORY_JOB_NAME,
+        CLIENT_INVENTORY_JOB_NAME,
+        INDEXER_CAPS_JOB_NAME,
+    ];
+    let supervisor_summary = runtime
+        .state
+        .workflow_runtime
+        .seed_supervisors(&workflow_supervisors)
+        .await
+        .map_err(|source| DaemonError::WorkflowRuntime { source })?;
+    info!(
+        started = supervisor_summary.started,
+        already_present = supervisor_summary.already_present,
+        "workflow runtime supervisors seeded"
+    );
     let announce_owner_prefix = announce_worker_owner_prefix();
     let announce_retention_cleanup = runtime.state.announce_worker.retention_cleanup();
 
@@ -3816,6 +3864,7 @@ impl fmt::Display for DaemonError {
             Self::BuildRuntime { source } => write!(formatter, "{source}"),
             Self::Bind { message } | Self::Serve { message } => formatter.write_str(message),
             Self::AnnounceStartup { source } => write!(formatter, "{source}"),
+            Self::WorkflowRuntime { source } => write!(formatter, "{source}"),
         }
     }
 }
@@ -3826,6 +3875,7 @@ impl std::error::Error for DaemonError {
             Self::Config { source } => Some(source),
             Self::BuildRuntime { source } => Some(source),
             Self::AnnounceStartup { source } => Some(source),
+            Self::WorkflowRuntime { source } => Some(source),
             Self::Bind { .. } | Self::Serve { .. } => None,
         }
     }
