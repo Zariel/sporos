@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,14 +17,16 @@ use crate::inventory_refresh::{
     record_inventory_refresh_health, scan_failure_reason,
 };
 use crate::persistence::repository::{
-    Repository, WorkflowProjectionDependency, WorkflowProjectionUpdate,
+    Repository, WorkflowInventoryCompletionRecord, WorkflowInventoryWaiterRecord,
+    WorkflowProjectionDependency, WorkflowProjectionUpdate,
 };
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::injection_worker::InjectionWorker;
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 use crate::runtime::workflow_contracts::{
     ActivityInputEnvelope, ActivityKind, InventoryRefreshKind, InventoryRefreshWorkflowInput,
-    WorkflowCustomStatus, WorkflowInstanceId, WorkflowKind, WorkflowReason, WorkflowState,
+    WorkflowCustomStatus, WorkflowEventName, WorkflowInstanceId, WorkflowKind, WorkflowReason,
+    WorkflowState,
 };
 
 pub const WORKFLOW_RUNTIME_DEPENDENCY: &str = "workflow-runtime";
@@ -34,6 +36,10 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STARTUP_LONG_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const INVENTORY_REFRESH_QUEUE: &str = "inventory_refresh_requests";
 const INVENTORY_REFRESH_ACTIVITY_ID: &str = "inventory-refresh";
+const INVENTORY_COMPLETION_FANOUT_LIMIT: u16 = 1_000;
+const INVENTORY_COMPLETION_LEASE_MS: i64 = 60_000;
+#[cfg(test)]
+const TEST_INVENTORY_WAIT_ORCHESTRATION: &str = "sporos.test.inventory_wait.v1";
 
 #[derive(Clone)]
 pub struct DuroxideWorkflowRuntime {
@@ -43,6 +49,7 @@ pub struct DuroxideWorkflowRuntime {
     runtime: Arc<Runtime>,
     seeded_supervisors: Arc<Mutex<BTreeSet<String>>>,
     active_inventory_refreshes: Arc<Mutex<BTreeSet<String>>>,
+    inventory_completion_events: InventoryCompletionEventBridge,
 }
 
 impl DuroxideWorkflowRuntime {
@@ -76,9 +83,11 @@ impl DuroxideWorkflowRuntime {
             .as_ref()
             .map(|(repository, _activities)| repository.clone());
         let active_inventory_refreshes = Arc::new(Mutex::new(BTreeSet::new()));
+        let inventory_completion_events =
+            InventoryCompletionEventBridge::new(Arc::clone(&store), repository.clone());
         let activity_registry = match inventory {
             Some((_repository, activities)) => activity_registry_with_inventory_activities(
-                activities,
+                activities.with_completion_event_bridge(inventory_completion_events.clone()),
                 Arc::clone(&active_inventory_refreshes),
             ),
             None => activity_registry(),
@@ -97,14 +106,26 @@ impl DuroxideWorkflowRuntime {
         )
         .await;
 
-        Ok(Self {
+        let runtime = Self {
             database_path,
             repository,
             store,
             runtime,
             seeded_supervisors: Arc::new(Mutex::new(BTreeSet::new())),
             active_inventory_refreshes,
-        })
+            inventory_completion_events,
+        };
+        if let Err(error) = runtime
+            .inventory_completion_events
+            .drain_persisted_completions()
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                "persisted inventory completion drain failed during workflow runtime startup"
+            );
+        }
+        Ok(runtime)
     }
 
     pub fn database_path(&self) -> &Path {
@@ -113,6 +134,16 @@ impl DuroxideWorkflowRuntime {
 
     pub fn client(&self) -> Client {
         Client::new(Arc::clone(&self.store))
+    }
+
+    pub async fn register_inventory_completion_waiter(
+        &self,
+        waiter: InventoryCompletionWaiter,
+    ) -> Result<InventoryCompletionWaitRegistration, DuroxideWorkflowRuntimeError> {
+        self.inventory_completion_events
+            .register_waiter(waiter)
+            .await
+            .map_err(|message| DuroxideWorkflowRuntimeError::InventoryCompletionBridge { message })
     }
 
     pub async fn submit_inventory_refresh(
@@ -520,6 +551,9 @@ pub enum DuroxideWorkflowRuntimeError {
     InventoryWorkflowWaitCancelled {
         workflow_id: String,
     },
+    InventoryCompletionBridge {
+        message: String,
+    },
     SeedTrackerPoisoned,
     InventoryTrackerPoisoned,
 }
@@ -633,6 +667,12 @@ impl fmt::Display for DuroxideWorkflowRuntimeError {
                 formatter,
                 "wait for inventory workflow `{workflow_id}` cancelled"
             ),
+            Self::InventoryCompletionBridge { message } => {
+                write!(
+                    formatter,
+                    "inventory completion event bridge failed: {message}"
+                )
+            }
             Self::SeedTrackerPoisoned => {
                 formatter.write_str("workflow supervisor seed tracker is poisoned")
             }
@@ -677,6 +717,7 @@ pub struct InventoryWorkflowActivities {
     injection_worker: InjectionWorker,
     shutdown: ShutdownSignal,
     failure_backoff: Duration,
+    completion_events: Option<InventoryCompletionEventBridge>,
 }
 
 impl InventoryWorkflowActivities {
@@ -693,7 +734,16 @@ impl InventoryWorkflowActivities {
             injection_worker,
             shutdown,
             failure_backoff,
+            completion_events: None,
         }
+    }
+
+    fn with_completion_event_bridge(
+        mut self,
+        completion_events: InventoryCompletionEventBridge,
+    ) -> Self {
+        self.completion_events = Some(completion_events);
+        self
     }
 }
 
@@ -820,6 +870,518 @@ struct InventoryActivityOutput {
     persisted_items: usize,
     pruned_items: u64,
     scan_failure_count: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InventoryCompletionWaiter {
+    pub workflow_id: String,
+    pub event_name: WorkflowEventName,
+    pub required_after_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InventoryCompletionWaitRegistration {
+    pub inserted: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InventoryCompletionEvent {
+    pub inventory_kind: InventoryRefreshKind,
+    pub source_workflow_id: String,
+    pub completed_at_ms: i64,
+    pub scanned_items: usize,
+    pub persisted_items: usize,
+    pub pruned_items: u64,
+}
+
+impl InventoryCompletionEvent {
+    fn event_name(&self) -> WorkflowEventName {
+        match self.inventory_kind {
+            InventoryRefreshKind::MediaFull | InventoryRefreshKind::MediaChanged => {
+                WorkflowEventName::MediaInventoryCompleted
+            }
+            InventoryRefreshKind::Client => WorkflowEventName::ClientInventoryCompleted,
+        }
+    }
+
+    fn to_record(&self) -> WorkflowInventoryCompletionRecord {
+        WorkflowInventoryCompletionRecord {
+            event_name: self.event_name().as_str().to_owned(),
+            source_workflow_id: self.source_workflow_id.clone(),
+            completed_at_ms: self.completed_at_ms,
+            inventory_kind: inventory_refresh_kind_key(self.inventory_kind).to_owned(),
+            scanned_items: self.scanned_items,
+            persisted_items: self.persisted_items,
+            pruned_items: self.pruned_items,
+        }
+    }
+
+    fn from_record(record: &WorkflowInventoryCompletionRecord) -> Result<Self, String> {
+        let inventory_kind = inventory_refresh_kind_from_key(&record.inventory_kind)?;
+        Ok(Self {
+            inventory_kind,
+            source_workflow_id: record.source_workflow_id.clone(),
+            completed_at_ms: record.completed_at_ms,
+            scanned_items: record.scanned_items,
+            persisted_items: record.persisted_items,
+            pruned_items: record.pruned_items,
+        })
+    }
+}
+
+fn inventory_refresh_kind_key(kind: InventoryRefreshKind) -> &'static str {
+    match kind {
+        InventoryRefreshKind::MediaFull => "media_full",
+        InventoryRefreshKind::MediaChanged => "media_changed",
+        InventoryRefreshKind::Client => "client",
+    }
+}
+
+fn inventory_refresh_kind_from_key(value: &str) -> Result<InventoryRefreshKind, String> {
+    match value {
+        "media_full" => Ok(InventoryRefreshKind::MediaFull),
+        "media_changed" => Ok(InventoryRefreshKind::MediaChanged),
+        "client" => Ok(InventoryRefreshKind::Client),
+        _ => Err(format!("unknown inventory refresh kind `{value}`")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct InventoryCompletionFanout {
+    pub waiters: usize,
+    pub delivered: usize,
+    pub failed: usize,
+}
+
+#[derive(Clone)]
+pub struct InventoryCompletionEventBridge {
+    store: Arc<dyn Provider>,
+    repository: Option<Repository>,
+    waiters: Arc<Mutex<InventoryCompletionWaiters>>,
+}
+
+#[derive(Debug, Default)]
+struct InventoryCompletionWaiters {
+    by_event: BTreeMap<String, BTreeMap<String, i64>>,
+}
+
+impl InventoryCompletionEventBridge {
+    fn new(store: Arc<dyn Provider>, repository: Option<Repository>) -> Self {
+        Self {
+            store,
+            repository,
+            waiters: Arc::new(Mutex::new(InventoryCompletionWaiters::default())),
+        }
+    }
+
+    async fn register_waiter(
+        &self,
+        waiter: InventoryCompletionWaiter,
+    ) -> Result<InventoryCompletionWaitRegistration, String> {
+        let event_name = inventory_completion_event_name(waiter.event_name)?;
+        if waiter.workflow_id.is_empty() {
+            return Err("inventory completion waiter workflow id must not be empty".to_owned());
+        }
+        if let Some(repository) = &self.repository {
+            let inserted = repository
+                .record_workflow_inventory_waiter(
+                    event_name,
+                    &waiter.workflow_id,
+                    waiter.required_after_ms,
+                    unix_time_ms(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(InventoryCompletionWaitRegistration { inserted });
+        }
+        self.register_memory_waiter(event_name, waiter)
+    }
+
+    fn register_memory_waiter(
+        &self,
+        event_name: &str,
+        waiter: InventoryCompletionWaiter,
+    ) -> Result<InventoryCompletionWaitRegistration, String> {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .map_err(|_error| "inventory completion waiter registry is poisoned".to_owned())?;
+        let event_waiters = waiters.by_event.entry(event_name.to_owned()).or_default();
+        let inserted = event_waiters
+            .insert(waiter.workflow_id, waiter.required_after_ms)
+            .is_none();
+        Ok(InventoryCompletionWaitRegistration { inserted })
+    }
+
+    async fn publish_completion(
+        &self,
+        event: &InventoryCompletionEvent,
+    ) -> Result<InventoryCompletionFanout, String> {
+        self.record_completion(event).await?;
+        let summary = self.drain_completion_event(event).await;
+        if let Ok(fanout) = summary.as_ref()
+            && self.completion_can_be_deleted(event, *fanout).await?
+        {
+            self.delete_persisted_completion(event).await?;
+        }
+        summary
+    }
+
+    async fn drain_persisted_completions(&self) -> Result<InventoryCompletionFanout, String> {
+        let Some(repository) = &self.repository else {
+            return Ok(InventoryCompletionFanout::default());
+        };
+        let completions = repository
+            .workflow_inventory_completions(INVENTORY_COMPLETION_FANOUT_LIMIT)
+            .await
+            .map_err(|error| format!("read persisted inventory completions failed: {error}"))?;
+        let mut total = InventoryCompletionFanout::default();
+        for completion in completions {
+            let event = InventoryCompletionEvent::from_record(&completion)?;
+            let summary = self.drain_completion_event(&event).await?;
+            total.waiters += summary.waiters;
+            total.delivered += summary.delivered;
+            total.failed += summary.failed;
+            if self.completion_can_be_deleted(&event, summary).await? {
+                self.delete_persisted_completion(&event).await?;
+            }
+        }
+        Ok(total)
+    }
+
+    async fn record_completion(&self, event: &InventoryCompletionEvent) -> Result<(), String> {
+        let Some(repository) = &self.repository else {
+            return Ok(());
+        };
+        repository
+            .record_workflow_inventory_completion(&event.to_record(), unix_time_ms())
+            .await
+            .map_err(|error| {
+                format!(
+                    "record inventory completion `{}` failed: {error}",
+                    event.source_workflow_id
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn delete_persisted_completion(
+        &self,
+        event: &InventoryCompletionEvent,
+    ) -> Result<(), String> {
+        let Some(repository) = &self.repository else {
+            return Ok(());
+        };
+        repository
+            .delete_workflow_inventory_completion(
+                event.event_name().as_str(),
+                &event.source_workflow_id,
+                event.completed_at_ms,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "delete inventory completion `{}` failed: {error}",
+                    event.source_workflow_id
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn completion_can_be_deleted(
+        &self,
+        event: &InventoryCompletionEvent,
+        summary: InventoryCompletionFanout,
+    ) -> Result<bool, String> {
+        if summary.waiters > 0 {
+            return Ok(true);
+        }
+        let Some(repository) = &self.repository else {
+            return Ok(true);
+        };
+        let due_count = repository
+            .workflow_inventory_waiters_due_count(
+                event.event_name().as_str(),
+                event.completed_at_ms,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "count waiters for inventory completion `{}` failed: {error}",
+                    event.source_workflow_id
+                )
+            })?;
+        Ok(due_count == 0)
+    }
+
+    async fn drain_completion_event(
+        &self,
+        event: &InventoryCompletionEvent,
+    ) -> Result<InventoryCompletionFanout, String> {
+        let event_name = event.event_name().as_str().to_owned();
+        let lease_owner = format!(
+            "inventory-completion:{}:{}",
+            event.source_workflow_id, event.completed_at_ms
+        );
+        let mut summary = InventoryCompletionFanout::default();
+        let mut cleanup_conflict = false;
+        loop {
+            let ready = self
+                .ready_waiters(&event_name, event.completed_at_ms, &lease_owner)
+                .await?;
+            let batch_len = ready.len();
+            if ready.is_empty() {
+                break;
+            }
+            summary.waiters += batch_len;
+            let mut batch_failed = false;
+            let mut cleanup_failed = false;
+            for waiter in ready {
+                let client = Client::new(Arc::clone(&self.store));
+                match self
+                    .enqueue_completion_if_target_is_running(&client, &waiter, &event_name, event)
+                    .await
+                {
+                    Ok(()) => {
+                        summary.delivered += 1;
+                        cleanup_failed |=
+                            !self.remove_delivered_waiter(&event_name, &waiter).await?;
+                    }
+                    Err(error) => {
+                        summary.failed += 1;
+                        batch_failed = true;
+                        self.release_waiter_after_delivery_failure(
+                            &event_name,
+                            &waiter,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        tracing::warn!(
+                            workflow_id = waiter.workflow_id,
+                            event_name,
+                            error = %error,
+                            "inventory completion event delivery failed"
+                        );
+                    }
+                }
+            }
+            let maybe_more_repository_waiters = self.repository.is_some()
+                && batch_len == usize::from(INVENTORY_COMPLETION_FANOUT_LIMIT);
+            cleanup_conflict |= cleanup_failed;
+            if !maybe_more_repository_waiters || batch_failed || cleanup_failed {
+                break;
+            }
+        }
+        if cleanup_conflict {
+            Err("inventory completion fanout could not confirm delivered waiter cleanup".to_owned())
+        } else if summary.failed > 0 {
+            Err(format!(
+                "inventory completion fanout failed for {} of {} waiters",
+                summary.failed, summary.waiters
+            ))
+        } else {
+            Ok(summary)
+        }
+    }
+
+    async fn enqueue_completion_if_target_is_running(
+        &self,
+        client: &Client,
+        waiter: &InventoryCompletionReadyWaiter,
+        event_name: &str,
+        event: &InventoryCompletionEvent,
+    ) -> Result<(), String> {
+        match client
+            .get_orchestration_status(&waiter.workflow_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            OrchestrationStatus::Running { .. } => client
+                .enqueue_event_typed(&waiter.workflow_id, event_name, event)
+                .await
+                .map_err(|error| error.to_string()),
+            OrchestrationStatus::NotFound => Err(format!(
+                "target workflow `{}` is not found",
+                waiter.workflow_id
+            )),
+            OrchestrationStatus::Completed { .. } => Err(format!(
+                "target workflow `{}` is already completed",
+                waiter.workflow_id
+            )),
+            OrchestrationStatus::Failed { details, .. } => Err(format!(
+                "target workflow `{}` is failed: {}",
+                waiter.workflow_id,
+                details.display_message()
+            )),
+        }
+    }
+
+    async fn ready_waiters(
+        &self,
+        event_name: &str,
+        completed_at_ms: i64,
+        lease_owner: &str,
+    ) -> Result<Vec<InventoryCompletionReadyWaiter>, String> {
+        let mut ready = BTreeMap::<String, InventoryCompletionReadyWaiter>::new();
+        if let Some(repository) = &self.repository {
+            let now_ms = unix_time_ms();
+            let rows = repository
+                .claim_workflow_inventory_waiters_ready(
+                    event_name,
+                    completed_at_ms,
+                    now_ms,
+                    lease_owner,
+                    now_ms.saturating_add(INVENTORY_COMPLETION_LEASE_MS),
+                    INVENTORY_COMPLETION_FANOUT_LIMIT,
+                )
+                .await
+                .map_err(|error| {
+                    format!("claim inventory completion waiters for `{event_name}` failed: {error}")
+                })?;
+            for row in rows {
+                ready.insert(
+                    row.workflow_id.clone(),
+                    InventoryCompletionReadyWaiter::from_repository(row, lease_owner.to_owned()),
+                );
+            }
+        }
+        for workflow_id in self.ready_memory_waiters(event_name, completed_at_ms) {
+            ready
+                .entry(workflow_id.clone())
+                .and_modify(|waiter| waiter.memory = true)
+                .or_insert_with(|| InventoryCompletionReadyWaiter::from_memory(workflow_id));
+        }
+        Ok(ready.into_values().collect())
+    }
+
+    async fn release_waiter_after_delivery_failure(
+        &self,
+        event_name: &str,
+        waiter: &InventoryCompletionReadyWaiter,
+        error: &str,
+    ) -> Result<(), String> {
+        if waiter.repository
+            && let Some(repository) = &self.repository
+        {
+            let lease_owner = waiter.lease_owner.as_deref().unwrap_or_default();
+            repository
+                .release_workflow_inventory_waiter(
+                    event_name,
+                    &waiter.workflow_id,
+                    lease_owner,
+                    error,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "release inventory completion waiter `{}` failed: {error}",
+                        waiter.workflow_id
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn ready_memory_waiters(&self, event_name: &str, completed_at_ms: i64) -> Vec<String> {
+        let Ok(waiters) = self.waiters.lock() else {
+            return Vec::new();
+        };
+        waiters
+            .by_event
+            .get(event_name)
+            .into_iter()
+            .flat_map(|event_waiters| event_waiters.iter())
+            .filter(|(_workflow_id, required_after_ms)| completed_at_ms >= **required_after_ms)
+            .map(|(workflow_id, _required_after_ms)| workflow_id.clone())
+            .collect()
+    }
+
+    async fn remove_delivered_waiter(
+        &self,
+        event_name: &str,
+        waiter: &InventoryCompletionReadyWaiter,
+    ) -> Result<bool, String> {
+        let mut removed = true;
+        if waiter.repository
+            && let Some(repository) = &self.repository
+        {
+            let lease_owner = waiter.lease_owner.as_deref().unwrap_or_default();
+            let deleted = repository
+                .delete_claimed_workflow_inventory_waiter(
+                    event_name,
+                    &waiter.workflow_id,
+                    lease_owner,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "delete delivered inventory completion waiter `{}` failed: {error}",
+                        waiter.workflow_id
+                    )
+                })?;
+            removed &= deleted;
+        }
+        if waiter.memory {
+            self.remove_memory_waiter(event_name, &waiter.workflow_id);
+        }
+        Ok(removed)
+    }
+
+    fn remove_memory_waiter(&self, event_name: &str, workflow_id: &str) {
+        let Ok(mut waiters) = self.waiters.lock() else {
+            return;
+        };
+        if let Some(event_waiters) = waiters.by_event.get_mut(event_name) {
+            event_waiters.remove(workflow_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct InventoryCompletionReadyWaiter {
+    workflow_id: String,
+    repository: bool,
+    memory: bool,
+    lease_owner: Option<String>,
+}
+
+impl InventoryCompletionReadyWaiter {
+    fn from_repository(row: WorkflowInventoryWaiterRecord, lease_owner: String) -> Self {
+        Self {
+            workflow_id: row.workflow_id,
+            repository: true,
+            memory: false,
+            lease_owner: Some(lease_owner),
+        }
+    }
+
+    fn from_memory(workflow_id: String) -> Self {
+        Self {
+            workflow_id,
+            repository: false,
+            memory: true,
+            lease_owner: None,
+        }
+    }
+}
+
+fn inventory_completion_event_name(event_name: WorkflowEventName) -> Result<&'static str, String> {
+    match event_name {
+        WorkflowEventName::MediaInventoryCompleted
+        | WorkflowEventName::ClientInventoryCompleted => Ok(event_name.as_str()),
+        _ => Err(format!(
+            "workflow event `{}` is not an inventory completion event",
+            event_name.as_str()
+        )),
+    }
+}
+
+impl fmt::Debug for InventoryCompletionEventBridge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InventoryCompletionEventBridge")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -984,8 +1546,58 @@ async fn run_inventory_activity(
     let finished_at_ms = unix_time_ms();
     let output = match result {
         Ok(summaries) => {
-            let output = inventory_activity_output(&summaries);
+            let mut output = inventory_activity_output(&summaries);
             if output.scan_failure_count == 0 {
+                if let Some(completion_events) = &activities.completion_events {
+                    match completion_events
+                        .publish_completion(&InventoryCompletionEvent {
+                            inventory_kind: input.request.kind,
+                            source_workflow_id: workflow_id.clone(),
+                            completed_at_ms: finished_at_ms,
+                            scanned_items: output.scanned_items,
+                            persisted_items: output.persisted_items,
+                            pruned_items: output.pruned_items,
+                        })
+                        .await
+                    {
+                        Ok(fanout) => {
+                            if fanout.waiters > 0 {
+                                tracing::info!(
+                                    workflow_id,
+                                    waiters = fanout.waiters,
+                                    delivered = fanout.delivered,
+                                    failed = fanout.failed,
+                                    "inventory completion events delivered"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            output.scan_failure_count = 1;
+                            record_inventory_refresh_health(
+                                &activities.inventory_refresh,
+                                Some(error.clone()),
+                                Some(activities.failure_backoff),
+                            )
+                            .await;
+                            record_inventory_activity_projection(
+                                &activities.repository,
+                                InventoryProjectionRecord {
+                                    workflow_id: &workflow_id,
+                                    public_id: &public_id,
+                                    state: WorkflowState::Retrying,
+                                    reason: WorkflowReason::BackingOff,
+                                    next_action: Some("completion_fanout_failed"),
+                                    started_at_ms: input.started_at_ms,
+                                    updated_at_ms: finished_at_ms,
+                                    finished_at_ms: None,
+                                    blocked_dependency_name: Some(error.as_str()),
+                                },
+                            )
+                            .await?;
+                            return Ok(output);
+                        }
+                    }
+                }
                 record_inventory_refresh_health(&activities.inventory_refresh, None, None).await;
                 record_inventory_activity_projection(
                     &activities.repository,
@@ -1164,6 +1776,19 @@ fn orchestration_registry() -> OrchestrationRegistry {
                 },
             );
         }
+    }
+    #[cfg(test)]
+    {
+        builder = builder.register_typed(
+            TEST_INVENTORY_WAIT_ORCHESTRATION,
+            |ctx: OrchestrationContext, event_name: String| async move {
+                let event: InventoryCompletionEvent = ctx.dequeue_event_typed(event_name).await;
+                Ok(format!(
+                    "{}:{}",
+                    event.source_workflow_id, event.persisted_items
+                ))
+            },
+        );
     }
     builder.build()
 }
@@ -1454,6 +2079,465 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inventory_refresh_activity_publishes_completion_event_to_registered_waiter() {
+        let temp_dir = TestTempDir::new("duroxide-inventory-workflow-event");
+        let media_dir = temp_dir.path().join("media");
+        let workflow_database = temp_dir.path().join("state").join(WORKFLOW_DATABASE_FILE);
+        std::fs::create_dir_all(&media_dir).unwrap();
+        std::fs::write(media_dir.join("Event.Movie.2025.mkv"), b"movie").unwrap();
+        let repository = Repository::connect(temp_dir.path().join("sporos.sqlite"))
+            .await
+            .unwrap();
+        let inventory_refresh =
+            InventoryRefreshWorker::new(repository.clone(), InventoryScanOptions::default());
+        let injection_worker = InjectionWorker::new(repository.clone(), Vec::new());
+        let (_shutdown, shutdown_signal) = shutdown_channel();
+        let runtime = DuroxideWorkflowRuntime::start_with_inventory_activities(
+            workflow_database,
+            InventoryWorkflowActivities::new(
+                repository.clone(),
+                inventory_refresh,
+                injection_worker,
+                shutdown_signal,
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .unwrap();
+        runtime
+            .client()
+            .start_orchestration_typed(
+                "waiting-search",
+                TEST_INVENTORY_WAIT_ORCHESTRATION,
+                WorkflowEventName::MediaInventoryCompleted
+                    .as_str()
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        wait_for_orchestration_running(&runtime.client(), "waiting-search").await;
+        runtime
+            .register_inventory_completion_waiter(InventoryCompletionWaiter {
+                workflow_id: "waiting-search".to_owned(),
+                event_name: WorkflowEventName::MediaInventoryCompleted,
+                required_after_ms: 1_000,
+            })
+            .await
+            .unwrap();
+
+        let submission = runtime
+            .submit_inventory_refresh(InventoryWorkflowRequest::media_full(vec![media_dir], 1_000))
+            .await
+            .unwrap();
+        wait_for_inventory_projection_state(
+            &repository,
+            &submission.workflow_id,
+            WorkflowState::Succeeded,
+        )
+        .await;
+        let status = runtime
+            .client()
+            .wait_for_orchestration("waiting-search", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("inventory:media:full:1", output);
+            }
+            other => panic!("expected completed waiting workflow, got {other:?}"),
+        }
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn inventory_completion_waiter_survives_bridge_recreation() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let orchestration_registry = OrchestrationRegistry::builder()
+            .register(
+                "WaitInventoryCompletionDurable",
+                |ctx: OrchestrationContext, _: String| async move {
+                    let event: InventoryCompletionEvent = ctx
+                        .dequeue_event_typed(WorkflowEventName::MediaInventoryCompleted.as_str())
+                        .await;
+                    Ok(format!(
+                        "{}:{}:{}",
+                        event.source_workflow_id, event.completed_at_ms, event.persisted_items
+                    ))
+                },
+            )
+            .build();
+        let runtime = Runtime::start_with_store(
+            Arc::clone(&store),
+            ActivityRegistry::builder().build(),
+            orchestration_registry,
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration(
+                "waiting-search-durable",
+                "WaitInventoryCompletionDurable",
+                "",
+            )
+            .await
+            .unwrap();
+        wait_for_orchestration_running(&client, "waiting-search-durable").await;
+
+        let first_bridge =
+            InventoryCompletionEventBridge::new(Arc::clone(&store), Some(repository.clone()));
+        first_bridge
+            .register_waiter(InventoryCompletionWaiter {
+                workflow_id: "waiting-search-durable".to_owned(),
+                event_name: WorkflowEventName::MediaInventoryCompleted,
+                required_after_ms: 2_000,
+            })
+            .await
+            .unwrap();
+        drop(first_bridge);
+
+        let second_bridge =
+            InventoryCompletionEventBridge::new(Arc::clone(&store), Some(repository.clone()));
+        let fanout = second_bridge
+            .publish_completion(&InventoryCompletionEvent {
+                inventory_kind: InventoryRefreshKind::MediaFull,
+                source_workflow_id: "inventory:media:full".to_owned(),
+                completed_at_ms: 2_000,
+                scanned_items: 1,
+                persisted_items: 1,
+                pruned_items: 0,
+            })
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("waiting-search-durable", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            InventoryCompletionFanout {
+                waiters: 1,
+                delivered: 1,
+                failed: 0
+            },
+            fanout
+        );
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("inventory:media:full:2000:1", output);
+            }
+            other => panic!("expected completed waiting workflow, got {other:?}"),
+        }
+
+        let remaining = repository
+            .workflow_inventory_waiters_ready("media_inventory_completed", 2_000, 10)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn inventory_completion_waiter_survives_file_backed_restart() {
+        let temp_dir = TestTempDir::new("duroxide-inventory-completion-file-restart");
+        let workflow_database = temp_dir.path().join("state").join(WORKFLOW_DATABASE_FILE);
+        let sporos_database = temp_dir.path().join("sporos.sqlite");
+        prepare_workflow_database(&workflow_database).await.unwrap();
+        let workflow_database_url = format!("sqlite:{}", workflow_database.display());
+        let first_store = Arc::new(
+            SqliteProvider::new(&workflow_database_url, None)
+                .await
+                .unwrap(),
+        ) as Arc<dyn Provider>;
+        let first_repository = Repository::connect(&sporos_database).await.unwrap();
+        let orchestration_registry = OrchestrationRegistry::builder()
+            .register(
+                "FileBackedInventoryCompletionConsumer",
+                |ctx: OrchestrationContext, _: String| async move {
+                    let event: InventoryCompletionEvent = ctx
+                        .dequeue_event_typed(WorkflowEventName::MediaInventoryCompleted.as_str())
+                        .await;
+                    Ok(format!(
+                        "{}:{}",
+                        event.source_workflow_id, event.persisted_items
+                    ))
+                },
+            )
+            .build();
+        let first_runtime = Runtime::start_with_store(
+            Arc::clone(&first_store),
+            ActivityRegistry::builder().build(),
+            orchestration_registry,
+        )
+        .await;
+        let first_client = Client::new(Arc::clone(&first_store));
+        first_client
+            .start_orchestration(
+                "waiting-search-file-restart",
+                "FileBackedInventoryCompletionConsumer",
+                "",
+            )
+            .await
+            .unwrap();
+        wait_for_orchestration_running(&first_client, "waiting-search-file-restart").await;
+        InventoryCompletionEventBridge::new(
+            Arc::clone(&first_store),
+            Some(first_repository.clone()),
+        )
+        .register_waiter(InventoryCompletionWaiter {
+            workflow_id: "waiting-search-file-restart".to_owned(),
+            event_name: WorkflowEventName::MediaInventoryCompleted,
+            required_after_ms: 2_000,
+        })
+        .await
+        .unwrap();
+        first_runtime.shutdown(Some(1_000)).await;
+        first_repository.pool().close().await;
+
+        let second_repository = Repository::connect(&sporos_database).await.unwrap();
+        let second_store = Arc::new(
+            SqliteProvider::new(&workflow_database_url, None)
+                .await
+                .unwrap(),
+        ) as Arc<dyn Provider>;
+        let second_runtime = Runtime::start_with_store(
+            Arc::clone(&second_store),
+            ActivityRegistry::builder().build(),
+            OrchestrationRegistry::builder()
+                .register(
+                    "FileBackedInventoryCompletionConsumer",
+                    |ctx: OrchestrationContext, _: String| async move {
+                        let event: InventoryCompletionEvent = ctx
+                            .dequeue_event_typed(
+                                WorkflowEventName::MediaInventoryCompleted.as_str(),
+                            )
+                            .await;
+                        Ok(format!(
+                            "{}:{}",
+                            event.source_workflow_id, event.persisted_items
+                        ))
+                    },
+                )
+                .build(),
+        )
+        .await;
+        let second_client = Client::new(Arc::clone(&second_store));
+        let fanout =
+            InventoryCompletionEventBridge::new(Arc::clone(&second_store), Some(second_repository))
+                .publish_completion(&InventoryCompletionEvent {
+                    inventory_kind: InventoryRefreshKind::MediaFull,
+                    source_workflow_id: "inventory:media:full".to_owned(),
+                    completed_at_ms: 2_000,
+                    scanned_items: 1,
+                    persisted_items: 1,
+                    pruned_items: 0,
+                })
+                .await
+                .unwrap();
+        let status = second_client
+            .wait_for_orchestration("waiting-search-file-restart", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            InventoryCompletionFanout {
+                waiters: 1,
+                delivered: 1,
+                failed: 0
+            },
+            fanout
+        );
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("inventory:media:full:1", output);
+            }
+            other => panic!("expected completed waiting workflow after restart, got {other:?}"),
+        }
+
+        second_runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn inventory_completion_event_waits_until_workflow_dequeues_it() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let orchestration_registry = OrchestrationRegistry::builder()
+            .register(
+                "DelayedInventoryCompletionConsumer",
+                |ctx: OrchestrationContext, _: String| async move {
+                    let _gate: String = ctx.dequeue_event_typed("gate").await;
+                    let event: InventoryCompletionEvent = ctx
+                        .dequeue_event_typed(WorkflowEventName::MediaInventoryCompleted.as_str())
+                        .await;
+                    Ok(format!(
+                        "{}:{}",
+                        event.source_workflow_id, event.persisted_items
+                    ))
+                },
+            )
+            .build();
+        let runtime = Runtime::start_with_store(
+            Arc::clone(&store),
+            ActivityRegistry::builder().build(),
+            orchestration_registry,
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration(
+                "waiting-search-delayed",
+                "DelayedInventoryCompletionConsumer",
+                "",
+            )
+            .await
+            .unwrap();
+        wait_for_orchestration_running(&client, "waiting-search-delayed").await;
+
+        let bridge =
+            InventoryCompletionEventBridge::new(Arc::clone(&store), Some(repository.clone()));
+        bridge
+            .register_waiter(InventoryCompletionWaiter {
+                workflow_id: "waiting-search-delayed".to_owned(),
+                event_name: WorkflowEventName::MediaInventoryCompleted,
+                required_after_ms: 2_000,
+            })
+            .await
+            .unwrap();
+        let fanout = bridge
+            .publish_completion(&InventoryCompletionEvent {
+                inventory_kind: InventoryRefreshKind::MediaFull,
+                source_workflow_id: "inventory:media:full".to_owned(),
+                completed_at_ms: 2_000,
+                scanned_items: 1,
+                persisted_items: 1,
+                pruned_items: 0,
+            })
+            .await
+            .unwrap();
+        client
+            .enqueue_event_typed("waiting-search-delayed", "gate", &"continue".to_owned())
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("waiting-search-delayed", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            InventoryCompletionFanout {
+                waiters: 1,
+                delivered: 1,
+                failed: 0
+            },
+            fanout
+        );
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("inventory:media:full:1", output);
+            }
+            other => panic!("expected completed waiting workflow, got {other:?}"),
+        }
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn inventory_completion_for_missing_workflow_is_retried_after_workflow_starts() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let orchestration_registry = OrchestrationRegistry::builder()
+            .register(
+                "LateInventoryCompletionConsumer",
+                |ctx: OrchestrationContext, _: String| async move {
+                    let event: InventoryCompletionEvent = ctx
+                        .dequeue_event_typed(WorkflowEventName::MediaInventoryCompleted.as_str())
+                        .await;
+                    Ok(format!(
+                        "{}:{}",
+                        event.source_workflow_id, event.persisted_items
+                    ))
+                },
+            )
+            .build();
+        let runtime = Runtime::start_with_store(
+            Arc::clone(&store),
+            ActivityRegistry::builder().build(),
+            orchestration_registry,
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        let bridge =
+            InventoryCompletionEventBridge::new(Arc::clone(&store), Some(repository.clone()));
+        bridge
+            .register_waiter(InventoryCompletionWaiter {
+                workflow_id: "waiting-search-late".to_owned(),
+                event_name: WorkflowEventName::MediaInventoryCompleted,
+                required_after_ms: 2_000,
+            })
+            .await
+            .unwrap();
+
+        let error = bridge
+            .publish_completion(&InventoryCompletionEvent {
+                inventory_kind: InventoryRefreshKind::MediaFull,
+                source_workflow_id: "inventory:media:full".to_owned(),
+                completed_at_ms: 2_000,
+                scanned_items: 1,
+                persisted_items: 1,
+                pruned_items: 0,
+            })
+            .await
+            .expect_err("missing target workflow should not be treated as delivered");
+        assert!(error.contains("inventory completion fanout failed"));
+        assert_eq!(
+            1,
+            repository
+                .workflow_inventory_completions(10)
+                .await
+                .unwrap()
+                .len()
+        );
+
+        client
+            .start_orchestration("waiting-search-late", "LateInventoryCompletionConsumer", "")
+            .await
+            .unwrap();
+        wait_for_orchestration_running(&client, "waiting-search-late").await;
+        let fanout = bridge.drain_persisted_completions().await.unwrap();
+        let status = client
+            .wait_for_orchestration("waiting-search-late", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            InventoryCompletionFanout {
+                waiters: 1,
+                delivered: 1,
+                failed: 0
+            },
+            fanout
+        );
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("inventory:media:full:1", output);
+            }
+            other => panic!("expected completed waiting workflow, got {other:?}"),
+        }
+        assert!(
+            repository
+                .workflow_inventory_completions(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
     async fn inventory_refresh_submission_coalesces_duplicate_active_request() {
         let temp_dir = TestTempDir::new("duroxide-inventory-coalesce");
         let runtime = DuroxideWorkflowRuntime::start(
@@ -1575,6 +2659,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inventory_completion_bridge_delivers_typed_events_to_waiters() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let bridge = InventoryCompletionEventBridge::new(Arc::clone(&store), None);
+        let orchestration_registry = OrchestrationRegistry::builder()
+            .register(
+                "WaitInventoryCompletion",
+                |ctx: OrchestrationContext, _: String| async move {
+                    let event: InventoryCompletionEvent = ctx
+                        .dequeue_event_typed(WorkflowEventName::MediaInventoryCompleted.as_str())
+                        .await;
+                    Ok(format!(
+                        "{}:{}:{}",
+                        event.source_workflow_id, event.completed_at_ms, event.persisted_items
+                    ))
+                },
+            )
+            .build();
+        let runtime = Runtime::start_with_store(
+            Arc::clone(&store),
+            ActivityRegistry::builder().build(),
+            orchestration_registry,
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration("waiting-search", "WaitInventoryCompletion", "")
+            .await
+            .unwrap();
+        wait_for_orchestration_running(&client, "waiting-search").await;
+        let registration = bridge
+            .register_waiter(InventoryCompletionWaiter {
+                workflow_id: "waiting-search".to_owned(),
+                event_name: WorkflowEventName::MediaInventoryCompleted,
+                required_after_ms: 2_000,
+            })
+            .await
+            .unwrap();
+
+        let stale = bridge
+            .publish_completion(&InventoryCompletionEvent {
+                inventory_kind: InventoryRefreshKind::MediaFull,
+                source_workflow_id: "inventory:media:full".to_owned(),
+                completed_at_ms: 1_999,
+                scanned_items: 1,
+                persisted_items: 1,
+                pruned_items: 0,
+            })
+            .await
+            .unwrap();
+        let delivered = bridge
+            .publish_completion(&InventoryCompletionEvent {
+                inventory_kind: InventoryRefreshKind::MediaFull,
+                source_workflow_id: "inventory:media:full".to_owned(),
+                completed_at_ms: 2_000,
+                scanned_items: 2,
+                persisted_items: 2,
+                pruned_items: 0,
+            })
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("waiting-search", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(registration.inserted);
+        assert_eq!(InventoryCompletionFanout::default(), stale);
+        assert_eq!(
+            InventoryCompletionFanout {
+                waiters: 1,
+                delivered: 1,
+                failed: 0
+            },
+            delivered
+        );
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("inventory:media:full:2000:2", output);
+            }
+            other => panic!("expected completed waiting workflow, got {other:?}"),
+        }
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
     async fn runtime_rejects_failed_supervisor_as_not_seeded() {
         let temp_dir = TestTempDir::new("duroxide-workflow-runtime-failed-supervisor");
         let database_path = temp_dir.path().join("state").join(WORKFLOW_DATABASE_FILE);
@@ -1657,6 +2827,34 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for supervisor failure"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_orchestration_running(client: &Client, instance_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match client
+                .get_orchestration_status(instance_id)
+                .await
+                .expect("orchestration status should be readable")
+            {
+                OrchestrationStatus::Running { .. } => return,
+                OrchestrationStatus::Completed { .. } => {
+                    panic!("orchestration completed before test could raise event");
+                }
+                OrchestrationStatus::Failed { details, .. } => {
+                    panic!(
+                        "orchestration failed before test could raise event: {}",
+                        details.display_message()
+                    );
+                }
+                OrchestrationStatus::NotFound => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for orchestration {instance_id} to run"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

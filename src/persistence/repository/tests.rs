@@ -284,6 +284,187 @@ async fn workflow_projection_ignores_stale_updates() {
 }
 
 #[tokio::test]
+async fn workflow_inventory_waiters_are_durable_and_selected_when_ready() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+
+    assert!(
+        repository
+            .record_workflow_inventory_waiter("media_inventory_completed", "search:one", 2_000, 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .record_workflow_inventory_waiter("media_inventory_completed", "search:two", 3_000, 200)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .record_workflow_inventory_waiter("media_inventory_completed", "search:one", 2_500, 300)
+            .await
+            .unwrap()
+    );
+    repository
+        .record_workflow_inventory_waiter("client_inventory_completed", "search:client", 1_000, 400)
+        .await
+        .unwrap();
+
+    let ready = repository
+        .workflow_inventory_waiters_ready("media_inventory_completed", 2_500, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        vec![WorkflowInventoryWaiterRecord {
+            event_name: "media_inventory_completed".to_owned(),
+            workflow_id: "search:one".to_owned(),
+            required_after_ms: 2_500,
+            registered_at_ms: 300,
+        }],
+        ready
+    );
+    assert_eq!(
+        1,
+        repository
+            .workflow_inventory_waiters_due_count("media_inventory_completed", 2_500)
+            .await
+            .unwrap()
+    );
+    let claimed = repository
+        .claim_workflow_inventory_waiters_ready(
+            "media_inventory_completed",
+            2_500,
+            500,
+            "test-lease",
+            1_500,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready, claimed);
+    assert!(
+        repository
+            .claim_workflow_inventory_waiters_ready(
+                "media_inventory_completed",
+                2_500,
+                500,
+                "test-lease-two",
+                1_500,
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !repository
+            .release_workflow_inventory_waiter(
+                "media_inventory_completed",
+                "search:one",
+                "wrong-lease",
+                "not owner",
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .release_workflow_inventory_waiter(
+                "media_inventory_completed",
+                "search:one",
+                "test-lease",
+                "retryable enqueue failure",
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        ready,
+        repository
+            .claim_workflow_inventory_waiters_ready(
+                "media_inventory_completed",
+                2_500,
+                500,
+                "test-lease-three",
+                1_500,
+                10,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .delete_claimed_workflow_inventory_waiter(
+                "media_inventory_completed",
+                "search:one",
+                "test-lease",
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .delete_claimed_workflow_inventory_waiter(
+                "media_inventory_completed",
+                "search:one",
+                "test-lease-three",
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .workflow_inventory_waiters_ready("media_inventory_completed", 2_500, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let completion = WorkflowInventoryCompletionRecord {
+        event_name: "media_inventory_completed".to_owned(),
+        source_workflow_id: "inventory:media:full".to_owned(),
+        completed_at_ms: 4_000,
+        inventory_kind: "media_full".to_owned(),
+        scanned_items: 10,
+        persisted_items: 9,
+        pruned_items: 1,
+    };
+    assert!(
+        repository
+            .record_workflow_inventory_completion(&completion, 4_100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .record_workflow_inventory_completion(&completion, 4_200)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        vec![completion.clone()],
+        repository.workflow_inventory_completions(10).await.unwrap()
+    );
+    assert!(
+        repository
+            .delete_workflow_inventory_completion(
+                &completion.event_name,
+                &completion.source_workflow_id,
+                completion.completed_at_ms,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .workflow_inventory_completions(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn remote_candidate_cache_material_reads_persisted_torrent_fields() {
     let repository = Repository::connect_in_memory().await.unwrap();
     let mut candidate = test_remote_candidate("guid-cache", "Example");

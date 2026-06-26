@@ -227,6 +227,36 @@ CREATE INDEX IF NOT EXISTS idx_workflow_projection_dependency
 CREATE INDEX IF NOT EXISTS idx_workflow_projection_recent
     ON workflow_projection (terminal, updated_at DESC, workflow_id);
 
+CREATE TABLE IF NOT EXISTS workflow_inventory_waiters (
+    event_name TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    required_after_ms INTEGER NOT NULL,
+    registered_at_ms INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_until_ms INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    PRIMARY KEY (event_name, workflow_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_inventory_waiters_ready
+    ON workflow_inventory_waiters (event_name, required_after_ms, lease_until_ms, workflow_id);
+
+CREATE TABLE IF NOT EXISTS workflow_inventory_completion_events (
+    event_name TEXT NOT NULL,
+    source_workflow_id TEXT NOT NULL,
+    completed_at_ms INTEGER NOT NULL,
+    inventory_kind TEXT NOT NULL,
+    scanned_items INTEGER NOT NULL,
+    persisted_items INTEGER NOT NULL,
+    pruned_items INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (event_name, source_workflow_id, completed_at_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_inventory_completion_events_due
+    ON workflow_inventory_completion_events (event_name, completed_at_ms, source_workflow_id);
+
 CREATE TABLE IF NOT EXISTS announce_work (
     id TEXT PRIMARY KEY,
     dedupe_hash TEXT NOT NULL,
@@ -346,6 +376,8 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "jobs",
     "dependency_health",
     "workflow_projection",
+    "workflow_inventory_waiters",
+    "workflow_inventory_completion_events",
     "announce_work",
 ];
 
@@ -413,6 +445,12 @@ mod tests {
             "idx_workflow_projection_state_reason",
             "idx_workflow_projection_dependency",
             "idx_workflow_projection_recent",
+            "PRIMARY KEY (event_name, workflow_id)",
+            "attempt_count INTEGER NOT NULL DEFAULT 0",
+            "lease_until_ms INTEGER",
+            "idx_workflow_inventory_waiters_ready",
+            "PRIMARY KEY (event_name, source_workflow_id, completed_at_ms)",
+            "idx_workflow_inventory_completion_events_due",
             "idx_local_files_item_size",
             "idx_local_items_media_title_source",
             "idx_local_item_title_grams_lookup",

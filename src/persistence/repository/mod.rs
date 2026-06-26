@@ -142,6 +142,25 @@ pub struct WorkflowProjectionItem {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkflowInventoryWaiterRecord {
+    pub event_name: String,
+    pub workflow_id: String,
+    pub required_after_ms: i64,
+    pub registered_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkflowInventoryCompletionRecord {
+    pub event_name: String,
+    pub source_workflow_id: String,
+    pub completed_at_ms: i64,
+    pub inventory_kind: String,
+    pub scanned_items: usize,
+    pub persisted_items: usize,
+    pub pruned_items: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WorkflowProjectionSnapshot {
     pub active_count: i64,
     pub oldest_active_age_ms: Option<i64>,
@@ -2212,6 +2231,312 @@ impl Repository {
         .map_err(|error| db_error("record workflow projection", error))?;
 
         Ok(())
+    }
+
+    pub async fn record_workflow_inventory_waiter(
+        &self,
+        event_name: &str,
+        workflow_id: &str,
+        required_after_ms: i64,
+        registered_at_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let existing: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT required_after_ms
+            FROM workflow_inventory_waiters
+            WHERE event_name = ?
+              AND workflow_id = ?
+            "#,
+        )
+        .bind(event_name)
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read workflow inventory waiter", error))?;
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO workflow_inventory_waiters (
+                event_name,
+                workflow_id,
+                required_after_ms,
+                registered_at_ms
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (event_name, workflow_id) DO UPDATE SET
+                required_after_ms = excluded.required_after_ms,
+                registered_at_ms = excluded.registered_at_ms,
+                lease_owner = NULL,
+                lease_until_ms = NULL,
+                last_error = NULL
+            "#,
+        )
+        .bind(event_name)
+        .bind(workflow_id)
+        .bind(required_after_ms)
+        .bind(registered_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record workflow inventory waiter", error))?;
+
+        Ok(existing.is_none() && result.rows_affected() > 0)
+    }
+
+    pub async fn workflow_inventory_waiters_ready(
+        &self,
+        event_name: &str,
+        completed_at_ms: i64,
+        limit: u16,
+    ) -> Result<Vec<WorkflowInventoryWaiterRecord>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                event_name,
+                workflow_id,
+                required_after_ms,
+                registered_at_ms
+            FROM workflow_inventory_waiters INDEXED BY idx_workflow_inventory_waiters_ready
+            WHERE event_name = ?
+              AND required_after_ms <= ?
+            ORDER BY required_after_ms, workflow_id
+            LIMIT ?
+            "#,
+        )
+        .bind(event_name)
+        .bind(completed_at_ms)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read ready workflow inventory waiters", error))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| WorkflowInventoryWaiterRecord {
+                event_name: row.get("event_name"),
+                workflow_id: row.get("workflow_id"),
+                required_after_ms: row.get("required_after_ms"),
+                registered_at_ms: row.get("registered_at_ms"),
+            })
+            .collect())
+    }
+
+    pub async fn workflow_inventory_waiters_due_count(
+        &self,
+        event_name: &str,
+        completed_at_ms: i64,
+    ) -> Result<i64, DatabaseError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_inventory_waiters
+            WHERE event_name = ?
+              AND required_after_ms <= ?
+            "#,
+        )
+        .bind(event_name)
+        .bind(completed_at_ms)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| db_error("count due workflow inventory waiters", error))
+    }
+
+    pub async fn claim_workflow_inventory_waiters_ready(
+        &self,
+        event_name: &str,
+        completed_at_ms: i64,
+        now_ms: i64,
+        lease_owner: &str,
+        lease_until_ms: i64,
+        limit: u16,
+    ) -> Result<Vec<WorkflowInventoryWaiterRecord>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            UPDATE workflow_inventory_waiters
+            SET lease_owner = ?,
+                lease_until_ms = ?,
+                attempt_count = attempt_count + 1,
+                last_error = NULL
+            WHERE (event_name, workflow_id) IN (
+                SELECT event_name, workflow_id
+                FROM workflow_inventory_waiters INDEXED BY idx_workflow_inventory_waiters_ready
+                WHERE event_name = ?
+                  AND required_after_ms <= ?
+                  AND (lease_until_ms IS NULL OR lease_until_ms <= ?)
+                ORDER BY required_after_ms, workflow_id
+                LIMIT ?
+            )
+            RETURNING
+                event_name,
+                workflow_id,
+                required_after_ms,
+                registered_at_ms
+            "#,
+        )
+        .bind(lease_owner)
+        .bind(lease_until_ms)
+        .bind(event_name)
+        .bind(completed_at_ms)
+        .bind(now_ms)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("claim ready workflow inventory waiters", error))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| WorkflowInventoryWaiterRecord {
+                event_name: row.get("event_name"),
+                workflow_id: row.get("workflow_id"),
+                required_after_ms: row.get("required_after_ms"),
+                registered_at_ms: row.get("registered_at_ms"),
+            })
+            .collect())
+    }
+
+    pub async fn release_workflow_inventory_waiter(
+        &self,
+        event_name: &str,
+        workflow_id: &str,
+        lease_owner: &str,
+        error: &str,
+    ) -> Result<bool, DatabaseError> {
+        let error = sanitize_url_for_logging(error).to_string();
+        let result = sqlx::query(
+            r#"
+            UPDATE workflow_inventory_waiters
+            SET lease_owner = NULL,
+                lease_until_ms = NULL,
+                last_error = ?
+            WHERE event_name = ?
+              AND workflow_id = ?
+              AND lease_owner = ?
+            "#,
+        )
+        .bind(error)
+        .bind(event_name)
+        .bind(workflow_id)
+        .bind(lease_owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("release workflow inventory waiter", error))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_claimed_workflow_inventory_waiter(
+        &self,
+        event_name: &str,
+        workflow_id: &str,
+        lease_owner: &str,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM workflow_inventory_waiters
+            WHERE event_name = ?
+              AND workflow_id = ?
+              AND lease_owner = ?
+            "#,
+        )
+        .bind(event_name)
+        .bind(workflow_id)
+        .bind(lease_owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("delete claimed workflow inventory waiter", error))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn record_workflow_inventory_completion(
+        &self,
+        completion: &WorkflowInventoryCompletionRecord,
+        created_at_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let scanned_items = i64_from_usize(completion.scanned_items, "scanned_items")?;
+        let persisted_items = i64_from_usize(completion.persisted_items, "persisted_items")?;
+        let pruned_items = i64_from_u64(completion.pruned_items, "pruned_items")?;
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO workflow_inventory_completion_events (
+                event_name,
+                source_workflow_id,
+                completed_at_ms,
+                inventory_kind,
+                scanned_items,
+                persisted_items,
+                pruned_items,
+                created_at_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&completion.event_name)
+        .bind(&completion.source_workflow_id)
+        .bind(completion.completed_at_ms)
+        .bind(&completion.inventory_kind)
+        .bind(scanned_items)
+        .bind(persisted_items)
+        .bind(pruned_items)
+        .bind(created_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record workflow inventory completion", error))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn workflow_inventory_completions(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<WorkflowInventoryCompletionRecord>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                event_name,
+                source_workflow_id,
+                completed_at_ms,
+                inventory_kind,
+                scanned_items,
+                persisted_items,
+                pruned_items
+            FROM workflow_inventory_completion_events
+                INDEXED BY idx_workflow_inventory_completion_events_due
+            ORDER BY completed_at_ms, event_name, source_workflow_id
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read workflow inventory completions", error))?;
+
+        rows.into_iter()
+            .map(workflow_inventory_completion_from_row)
+            .collect()
+    }
+
+    pub async fn delete_workflow_inventory_completion(
+        &self,
+        event_name: &str,
+        source_workflow_id: &str,
+        completed_at_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM workflow_inventory_completion_events
+            WHERE event_name = ?
+              AND source_workflow_id = ?
+              AND completed_at_ms = ?
+            "#,
+        )
+        .bind(event_name)
+        .bind(source_workflow_id)
+        .bind(completed_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("delete workflow inventory completion", error))?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn workflow_projection_snapshot(
@@ -6252,6 +6577,27 @@ fn i64_from_u64(value: u64, field: &'static str) -> Result<i64, DatabaseError> {
     })
 }
 
+fn i64_from_usize(value: usize, field: &'static str) -> Result<i64, DatabaseError> {
+    i64::try_from(value).map_err(|error| DatabaseError::QueryFailed {
+        operation: format!("convert {field} to sqlite integer"),
+        message: error.to_string(),
+    })
+}
+
+fn usize_from_i64(value: i64, field: &'static str) -> Result<usize, DatabaseError> {
+    usize::try_from(value).map_err(|error| DatabaseError::QueryFailed {
+        operation: format!("read {field}"),
+        message: error.to_string(),
+    })
+}
+
+fn u64_from_i64(value: i64, field: &'static str) -> Result<u64, DatabaseError> {
+    u64::try_from(value).map_err(|error| DatabaseError::QueryFailed {
+        operation: format!("read {field}"),
+        message: error.to_string(),
+    })
+}
+
 fn u16_from_i64(value: i64, field: &'static str) -> Result<u16, DatabaseError> {
     u16::try_from(value).map_err(|error| DatabaseError::QueryFailed {
         operation: format!("read {field}"),
@@ -6490,6 +6836,20 @@ fn workflow_projection_item_from_row(
         started_at_ms: row.get("started_at"),
         updated_at_ms: row.get("updated_at"),
         finished_at_ms: row.get("finished_at"),
+    })
+}
+
+fn workflow_inventory_completion_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<WorkflowInventoryCompletionRecord, DatabaseError> {
+    Ok(WorkflowInventoryCompletionRecord {
+        event_name: row.get("event_name"),
+        source_workflow_id: row.get("source_workflow_id"),
+        completed_at_ms: row.get("completed_at_ms"),
+        inventory_kind: row.get("inventory_kind"),
+        scanned_items: usize_from_i64(row.get("scanned_items"), "completion scanned_items")?,
+        persisted_items: usize_from_i64(row.get("persisted_items"), "completion persisted_items")?,
+        pruned_items: u64_from_i64(row.get("pruned_items"), "completion pruned_items")?,
     })
 }
 

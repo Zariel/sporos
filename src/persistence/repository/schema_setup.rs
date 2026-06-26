@@ -25,6 +25,28 @@ pub(super) async fn reconcile_inline_schema(pool: &SqlitePool) -> Result<(), Dat
         "ALTER TABLE dependency_health ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    if table_exists(pool, "workflow_inventory_waiters").await? {
+        for (column, statement) in [
+            (
+                "lease_owner",
+                "ALTER TABLE workflow_inventory_waiters ADD COLUMN lease_owner TEXT",
+            ),
+            (
+                "lease_until_ms",
+                "ALTER TABLE workflow_inventory_waiters ADD COLUMN lease_until_ms INTEGER",
+            ),
+            (
+                "attempt_count",
+                "ALTER TABLE workflow_inventory_waiters ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_error",
+                "ALTER TABLE workflow_inventory_waiters ADD COLUMN last_error TEXT",
+            ),
+        ] {
+            add_column_if_missing(pool, "workflow_inventory_waiters", column, statement).await?;
+        }
+    }
     Ok(())
 }
 
