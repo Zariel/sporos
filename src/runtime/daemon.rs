@@ -4102,6 +4102,7 @@ mod tests {
     use crate::indexers::{CategoryCaps, RetryAfter, SearchCaps, TorznabCaps, TorznabLimits};
     use crate::notifications::{NotificationEvent, NotificationJob, notification_dependency_key};
     use crate::persistence::repository::{JobStateUpdate, Repository};
+    use crate::runtime::announce_worker::AnnounceWorker;
     use crate::secrets::{ApiKey, NotificationToken};
     use axum::body::{Body, Bytes};
     use axum::http::{
@@ -4678,6 +4679,123 @@ mod tests {
             }
         ));
         assert_eq!(0, saved_torrent_count(&output_dir));
+    }
+
+    #[tokio::test]
+    async fn announce_save_retry_after_completion_write_failure_is_idempotent() {
+        let root = unique_temp_dir("daemon-announce-completion-write-retry");
+        let output_dir = root.join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let bytes = test_torrent_bytes().to_vec();
+        let mut config = SporosConfig::default();
+        config.paths.output_dir = output_dir.clone();
+        let repository = Repository::connect(root.join("sporos.sqlite"))
+            .await
+            .unwrap();
+        repository
+            .upsert_local_item_with_files(
+                &LocalItem {
+                    id: None,
+                    source: LocalItemSource::DataRoot {
+                        path: root.to_path_buf(),
+                    },
+                    title: ItemTitle::new("movie.mkv").unwrap(),
+                    display_name: DisplayName::new("movie.mkv").unwrap(),
+                    media_type: MediaType::Movie,
+                    info_hash: None,
+                    path: Some(root.clone()),
+                    save_path: Some(root.clone()),
+                    total_size: ByteSize::new(10),
+                    mtime_ms: None,
+                },
+                &[local_file()],
+            )
+            .await
+            .unwrap();
+        let id = AnnounceWorkId::new("ann_completion_write_retry").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-completion-write-retry",
+            "tracker.example",
+            "https://tracker.example/download/completion-write-retry",
+        )
+        .await;
+        assert!(
+            repository
+                .claim_announce_work_by_id(&id, "test-worker", unix_time_ms(), i64::MAX)
+                .await
+                .unwrap()
+        );
+        let runtime = AppRuntime::from_repository(config.clone(), repository.clone())
+            .await
+            .unwrap();
+        let worker =
+            AnnounceWorker::new(repository.clone(), "test-worker", &config.announce).unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER abort_announce_success_once
+            BEFORE UPDATE OF status ON announce_work
+            WHEN new.status = 'succeeded'
+             AND old.id = 'ann_completion_write_retry'
+            BEGIN
+                SELECT RAISE(ABORT, 'abort announce success');
+            END
+            "#,
+        )
+        .execute(repository.pool())
+        .await
+        .unwrap();
+
+        let first = process_downloaded_announce_candidate(downloaded_announce_candidate(
+            &runtime,
+            root.join("cache-first.torrent"),
+            bytes,
+            config,
+        ))
+        .await
+        .unwrap();
+        if let AnnounceWorkOutcome::Succeeded { reason, outcome } = &first {
+            assert!(
+                repository
+                    .record_announce_action_checkpoint(
+                        &id,
+                        "test-worker",
+                        *reason,
+                        outcome,
+                        unix_time_ms(),
+                    )
+                    .await
+                    .unwrap()
+            );
+        } else {
+            panic!("expected saved announce outcome, got {first:?}");
+        }
+        let first_complete = worker.complete(&id, first, unix_time_ms()).await;
+        sqlx::query("DROP TRIGGER abort_announce_success_once")
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let checkpoint = repository
+            .announce_action_checkpoint(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = AnnounceWorkOutcome::Succeeded {
+            reason: AnnounceReason::Saved,
+            outcome: checkpoint.action_outcome.unwrap(),
+        };
+        let second_complete = worker.complete(&id, second, unix_time_ms()).await;
+
+        let _error = first_complete.unwrap_err();
+        assert_eq!(Ok(true), second_complete);
+        assert_eq!(1, saved_torrent_count(&output_dir));
+        let loaded = repository.announce_work_item(&id).await.unwrap().unwrap();
+        assert_eq!(AnnounceStatus::Succeeded, loaded.status);
+        assert_eq!(AnnounceReason::Saved, loaded.reason);
+        assert_eq!(1, loaded.attempt_count);
+        runtime.state.workflow_runtime.shutdown(Some(1_000)).await;
     }
 
     #[tokio::test]
@@ -9712,6 +9830,51 @@ mod tests {
             FileIndex::new(0),
         )
         .unwrap()
+    }
+
+    fn downloaded_announce_candidate(
+        runtime: &AppRuntime,
+        cache_path: PathBuf,
+        torrent_bytes: Vec<u8>,
+        config: SporosConfig,
+    ) -> DownloadedAnnounceCandidate {
+        fs::write(&cache_path, &torrent_bytes).unwrap();
+        let parsed = parse_metafile(&torrent_bytes).unwrap();
+        let candidate = RemoteCandidate {
+            id: None,
+            indexer_id: IndexerId::new(1).unwrap(),
+            guid: CandidateGuid::new("guid-completion-write-retry").unwrap(),
+            download_url: DownloadUrl::new(
+                "https://tracker.example/download/completion-write-retry",
+            )
+            .unwrap(),
+            title: ItemTitle::new("movie.mkv").unwrap(),
+            tracker: TrackerName::new("tracker.example").unwrap(),
+            size: Some(ByteSize::new(10)),
+            published_at_ms: None,
+            info_hash: Some(parsed.metafile.info_hash().clone()),
+            torrent_cache_path: Some(cache_path.clone()),
+        };
+        DownloadedAnnounceCandidate {
+            processor: AnnounceProcessor::from_state(&runtime.state),
+            cached: CachedCandidateTorrent {
+                candidate,
+                metafile: parsed.metafile,
+                tracker_hosts: parsed.tracker_hosts,
+                cache_path,
+            },
+            torrent_bytes,
+            context: AnnounceWorkflowContext {
+                now_ms: unix_time_ms(),
+                attempt_count: 1,
+                jitter_key: "ann_completion_write_retry".to_owned(),
+                outcome_config: announce_outcome_config(&config.announce),
+                reverse_lookup_config: runtime_reverse_lookup_config(&config),
+                inventory_freshness: AnnounceInventoryFreshness::default(),
+                inventory_refresh_mode: AnnounceInventoryRefreshMode::QueueStaleRefreshes,
+            },
+            shutdown: runtime.state.shutdown_signal.clone(),
+        }
     }
 
     fn preexisting_indexer_candidate() -> RemoteCandidate {

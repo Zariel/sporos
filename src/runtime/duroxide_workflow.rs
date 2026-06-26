@@ -11,7 +11,9 @@ use duroxide::runtime::{OrchestrationStatus, Runtime, RuntimeOptions};
 use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry};
 use serde::{Deserialize, Serialize};
 
-use crate::announce::{AnnounceQueueConfig, AnnounceReason, AnnounceWorkId, AnnounceWorkItem};
+use crate::announce::{
+    AnnounceQueueConfig, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
+};
 use crate::domain::{DependencyKind, DependencyName};
 use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshSummary, InventoryRefreshWorker,
@@ -21,7 +23,9 @@ use crate::persistence::repository::{
     Repository, WorkflowInventoryCompletionRecord, WorkflowInventoryWaiterRecord,
     WorkflowProjectionDependency, WorkflowProjectionUpdate,
 };
-use crate::runtime::announce_worker::{AnnounceWorkOutcome, AnnounceWorker, unix_time_ms};
+use crate::runtime::announce_worker::{
+    AnnounceWorkOutcome, AnnounceWorker, retry_database_call, unix_time_ms,
+};
 use crate::runtime::daemon::{
     AnnounceInventoryRefreshMode, AnnounceProcessor, process_announce_work_with_processor_mode,
 };
@@ -2062,12 +2066,37 @@ async fn run_announce_process_activity(
         )
         .unwrap_or(i64::MAX),
     );
+    let worker = AnnounceWorker::new(
+        activities.repository.clone(),
+        ANNOUNCE_WORKFLOW_OWNER,
+        &activities.queue_config,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(output) =
+        complete_checkpointed_announce_activity(&activities, &worker, &workflow_id, &input, &id)
+            .await?
+    {
+        return Ok(output);
+    }
     let claimed = activities
         .repository
         .claim_announce_work_by_id(&id, ANNOUNCE_WORKFLOW_OWNER, now_ms, lease_until_ms)
         .await
         .map_err(|error| error.to_string())?;
     if !claimed {
+        if let Some(output) =
+            completed_announce_activity_output(&activities.repository, &id, now_ms).await?
+        {
+            record_announce_activity_projection(
+                &activities.repository,
+                &workflow_id,
+                &input,
+                &output,
+                unix_time_ms(),
+            )
+            .await?;
+            return Ok(output);
+        }
         return Err(format!(
             "announce work `{}` could not be claimed",
             id.as_str()
@@ -2087,12 +2116,8 @@ async fn run_announce_process_activity(
             register_announce_inventory_waiters(&activities, &workflow_id, input.received_at_ms)
                 .await?;
     }
-    let worker = AnnounceWorker::new(
-        activities.repository.clone(),
-        ANNOUNCE_WORKFLOW_OWNER,
-        &activities.queue_config,
-    )
-    .map_err(|error| error.to_string())?;
+    record_announce_action_checkpoint(&activities.repository, &id, &outcome, unix_time_ms())
+        .await?;
     let completed = worker
         .complete(&id, outcome, unix_time_ms())
         .await
@@ -2112,6 +2137,135 @@ async fn run_announce_process_activity(
     )
     .await?;
     Ok(output)
+}
+
+async fn complete_checkpointed_announce_activity(
+    activities: &AnnounceWorkflowActivities,
+    worker: &AnnounceWorker,
+    workflow_id: &str,
+    input: &AnnounceActivityInput,
+    id: &AnnounceWorkId,
+) -> Result<Option<AnnounceProcessActivityOutput>, String> {
+    let Some(checkpoint) = activities
+        .repository
+        .announce_action_checkpoint(id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    if checkpoint.status != AnnounceStatus::Running
+        || checkpoint.lease_owner.as_deref() != Some(ANNOUNCE_WORKFLOW_OWNER)
+    {
+        return Ok(None);
+    }
+    let Some(outcome) = announce_checkpoint_outcome(checkpoint.action_outcome.as_deref()) else {
+        return Ok(None);
+    };
+    let now_ms = unix_time_ms();
+    let output = announce_process_activity_output(&outcome, now_ms);
+    let completed = worker
+        .complete(id, outcome, now_ms)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !completed {
+        return Err(format!(
+            "checkpointed announce work `{}` outcome could not be recorded for workflow `{workflow_id}`",
+            id.as_str()
+        ));
+    }
+    record_announce_activity_projection(
+        &activities.repository,
+        workflow_id,
+        input,
+        &output,
+        unix_time_ms(),
+    )
+    .await?;
+    Ok(Some(output))
+}
+
+fn announce_checkpoint_outcome(outcome: Option<&str>) -> Option<AnnounceWorkOutcome> {
+    let (reason, outcome) = match outcome? {
+        "saved" => (AnnounceReason::Saved, "saved"),
+        "injected" => (AnnounceReason::Injected, "injected"),
+        "dry_run" => (AnnounceReason::DryRun, "dry_run"),
+        "already_exists" => (AnnounceReason::AlreadyExists, "already_exists"),
+        _ => return None,
+    };
+    Some(AnnounceWorkOutcome::Succeeded {
+        reason,
+        outcome: outcome.to_owned(),
+    })
+}
+
+async fn record_announce_action_checkpoint(
+    repository: &Repository,
+    id: &AnnounceWorkId,
+    outcome: &AnnounceWorkOutcome,
+    now_ms: i64,
+) -> Result<(), String> {
+    let AnnounceWorkOutcome::Succeeded { reason, outcome } = outcome else {
+        return Ok(());
+    };
+    let recorded = retry_database_call("record announce action checkpoint", None, || {
+        repository.record_announce_action_checkpoint(
+            id,
+            ANNOUNCE_WORKFLOW_OWNER,
+            *reason,
+            outcome,
+            now_ms,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if recorded {
+        Ok(())
+    } else {
+        Err(format!(
+            "announce work `{}` action checkpoint could not be recorded",
+            id.as_str()
+        ))
+    }
+}
+
+async fn completed_announce_activity_output(
+    repository: &Repository,
+    id: &AnnounceWorkId,
+    now_ms: i64,
+) -> Result<Option<AnnounceProcessActivityOutput>, String> {
+    let Some(work) = repository
+        .announce_work_item(id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    match work.status {
+        AnnounceStatus::Succeeded => Ok(Some(announce_process_activity_output(
+            &AnnounceWorkOutcome::Succeeded {
+                reason: work.reason,
+                outcome: announce_reason_label(work.reason),
+            },
+            now_ms,
+        ))),
+        AnnounceStatus::TerminalFailed | AnnounceStatus::Expired => {
+            Ok(Some(announce_process_activity_output(
+                &AnnounceWorkOutcome::TerminalFailed {
+                    reason: work.reason,
+                    redacted_message: work
+                        .last_redacted_message
+                        .map(|message| message.as_str().to_owned())
+                        .unwrap_or_else(|| announce_reason_label(work.reason)),
+                },
+                now_ms,
+            )))
+        }
+        AnnounceStatus::Queued
+        | AnnounceStatus::Running
+        | AnnounceStatus::Waiting
+        | AnnounceStatus::Retryable => Ok(None),
+    }
 }
 
 async fn run_announce_queue_inventory_activity(
@@ -2622,8 +2776,12 @@ mod tests {
     use duroxide::runtime::OrchestrationStatus;
 
     use super::*;
+    use crate::announce::{AnnounceDedupeIdentity, AnnounceFetchMaterial};
+    use crate::config::SporosConfig;
+    use crate::domain::{ByteSize, CandidateGuid, ItemTitle, TrackerName};
     use crate::inventory::InventoryScanOptions;
     use crate::persistence::repository::Repository;
+    use crate::runtime::app::AppRuntime;
     use crate::runtime::health::HealthRegistry;
     use crate::runtime::injection_worker::InjectionWorker;
     use crate::runtime::scheduler::{
@@ -3164,6 +3322,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_process_activity_recovers_terminal_row_after_projection_retry() {
+        let temp_dir = TestTempDir::new("duroxide-announce-terminal-retry");
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let work = test_announce_work("ann_terminal_retry", "guid-terminal-retry", 1_000);
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .claim_announce_work_by_id(&work.id, ANNOUNCE_WORKFLOW_OWNER, 1_100, 2_000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .mark_announce_succeeded(
+                    &work.id,
+                    ANNOUNCE_WORKFLOW_OWNER,
+                    AnnounceReason::Saved,
+                    "saved",
+                    1_200,
+                )
+                .await
+                .unwrap()
+        );
+        let mut config = SporosConfig::default();
+        config.paths.database = temp_dir.path().join("sporos.db");
+        let runtime = AppRuntime::from_repository(config.clone(), repository.clone())
+            .await
+            .unwrap();
+        let activities = AnnounceWorkflowActivities::new(
+            repository.clone(),
+            AnnounceProcessor::new(
+                runtime.state.config.clone(),
+                repository.clone(),
+                runtime.state.health.clone(),
+                runtime.state.metrics.clone(),
+                runtime.state.scheduler.clone(),
+                runtime.state.injection_worker.clone(),
+            ),
+            config.announce.clone(),
+            runtime.state.shutdown_signal.clone(),
+        );
+
+        let output = Box::pin(run_announce_process_activity(
+            activities,
+            "announce:ann_terminal_retry".to_owned(),
+            AnnounceActivityInput {
+                work_id: work.id.as_str().to_owned(),
+                received_at_ms: work.received_at_ms,
+                raw_secret_material_count: 0,
+            },
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(AnnounceActivityState::Succeeded, output.state);
+        assert_eq!("Saved", output.reason);
+        let loaded = repository
+            .announce_work_item(&work.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(1, loaded.attempt_count);
+        let snapshot = repository
+            .workflow_projection_snapshot(10, unix_time_ms())
+            .await
+            .unwrap();
+        let projection = snapshot
+            .recent
+            .iter()
+            .find(|item| item.workflow_id == "announce:ann_terminal_retry")
+            .unwrap();
+        assert_eq!("succeeded", projection.state);
+        assert_eq!(Some("Saved".to_owned()), projection.next_action);
+
+        runtime.state.workflow_runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn announce_process_activity_completes_from_action_checkpoint_without_reprocessing() {
+        let temp_dir = TestTempDir::new("duroxide-announce-action-checkpoint");
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let work = test_announce_work("ann_action_checkpoint", "guid-action-checkpoint", 1_000);
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .claim_announce_work_by_id(&work.id, ANNOUNCE_WORKFLOW_OWNER, 1_100, 2_000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .record_announce_action_checkpoint(
+                    &work.id,
+                    ANNOUNCE_WORKFLOW_OWNER,
+                    AnnounceReason::Saved,
+                    "saved",
+                    1_200,
+                )
+                .await
+                .unwrap()
+        );
+        let mut config = SporosConfig::default();
+        config.paths.database = temp_dir.path().join("sporos.db");
+        let runtime = AppRuntime::from_repository(config.clone(), repository.clone())
+            .await
+            .unwrap();
+        let activities = AnnounceWorkflowActivities::new(
+            repository.clone(),
+            AnnounceProcessor::new(
+                runtime.state.config.clone(),
+                repository.clone(),
+                runtime.state.health.clone(),
+                runtime.state.metrics.clone(),
+                runtime.state.scheduler.clone(),
+                runtime.state.injection_worker.clone(),
+            ),
+            config.announce.clone(),
+            runtime.state.shutdown_signal.clone(),
+        );
+
+        let output = Box::pin(run_announce_process_activity(
+            activities,
+            "announce:ann_action_checkpoint".to_owned(),
+            AnnounceActivityInput {
+                work_id: work.id.as_str().to_owned(),
+                received_at_ms: work.received_at_ms,
+                raw_secret_material_count: 0,
+            },
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(AnnounceActivityState::Succeeded, output.state);
+        assert_eq!("Saved", output.reason);
+        let loaded = repository
+            .announce_work_item(&work.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(AnnounceStatus::Succeeded, loaded.status);
+        assert_eq!(AnnounceReason::Saved, loaded.reason);
+        assert_eq!(1, loaded.attempt_count);
+        let snapshot = repository
+            .workflow_projection_snapshot(10, unix_time_ms())
+            .await
+            .unwrap();
+        let projection = snapshot
+            .recent
+            .iter()
+            .find(|item| item.workflow_id == "announce:ann_action_checkpoint")
+            .unwrap();
+        assert_eq!("succeeded", projection.state);
+        assert_eq!(Some("Saved".to_owned()), projection.next_action);
+
+        runtime.state.workflow_runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
     async fn inventory_completion_for_missing_workflow_is_retried_after_workflow_starts() {
         let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -3603,6 +3925,41 @@ mod tests {
                 "timed out waiting for inventory workflow projection state {expected}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn test_announce_work(id: &str, guid: &str, received_at_ms: i64) -> AnnounceWorkItem {
+        let tracker = TrackerName::new("tracker.example").unwrap();
+        let guid = CandidateGuid::new(guid).unwrap();
+        let dedupe_hash = AnnounceDedupeIdentity::Guid {
+            tracker: tracker.clone(),
+            guid: guid.clone(),
+        }
+        .hash();
+
+        AnnounceWorkItem {
+            id: AnnounceWorkId::new(id).unwrap(),
+            status: AnnounceStatus::Queued,
+            reason: AnnounceReason::Accepted,
+            dedupe_hash,
+            title: ItemTitle::new("Example").unwrap(),
+            tracker,
+            guid: Some(guid),
+            info_hash: None,
+            size: Some(ByteSize::new(42)),
+            fetch: Option::<AnnounceFetchMaterial>::None,
+            received_at_ms,
+            updated_at_ms: received_at_ms,
+            first_attempt_at_ms: None,
+            finished_at_ms: None,
+            attempt_count: 0,
+            next_attempt_at_ms: received_at_ms,
+            expires_at_ms: received_at_ms.saturating_add(60_000),
+            lease: None,
+            last_dependency_kind: None,
+            last_dependency_name: None,
+            last_error_class: None,
+            last_redacted_message: None,
         }
     }
 

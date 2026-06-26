@@ -537,6 +537,13 @@ pub struct AnnounceRetryUpdate<'a> {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceActionCheckpoint {
+    pub status: AnnounceStatus,
+    pub lease_owner: Option<String>,
+    pub action_outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AnnounceDependency {
     pub kind: DependencyKind,
     pub name: DependencyName,
@@ -3581,9 +3588,105 @@ impl Repository {
         .await
         .map_err(|error| db_error("read active announce work", error))?;
 
-        rows.into_iter()
-            .map(active_announce_work_from_row)
-            .collect()
+        rows.into_iter().map(announce_work_item_from_row).collect()
+    }
+
+    pub async fn announce_work_item(
+        &self,
+        id: &AnnounceWorkId,
+    ) -> Result<Option<AnnounceWorkItem>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                dedupe_hash,
+                received_at,
+                updated_at,
+                first_attempt_at,
+                finished_at,
+                tracker,
+                guid,
+                info_hash,
+                title,
+                size,
+                download_url,
+                cookie,
+                status,
+                reason,
+                attempt_count,
+                next_attempt_at,
+                expires_at,
+                last_dependency_kind,
+                last_dependency_name,
+                last_error_class,
+                last_error_message
+            FROM announce_work
+            WHERE id = ?
+            "#,
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce work item", error))?;
+
+        row.map(announce_work_item_from_row).transpose()
+    }
+
+    pub async fn announce_action_checkpoint(
+        &self,
+        id: &AnnounceWorkId,
+    ) -> Result<Option<AnnounceActionCheckpoint>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT status, lease_owner, last_action_outcome
+            FROM announce_work
+            WHERE id = ?
+            "#,
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read announce action checkpoint", error))?;
+
+        row.map(|row| {
+            Ok(AnnounceActionCheckpoint {
+                status: announce_status_from_key(row.get::<String, _>("status").as_str())?,
+                lease_owner: row.get("lease_owner"),
+                action_outcome: row.get("last_action_outcome"),
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn record_announce_action_checkpoint(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        reason: AnnounceReason,
+        outcome: &str,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET reason = ?,
+                updated_at = ?,
+                download_url = NULL,
+                cookie = NULL,
+                last_action_outcome = ?
+            WHERE id = ? AND lease_owner = ? AND status = 'running'
+            "#,
+        )
+        .bind(announce_reason_key(reason))
+        .bind(now_ms)
+        .bind(outcome)
+        .bind(id.as_str())
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record announce action checkpoint", error))?;
+
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn announce_candidate_material(
@@ -6739,7 +6842,7 @@ fn announce_reason_from_key(value: &str) -> Result<AnnounceReason, DatabaseError
     }
 }
 
-fn active_announce_work_from_row(row: SqliteRow) -> Result<AnnounceWorkItem, DatabaseError> {
+fn announce_work_item_from_row(row: SqliteRow) -> Result<AnnounceWorkItem, DatabaseError> {
     let id = AnnounceWorkId::new(row.get::<String, _>("id")).map_err(|error| {
         DatabaseError::QueryFailed {
             operation: "read announce work id".to_owned(),

@@ -1138,7 +1138,7 @@ fn defer_claim_if_database_busy(
     }
 }
 
-async fn retry_database_call<T, F, Fut>(
+pub(crate) async fn retry_database_call<T, F, Fut>(
     operation: &'static str,
     shutdown: Option<&ShutdownSignal>,
     mut call: F,

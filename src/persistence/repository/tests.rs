@@ -3046,6 +3046,39 @@ async fn announce_claim_lease_retry_and_success_flow() {
 }
 
 #[tokio::test]
+async fn announce_work_item_reads_terminal_rows() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let work = test_announce_work("ann_terminal_read", "guid-terminal-read", 1);
+    repository
+        .insert_or_dedupe_announce_work(&work, 10)
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .claim_announce_work_by_id(&work.id, "worker-1", 2, 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .mark_announce_succeeded(&work.id, "worker-1", AnnounceReason::Saved, "saved", 3)
+            .await
+            .unwrap()
+    );
+
+    let loaded = repository
+        .announce_work_item(&work.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(work.id, loaded.id);
+    assert_eq!(AnnounceStatus::Succeeded, loaded.status);
+    assert_eq!(AnnounceReason::Saved, loaded.reason);
+    assert_eq!(Some(3), loaded.finished_at_ms);
+}
+
+#[tokio::test]
 async fn announce_insert_persists_fetch_material() {
     let repository = Repository::connect_in_memory().await.unwrap();
     let mut work = test_announce_work("ann_fetch", "guid-fetch", 1);
