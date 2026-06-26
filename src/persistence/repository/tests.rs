@@ -155,6 +155,7 @@ async fn announce_candidate_material_reads_typed_fetch_material() {
     assert_eq!(Some(download_url), material.download_url);
     assert_eq!(Some("session=abc"), material.cookie.as_deref());
     assert_eq!(3, material.attempt_count);
+    assert_eq!(work.received_at_ms, material.received_at_ms);
 
     let debug = format!("{material:?}");
     assert!(!debug.contains("supersecret"));
@@ -2451,6 +2452,17 @@ async fn records_jobs_and_dependency_health() {
     assert_eq!(Some(200), rss.last_finished_at_ms);
     assert_eq!(Some(456), rss.next_run_at_ms);
     assert_eq!(Some("rate limited".to_owned()), rss.last_error);
+    let rss_by_name = repository
+        .job_status(&JobName::new("rss").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*rss, rss_by_name);
+    let missing_job = repository
+        .job_status(&JobName::new("missing").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(None, missing_job);
     let client_health = health
         .iter()
         .find(|health| health.dependency_type == "torrent_client")

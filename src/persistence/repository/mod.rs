@@ -406,6 +406,7 @@ pub struct AnnounceCandidateMaterial {
     pub download_url: Option<DownloadUrl>,
     pub cookie: Option<String>,
     pub attempt_count: u16,
+    pub received_at_ms: i64,
 }
 
 impl fmt::Debug for AnnounceCandidateMaterial {
@@ -426,6 +427,7 @@ impl fmt::Debug for AnnounceCandidateMaterial {
             )
             .field("cookie", &self.cookie.as_ref().map(|_| "[REDACTED]"))
             .field("attempt_count", &self.attempt_count)
+            .field("received_at_ms", &self.received_at_ms)
             .finish()
     }
 }
@@ -1824,23 +1826,26 @@ impl Repository {
         .await
         .map_err(|error| db_error("read job status snapshot", error))?;
 
-        rows.into_iter()
-            .map(|row| {
-                Ok(JobStatusSnapshot {
-                    name: JobName::new(row.get::<String, _>("name")).map_err(|error| {
-                        DatabaseError::QueryFailed {
-                            operation: "read job status name".to_owned(),
-                            message: error.to_string(),
-                        }
-                    })?,
-                    state: row.get("state"),
-                    last_started_at_ms: row.get("last_started_at"),
-                    last_finished_at_ms: row.get("last_finished_at"),
-                    next_run_at_ms: row.get("next_run_at"),
-                    last_error: row.get("last_error"),
-                })
-            })
-            .collect()
+        rows.into_iter().map(job_status_snapshot_from_row).collect()
+    }
+
+    pub async fn job_status(
+        &self,
+        name: &JobName,
+    ) -> Result<Option<JobStatusSnapshot>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT name, state, last_started_at, last_finished_at, next_run_at, last_error
+            FROM jobs
+            WHERE name = ?
+            "#,
+        )
+        .bind(name.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read job status", error))?;
+
+        row.map(job_status_snapshot_from_row).transpose()
     }
 
     pub async fn record_dependency_health(
@@ -2886,7 +2891,8 @@ impl Repository {
     ) -> Result<Option<AnnounceCandidateMaterial>, DatabaseError> {
         let row = sqlx::query(
             r#"
-            SELECT title, tracker, guid, info_hash, size, download_url, cookie, attempt_count
+            SELECT title, tracker, guid, info_hash, size, download_url, cookie,
+                   attempt_count, received_at
             FROM announce_work
             WHERE id = ?
             "#,
@@ -6108,6 +6114,25 @@ fn announce_candidate_material_from_row(
             })?,
         cookie: row.get("cookie"),
         attempt_count,
+        received_at_ms: row.get("received_at"),
+    })
+}
+
+fn job_status_snapshot_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<JobStatusSnapshot, DatabaseError> {
+    Ok(JobStatusSnapshot {
+        name: JobName::new(row.get::<String, _>("name")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read job status name".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        state: row.get("state"),
+        last_started_at_ms: row.get("last_started_at"),
+        last_finished_at_ms: row.get("last_finished_at"),
+        next_run_at_ms: row.get("next_run_at"),
+        last_error: row.get("last_error"),
     })
 }
 

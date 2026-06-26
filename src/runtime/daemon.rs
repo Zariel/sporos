@@ -2423,12 +2423,28 @@ async fn process_announce_work(
             );
         }
     };
+    let inventory_fresh_after_announce =
+        match media_inventory_fresh_after_announce(&state.repository, candidate.received_at_ms)
+            .await
+        {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                return retryable_database_outcome(
+                    error,
+                    now_ms,
+                    1,
+                    id.as_str(),
+                    announce_outcome_config(&state.config.announce),
+                );
+            }
+        };
     let context = AnnounceWorkflowContext {
         now_ms,
         attempt_count: candidate.attempt_count,
         jitter_key: id.as_str().to_owned(),
         outcome_config: announce_outcome_config(&state.config.announce),
         reverse_lookup_config: runtime_reverse_lookup_config(&state.config),
+        inventory_fresh_after_announce,
     };
     let prepared = PreparedAnnounceCandidateStage {
         state,
@@ -2469,6 +2485,53 @@ struct AnnounceWorkflowContext {
     jitter_key: String,
     outcome_config: AnnounceOutcomeConfig,
     reverse_lookup_config: ReverseLookupConfig,
+    inventory_fresh_after_announce: bool,
+}
+
+async fn media_inventory_fresh_after_announce(
+    repository: &Repository,
+    received_at_ms: i64,
+) -> Result<bool, DatabaseError> {
+    let job_name = JobName::new(MEDIA_INVENTORY_JOB_NAME).map_err(domain_database_error)?;
+    Ok(repository.job_status(&job_name).await?.is_some_and(|job| {
+        job.state == "succeeded"
+            && job
+                .last_started_at_ms
+                .is_some_and(|started_at_ms| started_at_ms >= received_at_ms)
+            && job
+                .last_finished_at_ms
+                .is_some_and(|finished_at_ms| finished_at_ms >= received_at_ms)
+    }))
+}
+
+fn classify_announce_lookup_outcome(
+    outcome: &ReverseLookupOutcome,
+    context: &AnnounceWorkflowContext,
+) -> AnnounceWorkOutcome {
+    let classified = classify_reverse_lookup_outcome(
+        outcome,
+        context.now_ms,
+        context.attempt_count,
+        context.jitter_key.as_str(),
+        context.outcome_config,
+    );
+    if matches!(outcome, ReverseLookupOutcome::NoCandidates)
+        && context.inventory_fresh_after_announce
+        && matches!(
+            classified,
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::InventoryRefreshing,
+                ..
+            }
+        )
+    {
+        AnnounceWorkOutcome::TerminalFailed {
+            reason: AnnounceReason::NoMatchTerminal,
+            redacted_message: "candidate did not match after refreshed inventory".to_owned(),
+        }
+    } else {
+        classified
+    }
 }
 
 #[derive(Clone)]
@@ -2554,12 +2617,9 @@ async fn initial_announce_lookup_stage(
                 &outcome,
                 next_action,
             );
-            AnnounceInitialLookupStage::Finished(classify_reverse_lookup_outcome(
+            AnnounceInitialLookupStage::Finished(classify_announce_lookup_outcome(
                 &outcome,
-                input.context.now_ms,
-                input.context.attempt_count,
-                input.context.jitter_key.as_str(),
-                input.context.outcome_config,
+                &input.context,
             ))
         }
     }
@@ -2991,24 +3051,8 @@ async fn process_downloaded_announce_candidate(
     }
 
     Ok(best_failure.map_or_else(
-        || {
-            classify_reverse_lookup_outcome(
-                &ReverseLookupOutcome::NoCandidates,
-                now_ms,
-                attempt_count,
-                jitter_key,
-                outcome_config,
-            )
-        },
-        |outcome| {
-            classify_reverse_lookup_outcome(
-                &outcome,
-                now_ms,
-                attempt_count,
-                jitter_key,
-                outcome_config,
-            )
-        },
+        || classify_announce_lookup_outcome(&ReverseLookupOutcome::NoCandidates, &context),
+        |outcome| classify_announce_lookup_outcome(&outcome, &context),
     ))
 }
 
@@ -3017,6 +3061,7 @@ struct RuntimeAnnounceCandidate {
     candidate: RemoteCandidate,
     cookie_or_fetch: Option<RuntimeAnnounceFetch>,
     attempt_count: u16,
+    received_at_ms: i64,
 }
 
 impl fmt::Debug for RuntimeAnnounceCandidate {
@@ -3039,6 +3084,7 @@ impl fmt::Debug for RuntimeAnnounceCandidate {
             .field("torrent_cache_path", &self.candidate.torrent_cache_path)
             .field("cookie_or_fetch", &self.cookie_or_fetch)
             .field("attempt_count", &self.attempt_count)
+            .field("received_at_ms", &self.received_at_ms)
             .finish()
     }
 }
@@ -3103,6 +3149,7 @@ async fn load_announce_candidate(
         candidate,
         cookie_or_fetch,
         attempt_count: material.attempt_count,
+        received_at_ms: material.received_at_ms,
     }))
 }
 
@@ -4173,6 +4220,7 @@ mod tests {
             jitter_key: "announce-already-present".to_owned(),
             outcome_config: announce_outcome_config(&config.announce),
             reverse_lookup_config: runtime_reverse_lookup_config(&config),
+            inventory_fresh_after_announce: false,
         };
         let repository = Repository::connect(root.join("sporos.sqlite"))
             .await
@@ -4423,6 +4471,7 @@ mod tests {
             jitter_key: "announce-link-policy".to_owned(),
             outcome_config: announce_outcome_config(&config.announce),
             reverse_lookup_config: runtime_reverse_lookup_config(&config),
+            inventory_fresh_after_announce: false,
         };
         let repository = Repository::connect_in_memory().await.unwrap();
         repository
@@ -5982,6 +6031,223 @@ mod tests {
             }
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_no_match_after_fresh_media_inventory_is_terminal() {
+        let root = unique_temp_dir("daemon-announce-fresh-inventory-no-match");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let id = AnnounceWorkId::new("ann_fresh_no_match").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-fresh-no-match",
+            "tracker.example",
+            "https://tracker.example/download/fresh-no-match",
+        )
+        .await;
+        let received_at_ms: i64 =
+            sqlx::query_scalar("SELECT received_at FROM announce_work WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        repository
+            .record_job_status(
+                &JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: Some(received_at_ms),
+                    last_finished_at_ms: Some(received_at_ms.saturating_add(1)),
+                    next_run_at_ms: Some(received_at_ms.saturating_add(60_000)),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let result = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id,
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            AnnounceWorkOutcome::TerminalFailed {
+                reason: AnnounceReason::NoMatchTerminal,
+                ..
+            }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_no_match_after_stale_media_inventory_waits_for_refresh() {
+        let root = unique_temp_dir("daemon-announce-stale-inventory-no-match");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let id = AnnounceWorkId::new("ann_stale_no_match").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-stale-no-match",
+            "tracker.example",
+            "https://tracker.example/download/stale-no-match",
+        )
+        .await;
+        let received_at_ms: i64 =
+            sqlx::query_scalar("SELECT received_at FROM announce_work WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        repository
+            .record_job_status(
+                &JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: Some(received_at_ms.saturating_sub(2)),
+                    last_finished_at_ms: Some(received_at_ms.saturating_sub(1)),
+                    next_run_at_ms: Some(received_at_ms.saturating_add(60_000)),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let result = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id,
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::InventoryRefreshing,
+                ..
+            }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_no_match_after_overlapping_media_inventory_waits_for_refresh() {
+        let root = unique_temp_dir("daemon-announce-overlap-inventory-no-match");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let id = AnnounceWorkId::new("ann_overlap_no_match").unwrap();
+        insert_announce_row(
+            &repository,
+            &id,
+            "guid-announce-overlap-no-match",
+            "tracker.example",
+            "https://tracker.example/download/overlap-no-match",
+        )
+        .await;
+        let received_at_ms: i64 =
+            sqlx::query_scalar("SELECT received_at FROM announce_work WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        repository
+            .record_job_status(
+                &JobName::new(MEDIA_INVENTORY_JOB_NAME).unwrap(),
+                JobStateUpdate {
+                    state: JobState::Succeeded,
+                    last_started_at_ms: Some(received_at_ms.saturating_sub(1)),
+                    last_finished_at_ms: Some(received_at_ms.saturating_add(1)),
+                    next_run_at_ms: Some(received_at_ms.saturating_add(60_000)),
+                    last_error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository)
+            .await
+            .unwrap();
+
+        let result = Box::pin(process_announce_work(
+            runtime.state.clone(),
+            id,
+            runtime.state.shutdown_signal.clone(),
+        ))
+        .await;
+
+        assert!(matches!(
+            result,
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::InventoryRefreshing,
+                ..
+            }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_inventory_only_terminalizes_no_candidate_announce_lookup() {
+        let config = SporosConfig::default();
+        let context = AnnounceWorkflowContext {
+            now_ms: 1_000,
+            attempt_count: 1,
+            jitter_key: "ann-classify-no-match".to_owned(),
+            outcome_config: announce_outcome_config(&config.announce),
+            reverse_lookup_config: runtime_reverse_lookup_config(&config),
+            inventory_fresh_after_announce: true,
+        };
+
+        let no_candidates =
+            classify_announce_lookup_outcome(&ReverseLookupOutcome::NoCandidates, &context);
+        assert!(matches!(
+            no_candidates,
+            AnnounceWorkOutcome::TerminalFailed {
+                reason: AnnounceReason::NoMatchTerminal,
+                ..
+            }
+        ));
+
+        let name_mismatch = ReverseLookupOutcome::BestFailure {
+            local_item: local_item(Path::new("/media/movie")),
+            assessment: PersistedCandidateAssessment::Rejected {
+                candidate_id: RemoteCandidateId::new(1).unwrap(),
+                assessment: CandidateAssessment {
+                    decision: MatchDecision::NoMatch,
+                    reason: crate::domain::DecisionReason::NameMismatch,
+                    matched_size: None,
+                    matched_ratio: None,
+                },
+                cache_status: crate::matching::CandidateCacheStatus::NotAvailable,
+            },
+        };
+
+        let rejected = classify_announce_lookup_outcome(&name_mismatch, &context);
+        assert!(matches!(
+            rejected,
+            AnnounceWorkOutcome::Waiting {
+                reason: AnnounceReason::InventoryRefreshing,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -8565,6 +8831,7 @@ mod tests {
                 cookie: Some("sid=secret-cookie".to_owned()),
             }),
             attempt_count: 1,
+            received_at_ms: 100,
         };
 
         let debug = format!("{candidate:?}");
