@@ -16,6 +16,7 @@ Optional environment:
   FORGEJO_REGISTRY_USER   Registry username. Defaults to FORGEJO_ACTOR/GITHUB_ACTOR.
   FORGEJO_REGISTRY_TOKEN  Registry token or password. Defaults to FORGEJO_TOKEN/GITHUB_TOKEN.
   FORGEJO_IMAGE           Full image name. Defaults to <registry>/<repository>.
+  FORGEJO_IMAGE_CACHE     BuildKit registry cache reference. Defaults to <image>:buildcache.
   FORGEJO_REPOSITORY      Owner/repository. Defaults to CI repository context.
 USAGE
 }
@@ -70,5 +71,11 @@ if [ -z "$token" ]; then
 fi
 
 printf "%s" "$token" | docker login "$registry" --username "$user" --password-stdin
-DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build -t "$image:$tag" -f Dockerfile .
+cache_ref="${FORGEJO_IMAGE_CACHE:-$image:buildcache}"
+DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build \
+  --cache-from "type=registry,ref=$cache_ref" \
+  --cache-to "type=registry,ref=$cache_ref,mode=max" \
+  -t "$image:$tag" \
+  -f Dockerfile \
+  .
 docker push "$image:$tag"

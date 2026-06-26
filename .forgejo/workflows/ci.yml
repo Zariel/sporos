@@ -35,7 +35,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -134,6 +134,7 @@ jobs:
 
       - name: Build and push image
         env:
+          FORGEJO_REGISTRY: git.cbannister.xyz
           FORGEJO_REPOSITORY: ${{ forgejo.repository }}
         run: scripts/ci/publish-forgejo-image "$FORGEJO_REF_NAME"
 
@@ -149,5 +150,6 @@ jobs:
 
       - name: Build and push latest image
         env:
+          FORGEJO_REGISTRY: git.cbannister.xyz
           FORGEJO_REPOSITORY: ${{ forgejo.repository }}
         run: scripts/ci/publish-forgejo-image latest
