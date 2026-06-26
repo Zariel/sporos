@@ -34,10 +34,7 @@ use crate::http::{JobRunWorkflowRequest, SearchWorkflowRequest, router};
 use crate::indexers::{
     CachedCandidateTorrent, CandidateDownloadClient, CandidateDownloadError, IndexerBackoffPolicy,
 };
-use crate::inventory_refresh::{
-    InventoryRefreshRequest, record_inventory_refresh_health, run_inventory_refresh_worker,
-    run_media_inventory_watcher, scan_failure_reason,
-};
+use crate::inventory_refresh::{InventoryRefreshRequest, run_media_inventory_watcher};
 use crate::matching::{
     CandidateAssessmentConfig, CandidateAssessmentInput, CandidatePrecheckConfig,
     FileTreeMatchConfig, FileTreeMatchMode, PersistedCandidateAssessment, ReverseLookupConfig,
@@ -62,6 +59,7 @@ use crate::runtime::announce_worker::{
 };
 use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
 use crate::runtime::duroxide_workflow::DuroxideWorkflowRuntimeError;
+use crate::runtime::duroxide_workflow::InventoryWorkflowRequest;
 use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
     DryRunAction, InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
@@ -288,8 +286,8 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         spawn_supervised_background(
             "inventory-refresh",
             &runtime.state,
-            run_inventory_refresh_worker(
-                runtime.state.inventory_refresh.clone(),
+            run_inventory_refresh_workflow_ingress(
+                runtime.state.clone(),
                 inventory_refresh,
                 runtime.state.shutdown_signal.clone(),
             ),
@@ -544,6 +542,56 @@ where
             http.record_worker_failure();
         }
     })
+}
+
+async fn run_inventory_refresh_workflow_ingress(
+    state: AppState,
+    mut receiver: crate::runtime::queue::WorkReceiver<InventoryRefreshRequest>,
+    mut shutdown: ShutdownSignal,
+) {
+    loop {
+        let request = tokio::select! {
+            request = receiver.recv() => request,
+            _state = shutdown.cancelled() => break,
+        };
+        let Some(request) = request else {
+            break;
+        };
+        let workflow_request =
+            InventoryWorkflowRequest::from_inventory_request(request, unix_time_ms());
+        let workflow_kind = workflow_request.kind;
+        let submitted = tokio::select! {
+            _state = shutdown.cancelled() => false,
+            result = state.workflow_runtime.submit_inventory_refresh(workflow_request) => {
+                match result {
+                    Ok(submission) => {
+                        info!(
+                            workflow_id = submission.workflow_id,
+                            outcome = ?submission.outcome,
+                            "inventory refresh workflow requested"
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        warn!(
+                            workflow_kind = ?workflow_kind,
+                            error = %error,
+                            "inventory refresh workflow request failed"
+                        );
+                        false
+                    }
+                }
+            }
+        };
+        if submitted {
+            receiver.mark_completed();
+        } else {
+            receiver.mark_cancelled();
+        }
+        if shutdown.state().phase != ShutdownPhase::Running {
+            break;
+        }
+    }
 }
 
 async fn run_scheduler_tick_loop(
@@ -2033,75 +2081,76 @@ async fn run_scheduled_media_inventory_job(
         return Ok(());
     }
 
-    let refresh_shutdown = shutdown.clone();
-    let result = state
-        .inventory_refresh
-        .refresh_data_dirs_until_shutdown(
-            InventoryRefreshRequest::full(state.config.paths.media_dirs.clone()),
-            refresh_shutdown,
-        )
-        .await;
-
-    let summary = match result {
-        Ok(summary) => summary,
-        Err(error) => {
-            if shutdown.state().phase != ShutdownPhase::Running {
-                return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
-            }
-            let reason = error.to_string();
-            record_inventory_refresh_health(
-                &state.inventory_refresh,
-                Some(reason.clone()),
-                Some(state.scheduler.failure_backoff()),
-            )
-            .await;
-            return Err(reason);
-        }
-    };
-
-    if summary.scan_failures.is_empty() {
-        record_inventory_refresh_health(&state.inventory_refresh, None, None).await;
-        Ok(())
-    } else {
-        let reason = scan_failure_reason(&summary.scan_failures);
-        record_inventory_refresh_health(
-            &state.inventory_refresh,
-            Some(reason.clone()),
-            Some(state.scheduler.failure_backoff()),
-        )
-        .await;
-        Err(reason)
+    if shutdown.state().phase != ShutdownPhase::Running {
+        return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
     }
+    let submitted_at_ms = unix_time_ms();
+    let request = InventoryWorkflowRequest::media_full(
+        state.config.paths.media_dirs.clone(),
+        submitted_at_ms,
+    );
+    let submission = state
+        .workflow_runtime
+        .submit_inventory_refresh(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    info!(
+        workflow_id = submission.workflow_id,
+        outcome = ?submission.outcome,
+        "media inventory refresh workflow requested"
+    );
+    state
+        .workflow_runtime
+        .wait_for_inventory_refresh_outcome(
+            &submission.workflow_id,
+            submitted_at_ms,
+            shutdown.clone(),
+        )
+        .await
+        .map_err(|error| {
+            if shutdown.state().phase != ShutdownPhase::Running {
+                SCHEDULER_SHUTDOWN_ERROR.to_owned()
+            } else {
+                error.to_string()
+            }
+        })
 }
 
 async fn run_scheduled_client_inventory_job(
     state: &AppState,
     mut shutdown: ShutdownSignal,
 ) -> Result<(), String> {
-    let result = tokio::select! {
+    let submitted_at_ms = unix_time_ms();
+    tokio::select! {
         _state = shutdown.cancelled() => {
-            return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
+            Err(SCHEDULER_SHUTDOWN_ERROR.to_owned())
         }
-        result = state.refresh_torrent_client_inventories() => result,
-    };
-    let summaries = match result {
-        Ok(summaries) => summaries,
-        Err(_) if shutdown.state().phase != ShutdownPhase::Running => {
-            return Err(SCHEDULER_SHUTDOWN_ERROR.to_owned());
+        result = state
+            .workflow_runtime
+            .submit_inventory_refresh(InventoryWorkflowRequest::client(submitted_at_ms)) => {
+            let submission = result.map_err(|error| error.to_string())?;
+            info!(
+                workflow_id = submission.workflow_id,
+                outcome = ?submission.outcome,
+                "client inventory refresh workflow requested"
+            );
+            state
+                .workflow_runtime
+                .wait_for_inventory_refresh_outcome(
+                    &submission.workflow_id,
+                    submitted_at_ms,
+                    shutdown.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    if shutdown.state().phase != ShutdownPhase::Running {
+                        SCHEDULER_SHUTDOWN_ERROR.to_owned()
+                    } else {
+                        error.to_string()
+                    }
+                })
         }
-        Err(error) => return Err(error.to_string()),
-    };
-    let scanned: usize = summaries.iter().map(|summary| summary.scanned_items).sum();
-    let persisted: usize = summaries
-        .iter()
-        .map(|summary| summary.persisted_items)
-        .sum();
-    let pruned: u64 = summaries.iter().map(|summary| summary.pruned_items).sum();
-    info!(
-        clients = summaries.len(),
-        scanned, persisted, pruned, "client inventory refresh completed"
-    );
-    Ok(())
+    }
 }
 
 async fn run_scheduled_cleanup_job(
@@ -2529,7 +2578,7 @@ async fn process_announce_work(
         context,
         shutdown,
     };
-    let downloaded = match initial_announce_lookup_stage(prepared).await {
+    let downloaded = match Box::pin(initial_announce_lookup_stage(prepared)).await {
         AnnounceInitialLookupStage::NeedsDownload(prepared) => {
             match download_announce_candidate_stage(*prepared).await {
                 AnnounceDownloadStage::Downloaded(downloaded) => *downloaded,
@@ -5304,15 +5353,9 @@ mod tests {
         let mut config = SporosConfig::default();
         config.paths.media_dirs = vec![root.clone()];
         let repository = Repository::connect_in_memory().await.unwrap();
-        let send_attempts = Arc::new(AtomicUsize::new(0));
-        let mut runtime = AppRuntime::from_repository(config, repository.clone())
+        let runtime = AppRuntime::from_repository(config, repository.clone())
             .await
             .unwrap();
-        runtime.state.inventory_refresh = runtime
-            .state
-            .inventory_refresh
-            .clone()
-            .with_data_root_scan_send_attempts(send_attempts.clone());
         let state = runtime.state.clone();
         let shutdown = state.shutdown.clone();
         let signal = state.shutdown_signal.clone();
@@ -5333,7 +5376,7 @@ mod tests {
             )
             .await;
         });
-        wait_for_atomic_count(&send_attempts, 65).await;
+        wait_for_workflow_projection_state(&repository, "inventory:media:full", "running").await;
         shutdown.cancel_now("test shutdown").unwrap();
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
@@ -8740,6 +8783,34 @@ mod tests {
             .fetch_optional(repository.pool())
             .await
             .unwrap();
+        assert_eq!(Some(expected), status.as_deref());
+    }
+
+    async fn wait_for_workflow_projection_state(
+        repository: &Repository,
+        workflow_id: &str,
+        expected: &str,
+    ) {
+        for _attempt in 0..50 {
+            let status = sqlx::query_scalar::<_, String>(
+                "SELECT state FROM workflow_projection WHERE workflow_id = ?",
+            )
+            .bind(workflow_id)
+            .fetch_optional(repository.pool())
+            .await
+            .unwrap();
+            if status.as_deref() == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM workflow_projection WHERE workflow_id = ?",
+        )
+        .bind(workflow_id)
+        .fetch_optional(repository.pool())
+        .await
+        .unwrap();
         assert_eq!(Some(expected), status.as_deref());
     }
 

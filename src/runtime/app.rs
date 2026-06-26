@@ -1166,6 +1166,9 @@ impl AppRuntime {
             operation: "build announce worker".to_owned(),
             message: error.to_string(),
         })?;
+        let scheduler_failure_backoff = Duration::from_millis(
+            u64::try_from(runtime_config.scheduler_config.failure_backoff_ms).unwrap_or(0),
+        );
         let scheduler = PersistedScheduler::new(
             repository.clone(),
             scheduler_queue.clone(),
@@ -1235,8 +1238,19 @@ impl AppRuntime {
         seed_runtime_health(&health, &persisted_health);
         seed_unknown_health_for_missing(&health, DependencyKind::Notification, &notification_names);
         seed_arr_endpoint_backoff(&mut arr_endpoints, &persisted_health, now_ms);
+        let (shutdown, shutdown_signal) = shutdown_channel();
         let workflow_runtime = map_workflow_runtime_error(
-            DuroxideWorkflowRuntime::start(runtime_workflow_database_path(&config)).await,
+            DuroxideWorkflowRuntime::start_with_inventory_activities(
+                runtime_workflow_database_path(&config),
+                crate::runtime::duroxide_workflow::InventoryWorkflowActivities::new(
+                    repository.clone(),
+                    inventory_refresh.clone(),
+                    injection_worker.clone(),
+                    shutdown_signal.clone(),
+                    scheduler_failure_backoff,
+                ),
+            )
+            .await,
             "start workflow runtime",
         )?;
         let workflow_runtime_name = map_workflow_runtime_error(
@@ -1250,7 +1264,6 @@ impl AppRuntime {
             arr_endpoints,
             Duration::from_secs(30),
         );
-        let (shutdown, shutdown_signal) = shutdown_channel();
         let queues = RuntimeQueues {
             workflow: workflow.clone(),
             scheduler: scheduler_queue.clone(),
