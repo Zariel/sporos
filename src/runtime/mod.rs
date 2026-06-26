@@ -8,3 +8,4 @@ pub mod queue;
 pub mod scheduler;
 pub mod search;
 pub mod shutdown;
+pub mod workflow_contracts;
