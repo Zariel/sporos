@@ -332,10 +332,12 @@ queue stale inventory refreshes immediately. `saved_retry_interval` controls
 its own daemon maintenance loop and is documented in the printed config schema.
 When `paths.media_dirs` are configured, Sporos also watches those roots and
 queues changed-path media inventory refreshes. Native filesystem events provide
-fast updates on local filesystems; a polling watcher also runs so NFS/PVC-backed
-media can still converge when native events are unavailable. The polling watcher
-uses metadata comparison and does not replace the periodic full `media_inventory`
-job, which remains the safety backstop.
+fast updates on local filesystems. On Linux, known network/FUSE-style roots use
+the polling watcher directly; other roots are probed with a temporary nested
+dotfile before native events are trusted. Roots that do not prove native event
+delivery fall back to polling so NFS/PVC-backed media can still converge. The
+polling watcher uses metadata comparison and does not replace the periodic full
+`media_inventory` job, which remains the safety backstop.
 
 Operators can queue an immediate supported job run with
 `POST /v1/jobs/{job_name}/runs`, for example

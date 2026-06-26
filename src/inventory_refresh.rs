@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::io::ErrorKind;
+use std::fs;
+use std::io::{ErrorKind, Write};
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -9,7 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
-use notify::{Config as NotifyConfig, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, PollWatcher, RecursiveMode, Watcher,
+    recommended_watcher,
+};
 use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{info, info_span, warn};
@@ -46,6 +50,7 @@ const VIRTUAL_SEASON_INCOMPLETE_MIN_AGE_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
 const MEDIA_WATCH_STOP_POLL: Duration = Duration::from_millis(500);
 const MEDIA_WATCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const MEDIA_WATCH_MAX_BATCH_AGE: Duration = Duration::from_secs(2);
+const MEDIA_WATCH_NATIVE_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 const MEDIA_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MEDIA_WATCH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MEDIA_WATCH_MAX_PENDING_PATHS: usize = 1_024;
@@ -1236,46 +1241,62 @@ fn run_media_inventory_watcher_blocking(
     stop_receiver: std_mpsc::Receiver<()>,
 ) {
     let (event_sender, event_receiver) = std_mpsc::channel::<notify::Result<Event>>();
-    let mut native_watcher = match notify::recommended_watcher({
-        let event_sender = event_sender.clone();
-        move |event| {
-            drop(event_sender.send(event));
-        }
-    }) {
-        Ok(watcher) => Some(watcher),
-        Err(error) => {
-            warn!(error = %error, "failed to start native media inventory watcher");
-            None
-        }
-    };
-    let mut poll_watcher = match PollWatcher::new(
-        {
+    let (native_dirs, mut polling_dirs) = classify_media_watch_dirs(&media_dirs);
+
+    let mut native_watcher = if native_dirs.is_empty() {
+        None
+    } else {
+        match recommended_watcher({
             let event_sender = event_sender.clone();
             move |event| {
                 drop(event_sender.send(event));
             }
-        },
-        NotifyConfig::default().with_poll_interval(MEDIA_WATCH_POLL_INTERVAL),
-    ) {
-        Ok(watcher) => Some(watcher),
-        Err(error) => {
-            warn!(error = %error, "failed to start polling media inventory watcher");
-            None
+        }) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                warn!(error = %error, "failed to start native media inventory watcher");
+                polling_dirs.extend(native_dirs.iter().cloned());
+                None
+            }
         }
     };
 
     let mut native_watched_dirs = 0usize;
-    let mut polling_watched_dirs = 0usize;
-    for media_dir in &media_dirs {
-        if let Some(watcher) = native_watcher.as_mut() {
+    if let Some(watcher) = native_watcher.as_mut() {
+        for media_dir in &native_dirs {
             match watcher.watch(media_dir, RecursiveMode::Recursive) {
                 Ok(()) => native_watched_dirs = native_watched_dirs.saturating_add(1),
                 Err(error) => {
                     warn!(path = %media_dir.display(), error = %error, "failed to watch media dir with native watcher");
+                    polling_dirs.push(media_dir.clone());
                 }
             }
         }
-        if let Some(watcher) = poll_watcher.as_mut() {
+    }
+
+    let mut poll_watcher = if polling_dirs.is_empty() {
+        None
+    } else {
+        match PollWatcher::new(
+            {
+                let event_sender = event_sender.clone();
+                move |event| {
+                    drop(event_sender.send(event));
+                }
+            },
+            NotifyConfig::default().with_poll_interval(MEDIA_WATCH_POLL_INTERVAL),
+        ) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                warn!(error = %error, "failed to start polling media inventory watcher");
+                None
+            }
+        }
+    };
+
+    let mut polling_watched_dirs = 0usize;
+    if let Some(watcher) = poll_watcher.as_mut() {
+        for media_dir in &polling_dirs {
             match watcher.watch(media_dir, RecursiveMode::Recursive) {
                 Ok(()) => polling_watched_dirs = polling_watched_dirs.saturating_add(1),
                 Err(error) => {
@@ -1346,6 +1367,220 @@ fn run_media_inventory_watcher_blocking(
         }
     }
     let _ = try_enqueue_media_changed_paths(&media_dirs, &queue, pending_paths);
+}
+
+fn classify_media_watch_dirs(media_dirs: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    classify_media_watch_dirs_with(
+        media_dirs,
+        media_dir_polling_reason,
+        probe_native_media_watch,
+    )
+}
+
+fn classify_media_watch_dirs_with<R, P>(
+    media_dirs: &[PathBuf],
+    mut polling_reason: R,
+    mut probe_native: P,
+) -> (Vec<PathBuf>, Vec<PathBuf>)
+where
+    R: FnMut(&Path) -> Option<String>,
+    P: FnMut(&Path) -> Result<(), String>,
+{
+    let mut native_dirs = Vec::new();
+    let mut polling_dirs = Vec::new();
+    for media_dir in media_dirs {
+        if let Some(reason) = polling_reason(media_dir) {
+            info!(
+                path = %media_dir.display(),
+                reason = %reason,
+                "media inventory watcher using polling watcher"
+            );
+            polling_dirs.push(media_dir.clone());
+            continue;
+        }
+        match probe_native(media_dir) {
+            Ok(()) => native_dirs.push(media_dir.clone()),
+            Err(reason) => {
+                info!(
+                    path = %media_dir.display(),
+                    reason = %reason,
+                    "native media inventory watcher probe did not confirm events; using polling watcher"
+                );
+                polling_dirs.push(media_dir.clone());
+            }
+        }
+    }
+    (native_dirs, polling_dirs)
+}
+
+#[cfg(target_os = "linux")]
+fn media_dir_polling_reason(media_dir: &Path) -> Option<String> {
+    match linux_fs_type(media_dir) {
+        Ok(fs_type) => linux_fs_type_polling_reason(fs_type).map(str::to_owned),
+        Err(error) => Some(format!("filesystem type probe failed: {error}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn media_dir_polling_reason(_media_dir: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fs_type(media_dir: &Path) -> Result<i64, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(media_dir.as_os_str().as_bytes())
+        .map_err(|_| "path contains an interior nul byte".to_owned())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is a valid nul-terminated path and `stat` points to
+    // writable memory for libc to initialize.
+    let result = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if result == 0 {
+        // SAFETY: statfs returned success and initialized the struct.
+        Ok(unsafe { stat.assume_init() }.f_type as i64)
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fs_type_polling_reason(fs_type: i64) -> Option<&'static str> {
+    match fs_type {
+        0x6969 => Some("nfs filesystem"),
+        0x517B => Some("smb filesystem"),
+        0xFF53_4D42 => Some("cifs filesystem"),
+        0x6573_5546 => Some("fuse filesystem"),
+        0x00C3_6400 => Some("ceph filesystem"),
+        0x0102_1997 => Some("9p filesystem"),
+        _ => None,
+    }
+}
+
+fn probe_native_media_watch(media_dir: &Path) -> Result<(), String> {
+    let (probe_sender, probe_receiver) = std_mpsc::channel::<notify::Result<Event>>();
+    let mut watcher = recommended_watcher(move |event| {
+        drop(probe_sender.send(event));
+    })
+    .map_err(|error| format!("native watcher unavailable: {error}"))?;
+    watcher
+        .watch(media_dir, RecursiveMode::Recursive)
+        .map_err(|error| format!("native watch registration failed: {error}"))?;
+    let probe = create_native_watch_probe(media_dir)?;
+    let deadline = Instant::now() + MEDIA_WATCH_NATIVE_PROBE_TIMEOUT;
+    let mut observed = false;
+    while Instant::now() < deadline {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        match probe_receiver.recv_timeout(timeout.min(Duration::from_millis(100))) {
+            Ok(Ok(event)) if event_contains_path(&event, &probe.file_path) => {
+                observed = true;
+                break;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                probe.cleanup()?;
+                return Err(format!("native watcher probe error: {error}"));
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                probe.cleanup()?;
+                return Err("native watcher probe channel closed".to_owned());
+            }
+        }
+    }
+    probe.cleanup()?;
+    if observed {
+        Ok(())
+    } else {
+        Err(format!(
+            "probe event not observed within {}ms",
+            MEDIA_WATCH_NATIVE_PROBE_TIMEOUT.as_millis()
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct NativeWatchProbe {
+    dir_path: PathBuf,
+    file_path: PathBuf,
+}
+
+impl NativeWatchProbe {
+    fn cleanup(self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        match fs::remove_file(&self.file_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("remove file failed: {error}")),
+        }
+        match fs::remove_dir(&self.dir_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("remove directory failed: {error}")),
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            let reason = failures.join("; ");
+            warn!(
+                path = %self.dir_path.display(),
+                reason = %reason,
+                "native media inventory watcher probe cleanup failed"
+            );
+            Err(format!("probe cleanup failed: {reason}"))
+        }
+    }
+}
+
+fn create_native_watch_probe(media_dir: &Path) -> Result<NativeWatchProbe, String> {
+    for attempt in 0..8 {
+        let dir_path = media_dir.join(format!(
+            ".sporos-notify-probe-{}-{}-{attempt}",
+            std::process::id(),
+            unix_time_ms()
+        ));
+        match fs::create_dir(&dir_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("probe directory creation failed: {error}"));
+            }
+        }
+        let file_path = dir_path.join("probe.tmp");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(b"sporos notify probe\n") {
+                    let probe = NativeWatchProbe {
+                        dir_path,
+                        file_path,
+                    };
+                    drop(probe.cleanup());
+                    return Err(format!("probe file write failed: {error}"));
+                }
+                return Ok(NativeWatchProbe {
+                    dir_path,
+                    file_path,
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                drop(fs::remove_dir(&dir_path));
+            }
+            Err(error) => {
+                drop(fs::remove_dir(&dir_path));
+                return Err(format!("probe file creation failed: {error}"));
+            }
+        }
+    }
+    Err("probe file path collision".to_owned())
+}
+
+fn event_contains_path(event: &Event, path: &Path) -> bool {
+    event.paths.iter().any(|event_path| event_path == path)
 }
 
 fn collect_media_watch_event(pending_paths: &mut Vec<PathBuf>, event: Event) -> bool {
@@ -2715,6 +2950,67 @@ mod tests {
         ));
 
         assert_eq!(vec![first, second], pending);
+    }
+
+    #[test]
+    fn media_watch_probe_matches_exact_event_path() {
+        let probe = PathBuf::from("/media/.sporos-notify-probe.tmp");
+        let other = PathBuf::from("/media/Movie.2026/movie.mkv");
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![other, probe.clone()],
+            attrs: notify::event::EventAttributes::new(),
+        };
+
+        assert!(event_contains_path(&event, &probe));
+        assert!(!event_contains_path(&event, Path::new("/media/other.tmp")));
+    }
+
+    #[test]
+    fn media_watch_classification_uses_polling_for_network_roots_before_probe() {
+        let local = PathBuf::from("/media/local");
+        let nfs = PathBuf::from("/media/nfs");
+        let (native_dirs, polling_dirs) = classify_media_watch_dirs_with(
+            &[local.clone(), nfs.clone()],
+            |path| {
+                if path == nfs {
+                    Some("nfs filesystem".to_owned())
+                } else {
+                    None
+                }
+            },
+            |path| {
+                assert_ne!(path, nfs.as_path());
+                Ok(())
+            },
+        );
+
+        assert_eq!(vec![local], native_dirs);
+        assert_eq!(vec![nfs], polling_dirs);
+    }
+
+    #[test]
+    fn media_watch_classification_falls_back_to_polling_when_probe_fails() {
+        let local = PathBuf::from("/media/local");
+        let (native_dirs, polling_dirs) = classify_media_watch_dirs_with(
+            std::slice::from_ref(&local),
+            |_| None,
+            |_| Err("probe file creation failed: permission denied".to_owned()),
+        );
+
+        assert!(native_dirs.is_empty());
+        assert_eq!(vec![local], polling_dirs);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_media_watch_classification_prefers_polling_for_network_filesystems() {
+        assert_eq!(Some("nfs filesystem"), linux_fs_type_polling_reason(0x6969));
+        assert_eq!(
+            Some("fuse filesystem"),
+            linux_fs_type_polling_reason(0x6573_5546)
+        );
+        assert_eq!(None, linux_fs_type_polling_reason(0xEF53));
     }
 
     #[tokio::test]
