@@ -445,6 +445,36 @@ where
     }
 }
 
+pub fn retry_transient_io_blocking<T, E, Operation, Classify>(
+    jitter_key: &str,
+    mut operation: Operation,
+    mut classify: Classify,
+) -> Result<T, E>
+where
+    Operation: FnMut(u8) -> Result<T, E>,
+    Classify: FnMut(&E) -> RetryDecision,
+{
+    let attempts = TRANSIENT_IO_RETRY_MAX_ATTEMPTS.max(1);
+    let policy = transient_io_retry_policy();
+    let mut attempt = 1;
+    loop {
+        match operation(attempt) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let decision = classify(&error);
+                if !decision.should_retry() || attempt == attempts {
+                    return Err(error);
+                }
+                let delay = retry_delay_after_decision(policy, attempt, jitter_key, decision);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
 pub async fn retry_with_backoff<T, E, MakeFuture, Fut, ShouldRetry>(
     max_attempts: u8,
     policy: JitteredBackoffPolicy,
@@ -894,6 +924,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(RetryOutcome::Shutdown, result);
+    }
+
+    #[test]
+    fn retry_transient_io_blocking_retries_transient_failures() {
+        let mut attempts = Vec::new();
+        let result = retry_transient_io_blocking(
+            "blocking-test",
+            |attempt| {
+                attempts.push(attempt);
+                if attempt == 1 {
+                    Err::<u8, _>(io::Error::from(io::ErrorKind::WouldBlock))
+                } else {
+                    Ok(42)
+                }
+            },
+            |_| RetryDecision::retry_after(RetryErrorKind::TransientLocalIo, Duration::ZERO),
+        );
+
+        assert_eq!(42, result.unwrap());
+        assert_eq!(vec![1, 2], attempts);
+    }
+
+    #[test]
+    fn retry_transient_io_blocking_preserves_terminal_failures() {
+        let mut attempts = Vec::new();
+        let result = retry_transient_io_blocking(
+            "blocking-test",
+            |attempt| {
+                attempts.push(attempt);
+                Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+            classify_io_error,
+        );
+
+        assert_eq!(io::ErrorKind::PermissionDenied, result.unwrap_err().kind());
+        assert_eq!(vec![1], attempts);
     }
 
     #[tokio::test]

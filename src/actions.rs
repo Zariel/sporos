@@ -30,6 +30,9 @@ use crate::metrics::ActionOutcome;
 use crate::persistence::torrent_cache::{
     TorrentCachePathError, TorrentOutputMetadata, torrent_output_path,
 };
+use crate::runtime::backoff::{
+    RetryDecision, RetryErrorKind, classify_io_error, retry_transient_io_blocking,
+};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const DEFAULT_LINK_SCAN_LIMIT: usize = 10_000;
@@ -431,6 +434,18 @@ pub fn save_candidate_torrent(
     metadata: &TorrentOutputMetadata,
     torrent_bytes: &[u8],
 ) -> Result<SaveTorrentOutcome, SaveTorrentError> {
+    retry_transient_io_blocking(
+        "save-candidate-torrent",
+        |_| save_candidate_torrent_once(output_dir, metadata, torrent_bytes),
+        classify_save_torrent_error,
+    )
+}
+
+fn save_candidate_torrent_once(
+    output_dir: &Path,
+    metadata: &TorrentOutputMetadata,
+    torrent_bytes: &[u8],
+) -> Result<SaveTorrentOutcome, SaveTorrentError> {
     let path =
         torrent_output_path(output_dir, metadata).map_err(SaveTorrentError::InvalidMetadata)?;
     ensure_output_child(output_dir, &path)?;
@@ -443,6 +458,25 @@ pub fn save_candidate_torrent(
         }
         ExistingFileStatus::NotFile => Err(SaveTorrentError::ExistingPathNotFile { path }),
         ExistingFileStatus::Missing => write_new_file(&path, torrent_bytes),
+    }
+}
+
+fn classify_save_torrent_error(error: &SaveTorrentError) -> RetryDecision {
+    match error {
+        SaveTorrentError::Io {
+            operation: "remove temporary torrent output",
+            ..
+        } => RetryDecision::do_not_retry(RetryErrorKind::FatalLocal),
+        SaveTorrentError::Io { source, .. } => classify_io_error(source),
+        SaveTorrentError::InvalidOutputPath { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidInput)
+        }
+        SaveTorrentError::InvalidMetadata(_) => {
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidInput)
+        }
+        SaveTorrentError::ExistingPathNotFile { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::FatalLocal)
+        }
     }
 }
 
@@ -3581,12 +3615,12 @@ fn write_new_file(
             })
         }
         Err(source) => {
-            let cleanup = remove_temporary_file(&temporary);
-            if cleanup.is_err() {
+            if let Err(cleanup) = remove_temporary_file(&temporary) {
                 tracing::warn!(
                     path = %temporary.display(),
                     "failed to remove temporary torrent output after link failure"
                 );
+                return Err(cleanup);
             }
             Err(SaveTorrentError::Io {
                 operation: "install torrent output",
@@ -3642,12 +3676,12 @@ fn write_temporary_file(
     torrent_bytes: &[u8],
 ) -> Result<(), SaveTorrentError> {
     if let Err(source) = file.write_all(torrent_bytes) {
-        let cleanup = remove_temporary_file(temporary);
-        if cleanup.is_err() {
+        if let Err(cleanup) = remove_temporary_file(temporary) {
             tracing::warn!(
                 path = %temporary.display(),
                 "failed to remove temporary torrent output after write failure"
             );
+            return Err(cleanup);
         }
         return Err(SaveTorrentError::Io {
             operation: "write temporary torrent output",
@@ -3675,11 +3709,34 @@ fn temporary_path(parent: &Path, path: &Path) -> PathBuf {
 }
 
 fn remove_temporary_file(path: &Path) -> Result<(), SaveTorrentError> {
-    fs::remove_file(path).map_err(|source| SaveTorrentError::Io {
-        operation: "remove temporary torrent output",
-        path: path.to_path_buf(),
-        source,
-    })
+    retry_transient_io_blocking(
+        "remove-temporary-torrent-output",
+        |_| remove_temporary_file_once(path),
+        classify_temporary_cleanup_error,
+    )
+}
+
+fn remove_temporary_file_once(path: &Path) -> Result<(), SaveTorrentError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(SaveTorrentError::Io {
+            operation: "remove temporary torrent output",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn classify_temporary_cleanup_error(error: &SaveTorrentError) -> RetryDecision {
+    match error {
+        SaveTorrentError::Io { source, .. } => classify_io_error(source),
+        SaveTorrentError::InvalidOutputPath { .. }
+        | SaveTorrentError::InvalidMetadata(_)
+        | SaveTorrentError::ExistingPathNotFile { .. } => {
+            RetryDecision::do_not_retry(RetryErrorKind::FatalLocal)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3756,6 +3813,51 @@ mod tests {
         assert!(!output_dir.exists());
 
         remove_temp_dir(&output_dir);
+    }
+
+    #[test]
+    fn save_action_retry_classifier_retries_transient_io() {
+        let error = SaveTorrentError::Io {
+            operation: "create output directory",
+            path: PathBuf::from("output"),
+            source: io::Error::from(io::ErrorKind::WouldBlock),
+        };
+
+        assert_eq!(
+            RetryDecision::retry(RetryErrorKind::TransientLocalIo),
+            classify_save_torrent_error(&error)
+        );
+    }
+
+    #[test]
+    fn save_action_retry_classifier_preserves_terminal_errors() {
+        let validation = SaveTorrentError::InvalidOutputPath {
+            output_dir: PathBuf::from("output"),
+            path: PathBuf::from("../outside"),
+        };
+        let cleanup = SaveTorrentError::Io {
+            operation: "remove temporary torrent output",
+            path: PathBuf::from("output/.tmp"),
+            source: io::Error::from(io::ErrorKind::WouldBlock),
+        };
+        let permissions = SaveTorrentError::Io {
+            operation: "create output directory",
+            path: PathBuf::from("output"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+
+        assert_eq!(
+            RetryDecision::do_not_retry(RetryErrorKind::InvalidInput),
+            classify_save_torrent_error(&validation)
+        );
+        assert_eq!(
+            RetryDecision::do_not_retry(RetryErrorKind::FatalLocal),
+            classify_save_torrent_error(&cleanup)
+        );
+        assert_eq!(
+            RetryDecision::do_not_retry(RetryErrorKind::PermissionDenied),
+            classify_save_torrent_error(&permissions)
+        );
     }
 
     #[test]

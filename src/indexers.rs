@@ -28,7 +28,7 @@ use crate::matching::{TorznabSearchPlan, TorznabSearchType};
 use crate::persistence::torrent_cache::{cached_torrent_path, with_cached_torrent_path_lock};
 use crate::runtime::backoff::{
     BackoffProbePolicy, JitteredBackoffPolicy, RetryDecision, RetryErrorKind, classify_http_status,
-    retry_transient_io,
+    classify_io_error, retry_transient_io, retry_transient_io_blocking,
 };
 use crate::secrets::{ApiKey, sanitize_url_for_logging};
 use crate::torrent::parse_metafile;
@@ -1287,6 +1287,7 @@ pub enum CandidateDownloadError {
     CacheWrite {
         path: std::path::PathBuf,
         message: String,
+        kind: Option<io::ErrorKind>,
     },
 }
 
@@ -1327,7 +1328,7 @@ impl fmt::Display for CandidateDownloadError {
                     "candidate download response exceeded {limit} bytes"
                 )
             }
-            Self::CacheWrite { path, message } => {
+            Self::CacheWrite { path, message, .. } => {
                 write!(
                     formatter,
                     "write cached torrent {}: {message}",
@@ -1369,7 +1370,10 @@ fn classify_candidate_download_error(error: &CandidateDownloadError) -> RetryDec
         | CandidateDownloadError::ResponseTooLarge { .. } => {
             RetryDecision::do_not_retry(RetryErrorKind::InvalidResponse)
         }
-        CandidateDownloadError::CacheWrite { .. } => {
+        CandidateDownloadError::CacheWrite {
+            kind: Some(kind), ..
+        } => classify_io_error(&io::Error::from(*kind)),
+        CandidateDownloadError::CacheWrite { kind: None, .. } => {
             RetryDecision::do_not_retry(RetryErrorKind::FatalLocal)
         }
     }
@@ -1833,7 +1837,13 @@ fn parse_http_date_ms(value: &str) -> Option<i64> {
 }
 
 fn write_cached_torrent(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownloadError> {
-    with_cached_torrent_path_lock(path, || write_cached_torrent_locked(path, bytes))
+    with_cached_torrent_path_lock(path, || {
+        retry_transient_io_blocking(
+            "write-cached-torrent",
+            |_| write_cached_torrent_locked(path, bytes),
+            classify_candidate_download_error,
+        )
+    })
 }
 
 fn write_cached_torrent_locked(path: &Path, bytes: &[u8]) -> Result<(), CandidateDownloadError> {
@@ -1842,49 +1852,36 @@ fn write_cached_torrent_locked(path: &Path, bytes: &[u8]) -> Result<(), Candidat
         .ok_or_else(|| CandidateDownloadError::CacheWrite {
             path: path.to_path_buf(),
             message: "cache path has no parent directory".to_owned(),
+            kind: None,
         })?;
-    fs::create_dir_all(parent).map_err(|error| CandidateDownloadError::CacheWrite {
-        path: parent.to_path_buf(),
-        message: error.to_string(),
-    })?;
+    fs::create_dir_all(parent).map_err(|error| cache_write_io_error(parent, error))?;
 
     let (mut temporary_file, temporary) = create_cache_temp_file(path)?;
     if let Err(error) = temporary_file.write_all(bytes) {
-        drop(fs::remove_file(&temporary));
-        return Err(CandidateDownloadError::CacheWrite {
-            path: temporary,
-            message: error.to_string(),
-        });
+        remove_cache_temp_file(&temporary)?;
+        return Err(cache_write_io_error(&temporary, error));
     }
     drop(temporary_file);
     match fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_file() => {
-            drop(fs::remove_file(&temporary));
+            remove_cache_temp_file(&temporary)?;
             touch_existing_cache_file(path)
         }
         Err(error) => {
-            drop(fs::remove_file(&temporary));
-            Err(CandidateDownloadError::CacheWrite {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })
+            remove_cache_temp_file(&temporary)?;
+            Err(cache_write_io_error(path, error))
         }
     }
 }
 
 fn touch_existing_cache_file(path: &Path) -> Result<(), CandidateDownloadError> {
-    let file = File::options().write(true).open(path).map_err(|error| {
-        CandidateDownloadError::CacheWrite {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        }
-    })?;
+    let file = File::options()
+        .write(true)
+        .open(path)
+        .map_err(|error| cache_write_io_error(path, error))?;
     file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
-        .map_err(|error| CandidateDownloadError::CacheWrite {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })
+        .map_err(|error| cache_write_io_error(path, error))
 }
 
 async fn write_cached_torrent_blocking(
@@ -1904,6 +1901,7 @@ async fn write_cached_torrent_blocking(
     .map_err(|error| CandidateDownloadError::CacheWrite {
         path: error_path,
         message: format!("cache write task failed: {error}"),
+        kind: None,
     })?
 }
 
@@ -1920,10 +1918,7 @@ fn create_cache_temp_file(
             Ok(file) => return Ok((file, temporary)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(CandidateDownloadError::CacheWrite {
-                    path: temporary,
-                    message: error.to_string(),
-                });
+                return Err(cache_write_io_error(&temporary, error));
             }
         }
     }
@@ -1931,7 +1926,37 @@ fn create_cache_temp_file(
     Err(CandidateDownloadError::CacheWrite {
         path: path.to_path_buf(),
         message: "failed to create a unique temporary cache file".to_owned(),
+        kind: None,
     })
+}
+
+fn cache_write_io_error(path: &Path, error: io::Error) -> CandidateDownloadError {
+    CandidateDownloadError::CacheWrite {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+        kind: Some(error.kind()),
+    }
+}
+
+fn cache_cleanup_error(path: &Path, error: io::Error) -> CandidateDownloadError {
+    CandidateDownloadError::CacheWrite {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+        kind: None,
+    }
+}
+
+fn remove_cache_temp_file(path: &Path) -> Result<(), CandidateDownloadError> {
+    retry_transient_io_blocking(
+        "remove-cache-temp-file",
+        |_| match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+        classify_io_error,
+    )
+    .map_err(|error| cache_cleanup_error(path, error))
 }
 
 fn unique_cache_temp_path(path: &Path) -> std::path::PathBuf {
@@ -3702,6 +3727,41 @@ mod tests {
         assert!(!CandidateDownloadPolicy::default().should_attempt(3));
 
         remove_temp_dir(&cache_dir);
+    }
+
+    #[test]
+    fn cache_write_retry_classifier_retries_transient_io() {
+        let error = cache_write_io_error(
+            Path::new("cache/candidate.torrent"),
+            io::ErrorKind::WouldBlock.into(),
+        );
+
+        assert_eq!(
+            RetryDecision::retry(RetryErrorKind::TransientLocalIo),
+            classify_candidate_download_error(&error)
+        );
+    }
+
+    #[test]
+    fn cache_write_retry_classifier_preserves_terminal_errors() {
+        let validation = CandidateDownloadError::CacheWrite {
+            path: PathBuf::from("candidate.torrent"),
+            message: "cache path has no parent directory".to_owned(),
+            kind: None,
+        };
+        let permissions = cache_write_io_error(
+            Path::new("cache/candidate.torrent"),
+            io::ErrorKind::PermissionDenied.into(),
+        );
+
+        assert_eq!(
+            RetryDecision::do_not_retry(RetryErrorKind::FatalLocal),
+            classify_candidate_download_error(&validation)
+        );
+        assert_eq!(
+            RetryDecision::do_not_retry(RetryErrorKind::PermissionDenied),
+            classify_candidate_download_error(&permissions)
+        );
     }
 
     #[tokio::test]
