@@ -1415,8 +1415,8 @@ where
 
 #[cfg(target_os = "linux")]
 fn media_dir_polling_reason(media_dir: &Path) -> Option<String> {
-    match linux_fs_type(media_dir) {
-        Ok(fs_type) => linux_fs_type_polling_reason(fs_type).map(str::to_owned),
+    match linux_mount_fs_type(media_dir) {
+        Ok(fs_type) => linux_fs_type_polling_reason(&fs_type).map(str::to_owned),
         Err(error) => Some(format!("filesystem type probe failed: {error}")),
     }
 }
@@ -1427,33 +1427,78 @@ fn media_dir_polling_reason(_media_dir: &Path) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_fs_type(media_dir: &Path) -> Result<i64, String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(media_dir.as_os_str().as_bytes())
-        .map_err(|_| "path contains an interior nul byte".to_owned())?;
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `path` is a valid nul-terminated path and `stat` points to
-    // writable memory for libc to initialize.
-    let result = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
-    if result == 0 {
-        // SAFETY: statfs returned success and initialized the struct.
-        Ok(unsafe { stat.assume_init() }.f_type as i64)
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
-    }
+fn linux_mount_fs_type(media_dir: &Path) -> Result<String, String> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("read /proc/self/mountinfo failed: {error}"))?;
+    linux_mount_fs_type_from_mountinfo(media_dir, &mountinfo)
 }
 
-#[cfg(target_os = "linux")]
-fn linux_fs_type_polling_reason(fs_type: i64) -> Option<&'static str> {
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn linux_mount_fs_type_from_mountinfo(media_dir: &Path, mountinfo: &str) -> Result<String, String> {
+    let mut best = None::<(PathBuf, String)>;
+    for line in mountinfo.lines() {
+        let Some((mount_point, fs_type)) = parse_linux_mountinfo_line(line) else {
+            continue;
+        };
+        if !path_contains_or_equals(&mount_point, media_dir) {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(best_mount, _)| {
+            mount_point.components().count() > best_mount.components().count()
+        }) {
+            best = Some((mount_point, fs_type));
+        }
+    }
+    best.map(|(_, fs_type)| fs_type)
+        .ok_or_else(|| format!("no mountinfo entry found for {}", media_dir.display()))
+}
+
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn parse_linux_mountinfo_line(line: &str) -> Option<(PathBuf, String)> {
+    let (mount_fields, fs_fields) = line.split_once(" - ")?;
+    let mount_point = mount_fields.split_whitespace().nth(4)?;
+    let fs_type = fs_fields.split_whitespace().next()?.to_owned();
+    Some((decode_linux_mountinfo_path(mount_point)?, fs_type))
+}
+
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn decode_linux_mountinfo_path(path: &str) -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.as_bytes().iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+        let first = bytes.next()?;
+        let second = bytes.next()?;
+        let third = bytes.next()?;
+        if !(matches!(first, b'0'..=b'7')
+            && matches!(second, b'0'..=b'7')
+            && matches!(third, b'0'..=b'7'))
+        {
+            return None;
+        }
+        let value = (first - b'0') * 64 + (second - b'0') * 8 + (third - b'0');
+        decoded.push(value);
+    }
+    Some(PathBuf::from(OsString::from_vec(decoded)))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_fs_type_polling_reason(fs_type: &str) -> Option<&'static str> {
+    if matches!(fs_type, "fuse" | "fuseblk" | "fusectl" | "sshfs") || fs_type.starts_with("fuse.") {
+        return Some("fuse filesystem");
+    }
     match fs_type {
-        0x6969 => Some("nfs filesystem"),
-        0x517B => Some("smb filesystem"),
-        0xFF53_4D42 => Some("cifs filesystem"),
-        0x6573_5546 => Some("fuse filesystem"),
-        0x00C3_6400 => Some("ceph filesystem"),
-        0x0102_1997 => Some("9p filesystem"),
+        "nfs" | "nfs4" => Some("nfs filesystem"),
+        "smb3" | "smbfs" => Some("smb filesystem"),
+        "cifs" => Some("cifs filesystem"),
+        "ceph" => Some("ceph filesystem"),
+        "9p" => Some("9p filesystem"),
         _ => None,
     }
 }
@@ -3002,15 +3047,40 @@ mod tests {
         assert_eq!(vec![local], polling_dirs);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn linux_media_watch_classification_prefers_polling_for_network_filesystems() {
-        assert_eq!(Some("nfs filesystem"), linux_fs_type_polling_reason(0x6969));
+        assert_eq!(Some("nfs filesystem"), linux_fs_type_polling_reason("nfs4"));
         assert_eq!(
             Some("fuse filesystem"),
-            linux_fs_type_polling_reason(0x6573_5546)
+            linux_fs_type_polling_reason("fuse.rclone")
         );
-        assert_eq!(None, linux_fs_type_polling_reason(0xEF53));
+        assert_eq!(
+            Some("fuse filesystem"),
+            linux_fs_type_polling_reason("sshfs")
+        );
+        assert_eq!(None, linux_fs_type_polling_reason("ext4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_mount_fs_type_uses_most_specific_mountinfo_entry() {
+        let mountinfo = "\
+25 1 8:1 / / rw,relatime - ext4 /dev/root rw\n\
+36 25 0:43 / /media rw,relatime - ext4 /dev/sdb1 rw\n\
+47 36 0:44 / /media/nfs rw,relatime - nfs4 server:/exports/media rw\n";
+
+        let fs_type =
+            linux_mount_fs_type_from_mountinfo(Path::new("/media/nfs/movies"), mountinfo).unwrap();
+
+        assert_eq!("nfs4", fs_type);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_mountinfo_path_decoder_handles_octal_escapes() {
+        let decoded = decode_linux_mountinfo_path("/media/My\\040Movies").unwrap();
+
+        assert_eq!(Path::new("/media/My Movies"), decoded);
     }
 
     #[tokio::test]
