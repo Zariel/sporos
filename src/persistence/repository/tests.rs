@@ -12,6 +12,7 @@ use crate::indexers::{
     parse_torznab_caps,
 };
 use crate::persistence::schema::{BUSY_TIMEOUT_MS, REQUIRED_TABLES};
+use crate::runtime::workflow_contracts::{WorkflowKind, WorkflowReason, WorkflowState};
 use crate::secrets::{ApiKey, CookieSecret};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
@@ -70,6 +71,216 @@ async fn readiness_helpers_probe_connection_and_schema() {
         .await
         .unwrap();
     assert!(!repository.schema_initialized().await.unwrap());
+}
+
+#[tokio::test]
+async fn workflow_projection_snapshot_reports_operator_state() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+
+    for update in [
+        WorkflowProjectionUpdate {
+            workflow_id: "announce:one",
+            workflow_kind: WorkflowKind::Announce,
+            public_id: "announce-one",
+            state: WorkflowState::Running,
+            reason: WorkflowReason::RunningActivity,
+            next_action: Some("matching"),
+            blocked_dependency: None,
+            raw_secret_material_count: 1,
+            started_at_ms: 1_000,
+            updated_at_ms: 1_500,
+            finished_at_ms: None,
+        },
+        WorkflowProjectionUpdate {
+            workflow_id: "announce:two",
+            workflow_kind: WorkflowKind::Announce,
+            public_id: "announce-two",
+            state: WorkflowState::Waiting,
+            reason: WorkflowReason::WaitingForDependency,
+            next_action: Some("retry_after_dependency_recovery"),
+            blocked_dependency: Some(WorkflowProjectionDependency {
+                kind: DependencyKind::Indexer,
+                name: "torznab",
+            }),
+            raw_secret_material_count: 2,
+            started_at_ms: 2_000,
+            updated_at_ms: 2_500,
+            finished_at_ms: None,
+        },
+        WorkflowProjectionUpdate {
+            workflow_id: "search:retry",
+            workflow_kind: WorkflowKind::Search,
+            public_id: "search-retry",
+            state: WorkflowState::Retrying,
+            reason: WorkflowReason::BackingOff,
+            next_action: Some("retry_download"),
+            blocked_dependency: Some(WorkflowProjectionDependency {
+                kind: DependencyKind::TorrentClient,
+                name: "qbit",
+            }),
+            raw_secret_material_count: 0,
+            started_at_ms: 3_000,
+            updated_at_ms: 3_500,
+            finished_at_ms: None,
+        },
+        WorkflowProjectionUpdate {
+            workflow_id: "job:done",
+            workflow_kind: WorkflowKind::ScheduledJob,
+            public_id: "media_inventory",
+            state: WorkflowState::Succeeded,
+            reason: WorkflowReason::Completed,
+            next_action: None,
+            blocked_dependency: None,
+            raw_secret_material_count: 0,
+            started_at_ms: 500,
+            updated_at_ms: 4_000,
+            finished_at_ms: Some(4_000),
+        },
+    ] {
+        repository
+            .record_workflow_projection(&update)
+            .await
+            .unwrap();
+    }
+
+    let snapshot = repository
+        .workflow_projection_snapshot(10, 6_000)
+        .await
+        .unwrap();
+
+    assert_eq!(3, snapshot.active_count);
+    assert_eq!(Some(5_000), snapshot.oldest_active_age_ms);
+    assert_eq!(3, snapshot.raw_secret_material_count);
+    assert!(snapshot.status_counts.iter().any(|count| {
+        count.workflow_kind == "announce"
+            && count.state == "waiting"
+            && count.reason == "waiting_for_dependency"
+            && count.count == 1
+    }));
+    assert!(snapshot.status_counts.iter().any(|count| {
+        count.workflow_kind == "scheduled_job"
+            && count.state == "succeeded"
+            && count.reason == "completed"
+            && count.count == 1
+    }));
+    assert!(snapshot.dependency_blocker_counts.iter().any(|count| {
+        count.workflow_kind == "announce" && count.dependency_kind == "indexer" && count.count == 1
+    }));
+    assert!(snapshot.dependency_blocker_counts.iter().any(|count| {
+        count.workflow_kind == "search"
+            && count.dependency_kind == "torrent_client"
+            && count.count == 1
+    }));
+    assert_eq!(4, snapshot.recent.len());
+    assert_eq!("search:retry", snapshot.recent[0].workflow_id);
+    assert_eq!(
+        Some("qbit"),
+        snapshot.recent[0].blocked_dependency_name.as_deref()
+    );
+
+    let metrics_snapshot = repository
+        .workflow_projection_metrics_snapshot(6_000)
+        .await
+        .unwrap();
+    assert_eq!(3, metrics_snapshot.active_count);
+    assert_eq!(Some(5_000), metrics_snapshot.oldest_active_age_ms);
+    assert_eq!(3, metrics_snapshot.raw_secret_material_count);
+    assert_eq!(0, metrics_snapshot.recent.len());
+}
+
+#[tokio::test]
+async fn workflow_projection_sanitizes_persisted_operator_strings() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    repository
+        .record_workflow_projection(&WorkflowProjectionUpdate {
+            workflow_id: "announce:secret",
+            workflow_kind: WorkflowKind::Announce,
+            public_id: "https://tracker.example/public?token=public-secret",
+            state: WorkflowState::Waiting,
+            reason: WorkflowReason::WaitingForDependency,
+            next_action: Some("https://tracker.example/action?apikey=action-secret"),
+            blocked_dependency: Some(WorkflowProjectionDependency {
+                kind: DependencyKind::Indexer,
+                name: "https://tracker.example/dependency?passkey=dependency-secret",
+            }),
+            raw_secret_material_count: 1,
+            started_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            finished_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    let row: (String, String, String) = sqlx::query_as(
+        r#"
+        SELECT public_id, next_action, blocked_dependency_name
+        FROM workflow_projection
+        WHERE workflow_id = 'announce:secret'
+        "#,
+    )
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+
+    let persisted = format!("{} {} {}", row.0, row.1, row.2);
+    assert!(persisted.contains("[REDACTED]"));
+    assert!(!persisted.contains("public-secret"));
+    assert!(!persisted.contains("action-secret"));
+    assert!(!persisted.contains("dependency-secret"));
+}
+
+#[tokio::test]
+async fn workflow_projection_ignores_stale_updates() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    repository
+        .record_workflow_projection(&WorkflowProjectionUpdate {
+            workflow_id: "announce:ordered",
+            workflow_kind: WorkflowKind::Announce,
+            public_id: "announce-ordered",
+            state: WorkflowState::Succeeded,
+            reason: WorkflowReason::Completed,
+            next_action: None,
+            blocked_dependency: None,
+            raw_secret_material_count: 0,
+            started_at_ms: 1_000,
+            updated_at_ms: 2_000,
+            finished_at_ms: Some(2_000),
+        })
+        .await
+        .unwrap();
+    repository
+        .record_workflow_projection(&WorkflowProjectionUpdate {
+            workflow_id: "announce:ordered",
+            workflow_kind: WorkflowKind::Announce,
+            public_id: "announce-ordered",
+            state: WorkflowState::Running,
+            reason: WorkflowReason::RunningActivity,
+            next_action: Some("matching"),
+            blocked_dependency: None,
+            raw_secret_material_count: 1,
+            started_at_ms: 1_000,
+            updated_at_ms: 1_500,
+            finished_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    let snapshot = repository
+        .workflow_projection_snapshot(10, 3_000)
+        .await
+        .unwrap();
+    assert_eq!(0, snapshot.active_count);
+    let row = snapshot
+        .recent
+        .iter()
+        .find(|item| item.workflow_id == "announce:ordered")
+        .unwrap();
+    assert_eq!("succeeded", row.state);
+    assert_eq!("completed", row.reason);
+    assert_eq!(2_000, row.updated_at_ms);
+    assert_eq!(Some(2_000), row.finished_at_ms);
+    assert!(row.terminal);
+    assert_eq!(0, row.raw_secret_material_count);
 }
 
 #[tokio::test]

@@ -26,6 +26,7 @@ use crate::domain::{
 };
 use crate::errors::DatabaseError;
 use crate::indexers::{ConfiguredTorznabIndexer, ProwlarrIndexer, TorznabCaps};
+use crate::runtime::workflow_contracts::{WorkflowKind, WorkflowReason, WorkflowState};
 use crate::secrets::{CookieSecret, sanitize_url_for_logging};
 use crate::time::unix_ms_to_rfc3339_seconds;
 
@@ -85,6 +86,69 @@ pub struct AnnounceQueueSnapshot {
     pub status_counts: Vec<AnnounceStatusCount>,
     pub attempt_counts: Vec<AnnounceAttemptCount>,
     pub dependency_wait_counts: Vec<AnnounceDependencyWaitCount>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WorkflowProjectionUpdate<'a> {
+    pub workflow_id: &'a str,
+    pub workflow_kind: WorkflowKind,
+    pub public_id: &'a str,
+    pub state: WorkflowState,
+    pub reason: WorkflowReason,
+    pub next_action: Option<&'a str>,
+    pub blocked_dependency: Option<WorkflowProjectionDependency<'a>>,
+    pub raw_secret_material_count: u16,
+    pub started_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WorkflowProjectionDependency<'a> {
+    pub kind: DependencyKind,
+    pub name: &'a str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkflowStatusCount {
+    pub workflow_kind: String,
+    pub state: String,
+    pub reason: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkflowDependencyBlockerCount {
+    pub workflow_kind: String,
+    pub dependency_kind: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkflowProjectionItem {
+    pub workflow_id: String,
+    pub workflow_kind: String,
+    pub public_id: String,
+    pub state: String,
+    pub reason: String,
+    pub next_action: Option<String>,
+    pub blocked_dependency_kind: Option<String>,
+    pub blocked_dependency_name: Option<String>,
+    pub raw_secret_material_count: u16,
+    pub terminal: bool,
+    pub started_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkflowProjectionSnapshot {
+    pub active_count: i64,
+    pub oldest_active_age_ms: Option<i64>,
+    pub raw_secret_material_count: i64,
+    pub status_counts: Vec<WorkflowStatusCount>,
+    pub dependency_blocker_counts: Vec<WorkflowDependencyBlockerCount>,
+    pub recent: Vec<WorkflowProjectionItem>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2078,6 +2142,261 @@ impl Repository {
 
         rows.into_iter()
             .map(dependency_health_snapshot_from_row)
+            .collect()
+    }
+
+    pub async fn record_workflow_projection(
+        &self,
+        update: &WorkflowProjectionUpdate<'_>,
+    ) -> Result<(), DatabaseError> {
+        let public_id = sanitize_url_for_logging(update.public_id).to_string();
+        let next_action = update
+            .next_action
+            .map(|value| sanitize_url_for_logging(value).to_string());
+        let blocked_dependency_kind = update
+            .blocked_dependency
+            .map(|dependency| dependency.kind.as_str());
+        let blocked_dependency_name = update
+            .blocked_dependency
+            .map(|dependency| sanitize_url_for_logging(dependency.name).to_string());
+        let terminal = update.state.is_terminal();
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_projection (
+                workflow_id,
+                workflow_kind,
+                public_id,
+                state,
+                reason,
+                next_action,
+                blocked_dependency_kind,
+                blocked_dependency_name,
+                raw_secret_material_count,
+                terminal,
+                started_at,
+                updated_at,
+                finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (workflow_id) DO UPDATE SET
+                workflow_kind = excluded.workflow_kind,
+                public_id = excluded.public_id,
+                state = excluded.state,
+                reason = excluded.reason,
+                next_action = excluded.next_action,
+                blocked_dependency_kind = excluded.blocked_dependency_kind,
+                blocked_dependency_name = excluded.blocked_dependency_name,
+                raw_secret_material_count = excluded.raw_secret_material_count,
+                terminal = excluded.terminal,
+                started_at = MIN(workflow_projection.started_at, excluded.started_at),
+                updated_at = excluded.updated_at,
+                finished_at = excluded.finished_at
+            WHERE excluded.updated_at >= workflow_projection.updated_at
+            "#,
+        )
+        .bind(update.workflow_id)
+        .bind(update.workflow_kind.as_str())
+        .bind(public_id)
+        .bind(update.state.as_str())
+        .bind(update.reason.as_str())
+        .bind(next_action)
+        .bind(blocked_dependency_kind)
+        .bind(blocked_dependency_name)
+        .bind(i64::from(update.raw_secret_material_count))
+        .bind(i64::from(terminal))
+        .bind(update.started_at_ms)
+        .bind(update.updated_at_ms)
+        .bind(update.finished_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("record workflow projection", error))?;
+
+        Ok(())
+    }
+
+    pub async fn workflow_projection_snapshot(
+        &self,
+        limit: u16,
+        now_ms: i64,
+    ) -> Result<WorkflowProjectionSnapshot, DatabaseError> {
+        self.workflow_projection_snapshot_limited(Some(limit), now_ms)
+            .await
+    }
+
+    pub async fn workflow_projection_metrics_snapshot(
+        &self,
+        now_ms: i64,
+    ) -> Result<WorkflowProjectionSnapshot, DatabaseError> {
+        self.workflow_projection_snapshot_limited(None, now_ms)
+            .await
+    }
+
+    async fn workflow_projection_snapshot_limited(
+        &self,
+        limit: Option<u16>,
+        now_ms: i64,
+    ) -> Result<WorkflowProjectionSnapshot, DatabaseError> {
+        let summary = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS active_count,
+                MIN(started_at) AS oldest_started_at,
+                COALESCE(SUM(raw_secret_material_count), 0) AS raw_secret_material_count
+            FROM workflow_projection INDEXED BY idx_workflow_projection_active
+            WHERE terminal = 0
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| db_error("read workflow projection summary", error))?;
+        let active_count = summary.get("active_count");
+        let oldest_started_at: Option<i64> = summary.get("oldest_started_at");
+        let raw_secret_material_count = summary.get("raw_secret_material_count");
+        let oldest_active_age_ms =
+            oldest_started_at.map(|started_at| now_ms.saturating_sub(started_at).max(0));
+
+        let recent = match limit {
+            Some(limit) => self.workflow_projection_recent(limit).await?,
+            None => Vec::new(),
+        };
+
+        Ok(WorkflowProjectionSnapshot {
+            active_count,
+            oldest_active_age_ms,
+            raw_secret_material_count,
+            status_counts: self.workflow_status_counts(limit).await?,
+            dependency_blocker_counts: self.workflow_dependency_blocker_counts(limit).await?,
+            recent,
+        })
+    }
+
+    async fn workflow_status_counts(
+        &self,
+        limit: Option<u16>,
+    ) -> Result<Vec<WorkflowStatusCount>, DatabaseError> {
+        let query = match limit {
+            Some(_) => {
+                r#"
+            SELECT workflow_kind, state, reason, COUNT(*) AS count
+            FROM workflow_projection INDEXED BY idx_workflow_projection_state_reason
+            GROUP BY workflow_kind, state, reason
+            ORDER BY count DESC, workflow_kind, state, reason
+            LIMIT ?
+            "#
+            }
+            None => {
+                r#"
+            SELECT workflow_kind, state, reason, COUNT(*) AS count
+            FROM workflow_projection INDEXED BY idx_workflow_projection_state_reason
+            GROUP BY workflow_kind, state, reason
+            ORDER BY count DESC, workflow_kind, state, reason
+            "#
+            }
+        };
+        let mut query = sqlx::query(query);
+        if let Some(limit) = limit {
+            query = query.bind(i64::from(limit));
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("read workflow projection status counts", error))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| WorkflowStatusCount {
+                workflow_kind: row.get("workflow_kind"),
+                state: row.get("state"),
+                reason: row.get("reason"),
+                count: row.get("count"),
+            })
+            .collect())
+    }
+
+    async fn workflow_dependency_blocker_counts(
+        &self,
+        limit: Option<u16>,
+    ) -> Result<Vec<WorkflowDependencyBlockerCount>, DatabaseError> {
+        let query = match limit {
+            Some(_) => {
+                r#"
+            SELECT
+                workflow_kind,
+                blocked_dependency_kind AS dependency_kind,
+                COUNT(*) AS count
+            FROM workflow_projection INDEXED BY idx_workflow_projection_dependency
+            WHERE terminal = 0
+              AND blocked_dependency_kind IS NOT NULL
+            GROUP BY workflow_kind, dependency_kind
+            ORDER BY count DESC, workflow_kind, dependency_kind
+            LIMIT ?
+            "#
+            }
+            None => {
+                r#"
+            SELECT
+                workflow_kind,
+                blocked_dependency_kind AS dependency_kind,
+                COUNT(*) AS count
+            FROM workflow_projection INDEXED BY idx_workflow_projection_dependency
+            WHERE terminal = 0
+              AND blocked_dependency_kind IS NOT NULL
+            GROUP BY workflow_kind, dependency_kind
+            ORDER BY count DESC, workflow_kind, dependency_kind
+            "#
+            }
+        };
+        let mut query = sqlx::query(query);
+        if let Some(limit) = limit {
+            query = query.bind(i64::from(limit));
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| db_error("read workflow projection dependency blockers", error))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| WorkflowDependencyBlockerCount {
+                workflow_kind: row.get("workflow_kind"),
+                dependency_kind: row.get("dependency_kind"),
+                count: row.get("count"),
+            })
+            .collect())
+    }
+
+    async fn workflow_projection_recent(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<WorkflowProjectionItem>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                workflow_id,
+                workflow_kind,
+                public_id,
+                state,
+                reason,
+                next_action,
+                blocked_dependency_kind,
+                blocked_dependency_name,
+                raw_secret_material_count,
+                terminal,
+                started_at,
+                updated_at,
+                finished_at
+            FROM workflow_projection INDEXED BY idx_workflow_projection_recent
+            ORDER BY terminal, updated_at DESC, workflow_id
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read workflow projection recent items", error))?;
+
+        rows.into_iter()
+            .map(workflow_projection_item_from_row)
             .collect()
     }
 
@@ -6148,6 +6467,29 @@ fn job_status_snapshot_from_row(
         last_finished_at_ms: row.get("last_finished_at"),
         next_run_at_ms: row.get("next_run_at"),
         last_error: row.get("last_error"),
+    })
+}
+
+fn workflow_projection_item_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<WorkflowProjectionItem, DatabaseError> {
+    Ok(WorkflowProjectionItem {
+        workflow_id: row.get("workflow_id"),
+        workflow_kind: row.get("workflow_kind"),
+        public_id: row.get("public_id"),
+        state: row.get("state"),
+        reason: row.get("reason"),
+        next_action: row.get("next_action"),
+        blocked_dependency_kind: row.get("blocked_dependency_kind"),
+        blocked_dependency_name: row.get("blocked_dependency_name"),
+        raw_secret_material_count: u16_from_i64(
+            row.get("raw_secret_material_count"),
+            "workflow raw secret material count",
+        )?,
+        terminal: row.get::<i64, _>("terminal") != 0,
+        started_at_ms: row.get("started_at"),
+        updated_at_ms: row.get("updated_at"),
+        finished_at_ms: row.get("finished_at"),
     })
 }
 

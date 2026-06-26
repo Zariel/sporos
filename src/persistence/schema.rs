@@ -199,6 +199,34 @@ CREATE TABLE IF NOT EXISTS dependency_health (
 CREATE INDEX IF NOT EXISTS idx_dependency_health_state_retry_after
     ON dependency_health (state, retry_after);
 
+CREATE TABLE IF NOT EXISTS workflow_projection (
+    workflow_id TEXT PRIMARY KEY,
+    workflow_kind TEXT NOT NULL,
+    public_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    next_action TEXT,
+    blocked_dependency_kind TEXT,
+    blocked_dependency_name TEXT,
+    raw_secret_material_count INTEGER NOT NULL DEFAULT 0,
+    terminal INTEGER NOT NULL DEFAULT 0,
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_projection_active
+    ON workflow_projection (terminal, started_at, workflow_kind)
+    WHERE terminal = 0;
+CREATE INDEX IF NOT EXISTS idx_workflow_projection_state_reason
+    ON workflow_projection (workflow_kind, state, reason);
+CREATE INDEX IF NOT EXISTS idx_workflow_projection_dependency
+    ON workflow_projection (terminal, workflow_kind, blocked_dependency_kind)
+    WHERE terminal = 0
+      AND blocked_dependency_kind IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_workflow_projection_recent
+    ON workflow_projection (terminal, updated_at DESC, workflow_id);
+
 CREATE TABLE IF NOT EXISTS announce_work (
     id TEXT PRIMARY KEY,
     dedupe_hash TEXT NOT NULL,
@@ -317,6 +345,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "search_history",
     "jobs",
     "dependency_health",
+    "workflow_projection",
     "announce_work",
 ];
 
@@ -378,6 +407,12 @@ mod tests {
             "name TEXT PRIMARY KEY",
             "PRIMARY KEY (dependency_type, dependency_name)",
             "failure_count INTEGER NOT NULL DEFAULT 0",
+            "workflow_id TEXT PRIMARY KEY",
+            "raw_secret_material_count INTEGER NOT NULL DEFAULT 0",
+            "idx_workflow_projection_active",
+            "idx_workflow_projection_state_reason",
+            "idx_workflow_projection_dependency",
+            "idx_workflow_projection_recent",
             "idx_local_files_item_size",
             "idx_local_items_media_title_source",
             "idx_local_item_title_grams_lookup",

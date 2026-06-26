@@ -308,6 +308,17 @@ pub enum WorkflowState {
 }
 
 impl WorkflowState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Retrying => "retrying",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
@@ -324,6 +335,21 @@ pub enum WorkflowReason {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl WorkflowReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::WaitingForInventory => "waiting_for_inventory",
+            Self::WaitingForDependency => "waiting_for_dependency",
+            Self::RunningActivity => "running_activity",
+            Self::BackingOff => "backing_off",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]

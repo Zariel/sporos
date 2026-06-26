@@ -42,6 +42,7 @@ use crate::notifications::{
 };
 use crate::persistence::repository::{
     AnnounceInsertResult, AnnounceQueueSnapshot, JobStatusSnapshot, Repository,
+    WorkflowProjectionSnapshot,
 };
 use crate::runtime::announce_worker::unix_time_ms;
 use crate::runtime::health::{
@@ -658,6 +659,8 @@ struct StatusResponse {
     jobs_error: Option<&'static str>,
     announce_queue: Option<AnnounceQueueStatusResponse>,
     announce_queue_error: Option<&'static str>,
+    workflows: Option<WorkflowProjectionStatusResponse>,
+    workflows_error: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -749,6 +752,53 @@ struct AnnounceDependencyWaitResponse {
     dependency_kind: String,
     dependency_name: String,
     count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowProjectionStatusResponse {
+    active_count: i64,
+    oldest_active_age_ms: Option<i64>,
+    raw_secret_material_count: i64,
+    statuses: Vec<WorkflowStatusCountResponse>,
+    dependency_blockers: Vec<WorkflowDependencyBlockerResponse>,
+    recent: Vec<WorkflowProjectionItemResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowStatusCountResponse {
+    workflow_kind: String,
+    state: String,
+    reason: String,
+    count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowDependencyBlockerResponse {
+    workflow_kind: String,
+    dependency_kind: String,
+    count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowProjectionItemResponse {
+    workflow_id: String,
+    workflow_kind: String,
+    public_id: String,
+    state: String,
+    reason: String,
+    next_action: Option<String>,
+    blocked_dependency: Option<WorkflowDependencyResponse>,
+    raw_secret_material_count: u16,
+    terminal: bool,
+    started_at_ms: i64,
+    updated_at_ms: i64,
+    finished_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowDependencyResponse {
+    kind: String,
+    name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1147,6 +1197,7 @@ async fn status(State(state): State<HttpState>) -> impl IntoResponse {
     let dependencies = dependency_statuses(&state).await;
     let (jobs, jobs_error) = job_statuses(&state).await;
     let (announce_queue, announce_queue_error) = announce_queue_status(&state).await;
+    let (workflows, workflows_error) = workflow_projection_status(&state).await;
     state
         .metrics
         .record_http_request(HttpMethod::Get, HttpRoute::Status, StatusCode::OK.as_u16());
@@ -1161,6 +1212,8 @@ async fn status(State(state): State<HttpState>) -> impl IntoResponse {
             jobs_error,
             announce_queue,
             announce_queue_error,
+            workflows,
+            workflows_error,
         }),
     )
 }
@@ -1645,6 +1698,14 @@ async fn metrics_snapshot(state: &HttpState) -> MetricsSnapshot {
             }
             Err(_error) => snapshot.snapshot_errors.push("dependency_health"),
         }
+        match acceptor
+            .repository
+            .workflow_projection_metrics_snapshot(unix_time_ms())
+            .await
+        {
+            Ok(workflows) => snapshot.workflow_projection = Some(workflows),
+            Err(_error) => snapshot.snapshot_errors.push("workflow_projection"),
+        }
     }
 
     snapshot
@@ -1665,6 +1726,25 @@ async fn announce_queue_status(
             Some(announce_queue_status_response(snapshot, &acceptor.config)),
             None,
         ),
+        Err(_error) => (None, Some("unavailable")),
+    }
+}
+
+async fn workflow_projection_status(
+    state: &HttpState,
+) -> (
+    Option<WorkflowProjectionStatusResponse>,
+    Option<&'static str>,
+) {
+    let Some(acceptor) = state.announce_acceptor.as_ref() else {
+        return (None, None);
+    };
+    match acceptor
+        .repository
+        .workflow_projection_snapshot(100, unix_time_ms())
+        .await
+    {
+        Ok(snapshot) => (Some(workflow_projection_status_response(snapshot)), None),
         Err(_error) => (None, Some("unavailable")),
     }
 }
@@ -1924,6 +2004,65 @@ fn announce_queue_status_response(
     }
 }
 
+fn workflow_projection_status_response(
+    snapshot: WorkflowProjectionSnapshot,
+) -> WorkflowProjectionStatusResponse {
+    WorkflowProjectionStatusResponse {
+        active_count: snapshot.active_count,
+        oldest_active_age_ms: snapshot.oldest_active_age_ms,
+        raw_secret_material_count: snapshot.raw_secret_material_count,
+        statuses: snapshot
+            .status_counts
+            .into_iter()
+            .map(|count| WorkflowStatusCountResponse {
+                workflow_kind: safe_operator_text(&count.workflow_kind),
+                state: safe_operator_text(&count.state),
+                reason: safe_operator_text(&count.reason),
+                count: count.count,
+            })
+            .collect(),
+        dependency_blockers: snapshot
+            .dependency_blocker_counts
+            .into_iter()
+            .map(|count| WorkflowDependencyBlockerResponse {
+                workflow_kind: safe_operator_text(&count.workflow_kind),
+                dependency_kind: safe_operator_text(&count.dependency_kind),
+                count: count.count,
+            })
+            .collect(),
+        recent: snapshot
+            .recent
+            .into_iter()
+            .map(|item| {
+                let blocked_dependency = match (
+                    item.blocked_dependency_kind.as_deref(),
+                    item.blocked_dependency_name.as_deref(),
+                ) {
+                    (Some(kind), Some(name)) => Some(WorkflowDependencyResponse {
+                        kind: safe_operator_text(kind),
+                        name: safe_operator_text(name),
+                    }),
+                    _ => None,
+                };
+                WorkflowProjectionItemResponse {
+                    workflow_id: safe_operator_text(&item.workflow_id),
+                    workflow_kind: safe_operator_text(&item.workflow_kind),
+                    public_id: safe_operator_text(&item.public_id),
+                    state: safe_operator_text(&item.state),
+                    reason: safe_operator_text(&item.reason),
+                    next_action: item.next_action.as_deref().map(safe_operator_text),
+                    blocked_dependency,
+                    raw_secret_material_count: item.raw_secret_material_count,
+                    terminal: item.terminal,
+                    started_at_ms: item.started_at_ms,
+                    updated_at_ms: item.updated_at_ms,
+                    finished_at_ms: item.finished_at_ms,
+                }
+            })
+            .collect(),
+    }
+}
+
 fn safe_operator_text(value: &str) -> String {
     sanitize_url_for_logging(value).to_string()
 }
@@ -1985,8 +2124,11 @@ mod tests {
 
     use crate::domain::{DependencyName, ReasonText};
     use crate::notifications::{NotificationEndpoint, NotificationEvent, NotificationEventKind};
-    use crate::persistence::repository::Repository;
+    use crate::persistence::repository::{
+        Repository, WorkflowProjectionDependency, WorkflowProjectionUpdate,
+    };
     use crate::runtime::queue::{EnqueueError, QueueKind, WorkReceiver, bounded_work_queue};
+    use crate::runtime::workflow_contracts::{WorkflowKind, WorkflowReason, WorkflowState};
 
     #[test]
     fn bearer_auth_validates_prefix_and_token() {
@@ -3030,6 +3172,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_readyz_and_metrics_expose_workflow_projection_snapshots() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        for update in [
+            WorkflowProjectionUpdate {
+                workflow_id: "announce:running",
+                workflow_kind: WorkflowKind::Announce,
+                public_id: "announce-running",
+                state: WorkflowState::Running,
+                reason: WorkflowReason::RunningActivity,
+                next_action: Some("matching"),
+                blocked_dependency: None,
+                raw_secret_material_count: 1,
+                started_at_ms: unix_time_ms().saturating_sub(5_000),
+                updated_at_ms: unix_time_ms().saturating_sub(4_000),
+                finished_at_ms: None,
+            },
+            WorkflowProjectionUpdate {
+                workflow_id: "announce:waiting",
+                workflow_kind: WorkflowKind::Announce,
+                public_id: "announce-waiting",
+                state: WorkflowState::Waiting,
+                reason: WorkflowReason::WaitingForDependency,
+                next_action: Some("retry_after_dependency_recovery"),
+                blocked_dependency: Some(WorkflowProjectionDependency {
+                    kind: DependencyKind::Indexer,
+                    name: "https://tracker.example/dependency?passkey=workflow-dependency-secret",
+                }),
+                raw_secret_material_count: 1,
+                started_at_ms: unix_time_ms().saturating_sub(3_000),
+                updated_at_ms: unix_time_ms().saturating_sub(2_000),
+                finished_at_ms: None,
+            },
+            WorkflowProjectionUpdate {
+                workflow_id: "search:retrying",
+                workflow_kind: WorkflowKind::Search,
+                public_id: "search-retrying",
+                state: WorkflowState::Retrying,
+                reason: WorkflowReason::BackingOff,
+                next_action: Some("retry_candidate_download"),
+                blocked_dependency: Some(WorkflowProjectionDependency {
+                    kind: DependencyKind::TorrentClient,
+                    name: "qbit",
+                }),
+                raw_secret_material_count: 0,
+                started_at_ms: unix_time_ms().saturating_sub(2_000),
+                updated_at_ms: unix_time_ms().saturating_sub(1_000),
+                finished_at_ms: None,
+            },
+            WorkflowProjectionUpdate {
+                workflow_id: "job:terminal",
+                workflow_kind: WorkflowKind::ScheduledJob,
+                public_id: "media_inventory",
+                state: WorkflowState::Succeeded,
+                reason: WorkflowReason::Completed,
+                next_action: None,
+                blocked_dependency: None,
+                raw_secret_material_count: 0,
+                started_at_ms: unix_time_ms().saturating_sub(1_000),
+                updated_at_ms: unix_time_ms(),
+                finished_at_ms: Some(unix_time_ms()),
+            },
+        ] {
+            repository
+                .record_workflow_projection(&update)
+                .await
+                .unwrap();
+        }
+        let app = announce_app(repository, None, AnnounceQueueConfig::default());
+
+        let readyz_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, readyz_response.status());
+        let readyz_body = axum::body::to_bytes(readyz_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let readyz_text = std::str::from_utf8(&readyz_body).unwrap();
+        assert_omits_fetch_secrets(readyz_text);
+
+        let status_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status_body = axum::body::to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_json: Value = serde_json::from_slice(&status_body).unwrap();
+        let workflows = &status_json["workflows"];
+        assert_eq!(3, workflows["active_count"]);
+        assert_eq!(2, workflows["raw_secret_material_count"]);
+        assert!(
+            workflows["oldest_active_age_ms"]
+                .as_i64()
+                .is_some_and(|age| age >= 0)
+        );
+        assert!(workflow_status_count(workflows, "announce", "running", "running_activity") >= 1);
+        assert!(
+            workflow_status_count(workflows, "announce", "waiting", "waiting_for_dependency") >= 1
+        );
+        assert!(workflow_status_count(workflows, "search", "retrying", "backing_off") >= 1);
+        assert!(workflow_status_count(workflows, "scheduled_job", "succeeded", "completed") >= 1);
+        assert!(workflow_dependency_blocker_count(workflows, "announce", "indexer") >= 1);
+        assert!(workflow_dependency_blocker_count(workflows, "search", "torrent_client") >= 1);
+        let recent = workflows["recent"].as_array().unwrap();
+        assert!(recent.iter().any(|item| item["state"] == "retrying"));
+        assert!(recent.iter().any(|item| item["blocked_dependency"]["name"]
+            == "https://tracker.example/dependency?passkey=[REDACTED]"));
+        let status_text = std::str::from_utf8(&status_body).unwrap();
+        assert_omits_fetch_secrets(status_text);
+
+        let metrics_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_body = axum::body::to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics_text = std::str::from_utf8(&metrics_body).unwrap();
+        assert!(metrics_text.contains("sporos_workflow_active_work 3"));
+        assert!(metrics_text.contains("sporos_workflow_active_fetch_material_rows 2"));
+        assert!(metrics_text.contains("sporos_workflow_oldest_active_age_seconds"));
+        assert!(metrics_text.contains("sporos_workflow_state_total{reason=\"running_activity\",state=\"running\",workflow=\"announce\"} 1"));
+        assert!(metrics_text.contains("sporos_workflow_state_total{reason=\"waiting_for_dependency\",state=\"waiting\",workflow=\"announce\"} 1"));
+        assert!(metrics_text.contains("sporos_workflow_state_total{reason=\"backing_off\",state=\"retrying\",workflow=\"search\"} 1"));
+        assert!(metrics_text.contains("sporos_workflow_state_total{reason=\"completed\",state=\"succeeded\",workflow=\"scheduled_job\"} 1"));
+        assert!(metrics_text.contains("sporos_workflow_dependency_blocker_count{dependency_kind=\"indexer\",workflow=\"announce\"} 1"));
+        assert!(metrics_text.contains("sporos_workflow_dependency_blocker_count{dependency_kind=\"torrent_client\",workflow=\"search\"} 1"));
+        assert!(!metrics_text.contains("workflow-dependency-secret"));
+        assert_omits_fetch_secrets(metrics_text);
+    }
+
+    #[tokio::test]
     async fn announcement_validation_errors_omit_fetch_secrets() {
         let repository = Repository::connect_in_memory().await.unwrap();
         let app = announce_app(repository, None, AnnounceQueueConfig::default());
@@ -3649,6 +3941,42 @@ mod tests {
             .unwrap_or_else(|| panic!("missing dependency status for {kind} {name}"))
     }
 
+    fn workflow_status_count(
+        workflows: &Value,
+        workflow_kind: &str,
+        state: &str,
+        reason: &str,
+    ) -> i64 {
+        workflows["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|count| {
+                count["workflow_kind"] == workflow_kind
+                    && count["state"] == state
+                    && count["reason"] == reason
+            })
+            .and_then(|count| count["count"].as_i64())
+            .unwrap_or(0)
+    }
+
+    fn workflow_dependency_blocker_count(
+        workflows: &Value,
+        workflow_kind: &str,
+        dependency_kind: &str,
+    ) -> i64 {
+        workflows["dependency_blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|count| {
+                count["workflow_kind"] == workflow_kind
+                    && count["dependency_kind"] == dependency_kind
+            })
+            .and_then(|count| count["count"].as_i64())
+            .unwrap_or(0)
+    }
+
     async fn status_example_json(
         readiness: ReadinessState,
         health: HealthRegistry,
@@ -3718,6 +4046,7 @@ mod tests {
             "wait-secret",
             "attempt-secret",
             "message-secret",
+            "workflow-dependency-secret",
         ] {
             assert!(!text.contains(secret), "{secret} leaked in {text}");
         }

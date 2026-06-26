@@ -9,7 +9,7 @@ use prometheus::{
 
 use crate::persistence::repository::{
     AnnounceQueueSnapshot, DependencyHealthSnapshot as StoredDependencyHealthSnapshot,
-    JobStatusSnapshot,
+    JobStatusSnapshot, WorkflowProjectionSnapshot,
 };
 use crate::runtime::health::DependencyHealthSnapshot;
 use crate::runtime::queue::QueueStats;
@@ -253,6 +253,7 @@ pub struct MetricsSnapshot {
     pub queues: Vec<QueueStats>,
     pub dependency_health: DependencyHealthSnapshot,
     pub announce_queue: Option<AnnounceQueueSnapshot>,
+    pub workflow_projection: Option<WorkflowProjectionSnapshot>,
     pub announce_worker_capacity: Option<u16>,
     pub jobs: Vec<JobStatusSnapshot>,
     pub stored_dependency_health: Vec<StoredDependencyHealthSnapshot>,
@@ -268,6 +269,7 @@ impl Default for MetricsSnapshot {
                 summaries: BTreeMap::new(),
             },
             announce_queue: None,
+            workflow_projection: None,
             announce_worker_capacity: None,
             jobs: Vec::new(),
             stored_dependency_health: Vec::new(),
@@ -747,6 +749,66 @@ fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto
         }
     }
 
+    let workflow_state = int_gauge_vec(
+        "sporos_workflow_state_total",
+        "Projected durable workflow state by workflow, state, and reason.",
+        &["workflow", "state", "reason"],
+    );
+    let workflow_dependency_blocker = int_gauge_vec(
+        "sporos_workflow_dependency_blocker_count",
+        "Active projected workflows waiting on dependency kind.",
+        &["workflow", "dependency_kind"],
+    );
+    if let Some(workflows) = &snapshot.workflow_projection {
+        let workflow_active = int_gauge(
+            "sporos_workflow_active_work",
+            "Active projected durable workflow count.",
+        );
+        let workflow_oldest_age = gauge(
+            "sporos_workflow_oldest_active_age_seconds",
+            "Oldest active projected workflow age.",
+        );
+        let workflow_fetch_material = int_gauge(
+            "sporos_workflow_active_fetch_material_rows",
+            "Active projected workflows retaining raw fetch material.",
+        );
+        workflow_active.set(workflows.active_count);
+        workflow_fetch_material.set(workflows.raw_secret_material_count);
+        register(&registry, Box::new(workflow_active.clone()));
+        register(&registry, Box::new(workflow_fetch_material.clone()));
+        if let Some(age_ms) = workflows.oldest_active_age_ms {
+            workflow_oldest_age.set(ms_to_seconds(i64_to_u64_floor(age_ms)));
+            register(&registry, Box::new(workflow_oldest_age.clone()));
+        }
+        let mut state_counts = BTreeMap::<(String, String, String), i64>::new();
+        for count in &workflows.status_counts {
+            let workflow = workflow_kind_label(&count.workflow_kind);
+            let state = workflow_state_label(&count.state);
+            let reason = workflow_reason_label(&count.reason);
+            let total = state_counts.entry((workflow, state, reason)).or_insert(0);
+            *total = total.saturating_add(count.count);
+        }
+        for ((workflow, state, reason), count) in state_counts {
+            workflow_state
+                .with_label_values(&[workflow.as_str(), state.as_str(), reason.as_str()])
+                .set(count);
+        }
+        let mut dependency_counts = BTreeMap::<(String, String), i64>::new();
+        for count in &workflows.dependency_blocker_counts {
+            let workflow = workflow_kind_label(&count.workflow_kind);
+            let dependency_kind = dependency_kind_label(&count.dependency_kind);
+            let total = dependency_counts
+                .entry((workflow, dependency_kind))
+                .or_insert(0);
+            *total = total.saturating_add(count.count);
+        }
+        for ((workflow, dependency_kind), count) in dependency_counts {
+            workflow_dependency_blocker
+                .with_label_values(&[workflow.as_str(), dependency_kind.as_str()])
+                .set(count);
+        }
+    }
+
     let job_state = int_gauge_vec(
         "sporos_job_state",
         "Persisted job state snapshots.",
@@ -792,6 +854,8 @@ fn snapshot_metric_families(snapshot: &MetricsSnapshot) -> Vec<prometheus::proto
         Box::new(announce_work.clone()),
         Box::new(announce_attempts.clone()),
         Box::new(announce_dependency_wait.clone()),
+        Box::new(workflow_state.clone()),
+        Box::new(workflow_dependency_blocker.clone()),
         Box::new(job_state.clone()),
         Box::new(job_last_duration.clone()),
         Box::new(snapshot_errors.clone()),
@@ -849,6 +913,46 @@ fn sanitized_label(value: &str) -> String {
     sanitize_url_for_logging(value).to_string()
 }
 
+fn workflow_kind_label(value: &str) -> String {
+    match value {
+        "announce" | "search" | "scheduled_job" | "inventory_refresh" | "saved_torrent_retry" => {
+            value.to_owned()
+        }
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn workflow_state_label(value: &str) -> String {
+    match value {
+        "running" | "waiting" | "retrying" | "succeeded" | "failed" | "cancelled" => {
+            value.to_owned()
+        }
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn workflow_reason_label(value: &str) -> String {
+    match value {
+        "accepted"
+        | "waiting_for_inventory"
+        | "waiting_for_dependency"
+        | "running_activity"
+        | "backing_off"
+        | "completed"
+        | "failed"
+        | "cancelled" => value.to_owned(),
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn dependency_kind_label(value: &str) -> String {
+    match value {
+        "torrent_client" | "indexer" | "prowlarr" | "arr" | "notification" | "local_state"
+        | "database" | "worker" => value.to_owned(),
+        _ => "unknown".to_owned(),
+    }
+}
+
 fn i64_from_usize(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -863,6 +967,8 @@ mod tests {
     use crate::domain::{DependencyName, JobName};
     use crate::persistence::repository::{
         AnnounceAttemptCount, AnnounceDependencyWaitCount, AnnounceStatusCount,
+        WorkflowDependencyBlockerCount, WorkflowProjectionItem, WorkflowProjectionSnapshot,
+        WorkflowStatusCount,
     };
     use crate::runtime::health::{DependencyKind, DependencySummary};
     use crate::runtime::queue::QueueKind;
@@ -922,6 +1028,7 @@ mod tests {
                     count: 1,
                 }],
             }),
+            workflow_projection: None,
             announce_worker_capacity: Some(2),
             jobs: vec![JobStatusSnapshot {
                 name: JobName::new("rss").unwrap(),
@@ -1094,6 +1201,143 @@ mod tests {
         assert!(!output.contains("attempt-secret"));
         assert!(!output.contains("dependency-secret"));
         assert!(!output.contains("other-dependency-secret"));
+    }
+
+    #[test]
+    fn workflow_projection_metrics_report_bounded_operator_state() {
+        let registry = MetricsRegistry::new();
+        let snapshot = MetricsSnapshot {
+            workflow_projection: Some(WorkflowProjectionSnapshot {
+                active_count: 3,
+                oldest_active_age_ms: Some(7_000),
+                raw_secret_material_count: 2,
+                status_counts: vec![
+                    WorkflowStatusCount {
+                        workflow_kind: "announce".to_owned(),
+                        state: "running".to_owned(),
+                        reason: "running_activity".to_owned(),
+                        count: 1,
+                    },
+                    WorkflowStatusCount {
+                        workflow_kind: "announce".to_owned(),
+                        state: "waiting".to_owned(),
+                        reason: "waiting_for_dependency".to_owned(),
+                        count: 1,
+                    },
+                    WorkflowStatusCount {
+                        workflow_kind: "search".to_owned(),
+                        state: "retrying".to_owned(),
+                        reason: "backing_off".to_owned(),
+                        count: 1,
+                    },
+                    WorkflowStatusCount {
+                        workflow_kind: "scheduled_job".to_owned(),
+                        state: "succeeded".to_owned(),
+                        reason: "completed".to_owned(),
+                        count: 1,
+                    },
+                ],
+                dependency_blocker_counts: vec![
+                    WorkflowDependencyBlockerCount {
+                        workflow_kind: "announce".to_owned(),
+                        dependency_kind: "indexer".to_owned(),
+                        count: 2,
+                    },
+                    WorkflowDependencyBlockerCount {
+                        workflow_kind: "search".to_owned(),
+                        dependency_kind: "torrent_client".to_owned(),
+                        count: 1,
+                    },
+                ],
+                recent: Vec::new(),
+            }),
+            ..MetricsSnapshot::default()
+        };
+
+        let output = registry.render_prometheus(&snapshot);
+
+        assert!(output.contains("sporos_workflow_active_work 3"));
+        assert!(output.contains("sporos_workflow_oldest_active_age_seconds 7"));
+        assert!(output.contains("sporos_workflow_active_fetch_material_rows 2"));
+        assert!(output.contains("sporos_workflow_state_total{reason=\"running_activity\",state=\"running\",workflow=\"announce\"} 1"));
+        assert!(output.contains("sporos_workflow_state_total{reason=\"waiting_for_dependency\",state=\"waiting\",workflow=\"announce\"} 1"));
+        assert!(output.contains("sporos_workflow_state_total{reason=\"backing_off\",state=\"retrying\",workflow=\"search\"} 1"));
+        assert!(output.contains("sporos_workflow_state_total{reason=\"completed\",state=\"succeeded\",workflow=\"scheduled_job\"} 1"));
+        assert!(output.contains("sporos_workflow_dependency_blocker_count{dependency_kind=\"indexer\",workflow=\"announce\"} 2"));
+        assert!(output.contains("sporos_workflow_dependency_blocker_count{dependency_kind=\"torrent_client\",workflow=\"search\"} 1"));
+    }
+
+    #[test]
+    fn workflow_projection_metrics_redact_freeform_labels_and_omit_recent_items() {
+        let registry = MetricsRegistry::new();
+        let snapshot = MetricsSnapshot {
+            workflow_projection: Some(WorkflowProjectionSnapshot {
+                active_count: 1,
+                oldest_active_age_ms: None,
+                raw_secret_material_count: 1,
+                status_counts: vec![
+                    WorkflowStatusCount {
+                        workflow_kind: "https://tracker.example/workflow?apikey=workflow-secret"
+                            .to_owned(),
+                        state: "waiting".to_owned(),
+                        reason: "https://tracker.example/reason?token=reason-secret".to_owned(),
+                        count: 1,
+                    },
+                    WorkflowStatusCount {
+                        workflow_kind:
+                            "https://tracker.example/workflow?apikey=other-workflow-secret"
+                                .to_owned(),
+                        state: "waiting".to_owned(),
+                        reason: "https://tracker.example/reason?token=other-reason-secret"
+                            .to_owned(),
+                        count: 2,
+                    },
+                ],
+                dependency_blocker_counts: vec![WorkflowDependencyBlockerCount {
+                    workflow_kind: "announce".to_owned(),
+                    dependency_kind: "https://tracker.example/dependency?passkey=dependency-secret"
+                        .to_owned(),
+                    count: 1,
+                }],
+                recent: vec![WorkflowProjectionItem {
+                    workflow_id: "announce:secret".to_owned(),
+                    workflow_kind: "announce".to_owned(),
+                    public_id: "public-secret".to_owned(),
+                    state: "waiting".to_owned(),
+                    reason: "waiting_for_dependency".to_owned(),
+                    next_action: Some("action-secret".to_owned()),
+                    blocked_dependency_kind: Some("indexer".to_owned()),
+                    blocked_dependency_name: Some("dependency-name-secret".to_owned()),
+                    raw_secret_material_count: 1,
+                    terminal: false,
+                    started_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                    finished_at_ms: None,
+                }],
+            }),
+            ..MetricsSnapshot::default()
+        };
+
+        let output = registry.render_prometheus(&snapshot);
+
+        assert!(
+            output.contains(
+                "sporos_workflow_state_total{reason=\"unknown\",state=\"waiting\",workflow=\"unknown\"} 3"
+            )
+        );
+        assert!(output.contains(
+            "sporos_workflow_dependency_blocker_count{dependency_kind=\"unknown\",workflow=\"announce\"} 1"
+        ));
+        assert!(!output.contains("[REDACTED]"));
+        assert!(!output.contains("https://tracker.example"));
+        assert!(!output.contains("workflow-secret"));
+        assert!(!output.contains("other-workflow-secret"));
+        assert!(!output.contains("reason-secret"));
+        assert!(!output.contains("other-reason-secret"));
+        assert!(!output.contains("dependency-secret"));
+        assert!(!output.contains("public-secret"));
+        assert!(!output.contains("action-secret"));
+        assert!(!output.contains("dependency-name-secret"));
     }
 
     #[test]

@@ -78,5 +78,14 @@
     "attempts": [],
     "dependency_waits": []
   },
-  "announce_queue_error": null
+  "announce_queue_error": null,
+  "workflows": {
+    "active_count": 0,
+    "oldest_active_age_ms": null,
+    "raw_secret_material_count": 0,
+    "statuses": [],
+    "dependency_blockers": [],
+    "recent": []
+  },
+  "workflows_error": null
 }
