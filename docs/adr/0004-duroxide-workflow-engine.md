@@ -33,7 +33,12 @@ Duroxide is an embedded Rust durable execution framework. Its public API
 provides an in-process Tokio runtime, SQLite storage provider, activity and
 orchestration registries, durable timers, external events, and replayed
 deterministic orchestration functions. Duroxide documentation is available at
-<https://docs.rs/duroxide/latest/duroxide/>.
+<https://docs.rs/duroxide/latest/duroxide/>. The implementation backlog should
+also use the upstream orchestration guide as a source for deterministic
+orchestration rules, activity boundaries, replay behavior, external events,
+durable event queues, custom status, KV state, sub-orchestrations, retry
+policies, cancellation, and continue-as-new:
+<https://github.com/microsoft/duroxide/blob/main/docs/ORCHESTRATION-GUIDE.md>.
 
 ## Decision
 

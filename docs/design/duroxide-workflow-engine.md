@@ -11,6 +11,13 @@ workflow state from the current engine. Evaluation starts from fresh test state.
 Existing Sporos domain tables remain authoritative for domain data; Duroxide
 owns workflow execution history, timers, waits, and activity scheduling.
 
+Use the upstream Duroxide orchestration guide as an implementation reference:
+<https://github.com/microsoft/duroxide/blob/main/docs/ORCHESTRATION-GUIDE.md>.
+Backlog items should preserve its rules for deterministic orchestrations,
+side-effecting activities, replay, external events and durable queues, custom
+status and KV state, sub-orchestrations, retries, cancellation, and
+continue-as-new.
+
 ## Runtime Shape
 
 Add a workflow runtime owned by `AppRuntime`:
