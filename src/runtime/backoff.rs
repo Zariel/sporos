@@ -6,6 +6,8 @@ use crate::errors::{
     ClassifyFailure, DatabaseError, FailureClass, IndexerError, TorrentClientError,
 };
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
+use crate::secrets::sanitize_url_for_logging;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct JitteredBackoffPolicy {
@@ -56,6 +58,30 @@ pub enum RetryErrorKind {
     FatalLocal,
     NonIdempotent,
     Unknown,
+}
+
+impl RetryErrorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TransientNetwork => "transient_network",
+            Self::Timeout => "timeout",
+            Self::RateLimited => "rate_limited",
+            Self::DependencyBackoff => "dependency_backoff",
+            Self::DatabaseBusy => "database_busy",
+            Self::TransientLocalIo => "transient_local_io",
+            Self::Authentication => "authentication",
+            Self::PermissionDenied => "permission_denied",
+            Self::BadRequest => "bad_request",
+            Self::NotFound => "not_found",
+            Self::Unsupported => "unsupported",
+            Self::InvalidResponse => "invalid_response",
+            Self::InvalidInput => "invalid_input",
+            Self::Cancelled => "cancelled",
+            Self::FatalLocal => "fatal_local",
+            Self::NonIdempotent => "non_idempotent",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -391,10 +417,14 @@ where
             Err(error) => {
                 let decision = classify(&error);
                 if !decision.should_retry() || attempt == attempts {
+                    if decision.should_retry() {
+                        log_retry_exhausted(jitter_key, attempt, attempts, decision);
+                    }
                     return RetryOutcome::Completed(Err(error));
                 }
 
                 let delay = retry_delay_after_decision(policy, attempt, jitter_key, decision);
+                log_retry_scheduled(jitter_key, attempt, attempts, decision, delay);
                 if delay.is_zero() {
                     continue;
                 }
@@ -405,7 +435,10 @@ where
                 let mut shutdown = shutdown.clone();
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return RetryOutcome::Shutdown,
+                    _ = shutdown.cancelled() => {
+                        log_retry_wait_shutdown(jitter_key, attempt, attempts, decision);
+                        return RetryOutcome::Shutdown;
+                    },
                     () = tokio::time::sleep(delay) => {}
                 }
             }
@@ -433,9 +466,13 @@ where
             Err(error) => {
                 let decision = classify(&error);
                 if !decision.should_retry() || attempt == attempts {
+                    if decision.should_retry() {
+                        log_retry_exhausted(jitter_key, attempt, attempts, decision);
+                    }
                     return Err(error);
                 }
                 let delay = retry_delay_after_decision(policy, attempt, jitter_key, decision);
+                log_retry_scheduled(jitter_key, attempt, attempts, decision, delay);
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
@@ -463,9 +500,13 @@ where
             Err(error) => {
                 let decision = classify(&error);
                 if !decision.should_retry() || attempt == attempts {
+                    if decision.should_retry() {
+                        log_retry_exhausted(jitter_key, attempt, attempts, decision);
+                    }
                     return Err(error);
                 }
                 let delay = retry_delay_after_decision(policy, attempt, jitter_key, decision);
+                log_retry_scheduled(jitter_key, attempt, attempts, decision, delay);
                 if !delay.is_zero() {
                     std::thread::sleep(delay);
                 }
@@ -506,11 +547,27 @@ where
 
         match result {
             Ok(value) => return RetryOutcome::Completed(Ok(value)),
-            Err(error) if !should_retry(&error) || attempt == attempts => {
-                return RetryOutcome::Completed(Err(error));
-            }
-            Err(_) => {
+            Err(error) => {
+                let retryable = should_retry(&error);
+                if !retryable || attempt == attempts {
+                    if retryable {
+                        log_retry_exhausted(
+                            jitter_key,
+                            attempt,
+                            attempts,
+                            RetryDecision::retry(RetryErrorKind::Unknown),
+                        );
+                    }
+                    return RetryOutcome::Completed(Err(error));
+                }
                 let delay = retry_delay_after_attempt(policy, attempt, jitter_key);
+                log_retry_scheduled(
+                    jitter_key,
+                    attempt,
+                    attempts,
+                    RetryDecision::retry(RetryErrorKind::Unknown),
+                    delay,
+                );
                 if delay.is_zero() {
                     continue;
                 }
@@ -521,7 +578,15 @@ where
                 let mut shutdown = shutdown.clone();
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return RetryOutcome::Shutdown,
+                    _ = shutdown.cancelled() => {
+                        log_retry_wait_shutdown(
+                            jitter_key,
+                            attempt,
+                            attempts,
+                            RetryDecision::retry(RetryErrorKind::Unknown),
+                        );
+                        return RetryOutcome::Shutdown;
+                    },
                     () = tokio::time::sleep(delay) => {}
                 }
             }
@@ -557,6 +622,68 @@ fn retry_delay_after_decision(
         .unwrap_or_else(|| retry_delay_after_attempt(policy, failed_attempt, jitter_key))
 }
 
+fn log_retry_scheduled(
+    operation: &str,
+    attempt: u8,
+    max_attempts: u8,
+    decision: RetryDecision,
+    delay: Duration,
+) {
+    let operation = safe_retry_operation_label(operation);
+    info!(
+        operation = %operation,
+        attempt,
+        max_attempts,
+        next_attempt = attempt.saturating_add(1),
+        retry_kind = %decision.kind().as_str(),
+        retry_delay_ms = delay.as_millis(),
+        "retryable operation failed; retrying"
+    );
+}
+
+fn log_retry_exhausted(operation: &str, attempt: u8, max_attempts: u8, decision: RetryDecision) {
+    let operation = safe_retry_operation_label(operation);
+    warn!(
+        operation = %operation,
+        attempt,
+        max_attempts,
+        retry_kind = %decision.kind().as_str(),
+        "retryable operation exhausted retries"
+    );
+}
+
+fn log_retry_wait_shutdown(
+    operation: &str,
+    attempt: u8,
+    max_attempts: u8,
+    decision: RetryDecision,
+) {
+    let operation = safe_retry_operation_label(operation);
+    info!(
+        operation = %operation,
+        attempt,
+        max_attempts,
+        retry_kind = %decision.kind().as_str(),
+        "retry wait stopped by shutdown"
+    );
+}
+
+fn safe_retry_operation_label(operation: &str) -> String {
+    if let Ok(url) = reqwest::Url::parse(operation) {
+        let Some(host) = url.host_str() else {
+            return "url".to_owned();
+        };
+        let mut label = format!("{}://{host}", url.scheme());
+        if let Some(port) = url.port() {
+            label.push(':');
+            label.push_str(&port.to_string());
+        }
+        return label;
+    }
+
+    sanitize_url_for_logging(operation).to_string()
+}
+
 fn retry_with_optional_ms(kind: RetryErrorKind, retry_after_ms: Option<i64>) -> RetryDecision {
     retry_with_optional_duration(kind, retry_after_ms.map(duration_from_ms))
 }
@@ -574,8 +701,13 @@ fn duration_from_ms(milliseconds: i64) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::runtime::shutdown::shutdown_channel;
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::MakeWriter;
 
     #[test]
     fn jittered_backoff_honors_retry_after_jitter_and_cap() {
@@ -962,6 +1094,68 @@ mod tests {
         assert_eq!(vec![1], attempts);
     }
 
+    #[test]
+    fn retry_helpers_log_retry_schedule_and_exhaustion() {
+        let writer = SharedWriter::default();
+        let captured = writer.captured();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("sporos=info"))
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_target(true)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            retry_transient_io_blocking(
+                "test retry",
+                |attempt| {
+                    if attempt == 1 {
+                        Err::<(), _>("retry")
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| RetryDecision::retry_after(RetryErrorKind::TransientLocalIo, Duration::ZERO),
+            )
+            .unwrap();
+
+            let result = retry_transient_io_blocking(
+                "test exhausted",
+                |_attempt| Err::<(), _>("retry"),
+                |_| RetryDecision::retry_after(RetryErrorKind::Timeout, Duration::ZERO),
+            );
+            assert_eq!(Err("retry"), result);
+
+            retry_transient_io_blocking(
+                "https://secret.example/download/passkey-in-path?apikey=abc123&passkey=def456&token=ghi789",
+                |attempt| {
+                    if attempt == 1 {
+                        Err::<(), _>("retry")
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| RetryDecision::retry_after(RetryErrorKind::TransientNetwork, Duration::ZERO),
+            )
+            .unwrap();
+        });
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("retryable operation failed; retrying"));
+        assert!(output.contains("operation"));
+        assert!(output.contains("test retry"));
+        assert!(output.contains("retry_kind=transient_local_io"));
+        assert!(output.contains("retry_delay_ms=0"));
+        assert!(output.contains("retryable operation exhausted retries"));
+        assert!(output.contains("test exhausted"));
+        assert!(output.contains("retry_kind=timeout"));
+        assert!(output.contains("https://secret.example"));
+        assert!(!output.contains("passkey-in-path"));
+        assert!(!output.contains("abc123"));
+        assert!(!output.contains("def456"));
+        assert!(!output.contains("ghi789"));
+    }
+
     #[tokio::test]
     async fn retry_with_classification_stops_in_flight_attempt_on_shutdown() {
         let (controller, signal) = shutdown_channel();
@@ -1028,5 +1222,44 @@ mod tests {
             Duration::from_millis(100),
             retry_delay_after_attempt(policy, 2, "notification-main")
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn captured(&self) -> Arc<Mutex<Vec<u8>>> {
+            Arc::clone(&self.captured)
+        }
+    }
+
+    struct SharedWriteGuard {
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedWriteGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.captured
+                .lock()
+                .map_err(|_poisoned| io::Error::other("captured log buffer mutex poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriteGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriteGuard {
+                captured: Arc::clone(&self.captured),
+            }
+        }
     }
 }
