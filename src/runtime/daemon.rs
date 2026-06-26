@@ -54,8 +54,8 @@ use crate::persistence::torrent_cache::{
     TorrentOutputMetadata, parse_cached_torrent_filename, with_cached_torrent_path_lock,
 };
 use crate::runtime::announce_worker::{
-    AnnounceOutcomeConfig, AnnounceWorkOutcome, AnnounceWorker, AnnounceWorkerError,
-    classify_injection_result, classify_reverse_lookup_outcome, unix_time_ms,
+    AnnounceOutcomeConfig, AnnounceWorkOutcome, AnnounceWorkerError, classify_injection_result,
+    classify_reverse_lookup_outcome, unix_time_ms,
 };
 use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
 use crate::runtime::duroxide_workflow::DuroxideWorkflowRuntimeError;
@@ -71,6 +71,7 @@ use crate::runtime::scheduler::{
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
 };
+use crate::runtime::workflow_contracts::WorkflowEventName;
 use crate::secrets::sanitize_url_for_logging;
 use crate::time::unix_ms_to_rfc3339_seconds;
 use crate::torrent::parse_metafile;
@@ -78,9 +79,9 @@ use crate::torrent::parse_metafile;
 const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKGROUND_ABORT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 const WORKFLOW_RUNTIME_SHUTDOWN_TIMEOUT_MS: u64 = 100;
-const ANNOUNCE_IDLE_SLEEP: Duration = Duration::from_millis(500);
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
+const ANNOUNCE_WORKFLOW_RECOVERY_MAX: u16 = u16::MAX;
 const SCHEDULER_SHUTDOWN_ERROR: &str = "scheduler is shutting down";
 const SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY: usize = 4;
 const SEARCH_CANDIDATE_STREAM_CAPACITY: usize = SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY;
@@ -89,6 +90,79 @@ const REMOTE_CANDIDATE_CLEANUP_MAX_BATCHES: u16 = 4;
 #[cfg(test)]
 static NO_CLIENT_SAVE_THREADS: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
     std::sync::Mutex::new(Vec::new());
+
+#[derive(Debug, Clone)]
+pub struct AnnounceProcessor {
+    config: SporosConfig,
+    repository: Repository,
+    health: crate::runtime::health::HealthRegistry,
+    metrics: crate::metrics::MetricsRegistry,
+    scheduler: crate::runtime::scheduler::PersistedScheduler,
+    injection_worker: InjectionWorker,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AnnounceInventoryRefreshMode {
+    QueueStaleRefreshes,
+    DeferToWorkflow,
+}
+
+impl AnnounceProcessor {
+    pub fn new(
+        config: SporosConfig,
+        repository: Repository,
+        health: crate::runtime::health::HealthRegistry,
+        metrics: crate::metrics::MetricsRegistry,
+        scheduler: crate::runtime::scheduler::PersistedScheduler,
+        injection_worker: InjectionWorker,
+    ) -> Self {
+        Self {
+            config,
+            repository,
+            health,
+            metrics,
+            scheduler,
+            injection_worker,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_state(state: &AppState) -> Self {
+        Self::new(
+            state.config.clone(),
+            state.repository.clone(),
+            state.health.clone(),
+            state.metrics.clone(),
+            state.scheduler.clone(),
+            state.injection_worker.clone(),
+        )
+    }
+
+    pub async fn stale_inventory_completion_events(
+        &self,
+        received_at_ms: i64,
+    ) -> Result<Vec<WorkflowEventName>, DatabaseError> {
+        let freshness = inventory_freshness_after_announce(self, received_at_ms).await?;
+        let mut events = Vec::new();
+        if freshness.media_stale() {
+            events.push(WorkflowEventName::MediaInventoryCompleted);
+        }
+        if freshness.client_stale() {
+            events.push(WorkflowEventName::ClientInventoryCompleted);
+        }
+        Ok(events)
+    }
+
+    pub async fn queue_stale_inventory_refreshes(
+        &self,
+        received_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), DatabaseError> {
+        let freshness = inventory_freshness_after_announce(self, received_at_ms).await?;
+        trigger_stale_inventory_refreshes(self, freshness, now_ms).await;
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -246,9 +320,16 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         already_present = supervisor_summary.already_present,
         "workflow runtime supervisors seeded"
     );
-    let announce_owner_prefix = announce_worker_owner_prefix();
-    let announce_retention_cleanup = runtime.state.announce_worker.retention_cleanup();
-
+    let announce_recovery = submit_active_announce_workflows(&runtime.state).await?;
+    if announce_recovery.active_rows > 0 {
+        info!(
+            active_rows = announce_recovery.active_rows,
+            started = announce_recovery.started,
+            already_running = announce_recovery.already_running,
+            terminalized = announce_recovery.terminalized,
+            "active announce workflows recovered"
+        );
+    }
     let RuntimeReceivers {
         announcements,
         searches,
@@ -259,28 +340,6 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     } = runtime.receivers;
 
     let mut handles = Vec::new();
-    for worker_index in 0..runtime.state.config.announce.worker_concurrency {
-        let announce_worker = AnnounceWorker::new(
-            runtime.state.repository.clone(),
-            &format!("{announce_owner_prefix}-{worker_index}"),
-            &runtime.state.config.announce,
-        )
-        .map(|worker| worker.with_retention_cleanup(announce_retention_cleanup.clone()))
-        .map_err(|source| DaemonError::AnnounceStartup { source })?;
-        handles.push(BackgroundTask::new(
-            "announce-worker",
-            spawn_supervised_background(
-                "announce-worker",
-                &runtime.state,
-                run_announce_worker_loop(
-                    runtime.state.clone(),
-                    announce_worker,
-                    runtime.state.shutdown_signal.clone(),
-                ),
-            ),
-            BackgroundShutdownPolicy::AwaitInFlight,
-        ));
-    }
     handles.push(BackgroundTask::new(
         "inventory-refresh",
         spawn_supervised_background(
@@ -431,6 +490,61 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
     }
 
     Ok(handles)
+}
+
+#[derive(Debug, Default)]
+struct AnnounceWorkflowRecoverySummary {
+    active_rows: usize,
+    started: usize,
+    already_running: usize,
+    terminalized: usize,
+}
+
+async fn submit_active_announce_workflows(
+    state: &AppState,
+) -> Result<AnnounceWorkflowRecoverySummary, DaemonError> {
+    let limit = u16::try_from(state.config.announce.max_pending)
+        .unwrap_or(ANNOUNCE_WORKFLOW_RECOVERY_MAX)
+        .max(1);
+    let work_items = state
+        .repository
+        .active_announce_work_items(limit)
+        .await
+        .map_err(|source| DaemonError::BuildRuntime { source })?;
+    let mut summary = AnnounceWorkflowRecoverySummary {
+        active_rows: work_items.len(),
+        ..AnnounceWorkflowRecoverySummary::default()
+    };
+    for work in work_items {
+        match state.workflow_runtime.submit_announcement(&work).await {
+            Ok(submission) => match submission.outcome {
+                crate::runtime::duroxide_workflow::AnnounceWorkflowSubmissionOutcome::Started => {
+                    summary.started += 1;
+                }
+                crate::runtime::duroxide_workflow::AnnounceWorkflowSubmissionOutcome::AlreadyRunning => {
+                    summary.already_running += 1;
+                }
+            },
+            Err(
+                DuroxideWorkflowRuntimeError::CompletedAnnounceWorkflow { .. }
+                | DuroxideWorkflowRuntimeError::FailedAnnounceWorkflow { .. },
+            ) => {
+                state
+                    .repository
+                    .mark_announce_rejected(
+                        &work.id,
+                        AnnounceReason::TransientDependencyFailure,
+                        "announce workflow instance was terminal during startup recovery",
+                        unix_time_ms(),
+                    )
+                    .await
+                    .map_err(|source| DaemonError::BuildRuntime { source })?;
+                summary.terminalized += 1;
+            }
+            Err(source) => return Err(DaemonError::WorkflowRuntime { source }),
+        }
+    }
+    Ok(summary)
 }
 
 async fn enqueue_startup_media_inventory_refresh(state: &AppState) -> Result<(), SchedulerError> {
@@ -623,14 +737,6 @@ async fn run_scheduler_tick_loop(
             Err(error) => warn!(error = %error, "scheduler tick failed"),
         }
     }
-}
-
-fn announce_worker_owner_prefix() -> String {
-    format!(
-        "sporos-announce-worker-{}-{}",
-        std::process::id(),
-        unix_time_ms()
-    )
 }
 
 async fn run_search_receiver(
@@ -1741,6 +1847,39 @@ async fn record_candidate_download_failure(
     error: &CandidateDownloadError,
     now_ms: i64,
 ) -> Result<(), DatabaseError> {
+    record_candidate_download_failure_with_dependencies(
+        &state.repository,
+        &state.health,
+        candidate,
+        error,
+        now_ms,
+    )
+    .await
+}
+
+async fn record_candidate_download_failure_with_processor(
+    processor: &AnnounceProcessor,
+    candidate: &RemoteCandidate,
+    error: &CandidateDownloadError,
+    now_ms: i64,
+) -> Result<(), DatabaseError> {
+    record_candidate_download_failure_with_dependencies(
+        &processor.repository,
+        &processor.health,
+        candidate,
+        error,
+        now_ms,
+    )
+    .await
+}
+
+async fn record_candidate_download_failure_with_dependencies(
+    repository: &Repository,
+    health: &crate::runtime::health::HealthRegistry,
+    candidate: &RemoteCandidate,
+    error: &CandidateDownloadError,
+    now_ms: i64,
+) -> Result<(), DatabaseError> {
     if !candidate_download_is_dependency_failure(error) {
         return Ok(());
     }
@@ -1755,29 +1894,27 @@ async fn record_candidate_download_failure(
             operation: "build candidate download health reason".to_owned(),
             message: error.to_string(),
         })?;
-    let failure_count = state
-        .repository
+    let failure_count = repository
         .dependency_failure_count(DependencyKind::Indexer, &name)
         .await?;
     let retry_after_ms =
         candidate_download_retry_after(error, now_ms, failure_count, name.as_str());
     if candidate_download_error_is_unavailable(error) {
-        state.health.set_unavailable(
+        health.set_unavailable(
             DependencyKind::Indexer,
             name.clone(),
             reason.clone(),
             Some(retry_after_ms),
         );
     } else {
-        state.health.set_degraded(
+        health.set_degraded(
             DependencyKind::Indexer,
             name.clone(),
             reason.clone(),
             Some(retry_after_ms),
         );
     }
-    state
-        .repository
+    repository
         .record_indexer_request_backoff(
             &name,
             &reason,
@@ -2480,49 +2617,35 @@ async fn remove_unreferenced_stale_candidate_cache_file(
     }
     Ok(remove_stale_candidate_cache_file(path, mtime_cutoff_ms).await)
 }
-
-async fn run_announce_worker_loop(
-    state: AppState,
-    worker: AnnounceWorker,
-    mut shutdown: ShutdownSignal,
-) {
-    loop {
-        if shutdown.state().phase != ShutdownPhase::Running {
-            break;
-        }
-
-        let batch = Box::pin(
-            worker.run_batch(unix_time_ms(), shutdown.clone(), |id, shutdown| {
-                process_announce_work(state.clone(), id, shutdown)
-            }),
-        )
-        .await;
-        match batch {
-            Ok(summary) => {
-                if summary.claimed > 0 {
-                    tracing::info!(
-                        claimed = summary.claimed,
-                        completed = summary.completed,
-                        released = summary.released,
-                        cancelled = summary.cancelled,
-                        "announce worker batch completed"
-                    );
-                }
-            }
-            Err(error) => warn!(error = %error, "announce worker batch failed"),
-        }
-
-        tokio::select! {
-            _state = shutdown.cancelled() => break,
-            () = tokio::time::sleep(ANNOUNCE_IDLE_SLEEP) => {}
-        }
-    }
-}
-
+#[cfg(test)]
 async fn process_announce_work(
     state: AppState,
     id: AnnounceWorkId,
     shutdown: ShutdownSignal,
+) -> AnnounceWorkOutcome {
+    let processor = AnnounceProcessor::from_state(&state);
+    process_announce_work_with_processor(processor, id, shutdown).await
+}
+
+pub async fn process_announce_work_with_processor(
+    processor: AnnounceProcessor,
+    id: AnnounceWorkId,
+    shutdown: ShutdownSignal,
+) -> AnnounceWorkOutcome {
+    process_announce_work_with_processor_mode(
+        processor,
+        id,
+        shutdown,
+        AnnounceInventoryRefreshMode::QueueStaleRefreshes,
+    )
+    .await
+}
+
+pub async fn process_announce_work_with_processor_mode(
+    processor: AnnounceProcessor,
+    id: AnnounceWorkId,
+    shutdown: ShutdownSignal,
+    inventory_refresh_mode: AnnounceInventoryRefreshMode,
 ) -> AnnounceWorkOutcome {
     let now_ms = unix_time_ms();
     if shutdown.state().phase != ShutdownPhase::Running {
@@ -2532,7 +2655,7 @@ async fn process_announce_work(
         };
     }
 
-    let candidate = match load_announce_candidate(&state.repository, &id).await {
+    let candidate = match load_announce_candidate(&processor.repository, &id).await {
         Ok(Some(candidate)) => candidate,
         Ok(None) => {
             return AnnounceWorkOutcome::TerminalFailed {
@@ -2546,12 +2669,12 @@ async fn process_announce_work(
                 now_ms,
                 1,
                 id.as_str(),
-                announce_outcome_config(&state.config.announce),
+                announce_outcome_config(&processor.config.announce),
             );
         }
     };
     let inventory_freshness =
-        match inventory_freshness_after_announce(&state, candidate.received_at_ms).await {
+        match inventory_freshness_after_announce(&processor, candidate.received_at_ms).await {
             Ok(freshness) => freshness,
             Err(error) => {
                 return retryable_database_outcome(
@@ -2559,7 +2682,7 @@ async fn process_announce_work(
                     now_ms,
                     1,
                     id.as_str(),
-                    announce_outcome_config(&state.config.announce),
+                    announce_outcome_config(&processor.config.announce),
                 );
             }
         };
@@ -2567,12 +2690,13 @@ async fn process_announce_work(
         now_ms,
         attempt_count: candidate.attempt_count,
         jitter_key: id.as_str().to_owned(),
-        outcome_config: announce_outcome_config(&state.config.announce),
-        reverse_lookup_config: runtime_reverse_lookup_config(&state.config),
+        outcome_config: announce_outcome_config(&processor.config.announce),
+        reverse_lookup_config: runtime_reverse_lookup_config(&processor.config),
         inventory_freshness,
+        inventory_refresh_mode,
     };
     let prepared = PreparedAnnounceCandidateStage {
-        state,
+        processor,
         id: id.clone(),
         candidate,
         context,
@@ -2611,6 +2735,7 @@ struct AnnounceWorkflowContext {
     outcome_config: AnnounceOutcomeConfig,
     reverse_lookup_config: ReverseLookupConfig,
     inventory_freshness: AnnounceInventoryFreshness,
+    inventory_refresh_mode: AnnounceInventoryRefreshMode,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2642,23 +2767,31 @@ impl AnnounceInventoryFreshness {
 }
 
 async fn inventory_freshness_after_announce(
-    state: &AppState,
+    processor: &AnnounceProcessor,
     received_at_ms: i64,
 ) -> Result<AnnounceInventoryFreshness, DatabaseError> {
-    let media_required = !state.config.paths.media_dirs.is_empty();
-    let client_required = state.injection_worker.client_count() > 0;
+    let media_required = !processor.config.paths.media_dirs.is_empty();
+    let client_required = processor.injection_worker.client_count() > 0;
     Ok(AnnounceInventoryFreshness {
         media_required,
         media_fresh: if media_required {
-            job_fresh_after_announce(&state.repository, MEDIA_INVENTORY_JOB_NAME, received_at_ms)
-                .await?
+            job_fresh_after_announce(
+                &processor.repository,
+                MEDIA_INVENTORY_JOB_NAME,
+                received_at_ms,
+            )
+            .await?
         } else {
             false
         },
         client_required,
         client_fresh: if client_required {
-            job_fresh_after_announce(&state.repository, CLIENT_INVENTORY_JOB_NAME, received_at_ms)
-                .await?
+            job_fresh_after_announce(
+                &processor.repository,
+                CLIENT_INVENTORY_JOB_NAME,
+                received_at_ms,
+            )
+            .await?
         } else {
             false
         },
@@ -2683,7 +2816,7 @@ async fn job_fresh_after_announce(
 }
 
 async fn classify_announce_lookup_outcome(
-    state: &AppState,
+    processor: &AnnounceProcessor,
     outcome: &ReverseLookupOutcome,
     context: &AnnounceWorkflowContext,
 ) -> AnnounceWorkOutcome {
@@ -2710,12 +2843,18 @@ async fn classify_announce_lookup_outcome(
         }
     } else if matches!(outcome, ReverseLookupOutcome::NoCandidates) {
         if context.inventory_freshness.any_stale() {
-            let stale_refresh_retry_at = trigger_stale_inventory_refreshes(
-                state,
-                context.inventory_freshness,
-                context.now_ms,
-            )
-            .await;
+            let stale_refresh_retry_at = if context.inventory_refresh_mode
+                == AnnounceInventoryRefreshMode::QueueStaleRefreshes
+            {
+                trigger_stale_inventory_refreshes(
+                    processor,
+                    context.inventory_freshness,
+                    context.now_ms,
+                )
+                .await
+            } else {
+                Some(context.now_ms.saturating_add(1_000))
+            };
             match classified {
                 AnnounceWorkOutcome::Waiting {
                     reason: AnnounceReason::InventoryRefreshing,
@@ -2738,7 +2877,7 @@ async fn classify_announce_lookup_outcome(
 }
 
 async fn trigger_stale_inventory_refreshes(
-    state: &AppState,
+    processor: &AnnounceProcessor,
     freshness: AnnounceInventoryFreshness,
     now_ms: i64,
 ) -> Option<i64> {
@@ -2746,13 +2885,15 @@ async fn trigger_stale_inventory_refreshes(
     if freshness.media_stale() {
         next_attempt_at_ms = min_optional_deadline(
             next_attempt_at_ms,
-            trigger_inventory_refresh_job(state, MEDIA_INVENTORY_JOB_NAME, "media", now_ms).await,
+            trigger_inventory_refresh_job(processor, MEDIA_INVENTORY_JOB_NAME, "media", now_ms)
+                .await,
         );
     }
     if freshness.client_stale() {
         next_attempt_at_ms = min_optional_deadline(
             next_attempt_at_ms,
-            trigger_inventory_refresh_job(state, CLIENT_INVENTORY_JOB_NAME, "client", now_ms).await,
+            trigger_inventory_refresh_job(processor, CLIENT_INVENTORY_JOB_NAME, "client", now_ms)
+                .await,
         );
     }
     next_attempt_at_ms
@@ -2767,7 +2908,7 @@ fn min_optional_deadline(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 }
 
 async fn trigger_inventory_refresh_job(
-    state: &AppState,
+    processor: &AnnounceProcessor,
     job_name: &str,
     inventory: &str,
     now_ms: i64,
@@ -2779,7 +2920,7 @@ async fn trigger_inventory_refresh_job(
             return None;
         }
     };
-    match state
+    match processor
         .scheduler
         .enqueue_opportunistic_run(&job_name, now_ms)
         .await
@@ -2819,7 +2960,7 @@ async fn trigger_inventory_refresh_job(
 
 #[derive(Clone)]
 struct PreparedAnnounceCandidateStage {
-    state: AppState,
+    processor: AnnounceProcessor,
     id: AnnounceWorkId,
     candidate: RuntimeAnnounceCandidate,
     context: AnnounceWorkflowContext,
@@ -2841,7 +2982,7 @@ async fn initial_announce_lookup_stage(
     input: PreparedAnnounceCandidateStage,
 ) -> AnnounceInitialLookupStage {
     let initial = match reverse_lookup_and_assess_candidate(
-        &input.state.repository,
+        &input.processor.repository,
         &input.candidate.candidate,
         &[],
         input.context.now_ms,
@@ -2901,7 +3042,7 @@ async fn initial_announce_lookup_stage(
                 next_action,
             );
             AnnounceInitialLookupStage::Finished(
-                classify_announce_lookup_outcome(&input.state, &outcome, &input.context).await,
+                classify_announce_lookup_outcome(&input.processor, &outcome, &input.context).await,
             )
         }
     }
@@ -2911,7 +3052,7 @@ async fn cached_announce_candidate_stage(
     input: PreparedAnnounceCandidateStage,
 ) -> Result<DownloadedAnnounceCandidate, AnnounceWorkOutcome> {
     let PreparedAnnounceCandidateStage {
-        state,
+        processor,
         candidate,
         context,
         shutdown,
@@ -2956,7 +3097,7 @@ async fn cached_announce_candidate_stage(
     })?;
 
     Ok(DownloadedAnnounceCandidate {
-        state,
+        processor,
         cached: CachedCandidateTorrent {
             candidate: candidate.candidate,
             metafile: parsed.metafile,
@@ -2973,7 +3114,7 @@ async fn download_announce_candidate_stage(
     input: PreparedAnnounceCandidateStage,
 ) -> AnnounceDownloadStage {
     let PreparedAnnounceCandidateStage {
-        state,
+        processor,
         id,
         candidate,
         context,
@@ -3010,12 +3151,12 @@ async fn download_announce_candidate_stage(
         }
         result = downloader.download_and_cache(
             &candidate.candidate,
-            &state.config.paths.torrent_cache_dir,
+            &processor.config.paths.torrent_cache_dir,
             fetch.cookie.as_deref(),
         ) => {
             match result {
                 Ok(cached) => {
-                    state.metrics.record_indexer_request(
+                    processor.metrics.record_indexer_request(
                         ExternalOperation::Download,
                         ExternalOutcome::Succeeded,
                         elapsed_ms(started),
@@ -3023,13 +3164,13 @@ async fn download_announce_candidate_stage(
                     cached
                 }
                 Err(error) => {
-                    state.metrics.record_indexer_request(
+                    processor.metrics.record_indexer_request(
                         ExternalOperation::Download,
                         candidate_download_metric_outcome(&error),
                         elapsed_ms(started),
                     );
                     if let Err(error) =
-                        record_candidate_download_failure(&state, &candidate.candidate, &error, now_ms)
+                        record_candidate_download_failure_with_processor(&processor, &candidate.candidate, &error, now_ms)
                             .await
                     {
                         return AnnounceDownloadStage::Finished(retryable_database_outcome(
@@ -3051,7 +3192,7 @@ async fn download_announce_candidate_stage(
             }
         }
     };
-    if let Err(error) = state
+    if let Err(error) = processor
         .repository
         .upsert_remote_candidate(&cached.candidate)
         .await
@@ -3077,7 +3218,7 @@ async fn download_announce_candidate_stage(
             ));
         }
     };
-    if let Err(error) = state
+    if let Err(error) = processor
         .repository
         .scrub_announce_fetch_material(&id, now_ms)
         .await
@@ -3092,7 +3233,7 @@ async fn download_announce_candidate_stage(
     }
 
     AnnounceDownloadStage::Downloaded(Box::new(DownloadedAnnounceCandidate {
-        state,
+        processor,
         cached,
         torrent_bytes,
         context,
@@ -3101,7 +3242,7 @@ async fn download_announce_candidate_stage(
 }
 
 struct DownloadedAnnounceCandidate {
-    state: AppState,
+    processor: AnnounceProcessor,
     cached: CachedCandidateTorrent,
     torrent_bytes: Vec<u8>,
     context: AnnounceWorkflowContext,
@@ -3112,7 +3253,7 @@ async fn process_downloaded_announce_candidate(
     input: DownloadedAnnounceCandidate,
 ) -> Result<AnnounceWorkOutcome, String> {
     let DownloadedAnnounceCandidate {
-        state,
+        processor,
         cached,
         torrent_bytes,
         context,
@@ -3123,7 +3264,7 @@ async fn process_downloaded_announce_candidate(
     let jitter_key = context.jitter_key.as_str();
     let outcome_config = context.outcome_config;
     let lookups = reverse_lookup_candidates(
-        &state.repository,
+        &processor.repository,
         &cached.candidate,
         ContentFilterContext::Announcement,
         &context.reverse_lookup_config,
@@ -3141,7 +3282,7 @@ async fn process_downloaded_announce_candidate(
             });
         }
         let assessment = assess_and_persist_candidate(
-            &state.repository,
+            &processor.repository,
             CandidateAssessmentInput {
                 local_item: &lookup.local_item,
                 local_files: &lookup.local_files,
@@ -3203,9 +3344,9 @@ async fn process_downloaded_announce_candidate(
             &cached.candidate,
             &selected.local_item,
             &selected.assessment,
-            if state.config.injection.dry_run {
+            if processor.config.injection.dry_run {
                 "dry_run"
-            } else if state.injection_worker.client_count() == 0 {
+            } else if processor.injection_worker.client_count() == 0 {
                 "save_candidate"
             } else {
                 "inject_candidate"
@@ -3217,11 +3358,11 @@ async fn process_downloaded_announce_candidate(
                 next_attempt_at_ms: now_ms,
             });
         }
-        if state.config.injection.dry_run && state.injection_worker.client_count() == 0 {
-            state.metrics.record_action(ActionOutcome::DryRun);
+        if processor.config.injection.dry_run && processor.injection_worker.client_count() == 0 {
+            processor.metrics.record_action(ActionOutcome::DryRun);
             info!(
                 action = ?DryRunAction::SaveCandidateTorrent {
-                    output_dir: state.config.paths.output_dir.clone()
+                    output_dir: processor.config.paths.output_dir.clone()
                 },
                 "dry run skipped announce side effect"
             );
@@ -3230,9 +3371,9 @@ async fn process_downloaded_announce_candidate(
                 outcome: "dry_run".to_owned(),
             });
         }
-        if state.injection_worker.client_count() == 0 {
+        if processor.injection_worker.client_count() == 0 {
             let save = save_candidate_torrent_blocking(
-                state.config.paths.output_dir.clone(),
+                processor.config.paths.output_dir.clone(),
                 candidate_output_metadata(
                     selected.local_item.media_type,
                     &cached.candidate,
@@ -3242,9 +3383,9 @@ async fn process_downloaded_announce_candidate(
             )
             .await;
             match save {
-                Ok(outcome) => state.metrics.record_action(outcome.action_outcome()),
+                Ok(outcome) => processor.metrics.record_action(outcome.action_outcome()),
                 Err(error) => {
-                    state.metrics.record_action(ActionOutcome::Failed);
+                    processor.metrics.record_action(ActionOutcome::Failed);
                     return Err(error.to_string());
                 }
             }
@@ -3259,8 +3400,8 @@ async fn process_downloaded_announce_candidate(
                 next_attempt_at_ms: now_ms,
             });
         }
-        let recheck = runtime_recheck_resume_config(&state.config);
-        let result = state
+        let recheck = runtime_recheck_resume_config(&processor.config);
+        let result = processor
             .injection_worker
             .process_until_shutdown(
                 InjectionRequest {
@@ -3272,10 +3413,10 @@ async fn process_downloaded_announce_candidate(
                     torrent_bytes,
                     assessment: selected.assessment,
                     assessed_at_ms: now_ms,
-                    output_dir: state.config.paths.output_dir.clone(),
-                    link_dirs: state.config.injection.link_dirs.clone(),
-                    link_type: runtime_link_type(&state.config),
-                    flat_linking: state.config.injection.flat_linking,
+                    output_dir: processor.config.paths.output_dir.clone(),
+                    link_dirs: processor.config.injection.link_dirs.clone(),
+                    link_type: runtime_link_type(&processor.config),
+                    flat_linking: processor.config.injection.flat_linking,
                     recheck,
                 },
                 shutdown.clone(),
@@ -3284,11 +3425,11 @@ async fn process_downloaded_announce_candidate(
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                state.metrics.record_action(ActionOutcome::Failed);
+                processor.metrics.record_action(ActionOutcome::Failed);
                 return Err(format!("{error:?}"));
             }
         };
-        state
+        processor
             .metrics
             .record_action(injection_metric_outcome(result.outcome));
         if result.outcome == InjectionOutcome::DryRun
@@ -3333,10 +3474,14 @@ async fn process_downloaded_announce_candidate(
     }
 
     Ok(match best_failure {
-        Some(outcome) => classify_announce_lookup_outcome(&state, &outcome, &context).await,
+        Some(outcome) => classify_announce_lookup_outcome(&processor, &outcome, &context).await,
         None => {
-            classify_announce_lookup_outcome(&state, &ReverseLookupOutcome::NoCandidates, &context)
-                .await
+            classify_announce_lookup_outcome(
+                &processor,
+                &ReverseLookupOutcome::NoCandidates,
+                &context,
+            )
+            .await
         }
     })
 }
@@ -3942,6 +4087,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::announce::{
+        AnnounceDedupeIdentity, AnnounceFetchMaterial, AnnounceStatus, AnnounceWorkItem,
+    };
     use crate::config::{
         ConfigTorrentClientKind, InjectionLinkTypeConfig, NotificationEndpointConfig,
         ProwlarrSourceConfig, SporosConfig, TorrentClientConfig, TorznabIndexerConfig,
@@ -4460,6 +4608,7 @@ mod tests {
             outcome_config: announce_outcome_config(&config.announce),
             reverse_lookup_config: runtime_reverse_lookup_config(&config),
             inventory_freshness: AnnounceInventoryFreshness::default(),
+            inventory_refresh_mode: AnnounceInventoryRefreshMode::QueueStaleRefreshes,
         };
         let repository = Repository::connect(root.join("sporos.sqlite"))
             .await
@@ -4510,8 +4659,9 @@ mod tests {
             cache_path: root.join("cache.torrent"),
         };
 
+        let processor = AnnounceProcessor::from_state(&runtime.state);
         let outcome = process_downloaded_announce_candidate(DownloadedAnnounceCandidate {
-            state: runtime.state,
+            processor,
             cached,
             torrent_bytes: bytes,
             context,
@@ -4711,6 +4861,7 @@ mod tests {
             outcome_config: announce_outcome_config(&config.announce),
             reverse_lookup_config: runtime_reverse_lookup_config(&config),
             inventory_freshness: AnnounceInventoryFreshness::default(),
+            inventory_refresh_mode: AnnounceInventoryRefreshMode::QueueStaleRefreshes,
         };
         let repository = Repository::connect_in_memory().await.unwrap();
         repository
@@ -4772,8 +4923,9 @@ mod tests {
             torrent_cache_path: Some(cache_path.clone()),
         };
 
+        let processor = AnnounceProcessor::from_state(&runtime.state);
         let outcome = process_downloaded_announce_candidate(DownloadedAnnounceCandidate {
-            state: runtime.state,
+            processor,
             cached: CachedCandidateTorrent {
                 candidate,
                 metafile: parsed.metafile,
@@ -6596,6 +6748,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_workflow_waits_for_scheduled_media_inventory_before_terminal_no_match() {
+        let root = unique_temp_dir("daemon-duroxide-announce-waits-media");
+        let media_dir = root.join("media");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&media_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        let mut config = SporosConfig::default();
+        config.paths.database = root.join("sporos.db");
+        config.paths.media_dirs = vec![media_dir];
+        config.paths.torrent_cache_dir = cache_dir;
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let now_ms = unix_time_ms().saturating_sub(1_000);
+        let tracker = TrackerName::new("tracker.example").unwrap();
+        let guid = CandidateGuid::new("guid-duroxide-announce-wait").unwrap();
+        let download_url =
+            DownloadUrl::new("https://tracker.example/download/duroxide-announce-wait").unwrap();
+        let work = AnnounceWorkItem {
+            id: AnnounceWorkId::new("ann_duroxide_wait_media").unwrap(),
+            status: AnnounceStatus::Queued,
+            reason: AnnounceReason::Accepted,
+            dedupe_hash: AnnounceDedupeIdentity::Guid {
+                tracker: tracker.clone(),
+                guid: guid.clone(),
+            }
+            .hash(),
+            title: ItemTitle::new("No Matching Movie").unwrap(),
+            tracker,
+            guid: Some(guid),
+            info_hash: None,
+            size: Some(ByteSize::new(42)),
+            fetch: Some(AnnounceFetchMaterial::new(&download_url, None).unwrap()),
+            received_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            first_attempt_at_ms: None,
+            finished_at_ms: None,
+            attempt_count: 0,
+            next_attempt_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(60_000),
+            lease: None,
+            last_dependency_kind: None,
+            last_dependency_name: None,
+            last_error_class: None,
+            last_redacted_message: None,
+        };
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        let state = runtime.state.clone();
+        let mut scheduler_receiver = runtime.receivers.scheduler;
+
+        state
+            .workflow_runtime
+            .submit_announcement(&work)
+            .await
+            .unwrap();
+        let run = tokio::time::timeout(Duration::from_secs(10), scheduler_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(MEDIA_INVENTORY_JOB_NAME, run.job_name.as_str());
+        wait_for_announce_row(
+            &repository,
+            work.id.as_str(),
+            "waiting",
+            "inventory_refreshing",
+        )
+        .await;
+        let before_completion_finished_at: Option<i64> =
+            sqlx::query_scalar("SELECT finished_at FROM announce_work WHERE id = ?")
+                .bind(work.id.as_str())
+                .fetch_one(repository.pool())
+                .await
+                .unwrap();
+        assert_eq!(None, before_completion_finished_at);
+
+        process_scheduled_job_run(&state, run, state.shutdown_signal.clone()).await;
+        scheduler_receiver.mark_completed();
+        wait_for_announce_terminal_after_scheduler_runs(
+            &state,
+            &repository,
+            &mut scheduler_receiver,
+            work.id.as_str(),
+        )
+        .await;
+        assert_announce_fetch_columns_cleared(&repository, work.id.as_str()).await;
+        state.workflow_runtime.shutdown(Some(1_000)).await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn announce_no_match_after_fresh_client_inventory_is_terminal() {
         let root = unique_temp_dir("daemon-announce-fresh-client-no-match");
         let cache_dir = root.join("cache");
@@ -6672,10 +6918,12 @@ mod tests {
                 client_required: false,
                 client_fresh: false,
             },
+            inventory_refresh_mode: AnnounceInventoryRefreshMode::QueueStaleRefreshes,
         };
 
+        let processor = AnnounceProcessor::from_state(&runtime.state);
         let no_candidates = classify_announce_lookup_outcome(
-            &runtime.state,
+            &processor,
             &ReverseLookupOutcome::NoCandidates,
             &context,
         )
@@ -6702,8 +6950,7 @@ mod tests {
             },
         };
 
-        let rejected =
-            classify_announce_lookup_outcome(&runtime.state, &name_mismatch, &context).await;
+        let rejected = classify_announce_lookup_outcome(&processor, &name_mismatch, &context).await;
         assert!(matches!(
             rejected,
             AnnounceWorkOutcome::Waiting {
@@ -8692,7 +8939,7 @@ mod tests {
         let mut config = SporosConfig::default();
         config.server.bind = "0.0.0.0:0".parse().unwrap();
 
-        let error = serve(config).await.unwrap_err();
+        let error = Box::pin(serve(config)).await.unwrap_err();
 
         assert!(matches!(error, DaemonError::Config { .. }));
         assert!(error.to_string().contains("server.api_token"));
@@ -9540,6 +9787,95 @@ mod tests {
         .execute(repository.pool())
         .await
         .unwrap();
+    }
+
+    async fn wait_for_announce_row(repository: &Repository, id: &str, status: &str, reason: &str) {
+        let mut last = None;
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row: Option<(String, String)> =
+                    sqlx::query_as("SELECT status, reason FROM announce_work WHERE id = ?")
+                        .bind(id)
+                        .fetch_optional(repository.pool())
+                        .await
+                        .unwrap();
+                if row
+                    .as_ref()
+                    .is_some_and(|row| row.0 == status && row.1 == reason)
+                {
+                    return;
+                }
+                last = row;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if result.is_err() {
+            let projection: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+                "SELECT workflow_id, state, reason, next_action FROM workflow_projection ORDER BY updated_at DESC LIMIT 5",
+            )
+            .fetch_all(repository.pool())
+            .await
+            .unwrap_or_default();
+            let waiter_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_inventory_waiters")
+                    .fetch_one(repository.pool())
+                    .await
+                    .unwrap_or_default();
+            let completion_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_inventory_completion_events")
+                    .fetch_one(repository.pool())
+                    .await
+                    .unwrap_or_default();
+            panic!(
+                "timed out waiting for announce {id} {status}/{reason}; last row: {last:?}; projection={projection:?}; waiters={waiter_count}; completions={completion_count}"
+            );
+        }
+    }
+
+    async fn wait_for_announce_terminal_after_scheduler_runs(
+        state: &AppState,
+        repository: &Repository,
+        scheduler_receiver: &mut crate::runtime::queue::WorkReceiver<ScheduledJobRun>,
+        id: &str,
+    ) {
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if announce_row_matches(repository, id, "terminal_failed", "no_match_terminal")
+                    .await
+                {
+                    return;
+                }
+                let Some(run) = scheduler_receiver.recv().await else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                if run.job_name.as_str() == MEDIA_INVENTORY_JOB_NAME {
+                    process_scheduled_job_run(state, run, state.shutdown_signal.clone()).await;
+                }
+                scheduler_receiver.mark_completed();
+            }
+        })
+        .await;
+        if result.is_err() {
+            wait_for_announce_row(repository, id, "terminal_failed", "no_match_terminal").await;
+        }
+    }
+
+    async fn announce_row_matches(
+        repository: &Repository,
+        id: &str,
+        status: &str,
+        reason: &str,
+    ) -> bool {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT status, reason FROM announce_work WHERE id = ?")
+                .bind(id)
+                .fetch_optional(repository.pool())
+                .await
+                .unwrap();
+        row.as_ref()
+            .is_some_and(|row| row.0 == status && row.1 == reason)
     }
 
     async fn assert_announce_fetch_columns_cleared(repository: &Repository, id: &str) {

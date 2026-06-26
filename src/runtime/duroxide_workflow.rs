@@ -11,6 +11,7 @@ use duroxide::runtime::{OrchestrationStatus, Runtime, RuntimeOptions};
 use duroxide::{ActivityContext, Client, OrchestrationContext, OrchestrationRegistry};
 use serde::{Deserialize, Serialize};
 
+use crate::announce::{AnnounceQueueConfig, AnnounceReason, AnnounceWorkId, AnnounceWorkItem};
 use crate::domain::{DependencyKind, DependencyName};
 use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshSummary, InventoryRefreshWorker,
@@ -20,13 +21,16 @@ use crate::persistence::repository::{
     Repository, WorkflowInventoryCompletionRecord, WorkflowInventoryWaiterRecord,
     WorkflowProjectionDependency, WorkflowProjectionUpdate,
 };
-use crate::runtime::announce_worker::unix_time_ms;
+use crate::runtime::announce_worker::{AnnounceWorkOutcome, AnnounceWorker, unix_time_ms};
+use crate::runtime::daemon::{
+    AnnounceInventoryRefreshMode, AnnounceProcessor, process_announce_work_with_processor_mode,
+};
 use crate::runtime::injection_worker::InjectionWorker;
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 use crate::runtime::workflow_contracts::{
-    ActivityInputEnvelope, ActivityKind, InventoryRefreshKind, InventoryRefreshWorkflowInput,
-    WorkflowCustomStatus, WorkflowEventName, WorkflowInstanceId, WorkflowKind, WorkflowReason,
-    WorkflowState,
+    ActivityInputEnvelope, ActivityKind, AnnounceWorkflowInput, InventoryRefreshKind,
+    InventoryRefreshWorkflowInput, WorkflowCustomStatus, WorkflowEventName, WorkflowInstanceId,
+    WorkflowKind, WorkflowReason, WorkflowState,
 };
 
 pub const WORKFLOW_RUNTIME_DEPENDENCY: &str = "workflow-runtime";
@@ -36,6 +40,9 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STARTUP_LONG_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const INVENTORY_REFRESH_QUEUE: &str = "inventory_refresh_requests";
 const INVENTORY_REFRESH_ACTIVITY_ID: &str = "inventory-refresh";
+const ANNOUNCE_PROCESS_ACTIVITY_ID: &str = "announce-process";
+const ANNOUNCE_WAIT_ACTIVITY_ID: &str = "announce-wait";
+const ANNOUNCE_WORKFLOW_OWNER: &str = "sporos-announce-workflow";
 const INVENTORY_COMPLETION_FANOUT_LIMIT: u16 = 1_000;
 const INVENTORY_COMPLETION_LEASE_MS: i64 = 60_000;
 #[cfg(test)]
@@ -62,12 +69,37 @@ impl DuroxideWorkflowRuntime {
         activities: InventoryWorkflowActivities,
     ) -> Result<Self, DuroxideWorkflowRuntimeError> {
         let repository = activities.repository.clone();
-        Self::start_inner(database_path, Some((repository, activities))).await
+        Self::start_inner(
+            database_path,
+            Some(WorkflowRuntimeActivities {
+                repository,
+                inventory: Some(activities),
+                announce: None,
+            }),
+        )
+        .await
+    }
+
+    pub async fn start_with_activities(
+        database_path: PathBuf,
+        inventory: InventoryWorkflowActivities,
+        announce: AnnounceWorkflowActivities,
+    ) -> Result<Self, DuroxideWorkflowRuntimeError> {
+        let repository = inventory.repository.clone();
+        Self::start_inner(
+            database_path,
+            Some(WorkflowRuntimeActivities {
+                repository,
+                inventory: Some(inventory),
+                announce: Some(announce),
+            }),
+        )
+        .await
     }
 
     async fn start_inner(
         database_path: PathBuf,
-        inventory: Option<(Repository, InventoryWorkflowActivities)>,
+        activities: Option<WorkflowRuntimeActivities>,
     ) -> Result<Self, DuroxideWorkflowRuntimeError> {
         prepare_workflow_database(&database_path).await?;
         let database_url = format!("sqlite:{}", database_path.display());
@@ -79,14 +111,14 @@ impl DuroxideWorkflowRuntime {
                     message: error.to_string(),
                 })?,
         ) as Arc<dyn Provider>;
-        let repository = inventory
+        let repository = activities
             .as_ref()
-            .map(|(repository, _activities)| repository.clone());
+            .map(|activities| activities.repository.clone());
         let active_inventory_refreshes = Arc::new(Mutex::new(BTreeSet::new()));
         let inventory_completion_events =
             InventoryCompletionEventBridge::new(Arc::clone(&store), repository.clone());
-        let activity_registry = match inventory {
-            Some((_repository, activities)) => activity_registry_with_inventory_activities(
+        let activity_registry = match activities {
+            Some(activities) => activity_registry_with_runtime_activities(
                 activities.with_completion_event_bridge(inventory_completion_events.clone()),
                 Arc::clone(&active_inventory_refreshes),
             ),
@@ -99,8 +131,8 @@ impl DuroxideWorkflowRuntime {
             RuntimeOptions {
                 dispatcher_min_poll_interval: STARTUP_POLL_INTERVAL,
                 dispatcher_long_poll_timeout: STARTUP_LONG_POLL_TIMEOUT,
-                orchestration_concurrency: 1,
-                worker_concurrency: 1,
+                orchestration_concurrency: 2,
+                worker_concurrency: 2,
                 ..RuntimeOptions::default()
             },
         )
@@ -234,6 +266,57 @@ impl DuroxideWorkflowRuntime {
             workflow_id: instance_id,
             outcome: InventoryWorkflowSubmissionOutcome::Queued,
         })
+    }
+
+    pub async fn submit_announcement(
+        &self,
+        work: &AnnounceWorkItem,
+    ) -> Result<AnnounceWorkflowSubmission, DuroxideWorkflowRuntimeError> {
+        let instance_id = WorkflowInstanceId::announce(work.id.as_str())
+            .map_err(DuroxideWorkflowRuntimeError::InvalidAnnounceWorkflowId)?;
+        let instance_id = instance_id.as_str().to_owned();
+        let input = announce_workflow_input(work);
+        let client = self.client();
+        match client
+            .get_orchestration_status(&instance_id)
+            .await
+            .map_err(|error| DuroxideWorkflowRuntimeError::ReadAnnounceWorkflow {
+                instance_id: instance_id.clone(),
+                message: error.to_string(),
+            })? {
+            OrchestrationStatus::NotFound => {
+                client
+                    .start_orchestration_typed(
+                        &instance_id,
+                        WorkflowKind::Announce.orchestration_name(),
+                        input,
+                    )
+                    .await
+                    .map_err(
+                        |error| DuroxideWorkflowRuntimeError::StartAnnounceWorkflow {
+                            instance_id: instance_id.clone(),
+                            message: error.to_string(),
+                        },
+                    )?;
+                Ok(AnnounceWorkflowSubmission {
+                    workflow_id: instance_id,
+                    outcome: AnnounceWorkflowSubmissionOutcome::Started,
+                })
+            }
+            OrchestrationStatus::Running { .. } => Ok(AnnounceWorkflowSubmission {
+                workflow_id: instance_id,
+                outcome: AnnounceWorkflowSubmissionOutcome::AlreadyRunning,
+            }),
+            OrchestrationStatus::Completed { .. } => {
+                Err(DuroxideWorkflowRuntimeError::CompletedAnnounceWorkflow { instance_id })
+            }
+            OrchestrationStatus::Failed { details, .. } => {
+                Err(DuroxideWorkflowRuntimeError::FailedAnnounceWorkflow {
+                    instance_id,
+                    message: details.display_message().to_string(),
+                })
+            }
+        }
     }
 
     pub async fn wait_for_inventory_refresh_outcome(
@@ -503,6 +586,7 @@ pub enum DuroxideWorkflowRuntimeError {
     },
     InvalidSupervisorId(crate::runtime::workflow_contracts::WorkflowContractError),
     InvalidInventoryWorkflowId(crate::runtime::workflow_contracts::WorkflowContractError),
+    InvalidAnnounceWorkflowId(crate::runtime::workflow_contracts::WorkflowContractError),
     ReadSupervisor {
         instance_id: String,
         message: String,
@@ -531,6 +615,21 @@ pub enum DuroxideWorkflowRuntimeError {
         message: String,
     },
     EnqueueInventoryRefresh {
+        instance_id: String,
+        message: String,
+    },
+    ReadAnnounceWorkflow {
+        instance_id: String,
+        message: String,
+    },
+    StartAnnounceWorkflow {
+        instance_id: String,
+        message: String,
+    },
+    CompletedAnnounceWorkflow {
+        instance_id: String,
+    },
+    FailedAnnounceWorkflow {
         instance_id: String,
         message: String,
     },
@@ -583,6 +682,7 @@ impl fmt::Display for DuroxideWorkflowRuntimeError {
             }
             Self::InvalidSupervisorId(error) => write!(formatter, "{error}"),
             Self::InvalidInventoryWorkflowId(error) => write!(formatter, "{error}"),
+            Self::InvalidAnnounceWorkflowId(error) => write!(formatter, "{error}"),
             Self::ReadSupervisor {
                 instance_id,
                 message,
@@ -635,6 +735,31 @@ impl fmt::Display for DuroxideWorkflowRuntimeError {
             } => write!(
                 formatter,
                 "enqueue inventory refresh for workflow `{instance_id}` failed: {message}"
+            ),
+            Self::ReadAnnounceWorkflow {
+                instance_id,
+                message,
+            } => write!(
+                formatter,
+                "read announce workflow `{instance_id}` failed: {message}"
+            ),
+            Self::StartAnnounceWorkflow {
+                instance_id,
+                message,
+            } => write!(
+                formatter,
+                "start announce workflow `{instance_id}` failed: {message}"
+            ),
+            Self::CompletedAnnounceWorkflow { instance_id } => write!(
+                formatter,
+                "announce workflow `{instance_id}` completed and cannot accept duplicate work"
+            ),
+            Self::FailedAnnounceWorkflow {
+                instance_id,
+                message,
+            } => write!(
+                formatter,
+                "announce workflow `{instance_id}` is failed: {message}"
             ),
             Self::RecordInventoryProjection {
                 workflow_id,
@@ -708,6 +833,63 @@ struct WorkflowShellActivityInput {
 struct WorkflowShellActivityOutput {
     activity: ActivityKind,
     accepted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowRuntimeActivities {
+    repository: Repository,
+    inventory: Option<InventoryWorkflowActivities>,
+    announce: Option<AnnounceWorkflowActivities>,
+}
+
+impl WorkflowRuntimeActivities {
+    fn with_completion_event_bridge(
+        mut self,
+        completion_events: InventoryCompletionEventBridge,
+    ) -> Self {
+        if let Some(inventory) = self.inventory.take() {
+            self.inventory =
+                Some(inventory.with_completion_event_bridge(completion_events.clone()));
+        }
+        if let Some(announce) = self.announce.take() {
+            self.announce = Some(announce.with_completion_event_bridge(completion_events));
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnounceWorkflowActivities {
+    repository: Repository,
+    processor: AnnounceProcessor,
+    queue_config: AnnounceQueueConfig,
+    shutdown: ShutdownSignal,
+    completion_events: Option<InventoryCompletionEventBridge>,
+}
+
+impl AnnounceWorkflowActivities {
+    pub fn new(
+        repository: Repository,
+        processor: AnnounceProcessor,
+        queue_config: AnnounceQueueConfig,
+        shutdown: ShutdownSignal,
+    ) -> Self {
+        Self {
+            repository,
+            processor,
+            queue_config,
+            shutdown,
+            completion_events: None,
+        }
+    }
+
+    fn with_completion_event_bridge(
+        mut self,
+        completion_events: InventoryCompletionEventBridge,
+    ) -> Self {
+        self.completion_events = Some(completion_events);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -856,6 +1038,68 @@ pub struct InventoryWorkflowSubmission {
 pub enum InventoryWorkflowSubmissionOutcome {
     Queued,
     Coalesced,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AnnounceWorkflowSubmission {
+    pub workflow_id: String,
+    pub outcome: AnnounceWorkflowSubmissionOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AnnounceWorkflowSubmissionOutcome {
+    Started,
+    AlreadyRunning,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct AnnounceActivityInput {
+    work_id: String,
+    received_at_ms: i64,
+    raw_secret_material_count: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct AnnounceProcessActivityOutput {
+    state: AnnounceActivityState,
+    reason: String,
+    next_attempt_at_ms: Option<i64>,
+    retry_delay_ms: Option<u64>,
+    events: Vec<WorkflowEventName>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct AnnounceWaitActivityOutput {
+    events: Vec<WorkflowEventName>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AnnounceActivityState {
+    Succeeded,
+    Failed,
+    WaitingInventory,
+    WaitingDependency,
+    Retrying,
+    Released,
+}
+
+fn announce_workflow_input(work: &AnnounceWorkItem) -> AnnounceWorkflowInput {
+    AnnounceWorkflowInput {
+        work_id: work.id.as_str().to_owned(),
+        dedupe_hash: work.dedupe_hash.as_str().to_owned(),
+        tracker: work.tracker.as_str().to_owned(),
+        candidate_guid: work
+            .guid
+            .as_ref()
+            .map(|guid| guid.as_str().to_owned())
+            .unwrap_or_default(),
+        candidate_title: work.title.as_str().to_owned(),
+        received_at_ms: work.received_at_ms,
+        expires_at_ms: work.expires_at_ms,
+        fetch_material_present: work.fetch.is_some(),
+        raw_secret_material_count: u16::from(work.fetch.is_some()),
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -1457,33 +1701,103 @@ fn activity_registry() -> ActivityRegistry {
     builder.build()
 }
 
-fn activity_registry_with_inventory_activities(
-    activities: InventoryWorkflowActivities,
+fn activity_registry_with_runtime_activities(
+    activities: WorkflowRuntimeActivities,
     active_inventory_refreshes: Arc<Mutex<BTreeSet<String>>>,
 ) -> ActivityRegistry {
     let mut builder = ActivityRegistry::builder();
     for activity in ActivityKind::ALL {
         match activity {
             ActivityKind::InventoryScanMedia | ActivityKind::InventoryRefreshClient => {
-                let activities = activities.clone();
-                let active_inventory_refreshes = Arc::clone(&active_inventory_refreshes);
-                builder = builder.register_typed(
-                    activity.as_str(),
-                    move |_ctx: ActivityContext,
-                          input: ActivityInputEnvelope<InventoryActivityInput>| {
-                        let activities = activities.clone();
-                        let active_inventory_refreshes = Arc::clone(&active_inventory_refreshes);
-                        async move {
-                            run_inventory_activity(
-                                activities,
-                                active_inventory_refreshes,
-                                input.workflow_id,
-                                input.payload,
-                            )
-                            .await
-                        }
-                    },
-                );
+                if let Some(inventory) = activities.inventory.clone() {
+                    let active_inventory_refreshes = Arc::clone(&active_inventory_refreshes);
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<InventoryActivityInput>| {
+                            let inventory = inventory.clone();
+                            let active_inventory_refreshes =
+                                Arc::clone(&active_inventory_refreshes);
+                            async move {
+                                run_inventory_activity(
+                                    inventory,
+                                    active_inventory_refreshes,
+                                    input.workflow_id,
+                                    input.payload,
+                                )
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::MatchingReverseLookup => {
+                if let Some(announce) = activities.announce.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<AnnounceActivityInput>| {
+                            let announce = announce.clone();
+                            async move {
+                                Box::pin(run_announce_process_activity(
+                                    announce,
+                                    input.workflow_id,
+                                    input.payload,
+                                ))
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::RepositoryWrite => {
+                if let Some(announce) = activities.announce.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<AnnounceActivityInput>| {
+                            let announce = announce.clone();
+                            async move {
+                                run_announce_queue_inventory_activity(
+                                    announce,
+                                    input.workflow_id,
+                                    input.payload,
+                                )
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
             }
             _ => {
                 builder = builder.register_typed(
@@ -1732,6 +2046,250 @@ async fn record_inventory_activity_projection(
         .map_err(|error| error.to_string())
 }
 
+async fn run_announce_process_activity(
+    activities: AnnounceWorkflowActivities,
+    workflow_id: String,
+    input: AnnounceActivityInput,
+) -> Result<AnnounceProcessActivityOutput, String> {
+    let id = AnnounceWorkId::new(input.work_id.clone()).map_err(|error| error.to_string())?;
+    let now_ms = unix_time_ms();
+    let lease_until_ms = now_ms.saturating_add(
+        i64::try_from(
+            activities
+                .queue_config
+                .lease_duration_secs
+                .saturating_mul(1_000),
+        )
+        .unwrap_or(i64::MAX),
+    );
+    let claimed = activities
+        .repository
+        .claim_announce_work_by_id(&id, ANNOUNCE_WORKFLOW_OWNER, now_ms, lease_until_ms)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !claimed {
+        return Err(format!(
+            "announce work `{}` could not be claimed",
+            id.as_str()
+        ));
+    }
+
+    let outcome = process_announce_work_with_processor_mode(
+        activities.processor.clone(),
+        id.clone(),
+        activities.shutdown.clone(),
+        AnnounceInventoryRefreshMode::DeferToWorkflow,
+    )
+    .await;
+    let mut output = announce_process_activity_output(&outcome, now_ms);
+    if output.state == AnnounceActivityState::WaitingInventory {
+        output.events =
+            register_announce_inventory_waiters(&activities, &workflow_id, input.received_at_ms)
+                .await?;
+    }
+    let worker = AnnounceWorker::new(
+        activities.repository.clone(),
+        ANNOUNCE_WORKFLOW_OWNER,
+        &activities.queue_config,
+    )
+    .map_err(|error| error.to_string())?;
+    let completed = worker
+        .complete(&id, outcome, unix_time_ms())
+        .await
+        .map_err(|error| error.to_string())?;
+    if !completed {
+        return Err(format!(
+            "announce work `{}` outcome could not be recorded for workflow `{workflow_id}`",
+            id.as_str()
+        ));
+    }
+    record_announce_activity_projection(
+        &activities.repository,
+        &workflow_id,
+        &input,
+        &output,
+        unix_time_ms(),
+    )
+    .await?;
+    Ok(output)
+}
+
+async fn run_announce_queue_inventory_activity(
+    activities: AnnounceWorkflowActivities,
+    _workflow_id: String,
+    input: AnnounceActivityInput,
+) -> Result<AnnounceWaitActivityOutput, String> {
+    let events = activities
+        .processor
+        .stale_inventory_completion_events(input.received_at_ms)
+        .await
+        .map_err(|error| error.to_string())?;
+    activities
+        .processor
+        .queue_stale_inventory_refreshes(input.received_at_ms, unix_time_ms())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(AnnounceWaitActivityOutput { events })
+}
+
+async fn register_announce_inventory_waiters(
+    activities: &AnnounceWorkflowActivities,
+    workflow_id: &str,
+    received_at_ms: i64,
+) -> Result<Vec<WorkflowEventName>, String> {
+    let Some(completion_events) = activities.completion_events.as_ref() else {
+        return Err("inventory completion event bridge is unavailable".to_owned());
+    };
+    let events = activities
+        .processor
+        .stale_inventory_completion_events(received_at_ms)
+        .await
+        .map_err(|error| error.to_string())?;
+    for event_name in &events {
+        completion_events
+            .register_waiter(InventoryCompletionWaiter {
+                workflow_id: workflow_id.to_owned(),
+                event_name: *event_name,
+                required_after_ms: received_at_ms,
+            })
+            .await?;
+    }
+    activities
+        .processor
+        .stale_inventory_completion_events(received_at_ms)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn announce_process_activity_output(
+    outcome: &AnnounceWorkOutcome,
+    now_ms: i64,
+) -> AnnounceProcessActivityOutput {
+    match outcome {
+        AnnounceWorkOutcome::Succeeded { reason, .. } => AnnounceProcessActivityOutput {
+            state: AnnounceActivityState::Succeeded,
+            reason: announce_reason_label(*reason),
+            next_attempt_at_ms: None,
+            retry_delay_ms: None,
+            events: Vec::new(),
+        },
+        AnnounceWorkOutcome::TerminalFailed { reason, .. } => AnnounceProcessActivityOutput {
+            state: AnnounceActivityState::Failed,
+            reason: announce_reason_label(*reason),
+            next_attempt_at_ms: None,
+            retry_delay_ms: None,
+            events: Vec::new(),
+        },
+        AnnounceWorkOutcome::Waiting {
+            reason,
+            next_attempt_at_ms,
+            ..
+        } => AnnounceProcessActivityOutput {
+            state: if *reason == AnnounceReason::InventoryRefreshing {
+                AnnounceActivityState::WaitingInventory
+            } else {
+                AnnounceActivityState::WaitingDependency
+            },
+            reason: announce_reason_label(*reason),
+            next_attempt_at_ms: Some(*next_attempt_at_ms),
+            retry_delay_ms: Some(retry_delay_ms(now_ms, *next_attempt_at_ms)),
+            events: Vec::new(),
+        },
+        AnnounceWorkOutcome::Retryable {
+            reason,
+            next_attempt_at_ms,
+            ..
+        } => AnnounceProcessActivityOutput {
+            state: AnnounceActivityState::Retrying,
+            reason: announce_reason_label(*reason),
+            next_attempt_at_ms: Some(*next_attempt_at_ms),
+            retry_delay_ms: Some(retry_delay_ms(now_ms, *next_attempt_at_ms)),
+            events: Vec::new(),
+        },
+        AnnounceWorkOutcome::Release {
+            reason,
+            next_attempt_at_ms,
+        } => AnnounceProcessActivityOutput {
+            state: AnnounceActivityState::Released,
+            reason: announce_reason_label(*reason),
+            next_attempt_at_ms: Some(*next_attempt_at_ms),
+            retry_delay_ms: Some(retry_delay_ms(now_ms, *next_attempt_at_ms)),
+            events: Vec::new(),
+        },
+    }
+}
+
+fn retry_delay_ms(now_ms: i64, next_attempt_at_ms: i64) -> u64 {
+    u64::try_from(next_attempt_at_ms.saturating_sub(now_ms).max(1)).unwrap_or(u64::MAX)
+}
+
+fn announce_reason_label(reason: AnnounceReason) -> String {
+    format!("{reason:?}")
+}
+
+async fn record_announce_activity_projection(
+    repository: &Repository,
+    workflow_id: &str,
+    input: &AnnounceActivityInput,
+    output: &AnnounceProcessActivityOutput,
+    now_ms: i64,
+) -> Result<(), String> {
+    let (state, reason, next_action, finished_at_ms, raw_secret_material_count) = match output.state
+    {
+        AnnounceActivityState::Succeeded => (
+            WorkflowState::Succeeded,
+            WorkflowReason::Completed,
+            Some(output.reason.as_str()),
+            Some(now_ms),
+            0,
+        ),
+        AnnounceActivityState::Failed => (
+            WorkflowState::Failed,
+            WorkflowReason::Failed,
+            Some(output.reason.as_str()),
+            Some(now_ms),
+            0,
+        ),
+        AnnounceActivityState::WaitingInventory => (
+            WorkflowState::Waiting,
+            WorkflowReason::WaitingForInventory,
+            Some("await_inventory"),
+            None,
+            input.raw_secret_material_count,
+        ),
+        AnnounceActivityState::WaitingDependency => (
+            WorkflowState::Waiting,
+            WorkflowReason::WaitingForDependency,
+            Some(output.reason.as_str()),
+            None,
+            input.raw_secret_material_count,
+        ),
+        AnnounceActivityState::Retrying | AnnounceActivityState::Released => (
+            WorkflowState::Retrying,
+            WorkflowReason::BackingOff,
+            Some(output.reason.as_str()),
+            None,
+            input.raw_secret_material_count,
+        ),
+    };
+    repository
+        .record_workflow_projection(&WorkflowProjectionUpdate {
+            workflow_id,
+            workflow_kind: WorkflowKind::Announce,
+            public_id: &input.work_id,
+            state,
+            reason,
+            next_action,
+            raw_secret_material_count,
+            blocked_dependency: None,
+            started_at_ms: input.received_at_ms,
+            updated_at_ms: now_ms,
+            finished_at_ms,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
 fn inventory_activity_output(summaries: &[InventoryRefreshSummary]) -> InventoryActivityOutput {
     InventoryActivityOutput {
         scanned_items: summaries.iter().map(|summary| summary.scanned_items).sum(),
@@ -1755,6 +2313,8 @@ fn orchestration_registry() -> OrchestrationRegistry {
                 workflow.orchestration_name(),
                 inventory_refresh_orchestration,
             );
+        } else if workflow == WorkflowKind::Announce {
+            builder = builder.register_typed(workflow.orchestration_name(), announce_orchestration);
         } else {
             builder = builder.register_typed(
                 workflow.orchestration_name(),
@@ -1791,6 +2351,148 @@ fn orchestration_registry() -> OrchestrationRegistry {
         );
     }
     builder.build()
+}
+
+async fn announce_orchestration(
+    ctx: OrchestrationContext,
+    input: AnnounceWorkflowInput,
+) -> Result<String, String> {
+    set_announce_custom_status(
+        &ctx,
+        &input,
+        WorkflowState::Running,
+        WorkflowReason::RunningActivity,
+        Some("processing"),
+        input.raw_secret_material_count,
+    )?;
+    let activity_input = AnnounceActivityInput {
+        work_id: input.work_id.clone(),
+        received_at_ms: input.received_at_ms,
+        raw_secret_material_count: input.raw_secret_material_count,
+    };
+    loop {
+        let process_input = ActivityInputEnvelope::new(
+            ctx.instance_id(),
+            ANNOUNCE_PROCESS_ACTIVITY_ID,
+            activity_input.clone(),
+        );
+        let output: AnnounceProcessActivityOutput = ctx
+            .schedule_activity_typed(ActivityKind::MatchingReverseLookup.as_str(), &process_input)
+            .await?;
+        match output.state {
+            AnnounceActivityState::Succeeded => {
+                set_announce_custom_status(
+                    &ctx,
+                    &input,
+                    WorkflowState::Succeeded,
+                    WorkflowReason::Completed,
+                    Some(output.reason.as_str()),
+                    0,
+                )?;
+                return Ok(output.reason);
+            }
+            AnnounceActivityState::Failed => {
+                set_announce_custom_status(
+                    &ctx,
+                    &input,
+                    WorkflowState::Failed,
+                    WorkflowReason::Failed,
+                    Some(output.reason.as_str()),
+                    0,
+                )?;
+                return Ok(output.reason);
+            }
+            AnnounceActivityState::WaitingInventory => {
+                set_announce_custom_status(
+                    &ctx,
+                    &input,
+                    WorkflowState::Waiting,
+                    WorkflowReason::WaitingForInventory,
+                    Some("await_inventory"),
+                    input.raw_secret_material_count,
+                )?;
+                if output.events.is_empty() {
+                    continue;
+                }
+                let setup = queue_announce_inventory_refresh(&ctx, &activity_input).await?;
+                if setup.events.is_empty() {
+                    continue;
+                }
+                let wait_for_media = setup
+                    .events
+                    .contains(&WorkflowEventName::MediaInventoryCompleted);
+                let wait_for_client = setup
+                    .events
+                    .contains(&WorkflowEventName::ClientInventoryCompleted);
+                if wait_for_media && wait_for_client {
+                    let media = ctx.dequeue_event_typed::<InventoryCompletionEvent>(
+                        WorkflowEventName::MediaInventoryCompleted.as_str(),
+                    );
+                    let client = ctx.dequeue_event_typed::<InventoryCompletionEvent>(
+                        WorkflowEventName::ClientInventoryCompleted.as_str(),
+                    );
+                    let (_media, _client) = ctx.join2(media, client).await;
+                } else if wait_for_media {
+                    let _media = ctx
+                        .dequeue_event_typed::<InventoryCompletionEvent>(
+                            WorkflowEventName::MediaInventoryCompleted.as_str(),
+                        )
+                        .await;
+                } else if wait_for_client {
+                    let _client = ctx
+                        .dequeue_event_typed::<InventoryCompletionEvent>(
+                            WorkflowEventName::ClientInventoryCompleted.as_str(),
+                        )
+                        .await;
+                }
+                set_announce_custom_status(
+                    &ctx,
+                    &input,
+                    WorkflowState::Running,
+                    WorkflowReason::RunningActivity,
+                    Some("processing"),
+                    input.raw_secret_material_count,
+                )?;
+            }
+            AnnounceActivityState::WaitingDependency
+            | AnnounceActivityState::Retrying
+            | AnnounceActivityState::Released => {
+                let delay_ms = output.retry_delay_ms.unwrap_or(1);
+                set_announce_custom_status(
+                    &ctx,
+                    &input,
+                    WorkflowState::Retrying,
+                    WorkflowReason::BackingOff,
+                    Some(output.reason.as_str()),
+                    input.raw_secret_material_count,
+                )?;
+                ctx.schedule_timer(Duration::from_millis(delay_ms)).await;
+                set_announce_custom_status(
+                    &ctx,
+                    &input,
+                    WorkflowState::Running,
+                    WorkflowReason::RunningActivity,
+                    Some("processing"),
+                    input.raw_secret_material_count,
+                )?;
+            }
+        }
+    }
+}
+
+async fn queue_announce_inventory_refresh(
+    ctx: &OrchestrationContext,
+    activity_input: &AnnounceActivityInput,
+) -> Result<AnnounceWaitActivityOutput, String> {
+    let wait_input = ActivityInputEnvelope::new(
+        ctx.instance_id(),
+        ANNOUNCE_WAIT_ACTIVITY_ID,
+        activity_input.clone(),
+    );
+    let output: AnnounceWaitActivityOutput = ctx
+        .schedule_activity_typed(ActivityKind::RepositoryWrite.as_str(), &wait_input)
+        .await?;
+    Ok(output)
 }
 
 async fn inventory_refresh_orchestration(
@@ -1861,6 +2563,23 @@ fn set_inventory_custom_status(
         reason,
     );
     status.next_action = next_action.map(str::to_owned);
+    let status = serde_json::to_string(&status).map_err(|error| error.to_string())?;
+    ctx.set_custom_status(status);
+    Ok(())
+}
+
+fn set_announce_custom_status(
+    ctx: &OrchestrationContext,
+    input: &AnnounceWorkflowInput,
+    state: WorkflowState,
+    reason: WorkflowReason,
+    next_action: Option<&str>,
+    raw_secret_material_count: u16,
+) -> Result<(), String> {
+    let mut status =
+        WorkflowCustomStatus::new(input.work_id.clone(), WorkflowKind::Announce, state, reason);
+    status.next_action = next_action.map(str::to_owned);
+    status.raw_secret_material_count = raw_secret_material_count;
     let status = serde_json::to_string(&status).map_err(|error| error.to_string())?;
     ctx.set_custom_status(status);
     Ok(())

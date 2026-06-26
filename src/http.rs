@@ -45,6 +45,7 @@ use crate::persistence::repository::{
     WorkflowProjectionSnapshot,
 };
 use crate::runtime::announce_worker::unix_time_ms;
+use crate::runtime::duroxide_workflow::DuroxideWorkflowRuntime;
 use crate::runtime::health::{
     DependencyHealthSnapshot as RuntimeDependencyHealthSnapshot, HealthRegistry,
 };
@@ -227,8 +228,13 @@ impl HttpState {
         mut self,
         repository: Repository,
         config: AnnounceQueueConfig,
+        workflow_runtime: DuroxideWorkflowRuntime,
     ) -> Self {
-        self.announce_acceptor = Some(AnnounceAcceptor { repository, config });
+        self.announce_acceptor = Some(AnnounceAcceptor {
+            repository,
+            config,
+            workflow_runtime,
+        });
         self
     }
 
@@ -519,6 +525,7 @@ fn ensure_writable_directory(path: &FsPath) -> io::Result<()> {
 struct AnnounceAcceptor {
     repository: Repository,
     config: AnnounceQueueConfig,
+    workflow_runtime: DuroxideWorkflowRuntime,
 }
 
 #[derive(Debug, Clone)]
@@ -1291,6 +1298,32 @@ async fn accept_announcement(
         .await
     {
         Ok(AnnounceInsertResult::Inserted { id }) => {
+            if let Err(error) = acceptor.workflow_runtime.submit_announcement(&work).await {
+                if let Err(reject_error) = acceptor
+                    .repository
+                    .mark_announce_rejected(
+                        &id,
+                        AnnounceReason::TransientDependencyFailure,
+                        &format!("cannot start announce workflow: {error}"),
+                        unix_time_ms(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        announce_id = %id,
+                        error = %reject_error,
+                        "failed to reject announce work after workflow start failure"
+                    );
+                }
+                metrics.record_workflow_enqueue(
+                    WorkflowMetric::Announcement,
+                    WorkflowOutcome::RejectedClosed,
+                );
+                return ApiErrorResponse::service_unavailable(format!(
+                    "cannot start announce workflow: {error}"
+                ))
+                .into_response();
+            }
             metrics.record_workflow_enqueue(
                 WorkflowMetric::Announcement,
                 WorkflowOutcome::DurableAccepted,
@@ -2502,8 +2535,11 @@ mod tests {
             Some(400),
         );
         let app = router(
-            HttpState::new(ReadinessState::ready(), health)
-                .with_announce_acceptor(repository, AnnounceQueueConfig::default()),
+            HttpState::new(ReadinessState::ready(), health).with_announce_acceptor(
+                repository,
+                AnnounceQueueConfig::default(),
+                test_workflow_runtime("status-dependencies").await,
+            ),
         );
 
         let response = app
@@ -2621,7 +2657,11 @@ mod tests {
             searches,
             jobs,
         })
-        .with_announce_acceptor(repository, AnnounceQueueConfig::default());
+        .with_announce_acceptor(
+            repository,
+            AnnounceQueueConfig::default(),
+            test_workflow_runtime("status-queues").await,
+        );
         let app = router(state);
 
         let response = app
@@ -2811,7 +2851,8 @@ mod tests {
             repository.clone(),
             Some("secret"),
             AnnounceQueueConfig::default(),
-        );
+        )
+        .await;
 
         let unauthorized = app
             .clone()
@@ -2908,7 +2949,8 @@ mod tests {
                     vec!["198.18.0.1".parse().unwrap()],
                 ),
             ])),
-        );
+        )
+        .await;
         let invalid_urls = [
             "not a url",
             "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
@@ -2953,7 +2995,7 @@ mod tests {
     #[tokio::test]
     async fn announcement_endpoint_deduplicates_active_work() {
         let repository = Repository::connect_in_memory().await.unwrap();
-        let app = announce_app(repository.clone(), None, AnnounceQueueConfig::default());
+        let app = announce_app(repository.clone(), None, AnnounceQueueConfig::default()).await;
         let body = serde_json::json!({
             "name": "Example",
             "guid": "guid-1",
@@ -3000,7 +3042,8 @@ mod tests {
                 max_pending: 1,
                 ..AnnounceQueueConfig::default()
             },
-        );
+        )
+        .await;
 
         let first = app
             .clone()
@@ -3089,7 +3132,8 @@ mod tests {
                 worker_concurrency: 3,
                 ..AnnounceQueueConfig::default()
             },
-        );
+        )
+        .await;
         let accepted = app
             .clone()
             .oneshot(json_post(
@@ -3239,7 +3283,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let app = announce_app(repository, None, AnnounceQueueConfig::default());
+        let app = announce_app(repository, None, AnnounceQueueConfig::default()).await;
 
         let readyz_response = app
             .clone()
@@ -3324,7 +3368,7 @@ mod tests {
     #[tokio::test]
     async fn announcement_validation_errors_omit_fetch_secrets() {
         let repository = Repository::connect_in_memory().await.unwrap();
-        let app = announce_app(repository, None, AnnounceQueueConfig::default());
+        let app = announce_app(repository, None, AnnounceQueueConfig::default()).await;
 
         let response = app
             .oneshot(json_post(
@@ -3411,7 +3455,7 @@ mod tests {
             .insert_or_dedupe_announce_work(&work, 10)
             .await
             .unwrap();
-        let app = announce_app(repository, None, AnnounceQueueConfig::default());
+        let app = announce_app(repository, None, AnnounceQueueConfig::default()).await;
 
         let status_response = app
             .clone()
@@ -3499,7 +3543,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let app = announce_app(repository, None, AnnounceQueueConfig::default());
+        let app = announce_app(repository, None, AnnounceQueueConfig::default()).await;
 
         let metrics_response = app
             .oneshot(
@@ -3842,7 +3886,7 @@ mod tests {
         )
     }
 
-    fn announce_app(
+    async fn announce_app(
         repository: Repository,
         token: Option<&str>,
         config: AnnounceQueueConfig,
@@ -3857,7 +3901,7 @@ mod tests {
                 searches,
                 jobs,
             })
-            .with_announce_acceptor(repository, config)
+            .with_announce_acceptor(repository, config, test_workflow_runtime("announce").await)
             .with_announce_download_resolver(test_download_resolver());
         if let Some(token) = token {
             state = state.with_api_token(token);
@@ -3866,7 +3910,7 @@ mod tests {
         router(state)
     }
 
-    fn announce_app_with_resolver(
+    async fn announce_app_with_resolver(
         repository: Repository,
         config: AnnounceQueueConfig,
         resolver: AnnounceDownloadUrlResolver,
@@ -3882,9 +3926,27 @@ mod tests {
                     searches,
                     jobs,
                 })
-                .with_announce_acceptor(repository, config)
+                .with_announce_acceptor(
+                    repository,
+                    config,
+                    test_workflow_runtime("announce-resolver").await,
+                )
                 .with_announce_download_resolver(resolver),
         )
+    }
+
+    async fn test_workflow_runtime(label: &str) -> DuroxideWorkflowRuntime {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sporos-http-workflow-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workflows.db");
+        DuroxideWorkflowRuntime::start(path).await.unwrap()
     }
 
     fn test_download_resolver() -> AnnounceDownloadUrlResolver {
@@ -3993,7 +4055,11 @@ mod tests {
                 searches,
                 jobs,
             })
-            .with_announce_acceptor(repository, AnnounceQueueConfig::default());
+            .with_announce_acceptor(
+                repository,
+                AnnounceQueueConfig::default(),
+                test_workflow_runtime("status-summary").await,
+            );
         if include_notification_queue {
             let (notifications, _notification_receiver) =
                 bounded_work_queue::<NotificationJob>(QueueKind::Notification, nonzero(3));

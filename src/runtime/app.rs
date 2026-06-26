@@ -43,9 +43,10 @@ use crate::persistence::repository::{
 };
 use crate::runtime::announce_worker::AnnounceWorker;
 use crate::runtime::backoff::stable_jitter_seed;
+use crate::runtime::daemon::AnnounceProcessor;
 use crate::runtime::duroxide_workflow::{
-    DuroxideWorkflowRuntime, DuroxideWorkflowRuntimeError, workflow_database_path,
-    workflow_runtime_dependency_name,
+    AnnounceWorkflowActivities, DuroxideWorkflowRuntime, DuroxideWorkflowRuntimeError,
+    workflow_database_path, workflow_runtime_dependency_name,
 };
 use crate::runtime::health::{DependencyKind, HealthRegistry};
 use crate::runtime::injection_worker::{InjectionClient, InjectionWorker};
@@ -1239,8 +1240,16 @@ impl AppRuntime {
         seed_unknown_health_for_missing(&health, DependencyKind::Notification, &notification_names);
         seed_arr_endpoint_backoff(&mut arr_endpoints, &persisted_health, now_ms);
         let (shutdown, shutdown_signal) = shutdown_channel();
+        let announce_processor = AnnounceProcessor::new(
+            config.clone(),
+            repository.clone(),
+            health.clone(),
+            metrics.clone(),
+            scheduler.clone(),
+            injection_worker.clone(),
+        );
         let workflow_runtime = map_workflow_runtime_error(
-            DuroxideWorkflowRuntime::start_with_inventory_activities(
+            DuroxideWorkflowRuntime::start_with_activities(
                 runtime_workflow_database_path(&config),
                 crate::runtime::duroxide_workflow::InventoryWorkflowActivities::new(
                     repository.clone(),
@@ -1248,6 +1257,12 @@ impl AppRuntime {
                     injection_worker.clone(),
                     shutdown_signal.clone(),
                     scheduler_failure_backoff,
+                ),
+                AnnounceWorkflowActivities::new(
+                    repository.clone(),
+                    announce_processor,
+                    config.announce.clone(),
+                    shutdown_signal.clone(),
                 ),
             )
             .await,
@@ -1297,7 +1312,11 @@ impl AppRuntime {
             .with_notification_endpoints(runtime_config.notification_endpoints.clone())
             .with_search_worker_concurrency(config.runtime.search_worker_concurrency)
             .with_allowed_jobs(runtime_config.http_jobs)
-            .with_announce_acceptor(repository.clone(), config.announce.clone());
+            .with_announce_acceptor(
+                repository.clone(),
+                config.announce.clone(),
+                workflow_runtime.clone(),
+            );
         if let Some(api_token) = config.server.api_token.as_ref() {
             http = http.with_api_token(api_token.expose_secret());
         }

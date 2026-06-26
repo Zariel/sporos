@@ -356,8 +356,8 @@ impl WorkflowReason {
 pub struct WorkflowInstanceId(String);
 
 impl WorkflowInstanceId {
-    pub fn announce(dedupe_hash: impl AsRef<str>) -> Result<Self, WorkflowContractError> {
-        Self::from_segments([("dedupe_hash", dedupe_hash.as_ref())], "announce")
+    pub fn announce(work_id: impl AsRef<str>) -> Result<Self, WorkflowContractError> {
+        Self::from_segments([("work_id", work_id.as_ref())], "announce")
     }
 
     pub fn search(request_id: impl AsRef<str>) -> Result<Self, WorkflowContractError> {
@@ -485,6 +485,7 @@ impl<T> ActivityOutputEnvelope<T> {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AnnounceWorkflowInput {
+    pub work_id: String,
     pub dedupe_hash: String,
     pub tracker: String,
     pub candidate_guid: String,
@@ -614,7 +615,7 @@ mod tests {
             matches!(
                 WorkflowInstanceId::announce("bad:value"),
                 Err(WorkflowContractError::InvalidIdSegment {
-                    field: "dedupe_hash",
+                    field: "work_id",
                     ..
                 })
             ),
@@ -827,6 +828,7 @@ mod tests {
             "ann_public_1",
             1_782_491_200_000,
             AnnounceWorkflowInput {
+                work_id: "ann_1782491200000_dedupe123".to_owned(),
                 dedupe_hash: "dedupe123".to_owned(),
                 tracker: "tracker-a".to_owned(),
                 candidate_guid: "guid-1".to_owned(),
@@ -846,6 +848,7 @@ mod tests {
                 "public_id": "ann_public_1",
                 "submitted_at_ms": 1782491200000_i64,
                 "payload": {
+                    "work_id": "ann_1782491200000_dedupe123",
                     "dedupe_hash": "dedupe123",
                     "tracker": "tracker-a",
                     "candidate_guid": "guid-1",

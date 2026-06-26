@@ -231,6 +231,16 @@ impl AnnounceDedupeIdentity {
 pub struct AnnounceDedupeHash(String);
 
 impl AnnounceDedupeHash {
+    pub fn from_persisted(value: impl Into<String>) -> Result<Self, AnnounceError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(AnnounceError::EmptyField {
+                field: "announce dedupe hash",
+            });
+        }
+        Ok(Self(value))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

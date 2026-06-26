@@ -3541,6 +3541,51 @@ impl Repository {
         }
     }
 
+    pub async fn active_announce_work_items(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<AnnounceWorkItem>, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                dedupe_hash,
+                received_at,
+                updated_at,
+                first_attempt_at,
+                finished_at,
+                tracker,
+                guid,
+                info_hash,
+                title,
+                size,
+                download_url,
+                cookie,
+                status,
+                reason,
+                attempt_count,
+                next_attempt_at,
+                expires_at,
+                last_dependency_kind,
+                last_dependency_name,
+                last_error_class,
+                last_error_message
+            FROM announce_work
+            WHERE status IN ('queued', 'running', 'waiting', 'retryable')
+            ORDER BY received_at, id
+            LIMIT ?
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read active announce work", error))?;
+
+        rows.into_iter()
+            .map(active_announce_work_from_row)
+            .collect()
+    }
+
     pub async fn announce_candidate_material(
         &self,
         id: &AnnounceWorkId,
@@ -3658,6 +3703,86 @@ impl Repository {
             .map_err(|error| db_error("commit announce claim transaction", error))?;
 
         Ok(claimed)
+    }
+
+    pub async fn claim_announce_work_by_id(
+        &self,
+        id: &AnnounceWorkId,
+        owner: &str,
+        now_ms: i64,
+        lease_until_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'running',
+                reason = 'accepted',
+                attempt_count = CASE
+                    WHEN status = 'running' AND lease_owner = ? THEN attempt_count
+                    ELSE attempt_count + 1
+                END,
+                first_attempt_at = COALESCE(first_attempt_at, ?),
+                updated_at = ?,
+                lease_owner = ?,
+                lease_until = ?,
+                last_dependency_kind = NULL,
+                last_dependency_name = NULL
+            WHERE id = ?
+              AND (
+                    status IN ('queued', 'retryable', 'waiting')
+                 OR (status = 'running' AND lease_owner = ?)
+              )
+              AND expires_at > ?
+            "#,
+        )
+        .bind(owner)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(owner)
+        .bind(lease_until_ms)
+        .bind(id.as_str())
+        .bind(owner)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("claim announce work by id", error))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn mark_announce_rejected(
+        &self,
+        id: &AnnounceWorkId,
+        reason: AnnounceReason,
+        redacted_message: &str,
+        now_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE announce_work
+            SET status = 'terminal_failed',
+                reason = ?,
+                updated_at = ?,
+                finished_at = ?,
+                download_url = NULL,
+                cookie = NULL,
+                lease_owner = NULL,
+                lease_until = NULL,
+                last_error_message = ?
+            WHERE id = ?
+              AND status IN ('queued', 'running', 'retryable', 'waiting')
+            "#,
+        )
+        .bind(announce_reason_key(reason))
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(redacted_message)
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("mark announce rejected", error))?;
+
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn announce_fetch_material(
@@ -6546,6 +6671,22 @@ fn announce_status_key(status: AnnounceStatus) -> &'static str {
     }
 }
 
+fn announce_status_from_key(value: &str) -> Result<AnnounceStatus, DatabaseError> {
+    match value {
+        "queued" => Ok(AnnounceStatus::Queued),
+        "running" => Ok(AnnounceStatus::Running),
+        "waiting" => Ok(AnnounceStatus::Waiting),
+        "retryable" => Ok(AnnounceStatus::Retryable),
+        "succeeded" => Ok(AnnounceStatus::Succeeded),
+        "terminal_failed" => Ok(AnnounceStatus::TerminalFailed),
+        "expired" => Ok(AnnounceStatus::Expired),
+        other => Err(DatabaseError::QueryFailed {
+            operation: "read announce work status".to_owned(),
+            message: format!("unknown announce status `{other}`"),
+        }),
+    }
+}
+
 fn announce_reason_key(reason: AnnounceReason) -> &'static str {
     match reason {
         AnnounceReason::Accepted => "accepted",
@@ -6568,6 +6709,165 @@ fn announce_reason_key(reason: AnnounceReason) -> &'static str {
         AnnounceReason::InvalidTorrentMetadata => "invalid_torrent_metadata",
         AnnounceReason::Expired => "expired",
     }
+}
+
+fn announce_reason_from_key(value: &str) -> Result<AnnounceReason, DatabaseError> {
+    match value {
+        "accepted" => Ok(AnnounceReason::Accepted),
+        "deduplicated" => Ok(AnnounceReason::Deduplicated),
+        "source_incomplete" => Ok(AnnounceReason::SourceIncomplete),
+        "inventory_refreshing" => Ok(AnnounceReason::InventoryRefreshing),
+        "dependency_backoff" => Ok(AnnounceReason::DependencyBackoff),
+        "candidate_downloading" => Ok(AnnounceReason::CandidateDownloading),
+        "client_checking" => Ok(AnnounceReason::ClientChecking),
+        "retry_after" => Ok(AnnounceReason::RetryAfter),
+        "transient_dependency_failure" => Ok(AnnounceReason::TransientDependencyFailure),
+        "saved" => Ok(AnnounceReason::Saved),
+        "injected" => Ok(AnnounceReason::Injected),
+        "dry_run" => Ok(AnnounceReason::DryRun),
+        "already_exists" => Ok(AnnounceReason::AlreadyExists),
+        "no_match_terminal" => Ok(AnnounceReason::NoMatchTerminal),
+        "invalid_request" => Ok(AnnounceReason::InvalidRequest),
+        "unsupported_shape" => Ok(AnnounceReason::UnsupportedShape),
+        "unsafe_path" => Ok(AnnounceReason::UnsafePath),
+        "invalid_torrent_metadata" => Ok(AnnounceReason::InvalidTorrentMetadata),
+        "expired" => Ok(AnnounceReason::Expired),
+        other => Err(DatabaseError::QueryFailed {
+            operation: "read announce work reason".to_owned(),
+            message: format!("unknown announce reason `{other}`"),
+        }),
+    }
+}
+
+fn active_announce_work_from_row(row: SqliteRow) -> Result<AnnounceWorkItem, DatabaseError> {
+    let id = AnnounceWorkId::new(row.get::<String, _>("id")).map_err(|error| {
+        DatabaseError::QueryFailed {
+            operation: "read announce work id".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let dedupe_hash = AnnounceDedupeHash::from_persisted(row.get::<String, _>("dedupe_hash"))
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: "read announce dedupe hash".to_owned(),
+            message: error.to_string(),
+        })?;
+    let tracker = TrackerName::new(row.get::<String, _>("tracker")).map_err(|error| {
+        DatabaseError::QueryFailed {
+            operation: "read announce tracker".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let guid = row
+        .get::<Option<String>, _>("guid")
+        .map(CandidateGuid::new)
+        .transpose()
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: "read announce guid".to_owned(),
+            message: error.to_string(),
+        })?;
+    let info_hash = row
+        .get::<Option<String>, _>("info_hash")
+        .map(InfoHash::new)
+        .transpose()
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: "read announce info hash".to_owned(),
+            message: error.to_string(),
+        })?;
+    let title = ItemTitle::new(row.get::<String, _>("title")).map_err(|error| {
+        DatabaseError::QueryFailed {
+            operation: "read announce title".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let size = row
+        .get::<Option<i64>, _>("size")
+        .map(|value| u64_from_i64(value, "announce size").map(ByteSize::new))
+        .transpose()?;
+    let cookie = row
+        .get::<Option<String>, _>("cookie")
+        .map(CookieSecret::new)
+        .transpose()
+        .map_err(|error| DatabaseError::QueryFailed {
+            operation: "read announce cookie".to_owned(),
+            message: error.to_string(),
+        })?;
+    let fetch = row
+        .get::<Option<String>, _>("download_url")
+        .map(|download_url| {
+            DownloadUrl::new(download_url)
+                .map_err(|error| DatabaseError::QueryFailed {
+                    operation: "read announce download url".to_owned(),
+                    message: error.to_string(),
+                })
+                .and_then(|download_url| {
+                    AnnounceFetchMaterial::new(&download_url, cookie).map_err(|error| {
+                        DatabaseError::QueryFailed {
+                            operation: "read announce fetch material".to_owned(),
+                            message: error.to_string(),
+                        }
+                    })
+                })
+        })
+        .transpose()?;
+    let attempt_count = u32::try_from(row.get::<i64, _>("attempt_count")).map_err(|error| {
+        DatabaseError::QueryFailed {
+            operation: "read announce attempt count".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+
+    Ok(AnnounceWorkItem {
+        id,
+        status: announce_status_from_key(row.get::<String, _>("status").as_str())?,
+        reason: announce_reason_from_key(row.get::<String, _>("reason").as_str())?,
+        dedupe_hash,
+        title,
+        tracker,
+        guid,
+        info_hash,
+        size,
+        fetch,
+        received_at_ms: row.get("received_at"),
+        updated_at_ms: row.get("updated_at"),
+        first_attempt_at_ms: row.get("first_attempt_at"),
+        finished_at_ms: row.get("finished_at"),
+        attempt_count,
+        next_attempt_at_ms: row.get("next_attempt_at"),
+        expires_at_ms: row.get("expires_at"),
+        lease: None,
+        last_dependency_kind: row
+            .get::<Option<String>, _>("last_dependency_kind")
+            .map(ReasonText::new)
+            .transpose()
+            .map_err(|error| DatabaseError::QueryFailed {
+                operation: "read announce dependency kind".to_owned(),
+                message: error.to_string(),
+            })?,
+        last_dependency_name: row
+            .get::<Option<String>, _>("last_dependency_name")
+            .map(ReasonText::new)
+            .transpose()
+            .map_err(|error| DatabaseError::QueryFailed {
+                operation: "read announce dependency name".to_owned(),
+                message: error.to_string(),
+            })?,
+        last_error_class: row
+            .get::<Option<String>, _>("last_error_class")
+            .map(ReasonText::new)
+            .transpose()
+            .map_err(|error| DatabaseError::QueryFailed {
+                operation: "read announce error class".to_owned(),
+                message: error.to_string(),
+            })?,
+        last_redacted_message: row
+            .get::<Option<String>, _>("last_error_message")
+            .map(ReasonText::new)
+            .transpose()
+            .map_err(|error| DatabaseError::QueryFailed {
+                operation: "read announce error message".to_owned(),
+                message: error.to_string(),
+            })?,
+    })
 }
 
 fn i64_from_u64(value: u64, field: &'static str) -> Result<i64, DatabaseError> {
