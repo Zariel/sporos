@@ -88,6 +88,52 @@ pub enum ActivityKind {
     CleanupRun,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityEffect {
+    ReadOnly,
+    LocalStateMutation,
+    ExternalMutation,
+    FilesystemMutation,
+    NotificationDelivery,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateSafety {
+    NaturallyIdempotent,
+    DeterministicAtomicWrite,
+    VerifyBeforeRetry,
+    RepeatAcceptedByContract,
+    DeliveryPolicyBounded,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityRetryBoundary {
+    SafeToRetryInsideActivity,
+    RetryOnlyAfterVerification,
+    RetryOnlyUnderDeliveryPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize)]
+pub struct ActivityRetryContract {
+    pub activity: ActivityKind,
+    pub effect: ActivityEffect,
+    pub duplicate_safety: DuplicateSafety,
+    pub retry_boundary: ActivityRetryBoundary,
+    pub contract: &'static str,
+}
+
+impl ActivityRetryContract {
+    pub const fn allows_bounded_inner_retry(self) -> bool {
+        matches!(
+            self.retry_boundary,
+            ActivityRetryBoundary::SafeToRetryInsideActivity
+        )
+    }
+}
+
 impl ActivityKind {
     pub const ALL: [Self; 11] = [
         Self::RepositoryRead,
@@ -121,6 +167,88 @@ impl ActivityKind {
 
     pub fn uses_duroxide_reserved_prefix(self) -> bool {
         self.as_str().starts_with(DUROXIDE_RESERVED_ACTIVITY_PREFIX)
+    }
+
+    pub const fn retry_contract(self) -> ActivityRetryContract {
+        match self {
+            Self::RepositoryRead => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::ReadOnly,
+                duplicate_safety: DuplicateSafety::NaturallyIdempotent,
+                retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
+                contract: "repository reads do not mutate external or local state and may use bounded transient database retry",
+            },
+            Self::RepositoryWrite => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "repository writes must use transactions, stable keys, or a follow-up read before retrying an ambiguous write",
+            },
+            Self::InventoryScanMedia => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::ReadOnly,
+                duplicate_safety: DuplicateSafety::NaturallyIdempotent,
+                retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
+                contract: "media scans only read filesystem metadata and may retry transient local IO without publishing partial state",
+            },
+            Self::InventoryRefreshClient => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "client inventory refresh may retry transient client reads before commit, but ambiguous persisted refresh state must be verified before repeating the activity",
+            },
+            Self::MatchingReverseLookup => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "reverse lookup and assessment persist deterministic candidate and decision rows, so ambiguous writes must be verified by stable candidate identity before retry",
+            },
+            Self::CandidateDownload => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::FilesystemMutation,
+                duplicate_safety: DuplicateSafety::DeterministicAtomicWrite,
+                retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
+                contract: "candidate downloads use deterministic cache keys and atomic writes; retry must accept a verified existing cache file",
+            },
+            Self::TorrentClientMutate => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::ExternalMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "torrent client mutation must check existing info hash or verify post-failure state before retrying injection, recheck, pause, resume, or start operations",
+            },
+            Self::ActionsPrepareLinks => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::FilesystemMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "link preparation uses deterministic destinations and must revalidate existing links and cleanup checkpoints before repeating a partial attempt",
+            },
+            Self::ActionsSaveTorrent => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::FilesystemMutation,
+                duplicate_safety: DuplicateSafety::DeterministicAtomicWrite,
+                retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
+                contract: "saved torrent writes use deterministic metadata, atomic output files, and verified existing-file handling before retrying transient local IO",
+            },
+            Self::NotificationsDeliver => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::NotificationDelivery,
+                duplicate_safety: DuplicateSafety::DeliveryPolicyBounded,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyUnderDeliveryPolicy,
+                contract: "notification delivery retries are bounded by endpoint policy; ambiguous timeout-after-send cases must not be replayed unless the policy accepts duplicate delivery",
+            },
+            Self::CleanupRun => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::RepeatAcceptedByContract,
+                retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
+                contract: "cleanup activities delete or mark deterministic stale records and files, and repeating cleanup must leave retained state unchanged",
+            },
+        }
     }
 }
 
@@ -507,6 +635,162 @@ mod tests {
             "media_inventory_completed",
             "media inventory event name",
         )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn activity_retry_contracts_cover_every_registered_activity() -> Result<(), Box<dyn Error>> {
+        for activity in ActivityKind::ALL {
+            let contract = activity.retry_contract();
+            ensure_eq(contract.activity, activity, "contract activity identity")?;
+            ensure_eq(
+                contract.contract.len() > 40,
+                true,
+                "contract description is operator-meaningful",
+            )?;
+            ensure_eq(
+                contract.contract.contains("secret"),
+                false,
+                "contract description must not mention secret material",
+            )?;
+
+            let json = serde_json::to_value(contract)?;
+            ensure_eq(
+                json["activity"].clone(),
+                json!(activity),
+                "contract activity json",
+            )?;
+            ensure_eq(
+                json["retry_boundary"].is_string(),
+                true,
+                "contract retry boundary json",
+            )?;
+            ensure_eq(
+                json["duplicate_safety"].is_string(),
+                true,
+                "contract duplicate safety json",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn side_effect_contracts_are_effect_safe() -> Result<(), Box<dyn Error>> {
+        for activity in ActivityKind::ALL {
+            let contract = activity.retry_contract();
+            match contract.effect {
+                ActivityEffect::ReadOnly => ensure_eq(
+                    contract.retry_boundary,
+                    ActivityRetryBoundary::SafeToRetryInsideActivity,
+                    "read only retry boundary",
+                )?,
+                ActivityEffect::LocalStateMutation => ensure_eq(
+                    matches!(
+                        contract.retry_boundary,
+                        ActivityRetryBoundary::RetryOnlyAfterVerification
+                            | ActivityRetryBoundary::SafeToRetryInsideActivity
+                    ),
+                    true,
+                    "local mutation retry boundary",
+                )?,
+                ActivityEffect::ExternalMutation => {
+                    ensure_eq(
+                        contract.retry_boundary,
+                        ActivityRetryBoundary::RetryOnlyAfterVerification,
+                        "external mutation retry boundary",
+                    )?;
+                    ensure_eq(
+                        contract.duplicate_safety,
+                        DuplicateSafety::VerifyBeforeRetry,
+                        "external mutation duplicate safety",
+                    )?;
+                }
+                ActivityEffect::FilesystemMutation => ensure_eq(
+                    matches!(
+                        contract.duplicate_safety,
+                        DuplicateSafety::DeterministicAtomicWrite
+                            | DuplicateSafety::VerifyBeforeRetry
+                    ),
+                    true,
+                    "filesystem mutation duplicate safety",
+                )?,
+                ActivityEffect::NotificationDelivery => {
+                    ensure_eq(
+                        contract.retry_boundary,
+                        ActivityRetryBoundary::RetryOnlyUnderDeliveryPolicy,
+                        "notification delivery retry boundary",
+                    )?;
+                    ensure_eq(
+                        contract.duplicate_safety,
+                        DuplicateSafety::DeliveryPolicyBounded,
+                        "notification delivery duplicate safety",
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_mutation_contracts_require_verification() -> Result<(), Box<dyn Error>> {
+        for activity in [
+            ActivityKind::RepositoryWrite,
+            ActivityKind::InventoryRefreshClient,
+            ActivityKind::MatchingReverseLookup,
+            ActivityKind::TorrentClientMutate,
+            ActivityKind::ActionsPrepareLinks,
+        ] {
+            let contract = activity.retry_contract();
+            ensure_eq(
+                contract.allows_bounded_inner_retry(),
+                false,
+                "ambiguous mutation inner retry boundary",
+            )?;
+            ensure_eq(
+                contract.duplicate_safety,
+                DuplicateSafety::VerifyBeforeRetry,
+                "ambiguous mutation duplicate safety",
+            )?;
+            ensure_eq(
+                contract.retry_boundary,
+                ActivityRetryBoundary::RetryOnlyAfterVerification,
+                "ambiguous mutation retry boundary",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deterministic_side_effect_contracts_allow_inner_retries() -> Result<(), Box<dyn Error>> {
+        for (activity, safety) in [
+            (
+                ActivityKind::CandidateDownload,
+                DuplicateSafety::DeterministicAtomicWrite,
+            ),
+            (
+                ActivityKind::ActionsSaveTorrent,
+                DuplicateSafety::DeterministicAtomicWrite,
+            ),
+            (
+                ActivityKind::CleanupRun,
+                DuplicateSafety::RepeatAcceptedByContract,
+            ),
+        ] {
+            let contract = activity.retry_contract();
+            ensure_eq(
+                contract.allows_bounded_inner_retry(),
+                true,
+                "deterministic side effect retry boundary",
+            )?;
+            ensure_eq(
+                contract.duplicate_safety,
+                safety,
+                "deterministic side effect duplicate safety",
+            )?;
+        }
 
         Ok(())
     }
