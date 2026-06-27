@@ -1306,6 +1306,14 @@ async fn accept_announcement(
         }
     };
 
+    accept_announcement_work(metrics, acceptor, work).await
+}
+
+async fn accept_announcement_work(
+    metrics: &MetricsRegistry,
+    acceptor: &AnnounceAcceptor,
+    work: AnnounceWorkItem,
+) -> Response {
     match acceptor
         .repository
         .insert_or_dedupe_announce_work(&work, acceptor.config.max_pending)
@@ -2210,6 +2218,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, header};
+    use duroxide::runtime::OrchestrationStatus;
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -2985,6 +2994,49 @@ mod tests {
             "https://tracker.example/download?id=1&authkey=[REDACTED]&torrent_pass=[REDACTED]",
             redacted_download_url
         );
+    }
+
+    #[tokio::test]
+    async fn announcement_acceptance_rejects_inserted_work_when_workflow_start_fails() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let metrics = MetricsRegistry::new();
+        let workflow_runtime = test_workflow_runtime("announce-start-failure").await;
+        let work = test_announce_work_item("ann_failed_start", "guid-failed-start");
+        workflow_runtime
+            .client()
+            .start_orchestration_typed(
+                "announce:ann_failed_start",
+                WorkflowKind::Announce.orchestration_name(),
+                "not an announce workflow input".to_owned(),
+            )
+            .await
+            .unwrap();
+        wait_for_failed_orchestration(&workflow_runtime, "announce:ann_failed_start").await;
+        let acceptor = AnnounceAcceptor {
+            repository: repository.clone(),
+            config: AnnounceQueueConfig::default(),
+            workflow_runtime,
+        };
+
+        let response = accept_announcement_work(&metrics, &acceptor, work.clone()).await;
+        let stored = repository
+            .announce_work_item(&work.id)
+            .await
+            .unwrap()
+            .expect("rejected work should remain durable");
+
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, response.status());
+        assert_eq!(AnnounceStatus::TerminalFailed, stored.status);
+        assert_eq!(AnnounceReason::TransientDependencyFailure, stored.reason);
+        assert!(stored.fetch.is_none());
+        assert!(
+            stored
+                .last_redacted_message
+                .as_ref()
+                .is_some_and(|message| message.as_str().contains("cannot start announce workflow"))
+        );
+
+        acceptor.workflow_runtime.shutdown(Some(1_000)).await;
     }
 
     #[tokio::test]
@@ -4005,6 +4057,65 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("workflows.db");
         DuroxideWorkflowRuntime::start(path).await.unwrap()
+    }
+
+    async fn wait_for_failed_orchestration(runtime: &DuroxideWorkflowRuntime, instance_id: &str) {
+        let client = runtime.client();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match client
+                .get_orchestration_status(instance_id)
+                .await
+                .expect("workflow status should be readable")
+            {
+                OrchestrationStatus::Failed { .. } => return,
+                OrchestrationStatus::Completed { .. } => {
+                    panic!("workflow completed unexpectedly");
+                }
+                OrchestrationStatus::NotFound | OrchestrationStatus::Running { .. } => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for failed workflow {instance_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn test_announce_work_item(id: &str, guid: &str) -> AnnounceWorkItem {
+        let tracker = TrackerName::new("tracker.example").unwrap();
+        let guid = CandidateGuid::new(guid).unwrap();
+        let dedupe_hash = AnnounceDedupeIdentity::Guid {
+            tracker: tracker.clone(),
+            guid: guid.clone(),
+        }
+        .hash();
+        let download_url = DownloadUrl::new("https://tracker.example/download?id=1").unwrap();
+        let fetch = AnnounceFetchMaterial::new(&download_url, None).unwrap();
+        AnnounceWorkItem {
+            id: AnnounceWorkId::new(id).unwrap(),
+            status: AnnounceStatus::Queued,
+            reason: AnnounceReason::Accepted,
+            dedupe_hash,
+            title: ItemTitle::new("Example").unwrap(),
+            tracker,
+            guid: Some(guid),
+            info_hash: None,
+            size: Some(ByteSize::new(42)),
+            fetch: Some(fetch),
+            received_at_ms: unix_time_ms(),
+            updated_at_ms: unix_time_ms(),
+            first_attempt_at_ms: None,
+            finished_at_ms: None,
+            attempt_count: 0,
+            next_attempt_at_ms: unix_time_ms(),
+            expires_at_ms: unix_time_ms().saturating_add(60_000),
+            lease: None,
+            last_dependency_kind: None,
+            last_dependency_name: None,
+            last_error_class: None,
+            last_redacted_message: None,
+        }
     }
 
     fn test_download_resolver() -> AnnounceDownloadUrlResolver {

@@ -78,6 +78,7 @@ const SAVED_RETRY_SCAN_ACTIVITY_ID: &str = "saved-retry-scan";
 const SAVED_RETRY_PROCESS_ACTIVITY_ID: &str = "saved-retry-process";
 const SAVED_RETRY_FINALIZE_ACTIVITY_ID: &str = "saved-retry-finalize";
 const SAVED_RETRY_ITEM_CHILD_CONCURRENCY: usize = 1;
+const ANNOUNCE_INVENTORY_WAIT_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 const ANNOUNCE_WORKFLOW_OWNER: &str = "sporos-announce-workflow";
 const INVENTORY_COMPLETION_FANOUT_LIMIT: u16 = 1_000;
 const INVENTORY_COMPLETION_LEASE_MS: i64 = 60_000;
@@ -4567,27 +4568,7 @@ async fn announce_orchestration(
                 let wait_for_client = setup
                     .events
                     .contains(&WorkflowEventName::ClientInventoryCompleted);
-                if wait_for_media && wait_for_client {
-                    let media = ctx.dequeue_event_typed::<InventoryCompletionEvent>(
-                        WorkflowEventName::MediaInventoryCompleted.as_str(),
-                    );
-                    let client = ctx.dequeue_event_typed::<InventoryCompletionEvent>(
-                        WorkflowEventName::ClientInventoryCompleted.as_str(),
-                    );
-                    let (_media, _client) = ctx.join2(media, client).await;
-                } else if wait_for_media {
-                    let _media = ctx
-                        .dequeue_event_typed::<InventoryCompletionEvent>(
-                            WorkflowEventName::MediaInventoryCompleted.as_str(),
-                        )
-                        .await;
-                } else if wait_for_client {
-                    let _client = ctx
-                        .dequeue_event_typed::<InventoryCompletionEvent>(
-                            WorkflowEventName::ClientInventoryCompleted.as_str(),
-                        )
-                        .await;
-                }
+                wait_for_announce_inventory_or_recheck(&ctx, wait_for_media, wait_for_client).await;
                 set_announce_custom_status(
                     &ctx,
                     &input,
@@ -4621,6 +4602,38 @@ async fn announce_orchestration(
             }
         }
     }
+}
+
+async fn wait_for_announce_inventory_or_recheck(
+    ctx: &OrchestrationContext,
+    wait_for_media: bool,
+    wait_for_client: bool,
+) {
+    if wait_for_media
+        && wait_for_announce_inventory_event_or_recheck(
+            ctx,
+            WorkflowEventName::MediaInventoryCompleted,
+        )
+        .await
+    {
+        return;
+    }
+    if wait_for_client {
+        let _timed_out = wait_for_announce_inventory_event_or_recheck(
+            ctx,
+            WorkflowEventName::ClientInventoryCompleted,
+        )
+        .await;
+    }
+}
+
+async fn wait_for_announce_inventory_event_or_recheck(
+    ctx: &OrchestrationContext,
+    event_name: WorkflowEventName,
+) -> bool {
+    let timer = ctx.schedule_timer(ANNOUNCE_INVENTORY_WAIT_RECHECK_INTERVAL);
+    let inventory = ctx.dequeue_event_typed::<InventoryCompletionEvent>(event_name.as_str());
+    ctx.select2(timer, inventory).await.is_first()
 }
 
 async fn queue_announce_inventory_refresh(
@@ -5452,6 +5465,389 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_orchestration_waits_for_media_and_client_inventory_events() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let process_calls = Arc::new(AtomicUsize::new(0));
+        let wait_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::start_with_options(
+            Arc::clone(&store),
+            announce_inventory_wait_test_activities(
+                Arc::clone(&process_calls),
+                Arc::clone(&wait_calls),
+                vec![
+                    WorkflowEventName::MediaInventoryCompleted,
+                    WorkflowEventName::ClientInventoryCompleted,
+                ],
+            ),
+            orchestration_registry(),
+            RuntimeOptions {
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                dispatcher_long_poll_timeout: Duration::from_millis(10),
+                orchestration_concurrency: 2,
+                worker_concurrency: 2,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration_typed(
+                "announce:wait-both",
+                WorkflowKind::Announce.orchestration_name(),
+                test_announce_workflow_input("ann_wait_both"),
+            )
+            .await
+            .unwrap();
+
+        client
+            .enqueue_event_typed(
+                "announce:wait-both",
+                WorkflowEventName::MediaInventoryCompleted.as_str(),
+                &test_inventory_completion_event(InventoryRefreshKind::MediaFull),
+            )
+            .await
+            .unwrap();
+        client
+            .enqueue_event_typed(
+                "announce:wait-both",
+                WorkflowEventName::ClientInventoryCompleted.as_str(),
+                &test_inventory_completion_event(InventoryRefreshKind::Client),
+            )
+            .await
+            .unwrap();
+        wait_for_atomic_at_least(&process_calls, 1).await;
+        wait_for_atomic_at_least(&wait_calls, 1).await;
+        let status = client
+            .wait_for_orchestration("announce:wait-both", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("Saved", output);
+            }
+            other => panic!("expected completed announce workflow, got {other:?}"),
+        }
+        assert!(process_calls.load(Ordering::SeqCst) >= 2);
+        assert!(wait_calls.load(Ordering::SeqCst) >= 1);
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn announce_orchestration_waits_for_client_inventory_event_only() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let process_calls = Arc::new(AtomicUsize::new(0));
+        let wait_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::start_with_options(
+            Arc::clone(&store),
+            announce_inventory_wait_test_activities(
+                Arc::clone(&process_calls),
+                Arc::clone(&wait_calls),
+                vec![WorkflowEventName::ClientInventoryCompleted],
+            ),
+            orchestration_registry(),
+            RuntimeOptions {
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                dispatcher_long_poll_timeout: Duration::from_millis(10),
+                orchestration_concurrency: 2,
+                worker_concurrency: 2,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration_typed(
+                "announce:wait-client",
+                WorkflowKind::Announce.orchestration_name(),
+                test_announce_workflow_input("ann_wait_client"),
+            )
+            .await
+            .unwrap();
+
+        client
+            .enqueue_event_typed(
+                "announce:wait-client",
+                WorkflowEventName::ClientInventoryCompleted.as_str(),
+                &test_inventory_completion_event(InventoryRefreshKind::Client),
+            )
+            .await
+            .unwrap();
+        wait_for_atomic_at_least(&process_calls, 1).await;
+        wait_for_atomic_at_least(&wait_calls, 1).await;
+        let status = client
+            .wait_for_orchestration("announce:wait-client", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("Saved", output);
+            }
+            other => panic!("expected completed announce workflow, got {other:?}"),
+        }
+        assert!(process_calls.load(Ordering::SeqCst) >= 2);
+        assert!(wait_calls.load(Ordering::SeqCst) >= 1);
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn announce_orchestration_rechecks_when_inventory_completion_event_is_missed() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let process_calls = Arc::new(AtomicUsize::new(0));
+        let wait_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::start_with_options(
+            Arc::clone(&store),
+            announce_inventory_wait_test_activities(
+                Arc::clone(&process_calls),
+                Arc::clone(&wait_calls),
+                vec![WorkflowEventName::MediaInventoryCompleted],
+            ),
+            orchestration_registry(),
+            RuntimeOptions {
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                dispatcher_long_poll_timeout: Duration::from_millis(10),
+                orchestration_concurrency: 2,
+                worker_concurrency: 2,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration_typed(
+                "announce:missed-inventory-event",
+                WorkflowKind::Announce.orchestration_name(),
+                test_announce_workflow_input("ann_missed_inventory_event"),
+            )
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("announce:missed-inventory-event", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("Saved", output);
+            }
+            other => panic!("expected completed announce workflow, got {other:?}"),
+        }
+        assert_eq!(2, process_calls.load(Ordering::SeqCst));
+        assert_eq!(1, wait_calls.load(Ordering::SeqCst));
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn announce_orchestration_preserves_partial_inventory_wait_after_recheck() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let process_calls = Arc::new(AtomicUsize::new(0));
+        let wait_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::start_with_options(
+            Arc::clone(&store),
+            announce_partial_inventory_wait_test_activities(
+                Arc::clone(&process_calls),
+                Arc::clone(&wait_calls),
+            ),
+            orchestration_registry(),
+            RuntimeOptions {
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                dispatcher_long_poll_timeout: Duration::from_millis(10),
+                orchestration_concurrency: 2,
+                worker_concurrency: 2,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration_typed(
+                "announce:partial-inventory-wait",
+                WorkflowKind::Announce.orchestration_name(),
+                test_announce_workflow_input("ann_partial_inventory_wait"),
+            )
+            .await
+            .unwrap();
+        wait_for_atomic_at_least(&wait_calls, 1).await;
+        client
+            .enqueue_event_typed(
+                "announce:partial-inventory-wait",
+                WorkflowEventName::MediaInventoryCompleted.as_str(),
+                &test_inventory_completion_event(InventoryRefreshKind::MediaFull),
+            )
+            .await
+            .unwrap();
+        wait_for_atomic_at_least(&process_calls, 2).await;
+        client
+            .enqueue_event_typed(
+                "announce:partial-inventory-wait",
+                WorkflowEventName::ClientInventoryCompleted.as_str(),
+                &test_inventory_completion_event(InventoryRefreshKind::Client),
+            )
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("announce:partial-inventory-wait", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("Saved", output);
+            }
+            other => panic!("expected completed announce workflow, got {other:?}"),
+        }
+        assert!(process_calls.load(Ordering::SeqCst) >= 3);
+        assert!(wait_calls.load(Ordering::SeqCst) >= 2);
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn announce_orchestration_resumes_after_candidate_cache_dependency_wait() {
+        let store = Arc::new(SqliteProvider::new_in_memory().await.unwrap()) as Arc<dyn Provider>;
+        let process_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::start_with_options(
+            Arc::clone(&store),
+            announce_dependency_retry_test_activities(Arc::clone(&process_calls), 5),
+            orchestration_registry(),
+            RuntimeOptions {
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                dispatcher_long_poll_timeout: Duration::from_millis(10),
+                orchestration_concurrency: 2,
+                worker_concurrency: 2,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration_typed(
+                "announce:wait-cache",
+                WorkflowKind::Announce.orchestration_name(),
+                test_announce_workflow_input("ann_wait_cache"),
+            )
+            .await
+            .unwrap();
+        let status = client
+            .wait_for_orchestration("announce:wait-cache", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("Saved", output);
+            }
+            other => panic!("expected completed announce workflow, got {other:?}"),
+        }
+        assert_eq!(2, process_calls.load(Ordering::SeqCst));
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn announce_orchestration_resumes_dependency_wait_after_file_backed_restart() {
+        let temp_dir = TestTempDir::new("duroxide-announce-dependency-restart");
+        let database_path = temp_dir.path().join(WORKFLOW_DATABASE_FILE);
+        prepare_workflow_database(&database_path).await.unwrap();
+        let database_url = format!("sqlite:{}", database_path.display());
+        let process_calls = Arc::new(AtomicUsize::new(0));
+        let first_store =
+            Arc::new(SqliteProvider::new(&database_url, None).await.unwrap()) as Arc<dyn Provider>;
+        let first_runtime = Runtime::start_with_options(
+            Arc::clone(&first_store),
+            announce_dependency_retry_test_activities(Arc::clone(&process_calls), 1_000),
+            orchestration_registry(),
+            RuntimeOptions {
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                dispatcher_long_poll_timeout: Duration::from_millis(10),
+                orchestration_concurrency: 2,
+                worker_concurrency: 2,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await;
+        let first_client = Client::new(Arc::clone(&first_store));
+        first_client
+            .start_orchestration_typed(
+                "announce:wait-cache-restart",
+                WorkflowKind::Announce.orchestration_name(),
+                test_announce_workflow_input("ann_wait_cache_restart"),
+            )
+            .await
+            .unwrap();
+        wait_for_atomic_at_least(&process_calls, 1).await;
+        first_runtime.shutdown(Some(1)).await;
+        assert_eq!(1, process_calls.load(Ordering::SeqCst));
+
+        let second_store =
+            Arc::new(SqliteProvider::new(&database_url, None).await.unwrap()) as Arc<dyn Provider>;
+        let second_runtime = Runtime::start_with_options(
+            Arc::clone(&second_store),
+            announce_dependency_retry_test_activities(Arc::clone(&process_calls), 1_000),
+            orchestration_registry(),
+            RuntimeOptions {
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                dispatcher_long_poll_timeout: Duration::from_millis(10),
+                orchestration_concurrency: 2,
+                worker_concurrency: 2,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await;
+        let second_client = Client::new(Arc::clone(&second_store));
+        let status = second_client
+            .wait_for_orchestration("announce:wait-cache-restart", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        match status {
+            OrchestrationStatus::Completed { output, .. } => {
+                assert_eq!("Saved", output);
+            }
+            other => panic!("expected completed announce workflow after restart, got {other:?}"),
+        }
+        assert_eq!(2, process_calls.load(Ordering::SeqCst));
+
+        second_runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_rejects_failed_announce_instance_on_resubmission() {
+        let temp_dir = TestTempDir::new("duroxide-announce-failed-resubmit");
+        let database_path = temp_dir.path().join("state").join(WORKFLOW_DATABASE_FILE);
+        let runtime = DuroxideWorkflowRuntime::start(database_path)
+            .await
+            .expect("workflow runtime should start");
+        let work = test_announce_work("ann_failed_instance", "guid-failed-instance", 1_000);
+
+        runtime
+            .client()
+            .start_orchestration_typed(
+                "announce:ann_failed_instance",
+                WorkflowKind::Announce.orchestration_name(),
+                "not an announce workflow input".to_owned(),
+            )
+            .await
+            .expect("failed announce workflow should be queued");
+        wait_for_orchestration_failure(&runtime.client(), "announce:ann_failed_instance").await;
+
+        let error = runtime
+            .submit_announcement(&work)
+            .await
+            .expect_err("failed announce instance must not be treated as recoverable");
+        assert!(matches!(
+            error,
+            DuroxideWorkflowRuntimeError::FailedAnnounceWorkflow { .. }
+        ));
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
     async fn submit_announcement_records_initial_running_projection() {
         let temp_dir = TestTempDir::new("duroxide-announce-start-projection");
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -6141,22 +6537,26 @@ mod tests {
     }
 
     async fn wait_for_supervisor_failure(client: &Client, instance_id: &str) {
+        wait_for_orchestration_failure(client, instance_id).await;
+    }
+
+    async fn wait_for_orchestration_failure(client: &Client, instance_id: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match client
                 .get_orchestration_status(instance_id)
                 .await
-                .expect("supervisor status should be readable")
+                .expect("orchestration status should be readable")
             {
                 OrchestrationStatus::Failed { .. } => return,
                 OrchestrationStatus::Completed { .. } => {
-                    panic!("supervisor completed unexpectedly");
+                    panic!("orchestration completed unexpectedly");
                 }
                 OrchestrationStatus::NotFound | OrchestrationStatus::Running { .. } => {}
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for supervisor failure"
+                "timed out waiting for orchestration {instance_id} failure"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -6252,6 +6652,37 @@ mod tests {
         }
     }
 
+    fn test_announce_workflow_input(work_id: &str) -> AnnounceWorkflowInput {
+        AnnounceWorkflowInput {
+            work_id: work_id.to_owned(),
+            dedupe_hash: format!("dedupe-{work_id}"),
+            tracker: "tracker.example".to_owned(),
+            candidate_guid: format!("guid-{work_id}"),
+            candidate_title: "Example".to_owned(),
+            received_at_ms: 1_000,
+            expires_at_ms: 61_000,
+            fetch_material_present: true,
+            raw_secret_material_count: 1,
+        }
+    }
+
+    fn test_inventory_completion_event(kind: InventoryRefreshKind) -> InventoryCompletionEvent {
+        let source_workflow_id = match kind {
+            InventoryRefreshKind::MediaFull => "inventory:media:full",
+            InventoryRefreshKind::MediaChanged => "inventory:media:changed:test",
+            InventoryRefreshKind::Client => "inventory:client",
+        };
+
+        InventoryCompletionEvent {
+            inventory_kind: kind,
+            source_workflow_id: source_workflow_id.to_owned(),
+            completed_at_ms: 2_000,
+            scanned_items: 1,
+            persisted_items: 1,
+            pruned_items: 0,
+        }
+    }
+
     fn test_announce_fetch_material() -> AnnounceFetchMaterial {
         let download_url =
             DownloadUrl::new("https://tracker.example/download?id=1&passkey=download-secret")
@@ -6261,6 +6692,177 @@ mod tests {
             Some(CookieSecret::new("sid=cookie-secret").unwrap()),
         )
         .unwrap()
+    }
+
+    async fn wait_for_atomic_at_least(counter: &AtomicUsize, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if counter.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for counter to reach {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn announce_inventory_wait_test_activities(
+        process_calls: Arc<AtomicUsize>,
+        wait_calls: Arc<AtomicUsize>,
+        events: Vec<WorkflowEventName>,
+    ) -> ActivityRegistry {
+        let process_events = events.clone();
+        let wait_events = events;
+        ActivityRegistry::builder()
+            .register_typed(
+                ActivityKind::MatchingReverseLookup.as_str(),
+                move |_ctx: ActivityContext,
+                      _input: ActivityInputEnvelope<AnnounceActivityInput>| {
+                    let process_calls = Arc::clone(&process_calls);
+                    let events = process_events.clone();
+                    async move {
+                        let call_index = process_calls.fetch_add(1, Ordering::SeqCst);
+                        if call_index == 0 {
+                            Ok(AnnounceProcessActivityOutput {
+                                state: AnnounceActivityState::WaitingInventory,
+                                reason: "InventoryRefreshing".to_owned(),
+                                next_attempt_at_ms: Some(2_000),
+                                retry_delay_ms: Some(1),
+                                dependency: None,
+                                events,
+                            })
+                        } else {
+                            Ok(AnnounceProcessActivityOutput {
+                                state: AnnounceActivityState::Succeeded,
+                                reason: "Saved".to_owned(),
+                                next_attempt_at_ms: None,
+                                retry_delay_ms: None,
+                                dependency: None,
+                                events: Vec::new(),
+                            })
+                        }
+                    }
+                },
+            )
+            .register_typed(
+                ActivityKind::RepositoryWrite.as_str(),
+                move |_ctx: ActivityContext,
+                      _input: ActivityInputEnvelope<AnnounceActivityInput>| {
+                    let wait_calls = Arc::clone(&wait_calls);
+                    let events = wait_events.clone();
+                    async move {
+                        wait_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(AnnounceWaitActivityOutput { events })
+                    }
+                },
+            )
+            .build()
+    }
+
+    fn announce_partial_inventory_wait_test_activities(
+        process_calls: Arc<AtomicUsize>,
+        wait_calls: Arc<AtomicUsize>,
+    ) -> ActivityRegistry {
+        ActivityRegistry::builder()
+            .register_typed(
+                ActivityKind::MatchingReverseLookup.as_str(),
+                move |_ctx: ActivityContext,
+                      _input: ActivityInputEnvelope<AnnounceActivityInput>| {
+                    let process_calls = Arc::clone(&process_calls);
+                    async move {
+                        match process_calls.fetch_add(1, Ordering::SeqCst) {
+                            0 => Ok(AnnounceProcessActivityOutput {
+                                state: AnnounceActivityState::WaitingInventory,
+                                reason: "InventoryRefreshing".to_owned(),
+                                next_attempt_at_ms: Some(2_000),
+                                retry_delay_ms: Some(1),
+                                dependency: None,
+                                events: vec![
+                                    WorkflowEventName::MediaInventoryCompleted,
+                                    WorkflowEventName::ClientInventoryCompleted,
+                                ],
+                            }),
+                            1 => Ok(AnnounceProcessActivityOutput {
+                                state: AnnounceActivityState::WaitingInventory,
+                                reason: "InventoryRefreshing".to_owned(),
+                                next_attempt_at_ms: Some(3_000),
+                                retry_delay_ms: Some(1),
+                                dependency: None,
+                                events: vec![WorkflowEventName::ClientInventoryCompleted],
+                            }),
+                            _ => Ok(AnnounceProcessActivityOutput {
+                                state: AnnounceActivityState::Succeeded,
+                                reason: "Saved".to_owned(),
+                                next_attempt_at_ms: None,
+                                retry_delay_ms: None,
+                                dependency: None,
+                                events: Vec::new(),
+                            }),
+                        }
+                    }
+                },
+            )
+            .register_typed(
+                ActivityKind::RepositoryWrite.as_str(),
+                move |_ctx: ActivityContext,
+                      _input: ActivityInputEnvelope<AnnounceActivityInput>| {
+                    let wait_calls = Arc::clone(&wait_calls);
+                    async move {
+                        let events = if wait_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            vec![
+                                WorkflowEventName::MediaInventoryCompleted,
+                                WorkflowEventName::ClientInventoryCompleted,
+                            ]
+                        } else {
+                            vec![WorkflowEventName::ClientInventoryCompleted]
+                        };
+                        Ok(AnnounceWaitActivityOutput { events })
+                    }
+                },
+            )
+            .build()
+    }
+
+    fn announce_dependency_retry_test_activities(
+        process_calls: Arc<AtomicUsize>,
+        retry_delay_ms: u64,
+    ) -> ActivityRegistry {
+        ActivityRegistry::builder()
+            .register_typed(
+                ActivityKind::MatchingReverseLookup.as_str(),
+                move |_ctx: ActivityContext,
+                      _input: ActivityInputEnvelope<AnnounceActivityInput>| {
+                    let process_calls = Arc::clone(&process_calls);
+                    async move {
+                        let call_index = process_calls.fetch_add(1, Ordering::SeqCst);
+                        if call_index == 0 {
+                            Ok(AnnounceProcessActivityOutput {
+                                state: AnnounceActivityState::WaitingDependency,
+                                reason: "CandidateCacheUnavailable".to_owned(),
+                                next_attempt_at_ms: Some(2_000),
+                                retry_delay_ms: Some(retry_delay_ms),
+                                dependency: Some(AnnounceProjectionDependency {
+                                    kind: DependencyKind::LocalState.as_str().to_owned(),
+                                    name: "candidate_cache".to_owned(),
+                                }),
+                                events: Vec::new(),
+                            })
+                        } else {
+                            Ok(AnnounceProcessActivityOutput {
+                                state: AnnounceActivityState::Succeeded,
+                                reason: "Saved".to_owned(),
+                                next_attempt_at_ms: None,
+                                retry_delay_ms: None,
+                                dependency: None,
+                                events: Vec::new(),
+                            })
+                        }
+                    }
+                },
+            )
+            .build()
     }
 
     #[tokio::test]
