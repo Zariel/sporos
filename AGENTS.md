@@ -171,6 +171,11 @@ Keep the configured `client_host` value as the persisted client identity unless
 a real client metadata table reduces repeated state or is needed for multi-client
 ownership. Existing client-owned tables should key by `client_host` directly.
 
+When editing Duroxide workflow code, follow
+`docs/duroxide-programming-guide.md`. It is the local concise contract; use the
+upstream Duroxide orchestration guide linked from that file for full API details
+instead of vendoring upstream documentation into this repository.
+
 ## Conventions & Patterns
 
 ### Rust design
