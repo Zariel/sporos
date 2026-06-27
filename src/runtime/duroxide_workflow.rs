@@ -23,7 +23,7 @@ use crate::inventory_refresh::{
     record_inventory_refresh_health, scan_failure_reason,
 };
 use crate::persistence::repository::{
-    Repository, SearchCandidateMaterialRef, WorkflowInventoryCompletionRecord,
+    AnnounceDependency, Repository, SearchCandidateMaterialRef, WorkflowInventoryCompletionRecord,
     WorkflowInventoryWaiterRecord, WorkflowProjectionDependency, WorkflowProjectionUpdate,
 };
 use crate::runtime::announce_worker::{
@@ -467,6 +467,20 @@ impl DuroxideWorkflowRuntime {
                             message: error.to_string(),
                         },
                     )?;
+                record_announce_start_projection(
+                    &self.repository,
+                    &instance_id,
+                    work,
+                    unix_time_ms(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        workflow_id = %instance_id,
+                        error = %error,
+                        "failed to record initial announce workflow projection after workflow start"
+                    );
+                });
                 Ok(AnnounceWorkflowSubmission {
                     workflow_id: instance_id,
                     outcome: AnnounceWorkflowSubmissionOutcome::Started,
@@ -1651,12 +1665,28 @@ struct AnnounceProcessActivityOutput {
     reason: String,
     next_attempt_at_ms: Option<i64>,
     retry_delay_ms: Option<u64>,
+    dependency: Option<AnnounceProjectionDependency>,
     events: Vec<WorkflowEventName>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct AnnounceWaitActivityOutput {
     events: Vec<WorkflowEventName>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct AnnounceProjectionDependency {
+    kind: String,
+    name: String,
+}
+
+impl From<&AnnounceDependency> for AnnounceProjectionDependency {
+    fn from(value: &AnnounceDependency) -> Self {
+        Self {
+            kind: value.kind.as_str().to_owned(),
+            name: value.name.as_str().to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -3703,6 +3733,36 @@ async fn record_announce_action_checkpoint(
     }
 }
 
+async fn record_announce_start_projection(
+    repository: &Option<Repository>,
+    workflow_id: &str,
+    work: &AnnounceWorkItem,
+    now_ms: i64,
+) -> Result<(), String> {
+    let Some(repository) = repository.as_ref() else {
+        return Ok(());
+    };
+    let update = WorkflowProjectionUpdate {
+        workflow_id,
+        workflow_kind: WorkflowKind::Announce,
+        public_id: work.id.as_str(),
+        state: WorkflowState::Running,
+        reason: WorkflowReason::RunningActivity,
+        next_action: Some("starting"),
+        raw_secret_material_count: u16::from(work.fetch.is_some()),
+        blocked_dependency: None,
+        started_at_ms: work.received_at_ms,
+        updated_at_ms: now_ms,
+        finished_at_ms: None,
+    };
+    retry_database_call("record initial announce workflow projection", None, || {
+        repository.record_workflow_projection(&update)
+    })
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 async fn completed_announce_activity_output(
     repository: &Repository,
     id: &AnnounceWorkId,
@@ -3799,6 +3859,7 @@ fn announce_process_activity_output(
             reason: announce_reason_label(*reason),
             next_attempt_at_ms: None,
             retry_delay_ms: None,
+            dependency: None,
             events: Vec::new(),
         },
         AnnounceWorkOutcome::TerminalFailed { reason, .. } => AnnounceProcessActivityOutput {
@@ -3806,12 +3867,13 @@ fn announce_process_activity_output(
             reason: announce_reason_label(*reason),
             next_attempt_at_ms: None,
             retry_delay_ms: None,
+            dependency: None,
             events: Vec::new(),
         },
         AnnounceWorkOutcome::Waiting {
             reason,
             next_attempt_at_ms,
-            ..
+            dependency,
         } => AnnounceProcessActivityOutput {
             state: if *reason == AnnounceReason::InventoryRefreshing {
                 AnnounceActivityState::WaitingInventory
@@ -3821,6 +3883,7 @@ fn announce_process_activity_output(
             reason: announce_reason_label(*reason),
             next_attempt_at_ms: Some(*next_attempt_at_ms),
             retry_delay_ms: Some(retry_delay_ms(now_ms, *next_attempt_at_ms)),
+            dependency: dependency.as_ref().map(AnnounceProjectionDependency::from),
             events: Vec::new(),
         },
         AnnounceWorkOutcome::Retryable {
@@ -3832,6 +3895,7 @@ fn announce_process_activity_output(
             reason: announce_reason_label(*reason),
             next_attempt_at_ms: Some(*next_attempt_at_ms),
             retry_delay_ms: Some(retry_delay_ms(now_ms, *next_attempt_at_ms)),
+            dependency: None,
             events: Vec::new(),
         },
         AnnounceWorkOutcome::Release {
@@ -3842,6 +3906,7 @@ fn announce_process_activity_output(
             reason: announce_reason_label(*reason),
             next_attempt_at_ms: Some(*next_attempt_at_ms),
             retry_delay_ms: Some(retry_delay_ms(now_ms, *next_attempt_at_ms)),
+            dependency: None,
             events: Vec::new(),
         },
     }
@@ -3862,6 +3927,7 @@ async fn record_announce_activity_projection(
     output: &AnnounceProcessActivityOutput,
     now_ms: i64,
 ) -> Result<(), String> {
+    let mut blocked_dependency = None;
     let (state, reason, next_action, finished_at_ms, raw_secret_material_count) = match output.state
     {
         AnnounceActivityState::Succeeded => (
@@ -3900,22 +3966,37 @@ async fn record_announce_activity_projection(
             input.raw_secret_material_count,
         ),
     };
-    repository
-        .record_workflow_projection(&WorkflowProjectionUpdate {
-            workflow_id,
-            workflow_kind: WorkflowKind::Announce,
-            public_id: &input.work_id,
-            state,
-            reason,
-            next_action,
-            raw_secret_material_count,
-            blocked_dependency: None,
-            started_at_ms: input.received_at_ms,
-            updated_at_ms: now_ms,
-            finished_at_ms,
-        })
-        .await
-        .map_err(|error| error.to_string())
+    if output.state == AnnounceActivityState::WaitingDependency {
+        blocked_dependency = output
+            .dependency
+            .as_ref()
+            .and_then(|dependency| {
+                DependencyKind::from_persisted(&dependency.kind).map(|kind| (kind, dependency))
+            })
+            .map(|dependency| WorkflowProjectionDependency {
+                kind: dependency.0,
+                name: dependency.1.name.as_str(),
+            });
+    }
+    let update = WorkflowProjectionUpdate {
+        workflow_id,
+        workflow_kind: WorkflowKind::Announce,
+        public_id: &input.work_id,
+        state,
+        reason,
+        next_action,
+        raw_secret_material_count,
+        blocked_dependency,
+        started_at_ms: input.received_at_ms,
+        updated_at_ms: now_ms,
+        finished_at_ms,
+    };
+    retry_database_call("record announce workflow projection", None, || {
+        repository.record_workflow_projection(&update)
+    })
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn inventory_activity_output(summaries: &[InventoryRefreshSummary]) -> InventoryActivityOutput {
@@ -4725,7 +4806,7 @@ mod tests {
     use super::*;
     use crate::announce::{AnnounceDedupeIdentity, AnnounceFetchMaterial};
     use crate::config::SporosConfig;
-    use crate::domain::{ByteSize, CandidateGuid, ItemTitle, TrackerName};
+    use crate::domain::{ByteSize, CandidateGuid, DownloadUrl, ItemTitle, TrackerName};
     use crate::inventory::InventoryScanOptions;
     use crate::persistence::repository::Repository;
     use crate::runtime::app::AppRuntime;
@@ -4736,6 +4817,7 @@ mod tests {
         MEDIA_INVENTORY_JOB_NAME,
     };
     use crate::runtime::shutdown::shutdown_channel;
+    use crate::secrets::CookieSecret;
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -5370,6 +5452,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_announcement_records_initial_running_projection() {
+        let temp_dir = TestTempDir::new("duroxide-announce-start-projection");
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut work = test_announce_work("ann_start_projection", "guid-start-projection", 1_000);
+        work.fetch = Some(test_announce_fetch_material());
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        let runtime = DuroxideWorkflowRuntime::start_inner(
+            temp_dir.path().join("workflows.db"),
+            Some(WorkflowRuntimeActivities {
+                repository: repository.clone(),
+                inventory: None,
+                announce: None,
+                scheduled_jobs: None,
+                search: None,
+                saved_retry: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let submission = runtime.submit_announcement(&work).await.unwrap();
+
+        assert_eq!(
+            AnnounceWorkflowSubmissionOutcome::Started,
+            submission.outcome
+        );
+        let snapshot = repository
+            .workflow_projection_snapshot(10, 1_500)
+            .await
+            .unwrap();
+        let projection = snapshot
+            .recent
+            .iter()
+            .find(|item| item.workflow_id == "announce:ann_start_projection")
+            .unwrap();
+        assert_eq!("announce", projection.workflow_kind);
+        assert_eq!("ann_start_projection", projection.public_id);
+        assert_eq!("running", projection.state);
+        assert_eq!("running_activity", projection.reason);
+        assert_eq!(Some("starting".to_owned()), projection.next_action);
+        assert_eq!(1, projection.raw_secret_material_count);
+        assert!(!projection.terminal);
+        assert_eq!(1_000, projection.started_at_ms);
+        assert_eq!(1, snapshot.active_count);
+        assert_eq!(1, snapshot.raw_secret_material_count);
+
+        runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
     async fn announce_process_activity_recovers_terminal_row_after_projection_retry() {
         let temp_dir = TestTempDir::new("duroxide-announce-terminal-retry");
         let repository = Repository::connect_in_memory().await.unwrap();
@@ -5448,6 +5583,137 @@ mod tests {
         assert_eq!(Some("Saved".to_owned()), projection.next_action);
 
         runtime.state.workflow_runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn announce_process_activity_recovers_terminal_failure_projection_without_fetch_material()
+    {
+        let temp_dir = TestTempDir::new("duroxide-announce-terminal-failure-retry");
+        let repository = Repository::connect_in_memory().await.unwrap();
+        let mut work = test_announce_work(
+            "ann_terminal_failure_retry",
+            "guid-terminal-failure-retry",
+            1_000,
+        );
+        work.fetch = Some(test_announce_fetch_material());
+        repository
+            .insert_or_dedupe_announce_work(&work, 10)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .mark_announce_rejected(
+                    &work.id,
+                    AnnounceReason::InvalidTorrentMetadata,
+                    "invalid torrent metadata",
+                    1_200,
+                )
+                .await
+                .unwrap()
+        );
+        let mut config = SporosConfig::default();
+        config.paths.database = temp_dir.path().join("sporos.db");
+        let runtime = AppRuntime::from_repository(config.clone(), repository.clone())
+            .await
+            .unwrap();
+        let activities = AnnounceWorkflowActivities::new(
+            repository.clone(),
+            AnnounceProcessor::new(
+                runtime.state.config.clone(),
+                repository.clone(),
+                runtime.state.health.clone(),
+                runtime.state.metrics.clone(),
+                runtime.state.scheduler.clone(),
+                runtime.state.injection_worker.clone(),
+            ),
+            config.announce.clone(),
+            runtime.state.shutdown_signal.clone(),
+        );
+
+        let output = Box::pin(run_announce_process_activity(
+            activities,
+            "announce:ann_terminal_failure_retry".to_owned(),
+            AnnounceActivityInput {
+                work_id: work.id.as_str().to_owned(),
+                received_at_ms: work.received_at_ms,
+                raw_secret_material_count: 1,
+            },
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(AnnounceActivityState::Failed, output.state);
+        assert_eq!("InvalidTorrentMetadata", output.reason);
+        let snapshot = repository
+            .workflow_projection_snapshot(10, unix_time_ms())
+            .await
+            .unwrap();
+        let projection = snapshot
+            .recent
+            .iter()
+            .find(|item| item.workflow_id == "announce:ann_terminal_failure_retry")
+            .unwrap();
+        assert_eq!("failed", projection.state);
+        assert_eq!("failed", projection.reason);
+        assert_eq!(
+            Some("InvalidTorrentMetadata".to_owned()),
+            projection.next_action
+        );
+        assert_eq!(0, projection.raw_secret_material_count);
+        assert!(projection.terminal);
+        assert!(projection.finished_at_ms.is_some());
+        assert_eq!(0, snapshot.raw_secret_material_count);
+
+        runtime.state.workflow_runtime.shutdown(Some(1_000)).await;
+    }
+
+    #[tokio::test]
+    async fn announce_waiting_dependency_projection_records_blocker() {
+        let repository = Repository::connect_in_memory().await.unwrap();
+        record_announce_activity_projection(
+            &repository,
+            "announce:ann_waiting_dependency",
+            &AnnounceActivityInput {
+                work_id: "ann_waiting_dependency".to_owned(),
+                received_at_ms: 1_000,
+                raw_secret_material_count: 1,
+            },
+            &AnnounceProcessActivityOutput {
+                state: AnnounceActivityState::WaitingDependency,
+                reason: "RetryAfter".to_owned(),
+                next_attempt_at_ms: Some(2_000),
+                retry_delay_ms: Some(1_000),
+                dependency: Some(AnnounceProjectionDependency {
+                    kind: DependencyKind::Indexer.as_str().to_owned(),
+                    name: "https://indexer.example/api?apikey=dependency-secret".to_owned(),
+                }),
+                events: Vec::new(),
+            },
+            1_100,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = repository
+            .workflow_projection_snapshot(10, 1_500)
+            .await
+            .unwrap();
+        let projection = snapshot
+            .recent
+            .iter()
+            .find(|item| item.workflow_id == "announce:ann_waiting_dependency")
+            .unwrap();
+        assert_eq!("waiting", projection.state);
+        assert_eq!("waiting_for_dependency", projection.reason);
+        assert_eq!(
+            Some("indexer".to_owned()),
+            projection.blocked_dependency_kind
+        );
+        assert_eq!(
+            Some("https://indexer.example/api?apikey=[REDACTED]".to_owned()),
+            projection.blocked_dependency_name
+        );
+        assert_eq!(1, snapshot.raw_secret_material_count);
     }
 
     #[tokio::test]
@@ -5984,6 +6250,17 @@ mod tests {
             last_error_class: None,
             last_redacted_message: None,
         }
+    }
+
+    fn test_announce_fetch_material() -> AnnounceFetchMaterial {
+        let download_url =
+            DownloadUrl::new("https://tracker.example/download?id=1&passkey=download-secret")
+                .unwrap();
+        AnnounceFetchMaterial::new(
+            &download_url,
+            Some(CookieSecret::new("sid=cookie-secret").unwrap()),
+        )
+        .unwrap()
     }
 
     #[tokio::test]

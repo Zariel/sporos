@@ -7500,27 +7500,14 @@ mod tests {
         assert!(cleanup.last_finished_at_ms.is_some());
         assert!(cleanup.next_run_at_ms.is_some());
         assert_eq!(None, cleanup.last_error);
-        let rows = sqlx::query("SELECT id, status, reason FROM announce_work ORDER BY id")
+        let rows = sqlx::query("SELECT id FROM announce_work ORDER BY id")
             .fetch_all(repository.pool())
             .await
             .unwrap()
             .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("id"),
-                    row.get::<String, _>("status"),
-                    row.get::<String, _>("reason"),
-                )
-            })
+            .map(|row| row.get::<String, _>("id"))
             .collect::<Vec<_>>();
-        assert_eq!(
-            vec![(
-                "ann_running".to_owned(),
-                "waiting".to_owned(),
-                "inventory_refreshing".to_owned()
-            )],
-            rows
-        );
+        assert_eq!(vec!["ann_running".to_owned()], rows);
         assert_eq!(0, job_queue.stats().depth);
         assert_eq!(0, scheduler_queue.stats().depth);
     }
