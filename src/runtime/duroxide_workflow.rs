@@ -37,8 +37,11 @@ use crate::runtime::daemon::{
     AnnounceInventoryRefreshMode, AnnounceProcessor, SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY,
     SearchWorkflowExecutionSummary, execute_scheduled_job, finalize_duroxide_search_workflow,
     process_announce_work_with_processor_mode, process_duroxide_search_candidate,
+    saved_torrent_retry_config,
 };
-use crate::runtime::injection_worker::InjectionWorker;
+use crate::runtime::injection_worker::{
+    InjectionWorker, SavedTorrentRetryItem, SavedTorrentRetrySummary,
+};
 use crate::runtime::scheduler::{
     CLIENT_INVENTORY_JOB_NAME, MEDIA_INVENTORY_JOB_NAME, PersistedScheduler,
     ScheduledJobClaimOutcome, SchedulerError,
@@ -46,9 +49,9 @@ use crate::runtime::scheduler::{
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 use crate::runtime::workflow_contracts::{
     ActivityInputEnvelope, ActivityKind, AnnounceWorkflowInput, InventoryRefreshKind,
-    InventoryRefreshWorkflowInput, ScheduledJobWorkflowInput, SearchWorkflowInput,
-    WorkflowCustomStatus, WorkflowEventName, WorkflowInstanceId, WorkflowKind, WorkflowReason,
-    WorkflowState,
+    InventoryRefreshWorkflowInput, SavedRetryWorkflowInput, ScheduledJobWorkflowInput,
+    SearchWorkflowInput, WorkflowCustomStatus, WorkflowEventName, WorkflowInstanceId, WorkflowKind,
+    WorkflowReason, WorkflowState,
 };
 
 pub const WORKFLOW_RUNTIME_DEPENDENCY: &str = "workflow-runtime";
@@ -70,6 +73,11 @@ const SEARCH_CANDIDATE_PAGE_ACTIVITY_ID_PREFIX: &str = "search-candidate-page";
 const SEARCH_CANDIDATE_ACTIVITY_ID_PREFIX: &str = "search-candidate";
 const SEARCH_FINALIZE_ACTIVITY_ID: &str = "search-finalize";
 const SEARCH_CANDIDATE_PAGE_LIMIT: u16 = 64;
+const SAVED_RETRY_ITEM_ORCHESTRATION: &str = "sporos.saved_torrent_retry.item.v1";
+const SAVED_RETRY_SCAN_ACTIVITY_ID: &str = "saved-retry-scan";
+const SAVED_RETRY_PROCESS_ACTIVITY_ID: &str = "saved-retry-process";
+const SAVED_RETRY_FINALIZE_ACTIVITY_ID: &str = "saved-retry-finalize";
+const SAVED_RETRY_ITEM_CHILD_CONCURRENCY: usize = 1;
 const ANNOUNCE_WORKFLOW_OWNER: &str = "sporos-announce-workflow";
 const INVENTORY_COMPLETION_FANOUT_LIMIT: u16 = 1_000;
 const INVENTORY_COMPLETION_LEASE_MS: i64 = 60_000;
@@ -89,6 +97,7 @@ pub struct DuroxideWorkflowRuntime {
     scheduled_job_scheduler: Option<PersistedScheduler>,
     scheduled_job_shutdown: Option<ShutdownSignal>,
     search_state: Option<SearchWorkflowStateHandle>,
+    saved_retry_state: Option<SavedRetryWorkflowStateHandle>,
 }
 
 impl DuroxideWorkflowRuntime {
@@ -109,6 +118,7 @@ impl DuroxideWorkflowRuntime {
                 announce: None,
                 scheduled_jobs: None,
                 search: None,
+                saved_retry: None,
             }),
         )
         .await
@@ -120,6 +130,7 @@ impl DuroxideWorkflowRuntime {
         announce: AnnounceWorkflowActivities,
         scheduled_jobs: ScheduledJobWorkflowActivities,
         search: SearchWorkflowActivities,
+        saved_retry: SavedRetryWorkflowActivities,
     ) -> Result<Self, DuroxideWorkflowRuntimeError> {
         let repository = inventory.repository.clone();
         Self::start_inner(
@@ -130,6 +141,7 @@ impl DuroxideWorkflowRuntime {
                 announce: Some(announce),
                 scheduled_jobs: Some(scheduled_jobs),
                 search: Some(search),
+                saved_retry: Some(saved_retry),
             }),
         )
         .await
@@ -168,6 +180,10 @@ impl DuroxideWorkflowRuntime {
             .as_ref()
             .and_then(|activities| activities.search.as_ref())
             .map(|activities| activities.state.clone());
+        let saved_retry_state = activities
+            .as_ref()
+            .and_then(|activities| activities.saved_retry.as_ref())
+            .map(|activities| activities.state.clone());
         let active_inventory_refreshes = Arc::new(Mutex::new(BTreeSet::new()));
         let inventory_completion_events =
             InventoryCompletionEventBridge::new(Arc::clone(&store), repository.clone());
@@ -204,6 +220,7 @@ impl DuroxideWorkflowRuntime {
             scheduled_job_scheduler,
             scheduled_job_shutdown,
             search_state,
+            saved_retry_state,
         };
         if let Err(error) = runtime
             .inventory_completion_events
@@ -239,6 +256,7 @@ impl DuroxideWorkflowRuntime {
             scheduled_job_scheduler: self.scheduled_job_scheduler.clone(),
             scheduled_job_shutdown: self.scheduled_job_shutdown.clone(),
             search_state: None,
+            saved_retry_state: None,
         }
     }
 
@@ -611,6 +629,9 @@ impl DuroxideWorkflowRuntime {
         if let Some(handle) = &self.search_state {
             handle.clear();
         }
+        if let Some(handle) = &self.saved_retry_state {
+            handle.clear();
+        }
     }
 
     async fn seed_supervisor(
@@ -756,6 +777,9 @@ impl Drop for DuroxideWorkflowRuntime {
             handle.clear();
         }
         if is_last_runtime_owner && let Some(handle) = &self.search_state {
+            handle.clear();
+        }
+        if is_last_runtime_owner && let Some(handle) = &self.saved_retry_state {
             handle.clear();
         }
         if is_last_runtime_owner && let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1151,6 +1175,7 @@ struct WorkflowRuntimeActivities {
     announce: Option<AnnounceWorkflowActivities>,
     scheduled_jobs: Option<ScheduledJobWorkflowActivities>,
     search: Option<SearchWorkflowActivities>,
+    saved_retry: Option<SavedRetryWorkflowActivities>,
 }
 
 impl WorkflowRuntimeActivities {
@@ -1268,6 +1293,38 @@ impl SearchWorkflowStateHandle {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SavedRetryWorkflowStateHandle {
+    state: Arc<Mutex<Option<crate::runtime::app::AppState>>>,
+}
+
+impl SavedRetryWorkflowStateHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bind(&self, state: crate::runtime::app::AppState) -> bool {
+        let Ok(mut guard) = self.state.lock() else {
+            return false;
+        };
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(state);
+        true
+    }
+
+    fn get(&self) -> Option<crate::runtime::app::AppState> {
+        self.state.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            *guard = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchWorkflowActivities {
     state: SearchWorkflowStateHandle,
@@ -1276,6 +1333,18 @@ pub struct SearchWorkflowActivities {
 
 impl SearchWorkflowActivities {
     pub fn new(state: SearchWorkflowStateHandle, shutdown: ShutdownSignal) -> Self {
+        Self { state, shutdown }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SavedRetryWorkflowActivities {
+    state: SavedRetryWorkflowStateHandle,
+    shutdown: ShutdownSignal,
+}
+
+impl SavedRetryWorkflowActivities {
+    pub fn new(state: SavedRetryWorkflowStateHandle, shutdown: ShutdownSignal) -> Self {
         Self { state, shutdown }
     }
 }
@@ -1484,6 +1553,36 @@ pub struct SearchWorkflowSubmission {
 pub enum SearchWorkflowSubmissionOutcome {
     Started,
     AlreadyRunning,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SavedRetryScanActivityInput {
+    requested_at_ms: i64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SavedRetryScanActivityOutput {
+    items: Vec<SavedTorrentRetryItem>,
+    interval_ms: u64,
+    failed: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SavedRetryProcessActivityInput {
+    item: SavedTorrentRetryItem,
+    requested_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SavedRetryFinalizeActivityInput {
+    requested_at_ms: i64,
+    summary: SavedTorrentRetrySummary,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SavedRetryFinalizeActivityOutput {
+    summary: SavedTorrentRetrySummary,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -2539,6 +2638,93 @@ fn activity_registry_with_runtime_activities(
                     );
                 }
             }
+            ActivityKind::SavedRetryScan => {
+                if let Some(saved_retry) = activities.saved_retry.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<SavedRetryScanActivityInput>| {
+                            let saved_retry = saved_retry.clone();
+                            async move {
+                                run_saved_retry_scan_activity(
+                                    saved_retry,
+                                    input.workflow_id,
+                                    input.payload,
+                                )
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::SavedRetryProcess => {
+                if let Some(saved_retry) = activities.saved_retry.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<SavedRetryProcessActivityInput>| {
+                            let saved_retry = saved_retry.clone();
+                            async move {
+                                run_saved_retry_process_activity(
+                                    saved_retry,
+                                    input.workflow_id,
+                                    input.payload,
+                                )
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::SavedRetryFinalize => {
+                if let Some(saved_retry) = activities.saved_retry.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<SavedRetryFinalizeActivityInput>| {
+                            let saved_retry = saved_retry.clone();
+                            async move {
+                                run_saved_retry_finalize_activity(
+                                    saved_retry,
+                                    input.workflow_id,
+                                    input.payload,
+                                )
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
             _ => {
                 builder = builder.register_typed(
                     activity.as_str(),
@@ -2553,6 +2739,158 @@ fn activity_registry_with_runtime_activities(
         }
     }
     builder.build()
+}
+
+async fn run_saved_retry_scan_activity(
+    activities: SavedRetryWorkflowActivities,
+    workflow_id: String,
+    input: SavedRetryScanActivityInput,
+) -> Result<SavedRetryScanActivityOutput, String> {
+    let state = activities
+        .state
+        .get()
+        .ok_or_else(|| "saved retry workflow app state is not bound".to_owned())?;
+    let mut config = saved_torrent_retry_config(&state.config);
+    config.assessed_at_ms = input.requested_at_ms;
+    record_saved_retry_projection(
+        &state.repository,
+        SavedRetryProjectionRecord {
+            workflow_id: &workflow_id,
+            state: WorkflowState::Running,
+            reason: WorkflowReason::RunningActivity,
+            next_action: Some("scanning"),
+            started_at_ms: input.requested_at_ms,
+            updated_at_ms: unix_time_ms(),
+            finished_at_ms: None,
+        },
+    )
+    .await?;
+    let mut shutdown = activities.shutdown.clone();
+    let interval_ms = duration_millis_u64(state.saved_retry_interval);
+    let items = match state
+        .injection_worker
+        .scan_saved_torrent_retry_items_until_shutdown(config, &mut shutdown)
+        .await
+    {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(error = ?error, "saved torrent retry scan failed");
+            return Ok(SavedRetryScanActivityOutput {
+                items: Vec::new(),
+                interval_ms,
+                failed: 1,
+            });
+        }
+    };
+    Ok(SavedRetryScanActivityOutput {
+        items,
+        interval_ms,
+        failed: 0,
+    })
+}
+
+async fn run_saved_retry_process_activity(
+    activities: SavedRetryWorkflowActivities,
+    _workflow_id: String,
+    input: SavedRetryProcessActivityInput,
+) -> Result<SavedTorrentRetrySummary, String> {
+    let state = activities
+        .state
+        .get()
+        .ok_or_else(|| "saved retry workflow app state is not bound".to_owned())?;
+    let mut config = saved_torrent_retry_config(&state.config);
+    config.assessed_at_ms = input.requested_at_ms;
+    let mut shutdown = activities.shutdown.clone();
+    match state
+        .injection_worker
+        .retry_saved_torrent_item_until_shutdown(input.item, config, &mut shutdown)
+        .await
+    {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            tracing::warn!(error = ?error, "saved torrent retry item failed");
+            Ok(SavedTorrentRetrySummary {
+                scanned: 1,
+                failed: 1,
+                kept: 1,
+                ..SavedTorrentRetrySummary::default()
+            })
+        }
+    }
+}
+
+async fn run_saved_retry_finalize_activity(
+    activities: SavedRetryWorkflowActivities,
+    workflow_id: String,
+    input: SavedRetryFinalizeActivityInput,
+) -> Result<SavedRetryFinalizeActivityOutput, String> {
+    let state = activities
+        .state
+        .get()
+        .ok_or_else(|| "saved retry workflow app state is not bound".to_owned())?;
+    let now_ms = unix_time_ms();
+    record_saved_retry_projection(
+        &state.repository,
+        SavedRetryProjectionRecord {
+            workflow_id: &workflow_id,
+            state: WorkflowState::Succeeded,
+            reason: WorkflowReason::Completed,
+            next_action: Some("completed"),
+            started_at_ms: input.requested_at_ms,
+            updated_at_ms: now_ms,
+            finished_at_ms: Some(now_ms),
+        },
+    )
+    .await?;
+    tracing::info!(
+        scanned = input.summary.scanned,
+        attempted = input.summary.attempted,
+        injected = input.summary.injected,
+        failed = input.summary.failed,
+        kept = input.summary.kept,
+        deleted = input.summary.deleted,
+        "saved torrent retry completed"
+    );
+    Ok(SavedRetryFinalizeActivityOutput {
+        summary: input.summary,
+    })
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct SavedRetryProjectionRecord<'a> {
+    workflow_id: &'a str,
+    state: WorkflowState,
+    reason: WorkflowReason,
+    next_action: Option<&'a str>,
+    started_at_ms: i64,
+    updated_at_ms: i64,
+    finished_at_ms: Option<i64>,
+}
+
+async fn record_saved_retry_projection(
+    repository: &Repository,
+    record: SavedRetryProjectionRecord<'_>,
+) -> Result<(), String> {
+    repository
+        .record_workflow_projection(&WorkflowProjectionUpdate {
+            workflow_id: record.workflow_id,
+            workflow_kind: WorkflowKind::SavedTorrentRetry,
+            public_id: "saved-retry",
+            state: record.state,
+            reason: record.reason,
+            next_action: record.next_action,
+            blocked_dependency: None,
+            raw_secret_material_count: 0,
+            started_at_ms: record.started_at_ms,
+            updated_at_ms: record.updated_at_ms,
+            finished_at_ms: record.finished_at_ms,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn run_search_plan_activity(
@@ -3612,6 +3950,11 @@ fn orchestration_registry() -> OrchestrationRegistry {
                 workflow.orchestration_name(),
                 scheduled_job_supervisor_orchestration,
             );
+        } else if workflow == WorkflowKind::SavedTorrentRetry {
+            builder = builder.register_typed(
+                workflow.orchestration_name(),
+                saved_retry_supervisor_orchestration,
+            );
         } else {
             builder = builder.register_typed(
                 workflow.orchestration_name(),
@@ -3650,6 +3993,10 @@ fn orchestration_registry() -> OrchestrationRegistry {
     builder = builder.register_typed(
         SCHEDULED_JOB_RUN_ORCHESTRATION,
         scheduled_job_run_orchestration,
+    );
+    builder = builder.register_typed(
+        SAVED_RETRY_ITEM_ORCHESTRATION,
+        saved_retry_item_orchestration,
     );
     builder.build()
 }
@@ -3788,6 +4135,156 @@ async fn scheduled_job_run_orchestration(
     );
     ctx.schedule_activity_typed(ActivityKind::ScheduledJobComplete.as_str(), &complete_input)
         .await
+}
+
+async fn saved_retry_supervisor_orchestration(
+    ctx: OrchestrationContext,
+    input: WorkflowSupervisorInput,
+) -> Result<WorkflowSupervisorOutput, String> {
+    if input.kind != WorkflowKind::SavedTorrentRetry {
+        return Err(format!(
+            "saved retry supervisor received {} input",
+            input.kind.as_str()
+        ));
+    }
+    let mut run_reason = "startup".to_owned();
+    loop {
+        let requested_at_ms = orchestration_now_ms(&ctx).await?;
+        let run_input = SavedRetryWorkflowInput {
+            reason: run_reason.clone(),
+            requested_at_ms,
+        };
+        let run = run_saved_retry_batch(&ctx, &input.public_id, &run_input).await?;
+        set_saved_retry_custom_status(
+            &ctx,
+            &input.public_id,
+            WorkflowState::Waiting,
+            WorkflowReason::WaitingForDependency,
+            Some("await_interval"),
+        )?;
+        ctx.schedule_timer(Duration::from_millis(run.interval_ms.max(1)))
+            .await;
+        run_reason = "interval".to_owned();
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SavedRetryRunOutput {
+    summary: SavedTorrentRetrySummary,
+    interval_ms: u64,
+}
+
+async fn run_saved_retry_batch(
+    ctx: &OrchestrationContext,
+    public_id: &str,
+    input: &SavedRetryWorkflowInput,
+) -> Result<SavedRetryRunOutput, String> {
+    set_saved_retry_custom_status(
+        ctx,
+        public_id,
+        WorkflowState::Running,
+        WorkflowReason::RunningActivity,
+        Some("scanning"),
+    )?;
+    let scan_input = ActivityInputEnvelope::new(
+        ctx.instance_id(),
+        SAVED_RETRY_SCAN_ACTIVITY_ID,
+        SavedRetryScanActivityInput {
+            requested_at_ms: input.requested_at_ms,
+            reason: input.reason.clone(),
+        },
+    );
+    let scan: SavedRetryScanActivityOutput = ctx
+        .schedule_activity_typed(ActivityKind::SavedRetryScan.as_str(), &scan_input)
+        .await?;
+    let mut summary = SavedTorrentRetrySummary {
+        failed: scan.failed,
+        ..SavedTorrentRetrySummary::default()
+    };
+    set_saved_retry_custom_status(
+        ctx,
+        public_id,
+        WorkflowState::Running,
+        WorkflowReason::RunningActivity,
+        Some("processing_items"),
+    )?;
+    let mut chunks = scan.items.chunks(SAVED_RETRY_ITEM_CHILD_CONCURRENCY);
+    for chunk in &mut chunks {
+        match chunk {
+            [first, second] => {
+                let first = saved_retry_item_child(ctx, first.clone(), input.requested_at_ms)?;
+                let second = saved_retry_item_child(ctx, second.clone(), input.requested_at_ms)?;
+                let (first, second) = ctx.join2(first, second).await;
+                summary.merge(first?);
+                summary.merge(second?);
+            }
+            [single] => {
+                let item = saved_retry_item_child(ctx, single.clone(), input.requested_at_ms)?;
+                summary.merge(item.await?);
+            }
+            _ => {}
+        }
+    }
+    set_saved_retry_custom_status(
+        ctx,
+        public_id,
+        WorkflowState::Running,
+        WorkflowReason::RunningActivity,
+        Some("finalizing"),
+    )?;
+    let finalize_input = ActivityInputEnvelope::new(
+        ctx.instance_id(),
+        SAVED_RETRY_FINALIZE_ACTIVITY_ID,
+        SavedRetryFinalizeActivityInput {
+            requested_at_ms: input.requested_at_ms,
+            summary,
+        },
+    );
+    let output: SavedRetryFinalizeActivityOutput = ctx
+        .schedule_activity_typed(ActivityKind::SavedRetryFinalize.as_str(), &finalize_input)
+        .await?;
+    set_saved_retry_custom_status(
+        ctx,
+        public_id,
+        WorkflowState::Succeeded,
+        WorkflowReason::Completed,
+        Some("completed"),
+    )?;
+    Ok(SavedRetryRunOutput {
+        summary: output.summary,
+        interval_ms: scan.interval_ms,
+    })
+}
+
+async fn saved_retry_item_orchestration(
+    ctx: OrchestrationContext,
+    input: SavedRetryProcessActivityInput,
+) -> Result<SavedTorrentRetrySummary, String> {
+    let process_input =
+        ActivityInputEnvelope::new(ctx.instance_id(), SAVED_RETRY_PROCESS_ACTIVITY_ID, input);
+    ctx.schedule_activity_typed(ActivityKind::SavedRetryProcess.as_str(), &process_input)
+        .await
+}
+
+fn saved_retry_item_child(
+    ctx: &OrchestrationContext,
+    item: SavedTorrentRetryItem,
+    requested_at_ms: i64,
+) -> Result<impl std::future::Future<Output = Result<SavedTorrentRetrySummary, String>>, String> {
+    let requested_at_ms = u64::try_from(requested_at_ms)
+        .map_err(|_error| format!("saved retry requested_at_ms is negative: {requested_at_ms}"))?;
+    let child_key = format!("{}.{}", item.item_key, requested_at_ms);
+    let child_id =
+        WorkflowInstanceId::saved_retry_item(&child_key).map_err(|error| error.to_string())?;
+    let input = SavedRetryProcessActivityInput {
+        item,
+        requested_at_ms: i64::try_from(requested_at_ms).unwrap_or(i64::MAX),
+    };
+    Ok(ctx.schedule_sub_orchestration_with_id_typed(
+        SAVED_RETRY_ITEM_ORCHESTRATION,
+        child_id.as_str(),
+        &input,
+    ))
 }
 
 async fn orchestration_now_ms(ctx: &OrchestrationContext) -> Result<i64, String> {
@@ -4160,6 +4657,25 @@ fn set_search_custom_status(
     let mut status = WorkflowCustomStatus::new(
         input.request_id.clone(),
         WorkflowKind::Search,
+        state,
+        reason,
+    );
+    status.next_action = next_action.map(str::to_owned);
+    let status = serde_json::to_string(&status).map_err(|error| error.to_string())?;
+    ctx.set_custom_status(status);
+    Ok(())
+}
+
+fn set_saved_retry_custom_status(
+    ctx: &OrchestrationContext,
+    public_id: &str,
+    state: WorkflowState,
+    reason: WorkflowReason,
+    next_action: Option<&str>,
+) -> Result<(), String> {
+    let mut status = WorkflowCustomStatus::new(
+        public_id.to_owned(),
+        WorkflowKind::SavedTorrentRetry,
         state,
         reason,
     );
@@ -5468,6 +5984,167 @@ mod tests {
             last_error_class: None,
             last_redacted_message: None,
         }
+    }
+
+    #[tokio::test]
+    async fn saved_retry_supervisor_runs_startup_and_interval_with_bounded_children() {
+        let temp_dir = TestTempDir::new("duroxide-saved-retry-supervisor");
+        let database_path = temp_dir.path().join("state").join(WORKFLOW_DATABASE_FILE);
+        prepare_workflow_database(&database_path).await.unwrap();
+        let database_url = format!("sqlite:{}", database_path.display());
+        let store =
+            Arc::new(SqliteProvider::new(&database_url, None).await.unwrap()) as Arc<dyn Provider>;
+        let test_state = Arc::new(SavedRetrySupervisorTestState::new(temp_dir.path()));
+        let runtime = Runtime::start_with_options(
+            Arc::clone(&store),
+            saved_retry_test_activity_registry(Arc::clone(&test_state)),
+            orchestration_registry(),
+            RuntimeOptions {
+                dispatcher_min_poll_interval: Duration::from_millis(5),
+                dispatcher_long_poll_timeout: Duration::from_millis(10),
+                orchestration_concurrency: 4,
+                worker_concurrency: 4,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await;
+        let client = Client::new(Arc::clone(&store));
+        client
+            .start_orchestration_typed(
+                WorkflowInstanceId::saved_retry_supervisor().as_str(),
+                WorkflowKind::SavedTorrentRetry.orchestration_name(),
+                WorkflowSupervisorInput {
+                    kind: WorkflowKind::SavedTorrentRetry,
+                    public_id: "saved-retry".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if test_state.finalize_count.load(Ordering::SeqCst) >= 2 {
+                    return;
+                }
+                test_state.finalized.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        runtime.shutdown(Some(1_000)).await;
+        assert!(test_state.scan_count.load(Ordering::SeqCst) >= 2);
+        assert!(test_state.process_count.load(Ordering::SeqCst) >= 8);
+        assert!(
+            test_state.max_active_processes.load(Ordering::SeqCst)
+                <= SAVED_RETRY_ITEM_CHILD_CONCURRENCY
+        );
+    }
+
+    #[derive(Debug)]
+    struct SavedRetrySupervisorTestState {
+        items: Vec<SavedTorrentRetryItem>,
+        scan_count: AtomicUsize,
+        process_count: AtomicUsize,
+        active_processes: AtomicUsize,
+        max_active_processes: AtomicUsize,
+        finalize_count: AtomicUsize,
+        finalized: tokio::sync::Notify,
+    }
+
+    impl SavedRetrySupervisorTestState {
+        fn new(root: &Path) -> Self {
+            let items = (0..4)
+                .map(|index| SavedTorrentRetryItem {
+                    directory: root.to_path_buf(),
+                    path: root.join(format!("saved-{index}.torrent")),
+                    item_key: format!("item.{index}"),
+                })
+                .collect();
+            Self {
+                items,
+                scan_count: AtomicUsize::new(0),
+                process_count: AtomicUsize::new(0),
+                active_processes: AtomicUsize::new(0),
+                max_active_processes: AtomicUsize::new(0),
+                finalize_count: AtomicUsize::new(0),
+                finalized: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn track_process_start(&self) {
+            let active = self.active_processes.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut current = self.max_active_processes.load(Ordering::SeqCst);
+            while active > current {
+                match self.max_active_processes.compare_exchange(
+                    current,
+                    active,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => current = next,
+                }
+            }
+        }
+    }
+
+    fn saved_retry_test_activity_registry(
+        state: Arc<SavedRetrySupervisorTestState>,
+    ) -> ActivityRegistry {
+        let scan_state = Arc::clone(&state);
+        let process_state = Arc::clone(&state);
+        let finalize_state = state;
+        ActivityRegistry::builder()
+            .register_typed(
+                ActivityKind::SavedRetryScan.as_str(),
+                move |_ctx: ActivityContext,
+                      _input: ActivityInputEnvelope<SavedRetryScanActivityInput>| {
+                    let state = Arc::clone(&scan_state);
+                    async move {
+                        state.scan_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(SavedRetryScanActivityOutput {
+                            items: state.items.clone(),
+                            interval_ms: 25,
+                            failed: 0,
+                        })
+                    }
+                },
+            )
+            .register_typed(
+                ActivityKind::SavedRetryProcess.as_str(),
+                move |_ctx: ActivityContext,
+                      _input: ActivityInputEnvelope<SavedRetryProcessActivityInput>| {
+                    let state = Arc::clone(&process_state);
+                    async move {
+                        state.track_process_start();
+                        state.process_count.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        state.active_processes.fetch_sub(1, Ordering::SeqCst);
+                        Ok(SavedTorrentRetrySummary {
+                            scanned: 1,
+                            attempted: 1,
+                            kept: 1,
+                            ..SavedTorrentRetrySummary::default()
+                        })
+                    }
+                },
+            )
+            .register_typed(
+                ActivityKind::SavedRetryFinalize.as_str(),
+                move |_ctx: ActivityContext,
+                      input: ActivityInputEnvelope<SavedRetryFinalizeActivityInput>| {
+                    let state = Arc::clone(&finalize_state);
+                    async move {
+                        state.finalize_count.fetch_add(1, Ordering::SeqCst);
+                        state.finalized.notify_waiters();
+                        Ok(SavedRetryFinalizeActivityOutput {
+                            summary: input.payload.summary,
+                        })
+                    }
+                },
+            )
+            .build()
     }
 
     struct TestTempDir {

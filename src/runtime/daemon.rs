@@ -402,20 +402,6 @@ async fn start_background_tasks(runtime: AppRuntime) -> Result<Vec<BackgroundTas
         ),
         BackgroundShutdownPolicy::AbortOnTimeout,
     ));
-    handles.push(BackgroundTask::new(
-        "saved-torrent-retry",
-        spawn_supervised_background(
-            "saved-torrent-retry",
-            &runtime.state,
-            run_saved_retry_loop(
-                runtime.state.injection_worker.clone(),
-                saved_torrent_retry_config(&runtime.state.config),
-                runtime.state.saved_retry_interval,
-                runtime.state.shutdown_signal.clone(),
-            ),
-        ),
-        BackgroundShutdownPolicy::AwaitInFlight,
-    ));
     if let Some(interval) = runtime_prowlarr_refresh_interval(&runtime.state) {
         handles.push(BackgroundTask::new(
             "prowlarr-refresh",
@@ -596,7 +582,7 @@ fn fuzzy_size_threshold_permille(threshold: f64) -> Permille {
     Permille::new(scaled.to_string().parse::<u16>().unwrap_or(1_000))
 }
 
-fn saved_torrent_retry_config(config: &SporosConfig) -> SavedTorrentRetryConfig {
+pub(crate) fn saved_torrent_retry_config(config: &SporosConfig) -> SavedTorrentRetryConfig {
     SavedTorrentRetryConfig {
         directories: vec![config.paths.output_dir.clone()],
         link_dirs: config.injection.link_dirs.clone(),
@@ -3842,49 +3828,6 @@ async fn run_prowlarr_refresh_loop(
             Err(error) => warn!(error = %error, "Prowlarr refresh failed"),
         }
 
-        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
-            break;
-        }
-
-        tokio::select! {
-            _state = shutdown.cancelled() => {
-                break;
-            }
-            () = tokio::time::sleep(interval) => {}
-        }
-    }
-}
-
-async fn run_saved_retry_loop(
-    worker: InjectionWorker,
-    config: SavedTorrentRetryConfig,
-    interval: Duration,
-    mut shutdown: ShutdownSignal,
-) {
-    loop {
-        if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
-            break;
-        }
-
-        let mut run_config = config.clone();
-        run_config.assessed_at_ms = unix_time_ms();
-        match worker
-            .retry_saved_torrents_until_shutdown(run_config, &mut shutdown)
-            .await
-        {
-            Ok(summary) => {
-                tracing::info!(
-                    scanned = summary.scanned,
-                    attempted = summary.attempted,
-                    injected = summary.injected,
-                    failed = summary.failed,
-                    kept = summary.kept,
-                    deleted = summary.deleted,
-                    "saved torrent retry completed"
-                );
-            }
-            Err(error) => warn!(error = ?error, "saved torrent retry failed"),
-        }
         if shutdown.state().phase != crate::runtime::shutdown::ShutdownPhase::Running {
             break;
         }

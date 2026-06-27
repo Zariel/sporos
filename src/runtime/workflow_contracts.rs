@@ -90,6 +90,9 @@ pub enum ActivityKind {
     SearchCandidatePage,
     SearchCandidateProcess,
     SearchFinalize,
+    SavedRetryScan,
+    SavedRetryProcess,
+    SavedRetryFinalize,
     ScheduledJobClaim,
     ScheduledJobComplete,
     ScheduledJobRun,
@@ -142,7 +145,7 @@ impl ActivityRetryContract {
 }
 
 impl ActivityKind {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 21] = [
         Self::RepositoryRead,
         Self::RepositoryWrite,
         Self::InventoryScanMedia,
@@ -158,6 +161,9 @@ impl ActivityKind {
         Self::SearchCandidatePage,
         Self::SearchCandidateProcess,
         Self::SearchFinalize,
+        Self::SavedRetryScan,
+        Self::SavedRetryProcess,
+        Self::SavedRetryFinalize,
         Self::ScheduledJobClaim,
         Self::ScheduledJobComplete,
         Self::ScheduledJobRun,
@@ -180,6 +186,9 @@ impl ActivityKind {
             Self::SearchCandidatePage => "sporos.search.candidate_page.v1",
             Self::SearchCandidateProcess => "sporos.search.candidate_process.v1",
             Self::SearchFinalize => "sporos.search.finalize.v1",
+            Self::SavedRetryScan => "sporos.saved_retry.scan.v1",
+            Self::SavedRetryProcess => "sporos.saved_retry.process.v1",
+            Self::SavedRetryFinalize => "sporos.saved_retry.finalize.v1",
             Self::ScheduledJobClaim => "sporos.scheduled_job.claim.v1",
             Self::ScheduledJobComplete => "sporos.scheduled_job.complete.v1",
             Self::ScheduledJobRun => "sporos.scheduled_job.run.v1",
@@ -296,6 +305,27 @@ impl ActivityKind {
                 duplicate_safety: DuplicateSafety::DeliveryPolicyBounded,
                 retry_boundary: ActivityRetryBoundary::RetryOnlyUnderDeliveryPolicy,
                 contract: "manual search finalization records summary metrics and queues operator notifications according to bounded notification delivery policy",
+            },
+            Self::SavedRetryScan => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::ReadOnly,
+                duplicate_safety: DuplicateSafety::NaturallyIdempotent,
+                retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
+                contract: "saved retry scans read configured retry directories and return bounded file references without reading torrent bytes",
+            },
+            Self::SavedRetryProcess => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::ExternalMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "saved retry item processing revalidates the saved file, match state, links, and torrent client state before repeating mutation after a retry or restart",
+            },
+            Self::SavedRetryFinalize => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::RepeatAcceptedByContract,
+                retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
+                contract: "saved retry finalization records bounded operator projection and metrics from deterministic child summaries",
             },
             Self::ScheduledJobClaim => ActivityRetryContract {
                 activity: self,

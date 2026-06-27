@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
@@ -182,7 +183,7 @@ impl Default for SavedTorrentRetryConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SavedTorrentRetrySummary {
     pub scanned: usize,
     pub attempted: usize,
@@ -195,6 +196,31 @@ pub struct SavedTorrentRetrySummary {
     pub skipped: usize,
     pub deleted: usize,
     pub kept: usize,
+}
+
+impl SavedTorrentRetrySummary {
+    pub fn merge(&mut self, other: Self) {
+        self.scanned = self.scanned.saturating_add(other.scanned);
+        self.attempted = self.attempted.saturating_add(other.attempted);
+        self.injected = self.injected.saturating_add(other.injected);
+        self.dry_run = self.dry_run.saturating_add(other.dry_run);
+        self.already_exists = self.already_exists.saturating_add(other.already_exists);
+        self.source_incomplete = self
+            .source_incomplete
+            .saturating_add(other.source_incomplete);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.no_match = self.no_match.saturating_add(other.no_match);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+        self.deleted = self.deleted.saturating_add(other.deleted);
+        self.kept = self.kept.saturating_add(other.kept);
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SavedTorrentRetryItem {
+    pub directory: PathBuf,
+    pub path: PathBuf,
+    pub item_key: String,
 }
 
 #[derive(Debug)]
@@ -1402,6 +1428,78 @@ impl InjectionWorker {
             Some(&wait_signal),
         )
         .await
+    }
+
+    pub(crate) async fn scan_saved_torrent_retry_items_until_shutdown(
+        &self,
+        config: SavedTorrentRetryConfig,
+        shutdown: &mut ShutdownSignal,
+    ) -> Result<Vec<SavedTorrentRetryItem>, InjectionWorkerError> {
+        let mut items = Vec::new();
+        if config.directories.is_empty() || config.max_saved_torrents == 0 {
+            return Ok(items);
+        }
+        let mut should_stop = || shutdown.state().phase != ShutdownPhase::Running;
+        for directory in &config.directories {
+            if should_stop() || items.len() >= config.max_saved_torrents {
+                return Ok(items);
+            }
+            let mut scan =
+                saved_torrent_path_scan(directory, config.max_saved_torrents - items.len());
+            while let Some(path) = scan.next_path_until_stop(&mut should_stop).await? {
+                let item_key = saved_torrent_retry_item_key(directory, &path);
+                items.push(SavedTorrentRetryItem {
+                    directory: directory.clone(),
+                    path,
+                    item_key,
+                });
+                if items.len() >= config.max_saved_torrents || should_stop() {
+                    scan.cancel();
+                    scan.finish().await?;
+                    return Ok(items);
+                }
+            }
+            scan.finish().await?;
+        }
+        Ok(items)
+    }
+
+    pub(crate) async fn retry_saved_torrent_item_until_shutdown(
+        &self,
+        item: SavedTorrentRetryItem,
+        config: SavedTorrentRetryConfig,
+        shutdown: &mut ShutdownSignal,
+    ) -> Result<SavedTorrentRetrySummary, InjectionWorkerError> {
+        let mut summary = SavedTorrentRetrySummary {
+            scanned: 1,
+            ..SavedTorrentRetrySummary::default()
+        };
+        let wait_signal = shutdown.clone();
+        let mut should_stop = || shutdown.state().phase != ShutdownPhase::Running;
+        if should_stop() {
+            summary.kept += 1;
+            return Ok(summary);
+        }
+        match preflight_saved_torrent_retry(item.directory, item.path, config).await? {
+            SavedTorrentPreflight::Ready(prepared) => {
+                self.retry_preflighted_saved_torrent(
+                    *prepared,
+                    &mut summary,
+                    &mut should_stop,
+                    Some(&wait_signal),
+                )
+                .await?;
+            }
+            SavedTorrentPreflight::Skipped => {
+                summary.skipped += 1;
+                summary.kept += 1;
+            }
+            SavedTorrentPreflight::Failed => {
+                summary.failed += 1;
+                summary.kept += 1;
+            }
+        }
+        Ok(summary)
     }
 
     async fn retry_saved_torrents_inner<F>(
@@ -2898,6 +2996,20 @@ fn is_direct_saved_torrent_file(directory: &Path, path: &Path) -> bool {
         && std::fs::symlink_metadata(path)
             .map(|metadata| metadata.file_type().is_file())
             .unwrap_or(false)
+}
+
+fn saved_torrent_retry_item_key(directory: &Path, path: &Path) -> String {
+    let value = format!("{}\n{}", directory.display(), path.display());
+    format!("path.{}", stable_hash_hex(&value))
+}
+
+fn stable_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn saved_remote_candidate(
