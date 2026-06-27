@@ -48,20 +48,20 @@ Representative Duroxide evidence:
 - `tests/duroxide_runtime.rs` proves SQLite-backed runtime startup, activity
   execution, a durable timer, an external wait, restart while waiting, and
   completion without repeating the completed activity.
-- `runtime::duroxide_workflow::tests::runtime_starts_seeds_supervisors_idempotently_and_shuts_down`
+- `runtime::workflow::tests::runtime_starts_seeds_supervisors_idempotently_and_shuts_down`
   proves runtime startup/shutdown and supervisor seeding.
-- `runtime::duroxide_workflow::tests::announce_orchestration_waits_for_media_and_client_inventory_events`
+- `runtime::workflow::tests::announce_orchestration_waits_for_media_and_client_inventory_events`
   and `announce_orchestration_preserves_partial_inventory_wait_after_recheck`
   prove announce no-match inventory waits behave as wait-all barriers.
-- `runtime::duroxide_workflow::tests::announce_orchestration_rechecks_when_inventory_completion_event_is_missed`
+- `runtime::workflow::tests::announce_orchestration_rechecks_when_inventory_completion_event_is_missed`
   covers missed inventory completion events with timer-backed recheck.
-- `runtime::duroxide_workflow::tests::announce_orchestration_resumes_dependency_wait_after_file_backed_restart`
+- `runtime::workflow::tests::announce_orchestration_resumes_dependency_wait_after_file_backed_restart`
   covers restart while an announce waits on candidate cache recovery.
 - `runtime::daemon::tests::announce_workflow_waits_for_scheduled_media_inventory_before_terminal_no_match`
   covers the real scheduled media inventory path before terminal no-match.
 - `runtime::daemon::tests::search_workflow_resumes_blocked_candidate_after_file_backed_restart`
   covers restart while a search candidate download is in flight.
-- `runtime::duroxide_workflow::tests::saved_retry_supervisor_runs_startup_and_interval_with_bounded_children`
+- `runtime::workflow::tests::saved_retry_supervisor_runs_startup_and_interval_with_bounded_children`
   covers saved retry startup, interval execution, child workflows, and bounded
   child concurrency.
 - `http::tests::announcement_acceptance_rejects_inserted_work_when_workflow_start_fails`

@@ -45,12 +45,6 @@ use crate::persistence::repository::{
 use crate::runtime::announce_worker::AnnounceWorker;
 use crate::runtime::backoff::stable_jitter_seed;
 use crate::runtime::daemon::AnnounceProcessor;
-use crate::runtime::duroxide_workflow::{
-    AnnounceWorkflowActivities, DuroxideWorkflowRuntime, DuroxideWorkflowRuntimeError,
-    SavedRetryWorkflowActivities, SavedRetryWorkflowStateHandle, ScheduledJobStateHandle,
-    ScheduledJobWorkflowActivities, SearchWorkflowActivities, SearchWorkflowStateHandle,
-    workflow_database_path, workflow_runtime_dependency_name,
-};
 use crate::runtime::health::{DependencyKind, HealthRegistry};
 use crate::runtime::injection_worker::{InjectionClient, InjectionWorker};
 use crate::runtime::queue::{QueueKind, RuntimeQueueConfig, WorkReceiver, bounded_work_queue};
@@ -64,6 +58,12 @@ use crate::runtime::search::{
 };
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, shutdown_channel,
+};
+use crate::runtime::workflow::{
+    AnnounceWorkflowActivities, DuroxideWorkflowRuntime, DuroxideWorkflowRuntimeError,
+    SavedRetryWorkflowActivities, SavedRetryWorkflowStateHandle, ScheduledJobStateHandle,
+    ScheduledJobWorkflowActivities, SearchWorkflowActivities, SearchWorkflowStateHandle,
+    workflow_database_path, workflow_runtime_dependency_name,
 };
 
 const PROWLARR_REFRESH_CONCURRENCY: usize = 4;
@@ -1264,7 +1264,7 @@ impl AppRuntime {
         let workflow_runtime = map_workflow_runtime_error(
             DuroxideWorkflowRuntime::start_with_activities(
                 runtime_workflow_database_path(&config),
-                crate::runtime::duroxide_workflow::InventoryWorkflowActivities::new(
+                crate::runtime::workflow::InventoryWorkflowActivities::new(
                     repository.clone(),
                     inventory_refresh.clone(),
                     injection_worker.clone(),
@@ -2101,8 +2101,7 @@ mod tests {
             .iter()
             .find(|dependency| {
                 dependency["kind"] == DependencyKind::LocalState.as_str()
-                    && dependency["name"]
-                        == crate::runtime::duroxide_workflow::WORKFLOW_RUNTIME_DEPENDENCY
+                    && dependency["name"] == crate::runtime::workflow::WORKFLOW_RUNTIME_DEPENDENCY
             })
             .expect("status should expose workflow runtime dependency health");
         assert_eq!("healthy", workflow_dependency["state"]);
@@ -2794,8 +2793,7 @@ mod tests {
         );
         assert!(health.entries.iter().any(|entry| {
             entry.key.kind == DependencyKind::LocalState
-                && entry.key.name.as_str()
-                    == crate::runtime::duroxide_workflow::WORKFLOW_RUNTIME_DEPENDENCY
+                && entry.key.name.as_str() == crate::runtime::workflow::WORKFLOW_RUNTIME_DEPENDENCY
                 && matches!(entry.state, DependencyState::Healthy { .. })
         }));
         assert_eq!(7, health.entries.len());

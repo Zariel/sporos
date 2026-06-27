@@ -45,12 +45,12 @@ use crate::persistence::repository::{
     WorkflowProjectionSnapshot,
 };
 use crate::runtime::announce_worker::unix_time_ms;
-use crate::runtime::duroxide_workflow::DuroxideWorkflowRuntime;
 use crate::runtime::health::{
     DependencyHealthSnapshot as RuntimeDependencyHealthSnapshot, HealthRegistry,
 };
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
 use crate::runtime::scheduler::ScheduledJobRun;
+use crate::runtime::workflow::DuroxideWorkflowRuntime;
 use crate::runtime::workflow_contracts::SearchWorkflowInput;
 use crate::secrets::{CookieSecret, sanitize_url_for_logging};
 

@@ -59,8 +59,6 @@ use crate::runtime::announce_worker::{
     classify_reverse_lookup_outcome, unix_time_ms,
 };
 use crate::runtime::app::{AppRuntime, AppState, RuntimeReceivers};
-use crate::runtime::duroxide_workflow::DuroxideWorkflowRuntimeError;
-use crate::runtime::duroxide_workflow::InventoryWorkflowRequest;
 use crate::runtime::health::DependencyKind;
 use crate::runtime::injection_worker::{
     DryRunAction, InjectionRequest, InjectionWorker, RecheckResumeConfig, SavedTorrentRetryConfig,
@@ -74,6 +72,8 @@ use crate::runtime::scheduler::{
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
 };
+use crate::runtime::workflow::DuroxideWorkflowRuntimeError;
+use crate::runtime::workflow::InventoryWorkflowRequest;
 #[cfg(test)]
 use crate::runtime::workflow_contracts::SearchWorkflowInput;
 use crate::runtime::workflow_contracts::WorkflowEventName;
@@ -485,10 +485,10 @@ async fn submit_active_announce_workflows(
     for work in work_items {
         match state.workflow_runtime.submit_announcement(&work).await {
             Ok(submission) => match submission.outcome {
-                crate::runtime::duroxide_workflow::AnnounceWorkflowSubmissionOutcome::Started => {
+                crate::runtime::workflow::AnnounceWorkflowSubmissionOutcome::Started => {
                     summary.started += 1;
                 }
-                crate::runtime::duroxide_workflow::AnnounceWorkflowSubmissionOutcome::AlreadyRunning => {
+                crate::runtime::workflow::AnnounceWorkflowSubmissionOutcome::AlreadyRunning => {
                     summary.already_running += 1;
                 }
             },
