@@ -47,8 +47,8 @@ use crate::runtime::backoff::stable_jitter_seed;
 use crate::runtime::daemon::AnnounceProcessor;
 use crate::runtime::duroxide_workflow::{
     AnnounceWorkflowActivities, DuroxideWorkflowRuntime, DuroxideWorkflowRuntimeError,
-    ScheduledJobStateHandle, ScheduledJobWorkflowActivities, workflow_database_path,
-    workflow_runtime_dependency_name,
+    ScheduledJobStateHandle, ScheduledJobWorkflowActivities, SearchWorkflowActivities,
+    SearchWorkflowStateHandle, workflow_database_path, workflow_runtime_dependency_name,
 };
 use crate::runtime::health::{DependencyKind, HealthRegistry};
 use crate::runtime::injection_worker::{InjectionClient, InjectionWorker};
@@ -1258,6 +1258,7 @@ impl AppRuntime {
             injection_worker.clone(),
         );
         let scheduled_job_state = ScheduledJobStateHandle::new();
+        let search_workflow_state = SearchWorkflowStateHandle::new();
         let workflow_runtime = map_workflow_runtime_error(
             DuroxideWorkflowRuntime::start_with_activities(
                 runtime_workflow_database_path(&config),
@@ -1278,6 +1279,10 @@ impl AppRuntime {
                     scheduler.clone(),
                     shutdown_signal.clone(),
                     scheduled_job_state.clone(),
+                ),
+                SearchWorkflowActivities::new(
+                    search_workflow_state.clone(),
+                    shutdown_signal.clone(),
                 ),
             )
             .await,
@@ -1331,7 +1336,8 @@ impl AppRuntime {
                 repository.clone(),
                 config.announce.clone(),
                 workflow_runtime.clone(),
-            );
+            )
+            .with_search_acceptor(workflow_runtime.clone());
         if let Some(api_token) = config.server.api_token.as_ref() {
             http = http.with_api_token(api_token.expose_secret());
         }
@@ -1368,6 +1374,15 @@ impl AppRuntime {
             scheduled_job_activity_state.health.clone(),
         );
         let _ = scheduled_job_state.bind(scheduled_job_activity_state);
+        let mut search_activity_state = state.clone();
+        search_activity_state.workflow_runtime = search_activity_state
+            .workflow_runtime
+            .without_scheduled_job_state();
+        search_activity_state.http = HttpState::new(
+            ReadinessState::ready(),
+            search_activity_state.health.clone(),
+        );
+        let _ = search_workflow_state.bind(search_activity_state);
         if let Err(error) = state.refresh_startup_prowlarr_sources(now_ms).await {
             state.workflow_runtime.shutdown(Some(1_000)).await;
             return Err(error);

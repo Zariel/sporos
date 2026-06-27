@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
 use sqlx::Row;
@@ -73,6 +74,8 @@ use crate::runtime::scheduler::{
 use crate::runtime::shutdown::{
     ShutdownController, ShutdownPhase, ShutdownSignal, record_safe_job_shutdown,
 };
+#[cfg(test)]
+use crate::runtime::workflow_contracts::SearchWorkflowInput;
 use crate::runtime::workflow_contracts::WorkflowEventName;
 use crate::secrets::sanitize_url_for_logging;
 use crate::time::unix_ms_to_rfc3339_seconds;
@@ -84,7 +87,7 @@ const WORKFLOW_RUNTIME_SHUTDOWN_TIMEOUT_MS: u64 = 100;
 const ANNOUNCE_CANDIDATE_INDEXER_ID: u64 = i64::MAX as u64;
 const ANNOUNCE_WORKFLOW_RECOVERY_MAX: u16 = u16::MAX;
 const SCHEDULER_SHUTDOWN_ERROR: &str = "scheduler is shutting down";
-const SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY: usize = 4;
+pub(crate) const SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY: usize = 4;
 const SEARCH_CANDIDATE_STREAM_CAPACITY: usize = SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY;
 const REMOTE_CANDIDATE_CLEANUP_MAX_BATCHES: u16 = 4;
 
@@ -777,19 +780,19 @@ async fn release_queued_search_requests(
     }
 }
 
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
-struct SearchWorkflowExecutionSummary {
-    planned_indexers: usize,
-    failed_indexers: usize,
-    candidates: usize,
-    persisted: usize,
-    downloaded: usize,
-    saved: usize,
-    injected: usize,
-    dry_run: usize,
-    already_present: usize,
-    rejected: usize,
-    failed: usize,
+#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SearchWorkflowExecutionSummary {
+    pub(crate) planned_indexers: usize,
+    pub(crate) failed_indexers: usize,
+    pub(crate) candidates: usize,
+    pub(crate) persisted: usize,
+    pub(crate) downloaded: usize,
+    pub(crate) saved: usize,
+    pub(crate) injected: usize,
+    pub(crate) dry_run: usize,
+    pub(crate) already_present: usize,
+    pub(crate) rejected: usize,
+    pub(crate) failed: usize,
 }
 
 async fn process_search_workflow(
@@ -827,6 +830,43 @@ async fn process_search_workflow(
     Ok(summary)
 }
 
+pub(crate) async fn process_duroxide_search_candidate(
+    state: AppState,
+    candidate: RemoteCandidate,
+    now_ms: i64,
+    shutdown: ShutdownSignal,
+) -> Result<SearchWorkflowExecutionSummary, String> {
+    let database_gate = Arc::new(Semaphore::new(1));
+    let (_index, result) = preflight_search_candidate(
+        0,
+        state.clone(),
+        candidate,
+        now_ms,
+        shutdown.clone(),
+        database_gate,
+    )
+    .await;
+    let mut summary = SearchWorkflowExecutionSummary::default();
+    Box::pin(record_search_candidate_preflight(
+        state,
+        result,
+        &shutdown,
+        &mut summary,
+    ))
+    .await?;
+    Ok(summary)
+}
+
+pub(crate) fn finalize_duroxide_search_workflow(
+    state: &AppState,
+    summary: &SearchWorkflowExecutionSummary,
+) {
+    state
+        .metrics
+        .record_search_attempt(search_metric_outcome(summary));
+    emit_search_result_notifications(state, summary);
+}
+
 async fn process_search_candidates(
     state: AppState,
     mut candidates: mpsc::Receiver<RemoteCandidate>,
@@ -843,8 +883,13 @@ async fn process_search_candidates(
 
     while !candidates_closed || next_record < next_launch {
         if let Some(result) = completed.remove(&next_record) {
-            record_search_candidate_preflight(state.clone(), result, &shutdown, &mut summary)
-                .await?;
+            Box::pin(record_search_candidate_preflight(
+                state.clone(),
+                result,
+                &shutdown,
+                &mut summary,
+            ))
+            .await?;
             next_record += 1;
             continue;
         }
@@ -5895,6 +5940,7 @@ mod tests {
         let search_queue = runtime.state.queues.workflow.searches.clone();
         let notification_queue = runtime.state.queues.notifications.clone();
         let metrics = runtime.state.metrics.clone();
+        let workflow_database_path = runtime.state.workflow_runtime.database_path().to_path_buf();
         let app = router(runtime.state.http.clone());
         let handles = start_background_tasks(runtime).await.unwrap();
 
@@ -5908,7 +5954,6 @@ mod tests {
 
         assert_eq!(StatusCode::ACCEPTED, accepted.status());
         wait_for_saved_torrent_count(&output_dir, 1).await;
-        wait_for_queue_completed(&search_queue, 1).await;
         wait_for_queue_completed(&notification_queue, 1).await;
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
@@ -5921,9 +5966,11 @@ mod tests {
             .fetch_one(repository.pool())
             .await
             .unwrap();
+        let search_stats = search_queue.stats();
         assert_eq!(1, candidates);
         assert_eq!(1, decisions);
-        assert_eq!(0, search_queue.stats().depth);
+        assert_eq!(0, search_stats.depth);
+        assert_eq!(0, search_stats.completed);
         assert_eq!(1, notification_requests.load(Ordering::SeqCst));
         let notification_body = notification_bodies
             .lock()
@@ -5944,6 +5991,9 @@ mod tests {
         ));
         assert!(metrics.contains("sporos_decisions_total{outcome=\"exact_match\"} 1"));
         assert!(metrics.contains("sporos_actions_total{outcome=\"saved\"} 1"));
+        let workflow_database = fs::read(&workflow_database_path).unwrap_or_default();
+        let workflow_database = String::from_utf8_lossy(&workflow_database);
+        assert!(!workflow_database.contains("url-secret"));
     }
 
     #[tokio::test]
@@ -6077,7 +6127,6 @@ mod tests {
             .await
             .unwrap();
         let shutdown = runtime.state.shutdown.clone();
-        let search_queue = runtime.state.queues.workflow.searches.clone();
         let metrics = runtime.state.metrics.clone();
         let app = router(runtime.state.http.clone());
         let handles = start_background_tasks(runtime).await.unwrap();
@@ -6091,7 +6140,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(StatusCode::ACCEPTED, accepted.status());
-        wait_for_queue_completed(&search_queue, 1).await;
+        wait_for_metric_contains(
+            &metrics,
+            "sporos_search_attempts_total{outcome=\"failed\"} 1",
+        )
+        .await;
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
@@ -6136,7 +6189,6 @@ mod tests {
             .await
             .unwrap();
         let shutdown = runtime.state.shutdown.clone();
-        let search_queue = runtime.state.queues.workflow.searches.clone();
         let metrics = runtime.state.metrics.clone();
         let app = router(runtime.state.http.clone());
         let handles = start_background_tasks(runtime).await.unwrap();
@@ -6150,7 +6202,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(StatusCode::ACCEPTED, accepted.status());
-        wait_for_queue_completed(&search_queue, 1).await;
+        wait_for_metric_contains(
+            &metrics,
+            "sporos_search_attempts_total{outcome=\"failed\"} 1",
+        )
+        .await;
         shutdown.cancel_now("test shutdown").unwrap();
         stop_background_tasks(handles).await;
 
@@ -6168,6 +6224,76 @@ mod tests {
             .unwrap();
         assert_eq!("unavailable", entry.state);
         assert!(entry.reason.as_deref().unwrap().contains("exceeded"));
+    }
+
+    #[tokio::test]
+    async fn search_workflow_resumes_blocked_candidate_after_file_backed_restart() {
+        let root = unique_temp_dir("daemon-search-duroxide-restart");
+        let output_dir = root.join("output");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(root.join("movie.mkv"), b"0123456789").unwrap();
+        let download_requests = Arc::new(AtomicUsize::new(0));
+        let release_download = Arc::new(tokio::sync::Notify::new());
+        let indexer_url = spawn_daemon_torznab_search_server_with_blocked_download(
+            Arc::clone(&download_requests),
+            Arc::clone(&release_download),
+        )
+        .await;
+        let database_path = root.join("sporos.db");
+        let mut config = SporosConfig::default();
+        config.paths.database = database_path.clone();
+        config.paths.output_dir = output_dir.clone();
+        config.paths.torrent_cache_dir = cache_dir;
+        config.indexers.torznab.insert(
+            "main".to_owned(),
+            TorznabIndexerConfig {
+                url: indexer_url,
+                api_key: Some(ApiKey::new("secret").unwrap()),
+                api_key_file: None,
+                api_key_env_source: None,
+            },
+        );
+        let repository = Repository::connect(database_path).await.unwrap();
+        let mut item = local_item(&root);
+        item.info_hash = None;
+        repository
+            .upsert_local_item_with_files(&item, &[local_file()])
+            .await
+            .unwrap();
+        let runtime = AppRuntime::from_repository(config.clone(), repository.clone())
+            .await
+            .unwrap();
+        repository
+            .record_indexer_caps_success(
+                &DependencyName::new("main").unwrap(),
+                &daemon_movie_caps(),
+                unix_time_ms(),
+            )
+            .await
+            .unwrap();
+        runtime
+            .state
+            .workflow_runtime
+            .submit_search(SearchWorkflowInput {
+                request_id: "manual-restart-1".to_owned(),
+                media_type: "auto".to_owned(),
+                query: "movie.mkv".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        wait_for_atomic_count(&download_requests, 1).await;
+        runtime.state.workflow_runtime.shutdown(Some(100)).await;
+        drop(runtime);
+
+        let restarted = AppRuntime::from_repository(config, repository.clone())
+            .await
+            .unwrap();
+        release_download.notify_waiters();
+        wait_for_saved_torrent_count(&output_dir, 1).await;
+        restarted.state.workflow_runtime.shutdown(Some(1_000)).await;
     }
 
     #[tokio::test]
@@ -9215,6 +9341,18 @@ mod tests {
         assert_eq!(expected, queue.stats().completed);
     }
 
+    async fn wait_for_metric_contains(metrics: &crate::metrics::MetricsRegistry, needle: &str) {
+        for _attempt in 0..50 {
+            let rendered = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
+            if rendered.contains(needle) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let rendered = metrics.render_prometheus(&crate::metrics::MetricsSnapshot::default());
+        assert!(rendered.contains(needle), "{rendered}");
+    }
+
     async fn wait_for_saved_torrent_count(path: &Path, expected: usize) {
         for _attempt in 0..50 {
             let count = saved_torrent_count(path);
@@ -9418,7 +9556,7 @@ mod tests {
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let download_url = format!("http://{address}/download");
+        let download_url = format!("http://{address}/download?apikey=url-secret");
         let app = axum::Router::new()
             .route(
                 "/api",
@@ -9443,6 +9581,48 @@ mod tests {
                     async move {
                         download_requests.fetch_add(1, Ordering::SeqCst);
                         (download_status, test_torrent_bytes())
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/api")
+    }
+
+    async fn spawn_daemon_torznab_search_server_with_blocked_download(
+        download_requests: Arc<AtomicUsize>,
+        release_download: Arc<tokio::sync::Notify>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let download_url = format!("http://{address}/download");
+        let app = axum::Router::new()
+            .route(
+                "/api",
+                get(move || {
+                    let download_url = download_url.clone();
+                    async move {
+                        (
+                            StatusCode::OK,
+                            search_rss_with_download(
+                                "candidate-search",
+                                "movie.mkv",
+                                &download_url,
+                            ),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/download",
+                get(move || {
+                    let download_requests = Arc::clone(&download_requests);
+                    let release_download = Arc::clone(&release_download);
+                    async move {
+                        download_requests.fetch_add(1, Ordering::SeqCst);
+                        release_download.notified().await;
+                        (StatusCode::OK, test_torrent_bytes())
                     }
                 }),
             );
@@ -9993,9 +10173,9 @@ mod tests {
             .fetch_all(repository.pool())
             .await
             .unwrap_or_default();
-            let waiter_count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM workflow_inventory_waiters")
-                    .fetch_one(repository.pool())
+            let waiters: Vec<(String, String)> =
+                sqlx::query_as("SELECT event_name, workflow_id FROM workflow_inventory_waiters")
+                    .fetch_all(repository.pool())
                     .await
                     .unwrap_or_default();
             let completion_count: i64 =
@@ -10004,7 +10184,7 @@ mod tests {
                     .await
                     .unwrap_or_default();
             panic!(
-                "timed out waiting for announce {id} {status}/{reason}; last row: {last:?}; projection={projection:?}; waiters={waiter_count}; completions={completion_count}"
+                "timed out waiting for announce {id} {status}/{reason}; last row: {last:?}; projection={projection:?}; waiters={waiters:?}; completions={completion_count}"
             );
         }
     }
@@ -10026,7 +10206,10 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 };
-                if run.job_name.as_str() == MEDIA_INVENTORY_JOB_NAME {
+                if matches!(
+                    run.job_name.as_str(),
+                    MEDIA_INVENTORY_JOB_NAME | CLIENT_INVENTORY_JOB_NAME
+                ) {
                     process_scheduled_job_run(state, run, state.shutdown_signal.clone()).await;
                 }
                 scheduler_receiver.mark_completed();

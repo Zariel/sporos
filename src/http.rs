@@ -51,12 +51,14 @@ use crate::runtime::health::{
 };
 use crate::runtime::queue::{BoundedWorkQueue, EnqueueError};
 use crate::runtime::scheduler::ScheduledJobRun;
+use crate::runtime::workflow_contracts::SearchWorkflowInput;
 use crate::secrets::{CookieSecret, sanitize_url_for_logging};
 
 const WORKFLOW_BODY_LIMIT_BYTES: usize = 16 * 1024;
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
 static READINESS_WRITE_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SEARCH_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type ResolveDownloadUrlFuture = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
 type ResolveDownloadUrlHost =
@@ -125,6 +127,7 @@ pub struct HttpState {
     search_worker_concurrency: usize,
     allowed_jobs: Option<Arc<BTreeSet<JobName>>>,
     announce_acceptor: Option<AnnounceAcceptor>,
+    search_acceptor: Option<SearchAcceptor>,
     announce_download_resolver: AnnounceDownloadUrlResolver,
     api_auth: Option<ApiAuth>,
     request_timeout: Duration,
@@ -148,6 +151,7 @@ impl HttpState {
             search_worker_concurrency: crate::config::DEFAULT_SEARCH_WORKER_CONCURRENCY,
             allowed_jobs: None,
             announce_acceptor: None,
+            search_acceptor: None,
             announce_download_resolver: AnnounceDownloadUrlResolver::system(),
             api_auth: None,
             request_timeout: Duration::from_secs(5),
@@ -235,6 +239,11 @@ impl HttpState {
             config,
             workflow_runtime,
         });
+        self
+    }
+
+    pub fn with_search_acceptor(mut self, workflow_runtime: DuroxideWorkflowRuntime) -> Self {
+        self.search_acceptor = Some(SearchAcceptor { workflow_runtime });
         self
     }
 
@@ -525,6 +534,11 @@ fn ensure_writable_directory(path: &FsPath) -> io::Result<()> {
 struct AnnounceAcceptor {
     repository: Repository,
     config: AnnounceQueueConfig,
+    workflow_runtime: DuroxideWorkflowRuntime,
+}
+
+#[derive(Debug, Clone)]
+struct SearchAcceptor {
     workflow_runtime: DuroxideWorkflowRuntime,
 }
 
@@ -1451,6 +1465,16 @@ async fn post_search(
         }
     };
     let _span = debug_span!("http.search", query = %request.query);
+    if let Some(acceptor) = state.search_acceptor.as_ref() {
+        let response = accept_search(&state.metrics, acceptor, request).await;
+        state.metrics.record_http_request(
+            HttpMethod::Post,
+            HttpRoute::Searches,
+            response.status().as_u16(),
+        );
+        return response;
+    }
+
     let queue = match state.search_queue() {
         Ok(queue) => queue,
         Err(error) => {
@@ -1477,6 +1501,40 @@ async fn post_search(
         response.status().as_u16(),
     );
     response
+}
+
+async fn accept_search(
+    metrics: &MetricsRegistry,
+    acceptor: &SearchAcceptor,
+    request: SearchWorkflowRequest,
+) -> Response {
+    let requested_at_ms = unix_time_ms();
+    let sequence = SEARCH_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let input = SearchWorkflowInput {
+        request_id: format!("manual-{requested_at_ms}-{sequence}"),
+        media_type: "auto".to_owned(),
+        query: request.query.as_str().to_owned(),
+    };
+    match acceptor.workflow_runtime.submit_search(input).await {
+        Ok(_submission) => {
+            metrics
+                .record_workflow_enqueue(WorkflowMetric::Search, WorkflowOutcome::DurableAccepted);
+            (
+                StatusCode::ACCEPTED,
+                Json(WorkflowAcceptedResponse {
+                    status: "queued",
+                    workflow: WorkflowKind::Search.as_str(),
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            metrics
+                .record_workflow_enqueue(WorkflowMetric::Search, WorkflowOutcome::RejectedClosed);
+            ApiErrorResponse::service_unavailable(format!("cannot start search workflow: {error}"))
+                .into_response()
+        }
+    }
 }
 
 async fn post_job_run(State(state): State<HttpState>, Path(job_name): Path<String>) -> Response {

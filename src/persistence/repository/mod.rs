@@ -475,6 +475,16 @@ pub struct RemoteCandidateCacheMaterial {
     pub torrent_cache_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SearchCandidateMaterialRef {
+    pub ordinal: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchCandidateMaterialPage {
+    pub refs: Vec<SearchCandidateMaterialRef>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DeletedRemoteCandidate {
     pub id: RemoteCandidateId,
@@ -1603,6 +1613,164 @@ impl Repository {
 
         row.map(remote_candidate_cache_material_from_row)
             .transpose()
+    }
+
+    pub async fn upsert_search_candidate_material(
+        &self,
+        workflow_id: &str,
+        ordinal: u32,
+        candidate: &RemoteCandidate,
+        created_at_ms: i64,
+    ) -> Result<(), DatabaseError> {
+        sqlx::query(
+            r#"
+            INSERT INTO search_candidate_material (
+                workflow_id,
+                ordinal,
+                indexer_id,
+                guid,
+                download_url,
+                redacted_download_url,
+                title,
+                tracker,
+                size,
+                published_at,
+                info_hash,
+                torrent_cache_path,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (workflow_id, ordinal) DO UPDATE SET
+                indexer_id = excluded.indexer_id,
+                guid = excluded.guid,
+                download_url = excluded.download_url,
+                redacted_download_url = excluded.redacted_download_url,
+                title = excluded.title,
+                tracker = excluded.tracker,
+                size = excluded.size,
+                published_at = excluded.published_at,
+                info_hash = excluded.info_hash,
+                torrent_cache_path = excluded.torrent_cache_path,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(i64::from(ordinal))
+        .bind(i64_from_u64(candidate.indexer_id.get(), "indexer id")?)
+        .bind(candidate.guid.as_str())
+        .bind(candidate.download_url.as_str())
+        .bind(sanitize_url_for_logging(candidate.download_url.as_str()).to_string())
+        .bind(candidate.title.as_str())
+        .bind(candidate.tracker.as_str())
+        .bind(
+            candidate
+                .size
+                .map(ByteSize::get)
+                .map(|size| i64_from_u64(size, "candidate size"))
+                .transpose()?,
+        )
+        .bind(candidate.published_at_ms)
+        .bind(candidate.info_hash.as_ref().map(InfoHash::as_str))
+        .bind(candidate.torrent_cache_path.as_ref().map(path_to_string))
+        .bind(created_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("upsert search candidate material", error))?;
+
+        Ok(())
+    }
+
+    pub async fn search_candidate_material_page(
+        &self,
+        workflow_id: &str,
+        start_ordinal: u32,
+        limit: u16,
+    ) -> Result<SearchCandidateMaterialPage, DatabaseError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT ordinal
+            FROM search_candidate_material
+            WHERE workflow_id = ?
+              AND ordinal >= ?
+            ORDER BY ordinal
+            LIMIT ?
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(i64::from(start_ordinal))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| db_error("read search candidate material page", error))?;
+
+        let refs = rows
+            .into_iter()
+            .map(|row| {
+                let ordinal = row.get::<i64, _>("ordinal");
+                u32::try_from(ordinal)
+                    .map(|ordinal| SearchCandidateMaterialRef { ordinal })
+                    .map_err(|error| DatabaseError::QueryFailed {
+                        operation: "read search candidate ordinal".to_owned(),
+                        message: error.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(SearchCandidateMaterialPage { refs })
+    }
+
+    pub async fn search_candidate_material(
+        &self,
+        workflow_id: &str,
+        ordinal: u32,
+    ) -> Result<Option<RemoteCandidate>, DatabaseError> {
+        let row = sqlx::query(
+            r#"
+            SELECT indexer_id, guid, download_url, title, tracker, size, published_at,
+                   info_hash, torrent_cache_path
+            FROM search_candidate_material
+            WHERE workflow_id = ?
+              AND ordinal = ?
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(i64::from(ordinal))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read search candidate material", error))?;
+
+        row.map(search_candidate_material_from_row).transpose()
+    }
+
+    pub async fn delete_search_candidate_material(
+        &self,
+        workflow_id: &str,
+    ) -> Result<u64, DatabaseError> {
+        let result = sqlx::query("DELETE FROM search_candidate_material WHERE workflow_id = ?")
+            .bind(workflow_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| db_error("delete search candidate material", error))?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn claim_search_workflow_finalization(
+        &self,
+        workflow_id: &str,
+        finalized_at_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO search_workflow_finalizations (workflow_id, finalized_at)
+            VALUES (?, ?)
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(finalized_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("claim search workflow finalization", error))?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn cleanup_stale_remote_candidates_batch(
@@ -7146,6 +7314,63 @@ fn remote_candidate_cache_material_from_row(
 ) -> Result<RemoteCandidateCacheMaterial, DatabaseError> {
     Ok(RemoteCandidateCacheMaterial {
         info_hash: row.get("info_hash"),
+        torrent_cache_path: row
+            .get::<Option<String>, _>("torrent_cache_path")
+            .map(PathBuf::from),
+    })
+}
+
+fn search_candidate_material_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<RemoteCandidate, DatabaseError> {
+    let size = row
+        .get::<Option<i64>, _>("size")
+        .map(|size| {
+            u64::try_from(size)
+                .map(ByteSize::new)
+                .map_err(|error| DatabaseError::QueryFailed {
+                    operation: "read search candidate size".to_owned(),
+                    message: error.to_string(),
+                })
+        })
+        .transpose()?;
+    Ok(RemoteCandidate {
+        id: None,
+        indexer_id: indexer_id_from_i64(row.get("indexer_id"), "indexer id")?,
+        guid: CandidateGuid::new(row.get::<String, _>("guid")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read search candidate guid".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        download_url: DownloadUrl::new(row.get::<String, _>("download_url")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read search candidate download URL".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        title: ItemTitle::new(row.get::<String, _>("title")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read search candidate title".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        tracker: TrackerName::new(row.get::<String, _>("tracker")).map_err(|error| {
+            DatabaseError::QueryFailed {
+                operation: "read search candidate tracker".to_owned(),
+                message: error.to_string(),
+            }
+        })?,
+        size,
+        published_at_ms: row.get("published_at"),
+        info_hash: row
+            .get::<Option<String>, _>("info_hash")
+            .map(InfoHash::new)
+            .transpose()
+            .map_err(|error| DatabaseError::QueryFailed {
+                operation: "read search candidate info hash".to_owned(),
+                message: error.to_string(),
+            })?,
         torrent_cache_path: row
             .get::<Option<String>, _>("torrent_cache_path")
             .map(PathBuf::from),

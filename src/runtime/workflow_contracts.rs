@@ -86,6 +86,10 @@ pub enum ActivityKind {
     ActionsSaveTorrent,
     NotificationsDeliver,
     CleanupRun,
+    SearchPlan,
+    SearchCandidatePage,
+    SearchCandidateProcess,
+    SearchFinalize,
     ScheduledJobClaim,
     ScheduledJobComplete,
     ScheduledJobRun,
@@ -138,7 +142,7 @@ impl ActivityRetryContract {
 }
 
 impl ActivityKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 18] = [
         Self::RepositoryRead,
         Self::RepositoryWrite,
         Self::InventoryScanMedia,
@@ -150,6 +154,10 @@ impl ActivityKind {
         Self::ActionsSaveTorrent,
         Self::NotificationsDeliver,
         Self::CleanupRun,
+        Self::SearchPlan,
+        Self::SearchCandidatePage,
+        Self::SearchCandidateProcess,
+        Self::SearchFinalize,
         Self::ScheduledJobClaim,
         Self::ScheduledJobComplete,
         Self::ScheduledJobRun,
@@ -168,6 +176,10 @@ impl ActivityKind {
             Self::ActionsSaveTorrent => "sporos.actions.save_torrent.v1",
             Self::NotificationsDeliver => "sporos.notifications.deliver.v1",
             Self::CleanupRun => "sporos.cleanup.run.v1",
+            Self::SearchPlan => "sporos.search.plan.v1",
+            Self::SearchCandidatePage => "sporos.search.candidate_page.v1",
+            Self::SearchCandidateProcess => "sporos.search.candidate_process.v1",
+            Self::SearchFinalize => "sporos.search.finalize.v1",
             Self::ScheduledJobClaim => "sporos.scheduled_job.claim.v1",
             Self::ScheduledJobComplete => "sporos.scheduled_job.complete.v1",
             Self::ScheduledJobRun => "sporos.scheduled_job.run.v1",
@@ -256,6 +268,34 @@ impl ActivityKind {
                 duplicate_safety: DuplicateSafety::RepeatAcceptedByContract,
                 retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
                 contract: "cleanup activities delete or mark deterministic stale records and files, and repeating cleanup must leave retained state unchanged",
+            },
+            Self::SearchPlan => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::LocalStateMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "manual search planning reads indexers and records stable dependency health, so ambiguous persistence must be verified before repeating the activity",
+            },
+            Self::SearchCandidatePage => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::ReadOnly,
+                duplicate_safety: DuplicateSafety::NaturallyIdempotent,
+                retry_boundary: ActivityRetryBoundary::SafeToRetryInsideActivity,
+                contract: "manual search candidate paging reads durable candidate material references without exposing fetch material and may retry transient database reads",
+            },
+            Self::SearchCandidateProcess => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::ExternalMutation,
+                duplicate_safety: DuplicateSafety::VerifyBeforeRetry,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyAfterVerification,
+                contract: "manual search candidate processing may cache torrents, prepare actions, and mutate clients; retries must verify existing candidate, files, and client state",
+            },
+            Self::SearchFinalize => ActivityRetryContract {
+                activity: self,
+                effect: ActivityEffect::NotificationDelivery,
+                duplicate_safety: DuplicateSafety::DeliveryPolicyBounded,
+                retry_boundary: ActivityRetryBoundary::RetryOnlyUnderDeliveryPolicy,
+                contract: "manual search finalization records summary metrics and queues operator notifications according to bounded notification delivery policy",
             },
             Self::ScheduledJobClaim => ActivityRetryContract {
                 activity: self,
@@ -799,6 +839,8 @@ mod tests {
             ActivityKind::MatchingReverseLookup,
             ActivityKind::TorrentClientMutate,
             ActivityKind::ActionsPrepareLinks,
+            ActivityKind::SearchPlan,
+            ActivityKind::SearchCandidateProcess,
         ] {
             let contract = activity.retry_contract();
             ensure_eq(

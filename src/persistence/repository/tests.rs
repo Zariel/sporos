@@ -511,6 +511,67 @@ async fn remote_candidate_cache_material_leaves_cached_hash_unparsed() {
 }
 
 #[tokio::test]
+async fn search_candidate_material_round_trips_and_finalizes_once() {
+    let repository = Repository::connect_in_memory().await.unwrap();
+    let mut candidate = test_remote_candidate("guid-search-material", "Example");
+    candidate.download_url =
+        DownloadUrl::new("https://tracker.example/download?passkey=supersecret").unwrap();
+
+    repository
+        .upsert_search_candidate_material("search:manual-1", 0, &candidate, 1_000)
+        .await
+        .unwrap();
+    let page = repository
+        .search_candidate_material_page("search:manual-1", 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(1, page.refs.len());
+    assert_eq!(0, page.refs[0].ordinal);
+
+    let material = repository
+        .search_candidate_material("search:manual-1", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.download_url, material.download_url);
+    let redacted_download_url: String = sqlx::query_scalar(
+        "SELECT redacted_download_url FROM search_candidate_material WHERE workflow_id = ?",
+    )
+    .bind("search:manual-1")
+    .fetch_one(repository.pool())
+    .await
+    .unwrap();
+    assert!(!redacted_download_url.contains("supersecret"));
+
+    assert!(
+        repository
+            .claim_search_workflow_finalization("search:manual-1", 2_000)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .claim_search_workflow_finalization("search:manual-1", 3_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        1,
+        repository
+            .delete_search_candidate_material("search:manual-1")
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .search_candidate_material("search:manual-1", 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn announce_candidate_material_reads_typed_fetch_material() {
     let repository = Repository::connect_in_memory().await.unwrap();
     let mut work = test_announce_work("ann_material", "guid-material", 1);

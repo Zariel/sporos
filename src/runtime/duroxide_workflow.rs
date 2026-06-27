@@ -14,15 +14,17 @@ use serde::{Deserialize, Serialize};
 use crate::announce::{
     AnnounceQueueConfig, AnnounceReason, AnnounceStatus, AnnounceWorkId, AnnounceWorkItem,
 };
-use crate::domain::{DependencyKind, DependencyName, JobName};
+use tokio::sync::mpsc;
+
+use crate::domain::{DependencyKind, DependencyName, ItemTitle, JobName};
 use crate::errors::DatabaseError;
 use crate::inventory_refresh::{
     InventoryRefreshRequest, InventoryRefreshSummary, InventoryRefreshWorker,
     record_inventory_refresh_health, scan_failure_reason,
 };
 use crate::persistence::repository::{
-    Repository, WorkflowInventoryCompletionRecord, WorkflowInventoryWaiterRecord,
-    WorkflowProjectionDependency, WorkflowProjectionUpdate,
+    Repository, SearchCandidateMaterialRef, WorkflowInventoryCompletionRecord,
+    WorkflowInventoryWaiterRecord, WorkflowProjectionDependency, WorkflowProjectionUpdate,
 };
 use crate::runtime::announce_worker::{
     AnnounceWorkOutcome, AnnounceWorker, retry_database_call, unix_time_ms,
@@ -32,8 +34,9 @@ use crate::runtime::backoff::{
     classify_database_error, retry_with_classification, transient_io_retry_policy,
 };
 use crate::runtime::daemon::{
-    AnnounceInventoryRefreshMode, AnnounceProcessor, execute_scheduled_job,
-    process_announce_work_with_processor_mode,
+    AnnounceInventoryRefreshMode, AnnounceProcessor, SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY,
+    SearchWorkflowExecutionSummary, execute_scheduled_job, finalize_duroxide_search_workflow,
+    process_announce_work_with_processor_mode, process_duroxide_search_candidate,
 };
 use crate::runtime::injection_worker::InjectionWorker;
 use crate::runtime::scheduler::{
@@ -43,8 +46,9 @@ use crate::runtime::scheduler::{
 use crate::runtime::shutdown::{ShutdownPhase, ShutdownSignal};
 use crate::runtime::workflow_contracts::{
     ActivityInputEnvelope, ActivityKind, AnnounceWorkflowInput, InventoryRefreshKind,
-    InventoryRefreshWorkflowInput, ScheduledJobWorkflowInput, WorkflowCustomStatus,
-    WorkflowEventName, WorkflowInstanceId, WorkflowKind, WorkflowReason, WorkflowState,
+    InventoryRefreshWorkflowInput, ScheduledJobWorkflowInput, SearchWorkflowInput,
+    WorkflowCustomStatus, WorkflowEventName, WorkflowInstanceId, WorkflowKind, WorkflowReason,
+    WorkflowState,
 };
 
 pub const WORKFLOW_RUNTIME_DEPENDENCY: &str = "workflow-runtime";
@@ -61,6 +65,11 @@ const SCHEDULED_JOB_COMPLETE_ACTIVITY_ID: &str = "scheduled-job-complete";
 const SCHEDULED_JOB_RUN_ACTIVITY_ID: &str = "scheduled-job-run";
 const ANNOUNCE_PROCESS_ACTIVITY_ID: &str = "announce-process";
 const ANNOUNCE_WAIT_ACTIVITY_ID: &str = "announce-wait";
+const SEARCH_PLAN_ACTIVITY_ID: &str = "search-plan";
+const SEARCH_CANDIDATE_PAGE_ACTIVITY_ID_PREFIX: &str = "search-candidate-page";
+const SEARCH_CANDIDATE_ACTIVITY_ID_PREFIX: &str = "search-candidate";
+const SEARCH_FINALIZE_ACTIVITY_ID: &str = "search-finalize";
+const SEARCH_CANDIDATE_PAGE_LIMIT: u16 = 64;
 const ANNOUNCE_WORKFLOW_OWNER: &str = "sporos-announce-workflow";
 const INVENTORY_COMPLETION_FANOUT_LIMIT: u16 = 1_000;
 const INVENTORY_COMPLETION_LEASE_MS: i64 = 60_000;
@@ -79,6 +88,7 @@ pub struct DuroxideWorkflowRuntime {
     scheduled_job_state: Option<ScheduledJobStateHandle>,
     scheduled_job_scheduler: Option<PersistedScheduler>,
     scheduled_job_shutdown: Option<ShutdownSignal>,
+    search_state: Option<SearchWorkflowStateHandle>,
 }
 
 impl DuroxideWorkflowRuntime {
@@ -98,6 +108,7 @@ impl DuroxideWorkflowRuntime {
                 inventory: Some(activities),
                 announce: None,
                 scheduled_jobs: None,
+                search: None,
             }),
         )
         .await
@@ -108,6 +119,7 @@ impl DuroxideWorkflowRuntime {
         inventory: InventoryWorkflowActivities,
         announce: AnnounceWorkflowActivities,
         scheduled_jobs: ScheduledJobWorkflowActivities,
+        search: SearchWorkflowActivities,
     ) -> Result<Self, DuroxideWorkflowRuntimeError> {
         let repository = inventory.repository.clone();
         Self::start_inner(
@@ -117,6 +129,7 @@ impl DuroxideWorkflowRuntime {
                 inventory: Some(inventory),
                 announce: Some(announce),
                 scheduled_jobs: Some(scheduled_jobs),
+                search: Some(search),
             }),
         )
         .await
@@ -151,6 +164,10 @@ impl DuroxideWorkflowRuntime {
             .as_ref()
             .and_then(|activities| activities.scheduled_jobs.as_ref())
             .map(|activities| activities.shutdown.clone());
+        let search_state = activities
+            .as_ref()
+            .and_then(|activities| activities.search.as_ref())
+            .map(|activities| activities.state.clone());
         let active_inventory_refreshes = Arc::new(Mutex::new(BTreeSet::new()));
         let inventory_completion_events =
             InventoryCompletionEventBridge::new(Arc::clone(&store), repository.clone());
@@ -186,6 +203,7 @@ impl DuroxideWorkflowRuntime {
             scheduled_job_state,
             scheduled_job_scheduler,
             scheduled_job_shutdown,
+            search_state,
         };
         if let Err(error) = runtime
             .inventory_completion_events
@@ -220,6 +238,7 @@ impl DuroxideWorkflowRuntime {
             scheduled_job_state: None,
             scheduled_job_scheduler: self.scheduled_job_scheduler.clone(),
             scheduled_job_shutdown: self.scheduled_job_shutdown.clone(),
+            search_state: None,
         }
     }
 
@@ -451,6 +470,54 @@ impl DuroxideWorkflowRuntime {
         }
     }
 
+    pub async fn submit_search(
+        &self,
+        input: SearchWorkflowInput,
+    ) -> Result<SearchWorkflowSubmission, DuroxideWorkflowRuntimeError> {
+        let instance_id = WorkflowInstanceId::search(&input.request_id)
+            .map_err(DuroxideWorkflowRuntimeError::InvalidSearchWorkflowId)?;
+        let instance_id = instance_id.as_str().to_owned();
+        let client = self.client();
+        match client
+            .get_orchestration_status(&instance_id)
+            .await
+            .map_err(|error| DuroxideWorkflowRuntimeError::ReadSearchWorkflow {
+                instance_id: instance_id.clone(),
+                message: error.to_string(),
+            })? {
+            OrchestrationStatus::NotFound => {
+                client
+                    .start_orchestration_typed(
+                        &instance_id,
+                        WorkflowKind::Search.orchestration_name(),
+                        input,
+                    )
+                    .await
+                    .map_err(|error| DuroxideWorkflowRuntimeError::StartSearchWorkflow {
+                        instance_id: instance_id.clone(),
+                        message: error.to_string(),
+                    })?;
+                Ok(SearchWorkflowSubmission {
+                    workflow_id: instance_id,
+                    outcome: SearchWorkflowSubmissionOutcome::Started,
+                })
+            }
+            OrchestrationStatus::Running { .. } => Ok(SearchWorkflowSubmission {
+                workflow_id: instance_id,
+                outcome: SearchWorkflowSubmissionOutcome::AlreadyRunning,
+            }),
+            OrchestrationStatus::Completed { .. } => {
+                Err(DuroxideWorkflowRuntimeError::CompletedSearchWorkflow { instance_id })
+            }
+            OrchestrationStatus::Failed { details, .. } => {
+                Err(DuroxideWorkflowRuntimeError::FailedSearchWorkflow {
+                    instance_id,
+                    message: details.display_message().to_string(),
+                })
+            }
+        }
+    }
+
     pub async fn wait_for_inventory_refresh_outcome(
         &self,
         workflow_id: &str,
@@ -539,6 +606,9 @@ impl DuroxideWorkflowRuntime {
     pub async fn shutdown(&self, timeout_ms: Option<u64>) {
         self.runtime.clone().shutdown(timeout_ms).await;
         if let Some(handle) = &self.scheduled_job_state {
+            handle.clear();
+        }
+        if let Some(handle) = &self.search_state {
             handle.clear();
         }
     }
@@ -685,6 +755,9 @@ impl Drop for DuroxideWorkflowRuntime {
         if is_last_runtime_owner && let Some(handle) = &self.scheduled_job_state {
             handle.clear();
         }
+        if is_last_runtime_owner && let Some(handle) = &self.search_state {
+            handle.clear();
+        }
         if is_last_runtime_owner && let Ok(handle) = tokio::runtime::Handle::try_current() {
             let runtime = Arc::clone(&self.runtime);
             handle.spawn(async move {
@@ -780,6 +853,22 @@ pub enum DuroxideWorkflowRuntimeError {
         instance_id: String,
     },
     FailedAnnounceWorkflow {
+        instance_id: String,
+        message: String,
+    },
+    InvalidSearchWorkflowId(crate::runtime::workflow_contracts::WorkflowContractError),
+    ReadSearchWorkflow {
+        instance_id: String,
+        message: String,
+    },
+    StartSearchWorkflow {
+        instance_id: String,
+        message: String,
+    },
+    CompletedSearchWorkflow {
+        instance_id: String,
+    },
+    FailedSearchWorkflow {
         instance_id: String,
         message: String,
     },
@@ -911,6 +1000,32 @@ impl fmt::Display for DuroxideWorkflowRuntimeError {
                 formatter,
                 "announce workflow `{instance_id}` is failed: {message}"
             ),
+            Self::InvalidSearchWorkflowId(error) => write!(formatter, "{error}"),
+            Self::ReadSearchWorkflow {
+                instance_id,
+                message,
+            } => write!(
+                formatter,
+                "read search workflow `{instance_id}` failed: {message}"
+            ),
+            Self::StartSearchWorkflow {
+                instance_id,
+                message,
+            } => write!(
+                formatter,
+                "start search workflow `{instance_id}` failed: {message}"
+            ),
+            Self::CompletedSearchWorkflow { instance_id } => write!(
+                formatter,
+                "search workflow `{instance_id}` completed and cannot accept duplicate work"
+            ),
+            Self::FailedSearchWorkflow {
+                instance_id,
+                message,
+            } => write!(
+                formatter,
+                "search workflow `{instance_id}` is failed: {message}"
+            ),
             Self::RecordInventoryProjection {
                 workflow_id,
                 message,
@@ -1035,6 +1150,7 @@ struct WorkflowRuntimeActivities {
     inventory: Option<InventoryWorkflowActivities>,
     announce: Option<AnnounceWorkflowActivities>,
     scheduled_jobs: Option<ScheduledJobWorkflowActivities>,
+    search: Option<SearchWorkflowActivities>,
 }
 
 impl WorkflowRuntimeActivities {
@@ -1117,6 +1233,50 @@ impl ScheduledJobStateHandle {
         if let Ok(mut guard) = self.state.lock() {
             *guard = None;
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchWorkflowStateHandle {
+    state: Arc<Mutex<Option<crate::runtime::app::AppState>>>,
+}
+
+impl SearchWorkflowStateHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bind(&self, state: crate::runtime::app::AppState) -> bool {
+        let Ok(mut guard) = self.state.lock() else {
+            return false;
+        };
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(state);
+        true
+    }
+
+    fn get(&self) -> Option<crate::runtime::app::AppState> {
+        self.state.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchWorkflowActivities {
+    state: SearchWorkflowStateHandle,
+    shutdown: ShutdownSignal,
+}
+
+impl SearchWorkflowActivities {
+    pub fn new(state: SearchWorkflowStateHandle, shutdown: ShutdownSignal) -> Self {
+        Self { state, shutdown }
     }
 }
 
@@ -1312,6 +1472,71 @@ pub struct AnnounceWorkflowSubmission {
 pub enum AnnounceWorkflowSubmissionOutcome {
     Started,
     AlreadyRunning,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SearchWorkflowSubmission {
+    pub workflow_id: String,
+    pub outcome: SearchWorkflowSubmissionOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SearchWorkflowSubmissionOutcome {
+    Started,
+    AlreadyRunning,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SearchPlanActivityInput {
+    input: SearchWorkflowInput,
+    planned_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SearchPlanActivityOutput {
+    planned_indexers: usize,
+    failed_indexers: usize,
+    candidate_count: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SearchCandidatePageActivityInput {
+    start_ordinal: u32,
+    limit: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SearchCandidatePageActivityOutput {
+    refs: Vec<SearchCandidateRef>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SearchCandidateActivityInput {
+    candidate: SearchCandidateRef,
+    planned_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SearchFinalizeActivityInput {
+    summary: SearchWorkflowExecutionSummary,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SearchFinalizeActivityOutput {
+    summary: SearchWorkflowExecutionSummary,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SearchCandidateRef {
+    ordinal: u32,
+}
+
+impl From<SearchCandidateMaterialRef> for SearchCandidateRef {
+    fn from(value: SearchCandidateMaterialRef) -> Self {
+        Self {
+            ordinal: value.ordinal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -2203,6 +2428,117 @@ fn activity_registry_with_runtime_activities(
                     );
                 }
             }
+            ActivityKind::SearchPlan => {
+                if let Some(search) = activities.search.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<SearchPlanActivityInput>| {
+                            let search = search.clone();
+                            async move {
+                                run_search_plan_activity(search, input.workflow_id, input.payload)
+                                    .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::SearchCandidatePage => {
+                if let Some(search) = activities.search.clone() {
+                    builder =
+                        builder.register_typed(
+                            activity.as_str(),
+                            move |_ctx: ActivityContext,
+                                  input: ActivityInputEnvelope<
+                                SearchCandidatePageActivityInput,
+                            >| {
+                                let search = search.clone();
+                                async move {
+                                    run_search_candidate_page_activity(
+                                        search,
+                                        input.workflow_id,
+                                        input.payload,
+                                    )
+                                    .await
+                                }
+                            },
+                        );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::SearchCandidateProcess => {
+                if let Some(search) = activities.search.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<SearchCandidateActivityInput>| {
+                            let search = search.clone();
+                            async move {
+                                Box::pin(run_search_candidate_activity(
+                                    search,
+                                    input.workflow_id,
+                                    input.payload,
+                                ))
+                                .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
+            ActivityKind::SearchFinalize => {
+                if let Some(search) = activities.search.clone() {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext,
+                              input: ActivityInputEnvelope<SearchFinalizeActivityInput>| {
+                            let search = search.clone();
+                            async move {
+                                run_search_finalize_activity(search, input.workflow_id, input.payload)
+                                    .await
+                            }
+                        },
+                    );
+                } else {
+                    builder = builder.register_typed(
+                        activity.as_str(),
+                        move |_ctx: ActivityContext, input: WorkflowShellActivityInput| async move {
+                            Ok(WorkflowShellActivityOutput {
+                                activity: input.activity,
+                                accepted: input.activity == activity,
+                            })
+                        },
+                    );
+                }
+            }
             _ => {
                 builder = builder.register_typed(
                     activity.as_str(),
@@ -2217,6 +2553,144 @@ fn activity_registry_with_runtime_activities(
         }
     }
     builder.build()
+}
+
+async fn run_search_plan_activity(
+    activities: SearchWorkflowActivities,
+    workflow_id: String,
+    input: SearchPlanActivityInput,
+) -> Result<SearchPlanActivityOutput, String> {
+    if activities.shutdown.state().phase != ShutdownPhase::Running {
+        return Err("search workflow is shutting down".to_owned());
+    }
+    let state = activities
+        .state
+        .get()
+        .ok_or_else(|| "search workflow app state is not bound".to_owned())?;
+    let request = crate::http::SearchWorkflowRequest {
+        query: ItemTitle::new(input.input.query).map_err(|error| error.to_string())?,
+    };
+    let (sender, mut receiver) = mpsc::channel(SEARCH_CANDIDATE_PREFLIGHT_CONCURRENCY);
+    let planning_state = state.clone();
+    let planning_shutdown = activities.shutdown.clone();
+    let planning = Box::pin(async move {
+        planning_state
+            .stream_search_workflow_candidates(
+                request,
+                input.planned_at_ms,
+                sender,
+                planning_shutdown,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let repository = state.repository.clone();
+    let storing = Box::pin(async move {
+        let mut stored = 0_usize;
+        while let Some(candidate) = receiver.recv().await {
+            let ordinal = u32::try_from(stored)
+                .map_err(|error| format!("search candidate ordinal overflow: {error}"))?;
+            repository
+                .upsert_search_candidate_material(
+                    &workflow_id,
+                    ordinal,
+                    &candidate,
+                    input.planned_at_ms,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            stored = stored.saturating_add(1);
+        }
+        Ok::<usize, String>(stored)
+    });
+    let (summary, stored) = tokio::try_join!(planning, storing)?;
+    Ok(SearchPlanActivityOutput {
+        planned_indexers: summary.plans.len(),
+        failed_indexers: summary.failed_indexers,
+        candidate_count: stored,
+    })
+}
+
+async fn run_search_candidate_page_activity(
+    activities: SearchWorkflowActivities,
+    workflow_id: String,
+    input: SearchCandidatePageActivityInput,
+) -> Result<SearchCandidatePageActivityOutput, String> {
+    let state = activities
+        .state
+        .get()
+        .ok_or_else(|| "search workflow app state is not bound".to_owned())?;
+    let page = state
+        .repository
+        .search_candidate_material_page(&workflow_id, input.start_ordinal, input.limit)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(SearchCandidatePageActivityOutput {
+        refs: page
+            .refs
+            .into_iter()
+            .map(SearchCandidateRef::from)
+            .collect(),
+    })
+}
+
+async fn run_search_candidate_activity(
+    activities: SearchWorkflowActivities,
+    workflow_id: String,
+    input: SearchCandidateActivityInput,
+) -> Result<SearchWorkflowExecutionSummary, String> {
+    if activities.shutdown.state().phase != ShutdownPhase::Running {
+        return Err("search workflow is shutting down".to_owned());
+    }
+    let state = activities
+        .state
+        .get()
+        .ok_or_else(|| "search workflow app state is not bound".to_owned())?;
+    let candidate = state
+        .repository
+        .search_candidate_material(&workflow_id, input.candidate.ordinal)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "search candidate material missing: workflow_id={workflow_id} ordinal={}",
+                input.candidate.ordinal
+            )
+        })?;
+    Box::pin(process_duroxide_search_candidate(
+        state,
+        candidate,
+        input.planned_at_ms,
+        activities.shutdown.clone(),
+    ))
+    .await
+}
+
+async fn run_search_finalize_activity(
+    activities: SearchWorkflowActivities,
+    workflow_id: String,
+    input: SearchFinalizeActivityInput,
+) -> Result<SearchFinalizeActivityOutput, String> {
+    let state = activities
+        .state
+        .get()
+        .ok_or_else(|| "search workflow app state is not bound".to_owned())?;
+    let claimed = state
+        .repository
+        .claim_search_workflow_finalization(&workflow_id, unix_time_ms())
+        .await
+        .map_err(|error| error.to_string())?;
+    if claimed {
+        finalize_duroxide_search_workflow(&state, &input.summary);
+        state
+            .repository
+            .delete_search_candidate_material(&workflow_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(SearchFinalizeActivityOutput {
+        summary: input.summary,
+    })
 }
 
 async fn run_inventory_activity(
@@ -3131,6 +3605,8 @@ fn orchestration_registry() -> OrchestrationRegistry {
             );
         } else if workflow == WorkflowKind::Announce {
             builder = builder.register_typed(workflow.orchestration_name(), announce_orchestration);
+        } else if workflow == WorkflowKind::Search {
+            builder = builder.register_typed(workflow.orchestration_name(), search_orchestration);
         } else if workflow == WorkflowKind::ScheduledJob {
             builder = builder.register_typed(
                 workflow.orchestration_name(),
@@ -3323,6 +3799,123 @@ fn system_time_to_unix_ms(time: SystemTime) -> Result<i64, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?;
     i64::try_from(duration.as_millis()).map_err(|error| error.to_string())
+}
+
+async fn search_orchestration(
+    ctx: OrchestrationContext,
+    input: SearchWorkflowInput,
+) -> Result<SearchWorkflowExecutionSummary, String> {
+    set_search_custom_status(
+        &ctx,
+        &input,
+        WorkflowState::Running,
+        WorkflowReason::RunningActivity,
+        Some("planning"),
+    )?;
+    let planned_at_ms = orchestration_now_ms(&ctx).await?;
+    let plan_input = ActivityInputEnvelope::new(
+        ctx.instance_id(),
+        SEARCH_PLAN_ACTIVITY_ID,
+        SearchPlanActivityInput {
+            input: input.clone(),
+            planned_at_ms,
+        },
+    );
+    let plan: SearchPlanActivityOutput = ctx
+        .schedule_activity_typed(ActivityKind::SearchPlan.as_str(), &plan_input)
+        .await?;
+    let mut summary = SearchWorkflowExecutionSummary {
+        planned_indexers: plan.planned_indexers,
+        failed_indexers: plan.failed_indexers,
+        candidates: plan.candidate_count,
+        ..SearchWorkflowExecutionSummary::default()
+    };
+
+    set_search_custom_status(
+        &ctx,
+        &input,
+        WorkflowState::Running,
+        WorkflowReason::RunningActivity,
+        Some("processing_candidates"),
+    )?;
+    let mut next_ordinal = 0_u32;
+    while usize::try_from(next_ordinal).map_err(|error| error.to_string())? < plan.candidate_count {
+        let page_input = ActivityInputEnvelope::new(
+            ctx.instance_id(),
+            format!("{SEARCH_CANDIDATE_PAGE_ACTIVITY_ID_PREFIX}-{next_ordinal}"),
+            SearchCandidatePageActivityInput {
+                start_ordinal: next_ordinal,
+                limit: SEARCH_CANDIDATE_PAGE_LIMIT,
+            },
+        );
+        let page: SearchCandidatePageActivityOutput = ctx
+            .schedule_activity_typed(ActivityKind::SearchCandidatePage.as_str(), &page_input)
+            .await?;
+        if page.refs.is_empty() {
+            break;
+        }
+        for candidate in page.refs {
+            next_ordinal = candidate.ordinal.saturating_add(1);
+            let activity_id = format!(
+                "{SEARCH_CANDIDATE_ACTIVITY_ID_PREFIX}-{}",
+                candidate.ordinal
+            );
+            let input = ActivityInputEnvelope::new(
+                ctx.instance_id(),
+                activity_id,
+                SearchCandidateActivityInput {
+                    candidate,
+                    planned_at_ms,
+                },
+            );
+            let output: SearchWorkflowExecutionSummary = ctx
+                .schedule_activity_typed(ActivityKind::SearchCandidateProcess.as_str(), &input)
+                .await?;
+            merge_search_summary(&mut summary, output);
+        }
+    }
+
+    set_search_custom_status(
+        &ctx,
+        &input,
+        WorkflowState::Running,
+        WorkflowReason::RunningActivity,
+        Some("finalizing"),
+    )?;
+    let finalize_input = ActivityInputEnvelope::new(
+        ctx.instance_id(),
+        SEARCH_FINALIZE_ACTIVITY_ID,
+        SearchFinalizeActivityInput {
+            summary: summary.clone(),
+        },
+    );
+    let output: SearchFinalizeActivityOutput = ctx
+        .schedule_activity_typed(ActivityKind::SearchFinalize.as_str(), &finalize_input)
+        .await?;
+    set_search_custom_status(
+        &ctx,
+        &input,
+        WorkflowState::Succeeded,
+        WorkflowReason::Completed,
+        Some("completed"),
+    )?;
+    Ok(output.summary)
+}
+
+fn merge_search_summary(
+    total: &mut SearchWorkflowExecutionSummary,
+    candidate: SearchWorkflowExecutionSummary,
+) {
+    total.persisted = total.persisted.saturating_add(candidate.persisted);
+    total.downloaded = total.downloaded.saturating_add(candidate.downloaded);
+    total.saved = total.saved.saturating_add(candidate.saved);
+    total.injected = total.injected.saturating_add(candidate.injected);
+    total.dry_run = total.dry_run.saturating_add(candidate.dry_run);
+    total.already_present = total
+        .already_present
+        .saturating_add(candidate.already_present);
+    total.rejected = total.rejected.saturating_add(candidate.rejected);
+    total.failed = total.failed.saturating_add(candidate.failed);
 }
 
 async fn announce_orchestration(
@@ -3552,6 +4145,25 @@ fn set_announce_custom_status(
         WorkflowCustomStatus::new(input.work_id.clone(), WorkflowKind::Announce, state, reason);
     status.next_action = next_action.map(str::to_owned);
     status.raw_secret_material_count = raw_secret_material_count;
+    let status = serde_json::to_string(&status).map_err(|error| error.to_string())?;
+    ctx.set_custom_status(status);
+    Ok(())
+}
+
+fn set_search_custom_status(
+    ctx: &OrchestrationContext,
+    input: &SearchWorkflowInput,
+    state: WorkflowState,
+    reason: WorkflowReason,
+    next_action: Option<&str>,
+) -> Result<(), String> {
+    let mut status = WorkflowCustomStatus::new(
+        input.request_id.clone(),
+        WorkflowKind::Search,
+        state,
+        reason,
+    );
+    status.next_action = next_action.map(str::to_owned);
     let status = serde_json::to_string(&status).map_err(|error| error.to_string())?;
     ctx.set_custom_status(status);
     Ok(())

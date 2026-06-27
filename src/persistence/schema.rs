@@ -171,6 +171,34 @@ CREATE INDEX IF NOT EXISTS idx_search_history_indexer_last_searched_at
 CREATE INDEX IF NOT EXISTS idx_search_history_first_searched_at
     ON search_history (first_searched_at);
 
+CREATE TABLE IF NOT EXISTS search_candidate_material (
+    workflow_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    indexer_id INTEGER NOT NULL,
+    guid TEXT NOT NULL,
+    download_url TEXT NOT NULL,
+    redacted_download_url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    tracker TEXT NOT NULL,
+    size INTEGER,
+    published_at INTEGER,
+    info_hash TEXT,
+    torrent_cache_path TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (workflow_id, ordinal),
+    UNIQUE (workflow_id, indexer_id, guid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_candidate_material_workflow_ordinal
+    ON search_candidate_material (workflow_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_search_candidate_material_created_at
+    ON search_candidate_material (created_at);
+
+CREATE TABLE IF NOT EXISTS search_workflow_finalizations (
+    workflow_id TEXT PRIMARY KEY,
+    finalized_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
     name TEXT PRIMARY KEY,
     state TEXT NOT NULL,
@@ -373,6 +401,8 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "match_decisions",
     "indexers",
     "search_history",
+    "search_candidate_material",
+    "search_workflow_finalizations",
     "jobs",
     "dependency_health",
     "workflow_projection",
