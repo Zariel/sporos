@@ -7,6 +7,7 @@
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, Transaction};
+use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
@@ -31,10 +32,21 @@ pub enum SqliteSynchronous {
 }
 
 /// Configuration options for SQLiteProvider
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SqliteOptions {
     /// Durability mode used for file-backed databases.
     pub synchronous: SqliteSynchronous,
+    /// Maximum number of connections in the provider pool.
+    pub max_connections: NonZeroU32,
+}
+
+impl Default for SqliteOptions {
+    fn default() -> Self {
+        Self {
+            synchronous: SqliteSynchronous::default(),
+            max_connections: NonZeroU32::new(5).expect("five is non-zero"),
+        }
+    }
 }
 
 /// SQLite-backed provider with full transactional support
@@ -186,12 +198,13 @@ impl SqliteProvider {
     pub async fn new(database_url: &str, options: Option<SqliteOptions>) -> Result<Self, sqlx::Error> {
         // Configure SQLite for better concurrency
         let is_memory = database_url.contains(":memory:") || database_url.contains("mode=memory");
-        let synchronous_pragma = match options.unwrap_or_default().synchronous {
+        let options = options.unwrap_or_default();
+        let synchronous_pragma = match options.synchronous {
             SqliteSynchronous::Normal => "PRAGMA synchronous = NORMAL",
             SqliteSynchronous::Full => "PRAGMA synchronous = FULL",
         };
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(options.max_connections.get())
             .after_connect(move |conn, _meta| {
                 Box::pin({
                     let is_memory = is_memory;

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io;
+use std::num::NonZeroU32;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,6 +16,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+const POOL_CONNECTIONS: NonZeroU32 = NonZeroU32::MIN;
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +100,7 @@ impl Storage {
             .foreign_keys(true)
             .busy_timeout(BUSY_TIMEOUT);
         let pool = SqlitePoolOptions::new()
-            .max_connections(4)
+            .max_connections(POOL_CONNECTIONS.get())
             .connect_with(options)
             .await
             .map_err(StorageOpenError::Connect)?;
@@ -119,6 +121,7 @@ impl Storage {
                 &database_url,
                 Some(DuroxideOptions {
                     synchronous: DuroxideSynchronous::Full,
+                    max_connections: POOL_CONNECTIONS,
                 }),
             )
             .await
@@ -457,18 +460,15 @@ mod tests {
             storage.effective_pragmas()
         );
 
+        assert_eq!(storage.pool.options().get_max_connections(), 1);
         let pool = storage.duroxide.get_pool();
-        let mut connections = Vec::new();
-        for _ in 0..5 {
-            connections.push(pool.acquire().await.expect("acquire Duroxide connection"));
-        }
-        for mut connection in connections {
-            let synchronous = duroxide_sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
-                .fetch_one(&mut *connection)
-                .await
-                .expect("inspect Duroxide connection");
-            assert_eq!(synchronous, 2);
-        }
+        assert_eq!(pool.options().get_max_connections(), 1);
+        let mut connection = pool.acquire().await.expect("acquire Duroxide connection");
+        let synchronous = duroxide_sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+            .fetch_one(&mut *connection)
+            .await
+            .expect("inspect Duroxide connection");
+        assert_eq!(synchronous, 2);
     }
 
     #[tokio::test]

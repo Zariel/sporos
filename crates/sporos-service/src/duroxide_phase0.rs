@@ -306,6 +306,64 @@ async fn terminates_an_orchestration_with_corrupted_history() {
 }
 
 #[tokio::test]
+async fn makes_progress_with_concurrent_domain_writes() {
+    const WORK_ITEMS: usize = 64;
+
+    let directory = TempDir::new().expect("create temporary directory");
+    let storage = open_in(&directory).await;
+    let provider = storage.duroxide_provider();
+    let runtime = Runtime::start_with_store(
+        provider.clone(),
+        ActivityRegistry::builder().build(),
+        OrchestrationRegistry::builder()
+            .register_versioned(PROBE_NAME, V2, replay_v2)
+            .build(),
+    )
+    .await;
+    let client = Client::new(provider);
+
+    let domain_writes = async {
+        for marker in 0..WORK_ITEMS {
+            sqlx::query(
+                "UPDATE sporos_schema_metadata SET value = ? WHERE key = 'application_schema'",
+            )
+            .bind(marker.to_string())
+            .execute(storage.pool())
+            .await
+            .expect("write domain state");
+        }
+    };
+    let orchestration_writes = async {
+        for marker in 0..WORK_ITEMS {
+            let instance = format!("contention-probe-{marker}");
+            client
+                .start_orchestration_versioned(&instance, PROBE_NAME, V2, "input")
+                .await
+                .expect("start orchestration under contention");
+        }
+        for marker in 0..WORK_ITEMS {
+            let instance = format!("contention-probe-{marker}");
+            let status = client
+                .wait_for_orchestration(&instance, Duration::from_secs(5))
+                .await
+                .expect("wait for orchestration under contention");
+            assert!(matches!(
+                status,
+                duroxide::OrchestrationStatus::Completed { .. }
+            ));
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(domain_writes, orchestration_writes)
+    })
+    .await
+    .expect("concurrent pools stopped making progress");
+
+    runtime.shutdown(Some(50)).await;
+}
+
+#[tokio::test]
 async fn crash_probe() {
     let Some(directory) = std::env::var_os(CRASH_PROBE_DIR) else {
         return;
