@@ -33,6 +33,7 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
   "query",
   "rustls",
 ] }
+proptest = "=1.11.0"
 semver = "=1.0.28"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
