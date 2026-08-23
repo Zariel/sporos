@@ -17,6 +17,7 @@ rust-version = "1.98"
 [workspace.dependencies]
 axum = "=0.8.9"
 base64 = "=0.22.1"
+clap = { version = "=4.6.6", features = ["derive", "env"] }
 duroxide = { version = "=0.1.30", features = ["sqlite"] }
 duroxide-sqlx = { package = "sqlx", version = "=0.8.6", default-features = false, features = [
   "runtime-tokio",

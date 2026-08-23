@@ -11,6 +11,7 @@ default-run = "sporos"
 [dependencies]
 axum.workspace = true
 base64.workspace = true
+clap.workspace = true
 duroxide.workspace = true
 duroxide-sqlx.workspace = true
 fs2.workspace = true

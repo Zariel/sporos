@@ -22,6 +22,14 @@ impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    pub fn resolve(
+        field: &str,
+        direct: Option<String>,
+        file: Option<PathBuf>,
+    ) -> Result<Self, ConfigError> {
+        resolve_secret(field, direct, file)
+    }
 }
 
 impl fmt::Debug for Secret {
