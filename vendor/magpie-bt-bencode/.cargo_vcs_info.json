@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "4bb7a387b4ff4f261b115f5182159393c00a01e3"
+  },
+  "path_in_vcs": "crates/magpie-bt-bencode"
+}
