@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{MatchedPath, Path, Query, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -31,6 +31,7 @@ pub struct HttpState {
     admin_token: Secret,
     readiness: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
+    inventory_stale_after: Option<Duration>,
 }
 
 impl HttpState {
@@ -41,6 +42,10 @@ impl HttpState {
             admin_token: config.auth.admin_token.clone(),
             readiness: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(Metrics::new()),
+            inventory_stale_after: config
+                .qbittorrent
+                .as_ref()
+                .map(|settings| settings.inventory_stale_after),
         }
     }
 
@@ -54,6 +59,15 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
         .route("/api/v1/admin/tasks", get(list_tasks))
         .route("/api/v1/admin/tasks/{task_id}", get(get_task))
         .route("/api/v1/admin/tasks/{task_id}/events", get(get_task_events))
+        .route("/api/v1/admin/inventory", get(get_inventory))
+        .route(
+            "/api/v1/admin/inventory/torrents",
+            get(list_inventory_torrents),
+        )
+        .route(
+            "/api/v1/admin/inventory/reconcile",
+            post(request_inventory_reconcile),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .layer(RequestBodyLimitLayer::new(admin_body_limit));
 
@@ -118,6 +132,26 @@ async fn metrics(State(state): State<HttpState>) -> Response {
             metric_escape(&task_state)
         ));
     }
+    let inventory = sqlx::query_as::<_, (i64, i64, Option<i64>)>(
+        "SELECT
+            (SELECT count(*) FROM sporos_qbit_torrent),
+            (SELECT count(*) FROM sporos_source_file WHERE available = 1),
+            (SELECT last_success_at FROM sporos_qbit_inventory_state WHERE singleton = 1)",
+    )
+    .fetch_optional(state.storage.pool())
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or((-1, -1, None));
+    output.push_str("# TYPE sporos_qbit_inventory_torrents gauge\n");
+    output.push_str(&format!("sporos_qbit_inventory_torrents {}\n", inventory.0));
+    output.push_str("# TYPE sporos_qbit_inventory_files gauge\n");
+    output.push_str(&format!("sporos_qbit_inventory_files {}\n", inventory.1));
+    output.push_str("# TYPE sporos_qbit_inventory_last_success_timestamp_seconds gauge\n");
+    output.push_str(&format!(
+        "sporos_qbit_inventory_last_success_timestamp_seconds {}\n",
+        inventory.2.unwrap_or(0) / 1000
+    ));
     (
         [(
             CONTENT_TYPE,
@@ -126,6 +160,249 @@ async fn metrics(State(state): State<HttpState>) -> Response {
         output,
     )
         .into_response()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InventoryStatus {
+    configured: bool,
+    baseline_complete: bool,
+    stale: bool,
+    response_id: Option<u64>,
+    generation: u64,
+    torrents: i64,
+    available_torrents: i64,
+    complete_torrents: i64,
+    files: i64,
+    last_success_at: Option<i64>,
+    last_full_reconcile_at: Option<i64>,
+    reconcile_requested_at: Option<i64>,
+}
+
+async fn get_inventory(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<InventoryStatus>, Problem> {
+    let inventory = state
+        .storage
+        .qbit_inventory_state()
+        .await
+        .map_err(|_| Problem::database(request_id.clone()))?;
+    let counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT
+            count(*),
+            coalesce(sum(available), 0),
+            coalesce(sum(CASE WHEN available = 1 AND is_complete = 1 THEN 1 ELSE 0 END), 0),
+            (SELECT count(*) FROM sporos_source_file WHERE available = 1)
+         FROM sporos_qbit_torrent",
+    )
+    .fetch_one(state.storage.pool())
+    .await
+    .map_err(|_| Problem::database(request_id))?;
+    let stale = match (inventory.last_success_at, state.inventory_stale_after) {
+        (Some(success), Some(limit)) => {
+            now_ms().saturating_sub(success) > i64::try_from(limit.as_millis()).unwrap_or(i64::MAX)
+        }
+        _ => true,
+    };
+    Ok(Json(InventoryStatus {
+        configured: state.inventory_stale_after.is_some(),
+        baseline_complete: inventory.has_baseline,
+        stale,
+        response_id: inventory.response_id,
+        generation: inventory.generation,
+        torrents: counts.0,
+        available_torrents: counts.1,
+        complete_torrents: counts.2,
+        files: counts.3,
+        last_success_at: inventory.last_success_at,
+        last_full_reconcile_at: inventory.last_full_reconcile_at,
+        reconcile_requested_at: inventory.reconcile_requested_at,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconcileRequest {
+    full: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileResponse {
+    queued: bool,
+    duplicate: bool,
+}
+
+async fn request_inventory_reconcile(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<ReconcileRequest>,
+) -> Result<(StatusCode, Json<ReconcileResponse>), Problem> {
+    if !request.full {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "full_reconcile_required",
+            "Full reconciliation required",
+            "the Phase 2 administrative reconciliation must set full to true",
+            request_id,
+        ));
+    }
+    if state.inventory_stale_after.is_none() {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "qbittorrent_not_configured",
+            "qBittorrent not configured",
+            "the qBittorrent integration is not configured",
+            request_id,
+        ));
+    }
+    let queued = state
+        .storage
+        .request_qbit_reconcile(now_ms())
+        .await
+        .map_err(|_| Problem::database(request_id))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ReconcileResponse {
+            queued,
+            duplicate: !queued,
+        }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryQuery {
+    #[serde(default = "default_page_size")]
+    limit: usize,
+    cursor: Option<String>,
+    available: Option<bool>,
+    complete: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InventoryPage {
+    items: Vec<InventoryView>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InventoryView {
+    id: String,
+    v1_hash: Option<String>,
+    v2_hash: Option<String>,
+    name: String,
+    total_size: i64,
+    amount_left: i64,
+    progress_ppm: i64,
+    state: String,
+    category: String,
+    tags: serde_json::Value,
+    complete: bool,
+    available: bool,
+    file_manifest_version: i64,
+    file_manifest_state: String,
+    added_at: Option<i64>,
+    completed_at: Option<i64>,
+    updated_at: i64,
+}
+
+async fn list_inventory_torrents(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(query): Query<InventoryQuery>,
+) -> Result<Json<InventoryPage>, Problem> {
+    if !(1..=200).contains(&query.limit) {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_page_size",
+            "Invalid page size",
+            "limit must be between 1 and 200",
+            request_id,
+        ));
+    }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|value| {
+            parse_id(value).ok_or_else(|| {
+                Problem::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cursor",
+                    "Invalid cursor",
+                    "the inventory cursor must be a source ID",
+                    request_id.clone(),
+                )
+            })
+        })
+        .transpose()?;
+    let fetch = i64::try_from(query.limit + 1).expect("page limit fits SQLite");
+    let rows = sqlx::query(
+        "SELECT * FROM sporos_qbit_torrent
+         WHERE (? IS NULL OR id > ?)
+           AND (? IS NULL OR available = ?)
+           AND (? IS NULL OR is_complete = ?)
+         ORDER BY id LIMIT ?",
+    )
+    .bind(cursor.as_ref().map(|id| id.as_slice()))
+    .bind(cursor.as_ref().map(|id| id.as_slice()))
+    .bind(query.available.map(i64::from))
+    .bind(query.available.map(i64::from))
+    .bind(query.complete.map(i64::from))
+    .bind(query.complete.map(i64::from))
+    .bind(fetch)
+    .fetch_all(state.storage.pool())
+    .await
+    .map_err(|_| Problem::database(request_id.clone()))?;
+    let has_more = rows.len() > query.limit;
+    let items = rows
+        .into_iter()
+        .take(query.limit)
+        .map(inventory_view)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| Problem::database(request_id))?;
+    let next_cursor = has_more
+        .then(|| items.last().map(|item| item.id.clone()))
+        .flatten();
+    Ok(Json(InventoryPage { items, next_cursor }))
+}
+
+fn inventory_view(row: sqlx::sqlite::SqliteRow) -> Result<InventoryView, sqlx::Error> {
+    let tags = serde_json::from_str(&row.try_get::<String, _>("tags_json")?)
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    Ok(InventoryView {
+        id: encode_hex(&row.try_get::<Vec<u8>, _>("id")?),
+        v1_hash: row
+            .try_get::<Option<Vec<u8>>, _>("v1_hash")?
+            .map(|value| encode_hex(&value)),
+        v2_hash: row
+            .try_get::<Option<Vec<u8>>, _>("v2_hash")?
+            .map(|value| encode_hex(&value)),
+        name: row.try_get("name")?,
+        total_size: row.try_get("total_size")?,
+        amount_left: row.try_get("amount_left")?,
+        progress_ppm: row.try_get("progress_ppm")?,
+        state: row.try_get("state")?,
+        category: row.try_get("category")?,
+        tags,
+        complete: row.try_get::<i64, _>("is_complete")? == 1,
+        available: row.try_get::<i64, _>("available")? == 1,
+        file_manifest_version: row.try_get("file_manifest_version")?,
+        file_manifest_state: row.try_get("file_manifest_state")?,
+        added_at: row.try_get("added_at")?,
+        completed_at: row.try_get("completed_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn now_ms() -> i64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[derive(Debug, Deserialize)]
@@ -749,9 +1026,52 @@ mod tests {
             "sporos_http_requests_total",
             "sporos_outbox_depth",
             "sporos_tasks",
+            "sporos_qbit_inventory_torrents",
+            "sporos_qbit_inventory_files",
+            "sporos_qbit_inventory_last_success_timestamp_seconds",
         ] {
             assert!(body.contains(name), "missing metric {name}");
         }
+    }
+
+    #[tokio::test]
+    async fn exposes_inventory_status_and_coalesces_reconcile_requests() {
+        let (_directory, mut state) = test_state().await;
+        state.inventory_stale_after = Some(Duration::from_secs(300));
+        let app = test_router(state);
+
+        let status = request(&app, "/api/v1/admin/inventory", Some("admin"), "").await;
+        assert_eq!(status.0, 200);
+        assert_eq!(status.1["configured"], true);
+        assert_eq!(status.1["baselineComplete"], false);
+        let first = request(
+            &app,
+            "/api/v1/admin/inventory/reconcile",
+            Some("admin"),
+            r#"{"full":true}"#,
+        )
+        .await;
+        let duplicate = request(
+            &app,
+            "/api/v1/admin/inventory/reconcile",
+            Some("admin"),
+            r#"{"full":true}"#,
+        )
+        .await;
+        assert_eq!(first.0, 202);
+        assert_eq!(first.1["queued"], true);
+        assert_eq!(duplicate.0, 202);
+        assert_eq!(duplicate.1["duplicate"], true);
+
+        let page = request(
+            &app,
+            "/api/v1/admin/inventory/torrents?limit=25",
+            Some("admin"),
+            "",
+        )
+        .await;
+        assert_eq!(page.0, 200);
+        assert_eq!(page.1["items"], serde_json::json!([]));
     }
 
     #[derive(Debug, Deserialize)]
@@ -816,6 +1136,7 @@ mod tests {
             admin_token: Secret::new("admin"),
             readiness: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(Metrics::new()),
+            inventory_stale_after: None,
         };
         (directory, state)
     }

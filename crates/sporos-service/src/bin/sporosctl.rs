@@ -27,6 +27,17 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Operate the qBittorrent inventory projection.
+    Inventory {
+        #[command(subcommand)]
+        command: InventoryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InventoryCommand {
+    /// Request a durable full inventory reconciliation.
+    Reconcile,
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,11 +98,28 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             query.append_pair("cursor", &cursor);
                         }
                     }
-                    request_json(&client, url, &token, cli.output).await
+                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
                 }
                 TaskCommand::Show { task_id } => {
                     let url = base.join(&format!("/api/v1/admin/tasks/{task_id}"))?;
-                    request_json(&client, url, &token, cli.output).await
+                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                }
+            }
+        }
+        Command::Inventory { command } => {
+            let token = admin_token()?;
+            match command {
+                InventoryCommand::Reconcile => {
+                    let url = base.join("/api/v1/admin/inventory/reconcile")?;
+                    request_json(
+                        &client,
+                        reqwest::Method::POST,
+                        url,
+                        &token,
+                        Some(serde_json::json!({"full": true})),
+                        cli.output,
+                    )
+                    .await
                 }
             }
         }
@@ -136,11 +164,19 @@ fn health_word(status: StatusCode) -> &'static str {
 
 async fn request_json(
     client: &reqwest::Client,
+    method: reqwest::Method,
     url: reqwest::Url,
     token: &Secret,
+    body: Option<Value>,
     output: Output,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let response = client.get(url).bearer_auth(token.expose()).send().await?;
+    let mut request = client.request(method, url).bearer_auth(token.expose());
+    if let Some(body) = body {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+    }
+    let response = request.send().await?;
     let status = response.status();
     let body = response.text().await?;
     let value: Value = serde_json::from_str(&body)?;
@@ -220,5 +256,13 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["sporosctl", "tasks", "delete", "id"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["sporosctl", "inventory", "reconcile"])
+                .expect("parse inventory reconciliation")
+                .command,
+            Command::Inventory {
+                command: InventoryCommand::Reconcile
+            }
+        ));
     }
 }

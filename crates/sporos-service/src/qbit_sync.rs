@@ -55,6 +55,15 @@ impl InventorySynchronizer {
         Ok(versions)
     }
 
+    pub async fn reconcile_requested(&self) -> Result<bool, SyncError> {
+        Ok(self
+            .storage
+            .qbit_inventory_state()
+            .await?
+            .reconcile_requested_at
+            .is_some())
+    }
+
     pub async fn sync_once(&self, now: i64) -> Result<SyncReport, SyncError> {
         let state = self.storage.qbit_inventory_state().await?;
         let requested_id = state.response_id.unwrap_or(0);

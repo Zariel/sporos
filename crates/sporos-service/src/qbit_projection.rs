@@ -73,6 +73,19 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn request_qbit_reconcile(&self, now: i64) -> Result<bool, ProjectionError> {
+        let changed = sqlx::query(
+            "UPDATE sporos_qbit_inventory_state SET reconcile_requested_at = ?
+             WHERE singleton = 1 AND reconcile_requested_at IS NULL",
+        )
+        .bind(now)
+        .execute(self.pool())
+        .await?
+        .rows_affected()
+            == 1;
+        Ok(changed)
+    }
+
     pub async fn project_qbit_batch(
         &self,
         changes: &[InventoryChange],

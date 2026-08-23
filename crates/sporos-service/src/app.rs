@@ -241,6 +241,27 @@ async fn qbit_loop(
                         }
                     }
                 }
+                match synchronizer.reconcile_requested().await {
+                    Ok(true) => {
+                        match synchronizer.reconcile(now_ms()).await {
+                            Ok(report) => info!(
+                                service = "sporos",
+                                changed = report.changed,
+                                completions = report.completions.len(),
+                                "requested qBittorrent inventory reconciliation completed"
+                            ),
+                            Err(error) => {
+                                warn!(service = "sporos", error = %error, "requested qBittorrent inventory reconciliation failed");
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(service = "sporos", error = %error, "qBittorrent inventory state unavailable");
+                        continue;
+                    }
+                }
                 match synchronizer.sync_once(now_ms()).await {
                     Ok(report) => {
                         if report.changed > 0 || !report.completions.is_empty() {
