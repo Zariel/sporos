@@ -14,6 +14,8 @@ const MIN_WEB_API_VERSION: Version = Version::new(2, 14, 1);
 const MAX_VERSION_BYTES: usize = 64;
 const MAX_MUTATION_BYTES: usize = 4 * 1024;
 const MAX_STATE_BYTES: usize = 1024 * 1024;
+const MAX_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FILE_LIST_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ApiKey(HeaderValue);
@@ -239,6 +241,45 @@ impl QbittorrentClient {
             added_torrent_ids: receipt.added_torrent_ids,
             pending_count: receipt.pending_count,
         })
+    }
+
+    pub async fn sync_main_data(&self, response_id: u64) -> Result<Vec<u8>, QbittorrentError> {
+        let response = self
+            .request(reqwest::Method::GET, "api/v2/sync/maindata")
+            .query(&[("rid", response_id)])
+            .send()
+            .await
+            .map_err(QbittorrentError::Request)?;
+        checked_body(response, MAX_INVENTORY_BYTES).await
+    }
+
+    pub async fn inventory_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<u8>, QbittorrentError> {
+        let response = self
+            .request(reqwest::Method::GET, "api/v2/torrents/info")
+            .query(&[
+                ("sort", "hash".to_owned()),
+                ("reverse", "false".to_owned()),
+                ("offset", offset.to_string()),
+                ("limit", limit.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(QbittorrentError::Request)?;
+        checked_body(response, MAX_INVENTORY_BYTES).await
+    }
+
+    pub async fn torrent_files(&self, qbit_id: &str) -> Result<Vec<u8>, QbittorrentError> {
+        let response = self
+            .request(reqwest::Method::GET, "api/v2/torrents/files")
+            .query(&[("hash", qbit_id)])
+            .send()
+            .await
+            .map_err(QbittorrentError::Request)?;
+        checked_body(response, MAX_FILE_LIST_BYTES).await
     }
 
     pub async fn torrent_state(
@@ -629,6 +670,56 @@ mod tests {
         let stop = requests.recv().expect("stop request");
         assert!(stop.head.starts_with("POST /api/v2/torrents/stop HTTP/1.1"));
         assert_eq!(stop.body, b"hashes=0123");
+        server.join().expect("fake server");
+    }
+
+    #[tokio::test]
+    async fn reads_inventory_only_through_bounded_adapter_endpoints() {
+        let main_data = br#"{"rid":8,"torrents":{}}"#;
+        let page = br#"[]"#;
+        let files = br#"[{"index":0,"name":"file.bin","size":4,"progress":1.0}]"#;
+        let (url, requests, server) = server(vec![
+            Reply {
+                status: "200 OK",
+                content_type: "application/json",
+                body: main_data,
+            },
+            Reply {
+                status: "200 OK",
+                content_type: "application/json",
+                body: page,
+            },
+            Reply {
+                status: "200 OK",
+                content_type: "application/json",
+                body: files,
+            },
+        ]);
+        let client = client(url);
+
+        assert_eq!(
+            client.sync_main_data(7).await.expect("main data"),
+            main_data
+        );
+        assert_eq!(client.inventory_page(500, 250).await.expect("page"), page);
+        assert_eq!(client.torrent_files("0123").await.expect("files"), files);
+
+        let main_request = requests.recv().expect("main-data request");
+        assert!(
+            main_request
+                .head
+                .starts_with("GET /api/v2/sync/maindata?rid=7 HTTP/1.1")
+        );
+        let page_request = requests.recv().expect("inventory-page request");
+        for parameter in ["sort=hash", "reverse=false", "offset=500", "limit=250"] {
+            assert!(page_request.head.contains(parameter));
+        }
+        let files_request = requests.recv().expect("file-list request");
+        assert!(
+            files_request
+                .head
+                .starts_with("GET /api/v2/torrents/files?hash=0123 HTTP/1.1")
+        );
         server.join().expect("fake server");
     }
 }
