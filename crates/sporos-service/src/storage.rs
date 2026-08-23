@@ -6,10 +6,12 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use sqlx::SqlitePool;
+use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectivePragmas {
@@ -96,6 +98,10 @@ impl Storage {
             .await
             .map_err(StorageOpenError::Connect)?;
         let effective_pragmas = inspect_pragmas(&pool).await?;
+        MIGRATOR
+            .run(&pool)
+            .await
+            .map_err(StorageOpenError::Migrate)?;
 
         Ok(Self {
             pool,
@@ -106,6 +112,10 @@ impl Storage {
 
     pub fn effective_pragmas(&self) -> &EffectivePragmas {
         &self.effective_pragmas
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 }
 
@@ -150,6 +160,8 @@ pub enum StorageOpenError {
     Connect(#[source] sqlx::Error),
     #[error("failed to inspect SQLite")]
     Inspect(#[source] sqlx::Error),
+    #[error("failed to migrate SQLite")]
+    Migrate(#[source] sqlx::migrate::MigrateError),
     #[error("SQLite {name} is {actual}; expected {expected}")]
     UnexpectedPragma {
         name: &'static str,
