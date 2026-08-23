@@ -1,0 +1,292 @@
+[
+  {
+    "name": "exact_same_tree",
+    "candidate_release": "Example.Movie.2024.1080p",
+    "candidate_files": [["Example.Movie.2024/movie.mkv", 1000], ["Example.Movie.2024/movie.nfo", 20]],
+    "sources": [{"release": "Example.Movie.2024.2160p", "files": [["Example.Movie.2024/movie.mkv", 1000], ["Example.Movie.2024/movie.nfo", 20]]}],
+    "expect": ["match", "strict", "match_strict", 2]
+  },
+  {
+    "name": "different_identity_identical_files",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_hash": 1,
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "hash": 2, "files": [["movie.mkv", 1000]]}],
+    "expect": ["match", "strict", "match_strict", 1]
+  },
+  {
+    "name": "existing_v1_identity",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_hash": 7,
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "hash": 7, "files": [["movie.mkv", 1000]]}],
+    "expect": ["already_present", null, "already_present", 0]
+  },
+  {
+    "name": "existing_v2_identity_with_unavailable_manifest",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_hash_v2": 8,
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "hash_v2": 8, "available": false, "files": []}],
+    "expect": ["already_present", null, "already_present", 0]
+  },
+  {
+    "name": "hybrid_identity_matches_either_hash",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_hash": 3,
+    "candidate_hash_v2": 4,
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "hash": 9, "hash_v2": 4, "files": [["movie.mkv", 1000]]}],
+    "expect": ["already_present", null, "already_present", 0]
+  },
+  {
+    "name": "different_root",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["candidate/movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["source/movie.mkv", 1000]]}],
+    "expect": ["match", "flexible", "match_flexible", 1]
+  },
+  {
+    "name": "renamed_unique_size",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["candidate-name.mkv", 1001]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["source-name.mkv", 1001]]}],
+    "expect": ["match", "flexible", "match_flexible", 1]
+  },
+  {
+    "name": "single_file_to_rooted_layout",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["Example/movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}],
+    "expect": ["match", "flexible", "match_flexible", 1]
+  },
+  {
+    "name": "missing_optional_sidecars",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000], ["movie.nfo", 10], ["Subs/en.srt", 20]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}],
+    "expect": ["match", "strict", "match_strict", 1]
+  },
+  {
+    "name": "extra_source_sidecars",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000], ["movie.nfo", 10]]}],
+    "expect": ["match", "strict", "match_strict", 1]
+  },
+  {
+    "name": "partial_primary_coverage",
+    "candidate_release": "Example.Show.S01",
+    "candidate_files": [["Example.Show.S01E01.mkv", 1000], ["Example.Show.S01E02.mkv", 2000]],
+    "sources": [{"release": "Example.Show.S01", "files": [["Example.Show.S01E01.mkv", 1000]]}],
+    "expect": ["match", "partial", "match_partial", 1]
+  },
+  {
+    "name": "ninety_percent_missing_is_still_partial",
+    "candidate_release": "Example.Show.S01",
+    "candidate_files": [["Example.Show.S01E01.mkv", 1000], ["Example.Show.S01E02.mkv", 9000]],
+    "sources": [{"release": "Example.Show.S01", "files": [["Example.Show.S01E01.mkv", 1000]]}],
+    "expect": ["match", "partial", "match_partial", 1]
+  },
+  {
+    "name": "duplicate_same_size_is_ambiguous",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["renamed.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["one.mkv", 1000], ["two.mkv", 1000]]}],
+    "expect": ["rejected", null, "ambiguous_file_mapping", 0]
+  },
+  {
+    "name": "equal_sources_are_ambiguous",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [
+      {"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]},
+      {"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}
+    ],
+    "expect": ["rejected", null, "ambiguous_file_mapping", 0]
+  },
+  {
+    "name": "complete_qbit_source_wins_semantic_tie",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [
+      {"release": "Example.Movie.2024", "kind": "data_directory_release", "files": [["movie.mkv", 1000]]},
+      {"release": "Example.Movie.2024", "kind": "qbittorrent_torrent", "files": [["movie.mkv", 1000]]}
+    ],
+    "expect": ["match", "strict", "match_strict", 1],
+    "expect_source": 2
+  },
+  {
+    "name": "season_from_individual_episodes",
+    "candidate_release": "Example.Show.S01",
+    "candidate_files": [["Example.Show.S01E01.mkv", 1000], ["Example.Show.S01E02.mkv", 2000]],
+    "sources": [
+      {"release": "Example.Show.S01E01", "files": [["Example.Show.S01E01.mkv", 1000]]},
+      {"release": "Example.Show.S01E02", "files": [["Example.Show.S01E02.mkv", 2000]]}
+    ],
+    "expect": ["match", "season_from_episodes", "match_season_from_episodes", 2]
+  },
+  {
+    "name": "season_pack_from_complete_season_pack",
+    "candidate_release": "Example.Show.S01",
+    "candidate_files": [["Example.Show.S01E01.mkv", 1000], ["Example.Show.S01E02.mkv", 2000]],
+    "sources": [{"release": "Example.Show.S01", "files": [["Example.Show.S01E01.mkv", 1000], ["Example.Show.S01E02.mkv", 2000]]}],
+    "expect": ["match", "strict", "match_strict", 2]
+  },
+  {
+    "name": "season_from_episodes_allows_missing_episode",
+    "candidate_release": "Example.Show.S01",
+    "candidate_files": [["Example.Show.S01E01.mkv", 1000], ["Example.Show.S01E02.mkv", 2000]],
+    "sources": [{"release": "Example.Show.S01E01", "files": [["Example.Show.S01E01.mkv", 1000]]}],
+    "expect": ["match", "season_from_episodes", "match_season_from_episodes", 1]
+  },
+  {
+    "name": "anime_absolute_episode",
+    "candidate_release": "Example Anime [012]",
+    "candidate_files": [["Example Anime [012].mkv", 1000]],
+    "sources": [{"release": "Example Anime [012]", "files": [["Different [012].mkv", 1000]]}],
+    "expect": ["match", "flexible", "match_flexible", 1]
+  },
+  {
+    "name": "date_episode",
+    "candidate_release": "Daily.Show.2026.08.24",
+    "candidate_files": [["Daily.Show.2026.08.24.mkv", 1000]],
+    "sources": [{"release": "Daily Show 2026-08-24", "files": [["Daily Show 2026-08-24.mkv", 1000]]}],
+    "expect": ["match", "flexible", "match_flexible", 1]
+  },
+  {
+    "name": "multi_episode_file",
+    "candidate_release": "Example.Show.S01E01-E02",
+    "candidate_files": [["Example.Show.S01E01E02.mkv", 2000]],
+    "sources": [{"release": "Example.Show.S01E01E02", "files": [["joined.mkv", 2000]]}],
+    "expect": ["match", "flexible", "match_flexible", 1]
+  },
+  {
+    "name": "movie_year_conflict",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2023", "files": [["movie.mkv", 1000]]}],
+    "expect": ["no_match", null, "year_conflict", 0]
+  },
+  {
+    "name": "alternate_title",
+    "candidate_release": "Amelie.2001",
+    "candidate_alternate_titles": ["Le Fabuleux Destin d Amelie Poulain"],
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Le.Fabuleux.Destin.d.Amelie.Poulain.2001", "files": [["movie.mkv", 1000]]}],
+    "expect": ["match", "strict", "match_strict", 1]
+  },
+  {
+    "name": "edition_difference_is_evidence_not_conflict",
+    "candidate_release": "Example.Movie.2024.Directors.Cut",
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024.Theatrical", "files": [["movie.mkv", 1000]]}],
+    "expect": ["match", "strict", "match_strict", 1]
+  },
+  {
+    "name": "arr_identity_conflict",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_arr": 10,
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "arr": 11, "files": [["movie.mkv", 1000]]}],
+    "expect": ["no_match", null, "series_conflict", 0]
+  },
+  {
+    "name": "bdmv_layout",
+    "candidate_release": "Example.Movie.2024.BDMV",
+    "candidate_files": [["BDMV/STREAM/00001.m2ts", 1000], ["BDMV/CLIPINF/00001.clpi", 10]],
+    "sources": [{"release": "Example.Movie.2024.BDMV", "files": [["BDMV/STREAM/00001.m2ts", 1000], ["BDMV/CLIPINF/00001.clpi", 10]]}],
+    "expect": ["match", "strict", "match_strict", 2]
+  },
+  {
+    "name": "video_ts_layout",
+    "candidate_release": "Example.Movie.2001.VIDEO_TS",
+    "candidate_files": [["VIDEO_TS/VIDEO_TS.IFO", 10], ["VIDEO_TS/VTS_01_1.VOB", 1000]],
+    "sources": [{"release": "Example.Movie.2001.VIDEO_TS", "files": [["VIDEO_TS/VIDEO_TS.IFO", 10], ["VIDEO_TS/VTS_01_1.VOB", 1000]]}],
+    "expect": ["match", "strict", "match_strict", 2]
+  },
+  {
+    "name": "sample_and_proof_are_optional",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000], ["Sample/sample.mkv", 10], ["Proof/proof.jpg", 10]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}],
+    "expect": ["match", "strict", "match_strict", 1]
+  },
+  {
+    "name": "zero_byte_file",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000], ["empty.dat", 0]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000], ["empty.dat", 0]]}],
+    "expect": ["match", "strict", "match_strict", 2]
+  },
+  {
+    "name": "padding_is_not_required",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000], [".pad/0", 24, true]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}],
+    "expect": ["match", "strict", "match_strict", 1]
+  },
+  {
+    "name": "unicode_normalization",
+    "candidate_release": "Amélie.2001",
+    "candidate_files": [["Café.mkv", 1000]],
+    "sources": [{"release": "Amélie.2001", "files": [["Café.mkv", 1000]]}],
+    "expect": ["match", "flexible", "match_flexible", 1]
+  },
+  {
+    "name": "case_sensitive_paths_are_not_strict",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["Movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}],
+    "expect": ["match", "flexible", "match_flexible", 1]
+  },
+  {
+    "name": "traversal_path",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["../movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}],
+    "expect": ["rejected", null, "unsafe_torrent_path", 0]
+  },
+  {
+    "name": "absolute_path",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["/movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}],
+    "expect": ["rejected", null, "unsafe_torrent_path", 0]
+  },
+  {
+    "name": "windows_unc_path",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["\\\\server\\share\\movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 1000]]}],
+    "expect": ["rejected", null, "unsafe_torrent_path", 0]
+  },
+  {
+    "name": "unicode_normalized_duplicate_path",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["Café.mkv", 1000], ["Café.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["Café.mkv", 1000]]}],
+    "expect": ["rejected", null, "unsafe_torrent_path", 0]
+  },
+  {
+    "name": "file_directory_prefix_collision",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["video", 1000], ["video/part.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["video", 1000], ["video/part.mkv", 1000]]}],
+    "expect": ["rejected", null, "unsafe_torrent_path", 0]
+  },
+  {
+    "name": "file_size_conflict",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.mkv", 999]]}],
+    "expect": ["no_match", null, "file_size_conflict", 0]
+  },
+  {
+    "name": "no_primary_video_overlap",
+    "candidate_release": "Example.Movie.2024",
+    "candidate_files": [["movie.mkv", 1000]],
+    "sources": [{"release": "Example.Movie.2024", "files": [["movie.nfo", 1000]]}],
+    "expect": ["no_match", null, "no_primary_video_overlap", 0]
+  }
+]
