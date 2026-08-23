@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use reqwest::Url;
 use sporos_service::{
+    inventory::{InventoryChange, parse_files, parse_inventory, parse_main_data},
     qbittorrent::{AddTorrentRequest, ApiKey, QbittorrentClient, QbittorrentError},
     torrent::TorrentParser,
 };
@@ -36,12 +37,14 @@ async fn stopped_add_is_safe_on_qbittorrent_5_2() {
         versions.application, versions.web_api
     );
 
+    let mut hashes = Vec::new();
     for case in cases() {
-        verify_case(&client, case).await;
+        hashes.push(verify_case(&client, case).await);
     }
+    verify_inventory_reads(&client, &hashes).await;
 }
 
-async fn verify_case(client: &QbittorrentClient, case: Case) {
+async fn verify_case(client: &QbittorrentClient, case: Case) -> String {
     let parsed = TorrentParser
         .parse(&case.torrent)
         .unwrap_or_else(|error| panic!("parse {} fixture: {error}", case.name));
@@ -91,6 +94,54 @@ async fn verify_case(client: &QbittorrentClient, case: Case) {
         .expect("idempotent explicit stop");
     let state = poll_stopped(client, &info_hash).await;
     assert!(state.is_stopped(), "torrent did not remain stopped");
+    info_hash
+}
+
+async fn verify_inventory_reads(client: &QbittorrentClient, hashes: &[String]) {
+    let main_body = client.sync_main_data(0).await.expect("full main data");
+    let mut identities = Vec::new();
+    let main = parse_main_data(main_body.as_slice(), u64::MAX, |change| {
+        if let InventoryChange::Upsert { qbit_id, delta } = change {
+            assert!(
+                delta
+                    .infohash_v1
+                    .as_deref()
+                    .is_some_and(|hash| !hash.is_empty())
+                    || delta
+                        .infohash_v2
+                        .as_deref()
+                        .is_some_and(|hash| !hash.is_empty())
+            );
+            identities.push(qbit_id);
+        }
+        Ok(())
+    })
+    .expect("parse full main data");
+    assert!(main.full_update);
+    assert_eq!(main.changed, hashes.len());
+
+    let page_body = client.inventory_page(0, 500).await.expect("inventory page");
+    let mut page_hashes = Vec::new();
+    let count = parse_inventory(page_body.as_slice(), u64::MAX, |torrent| {
+        assert!(!torrent.infohash_v1.is_empty() || !torrent.infohash_v2.is_empty());
+        page_hashes.push(torrent.hash);
+        Ok(())
+    })
+    .expect("parse inventory page");
+    assert_eq!(count, hashes.len());
+    assert_eq!(page_hashes, identities);
+
+    for hash in hashes {
+        let body = client.torrent_files(hash).await.expect("torrent files");
+        let mut next = 0_usize;
+        let count = parse_files(body.as_slice(), u64::MAX, 100_000, |file| {
+            assert_eq!(file.index, next);
+            next += 1;
+            Ok(())
+        })
+        .expect("parse torrent files");
+        assert!(count > 0);
+    }
 }
 
 struct Case {
