@@ -32,7 +32,7 @@ sporos-model = { path = "crates/sporos-model" }
 sporos-service = { path = "crates/sporos-service" }
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 
 [patch.crates-io]
 duroxide = { path = "vendor/duroxide" }

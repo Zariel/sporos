@@ -2,3 +2,6 @@
 
 pub mod durable_ingress;
 pub mod storage;
+
+#[cfg(test)]
+mod duroxide_phase0;
