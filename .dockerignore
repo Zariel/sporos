@@ -1,0 +1,14 @@
+.git
+.jj
+.github
+_private
+docs
+fuzz
+scripts
+target
+flake.lock
+flake.nix
+result
+*.db
+*.db-shm
+*.db-wal

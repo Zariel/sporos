@@ -29,11 +29,13 @@
         {
           default = pkgs.mkShell {
             packages = [
+              pkgs.actionlint
               rustToolchain
               pkgs.cargo-audit
               pkgs.cargo-deny
               pkgs.cargo-nextest
               pkgs.pkg-config
+              pkgs.shellcheck
               pkgs.sqlite
               pkgs.taplo
             ];

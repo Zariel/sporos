@@ -29,7 +29,7 @@ cargo test --workspace
 ```
 
 The default shell includes the pinned Rust toolchain plus `cargo-nextest`,
-`cargo-deny`, `cargo-audit`, Taplo, and the SQLite CLI.
+`cargo-deny`, `cargo-audit`, Taplo, actionlint, ShellCheck, and the SQLite CLI.
 
 ## Fuzzing
 
@@ -42,8 +42,7 @@ cargo fuzz run <target>
 ```
 
 Without Nix, install nightly through rustup and `cargo-fuzz` through Cargo,
-then run the same target with `cargo +nightly fuzz`. Fuzz targets will be added
-as the Phase 0 parser evaluations begin.
+then run the same target with `cargo +nightly fuzz`.
 
 ## Checks
 

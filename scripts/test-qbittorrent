@@ -28,6 +28,8 @@ trap cleanup EXIT INT TERM
 
 "$runtime" volume create "$config_volume" >/dev/null
 "$runtime" volume create "$downloads_volume" >/dev/null
+# API_KEY is intentionally expanded by the container shell, not this script.
+# shellcheck disable=SC2016
 "$runtime" run --rm \
     --entrypoint /bin/sh \
     --env API_KEY="$api_key" \
