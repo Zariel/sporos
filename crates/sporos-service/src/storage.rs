@@ -494,7 +494,7 @@ mod tests {
                 .await
                 .expect("read Duroxide migration ledger");
 
-        assert_eq!(domain_version, 3);
+        assert_eq!(domain_version, 4);
         assert_eq!(duroxide_has_domain_version, 0);
     }
 
@@ -521,7 +521,37 @@ mod tests {
         .fetch_one(storage.pool())
         .await
         .expect("count domain tables");
-        assert_eq!(domain_tables, 21);
+        assert_eq!(domain_tables, 22);
+    }
+
+    #[tokio::test]
+    async fn initializes_inventory_cursor_without_a_baseline() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = open_in(&directory).await.expect("open storage");
+
+        let state = sqlx::query_as::<_, (i64, Option<i64>, i64, Option<i64>)>(
+            "SELECT singleton, response_id, generation, baseline_at
+             FROM sporos_qbit_inventory_state",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .expect("read inventory state");
+        assert_eq!(state, (1, None, 0, None));
+
+        let columns = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM pragma_table_info('sporos_qbit_torrent')",
+        )
+        .fetch_all(storage.pool())
+        .await
+        .expect("inspect inventory columns");
+        for expected in [
+            "qbit_id",
+            "content_fingerprint",
+            "file_manifest_state",
+            "file_manifest_loaded_at",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
     }
 
     #[tokio::test]
