@@ -3,6 +3,7 @@
 pub mod config;
 pub mod durable_ingress;
 pub mod engine;
+pub mod http;
 pub mod inventory;
 pub mod outbox;
 pub mod qbittorrent;

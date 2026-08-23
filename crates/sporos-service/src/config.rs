@@ -15,6 +15,10 @@ const MAX_SECRET_BYTES: u64 = 64 * 1024;
 pub struct Secret(String);
 
 impl Secret {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -477,7 +481,7 @@ fn secret(field: &str, value: String) -> Result<Secret, ConfigError> {
     } else if value.len() as u64 > MAX_SECRET_BYTES {
         Err(ConfigError::SecretTooLarge(field.to_owned()))
     } else {
-        Ok(Secret(value))
+        Ok(Secret::new(value))
     }
 }
 

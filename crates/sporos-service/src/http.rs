@@ -1,0 +1,871 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use axum::extract::{MatchedPath, Path, Query, Request, State};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Extension, Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::Row;
+use subtle::ConstantTimeEq;
+use tower::ServiceBuilder;
+use tower_http::limit::RequestBodyLimitLayer;
+
+use crate::config::{Config, Secret};
+use crate::storage::Storage;
+
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+pub struct HttpState {
+    storage: Arc<Storage>,
+    webhook_token: Secret,
+    admin_token: Secret,
+    readiness: Arc<AtomicBool>,
+    metrics: Arc<Metrics>,
+}
+
+impl HttpState {
+    pub fn new(storage: Arc<Storage>, config: &Config) -> Self {
+        Self {
+            storage,
+            webhook_token: config.auth.webhook_token.clone(),
+            admin_token: config.auth.admin_token.clone(),
+            readiness: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(Metrics::new()),
+        }
+    }
+
+    pub fn set_ready(&self, ready: bool) {
+        self.readiness.store(ready, Ordering::Release);
+    }
+}
+
+pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
+    let admin = Router::new()
+        .route("/api/v1/admin/tasks", get(list_tasks))
+        .route("/api/v1/admin/tasks/{task_id}", get(get_task))
+        .route("/api/v1/admin/tasks/{task_id}/events", get(get_task_events))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
+        .layer(RequestBodyLimitLayer::new(admin_body_limit));
+
+    Router::new()
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .merge(admin)
+        .fallback(not_found)
+        .layer(
+            ServiceBuilder::new()
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    observe_request,
+                ))
+                .layer(middleware::from_fn(request_id)),
+        )
+        .with_state(state)
+}
+
+async fn livez() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn readyz(State(state): State<HttpState>) -> StatusCode {
+    if !state.readiness.load(Ordering::Acquire) {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(state.storage.pool())
+        .await
+    {
+        Ok(1) => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+async fn metrics(State(state): State<HttpState>) -> Response {
+    let outbox_depth = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM sporos_outbox
+         WHERE dispatched_at IS NULL AND permanent_failure_at IS NULL",
+    )
+    .fetch_one(state.storage.pool())
+    .await
+    .unwrap_or(-1);
+    let task_rows =
+        sqlx::query("SELECT kind, state, count(*) AS count FROM sporos_task GROUP BY kind, state")
+            .fetch_all(state.storage.pool())
+            .await
+            .unwrap_or_default();
+    let mut output = state.metrics.render();
+    output.push_str("# TYPE sporos_outbox_depth gauge\n");
+    output.push_str(&format!("sporos_outbox_depth {outbox_depth}\n"));
+    output.push_str("# TYPE sporos_tasks gauge\n");
+    for row in task_rows {
+        let kind = row.try_get::<String, _>("kind").unwrap_or_default();
+        let task_state = row.try_get::<String, _>("state").unwrap_or_default();
+        let count = row.try_get::<i64, _>("count").unwrap_or_default();
+        output.push_str(&format!(
+            "sporos_tasks{{kind=\"{}\",state=\"{}\"}} {count}\n",
+            metric_escape(&kind),
+            metric_escape(&task_state)
+        ));
+    }
+    (
+        [(
+            CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        output,
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskQuery {
+    #[serde(default = "default_page_size")]
+    limit: usize,
+    cursor: Option<String>,
+    state: Option<String>,
+}
+
+const fn default_page_size() -> usize {
+    50
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskPage {
+    items: Vec<TaskView>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskView {
+    id: String,
+    kind: String,
+    state: String,
+    projection_generation: i64,
+    duroxide_instance_id: String,
+    duroxide_execution_id: Option<String>,
+    reason_code: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    terminal_at: Option<i64>,
+}
+
+async fn list_tasks(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(query): Query<TaskQuery>,
+) -> Result<Json<TaskPage>, Problem> {
+    if !(1..=200).contains(&query.limit) {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_page_size",
+            "Invalid page size",
+            "limit must be between 1 and 200",
+            request_id,
+        ));
+    }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()
+        .map_err(|_| {
+            Problem::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_cursor",
+                "Invalid cursor",
+                "the pagination cursor is invalid",
+                request_id.clone(),
+            )
+        })?;
+    let fetch = i64::try_from(query.limit + 1).expect("page limit fits SQLite");
+    let rows = match (cursor, query.state.as_deref()) {
+        (Some((created_at, id)), Some(filter)) => {
+            sqlx::query(
+                "SELECT * FROM sporos_task WHERE state = ?
+                 AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(filter)
+            .bind(created_at)
+            .bind(created_at)
+            .bind(id)
+            .bind(fetch)
+            .fetch_all(state.storage.pool())
+            .await
+        }
+        (Some((created_at, id)), None) => {
+            sqlx::query(
+                "SELECT * FROM sporos_task
+                 WHERE created_at < ? OR (created_at = ? AND id < ?)
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(created_at)
+            .bind(created_at)
+            .bind(id)
+            .bind(fetch)
+            .fetch_all(state.storage.pool())
+            .await
+        }
+        (None, Some(filter)) => {
+            sqlx::query(
+                "SELECT * FROM sporos_task WHERE state = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(filter)
+            .bind(fetch)
+            .fetch_all(state.storage.pool())
+            .await
+        }
+        (None, None) => {
+            sqlx::query("SELECT * FROM sporos_task ORDER BY created_at DESC, id DESC LIMIT ?")
+                .bind(fetch)
+                .fetch_all(state.storage.pool())
+                .await
+        }
+    }
+    .map_err(|_| Problem::database(request_id.clone()))?;
+    let has_more = rows.len() > query.limit;
+    let rows = rows.into_iter().take(query.limit).collect::<Vec<_>>();
+    let next_cursor = if has_more {
+        rows.last()
+            .map(encode_cursor)
+            .transpose()
+            .map_err(|_| Problem::database(request_id.clone()))?
+    } else {
+        None
+    };
+    let items = rows
+        .into_iter()
+        .map(task_view)
+        .collect::<Result<_, _>>()
+        .map_err(|_| Problem::database(request_id))?;
+    Ok(Json(TaskPage { items, next_cursor }))
+}
+
+async fn get_task(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(task_id): Path<String>,
+) -> Result<Json<TaskView>, Problem> {
+    let id = parse_id(&task_id).ok_or_else(|| {
+        Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_task_id",
+            "Invalid task ID",
+            "task ID must be 32 lowercase hexadecimal characters",
+            request_id.clone(),
+        )
+    })?;
+    let row = sqlx::query("SELECT * FROM sporos_task WHERE id = ?")
+        .bind(id.as_slice())
+        .fetch_optional(state.storage.pool())
+        .await
+        .map_err(|_| Problem::database(request_id.clone()))?
+        .ok_or_else(|| {
+            Problem::new(
+                StatusCode::NOT_FOUND,
+                "task_not_found",
+                "Task not found",
+                "no task has that ID",
+                request_id.clone(),
+            )
+        })?;
+    Ok(Json(
+        task_view(row).map_err(|_| Problem::database(request_id))?,
+    ))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskEventView {
+    sequence: i64,
+    state: String,
+    reason_code: Option<String>,
+    detail: Option<serde_json::Value>,
+    created_at: i64,
+}
+
+async fn get_task_events(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(task_id): Path<String>,
+) -> Result<Json<Vec<TaskEventView>>, Problem> {
+    let id = parse_id(&task_id).ok_or_else(|| {
+        Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_task_id",
+            "Invalid task ID",
+            "task ID must be 32 lowercase hexadecimal characters",
+            request_id.clone(),
+        )
+    })?;
+    let rows = sqlx::query(
+        "SELECT sequence, state, reason_code, detail_json, created_at
+         FROM sporos_task_event WHERE task_id = ? ORDER BY sequence",
+    )
+    .bind(id.as_slice())
+    .fetch_all(state.storage.pool())
+    .await
+    .map_err(|_| Problem::database(request_id.clone()))?;
+    if rows.is_empty() {
+        return Err(Problem::new(
+            StatusCode::NOT_FOUND,
+            "task_not_found",
+            "Task not found",
+            "no task has that ID",
+            request_id,
+        ));
+    }
+    let events = rows
+        .into_iter()
+        .map(|row| {
+            let detail = row
+                .try_get::<Option<String>, _>("detail_json")?
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+            Ok(TaskEventView {
+                sequence: row.try_get("sequence")?,
+                state: row.try_get("state")?,
+                reason_code: row.try_get("reason_code")?,
+                detail,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(|_| Problem::database(request_id))?;
+    Ok(Json(events))
+}
+
+fn task_view(row: sqlx::sqlite::SqliteRow) -> Result<TaskView, sqlx::Error> {
+    let id = row.try_get::<Vec<u8>, _>("id")?;
+    Ok(TaskView {
+        id: encode_hex(&id),
+        kind: row.try_get("kind")?,
+        state: row.try_get("state")?,
+        projection_generation: row.try_get("projection_generation")?,
+        duroxide_instance_id: row.try_get("duroxide_instance_id")?,
+        duroxide_execution_id: row.try_get("duroxide_execution_id")?,
+        reason_code: row.try_get("reason_code")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        terminal_at: row.try_get("terminal_at")?,
+    })
+}
+
+fn encode_cursor(row: &sqlx::sqlite::SqliteRow) -> Result<String, sqlx::Error> {
+    let cursor = (
+        row.try_get::<i64, _>("created_at")?,
+        row.try_get::<Vec<u8>, _>("id")?,
+    );
+    let bytes =
+        serde_json::to_vec(&cursor).map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_cursor(cursor: &str) -> Result<(i64, Vec<u8>), ()> {
+    let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| ())?;
+    let cursor: (i64, Vec<u8>) = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    if cursor.1.len() == 16 {
+        Ok(cursor)
+    } else {
+        Err(())
+    }
+}
+
+async fn require_admin(State(state): State<HttpState>, request: Request, next: Next) -> Response {
+    authorize(&state.admin_token, request, next).await
+}
+
+pub async fn require_webhook(
+    State(state): State<HttpState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authorize(&state.webhook_token, request, next).await
+}
+
+async fn authorize(expected: &Secret, request: Request, next: Next) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(RequestId::next);
+    let supplied = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if !supplied.is_some_and(|value| token_eq(expected.expose(), value)) {
+        return Problem::new(
+            StatusCode::UNAUTHORIZED,
+            "authentication_required",
+            "Authentication required",
+            "a valid bearer token is required",
+            request_id,
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+fn token_eq(expected: &str, supplied: &str) -> bool {
+    let expected = Sha256::digest(expected.as_bytes());
+    let supplied = Sha256::digest(supplied.as_bytes());
+    bool::from(expected.ct_eq(&supplied))
+}
+
+async fn request_id(mut request: Request, next: Next) -> Response {
+    let request_id = RequestId::next();
+    request.extensions_mut().insert(request_id.clone());
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id.0) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+async fn observe_request(State(state): State<HttpState>, request: Request, next: Next) -> Response {
+    let method = request.method().as_str().to_owned();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("unmatched")
+        .to_owned();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    state.metrics.observe(
+        route,
+        method,
+        response.status().as_u16(),
+        started.elapsed().as_micros() as u64,
+    );
+    response
+}
+
+async fn not_found(Extension(request_id): Extension<RequestId>) -> Problem {
+    Problem::new(
+        StatusCode::NOT_FOUND,
+        "route_not_found",
+        "Route not found",
+        "no endpoint matches this request",
+        request_id,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct RequestId(String);
+
+impl RequestId {
+    fn next() -> Self {
+        let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Self(format!("req_{sequence:016x}"))
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Problem {
+    #[serde(skip)]
+    status_code: StatusCode,
+    r#type: String,
+    title: &'static str,
+    status: u16,
+    code: &'static str,
+    detail: &'static str,
+    request_id: String,
+}
+
+impl Problem {
+    fn new(
+        status: StatusCode,
+        code: &'static str,
+        title: &'static str,
+        detail: &'static str,
+        request_id: RequestId,
+    ) -> Self {
+        Self {
+            status_code: status,
+            r#type: format!("urn:sporos:error:{code}"),
+            title,
+            status: status.as_u16(),
+            code,
+            detail,
+            request_id: request_id.0,
+        }
+    }
+
+    fn database(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database_unavailable",
+            "Database unavailable",
+            "the task projection could not be read",
+            request_id,
+        )
+    }
+}
+
+impl IntoResponse for Problem {
+    fn into_response(self) -> Response {
+        let status = self.status_code;
+        (status, Json(self)).into_response()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MetricKey {
+    route: String,
+    method: String,
+    status: u16,
+}
+
+#[derive(Debug)]
+struct MetricValue {
+    count: u64,
+    duration_micros: u64,
+}
+
+#[derive(Debug)]
+struct Metrics {
+    started: Instant,
+    http: Mutex<BTreeMap<MetricKey, MetricValue>>,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            http: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn observe(&self, route: String, method: String, status: u16, duration_micros: u64) {
+        let mut http = self
+            .http
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let value = http
+            .entry(MetricKey {
+                route,
+                method,
+                status,
+            })
+            .or_insert(MetricValue {
+                count: 0,
+                duration_micros: 0,
+            });
+        value.count = value.count.saturating_add(1);
+        value.duration_micros = value.duration_micros.saturating_add(duration_micros);
+    }
+
+    fn render(&self) -> String {
+        let http = self
+            .http
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut output = String::from(
+            "# TYPE sporos_build_info gauge\nsporos_build_info{version=\"0.0.0\"} 1\n\
+             # TYPE sporos_process_uptime_seconds gauge\n",
+        );
+        output.push_str(&format!(
+            "sporos_process_uptime_seconds {}\n",
+            self.started.elapsed().as_secs()
+        ));
+        output.push_str("# TYPE sporos_http_requests_total counter\n");
+        output.push_str("# TYPE sporos_http_request_duration_seconds summary\n");
+        for (key, value) in http.iter() {
+            let labels = format!(
+                "route=\"{}\",method=\"{}\",status=\"{}\"",
+                metric_escape(&key.route),
+                metric_escape(&key.method),
+                key.status
+            );
+            output.push_str(&format!(
+                "sporos_http_requests_total{{{labels}}} {}\n",
+                value.count
+            ));
+            output.push_str(&format!(
+                "sporos_http_request_duration_seconds_count{{{labels}}} {}\n",
+                value.count
+            ));
+            output.push_str(&format!(
+                "sporos_http_request_duration_seconds_sum{{{labels}}} {:.6}\n",
+                value.duration_micros as f64 / 1_000_000.0
+            ));
+        }
+        output
+    }
+}
+
+fn metric_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn parse_id(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut id = [0; 16];
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (index, pair) in pairs.iter().enumerate() {
+        id[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
+    }
+    Some(id)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request as HttpRequest;
+    use axum::routing::post;
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::durable_ingress::{NewTask, PolicySnapshot};
+    use crate::engine::{FAKE_TASK_NAME, FAKE_TASK_VERSION, FakeTaskInput};
+    use sporos_model::{PolicySnapshotId, TaskId, TaskKey};
+
+    #[tokio::test]
+    async fn separates_admin_and_webhook_authentication() {
+        let (_directory, state) = test_state().await;
+        let app = test_router(state);
+
+        assert_eq!(
+            request(&app, "/api/v1/admin/tasks", Some("webhook"), "")
+                .await
+                .0,
+            401
+        );
+        assert_eq!(
+            request(&app, "/api/v1/admin/tasks", Some("admin"), "")
+                .await
+                .0,
+            200
+        );
+        assert_eq!(
+            request(&app, "/_test/webhook", Some("admin"), r#"{"marker":1}"#)
+                .await
+                .0,
+            401
+        );
+        assert_eq!(
+            request(&app, "/_test/webhook", Some("webhook"), r#"{"marker":1}"#)
+                .await
+                .0,
+            202
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_authentication_before_decoding_the_body() {
+        let (_directory, state) = test_state().await;
+        let app = test_router(state);
+        let (status, body) = request(&app, "/_test/webhook", None, "not-json").await;
+
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], "authentication_required");
+    }
+
+    #[tokio::test]
+    async fn duplicate_webhook_requests_return_the_existing_task() {
+        let (_directory, state) = test_state().await;
+        let app = test_router(state);
+        let first = request(&app, "/_test/webhook", Some("webhook"), r#"{"marker":7}"#).await;
+        let second = request(&app, "/_test/webhook", Some("webhook"), r#"{"marker":7}"#).await;
+
+        assert_eq!(first.0, 202);
+        assert_eq!(second.0, 200);
+        assert_eq!(first.1["taskId"], second.1["taskId"]);
+        assert_eq!(second.1["duplicate"], true);
+    }
+
+    #[tokio::test]
+    async fn exposes_stable_health_and_metric_names() {
+        let (_directory, state) = test_state().await;
+        let app = test_router(state.clone());
+        assert_eq!(request(&app, "/livez", None, "").await.0, 200);
+        assert_eq!(request(&app, "/readyz", None, "").await.0, 503);
+        state.set_ready(true);
+        assert_eq!(request(&app, "/readyz", None, "").await.0, 200);
+
+        let response = app
+            .clone()
+            .oneshot(HttpRequest::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for name in [
+            "sporos_build_info",
+            "sporos_http_requests_total",
+            "sporos_outbox_depth",
+            "sporos_tasks",
+        ] {
+            assert!(body.contains(name), "missing metric {name}");
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FakeRequest {
+        marker: u8,
+    }
+
+    #[derive(Debug, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FakeResponse {
+        task_id: String,
+        duplicate: bool,
+    }
+
+    async fn fake_webhook(
+        State(state): State<HttpState>,
+        Json(request): Json<FakeRequest>,
+    ) -> impl IntoResponse {
+        let task = fake_task(request.marker);
+        match state.storage.accept_task(&task).await {
+            Ok(accepted) => (
+                if accepted.duplicate {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                },
+                Json(FakeResponse {
+                    task_id: encode_hex(accepted.id.as_bytes()),
+                    duplicate: accepted.duplicate,
+                }),
+            )
+                .into_response(),
+            Err(_) => StatusCode::INSUFFICIENT_STORAGE.into_response(),
+        }
+    }
+
+    fn test_router(state: HttpState) -> Router {
+        router(state.clone(), 1024 * 1024).merge(
+            Router::new()
+                .route("/_test/webhook", post(fake_webhook))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_webhook,
+                ))
+                .with_state(state),
+        )
+    }
+
+    async fn test_state() -> (TempDir, HttpState) {
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = Arc::new(
+            Storage::open(
+                directory.path().join("sporos.lock"),
+                directory.path().join("sporos.db"),
+            )
+            .await
+            .expect("open storage"),
+        );
+        let state = HttpState {
+            storage,
+            webhook_token: Secret::new("webhook"),
+            admin_token: Secret::new("admin"),
+            readiness: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(Metrics::new()),
+        };
+        (directory, state)
+    }
+
+    async fn request(app: &Router, path: &str, token: Option<&str>, body: &str) -> (u16, Value) {
+        let mut request = if body.is_empty() {
+            HttpRequest::get(path)
+        } else {
+            HttpRequest::post(path).header(CONTENT_TYPE, "application/json")
+        };
+        if let Some(token) = token {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
+    }
+
+    fn fake_task(marker: u8) -> NewTask {
+        NewTask {
+            id: TaskId::from_bytes([marker; 16]),
+            key: TaskKey::from_bytes([marker; 32]),
+            kind: "fake".to_owned(),
+            policy: PolicySnapshot {
+                id: PolicySnapshotId::from_bytes([marker; 16]),
+                config_hash: [marker; 32],
+                matcher_version: "phase1".to_owned(),
+                payload_json: "{}".to_owned(),
+                created_at: 1,
+            },
+            orchestration_name: FAKE_TASK_NAME.to_owned(),
+            orchestration_version: FAKE_TASK_VERSION.to_owned(),
+            instance_id: format!("fake-v1:{marker}"),
+            input_json: serde_json::to_string(&FakeTaskInput {
+                task_id: [marker; 16],
+                accepted_at_ms: 1,
+                delay_ms: 1,
+            })
+            .expect("encode fake task"),
+            created_at: 1,
+        }
+    }
+}
