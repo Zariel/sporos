@@ -1,0 +1,22 @@
+[workspace]
+members = [
+  "crates/sporos-matcher",
+  "crates/sporos-model",
+  "crates/sporos-service",
+  "crates/sporos-testkit",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Zariel/sporos"
+rust-version = "1.98"
+
+[workspace.dependencies]
+sporos-matcher = { path = "crates/sporos-matcher" }
+sporos-model = { path = "crates/sporos-model" }
+sporos-service = { path = "crates/sporos-service" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
