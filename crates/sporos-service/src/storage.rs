@@ -150,6 +150,13 @@ impl Storage {
         std::sync::Arc::clone(&self.duroxide)
     }
 
+    pub async fn checkpoint(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
