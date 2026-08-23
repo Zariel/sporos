@@ -75,3 +75,18 @@ documented patch under `vendor/duroxide`; changes there must be reviewed
 separately from routine dependency updates. Torrent metainfo is parsed with the
 exactly pinned Magpie crates and the local bounded-decoder patch documented in
 `docs/decisions/0001-torrent-parser.md`.
+
+## External services
+
+Real dependency tests are opt-in and use disposable containers. The
+qBittorrent test selects Podman when available and otherwise Docker:
+
+```console
+scripts/test-qbittorrent
+```
+
+It runs a digest-pinned qBittorrent 5.2.1 image, exposes the Web API only on a
+random loopback port, and verifies API-key authentication and stopped-add
+layout for single- and multi-file v1, v2, and hybrid torrents. The container
+and its temporary volumes are removed on exit. Set `CONTAINER_RUNTIME` or
+`QBITTORRENT_IMAGE` to override the defaults.

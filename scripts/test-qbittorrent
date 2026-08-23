@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+api_key='qbt_0123456789abcdefghijklmnopqr'
+image_default='lscr.io/linuxserver/qbittorrent@sha256:128fc1ded61de40107311b6424a797ebffed0cda3451cd63776394d46cddf59c'
+image=${QBITTORRENT_IMAGE:-$image_default}
+
+if [[ -n ${CONTAINER_RUNTIME:-} ]]; then
+    runtime=$CONTAINER_RUNTIME
+elif command -v podman >/dev/null 2>&1; then
+    runtime=podman
+elif command -v docker >/dev/null 2>&1; then
+    runtime=docker
+else
+    echo 'Podman or Docker is required for this integration test.' >&2
+    exit 1
+fi
+
+container="sporos-qbittorrent-$$"
+config_volume="$container-config"
+downloads_volume="$container-downloads"
+
+cleanup() {
+    "$runtime" rm --force "$container" >/dev/null 2>&1 || true
+    "$runtime" volume rm --force "$config_volume" "$downloads_volume" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+"$runtime" volume create "$config_volume" >/dev/null
+"$runtime" volume create "$downloads_volume" >/dev/null
+"$runtime" run --rm \
+    --entrypoint /bin/sh \
+    --env API_KEY="$api_key" \
+    --volume "$config_volume:/config" \
+    "$image" \
+    -c 'mkdir -p /config/qBittorrent && printf "%s\n" \
+        "[LegalNotice]" \
+        "Accepted=true" \
+        "" \
+        "[Preferences]" \
+        "Connection\\PortRangeMin=6881" \
+        "Downloads\\SavePath=/downloads/" \
+        "WebUI\\APIKey=$API_KEY" \
+        "WebUI\\Address=*" \
+        "WebUI\\CSRFProtection=false" \
+        "WebUI\\Enabled=true" \
+        "WebUI\\HostHeaderValidation=false" \
+        "WebUI\\Port=8080" \
+        "WebUI\\ServerDomains=*" \
+        > /config/qBittorrent/qBittorrent.conf'
+
+"$runtime" run --detach --name "$container" \
+    --env PUID="$(id -u)" \
+    --env PGID="$(id -g)" \
+    --env TZ=UTC \
+    --publish 127.0.0.1::8080 \
+    --volume "$config_volume:/config" \
+    --volume "$downloads_volume:/downloads" \
+    "$image" >/dev/null
+
+published_port=$(
+    "$runtime" port "$container" 8080/tcp \
+        | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' \
+        | head -n 1
+)
+if [[ -z $published_port ]]; then
+    echo 'Could not determine the qBittorrent WebUI port.' >&2
+    exit 1
+fi
+url="http://127.0.0.1:$published_port"
+
+for _ in $(seq 1 60); do
+    if curl --fail --silent --show-error \
+        --header "Authorization: Bearer $api_key" \
+        "$url/api/v2/app/version" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+if ! curl --fail --silent --show-error \
+    --header "Authorization: Bearer $api_key" \
+    "$url/api/v2/app/version"; then
+    "$runtime" logs "$container" >&2
+    exit 1
+fi
+echo
+
+SPOROS_QBITTORRENT_URL=$url \
+SPOROS_QBITTORRENT_API_KEY=$api_key \
+cargo test -p sporos-service --test qbittorrent_real -- --ignored --nocapture
+
+if [[ $("$runtime" exec "$container" find /downloads -type f -print -quit) ]]; then
+    echo 'qBittorrent materialised data before hardlink verification.' >&2
+    exit 1
+fi
