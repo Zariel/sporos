@@ -6,9 +6,10 @@ Cargo commands.
 
 ## With rustup
 
-Install [rustup](https://rustup.rs/) and enter the repository. Rustup reads the
-toolchain file and installs Rust 1.98.0 with rustfmt and Clippy when a Cargo
-command first runs.
+Install [rustup](https://rustup.rs/) and a C build toolchain, then enter the
+repository. The C compiler and linker build the bundled SQLite library; no
+system SQLite installation is required. Rustup reads the toolchain file and
+installs Rust 1.98.0 with rustfmt and Clippy when a Cargo command first runs.
 
 ```console
 cargo test --workspace
@@ -46,7 +47,8 @@ as the Phase 0 parser evaluations begin.
 
 ## Checks
 
-The baseline checks require only the pinned Rust toolchain:
+The baseline checks require the pinned Rust toolchain and the C build tools
+described above:
 
 ```console
 cargo fmt --all --check
@@ -68,6 +70,7 @@ cargo deny check
 cargo audit
 ```
 
-Phase 0 intentionally does not select Duroxide or a torrent metainfo parser in
-the workspace manifest. Those dependencies must be chosen from experimental
-durability, replay, bounded-memory, and v1/v2/hybrid parsing results.
+Phase 0 pins Duroxide 0.1.30. Its SQLite provider is vendored with a small,
+documented patch under `vendor/duroxide`; changes there must be reviewed
+separately from routine dependency updates. A torrent metainfo parser remains
+unselected until the bounded-memory and v1/v2/hybrid experiments are complete.

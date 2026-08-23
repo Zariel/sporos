@@ -9,6 +9,8 @@ publish = false
 default-run = "sporos"
 
 [dependencies]
+duroxide.workspace = true
+duroxide-sqlx.workspace = true
 fs2.workspace = true
 sqlx.workspace = true
 sporos-matcher.workspace = true

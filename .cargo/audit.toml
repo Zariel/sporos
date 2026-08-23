@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+  # This is an inactive optional SQLx 0.8 MySQL dependency. The vendored
+  # Duroxide provider enables SQLite only; `cargo tree -i rsa` is empty.
+  "RUSTSEC-2023-0071",
+]

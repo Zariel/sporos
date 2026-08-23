@@ -1,0 +1,62 @@
+[package]
+name = "duroxide"
+version = "0.1.30"
+edition = "2024"
+description = "Durable code execution framework for Rust"
+license = "MIT"
+repository = "https://github.com/microsoft/duroxide"
+homepage = "https://github.com/microsoft/duroxide"
+documentation = "https://docs.rs/duroxide"
+keywords = ["durable", "workflow", "orchestration", "async", "tasks"]
+categories = ["asynchronous", "concurrency"]
+
+[features]
+default = []
+sqlite = ["sqlx", "libsqlite3-sys"]  # SQLite provider (bundled, no system deps)
+provider-test = ["futures"]  # Provider validation test harness (generic, no provider dependency)
+test = ["provider-test", "test-hooks"]  # Auto-enable provider-test and test-hooks for tests
+test-hooks = []  # Enable test hooks for fault injection in integration tests
+replay-version-test = ["test"]  # Zero-cost: only gates test code for replay engine extensibility verification
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"  # For CancellationToken
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+tracing = { version = "0.1", features = ["std"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
+semver = "1"
+
+# used by provider-tests
+futures = { version = "0.3", optional = true }
+
+# Metrics facade (always on, zero-cost if no recorder installed)
+metrics = "0.24"
+
+# SQLite support (optional, bundled)
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"], optional = true }
+libsqlite3-sys = { version = ">=0.28", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+# Used in tests/examples
+tempfile = "3"
+proptest = "1.4"
+# Metrics test utilities (DebuggingRecorder for snapshot assertions)
+metrics-util = "0.19"
+# Enable sqlite, provider-test, and test-hooks features for integration tests
+duroxide = { path = ".", features = ["sqlite", "provider-test", "test-hooks"] }
+
+# Clippy lints for better code quality
+[lints.clippy]
+# Correctness (warn for now, can upgrade to deny after fixing)
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Performance
+clone_on_ref_ptr = "warn"
+large_enum_variant = "warn"
+
+# Style and maintainability
+missing_errors_doc = "warn"
