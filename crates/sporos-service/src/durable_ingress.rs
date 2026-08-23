@@ -53,8 +53,8 @@ impl Storage {
 
         sqlx::query(
             "INSERT INTO sporos_task (
-                id, kind, state, generation, duroxide_instance_id,
-                policy_snapshot_id, attempt_count, created_at, updated_at
+                id, kind, state, projection_generation, duroxide_instance_id,
+                policy_snapshot_id, observed_retry_count, created_at, updated_at
              ) VALUES (?, ?, 'queued', 0, ?, ?, 0, ?, ?)
              ON CONFLICT(id) DO NOTHING",
         )
@@ -82,7 +82,7 @@ impl Storage {
         let inserted = sqlx::query(
             "INSERT INTO sporos_outbox (
                 task_id, task_key, orchestration_name, orchestration_version,
-                instance_id, input_json, visible_at, attempt_count
+                instance_id, input_json, visible_at, start_delivery_attempt_count
              ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
              ON CONFLICT(task_key) DO NOTHING",
         )

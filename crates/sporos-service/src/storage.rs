@@ -477,7 +477,7 @@ mod tests {
         let storage = open_in(&directory).await.expect("open storage");
 
         let domain_version =
-            sqlx::query_scalar::<_, i64>("SELECT version FROM sporos_schema_migration")
+            sqlx::query_scalar::<_, i64>("SELECT max(version) FROM sporos_schema_migration")
                 .fetch_one(storage.pool())
                 .await
                 .expect("read domain migration ledger");
@@ -487,8 +487,34 @@ mod tests {
                 .await
                 .expect("read Duroxide migration ledger");
 
-        assert_eq!(domain_version, 1);
+        assert_eq!(domain_version, 3);
         assert_eq!(duroxide_has_domain_version, 0);
+    }
+
+    #[tokio::test]
+    async fn keeps_task_projection_non_executable() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = open_in(&directory).await.expect("open storage");
+
+        let columns =
+            sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('sporos_task')")
+                .fetch_all(storage.pool())
+                .await
+                .expect("inspect task columns");
+        assert!(columns.contains(&"projection_generation".to_owned()));
+        assert!(columns.contains(&"observed_retry_count".to_owned()));
+        for forbidden in ["next_run_at", "visible_at", "lease_token", "lease_until"] {
+            assert!(!columns.iter().any(|column| column == forbidden));
+        }
+
+        let domain_tables = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM sqlite_schema
+             WHERE type = 'table' AND name LIKE 'sporos_%'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .expect("count domain tables");
+        assert_eq!(domain_tables, 21);
     }
 
     #[tokio::test]
