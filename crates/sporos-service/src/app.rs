@@ -21,6 +21,8 @@ use crate::config::{Config, LogFormat, Logging};
 use crate::engine::registries;
 use crate::http::{HttpState, router};
 use crate::outbox::OutboxDispatcher;
+use crate::qbit_sync::InventorySynchronizer;
+use crate::qbittorrent::{ApiKey, QbittorrentClient, QbittorrentConfigError};
 use crate::storage::Storage;
 
 const OUTBOX_INTERVAL: Duration = Duration::from_millis(100);
@@ -57,6 +59,25 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             .await
             .map_err(AppError::OpenStorage)?,
     );
+    let synchronizer = config
+        .qbittorrent
+        .as_ref()
+        .map(|settings| {
+            let api_key = ApiKey::new(settings.api_key.expose())?;
+            let client = QbittorrentClient::with_timeout(
+                settings.url.clone(),
+                api_key,
+                settings.request_timeout,
+            )?;
+            Ok::<_, QbittorrentConfigError>(InventorySynchronizer::new(
+                Arc::clone(&storage),
+                client,
+                settings.inventory_batch_size,
+                settings.database_batch_size,
+            ))
+        })
+        .transpose()
+        .map_err(AppError::QbittorrentConfig)?;
     let provider = storage.duroxide_provider();
     let client = Client::new(provider.clone());
     OutboxDispatcher::new(&storage, client.clone(), config.limits.outbox_batch_size)
@@ -99,6 +120,24 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         )
         .await;
     });
+    let (qbit_stop_tx, qbit_stop_rx) = watch::channel(false);
+    let qbit = synchronizer.map(|synchronizer| {
+        let settings = config
+            .qbittorrent
+            .as_ref()
+            .expect("synchronizer has qBittorrent settings");
+        let sync_interval = settings.sync_interval;
+        let full_reconcile_interval = settings.full_reconcile_interval;
+        tokio::spawn(async move {
+            qbit_loop(
+                synchronizer,
+                sync_interval,
+                full_reconcile_interval,
+                qbit_stop_rx,
+            )
+            .await;
+        })
+    });
 
     state.set_ready(true);
     info!(
@@ -116,6 +155,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
 
     state.set_ready(false);
     let _ = outbox_stop_tx.send(true);
+    let _ = qbit_stop_tx.send(true);
     let _ = http_stop_tx.send(());
     info!(service = "sporos", "shutdown started");
 
@@ -130,13 +170,29 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             );
         }
     };
+    let qbit_shutdown = async {
+        if let Some(mut qbit) = qbit
+            && tokio::time::timeout(grace, &mut qbit).await.is_err()
+        {
+            qbit.abort();
+            warn!(
+                service = "sporos",
+                "qBittorrent observer exceeded shutdown grace"
+            );
+        }
+    };
     let server_shutdown = async {
         if server_result.is_none() && tokio::time::timeout(grace, &mut server).await.is_err() {
             server.abort();
             warn!(service = "sporos", "HTTP server exceeded shutdown grace");
         }
     };
-    tokio::join!(runtime_shutdown, outbox_shutdown, server_shutdown);
+    tokio::join!(
+        runtime_shutdown,
+        outbox_shutdown,
+        qbit_shutdown,
+        server_shutdown
+    );
 
     storage.checkpoint().await.map_err(AppError::Checkpoint)?;
     info!(service = "sporos", "shutdown complete");
@@ -146,6 +202,76 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         return Err(AppError::ServerStopped);
     }
     Ok(())
+}
+
+async fn qbit_loop(
+    synchronizer: InventorySynchronizer,
+    sync_period: Duration,
+    full_period: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut contract_validated = false;
+    let mut sync_interval = tokio::time::interval(sync_period);
+    sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut full_interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + full_period, full_period);
+    full_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+            _ = sync_interval.tick() => {
+                if !contract_validated {
+                    match synchronizer.negotiate().await {
+                        Ok(versions) => {
+                            contract_validated = true;
+                            info!(
+                                service = "sporos",
+                                qbit_application_version = %versions.application,
+                                qbit_web_api_version = %versions.web_api,
+                                "qBittorrent contract enabled"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(service = "sporos", error = %error, "qBittorrent contract unavailable");
+                            continue;
+                        }
+                    }
+                }
+                match synchronizer.sync_once(now_ms()).await {
+                    Ok(report) => {
+                        if report.changed > 0 || !report.completions.is_empty() {
+                            info!(
+                                service = "sporos",
+                                changed = report.changed,
+                                completions = report.completions.len(),
+                                full_update = report.full_update,
+                                "qBittorrent inventory synchronized"
+                            );
+                        }
+                        if let Err(error) = synchronizer.refresh_manifests(8, now_ms()).await {
+                            warn!(service = "sporos", error = %error, "qBittorrent manifest refresh failed");
+                        }
+                    }
+                    Err(error) => warn!(service = "sporos", error = %error, "qBittorrent inventory sync failed"),
+                }
+            }
+            _ = full_interval.tick(), if contract_validated => {
+                match synchronizer.reconcile(now_ms()).await {
+                    Ok(report) => info!(
+                        service = "sporos",
+                        changed = report.changed,
+                        completions = report.completions.len(),
+                        "qBittorrent inventory reconciled"
+                    ),
+                    Err(error) => warn!(service = "sporos", error = %error, "qBittorrent inventory reconciliation failed"),
+                }
+            }
+        }
+    }
 }
 
 async fn dispatch_loop(
@@ -207,6 +333,8 @@ pub enum AppError {
     OpenStorage(#[source] crate::storage::StorageOpenError),
     #[error("initial outbox delivery check failed")]
     InitialOutboxDispatch(#[source] crate::outbox::DispatchError),
+    #[error("invalid qBittorrent client configuration")]
+    QbittorrentConfig(#[source] QbittorrentConfigError),
     #[error("failed to bind the HTTP listener")]
     Bind(#[source] std::io::Error),
     #[error("failed to inspect the HTTP listener")]
