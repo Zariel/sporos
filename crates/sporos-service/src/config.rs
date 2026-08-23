@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use reqwest::Url;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
@@ -46,6 +47,19 @@ pub struct Config {
     pub limits: Limits,
     pub logging: Logging,
     pub metrics: Metrics,
+    pub qbittorrent: Option<Qbittorrent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qbittorrent {
+    pub url: Url,
+    pub api_key: Secret,
+    pub request_timeout: Duration,
+    pub sync_interval: Duration,
+    pub full_reconcile_interval: Duration,
+    pub inventory_batch_size: usize,
+    pub database_batch_size: usize,
+    pub inventory_stale_after: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +185,7 @@ struct RawConfig {
     limits: Limits,
     logging: Logging,
     metrics: Metrics,
-    qbittorrent: Option<ServiceConfig>,
+    qbittorrent: Option<RawQbittorrent>,
     prowlarr: Option<ServiceConfig>,
     arr: ArrConfig,
     paths: PathsConfig,
@@ -179,6 +193,40 @@ struct RawConfig {
     matching: MatchingConfig,
     injection: InjectionConfig,
     data_scan: DataScanConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawQbittorrent {
+    url: String,
+    api_key: Option<String>,
+    api_key_file: Option<PathBuf>,
+    #[serde(with = "duration")]
+    request_timeout: Duration,
+    #[serde(with = "duration")]
+    sync_interval: Duration,
+    #[serde(with = "duration")]
+    full_reconcile_interval: Duration,
+    inventory_batch_size: usize,
+    database_batch_size: usize,
+    #[serde(with = "duration")]
+    inventory_stale_after: Duration,
+}
+
+impl Default for RawQbittorrent {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            api_key: None,
+            api_key_file: None,
+            request_timeout: Duration::from_secs(30),
+            sync_interval: Duration::from_secs(10),
+            full_reconcile_interval: Duration::from_secs(6 * 60 * 60),
+            inventory_batch_size: 500,
+            database_batch_size: 200,
+            inventory_stale_after: Duration::from_secs(5 * 60),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -398,7 +446,24 @@ fn load(
         return Err(ConfigError::SharedAuthToken);
     }
 
-    validate_optional_secrets(raw.qbittorrent.as_ref(), "qbittorrent.api_key")?;
+    let qbittorrent = raw
+        .qbittorrent
+        .map(|service| -> Result<Qbittorrent, ConfigError> {
+            let url = Url::parse(&service.url).map_err(|_| ConfigError::QbittorrentUrl)?;
+            let api_key =
+                resolve_secret("qbittorrent.api_key", service.api_key, service.api_key_file)?;
+            Ok(Qbittorrent {
+                url,
+                api_key,
+                request_timeout: service.request_timeout,
+                sync_interval: service.sync_interval,
+                full_reconcile_interval: service.full_reconcile_interval,
+                inventory_batch_size: service.inventory_batch_size,
+                database_batch_size: service.database_batch_size,
+                inventory_stale_after: service.inventory_stale_after,
+            })
+        })
+        .transpose()?;
     validate_optional_secrets(raw.prowlarr.as_ref(), "prowlarr.api_key")?;
     for (kind, services) in [("sonarr", &raw.arr.sonarr), ("radarr", &raw.arr.radarr)] {
         for (name, service) in services {
@@ -416,11 +481,12 @@ fn load(
         limits: raw.limits,
         logging: raw.logging,
         metrics: raw.metrics,
+        qbittorrent,
     })
 }
 
 fn validate_positive(config: &RawConfig) -> Result<(), ConfigError> {
-    let values = [
+    let mut values = vec![
         (
             "server.autobrr_body_limit_bytes",
             config.server.autobrr_body_limit_bytes,
@@ -453,6 +519,46 @@ fn validate_positive(config: &RawConfig) -> Result<(), ConfigError> {
             config.limits.internal_channel_capacity,
         ),
     ];
+    if let Some(qbittorrent) = &config.qbittorrent {
+        values.extend([
+            (
+                "qbittorrent.inventory_batch_size",
+                qbittorrent.inventory_batch_size,
+            ),
+            (
+                "qbittorrent.database_batch_size",
+                qbittorrent.database_batch_size,
+            ),
+        ]);
+        if qbittorrent.inventory_batch_size > 500 {
+            return Err(ConfigError::LimitTooLarge {
+                field: "qbittorrent.inventory_batch_size",
+                maximum: 500,
+            });
+        }
+        if qbittorrent.database_batch_size > 500 {
+            return Err(ConfigError::LimitTooLarge {
+                field: "qbittorrent.database_batch_size",
+                maximum: 500,
+            });
+        }
+        for (field, value) in [
+            ("qbittorrent.request_timeout", qbittorrent.request_timeout),
+            ("qbittorrent.sync_interval", qbittorrent.sync_interval),
+            (
+                "qbittorrent.full_reconcile_interval",
+                qbittorrent.full_reconcile_interval,
+            ),
+            (
+                "qbittorrent.inventory_stale_after",
+                qbittorrent.inventory_stale_after,
+            ),
+        ] {
+            if value.is_zero() {
+                return Err(ConfigError::ZeroLimit(field));
+            }
+        }
+    }
     if let Some((field, _)) = values.into_iter().find(|(_, value)| *value == 0) {
         return Err(ConfigError::ZeroLimit(field));
     }
@@ -585,6 +691,10 @@ pub enum ConfigError {
     },
     #[error("{0} must be greater than zero")]
     ZeroLimit(&'static str),
+    #[error("{field} must not exceed {maximum}")]
+    LimitTooLarge { field: &'static str, maximum: usize },
+    #[error("invalid qBittorrent URL")]
+    QbittorrentUrl,
     #[error("{0} must specify either a direct value or a file")]
     MissingSecret(String),
     #[error("{0} cannot specify both a direct value and a file")]
@@ -712,6 +822,49 @@ mod tests {
 
         assert_eq!(config.auth.webhook_token.expose(), "webhook");
         assert_eq!(config.auth.admin_token.expose(), "admin");
+    }
+
+    #[test]
+    fn loads_bounded_qbittorrent_settings() {
+        let config = load_config(
+            r#"
+                [auth]
+                webhook_token = "webhook"
+                admin_token = "admin"
+                [qbittorrent]
+                url = "http://qbittorrent:8080"
+                api_key = "qbt_0123456789abcdefghijklmnopqr"
+                sync_interval = "15s"
+                inventory_batch_size = 400
+                database_batch_size = 100
+            "#,
+        )
+        .expect("load qBittorrent settings");
+        let qbittorrent = config.qbittorrent.expect("qBittorrent configured");
+
+        assert_eq!(qbittorrent.url.as_str(), "http://qbittorrent:8080/");
+        assert_eq!(qbittorrent.sync_interval, Duration::from_secs(15));
+        assert_eq!(qbittorrent.inventory_batch_size, 400);
+        assert_eq!(qbittorrent.database_batch_size, 100);
+        assert!(!format!("{qbittorrent:?}").contains(qbittorrent.api_key.expose()));
+    }
+
+    #[test]
+    fn rejects_unbounded_qbittorrent_batches() {
+        let error = load_config(
+            r#"
+                [auth]
+                webhook_token = "webhook"
+                admin_token = "admin"
+                [qbittorrent]
+                url = "http://qbittorrent:8080"
+                api_key = "secret"
+                inventory_batch_size = 501
+            "#,
+        )
+        .expect_err("reject unbounded inventory pages");
+
+        assert!(matches!(error, ConfigError::LimitTooLarge { .. }));
     }
 
     #[test]

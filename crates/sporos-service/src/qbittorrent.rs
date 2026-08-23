@@ -130,6 +130,14 @@ pub struct QbittorrentClient {
 
 impl QbittorrentClient {
     pub fn new(base_url: Url, api_key: ApiKey) -> Result<Self, QbittorrentConfigError> {
+        Self::with_timeout(base_url, api_key, Duration::from_secs(30))
+    }
+
+    pub fn with_timeout(
+        base_url: Url,
+        api_key: ApiKey,
+        timeout: Duration,
+    ) -> Result<Self, QbittorrentConfigError> {
         if !matches!(base_url.scheme(), "http" | "https")
             || base_url.cannot_be_a_base()
             || !base_url.username().is_empty()
@@ -147,7 +155,7 @@ impl QbittorrentClient {
 
         Ok(Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(timeout)
                 .build()
                 .map_err(QbittorrentConfigError::Client)?,
             base_url: normalized,

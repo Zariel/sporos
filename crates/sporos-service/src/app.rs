@@ -250,6 +250,7 @@ mod tests {
             limits: Limits::default(),
             logging: Logging::default(),
             metrics: Metrics::default(),
+            qbittorrent: None,
         };
         let lock_path = config.runtime.lock_path.clone();
         let database_path = config.runtime.database_path.clone();
