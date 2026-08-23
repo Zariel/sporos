@@ -8,6 +8,7 @@ use sporos_model::TaskId;
 
 use crate::storage::Storage;
 use crate::task_projection::ProjectionUpdate;
+use crate::{completion, completion::CompletionInput};
 
 pub const FAKE_TASK_NAME: &str = "Phase1FakeTask";
 pub const FAKE_TASK_VERSION: &str = "1.0.0";
@@ -22,6 +23,7 @@ pub struct FakeTaskInput {
 }
 
 pub fn registries(storage: Arc<Storage>) -> (ActivityRegistry, OrchestrationRegistry) {
+    let completion_storage = Arc::clone(&storage);
     let activities = ActivityRegistry::builder()
         .register(
             PROJECT_TASK_ACTIVITY,
@@ -37,11 +39,43 @@ pub fn registries(storage: Arc<Storage>) -> (ActivityRegistry, OrchestrationRegi
                 }
             },
         )
+        .register(
+            completion::PROJECT_ACTIVITY,
+            move |_context: ActivityContext, input: String| {
+                let storage = Arc::clone(&completion_storage);
+                async move {
+                    let input: CompletionInput = serde_json::from_str(&input)
+                        .map_err(|error| format!("invalid completion projection: {error}"))?;
+                    storage
+                        .project_completion(&input)
+                        .await
+                        .map_err(|error| format!("project completion: {error}"))?;
+                    Ok("{}".to_owned())
+                }
+            },
+        )
         .build();
     let orchestrations = OrchestrationRegistry::builder()
         .register_versioned(FAKE_TASK_NAME, FAKE_TASK_VERSION, fake_task)
+        .register_versioned(
+            completion::ORCHESTRATION_NAME,
+            completion::ORCHESTRATION_VERSION,
+            completion_workflow,
+        )
         .build();
     (activities, orchestrations)
+}
+
+async fn completion_workflow(
+    context: OrchestrationContext,
+    input: String,
+) -> Result<String, String> {
+    let _: CompletionInput = serde_json::from_str(&input)
+        .map_err(|error| format!("invalid completion input: {error}"))?;
+    context
+        .schedule_activity(completion::PROJECT_ACTIVITY, input.clone())
+        .await?;
+    Ok(input)
 }
 
 async fn fake_task(context: OrchestrationContext, input: String) -> Result<String, String> {

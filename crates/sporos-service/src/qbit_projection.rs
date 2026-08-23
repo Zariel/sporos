@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::inventory::{InventoryChange, InventoryDelta, InventoryTorrent};
 use crate::storage::Storage;
+use crate::{completion, completion::CompletionError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InventoryState {
@@ -19,6 +20,8 @@ pub struct InventoryState {
 pub struct CompletionTransition {
     pub source_id: [u8; 16],
     pub completed_at: i64,
+    pub operation_id: [u8; 16],
+    pub task_id: [u8; 16],
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -343,16 +346,22 @@ async fn project_torrent(
     .execute(&mut **transaction)
     .await?;
 
+    let completion = if became_complete {
+        let completed_at = completed_at.expect("complete torrents have completion time");
+        let accepted = completion::accept(transaction, source_id, completed_at, now).await?;
+        (!accepted.duplicate).then_some(CompletionTransition {
+            source_id,
+            completed_at,
+            operation_id: accepted.operation_id,
+            task_id: accepted.task_id,
+        })
+    } else {
+        None
+    };
+
     Ok(TorrentOutcome {
         source_id,
-        completion: if became_complete {
-            Some(CompletionTransition {
-                source_id,
-                completed_at: completed_at.expect("complete torrents have completion time"),
-            })
-        } else {
-            None
-        },
+        completion,
         manifest_needed,
     })
 }
@@ -522,13 +531,21 @@ pub enum ProjectionError {
     InvalidProgress,
     #[error("could not encode qBittorrent tags")]
     Tags(#[source] serde_json::Error),
+    #[error("could not persist qBittorrent completion work")]
+    Completion(#[from] CompletionError),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use duroxide::runtime::Runtime;
+    use duroxide::{Client, OrchestrationStatus};
     use tempfile::TempDir;
 
     use super::*;
+    use crate::engine::registries;
+    use crate::outbox::OutboxDispatcher;
 
     #[tokio::test]
     async fn projects_partial_updates_and_advances_cursor_last() {
@@ -564,6 +581,23 @@ mod tests {
             storage.qbit_inventory_state().await.unwrap().response_id,
             Some(8)
         );
+        let counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT
+                (SELECT count(*) FROM sporos_qbit_completion),
+                (SELECT count(*) FROM sporos_operation),
+                (SELECT count(*) FROM sporos_task),
+                (SELECT count(*) FROM sporos_outbox)",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (1, 1, 1, 1));
+
+        let replay = storage
+            .project_qbit_batch(&[completion()], 1, true, 13)
+            .await
+            .expect("replay completion delta");
+        assert!(replay.completions.is_empty());
     }
 
     #[tokio::test]
@@ -600,6 +634,51 @@ mod tests {
             .await
             .expect_err("reject partial first sighting");
         assert!(matches!(error, ProjectionError::MissingField(_)));
+    }
+
+    #[tokio::test]
+    async fn completion_operation_runs_from_the_transactional_outbox() {
+        let directory = TempDir::new().expect("temporary directory");
+        let storage = Arc::new(open(&directory).await);
+        storage
+            .project_qbit_batch(&[snapshot(false)], 1, false, 10)
+            .await
+            .unwrap();
+        storage.finish_qbit_sync(1, Some(1), 10).await.unwrap();
+        storage
+            .project_qbit_batch(&[completion()], 1, true, 20)
+            .await
+            .unwrap();
+
+        let instance_id =
+            sqlx::query_scalar::<_, String>("SELECT duroxide_instance_id FROM sporos_operation")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        let provider = storage.duroxide_provider();
+        let client = Client::new(provider.clone());
+        let (activities, orchestrations) = registries(Arc::clone(&storage));
+        let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
+        OutboxDispatcher::new(&storage, client.clone(), 1)
+            .run_once(20)
+            .await
+            .expect("dispatch completion operation");
+
+        let status = client
+            .wait_for_orchestration(&instance_id, std::time::Duration::from_secs(5))
+            .await
+            .expect("wait for completion operation");
+        assert!(matches!(status, OrchestrationStatus::Completed { .. }));
+        let states = sqlx::query_as::<_, (String, String)>(
+            "SELECT
+                (SELECT state FROM sporos_operation),
+                (SELECT state FROM sporos_task)",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(states, ("completed".to_owned(), "completed".to_owned()));
+        runtime.shutdown(Some(100)).await;
     }
 
     fn snapshot(complete: bool) -> InventoryChange {
