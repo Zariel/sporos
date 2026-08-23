@@ -295,6 +295,8 @@ pub enum SyncError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Read};
+
     use tempfile::TempDir;
 
     use super::*;
@@ -353,6 +355,46 @@ mod tests {
         assert!(matches!(error, SyncError::InitialUpdateNotFull));
     }
 
+    #[tokio::test]
+    #[ignore = "release-mode Phase 2 memory gate"]
+    async fn target_inventory_stays_within_the_memory_budget() {
+        const TORRENTS: usize = 10_000;
+        const FILES: usize = 60_000;
+        const MAX_PEAK_RSS_KIB: u64 = 512 * 1024;
+
+        let directory = TempDir::new().expect("temporary directory");
+        let storage = open(&directory).await;
+        let started = std::time::Instant::now();
+        let report = apply_main_data(&storage, full_update(1, TORRENTS, true), 200, false, 0, 10)
+            .await
+            .expect("project target inventory");
+        assert_eq!(report.changed, TORRENTS);
+        assert!(report.completions.is_empty());
+        let operations = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sporos_operation")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(operations, 0, "the first bootstrap produced work");
+
+        let mut file_batch = Vec::with_capacity(200);
+        let file_count =
+            crate::inventory::parse_files(SyntheticFiles::new(FILES), u64::MAX, FILES, |file| {
+                file_batch.push(file);
+                if file_batch.len() == 200 {
+                    file_batch.clear();
+                }
+                Ok(())
+            })
+            .expect("parse target file inventory");
+        assert_eq!(file_count, FILES);
+        let peak = peak_rss_kib();
+        eprintln!(
+            "phase2 torrents={TORRENTS} files={FILES} elapsed_ms={} peak_rss_kib={peak}",
+            started.elapsed().as_millis()
+        );
+        assert!(peak <= MAX_PEAK_RSS_KIB, "peak RSS was {peak} KiB");
+    }
+
     fn full_update(response_id: u64, count: usize, complete: bool) -> Vec<u8> {
         let mut torrents = serde_json::Map::new();
         for number in 0..count {
@@ -391,5 +433,62 @@ mod tests {
         )
         .await
         .expect("open storage")
+    }
+
+    struct SyntheticFiles {
+        total: usize,
+        next: usize,
+        current: io::Cursor<Vec<u8>>,
+    }
+
+    impl SyntheticFiles {
+        fn new(total: usize) -> Self {
+            Self {
+                total,
+                next: 0,
+                current: io::Cursor::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Read for SyntheticFiles {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.current.position() == self.current.get_ref().len() as u64 {
+                let bytes = if self.next == 0 {
+                    self.next += 1;
+                    b"[".to_vec()
+                } else if self.next <= self.total {
+                    let index = self.next - 1;
+                    self.next += 1;
+                    let separator = if index == 0 { "" } else { "," };
+                    format!(
+                        "{separator}{{\"index\":{index},\"name\":\"release/file-{index}.mkv\",\"size\":4,\"progress\":1.0}}"
+                    )
+                    .into_bytes()
+                } else if self.next == self.total + 1 {
+                    self.next += 1;
+                    b"]".to_vec()
+                } else {
+                    return Ok(0);
+                };
+                self.current = io::Cursor::new(bytes);
+            }
+            self.current.read(output)
+        }
+    }
+
+    fn peak_rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmHWM:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+            })
+            .unwrap_or(0)
     }
 }
