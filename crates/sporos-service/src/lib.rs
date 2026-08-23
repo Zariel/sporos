@@ -5,6 +5,7 @@ pub mod durable_ingress;
 pub mod inventory;
 pub mod qbittorrent;
 pub mod storage;
+pub mod task_projection;
 pub mod torrent;
 pub mod torznab;
 
