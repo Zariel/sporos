@@ -2215,6 +2215,9 @@ dependencies = [
 [[package]]
 name = "sporos-model"
 version = "0.0.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "sporos-service"
