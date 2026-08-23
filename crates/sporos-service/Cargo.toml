@@ -9,8 +9,15 @@ publish = false
 default-run = "sporos"
 
 [dependencies]
+fs2.workspace = true
+sqlx.workspace = true
 sporos-matcher.workspace = true
 sporos-model.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
