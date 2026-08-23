@@ -226,6 +226,86 @@ async fn recovers_a_durable_timer_after_restart() {
 }
 
 #[tokio::test]
+async fn terminates_an_orchestration_with_corrupted_history() {
+    let directory = TempDir::new().expect("create temporary directory");
+    let storage = open_in(&directory).await;
+    let provider = storage.duroxide_provider();
+    let runtime = Runtime::start_with_store(
+        provider.clone(),
+        activities(Arc::new(AtomicUsize::new(0))),
+        OrchestrationRegistry::builder()
+            .register_versioned(PROBE_NAME, V1, replay_v1)
+            .build(),
+    )
+    .await;
+    let client = Client::new(provider.clone());
+    client
+        .start_orchestration_versioned("poison-probe", PROBE_NAME, V1, "input")
+        .await
+        .expect("start poison probe");
+    wait_for_event(&provider, "poison-probe", "ExternalSubscribed").await;
+
+    runtime.shutdown(Some(50)).await;
+    let updated = duroxide_sqlx::query(
+        "UPDATE history SET event_data = 'not-json' WHERE instance_id = ? AND event_id = (SELECT min(event_id) FROM history WHERE instance_id = ?)",
+    )
+    .bind("poison-probe")
+    .bind("poison-probe")
+    .execute(provider.get_pool())
+    .await
+    .expect("corrupt persisted history");
+    assert_eq!(updated.rows_affected(), 1);
+    client
+        .raise_event("poison-probe", "Continue", "signal")
+        .await
+        .expect("enqueue poisoned orchestration");
+
+    let runtime = Runtime::start_with_options(
+        provider.clone(),
+        activities(Arc::new(AtomicUsize::new(0))),
+        OrchestrationRegistry::builder()
+            .register_versioned(PROBE_NAME, V1, replay_v1)
+            .build(),
+        RuntimeOptions {
+            dispatcher_min_poll_interval: Duration::from_millis(10),
+            max_attempts: 1,
+            ..RuntimeOptions::default()
+        },
+    )
+    .await;
+
+    let output = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let row = duroxide_sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT status, output FROM executions WHERE instance_id = ?",
+            )
+            .bind("poison-probe")
+            .fetch_one(provider.get_pool())
+            .await
+            .expect("inspect poisoned execution");
+            if row.0 == "Failed" {
+                return row.1.expect("failed execution output");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("poisoned orchestration did not terminate");
+    assert!(output.contains("history deserialization failed"));
+
+    let queued = duroxide_sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM orchestrator_queue WHERE instance_id = ?",
+    )
+    .bind("poison-probe")
+    .fetch_one(provider.get_pool())
+    .await
+    .expect("inspect poisoned queue");
+    assert_eq!(queued, 0);
+
+    runtime.shutdown(Some(50)).await;
+}
+
+#[tokio::test]
 async fn crash_probe() {
     let Some(directory) = std::env::var_os(CRASH_PROBE_DIR) else {
         return;
