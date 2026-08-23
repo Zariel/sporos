@@ -11,6 +11,7 @@ use crate::qbittorrent::{QbittorrentClient, QbittorrentError, SupportedVersions}
 use crate::storage::Storage;
 
 const PARSER_CHANNEL_CAPACITY: usize = 32;
+const MAX_FILES_PER_TORRENT: usize = 100_000;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
@@ -106,6 +107,67 @@ impl InventorySynchronizer {
         }
         self.storage.finish_qbit_reconcile(generation, now).await?;
         Ok(report)
+    }
+
+    pub async fn refresh_manifests(&self, limit: usize, now: i64) -> Result<usize, SyncError> {
+        let sources = self.storage.stale_qbit_manifests(limit).await?;
+        for source_id in &sources {
+            self.load_manifest(*source_id, now).await?;
+        }
+        Ok(sources.len())
+    }
+
+    pub async fn load_manifest(&self, source_id: [u8; 16], now: i64) -> Result<usize, SyncError> {
+        let result = self.load_manifest_inner(source_id, now).await;
+        if result.is_err() {
+            self.storage.fail_qbit_manifest(source_id).await?;
+        }
+        result
+    }
+
+    async fn load_manifest_inner(&self, source_id: [u8; 16], now: i64) -> Result<usize, SyncError> {
+        let target = self.storage.prepare_qbit_manifest(source_id).await?;
+        let body = self.client.torrent_files(&target.qbit_id).await?;
+        let (sender, mut receiver) = mpsc::channel(PARSER_CHANNEL_CAPACITY);
+        let parser = tokio::task::spawn_blocking(move || {
+            crate::inventory::parse_files(
+                Cursor::new(body),
+                u64::MAX,
+                MAX_FILES_PER_TORRENT,
+                |file| {
+                    sender
+                        .blocking_send(file)
+                        .map_err(|_| "manifest projection stopped".to_owned())
+                },
+            )
+        });
+        let mut batch = Vec::with_capacity(self.database_batch_size);
+        let mut count = 0_usize;
+        while let Some(file) = receiver.recv().await {
+            if file.index != count {
+                return Err(SyncError::NonContiguousFileIndex {
+                    expected: count,
+                    actual: file.index,
+                });
+            }
+            count += 1;
+            batch.push(file);
+            if batch.len() == self.database_batch_size {
+                self.storage.project_qbit_files(&target, &batch).await?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.storage.project_qbit_files(&target, &batch).await?;
+        }
+        let parsed = parser.await.map_err(SyncError::ParserTask)??;
+        if parsed != count {
+            return Err(SyncError::FileCountChanged);
+        }
+        self.storage
+            .finish_qbit_manifest(&target, count, now)
+            .await?;
+        Ok(count)
     }
 }
 
@@ -216,6 +278,10 @@ pub enum SyncError {
     ZeroBatchSize,
     #[error("qBittorrent parser task failed")]
     ParserTask(#[source] tokio::task::JoinError),
+    #[error("qBittorrent file indexes are not contiguous: expected {expected}, got {actual}")]
+    NonContiguousFileIndex { expected: usize, actual: usize },
+    #[error("qBittorrent file count changed while it was decoded")]
+    FileCountChanged,
 }
 
 #[cfg(test)]

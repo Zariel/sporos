@@ -2,7 +2,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 use thiserror::Error;
 
-use crate::inventory::{InventoryChange, InventoryDelta, InventoryTorrent};
+use crate::inventory::{InventoryChange, InventoryDelta, InventoryFile, InventoryTorrent};
 use crate::storage::Storage;
 use crate::{completion, completion::CompletionError};
 
@@ -29,6 +29,13 @@ pub struct ProjectionBatch {
     pub changed: usize,
     pub completions: Vec<CompletionTransition>,
     pub manifests_needed: Vec<[u8; 16]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestTarget {
+    pub source_id: [u8; 16],
+    pub qbit_id: String,
+    pub version: u64,
 }
 
 impl Storage {
@@ -185,6 +192,147 @@ impl Storage {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn stale_qbit_manifests(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<[u8; 16]>, ProjectionError> {
+        let limit = i64::try_from(limit).map_err(|_| ProjectionError::Range("manifest limit"))?;
+        let rows = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT id FROM sporos_qbit_torrent
+             WHERE available = 1 AND file_manifest_state IN ('stale', 'loading')
+             ORDER BY updated_at, id LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|value| {
+                value
+                    .try_into()
+                    .map_err(|_| ProjectionError::StoredRange("source ID"))
+            })
+            .collect()
+    }
+
+    pub async fn prepare_qbit_manifest(
+        &self,
+        source_id: [u8; 16],
+    ) -> Result<ManifestTarget, ProjectionError> {
+        let mut transaction = self.pool().begin().await?;
+        let row = sqlx::query(
+            "SELECT qbit_id, file_manifest_version FROM sporos_qbit_torrent
+             WHERE id = ? AND available = 1",
+        )
+        .bind(source_id.as_slice())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(ProjectionError::MissingSource)?;
+        let qbit_id = row.try_get("qbit_id")?;
+        let current = required_u64(&row, "file_manifest_version")?;
+        let version = current
+            .checked_add(1)
+            .ok_or(ProjectionError::Range("manifest version"))?;
+        sqlx::query("UPDATE sporos_qbit_torrent SET file_manifest_state = 'loading' WHERE id = ?")
+            .bind(source_id.as_slice())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE sporos_source_file SET available = 0
+             WHERE source_id = ? AND manifest_version = ?",
+        )
+        .bind(source_id.as_slice())
+        .bind(to_i64(version, "manifest version")?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(ManifestTarget {
+            source_id,
+            qbit_id,
+            version,
+        })
+    }
+
+    pub async fn project_qbit_files(
+        &self,
+        target: &ManifestTarget,
+        files: &[InventoryFile],
+    ) -> Result<(), ProjectionError> {
+        let version = to_i64(target.version, "manifest version")?;
+        let mut transaction = self.pool().begin().await?;
+        for file in files {
+            let ordinal =
+                i64::try_from(file.index).map_err(|_| ProjectionError::Range("file ordinal"))?;
+            let size = to_i64(file.size, "file size")?;
+            sqlx::query(
+                "INSERT INTO sporos_source_file (
+                    source_id, manifest_version, relative_path, display_path,
+                    size, file_kind, available, ordinal
+                 ) VALUES (?, ?, ?, ?, ?, 'unknown', 0, ?)
+                 ON CONFLICT(source_id, manifest_version, ordinal) DO UPDATE SET
+                    relative_path = excluded.relative_path,
+                    display_path = excluded.display_path,
+                    size = excluded.size,
+                    file_kind = excluded.file_kind,
+                    available = 0",
+            )
+            .bind(target.source_id.as_slice())
+            .bind(version)
+            .bind(file.name.as_bytes())
+            .bind(&file.name)
+            .bind(size)
+            .bind(ordinal)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn finish_qbit_manifest(
+        &self,
+        target: &ManifestTarget,
+        file_count: usize,
+        now: i64,
+    ) -> Result<(), ProjectionError> {
+        let version = to_i64(target.version, "manifest version")?;
+        let file_count =
+            i64::try_from(file_count).map_err(|_| ProjectionError::Range("manifest file count"))?;
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("UPDATE sporos_source_file SET available = 0 WHERE source_id = ?")
+            .bind(target.source_id.as_slice())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE sporos_source_file SET available = 1
+             WHERE source_id = ? AND manifest_version = ? AND ordinal < ?",
+        )
+        .bind(target.source_id.as_slice())
+        .bind(version)
+        .bind(file_count)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE sporos_qbit_torrent
+             SET file_manifest_version = ?, file_manifest_state = 'loaded',
+                 file_manifest_loaded_at = ? WHERE id = ?",
+        )
+        .bind(version)
+        .bind(now)
+        .bind(target.source_id.as_slice())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn fail_qbit_manifest(&self, source_id: [u8; 16]) -> Result<(), ProjectionError> {
+        sqlx::query("UPDATE sporos_qbit_torrent SET file_manifest_state = 'stale' WHERE id = ?")
+            .bind(source_id.as_slice())
+            .execute(self.pool())
+            .await?;
         Ok(())
     }
 }
@@ -529,6 +677,8 @@ pub enum ProjectionError {
     InvalidHash(&'static str),
     #[error("qBittorrent progress is invalid")]
     InvalidProgress,
+    #[error("qBittorrent source is unavailable")]
+    MissingSource,
     #[error("could not encode qBittorrent tags")]
     Tags(#[source] serde_json::Error),
     #[error("could not persist qBittorrent completion work")]
@@ -679,6 +829,63 @@ mod tests {
         .unwrap();
         assert_eq!(states, ("completed".to_owned(), "completed".to_owned()));
         runtime.shutdown(Some(100)).await;
+    }
+
+    #[tokio::test]
+    async fn publishes_a_manifest_only_after_all_files_are_staged() {
+        let directory = TempDir::new().expect("temporary directory");
+        let storage = open(&directory).await;
+        storage
+            .project_qbit_batch(&[snapshot(false)], 1, false, 10)
+            .await
+            .unwrap();
+        storage.finish_qbit_sync(1, Some(1), 10).await.unwrap();
+        let transition = storage
+            .project_qbit_batch(&[completion()], 1, true, 20)
+            .await
+            .unwrap();
+        let source_id = transition.manifests_needed[0];
+        assert_eq!(storage.stale_qbit_manifests(10).await.unwrap(), [source_id]);
+
+        let target = storage.prepare_qbit_manifest(source_id).await.unwrap();
+        storage
+            .project_qbit_files(
+                &target,
+                &[
+                    InventoryFile {
+                        index: 0,
+                        name: "release/a.mkv".to_owned(),
+                        size: 4,
+                        progress: 1.0,
+                    },
+                    InventoryFile {
+                        index: 1,
+                        name: "release/a.srt".to_owned(),
+                        size: 2,
+                        progress: 1.0,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let before = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM sporos_source_file WHERE available = 1",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(before, 0);
+
+        storage.finish_qbit_manifest(&target, 2, 30).await.unwrap();
+        let projected = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT file_manifest_version, file_manifest_state,
+                    (SELECT count(*) FROM sporos_source_file WHERE available = 1)
+             FROM sporos_qbit_torrent",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(projected, (1, "loaded".to_owned(), 2));
     }
 
     fn snapshot(complete: bool) -> InventoryChange {
