@@ -72,5 +72,6 @@ cargo audit
 
 Phase 0 pins Duroxide 0.1.30. Its SQLite provider is vendored with a small,
 documented patch under `vendor/duroxide`; changes there must be reviewed
-separately from routine dependency updates. A torrent metainfo parser remains
-unselected until the bounded-memory and v1/v2/hybrid experiments are complete.
+separately from routine dependency updates. Torrent metainfo is parsed with the
+exactly pinned Magpie crates and the local bounded-decoder patch documented in
+`docs/decisions/0001-torrent-parser.md`.
