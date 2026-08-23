@@ -3,6 +3,7 @@
 pub mod config;
 pub mod durable_ingress;
 pub mod inventory;
+pub mod outbox;
 pub mod qbittorrent;
 pub mod storage;
 pub mod task_projection;
