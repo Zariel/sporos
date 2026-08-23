@@ -2210,6 +2210,7 @@ name = "sporos-matcher"
 version = "0.0.0"
 dependencies = [
  "sporos-model",
+ "unicode-normalization",
 ]
 
 [[package]]

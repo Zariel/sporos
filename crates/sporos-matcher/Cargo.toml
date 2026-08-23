@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 sporos-model.workspace = true
+unicode-normalization.workspace = true
 
 [lints]
 workspace = true
