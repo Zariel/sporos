@@ -7,6 +7,7 @@ pub mod engine;
 pub mod http;
 pub mod inventory;
 pub mod outbox;
+pub mod qbit_projection;
 pub mod qbittorrent;
 pub mod storage;
 pub mod task_projection;
