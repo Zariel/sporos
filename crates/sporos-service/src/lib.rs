@@ -1,5 +1,6 @@
 //! Service adapters and application composition for Sporos.
 
+pub mod config;
 pub mod durable_ingress;
 pub mod inventory;
 pub mod qbittorrent;
