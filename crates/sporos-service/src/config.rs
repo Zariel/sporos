@@ -48,6 +48,22 @@ pub struct Config {
     pub logging: Logging,
     pub metrics: Metrics,
     pub qbittorrent: Option<Qbittorrent>,
+    pub arr: Vec<ArrInstance>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrKind {
+    Sonarr,
+    Radarr,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArrInstance {
+    pub kind: ArrKind,
+    pub name: String,
+    pub url: Url,
+    pub api_key: Secret,
+    pub request_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -465,9 +481,28 @@ fn load(
         })
         .transpose()?;
     validate_optional_secrets(raw.prowlarr.as_ref(), "prowlarr.api_key")?;
-    for (kind, services) in [("sonarr", &raw.arr.sonarr), ("radarr", &raw.arr.radarr)] {
+    let mut arr = Vec::new();
+    for (kind_name, kind, services) in [
+        ("sonarr", ArrKind::Sonarr, raw.arr.sonarr),
+        ("radarr", ArrKind::Radarr, raw.arr.radarr),
+    ] {
         for (name, service) in services {
-            validate_optional_secrets(service.into(), &format!("arr.{kind}.{name}.api_key"))?;
+            let url = Url::parse(&service.url).map_err(|_| ConfigError::ArrUrl {
+                kind: kind_name,
+                name: name.clone(),
+            })?;
+            let api_key = resolve_secret(
+                &format!("arr.{kind_name}.{name}.api_key"),
+                service.api_key,
+                service.api_key_file,
+            )?;
+            arr.push(ArrInstance {
+                kind,
+                name,
+                url,
+                api_key,
+                request_timeout: service.request_timeout,
+            });
         }
     }
 
@@ -482,6 +517,7 @@ fn load(
         logging: raw.logging,
         metrics: raw.metrics,
         qbittorrent,
+        arr,
     })
 }
 
@@ -695,6 +731,8 @@ pub enum ConfigError {
     LimitTooLarge { field: &'static str, maximum: usize },
     #[error("invalid qBittorrent URL")]
     QbittorrentUrl,
+    #[error("invalid {kind} URL for Arr instance {name}")]
+    ArrUrl { kind: &'static str, name: String },
     #[error("{0} must specify either a direct value or a file")]
     MissingSecret(String),
     #[error("{0} cannot specify both a direct value and a file")]
@@ -865,6 +903,32 @@ mod tests {
         .expect_err("reject unbounded inventory pages");
 
         assert!(matches!(error, ConfigError::LimitTooLarge { .. }));
+    }
+
+    #[test]
+    fn loads_named_optional_arr_instances() {
+        let config = load_config(
+            r#"
+                [auth]
+                webhook_token = "webhook"
+                admin_token = "admin"
+                [arr.sonarr.main]
+                url = "http://sonarr:8989"
+                api_key = "sonarr-secret"
+                request_timeout = "15s"
+                [arr.radarr.movies]
+                url = "http://radarr:7878"
+                api_key = "radarr-secret"
+            "#,
+        )
+        .expect("load Arr instances");
+
+        assert_eq!(config.arr.len(), 2);
+        assert_eq!(config.arr[0].kind, ArrKind::Sonarr);
+        assert_eq!(config.arr[0].name, "main");
+        assert_eq!(config.arr[0].request_timeout, Duration::from_secs(15));
+        assert_eq!(config.arr[1].kind, ArrKind::Radarr);
+        assert!(!format!("{:?}", config.arr).contains("sonarr-secret"));
     }
 
     #[test]

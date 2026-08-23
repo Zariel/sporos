@@ -400,6 +400,7 @@ mod tests {
             logging: Logging::default(),
             metrics: Metrics::default(),
             qbittorrent: None,
+            arr: Vec::new(),
         };
         let lock_path = config.runtime.lock_path.clone();
         let database_path = config.runtime.database_path.clone();

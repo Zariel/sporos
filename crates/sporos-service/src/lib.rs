@@ -1,6 +1,7 @@
 //! Service adapters and application composition for Sporos.
 
 pub mod app;
+pub mod arr;
 pub mod completion;
 pub mod config;
 pub mod durable_ingress;
