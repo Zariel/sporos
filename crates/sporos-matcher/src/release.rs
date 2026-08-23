@@ -101,6 +101,42 @@ pub fn parse_release(value: &str) -> ReleaseDescriptor {
     descriptor
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpisodeKey {
+    Season { season: u16, episode: u16 },
+    Date(Date),
+    Absolute(u32),
+}
+
+pub(crate) fn episode_keys(value: &str) -> Vec<EpisodeKey> {
+    let descriptor = parse_release(value);
+    match descriptor.kind {
+        VideoKind::Episode => {
+            let Some(season) = descriptor.season else {
+                return Vec::new();
+            };
+            let Some(first) = descriptor.episode else {
+                return Vec::new();
+            };
+            let last = descriptor.episode_end.unwrap_or(first);
+            (first..=last)
+                .map(|episode| EpisodeKey::Season { season, episode })
+                .collect()
+        }
+        VideoKind::DateEpisode => descriptor
+            .air_date
+            .map(EpisodeKey::Date)
+            .into_iter()
+            .collect(),
+        VideoKind::AbsoluteEpisode => descriptor
+            .absolute_episode
+            .map(EpisodeKey::Absolute)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn descriptor(kind: VideoKind, title: &str) -> ReleaseDescriptor {
     let mut descriptor = ReleaseDescriptor::unknown(normalize_title(title));
     descriptor.kind = kind;

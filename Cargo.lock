@@ -2209,6 +2209,8 @@ dependencies = [
 name = "sporos-matcher"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "sporos-model",
  "unicode-normalization",
 ]
