@@ -1483,6 +1483,7 @@ pub struct RetryPolicy {
     /// timeout. If timeout fires, returns error immediately (no retry).
     /// Retries only occur for activity errors, not timeouts. None = no timeout.
     pub timeout: Option<std::time::Duration>,
+    error_filter: Option<fn(&str) -> bool>,
 }
 
 impl Default for RetryPolicy {
@@ -1491,6 +1492,7 @@ impl Default for RetryPolicy {
             max_attempts: 3,
             backoff: BackoffStrategy::default(),
             timeout: None,
+            error_filter: None,
         }
     }
 }
@@ -1529,6 +1531,19 @@ impl RetryPolicy {
     pub fn with_backoff(mut self, backoff: BackoffStrategy) -> Self {
         self.backoff = backoff;
         self
+    }
+
+    /// Retry only activity errors accepted by this deterministic filter.
+    ///
+    /// The filter receives the recorded application error text. Returning false
+    /// stops retry processing and returns that error to the orchestration.
+    pub fn with_error_filter(mut self, filter: fn(&str) -> bool) -> Self {
+        self.error_filter = Some(filter);
+        self
+    }
+
+    fn should_retry_error(&self, error: &str) -> bool {
+        self.error_filter.is_none_or(|filter| filter(error))
     }
 
     /// Compute delay for given attempt using the configured backoff strategy.
@@ -3008,7 +3023,7 @@ impl OrchestrationContext {
                 Err(e) => {
                     // Activity failed with error - apply retry policy
                     last_error = e.clone();
-                    if attempt < policy.max_attempts {
+                    if attempt < policy.max_attempts && policy.should_retry_error(&e) {
                         self.trace(
                             "warn",
                             format!(
@@ -3020,6 +3035,8 @@ impl OrchestrationContext {
                         if !delay.is_zero() {
                             self.schedule_timer(delay).await;
                         }
+                    } else if !policy.should_retry_error(&e) {
+                        return Err(e);
                     }
                 }
             }

@@ -1,5 +1,6 @@
 //! Service adapters and application composition for Sporos.
 
+mod activity_failure;
 pub mod app;
 pub mod arr;
 pub mod candidate;

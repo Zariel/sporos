@@ -159,14 +159,16 @@ impl SearchExecutor {
             move |_context: ActivityContext, input: String| {
                 let executor = executor.clone();
                 async move {
-                    let input: SearchInput = serde_json::from_str(&input)
-                        .map_err(|error| format!("invalid search input: {error}"))?;
+                    let input: SearchInput = serde_json::from_str(&input).map_err(|error| {
+                        crate::activity_failure::permanent("invalid_search_input", error)
+                    })?;
                     let outcome = executor
                         .execute(&input, now_ms())
                         .await
-                        .map_err(|error| format!("execute search: {error}"))?;
-                    serde_json::to_string(&outcome)
-                        .map_err(|error| format!("encode search outcome: {error}"))
+                        .map_err(|error| error.activity_failure())?;
+                    serde_json::to_string(&outcome).map_err(|error| {
+                        crate::activity_failure::permanent("encode_search_result", error)
+                    })
                 }
             },
         );
@@ -182,13 +184,15 @@ impl SearchExecutor {
                         Some(limiter) => Some(crate::execution::permit(limiter).await),
                         None => None,
                     };
-                    let input: BackfillInput = serde_json::from_str(&input)
-                        .map_err(|error| format!("invalid backfill input: {error}"))?;
+                    let input: BackfillInput = serde_json::from_str(&input).map_err(|error| {
+                        crate::activity_failure::permanent("invalid_backfill_input", error)
+                    })?;
                     let page = produce_page(&storage, &input, now_ms())
                         .await
-                        .map_err(|error| format!("produce backfill page: {error}"))?;
-                    serde_json::to_string(&page)
-                        .map_err(|error| format!("encode backfill page: {error}"))
+                        .map_err(|error| error.activity_failure())?;
+                    serde_json::to_string(&page).map_err(|error| {
+                        crate::activity_failure::permanent("encode_backfill_result", error)
+                    })
                 }
             },
         )
@@ -1028,6 +1032,43 @@ pub(crate) enum SearchError {
     SourceUnavailable,
     #[error("database contains an invalid identifier")]
     InvalidStoredId,
+}
+
+impl SearchError {
+    pub(crate) fn activity_failure(&self) -> String {
+        match self {
+            Self::Database(_) | Self::DurableIngress(_) | Self::Candidate(_) => {
+                crate::activity_failure::transient("search_storage_unavailable", self)
+            }
+            Self::Prowlarr(error) if retryable_prowlarr(error) => {
+                crate::activity_failure::transient("prowlarr_unavailable", self)
+            }
+            Self::Prowlarr(_) | Self::Json(_) | Self::SourceUnavailable | Self::InvalidStoredId => {
+                crate::activity_failure::permanent("invalid_search_state", self)
+            }
+        }
+    }
+}
+
+fn retryable_prowlarr(error: &ProwlarrError) -> bool {
+    match error {
+        ProwlarrError::Request(_) | ProwlarrError::RateLimited { .. } => true,
+        ProwlarrError::HttpStatus(status) => {
+            status.is_server_error()
+                || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        ProwlarrError::Database(_) => true,
+        ProwlarrError::InvalidApiKey
+        | ProwlarrError::Client(_)
+        | ProwlarrError::ResponseTooLarge(_)
+        | ProwlarrError::Malformed(_, _)
+        | ProwlarrError::MalformedField(_)
+        | ProwlarrError::UnsafeDownloadUrl
+        | ProwlarrError::RedirectRejected
+        | ProwlarrError::Torznab(_)
+        | ProwlarrError::Json(_) => false,
+    }
 }
 
 #[cfg(test)]

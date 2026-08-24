@@ -17,11 +17,13 @@ pub const FAKE_TASK_VERSION: &str = "1.0.0";
 const PROJECT_TASK_ACTIVITY: &str = "ProjectTask";
 
 pub(crate) fn activity_retry_policy() -> RetryPolicy {
-    RetryPolicy::new(5).with_backoff(BackoffStrategy::Exponential {
-        base: Duration::from_secs(1),
-        multiplier: 2.0,
-        max: Duration::from_secs(30),
-    })
+    RetryPolicy::new(5)
+        .with_backoff(BackoffStrategy::Exponential {
+            base: Duration::from_secs(1),
+            multiplier: 2.0,
+            max: Duration::from_secs(30),
+        })
+        .with_error_filter(crate::activity_failure::retryable)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,18 +79,21 @@ pub(crate) fn registries_with_limits(
                 let storage = Arc::clone(&completion_storage);
                 let completion_search = completion_search.clone();
                 async move {
-                    let input: CompletionInput = serde_json::from_str(&input)
-                        .map_err(|error| format!("invalid completion projection: {error}"))?;
+                    let input: CompletionInput = serde_json::from_str(&input).map_err(|error| {
+                        crate::activity_failure::permanent("invalid_completion_input", error)
+                    })?;
                     if let Some(search) = completion_search.as_ref() {
                         search
                             .project_completion(&input)
                             .await
-                            .map_err(|error| format!("produce completion searches: {error}"))?;
+                            .map_err(|error| error.activity_failure())?;
                     } else {
-                        storage
-                            .project_completion(&input)
-                            .await
-                            .map_err(|error| format!("project completion: {error}"))?;
+                        storage.project_completion(&input).await.map_err(|error| {
+                            crate::activity_failure::transient(
+                                "completion_projection_failed",
+                                error,
+                            )
+                        })?;
                     }
                     Ok("{}".to_owned())
                 }
@@ -105,14 +110,16 @@ pub(crate) fn registries_with_limits(
                         None => None,
                     };
                     let input: crate::candidate::CandidateWorkflowInput =
-                        serde_json::from_str(&input)
-                            .map_err(|error| format!("invalid candidate evaluation: {error}"))?;
+                        serde_json::from_str(&input).map_err(|error| {
+                            crate::activity_failure::permanent("invalid_candidate_input", error)
+                        })?;
                     let result = storage
                         .evaluate_candidate(&input, now_ms())
                         .await
-                        .map_err(|error| format!("evaluate candidate: {error}"))?;
-                    serde_json::to_string(&result)
-                        .map_err(|error| format!("encode candidate evaluation: {error}"))
+                        .map_err(|error| error.activity_failure())?;
+                    serde_json::to_string(&result).map_err(|error| {
+                        crate::activity_failure::permanent("encode_candidate_result", error)
+                    })
                 }
             },
         );
@@ -266,8 +273,11 @@ impl From<ProjectionActivity> for ProjectionUpdate {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use duroxide::runtime::Runtime;
-    use duroxide::{Client, OrchestrationStatus};
+    use duroxide::runtime::registry::ActivityRegistry;
+    use duroxide::{ActivityContext, Client, OrchestrationRegistry, OrchestrationStatus};
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -277,6 +287,98 @@ mod tests {
     use sporos_model::{PolicySnapshotId, TaskKey};
 
     const CRASH_PROBE_DIRECTORY: &str = "SPOROS_PHASE1_CRASH_PROBE_DIRECTORY";
+
+    #[tokio::test]
+    async fn retries_only_classified_transient_activity_failures() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = open(&directory).await;
+        let provider = storage.duroxide_provider();
+        let client = Client::new(provider.clone());
+        let transient_attempts = Arc::new(AtomicUsize::new(0));
+        let permanent_attempts = Arc::new(AtomicUsize::new(0));
+        let transient_counter = Arc::clone(&transient_attempts);
+        let permanent_counter = Arc::clone(&permanent_attempts);
+        let activities = ActivityRegistry::builder()
+            .register(
+                "TransientFixture",
+                move |_context: ActivityContext, _input: String| {
+                    let attempts = Arc::clone(&transient_counter);
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                            Err(crate::activity_failure::transient(
+                                "fixture_unavailable",
+                                "retry",
+                            ))
+                        } else {
+                            Ok("complete".to_owned())
+                        }
+                    }
+                },
+            )
+            .register(
+                "PermanentFixture",
+                move |_context: ActivityContext, _input: String| {
+                    let attempts = Arc::clone(&permanent_counter);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err(crate::activity_failure::permanent(
+                            "invalid_fixture",
+                            "stop",
+                        ))
+                    }
+                },
+            )
+            .build();
+        let orchestrations = OrchestrationRegistry::builder()
+            .register_versioned("RetryFixture", "1.0.0", retry_fixture)
+            .build();
+        let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
+        client
+            .start_orchestration_versioned(
+                "retry-transient",
+                "RetryFixture",
+                "1.0.0",
+                "TransientFixture",
+            )
+            .await
+            .unwrap();
+        client
+            .start_orchestration_versioned(
+                "retry-permanent",
+                "RetryFixture",
+                "1.0.0",
+                "PermanentFixture",
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .wait_for_orchestration("retry-transient", Duration::from_secs(5))
+                .await
+                .unwrap(),
+            OrchestrationStatus::Completed { .. }
+        ));
+        assert!(matches!(
+            client
+                .wait_for_orchestration("retry-permanent", Duration::from_secs(5))
+                .await
+                .unwrap(),
+            OrchestrationStatus::Failed { .. }
+        ));
+        assert_eq!(transient_attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(permanent_attempts.load(Ordering::SeqCst), 1);
+        runtime.shutdown(None).await;
+    }
+
+    async fn retry_fixture(
+        context: OrchestrationContext,
+        activity: String,
+    ) -> Result<String, String> {
+        context
+            .schedule_activity_with_retry(activity, "{}", activity_retry_policy())
+            .await
+    }
 
     #[tokio::test]
     async fn persisted_fake_task_survives_process_kill() {

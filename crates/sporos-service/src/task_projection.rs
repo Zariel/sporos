@@ -211,20 +211,25 @@ fn repaired_terminal(status: OrchestrationStatus) -> Option<(String, String, Str
         }
         OrchestrationStatus::Failed { details, .. } => {
             let cancelled = matches!(
-                details,
+                &details,
                 ErrorDetails::Application {
                     kind: AppErrorKind::Cancelled { .. },
                     ..
                 }
             );
+            let classified_reason = match &details {
+                ErrorDetails::Application { message, .. } => {
+                    crate::activity_failure::permanent_reason(message)
+                }
+                _ => None,
+            };
             Some((
                 if cancelled { "cancelled" } else { "failed" }.to_owned(),
                 if cancelled {
-                    "workflow_cancelled"
+                    "workflow_cancelled".to_owned()
                 } else {
-                    "workflow_failed"
-                }
-                .to_owned(),
+                    classified_reason.unwrap_or_else(|| "workflow_failed".to_owned())
+                },
                 serde_json::json!({
                     "source": "duroxide_projection_repair",
                     "category": details.category().to_string(),
@@ -489,6 +494,26 @@ mod tests {
         assert_eq!(row.get::<i64, _>("projection_generation"), 1);
         assert_eq!(row.get::<i64, _>("terminal_at"), 5);
         runtime.shutdown(None).await;
+    }
+
+    #[test]
+    fn repair_preserves_a_classified_permanent_reason() {
+        let status = OrchestrationStatus::Failed {
+            details: ErrorDetails::Application {
+                kind: AppErrorKind::OrchestrationFailed,
+                message: crate::activity_failure::permanent(
+                    "invalid_candidate_state",
+                    "missing manifest",
+                ),
+                retryable: false,
+            },
+            custom_status: None,
+            custom_status_version: 0,
+        };
+
+        let (_, reason, _) = repaired_terminal(status).expect("terminal repair");
+
+        assert_eq!(reason, "invalid_candidate_state");
     }
 
     #[tokio::test]

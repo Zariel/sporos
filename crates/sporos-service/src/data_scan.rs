@@ -50,14 +50,16 @@ impl DataScanExecutor {
         activities.register(ACTIVITY, move |_context: ActivityContext, input: String| {
             let executor = self.clone();
             async move {
-                let input: ScanInput = serde_json::from_str(&input)
-                    .map_err(|error| format!("invalid data scan input: {error}"))?;
+                let input: ScanInput = serde_json::from_str(&input).map_err(|error| {
+                    crate::activity_failure::permanent("invalid_data_scan_input", error)
+                })?;
                 let step = executor
                     .scan_page(&input, now_ms())
                     .await
-                    .map_err(|error| format!("scan data root: {error}"))?;
-                serde_json::to_string(&step)
-                    .map_err(|error| format!("encode data scan step: {error}"))
+                    .map_err(|error| error.activity_failure())?;
+                serde_json::to_string(&step).map_err(|error| {
+                    crate::activity_failure::permanent("encode_data_scan_result", error)
+                })
             }
         })
     }
@@ -950,6 +952,23 @@ pub(crate) enum DataScanError {
     Range,
     #[error("database contains an out-of-range scan value")]
     StoredRange,
+}
+
+impl DataScanError {
+    fn activity_failure(&self) -> String {
+        match self {
+            Self::Database(_)
+            | Self::DurableIngress(_)
+            | Self::Search(_)
+            | Self::Join(_)
+            | Self::Filesystem(_) => {
+                crate::activity_failure::transient("data_scan_dependency_unavailable", self)
+            }
+            Self::Json(_) | Self::Range | Self::StoredRange => {
+                crate::activity_failure::permanent("invalid_data_scan_state", self)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -46,14 +46,16 @@ impl TaskControl {
         activities.register(ACTIVITY, move |_context: ActivityContext, input: String| {
             let control = self.clone();
             async move {
-                let input: CancellationInput = serde_json::from_str(&input)
-                    .map_err(|error| format!("invalid cancellation input: {error}"))?;
+                let input: CancellationInput = serde_json::from_str(&input).map_err(|error| {
+                    crate::activity_failure::permanent("invalid_cancellation_input", error)
+                })?;
                 let done = control
                     .reconcile(&input)
                     .await
-                    .map_err(|error| format!("reconcile cancellation: {error}"))?;
-                serde_json::to_string(&CancellationStep { done })
-                    .map_err(|error| format!("encode cancellation step: {error}"))
+                    .map_err(|error| error.activity_failure())?;
+                serde_json::to_string(&CancellationStep { done }).map_err(|error| {
+                    crate::activity_failure::permanent("encode_cancellation_result", error)
+                })
             }
         })
     }
@@ -392,6 +394,24 @@ pub(crate) enum TaskControlError {
     GenerationRange,
     #[error("cancellation command could not be encoded")]
     EncodeCancellation(#[source] serde_json::Error),
+}
+
+impl TaskControlError {
+    fn activity_failure(&self) -> String {
+        match self {
+            Self::Database(_) | Self::Duroxide(_) => {
+                crate::activity_failure::transient("task_control_dependency_unavailable", self)
+            }
+            Self::TaskNotFound
+            | Self::TaskTerminal
+            | Self::TaskNotRetryable
+            | Self::UnsupportedRetry
+            | Self::GenerationRange
+            | Self::EncodeCancellation(_) => {
+                crate::activity_failure::permanent("invalid_task_control_state", self)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

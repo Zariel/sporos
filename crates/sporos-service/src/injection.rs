@@ -174,16 +174,18 @@ impl InjectionExecutor {
             Some(limiter) => Some(crate::execution::permit(limiter).await),
             None => None,
         };
-        let input: InjectionInput = serde_json::from_str(raw)
-            .map_err(|error| format!("invalid injection activity input: {error}"))?;
+        let input: InjectionInput = serde_json::from_str(raw).map_err(|error| {
+            crate::activity_failure::permanent("invalid_injection_input", error)
+        })?;
         let result = match stage {
             Stage::Prepare => self.prepare(&input).await,
             Stage::Materialize => self.materialize(&input).await,
             Stage::Recheck => self.recheck(&input).await,
             Stage::Observe => self.observe(&input).await,
         }
-        .map_err(|error| error.to_string())?;
-        serde_json::to_string(&result).map_err(|error| format!("encode injection result: {error}"))
+        .map_err(|error| error.activity_failure())?;
+        serde_json::to_string(&result)
+            .map_err(|error| crate::activity_failure::permanent("encode_injection_result", error))
     }
 
     async fn prepare(&self, input: &InjectionInput) -> Result<StepResult, InjectionError> {
@@ -1112,6 +1114,56 @@ enum InjectionError {
     Range(&'static str),
     #[error("stored {0} is outside the supported range")]
     StoredRange(&'static str),
+}
+
+impl InjectionError {
+    fn activity_failure(&self) -> String {
+        match self {
+            Self::Database(_)
+            | Self::MaterializerTask(_)
+            | Self::PieceParserTask(_)
+            | Self::Filesystem(_) => {
+                crate::activity_failure::transient("injection_dependency_unavailable", self)
+            }
+            Self::Qbittorrent(error) if retryable_qbittorrent(error) => {
+                crate::activity_failure::transient("qbittorrent_unavailable", self)
+            }
+            Self::Projection(error) => error.activity_failure(),
+            Self::Qbittorrent(_)
+            | Self::Json(_)
+            | Self::Materialize(_)
+            | Self::Pieces(_)
+            | Self::MissingPlan
+            | Self::MissingManifest
+            | Self::MissingHash
+            | Self::MissingPieceLength
+            | Self::NamespaceOutsideRoot
+            | Self::UnmappedSourceRoot
+            | Self::InvalidSourcePath
+            | Self::TorrentSizeOverflow
+            | Self::PieceCount
+            | Self::InvalidProgress
+            | Self::Range(_)
+            | Self::StoredRange(_) => {
+                crate::activity_failure::permanent("invalid_injection_state", self)
+            }
+        }
+    }
+}
+
+fn retryable_qbittorrent(error: &crate::qbittorrent::QbittorrentError) -> bool {
+    match error {
+        crate::qbittorrent::QbittorrentError::Request(_) => true,
+        crate::qbittorrent::QbittorrentError::HttpStatus(status) => {
+            status.is_server_error()
+                || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        crate::qbittorrent::QbittorrentError::ResponseTooLarge(_)
+        | crate::qbittorrent::QbittorrentError::MalformedResponse { .. }
+        | crate::qbittorrent::QbittorrentError::UnsupportedVersion { .. }
+        | crate::qbittorrent::QbittorrentError::AddRejected => false,
+    }
 }
 
 #[cfg(test)]

@@ -1021,6 +1021,27 @@ pub enum CandidateWorkflowError {
     Template,
 }
 
+impl CandidateWorkflowError {
+    pub(crate) fn activity_failure(&self) -> String {
+        match self {
+            Self::Database(_)
+            | Self::Projection(crate::task_projection::ProjectionError::Database(_)) => {
+                crate::activity_failure::transient("candidate_storage_unavailable", self)
+            }
+            Self::Projection(_)
+            | Self::Json(_)
+            | Self::MissingCandidate
+            | Self::MissingManifest
+            | Self::MissingTask
+            | Self::Range(_)
+            | Self::StoredRange(_)
+            | Self::MatchCollision
+            | Self::PlanCollision
+            | Self::Template => crate::activity_failure::permanent("invalid_candidate_state", self),
+        }
+    }
+}
+
 impl From<crate::template::TemplateError> for CandidateWorkflowError {
     fn from(_: crate::template::TemplateError) -> Self {
         Self::Template
