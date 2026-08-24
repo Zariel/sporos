@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::arr::ArrEnricher;
 use crate::candidate_workflow::SOURCE_COMPLETED_EVENT;
 use crate::config::{Config, LogFormat, Logging};
 use crate::engine::registries;
@@ -90,6 +91,10 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         .map(|settings| ProwlarrClient::new(settings, config.matching.max_torrent_bytes))
         .transpose()
         .map_err(|error| AppError::ProwlarrConfig(error.to_string()))?;
+    let arr = (!config.arr.is_empty())
+        .then(|| ArrEnricher::new(Arc::clone(&storage), &config.arr))
+        .transpose()
+        .map_err(|error| AppError::ArrConfig(error.to_string()))?;
     let provider = storage.duroxide_provider();
     let client = Client::new(provider.clone());
     OutboxDispatcher::new(&storage, client.clone(), config.limits.outbox_batch_size)
@@ -101,7 +106,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         .map_err(AppError::Bind)?;
     let address = listener.local_addr().map_err(AppError::LocalAddress)?;
     let search = prowlarr_api.clone().map(|client| {
-        SearchExecutor::new(
+        let executor = SearchExecutor::new(
             Arc::clone(&storage),
             client,
             SearchPolicy::new(
@@ -110,7 +115,12 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
                 config.injection.clone(),
                 config.paths.clone(),
             ),
-        )
+        );
+        if let Some(arr) = arr.clone() {
+            executor.with_arr(arr)
+        } else {
+            executor
+        }
     });
     let (activities, orchestrations) = registries(Arc::clone(&storage), qbit_api, search);
     let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
@@ -479,6 +489,8 @@ pub enum AppError {
     QbittorrentConfig(#[source] QbittorrentConfigError),
     #[error("invalid Prowlarr client configuration")]
     ProwlarrConfig(String),
+    #[error("invalid Arr client configuration: {0}")]
+    ArrConfig(String),
     #[error("failed to bind the HTTP listener")]
     Bind(#[source] std::io::Error),
     #[error("failed to inspect the HTTP listener")]

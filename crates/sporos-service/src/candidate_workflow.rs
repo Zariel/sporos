@@ -1135,6 +1135,7 @@ mod tests {
                     indexer: Some("fixture".to_owned()),
                     indexer_id: None,
                     trigger: "autobrr".to_owned(),
+                    release_hint: None,
                     category: None,
                     tags: Vec::new(),
                     request_id: "request".to_owned(),

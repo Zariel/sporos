@@ -44,6 +44,7 @@ pub struct CandidateSubmission {
     pub indexer: Option<String>,
     pub indexer_id: Option<i64>,
     pub trigger: String,
+    pub release_hint: Option<sporos_model::ReleaseDescriptor>,
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub request_id: String,
@@ -127,7 +128,22 @@ impl CandidateIngress {
             .as_deref()
             .filter(|name| !name.is_empty())
             .unwrap_or(torrent_name);
-        let release = parse_release(display_name);
+        let mut release = parse_release(display_name);
+        if let Some(hint) = submission.release_hint
+            && (hint.primary_title == release.primary_title
+                || hint.alternate_titles.contains(&release.primary_title))
+        {
+            release.arr_identity = hint.arr_identity;
+            for title in hint
+                .alternate_titles
+                .into_iter()
+                .chain(std::iter::once(hint.primary_title))
+            {
+                if title != release.primary_title && !release.alternate_titles.contains(&title) {
+                    release.alternate_titles.push(title);
+                }
+            }
+        }
         let policy = CandidatePolicy {
             matching: self.matching.policy.clone(),
             source_filters: self.source_filters.clone(),
@@ -440,6 +456,7 @@ mod tests {
             indexer: Some("fixture".to_owned()),
             indexer_id: None,
             trigger: "test".to_owned(),
+            release_hint: None,
             category: None,
             tags: Vec::new(),
             request_id: format!("req-{received_at}"),

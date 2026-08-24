@@ -127,6 +127,7 @@ pub(crate) struct SearchExecutor {
     storage: Arc<Storage>,
     client: ProwlarrClient,
     policy: SearchPolicy,
+    arr: Option<crate::arr::ArrEnricher>,
 }
 
 impl SearchExecutor {
@@ -135,7 +136,13 @@ impl SearchExecutor {
             storage,
             client,
             policy,
+            arr: None,
         }
+    }
+
+    pub(crate) fn with_arr(mut self, arr: crate::arr::ArrEnricher) -> Self {
+        self.arr = Some(arr);
+        self
     }
 
     pub(crate) fn register(self, activities: ActivityRegistryBuilder) -> ActivityRegistryBuilder {
@@ -207,6 +214,11 @@ impl SearchExecutor {
     }
 
     async fn execute(&self, input: &SearchInput, now: i64) -> Result<SearchOutcome, SearchError> {
+        if let Some(arr) = &self.arr {
+            // Enrichment is advisory: filename and file-tree matching remains available
+            // while an Arr instance is down.
+            let _ = arr.enrich_source(input.source_id, now).await;
+        }
         let Some(source) = self.load_source(input).await? else {
             self.finish(input, now, "source_unavailable", true, 0, 0)
                 .await?;
@@ -307,6 +319,7 @@ impl SearchExecutor {
                         indexer: Some(source.indexer_name.clone()),
                         indexer_id: Some(input.indexer_id),
                         trigger: input.trigger.clone(),
+                        release_hint: Some(source.release.clone()),
                         category: None,
                         tags: Vec::new(),
                         request_id: format!("search:{}:{ordinal}", hex(&input.attempt_id)),

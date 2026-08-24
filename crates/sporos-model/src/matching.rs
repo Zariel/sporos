@@ -47,6 +47,12 @@ pub struct ArrIdentity {
     pub kind: ArrKind,
     pub instance: String,
     pub entity_id: i64,
+    #[serde(default)]
+    pub tvdb_id: Option<i64>,
+    #[serde(default)]
+    pub tmdb_id: Option<i64>,
+    #[serde(default)]
+    pub imdb_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

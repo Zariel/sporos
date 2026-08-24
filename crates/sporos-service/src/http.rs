@@ -325,6 +325,7 @@ async fn autobrr_torrent(
                 indexer: request.indexer,
                 indexer_id: None,
                 trigger: "autobrr".to_owned(),
+                release_hint: None,
                 category: request.category,
                 tags: request.tags,
                 request_id: request_id.0.clone(),

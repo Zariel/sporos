@@ -706,12 +706,26 @@ fn load(
             })
         })
         .transpose()?;
+    if raw.arr.sonarr.len().saturating_add(raw.arr.radarr.len()) > 32 {
+        return Err(ConfigError::TooManyArrInstances);
+    }
     let mut arr = Vec::new();
     for (kind_name, kind, services) in [
         ("sonarr", ArrKind::Sonarr, raw.arr.sonarr),
         ("radarr", ArrKind::Radarr, raw.arr.radarr),
     ] {
         for (name, service) in services {
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(ConfigError::ArrName {
+                    kind: kind_name,
+                    name,
+                });
+            }
             let url = Url::parse(&service.url).map_err(|_| ConfigError::ArrUrl {
                 kind: kind_name,
                 name: name.clone(),
@@ -1216,6 +1230,10 @@ pub enum ConfigError {
     EmptyThreshold,
     #[error("invalid {kind} URL for Arr instance {name}")]
     ArrUrl { kind: &'static str, name: String },
+    #[error("too many Arr instances; at most 32 are supported")]
+    TooManyArrInstances,
+    #[error("invalid {kind} instance name {name:?}")]
+    ArrName { kind: &'static str, name: String },
     #[error("{0} must specify either a direct value or a file")]
     MissingSecret(String),
     #[error("{0} cannot specify both a direct value and a file")]

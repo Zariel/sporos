@@ -165,5 +165,8 @@ fn arr_identity(entity_id: i64) -> ArrIdentity {
         kind: ArrKind::Series,
         instance: "fixture".to_owned(),
         entity_id,
+        tvdb_id: None,
+        tmdb_id: None,
+        imdb_id: None,
     }
 }

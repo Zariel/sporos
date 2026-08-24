@@ -324,13 +324,25 @@ impl SearchQuery {
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
-        if !supported.contains("q") {
+        let external = release.arr_identity.as_ref().and_then(|identity| {
+            [
+                ("imdbid", identity.imdb_id.clone()),
+                ("tvdbid", identity.tvdb_id.map(|value| value.to_string())),
+                ("tmdbid", identity.tmdb_id.map(|value| value.to_string())),
+            ]
+            .into_iter()
+            .find(|(name, value)| supported.contains(*name) && value.is_some())
+            .and_then(|(name, value)| value.map(|value| (name.to_owned(), value)))
+        });
+        if external.is_none() && !supported.contains("q") {
             return None;
         }
-        let mut parameters = vec![
-            ("t".to_owned(), kind.to_owned()),
-            ("q".to_owned(), release.primary_title.as_str().to_owned()),
-        ];
+        let mut parameters = vec![("t".to_owned(), kind.to_owned())];
+        if let Some(external) = external {
+            parameters.push(external);
+        } else {
+            parameters.push(("q".to_owned(), release.primary_title.as_str().to_owned()));
+        }
         for (name, value) in [
             ("year", release.year.map(|value| value.to_string())),
             ("season", release.season.map(|value| value.to_string())),
@@ -456,5 +468,34 @@ mod tests {
     fn query_rejects_an_indexer_without_text_search() {
         let release = ReleaseDescriptor::unknown(NormalizedTitle::from_normalized("movie"));
         assert!(SearchQuery::for_release(&release, &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn query_prefers_an_advertised_arr_identifier() {
+        let mut release = ReleaseDescriptor::unknown(NormalizedTitle::from_normalized("show"));
+        release.kind = VideoKind::Episode;
+        release.arr_identity = Some(sporos_model::ArrIdentity {
+            kind: sporos_model::ArrKind::Series,
+            instance: "main".to_owned(),
+            entity_id: 7,
+            tvdb_id: Some(11),
+            tmdb_id: None,
+            imdb_id: None,
+        });
+
+        let query = SearchQuery::for_release(
+            &release,
+            &serde_json::json!({"tvSearchParams": ["q", "tvdbid"]}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            query.parameters,
+            [
+                ("t".to_owned(), "tvsearch".to_owned()),
+                ("tvdbid".to_owned(), "11".to_owned()),
+                ("extended".to_owned(), "1".to_owned()),
+            ]
+        );
     }
 }
