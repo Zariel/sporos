@@ -57,6 +57,9 @@ impl Matcher for PureMatcher {
                 evidence,
             };
         }
+        if input_budget_exceeded(request) {
+            return rejection(MatchReason::MatcherBudgetExceeded, evidence);
+        }
         let mut sources: Vec<_> = request
             .sources
             .iter()
@@ -251,6 +254,11 @@ fn assign_with(
     policy: &MatchingPolicy,
     score: impl Fn(&TorrentFile, &LocalSourceFile, &MatchingPolicy) -> Option<u32>,
 ) -> Result<Assignment, AssignmentError> {
+    if candidates.len() > policy.max_assignment_files
+        || sources.len() > policy.max_assignment_files.saturating_sub(candidates.len())
+    {
+        return Err(AssignmentError::BudgetExceeded);
+    }
     let mut source_buckets: BTreeMap<BucketKey, Vec<usize>> = BTreeMap::new();
     for (index, (_, source)) in sources.iter().enumerate() {
         source_buckets
@@ -279,10 +287,6 @@ fn assign_with(
                 reverse[source_index].push(candidate_index);
             }
         }
-    }
-    let relevant_sources = reverse.iter().filter(|edges| !edges.is_empty()).count();
-    if candidates.len() + relevant_sources > policy.max_assignment_files {
-        return Err(AssignmentError::BudgetExceeded);
     }
     let score_unit = u128::from(
         edges
@@ -374,6 +378,33 @@ fn assign_with(
         pairs,
         ambiguous: false,
     })
+}
+
+fn input_budget_exceeded(request: &MatchRequest<'_>) -> bool {
+    let candidate_files = request
+        .candidate
+        .files
+        .iter()
+        .filter(|file| !file.padding)
+        .count();
+    if candidate_files > request.policy.max_assignment_files {
+        return true;
+    }
+    request
+        .sources
+        .iter()
+        .filter(|source| source.available)
+        .try_fold(candidate_files, |total, source| {
+            total.checked_add(source.files.len()).filter(|total| {
+                source.files.len()
+                    <= request
+                        .policy
+                        .max_assignment_files
+                        .saturating_sub(candidate_files)
+                    && *total <= request.policy.max_assignment_files
+            })
+        })
+        .is_none()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1060,11 +1091,11 @@ mod tests {
     }
 
     #[test]
-    fn identical_sidecars_stop_at_the_edge_budget() {
-        let candidates: Vec<_> = (0..20)
+    fn thousands_of_identical_sidecars_stop_at_the_edge_budget() {
+        let candidates: Vec<_> = (0..2_000)
             .map(|index| candidate(index, &format!("candidate-{index}/same.srt"), 10))
             .collect();
-        let sources: Vec<_> = (0..20)
+        let sources: Vec<_> = (0..2_000)
             .map(|index| source(index, &format!("source-{index}/same.srt"), 10))
             .collect();
         let candidate_refs: Vec<_> = candidates.iter().collect();
@@ -1073,7 +1104,7 @@ mod tests {
             .map(|file| (SourceId::from_bytes([1; 16]), file))
             .collect();
         let policy = MatchingPolicy {
-            max_candidate_edges: 100,
+            max_candidate_edges: 10_000,
             ..MatchingPolicy::default()
         };
 
@@ -1084,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn irrelevant_source_files_do_not_enter_assignment() {
+    fn assignment_file_budget_is_checked_before_bucketing() {
         let candidates: Vec<_> = (0..1_000)
             .map(|index| candidate(index, &format!("candidate-{index}.mkv"), 10))
             .collect();
@@ -1101,8 +1132,10 @@ mod tests {
             ..MatchingPolicy::default()
         };
 
-        let assignment = assign(&candidate_refs, &source_refs, &policy).expect("empty assignment");
-        assert!(assignment.pairs.is_empty());
+        assert!(matches!(
+            assign(&candidate_refs, &source_refs, &policy),
+            Err(AssignmentError::BudgetExceeded)
+        ));
     }
 
     #[test]

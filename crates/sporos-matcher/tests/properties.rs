@@ -103,6 +103,24 @@ fn equal_best_paths_are_rejected() {
     assert_eq!(decision.reason, MatchReason::AmbiguousFileMapping);
 }
 
+#[test]
+fn aggregate_budget_rejects_many_large_similar_sources() {
+    let candidate = manifest(&(1..=20).collect::<Vec<_>>());
+    let release = parse_release("Permutation.Show.S01");
+    let sources: Vec<_> = (1..=64)
+        .map(|seed| source(seed, &vec![1_000; 100], false))
+        .collect();
+    let decision = PureMatcher.evaluate(&MatchRequest {
+        candidate: &candidate,
+        candidate_release: &release,
+        sources: &sources,
+        policy: &MatchingPolicy::default(),
+    });
+
+    assert_eq!(decision.outcome, MatchOutcome::Rejected);
+    assert_eq!(decision.reason, MatchReason::MatcherBudgetExceeded);
+}
+
 fn manifest(sizes: &[u64]) -> TorrentManifest {
     TorrentManifest {
         hashes: InfoHashes::default(),

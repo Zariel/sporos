@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use sporos_matcher::{MatchRequest, Matcher, PureMatcher};
 use sporos_model::{
     ArrKind, CandidateId, InfoHashes, LocalSourceFile, LocalSourceManifest, MatchDecision,
-    MatchOutcome, ReleaseDescriptor, SourceId, SourceKind, TaskId, TorrentManifest,
+    MatchEvidence, MatchOutcome, MatchReason, Ratio, ReleaseDescriptor, SourceId, SourceKind,
+    TaskId, TorrentManifest,
 };
 use sqlx::{QueryBuilder, Row, Sqlite};
 use thiserror::Error;
@@ -97,9 +98,17 @@ impl Storage {
         now: i64,
     ) -> Result<EvaluationResult, CandidateWorkflowError> {
         let loaded = self.load_candidate(input).await?;
-        let sources = self
-            .candidate_sources(&loaded.release, &loaded.policy)
-            .await?;
+        let sources = match self
+            .candidate_sources(&loaded.manifest, &loaded.release, &loaded.policy)
+            .await?
+        {
+            CandidateSources::Loaded(sources) => sources,
+            CandidateSources::BudgetExceeded => {
+                return self
+                    .persist_terminal(input, &loaded, matcher_budget_rejection(&loaded), now)
+                    .await;
+            }
+        };
         let mut waiting = Vec::new();
         let mut available = Vec::new();
         for source in sources {
@@ -190,9 +199,10 @@ impl Storage {
 
     async fn candidate_sources(
         &self,
+        candidate: &TorrentManifest,
         release: &ReleaseDescriptor,
         policy: &CandidatePolicy,
-    ) -> Result<Vec<LoadedSource>, CandidateWorkflowError> {
+    ) -> Result<CandidateSources, CandidateWorkflowError> {
         let include_categories = serde_json::to_string(&policy.source_filters.include_categories)?;
         let exclude_categories = serde_json::to_string(&policy.source_filters.exclude_categories)?;
         let include_tags = serde_json::to_string(&policy.source_filters.include_tags)?;
@@ -201,7 +211,11 @@ impl Storage {
         let external_ids = reduction_external_ids(release);
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT id, v1_hash, v2_hash, release_json, is_complete,
-                    file_manifest_version, file_manifest_state
+                    file_manifest_version, file_manifest_state,
+                    (SELECT count(*) FROM sporos_source_file source_file
+                     WHERE source_file.source_id = sporos_qbit_torrent.id
+                       AND source_file.manifest_version = sporos_qbit_torrent.file_manifest_version
+                       AND source_file.available = 1) AS source_file_count
              FROM sporos_qbit_torrent
              WHERE available = 1 AND ",
         );
@@ -255,14 +269,11 @@ impl Storage {
             let manifest_version = row.try_get::<i64, _>("file_manifest_version")?;
             let state = row.try_get::<String, _>("file_manifest_state")?;
             let manifest_loaded = manifest_version > 0 && state == "loaded";
-            let files = if manifest_loaded {
-                self.source_files(id, manifest_version).await?
-            } else {
-                Vec::new()
-            };
             sources.push(LoadedSource {
                 complete: row.try_get::<i64, _>("is_complete")? == 1,
                 manifest_loaded,
+                manifest_version,
+                file_count: to_usize(row.try_get("source_file_count")?, "source file count")?,
                 manifest: LocalSourceManifest {
                     id,
                     kind: SourceKind::QbittorrentTorrent,
@@ -271,7 +282,7 @@ impl Storage {
                         v1: optional_bytes(row.try_get("v1_hash")?, "v1 hash")?,
                         v2: optional_bytes(row.try_get("v2_hash")?, "v2 hash")?,
                     },
-                    files,
+                    files: Vec::new(),
                     available: true,
                 },
             });
@@ -280,7 +291,11 @@ impl Storage {
             MAX_PLAUSIBLE_SOURCES.saturating_sub(i64::try_from(sources.len()).unwrap_or(i64::MAX));
         if remaining > 0 {
             let mut query = QueryBuilder::<Sqlite>::new(
-                "SELECT id, kind, release_json, last_seen_generation
+                "SELECT id, kind, release_json, last_seen_generation,
+                        (SELECT count(*) FROM sporos_source_file source_file
+                         WHERE source_file.source_id = sporos_data_source.id
+                           AND source_file.manifest_version = sporos_data_source.last_seen_generation
+                           AND source_file.available = 1) AS source_file_count
                  FROM sporos_data_source
                  WHERE available = 1 AND ",
             );
@@ -300,6 +315,8 @@ impl Storage {
                 sources.push(LoadedSource {
                     complete: true,
                     manifest_loaded: true,
+                    manifest_version: generation,
+                    file_count: to_usize(row.try_get("source_file_count")?, "source file count")?,
                     manifest: LocalSourceManifest {
                         id,
                         kind: if row.try_get::<String, _>("kind")? == "file" {
@@ -309,30 +326,78 @@ impl Storage {
                         },
                         release: serde_json::from_str(&row.try_get::<String, _>("release_json")?)?,
                         hashes: InfoHashes::default(),
-                        files: self.source_files(id, generation).await?,
+                        files: Vec::new(),
                         available: true,
                     },
                 });
             }
         }
-        Ok(sources)
+        let candidate_files = candidate.files.iter().filter(|file| !file.padding).count();
+        let mut admitted_files = candidate_files;
+        for source in &sources {
+            if !source.complete
+                || !source.manifest_loaded
+                || same_identity(candidate, &source.manifest)
+            {
+                continue;
+            }
+            if source.file_count
+                > policy
+                    .matching
+                    .max_assignment_files
+                    .saturating_sub(candidate_files)
+            {
+                return Ok(CandidateSources::BudgetExceeded);
+            }
+            let Some(total) = admitted_files.checked_add(source.file_count) else {
+                return Ok(CandidateSources::BudgetExceeded);
+            };
+            if total > policy.matching.max_assignment_files {
+                return Ok(CandidateSources::BudgetExceeded);
+            }
+            admitted_files = total;
+        }
+        for source in &mut sources {
+            if source.complete
+                && source.manifest_loaded
+                && !same_identity(candidate, &source.manifest)
+            {
+                let Some(files) = self
+                    .source_files(
+                        source.manifest.id,
+                        source.manifest_version,
+                        source.file_count,
+                    )
+                    .await?
+                else {
+                    return Ok(CandidateSources::BudgetExceeded);
+                };
+                source.manifest.files = files;
+            }
+        }
+        Ok(CandidateSources::Loaded(sources))
     }
 
     async fn source_files(
         &self,
         source_id: SourceId,
         manifest_version: i64,
-    ) -> Result<Vec<LocalSourceFile>, CandidateWorkflowError> {
+        limit: usize,
+    ) -> Result<Option<Vec<LocalSourceFile>>, CandidateWorkflowError> {
         let rows = sqlx::query(
             "SELECT id, display_path, size, device, inode
              FROM sporos_source_file
              WHERE source_id = ? AND manifest_version = ? AND available = 1
-             ORDER BY ordinal LIMIT 100000",
+             ORDER BY ordinal LIMIT ?",
         )
         .bind(source_id.as_bytes().as_slice())
         .bind(manifest_version)
+        .bind(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX))
         .fetch_all(self.pool())
         .await?;
+        if rows.len() > limit {
+            return Ok(None);
+        }
         rows.into_iter()
             .map(|row| {
                 Ok(LocalSourceFile {
@@ -343,7 +408,8 @@ impl Storage {
                     inode: optional_u64(row.try_get("inode")?, "source inode")?,
                 })
             })
-            .collect()
+            .collect::<Result<_, _>>()
+            .map(Some)
     }
 
     async fn request_manifest(&self, source_id: SourceId) -> Result<(), CandidateWorkflowError> {
@@ -811,7 +877,14 @@ impl LoadedCandidate {
 struct LoadedSource {
     complete: bool,
     manifest_loaded: bool,
+    manifest_version: i64,
+    file_count: usize,
     manifest: LocalSourceManifest,
+}
+
+enum CandidateSources {
+    Loaded(Vec<LoadedSource>),
+    BudgetExceeded,
 }
 
 fn same_identity(candidate: &TorrentManifest, source: &LocalSourceManifest) -> bool {
@@ -824,6 +897,25 @@ fn rejected_source_timeout(decision: &MatchDecision) -> MatchDecision {
     decision.outcome = MatchOutcome::Rejected;
     decision.reason = sporos_model::MatchReason::NoPlausibleSource;
     decision
+}
+
+fn matcher_budget_rejection(loaded: &LoadedCandidate) -> MatchDecision {
+    let files = loaded.manifest.files.iter().filter(|file| !file.padding);
+    MatchDecision {
+        outcome: MatchOutcome::Rejected,
+        mode: None,
+        reason: MatchReason::MatcherBudgetExceeded,
+        source_ids: Vec::new(),
+        mappings: Vec::new(),
+        mapped_bytes: 0,
+        missing_bytes: files.clone().map(|file| file.size).sum(),
+        present_ratio: Ratio::ZERO,
+        requires_recheck: false,
+        evidence: MatchEvidence {
+            candidate_files: files.count(),
+            ..MatchEvidence::default()
+        },
+    }
 }
 
 fn terminal_state(decision: &MatchDecision, dry_run: bool) -> &'static str {
@@ -871,6 +963,10 @@ fn to_u64(value: i64, field: &'static str) -> Result<u64, CandidateWorkflowError
     value
         .try_into()
         .map_err(|_| CandidateWorkflowError::StoredRange(field))
+}
+
+fn to_usize(value: i64, field: &'static str) -> Result<usize, CandidateWorkflowError> {
+    usize::try_from(value).map_err(|_| CandidateWorkflowError::StoredRange(field))
 }
 
 fn to_i64(value: u64, field: &'static str) -> Result<i64, CandidateWorkflowError> {
@@ -1034,6 +1130,50 @@ mod tests {
             EvaluationResult::Terminal { ref state, plan_id: None, .. } if state == "rejected"
         ));
         assert_eq!(count(&storage, "sporos_injection_plan").await, 0);
+    }
+
+    #[tokio::test]
+    async fn source_file_budget_rejects_before_loading_manifests() {
+        let directory = TempDir::new().expect("temporary directory");
+        let storage = open(&directory).await;
+        project_source(&storage, true, 13, 1).await;
+        let input = accept(&storage, directory.path(), 10).await;
+        let mut policy: CandidatePolicy = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT payload_json FROM sporos_policy_snapshot WHERE id = ?",
+            )
+            .bind(input.policy_snapshot_id.as_slice())
+            .fetch_one(storage.pool())
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        policy.matching.max_assignment_files = 1;
+        sqlx::query("UPDATE sporos_policy_snapshot SET payload_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&policy).unwrap())
+            .bind(input.policy_snapshot_id.as_slice())
+            .execute(storage.pool())
+            .await
+            .unwrap();
+        // A decode attempt would reject this negative stored inode.
+        sqlx::query("UPDATE sporos_source_file SET inode = -1")
+            .execute(storage.pool())
+            .await
+            .unwrap();
+
+        let result = storage.evaluate_candidate(&input, 20).await.unwrap();
+
+        assert!(matches!(
+            result,
+            EvaluationResult::Terminal { ref state, plan_id: None, .. } if state == "rejected"
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT reason_code FROM sporos_match")
+                .fetch_one(storage.pool())
+                .await
+                .unwrap(),
+            "matcher_budget_exceeded"
+        );
     }
 
     #[tokio::test]
