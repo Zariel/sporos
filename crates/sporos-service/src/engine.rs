@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use duroxide::runtime::registry::ActivityRegistry;
-use duroxide::{ActivityContext, OrchestrationContext, OrchestrationRegistry};
+use duroxide::{
+    ActivityContext, BackoffStrategy, OrchestrationContext, OrchestrationRegistry, RetryPolicy,
+};
 use serde::{Deserialize, Serialize};
 use sporos_model::TaskId;
 
@@ -13,6 +15,14 @@ use crate::{candidate_workflow, completion, completion::CompletionInput};
 pub const FAKE_TASK_NAME: &str = "Phase1FakeTask";
 pub const FAKE_TASK_VERSION: &str = "1.0.0";
 const PROJECT_TASK_ACTIVITY: &str = "ProjectTask";
+
+pub(crate) fn activity_retry_policy() -> RetryPolicy {
+    RetryPolicy::new(5).with_backoff(BackoffStrategy::Exponential {
+        base: Duration::from_secs(1),
+        multiplier: 2.0,
+        max: Duration::from_secs(30),
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -152,7 +162,11 @@ async fn completion_workflow(
     let _: CompletionInput = serde_json::from_str(&input)
         .map_err(|error| format!("invalid completion input: {error}"))?;
     context
-        .schedule_activity(completion::PROJECT_ACTIVITY, input.clone())
+        .schedule_activity_with_retry(
+            completion::PROJECT_ACTIVITY,
+            input.clone(),
+            activity_retry_policy(),
+        )
         .await?;
     Ok(input)
 }
@@ -172,7 +186,7 @@ async fn project(context: &OrchestrationContext, update: ProjectionActivity) -> 
     let payload =
         serde_json::to_string(&update).map_err(|error| format!("encode projection: {error}"))?;
     let _ = context
-        .schedule_activity(PROJECT_TASK_ACTIVITY, payload)
+        .schedule_activity_with_retry(PROJECT_TASK_ACTIVITY, payload, activity_retry_policy())
         .await?;
     Ok(())
 }

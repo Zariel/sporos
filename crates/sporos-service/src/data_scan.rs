@@ -427,7 +427,13 @@ pub(crate) async fn workflow(
 ) -> Result<String, String> {
     let _: ScanInput = serde_json::from_str(&input)
         .map_err(|error| format!("invalid data scan input: {error}"))?;
-    let output = context.schedule_activity(ACTIVITY, input.clone()).await?;
+    let output = context
+        .schedule_activity_with_retry(
+            ACTIVITY,
+            input.clone(),
+            crate::engine::activity_retry_policy(),
+        )
+        .await?;
     let step: ScanStep = serde_json::from_str(&output)
         .map_err(|error| format!("invalid data scan step: {error}"))?;
     if step.done {

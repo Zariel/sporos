@@ -42,7 +42,11 @@ pub async fn workflow(context: OrchestrationContext, input: String) -> Result<St
         .map_err(|error| format!("invalid candidate workflow input: {error}"))?;
     loop {
         let output = context
-            .schedule_activity(EVALUATE_ACTIVITY, input.clone())
+            .schedule_activity_with_retry(
+                EVALUATE_ACTIVITY,
+                input.clone(),
+                crate::engine::activity_retry_policy(),
+            )
             .await?;
         let result: EvaluationResult = serde_json::from_str(&output)
             .map_err(|error| format!("invalid candidate evaluation result: {error}"))?;

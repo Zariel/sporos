@@ -544,7 +544,11 @@ pub(crate) async fn workflow(
         serde_json::from_str(&input).map_err(|error| format!("invalid search input: {error}"))?;
     loop {
         let output = context
-            .schedule_activity(EXECUTE_ACTIVITY, input.clone())
+            .schedule_activity_with_retry(
+                EXECUTE_ACTIVITY,
+                input.clone(),
+                crate::engine::activity_retry_policy(),
+            )
             .await?;
         match serde_json::from_str::<SearchOutcome>(&output)
             .map_err(|error| format!("invalid search outcome: {error}"))?
@@ -566,10 +570,11 @@ pub(crate) async fn backfill_workflow(
     let mut input: BackfillInput =
         serde_json::from_str(&input).map_err(|error| format!("invalid backfill input: {error}"))?;
     let output = context
-        .schedule_activity(
+        .schedule_activity_with_retry(
             BACKFILL_ACTIVITY,
             serde_json::to_string(&input)
                 .map_err(|error| format!("encode backfill input: {error}"))?,
+            crate::engine::activity_retry_policy(),
         )
         .await?;
     let page: BackfillPage =

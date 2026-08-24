@@ -99,7 +99,11 @@ async fn step(
     input: &str,
 ) -> Result<StepResult, String> {
     let output = context
-        .schedule_activity(activity, input.to_owned())
+        .schedule_activity_with_retry(
+            activity,
+            input.to_owned(),
+            crate::engine::activity_retry_policy(),
+        )
         .await?;
     serde_json::from_str(&output).map_err(|error| format!("invalid {activity} result: {error}"))
 }
