@@ -21,13 +21,14 @@ impl Storage {
         release: &ReleaseDescriptor,
         announced_size: Option<u64>,
         size_tolerance: f64,
+        allow_season_from_episodes: bool,
         filters: &SourceFilters,
     ) -> Result<Option<SourceState>, PreflightError> {
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT is_complete FROM sporos_qbit_torrent WHERE available = 1 AND normalized_title = ",
         );
         query.push_bind(release.primary_title.as_str());
-        push_identity(&mut query, release);
+        push_identity(&mut query, release, allow_season_from_episodes);
         if let Some(size) = announced_size.filter(|size| *size > 0) {
             let delta = ((size as f64) * size_tolerance).ceil() as u64;
             query.push(" AND total_size BETWEEN ");
@@ -40,17 +41,45 @@ impl Storage {
         query.push_bind(MAX_PLAUSIBLE_ROWS);
 
         let rows = query.build().fetch_all(self.pool()).await?;
-        Ok(rows.first().map(|row| {
+        let qbit = rows.first().map(|row| {
             if row.get::<i64, _>("is_complete") == 1 {
                 SourceState::Complete
             } else {
                 SourceState::Downloading
             }
-        }))
+        });
+        if qbit.is_some() {
+            return Ok(qbit);
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT release_json FROM sporos_data_source WHERE available = 1 AND normalized_title = ",
+        );
+        query.push_bind(release.primary_title.as_str());
+        if let Some(size) = announced_size.filter(|size| *size > 0) {
+            let delta = ((size as f64) * size_tolerance).ceil() as u64;
+            query.push(" AND total_size BETWEEN ");
+            query.push_bind(to_i64(size.saturating_sub(delta))?);
+            query.push(" AND ");
+            query.push_bind(to_i64(size.saturating_add(delta))?);
+        }
+        query.push(" ORDER BY id LIMIT ");
+        query.push_bind(MAX_PLAUSIBLE_ROWS);
+        for row in query.build().fetch_all(self.pool()).await? {
+            let source: ReleaseDescriptor = serde_json::from_str(row.get("release_json"))?;
+            if plausible_identity(release, &source, allow_season_from_episodes) {
+                return Ok(Some(SourceState::Complete));
+            }
+        }
+        Ok(None)
     }
 }
 
-fn push_identity(query: &mut QueryBuilder<Sqlite>, release: &ReleaseDescriptor) {
+fn push_identity(
+    query: &mut QueryBuilder<Sqlite>,
+    release: &ReleaseDescriptor,
+    allow_season_from_episodes: bool,
+) {
     match release.kind {
         VideoKind::Movie | VideoKind::Disc => {
             query.push(" AND video_kind IN ('movie', 'disc', 'unknown_video')");
@@ -62,7 +91,11 @@ fn push_identity(query: &mut QueryBuilder<Sqlite>, release: &ReleaseDescriptor) 
             optional_equal(query, "episode", release.episode.map(i64::from));
         }
         VideoKind::SeasonPack => {
-            query.push(" AND video_kind IN ('season_pack', 'unknown_video')");
+            if allow_season_from_episodes {
+                query.push(" AND video_kind IN ('season_pack', 'episode', 'unknown_video')");
+            } else {
+                query.push(" AND video_kind IN ('season_pack', 'unknown_video')");
+            }
             optional_equal(query, "season", release.season.map(i64::from));
         }
         VideoKind::DateEpisode => {
@@ -86,6 +119,29 @@ fn push_identity(query: &mut QueryBuilder<Sqlite>, release: &ReleaseDescriptor) 
         }
         VideoKind::UnknownVideo => {}
     }
+}
+
+fn plausible_identity(
+    candidate: &ReleaseDescriptor,
+    source: &ReleaseDescriptor,
+    allow_season_from_episodes: bool,
+) -> bool {
+    let kind = candidate.kind == VideoKind::UnknownVideo
+        || source.kind == VideoKind::UnknownVideo
+        || candidate.kind == source.kind
+        || (allow_season_from_episodes
+            && candidate.kind == VideoKind::SeasonPack
+            && source.kind == VideoKind::Episode);
+    kind && compatible(candidate.year, source.year)
+        && compatible(candidate.season, source.season)
+        && (candidate.kind == VideoKind::SeasonPack
+            || compatible(candidate.episode, source.episode))
+        && compatible(candidate.absolute_episode, source.absolute_episode)
+        && compatible(candidate.air_date, source.air_date)
+}
+
+fn compatible<T: PartialEq>(left: Option<T>, right: Option<T>) -> bool {
+    left.is_none() || right.is_none() || left == right
 }
 
 fn optional_equal(query: &mut QueryBuilder<Sqlite>, column: &str, value: Option<i64>) {
@@ -151,6 +207,8 @@ fn to_i64(value: u64) -> Result<i64, PreflightError> {
 pub enum PreflightError {
     #[error("preflight inventory query failed")]
     Database(#[from] sqlx::Error),
+    #[error("stored data-source metadata is invalid")]
+    Json(#[from] serde_json::Error),
     #[error("announced size is outside the supported range")]
     SizeRange,
 }
@@ -191,6 +249,7 @@ mod tests {
                     &parse_release("Example.Show.S01E02.1080p"),
                     Some(1_010),
                     0.02,
+                    true,
                     &filters,
                 )
                 .await
@@ -203,6 +262,7 @@ mod tests {
                     &parse_release("Example.Show.S01E03.1080p"),
                     None,
                     0.02,
+                    true,
                     &filters,
                 )
                 .await
@@ -215,6 +275,7 @@ mod tests {
                     &parse_release("Example.Show.S01E04.1080p"),
                     None,
                     0.02,
+                    true,
                     &filters,
                 )
                 .await

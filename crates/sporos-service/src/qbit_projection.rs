@@ -857,7 +857,7 @@ mod tests {
                 .unwrap();
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = registries(Arc::clone(&storage), None, None);
+        let (activities, orchestrations) = registries(Arc::clone(&storage), None, None, None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(20)

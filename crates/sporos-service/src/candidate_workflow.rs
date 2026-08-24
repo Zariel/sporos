@@ -270,6 +270,40 @@ impl Storage {
                 },
             });
         }
+        let remaining =
+            MAX_PLAUSIBLE_SOURCES.saturating_sub(i64::try_from(sources.len()).unwrap_or(i64::MAX));
+        if remaining > 0 {
+            let rows = sqlx::query(
+                "SELECT id, kind, release_json, last_seen_generation
+                 FROM sporos_data_source
+                 WHERE available = 1 AND normalized_title = ?
+                 ORDER BY id LIMIT ?",
+            )
+            .bind(release.primary_title.as_str())
+            .bind(remaining)
+            .fetch_all(self.pool())
+            .await?;
+            for row in rows {
+                let id = SourceId::from_bytes(bytes_16(row.try_get("id")?, "source ID")?);
+                let generation = row.try_get::<i64, _>("last_seen_generation")?;
+                sources.push(LoadedSource {
+                    complete: true,
+                    manifest_loaded: true,
+                    manifest: LocalSourceManifest {
+                        id,
+                        kind: if row.try_get::<String, _>("kind")? == "file" {
+                            SourceKind::DataDirectoryFile
+                        } else {
+                            SourceKind::DataDirectoryRelease
+                        },
+                        release: serde_json::from_str(&row.try_get::<String, _>("release_json")?)?,
+                        hashes: InfoHashes::default(),
+                        files: self.source_files(id, generation).await?,
+                        available: true,
+                    },
+                });
+            }
+        }
         Ok(sources)
     }
 
@@ -643,6 +677,7 @@ async fn source_template_data(
     ids.sort_unstable_by_key(|id| *id.as_bytes());
     let mut category = String::new();
     let mut tags = Vec::new();
+    let mut kind = "data_directory_release";
     for source_id in ids {
         let row = sqlx::query("SELECT category, tags_json FROM sporos_qbit_torrent WHERE id = ?")
             .bind(source_id.as_bytes().as_slice())
@@ -651,6 +686,7 @@ async fn source_template_data(
         let Some(row) = row else {
             continue;
         };
+        kind = "qbittorrent_torrent";
         if category.is_empty() {
             category = row.try_get("category")?;
         }
@@ -661,7 +697,7 @@ async fn source_template_data(
     Ok(SourceTemplateData {
         category,
         tags,
-        kind: "qbittorrent_torrent".to_owned(),
+        kind: kind.to_owned(),
     })
 }
 
@@ -953,7 +989,7 @@ mod tests {
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
         let (activities, orchestrations) =
-            crate::engine::registries(Arc::clone(&storage), None, None);
+            crate::engine::registries(Arc::clone(&storage), None, None, None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(now_ms())
@@ -1049,7 +1085,7 @@ mod tests {
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
         let (activities, orchestrations) =
-            crate::engine::registries(Arc::clone(&storage), None, None);
+            crate::engine::registries(Arc::clone(&storage), None, None, None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(now_ms())

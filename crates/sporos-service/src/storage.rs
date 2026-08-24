@@ -494,7 +494,7 @@ mod tests {
                 .await
                 .expect("read Duroxide migration ledger");
 
-        assert_eq!(domain_version, 11);
+        assert_eq!(domain_version, 12);
         assert_eq!(duroxide_has_domain_version, 0);
     }
 
@@ -521,7 +521,7 @@ mod tests {
         .fetch_one(storage.pool())
         .await
         .expect("count domain tables");
-        assert_eq!(domain_tables, 27);
+        assert_eq!(domain_tables, 29);
     }
 
     #[tokio::test]

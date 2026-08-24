@@ -6,6 +6,7 @@ pub mod candidate;
 pub mod candidate_workflow;
 pub mod completion;
 pub mod config;
+mod data_scan;
 pub mod durable_ingress;
 pub mod engine;
 pub mod hardlink;

@@ -31,7 +31,7 @@ const DEFAULT_RETRY_MS: i64 = 60_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchPolicy {
-    matching: Matching,
+    pub(crate) matching: Matching,
     source_filters: SourceFilters,
     injection: Injection,
     paths: Paths,
@@ -363,29 +363,54 @@ impl SearchExecutor {
     }
 
     async fn load_source(&self, input: &SearchInput) -> Result<Option<SearchSource>, SearchError> {
-        let row = sqlx::query(
-            "SELECT q.release_json, q.total_size, q.category, q.tags_json, i.name
-             FROM sporos_qbit_torrent q JOIN sporos_indexer i ON i.prowlarr_id = ?
-             WHERE q.id = ? AND q.available = 1 AND q.is_complete = 1",
+        let indexer_name = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sporos_indexer WHERE prowlarr_id = ? AND eligible = 1",
         )
         .bind(input.indexer_id)
+        .fetch_optional(self.storage.pool())
+        .await?;
+        let Some(indexer_name) = indexer_name else {
+            return Ok(None);
+        };
+        let policy = self.load_policy(input.policy_snapshot_id).await?;
+        let row = sqlx::query(
+            "SELECT release_json, total_size, category, tags_json
+             FROM sporos_qbit_torrent
+             WHERE id = ? AND available = 1 AND is_complete = 1",
+        )
+        .bind(input.source_id.as_slice())
+        .fetch_optional(self.storage.pool())
+        .await?;
+        if let Some(row) = row {
+            let category = row.try_get::<String, _>("category")?;
+            let tags: Vec<String> = serde_json::from_str(&row.try_get::<String, _>("tags_json")?)?;
+            if !source_allowed(&category, &tags, &policy.source_filters) {
+                return Ok(None);
+            }
+            let Some(release_json) = row.try_get::<Option<String>, _>("release_json")? else {
+                return Ok(None);
+            };
+            return Ok(Some(SearchSource {
+                release: serde_json::from_str(&release_json)?,
+                total_size: u64::try_from(row.try_get::<i64, _>("total_size")?).unwrap_or(u64::MAX),
+                indexer_name,
+            }));
+        }
+        let row = sqlx::query(
+            "SELECT release_json, total_size FROM sporos_data_source
+             WHERE id = ? AND available = 1",
+        )
         .bind(input.source_id.as_slice())
         .fetch_optional(self.storage.pool())
         .await?;
         let Some(row) = row else { return Ok(None) };
-        let policy = self.load_policy(input.policy_snapshot_id).await?;
-        let category = row.try_get::<String, _>("category")?;
-        let tags: Vec<String> = serde_json::from_str(&row.try_get::<String, _>("tags_json")?)?;
-        if !source_allowed(&category, &tags, &policy.source_filters) {
-            return Ok(None);
-        }
         let Some(release_json) = row.try_get::<Option<String>, _>("release_json")? else {
             return Ok(None);
         };
         Ok(Some(SearchSource {
             release: serde_json::from_str(&release_json)?,
             total_size: u64::try_from(row.try_get::<i64, _>("total_size")?).unwrap_or(u64::MAX),
-            indexer_name: row.try_get("name")?,
+            indexer_name,
         }))
     }
 
@@ -782,14 +807,23 @@ pub(crate) async fn accept_in(
     operation_id: Option<[u8; 16]>,
     now: i64,
 ) -> Result<bool, SearchError> {
-    let release_json = sqlx::query_scalar::<_, Option<String>>(
+    let mut release_json = sqlx::query_scalar::<_, Option<String>>(
         "SELECT release_json FROM sporos_qbit_torrent WHERE id = ? AND available = 1 AND is_complete = 1",
     )
     .bind(source_id.as_slice())
     .fetch_optional(&mut **transaction)
     .await?
-    .flatten()
-    .ok_or(SearchError::SourceUnavailable)?;
+    .flatten();
+    if release_json.is_none() {
+        release_json = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT release_json FROM sporos_data_source WHERE id = ? AND available = 1",
+        )
+        .bind(source_id.as_slice())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .flatten();
+    }
+    let release_json = release_json.ok_or(SearchError::SourceUnavailable)?;
     let policy_json = serde_json::to_string(policy)?;
     let policy_hash: [u8; 32] = Sha256::digest(policy_json.as_bytes()).into();
     let policy_id = first16(&policy_hash);

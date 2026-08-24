@@ -20,6 +20,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::arr::ArrEnricher;
 use crate::candidate_workflow::SOURCE_COMPLETED_EVENT;
 use crate::config::{Config, LogFormat, Logging};
+use crate::data_scan::DataScanExecutor;
 use crate::engine::registries;
 use crate::http::{HttpState, router};
 use crate::outbox::OutboxDispatcher;
@@ -122,7 +123,10 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             executor
         }
     });
-    let (activities, orchestrations) = registries(Arc::clone(&storage), qbit_api, search);
+    let data_scan = (!config.data_roots.is_empty())
+        .then(|| DataScanExecutor::new(Arc::clone(&storage), config.data_roots.clone()));
+    let (activities, orchestrations) =
+        registries(Arc::clone(&storage), qbit_api, search, data_scan);
     let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
     let state = HttpState::new(Arc::clone(&storage), &config, prowlarr_api.clone());
     let app: Router = router(state.clone(), config.server.admin_body_limit_bytes)

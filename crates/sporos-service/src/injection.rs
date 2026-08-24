@@ -383,6 +383,7 @@ struct LinkRow {
     candidate_path: String,
     source_root_remote: String,
     source_path: String,
+    source_service: String,
     size: u64,
     device: Option<u64>,
     inode: Option<u64>,
@@ -426,8 +427,14 @@ impl InjectionPlan {
         self.mappings
             .iter()
             .map(|mapping| PlannedLink {
-                source_root: paths
-                    .remote_to_local("qbittorrent", Path::new(&mapping.source_root_remote)),
+                source_root: if mapping.source_service == "data" {
+                    PathBuf::from(&mapping.source_root_remote)
+                } else {
+                    paths.remote_to_local(
+                        &mapping.source_service,
+                        Path::new(&mapping.source_root_remote),
+                    )
+                },
                 source_relative: PathBuf::from(&mapping.source_path),
                 destination_relative: PathBuf::from(&mapping.candidate_path),
                 expected_size: mapping.size,
@@ -493,23 +500,49 @@ impl Storage {
     async fn load_link_rows(&self, plan_id: [u8; 16]) -> Result<Vec<LinkRow>, InjectionError> {
         let rows = sqlx::query(
             "SELECT fm.candidate_ordinal, CAST(fm.candidate_path AS TEXT) AS candidate_path,
-                    qt.save_path, sf.display_path, sf.size, sf.device, sf.inode, sf.id
+                    qt.save_path, sf.display_path, sf.local_path, sf.size, sf.device,
+                    sf.inode, sf.id, qt.id AS qbit_id
              FROM sporos_injection_plan ip
              JOIN sporos_file_mapping fm ON fm.match_id = ip.match_id
              JOIN sporos_source_file sf ON sf.id = fm.source_file_id
-             JOIN sporos_qbit_torrent qt ON qt.id = sf.source_id
-             WHERE ip.id = ? ORDER BY fm.candidate_ordinal LIMIT 100000",
+             LEFT JOIN sporos_qbit_torrent qt ON qt.id = sf.source_id
+             LEFT JOIN sporos_data_source ds ON ds.id = sf.source_id
+             WHERE ip.id = ? AND (qt.id IS NOT NULL OR ds.id IS NOT NULL)
+             ORDER BY fm.candidate_ordinal LIMIT 100000",
         )
         .bind(plan_id.as_slice())
         .fetch_all(self.pool())
         .await?;
         rows.into_iter()
             .map(|row| {
+                let qbit_id: Option<Vec<u8>> = row.try_get("qbit_id")?;
+                let (source_root_remote, source_path, source_service) = if qbit_id.is_some() {
+                    (
+                        row.try_get("save_path")?,
+                        row.try_get("display_path")?,
+                        "qbittorrent".to_owned(),
+                    )
+                } else {
+                    let local_path: String = row
+                        .try_get::<Option<String>, _>("local_path")?
+                        .ok_or(InjectionError::InvalidSourcePath)?;
+                    let path = Path::new(&local_path);
+                    let parent = path
+                        .parent()
+                        .and_then(Path::to_str)
+                        .ok_or(InjectionError::InvalidSourcePath)?;
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or(InjectionError::InvalidSourcePath)?;
+                    (parent.to_owned(), name.to_owned(), "data".to_owned())
+                };
                 Ok(LinkRow {
                     candidate_ordinal: to_u32(row.try_get("candidate_ordinal")?, "ordinal")?,
                     candidate_path: row.try_get("candidate_path")?,
-                    source_root_remote: row.try_get("save_path")?,
-                    source_path: row.try_get("display_path")?,
+                    source_root_remote,
+                    source_path,
+                    source_service,
                     size: to_u64(row.try_get("size")?, "size")?,
                     device: optional_u64(row.try_get("device")?, "device")?,
                     inode: optional_u64(row.try_get("inode")?, "inode")?,
@@ -992,6 +1025,8 @@ enum InjectionError {
     MissingPieceLength,
     #[error("candidate namespace is outside its managed root")]
     NamespaceOutsideRoot,
+    #[error("source file path is invalid")]
+    InvalidSourcePath,
     #[error("candidate torrent size overflowed")]
     TorrentSizeOverflow,
     #[error("qBittorrent piece count does not match the torrent")]
@@ -1012,6 +1047,7 @@ mod tests {
     use std::thread;
 
     use reqwest::Url;
+    use sporos_matcher::parse_release;
     use sporos_model::{InfoHashes, TorrentFile};
     use tempfile::TempDir;
 
@@ -1157,6 +1193,57 @@ mod tests {
         assert_eq!(injection.get::<String, _>("state"), "completed");
     }
 
+    #[tokio::test]
+    async fn data_source_plan_uses_its_catalogued_local_path() {
+        let directory = TempDir::new().unwrap();
+        let source_root = directory.path().join("source");
+        std::fs::create_dir(&source_root).unwrap();
+        let source_file = source_root.join("Example.Movie.2024");
+        std::fs::write(&source_file, b"source-bytes!").unwrap();
+        let storage = Storage::open(
+            directory.path().join("sporos.lock"),
+            directory.path().join("sporos.db"),
+        )
+        .await
+        .unwrap();
+        project_data_source(&storage, &source_file).await;
+        let accepted = accept_candidate(&storage, directory.path(), &source_root).await;
+        let workflow_input: CandidateWorkflowInput = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT input_json FROM sporos_outbox WHERE task_id = ?",
+            )
+            .bind(accepted.task_id.as_bytes().as_slice())
+            .fetch_one(storage.pool())
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let EvaluationResult::Terminal {
+            plan_id: Some(plan_id),
+            ..
+        } = storage
+            .evaluate_candidate(&workflow_input, 20)
+            .await
+            .unwrap()
+        else {
+            panic!("data source did not produce an injection plan");
+        };
+        let plan = storage
+            .load_injection(&InjectionInput {
+                task_id: workflow_input.task_id,
+                candidate_id: workflow_input.candidate_id,
+                policy_snapshot_id: workflow_input.policy_snapshot_id,
+                plan_id,
+            })
+            .await
+            .unwrap();
+        let links = plan.planned_links();
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source_root, source_root);
+        assert_eq!(links[0].source_relative, Path::new("Example.Movie.2024"));
+    }
+
     #[test]
     fn missing_piece_intersecting_a_link_is_never_safe() {
         let manifest = manifest();
@@ -1229,6 +1316,44 @@ mod tests {
             .await
             .unwrap();
         storage.finish_qbit_manifest(&target, 1, 2).await.unwrap();
+    }
+
+    async fn project_data_source(storage: &Storage, source_file: &Path) {
+        let source_id = [9_u8; 16];
+        let metadata = std::fs::metadata(source_file).unwrap();
+        let release = parse_release("Example.Movie.2024");
+        sqlx::query(
+            "INSERT INTO sporos_data_source
+             (id, root_name, relative_path, kind, name, total_size, release_json,
+              normalized_title, device, inode, modified_at, available,
+              last_seen_generation, updated_at)
+             VALUES (?, 'media', ?, 'file', 'Example.Movie.2024', 13, ?, ?, ?, ?, ?, 1, 1, 1)",
+        )
+        .bind(source_id.as_slice())
+        .bind(b"Example.Movie.2024".as_slice())
+        .bind(serde_json::to_string(&release).unwrap())
+        .bind(release.primary_title.as_str())
+        .bind(i64::try_from(metadata.dev()).unwrap())
+        .bind(i64::try_from(metadata.ino()).unwrap())
+        .bind(metadata.mtime())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sporos_source_file
+             (source_id, manifest_version, relative_path, display_path, size,
+              file_kind, local_path, device, inode, modified_at, available, ordinal)
+             VALUES (?, 1, ?, 'Example.Movie.2024', 13, 'video', ?, ?, ?, ?, 1, 0)",
+        )
+        .bind(source_id.as_slice())
+        .bind(b"Example.Movie.2024".as_slice())
+        .bind(source_file.to_str().unwrap())
+        .bind(i64::try_from(metadata.dev()).unwrap())
+        .bind(i64::try_from(metadata.ino()).unwrap())
+        .bind(metadata.mtime())
+        .execute(storage.pool())
+        .await
+        .unwrap();
     }
 
     async fn accept_candidate(

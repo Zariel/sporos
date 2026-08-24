@@ -22,6 +22,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::candidate::{CandidateError, CandidateIngress, CandidateSubmission};
 use crate::config::{Config, Matching, Secret, SourceFilters};
+use crate::data_scan::accept as accept_data_scan;
 use crate::preflight::SourceState;
 use crate::prowlarr::ProwlarrClient;
 use crate::search::{BackfillSelection, SearchPolicy, accept_backfill};
@@ -44,6 +45,7 @@ pub struct HttpState {
     search_policy: SearchPolicy,
     prowlarr_configured: bool,
     prowlarr_client: Option<ProwlarrClient>,
+    data_roots: std::collections::BTreeSet<String>,
     upload_permits: Arc<Semaphore>,
     autobrr_body_limit_bytes: usize,
 }
@@ -80,6 +82,7 @@ impl HttpState {
             ),
             prowlarr_configured: config.prowlarr.is_some(),
             prowlarr_client,
+            data_roots: config.data_roots.keys().cloned().collect(),
             upload_permits: Arc::new(Semaphore::new(config.limits.max_uploads)),
             autobrr_body_limit_bytes: config.server.autobrr_body_limit_bytes,
         }
@@ -113,6 +116,7 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
             get(get_operation),
         )
         .route("/api/v1/admin/searches", post(start_inventory_search))
+        .route("/api/v1/admin/data-scans", post(start_data_scan))
         .route("/api/v1/admin/tasks/{task_id}", get(get_task))
         .route("/api/v1/admin/tasks/{task_id}/events", get(get_task_events))
         .route("/api/v1/admin/inventory", get(get_inventory))
@@ -225,11 +229,13 @@ async fn autobrr_check(
             &release,
             request.size.filter(|size| *size > 0),
             state.matching.preflight_size_tolerance,
+            state.matching.policy.allow_season_from_episodes,
             &state.source_filters,
         )
         .await
         .map_err(|error| match error {
-            crate::preflight::PreflightError::Database(_) => Problem::database(request_id.clone()),
+            crate::preflight::PreflightError::Database(_)
+            | crate::preflight::PreflightError::Json(_) => Problem::database(request_id.clone()),
             crate::preflight::PreflightError::SizeRange => Problem::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_size",
@@ -754,6 +760,94 @@ fn valid_info_hash(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DataScanRequest {
+    root: String,
+    #[serde(default)]
+    indexer_ids: Vec<i64>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataScanResponse {
+    operation_id: String,
+    task_id: String,
+    duplicate: bool,
+    status: &'static str,
+}
+
+async fn start_data_scan(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<DataScanRequest>,
+) -> Result<(StatusCode, Json<DataScanResponse>), Problem> {
+    if !state.data_roots.contains(&request.root) {
+        return Err(Problem::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "data_root_not_configured",
+            "Data root not configured",
+            "root must name a configured data scan root",
+            request_id,
+        ));
+    }
+    if request.indexer_ids.len() > 100 {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_data_scan",
+            "Invalid data scan",
+            "at most 100 Prowlarr indexers may be selected",
+            request_id,
+        ));
+    }
+    for indexer_id in &request.indexer_ids {
+        if sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM sporos_indexer WHERE prowlarr_id = ? AND eligible = 1",
+        )
+        .bind(indexer_id)
+        .fetch_optional(state.storage.pool())
+        .await
+        .map_err(|_| Problem::database(request_id.clone()))?
+        .is_none()
+        {
+            return Err(Problem::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "indexer_ineligible",
+                "Indexer is not eligible",
+                "an explicitly selected Prowlarr indexer is absent or unsafe",
+                request_id,
+            ));
+        }
+    }
+    let accepted = accept_data_scan(
+        &state.storage,
+        &request.root,
+        state.search_policy.clone().with_dry_run(request.dry_run),
+        request.indexer_ids,
+        request.force.then_some(request_id.0.as_str()),
+        now_ms(),
+    )
+    .await
+    .map_err(|_| Problem::database(request_id))?;
+    Ok((
+        if accepted.duplicate {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(DataScanResponse {
+            operation_id: encode_hex(&accepted.operation_id),
+            task_id: encode_hex(&accepted.task_id),
+            duplicate: accepted.duplicate,
+            status: "queued",
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1941,6 +2035,7 @@ mod tests {
             ),
             prowlarr_configured: false,
             prowlarr_client: None,
+            data_roots: Default::default(),
             upload_permits: Arc::new(Semaphore::new(4)),
             autobrr_body_limit_bytes: 12 * 1024 * 1024,
         };
