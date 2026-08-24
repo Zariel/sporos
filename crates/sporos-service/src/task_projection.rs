@@ -127,12 +127,30 @@ impl Storage {
                     duroxide_execution_id, observed_retry_count
              FROM sporos_task
              WHERE terminal_at IS NULL AND duroxide_instance_id IS NOT NULL
-             ORDER BY updated_at, id
+             ORDER BY projection_repair_checked_at IS NOT NULL,
+                      projection_repair_checked_at, updated_at, id
              LIMIT ?",
         )
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(self.pool())
         .await?;
+        if !rows.is_empty() {
+            let mut transaction = self.pool().begin().await?;
+            for row in &rows {
+                let task_id: Vec<u8> = row.try_get("id")?;
+                sqlx::query(
+                    "UPDATE sporos_task SET projection_repair_checked_at = ?
+                     WHERE id = ? AND terminal_at IS NULL",
+                )
+                .bind(occurred_at)
+                .bind(task_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            // Advance the repair cursor before remote inspection so one unavailable
+            // instance cannot permanently hide later terminal workflows.
+            transaction.commit().await?;
+        }
         let mut report = ProjectionRepairReport::default();
         for row in rows {
             report.inspected += 1;
@@ -473,11 +491,96 @@ mod tests {
         runtime.shutdown(None).await;
     }
 
+    #[tokio::test]
+    async fn repair_cursor_reaches_terminal_tasks_after_a_full_running_batch() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = Storage::open(
+            directory.path().join("sporos.lock"),
+            directory.path().join("sporos.db"),
+        )
+        .await
+        .expect("open storage");
+        for index in 1_u8..=33 {
+            accept_fake(&storage, index).await;
+        }
+
+        let provider = storage.duroxide_provider();
+        let client = Client::new(provider.clone());
+        let runtime = Runtime::start_with_store(
+            provider,
+            ActivityRegistry::builder().build(),
+            OrchestrationRegistry::builder()
+                .register_versioned("RunningFixture", "1.0.0", running_fixture)
+                .register_versioned("RepairFixture", "1.0.0", fail_fixture)
+                .build(),
+        )
+        .await;
+        for index in 1_u8..=32 {
+            client
+                .start_orchestration_versioned(
+                    &format!("fake-v1:{index}"),
+                    "RunningFixture",
+                    "1.0.0",
+                    "{}",
+                )
+                .await
+                .expect("start running workflow");
+        }
+        client
+            .start_orchestration_versioned("fake-v1:33", "RepairFixture", "1.0.0", "{}")
+            .await
+            .expect("start failing workflow");
+        assert!(matches!(
+            client
+                .wait_for_orchestration("fake-v1:33", Duration::from_secs(5))
+                .await
+                .expect("wait for failure"),
+            OrchestrationStatus::Failed { .. }
+        ));
+
+        assert_eq!(
+            storage
+                .repair_terminal_task_projections(&client, 32, 100)
+                .await
+                .expect("inspect first repair batch"),
+            ProjectionRepairReport {
+                inspected: 32,
+                repaired: 0,
+            }
+        );
+        assert_eq!(
+            storage
+                .repair_terminal_task_projections(&client, 32, 101)
+                .await
+                .expect("inspect rotated repair batch"),
+            ProjectionRepairReport {
+                inspected: 32,
+                repaired: 1,
+            }
+        );
+        let terminal_at: Option<i64> =
+            sqlx::query_scalar("SELECT terminal_at FROM sporos_task WHERE id = ?")
+                .bind([33_u8; 16].as_slice())
+                .fetch_one(storage.pool())
+                .await
+                .expect("read repaired task");
+        assert_eq!(terminal_at, Some(101));
+        runtime.shutdown(None).await;
+    }
+
     async fn fail_fixture(
         _context: OrchestrationContext,
         _input: String,
     ) -> Result<String, String> {
         Err("fixture failure".to_owned())
+    }
+
+    async fn running_fixture(
+        context: OrchestrationContext,
+        _input: String,
+    ) -> Result<String, String> {
+        context.schedule_timer(Duration::from_secs(60 * 60)).await;
+        Ok("{}".to_owned())
     }
 
     fn update(generation: u64, state: &str, terminal: bool) -> ProjectionUpdate {
@@ -522,6 +625,29 @@ mod tests {
             .await
             .expect("accept task");
         storage
+    }
+
+    async fn accept_fake(storage: &Storage, index: u8) {
+        storage
+            .accept_task(&NewTask {
+                id: TaskId::from_bytes([index; 16]),
+                key: TaskKey::from_bytes([index; 32]),
+                kind: "fake".to_owned(),
+                policy: PolicySnapshot {
+                    id: PolicySnapshotId::from_bytes([1; 16]),
+                    config_hash: [1; 32],
+                    matcher_version: "phase1".to_owned(),
+                    payload_json: "{}".to_owned(),
+                    created_at: 1,
+                },
+                orchestration_name: "FakeTask".to_owned(),
+                orchestration_version: "1".to_owned(),
+                instance_id: format!("fake-v1:{index}"),
+                input_json: "{}".to_owned(),
+                created_at: i64::from(index),
+            })
+            .await
+            .expect("accept fake task");
     }
 
     async fn event_count(storage: &Storage) -> i64 {
