@@ -55,6 +55,7 @@ pub struct Config {
     pub matching: Matching,
     pub injection: Injection,
     pub paths: Paths,
+    pub data_roots: BTreeMap<String, DataRoot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,11 +586,11 @@ struct DataScanConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DataRoot {
-    path: PathBuf,
-    max_depth: usize,
-    max_releases: usize,
-    max_files_per_release: usize,
+pub struct DataRoot {
+    pub path: PathBuf,
+    pub max_depth: usize,
+    pub max_releases: usize,
+    pub max_files_per_release: usize,
 }
 
 impl Config {
@@ -654,6 +655,7 @@ fn load(
         rewrite: raw.paths.rewrite.clone(),
     };
     validate_paths(&paths)?;
+    validate_data_roots(&raw.data_scan.roots)?;
     let webhook_token = resolve_secret(
         "auth.webhook_token",
         raw.auth.webhook_token,
@@ -746,7 +748,31 @@ fn load(
         matching,
         injection,
         paths,
+        data_roots: raw.data_scan.roots,
     })
+}
+
+fn validate_data_roots(roots: &BTreeMap<String, DataRoot>) -> Result<(), ConfigError> {
+    for (name, root) in roots {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(ConfigError::DataRootName(name.clone()));
+        }
+        if !root.path.is_absolute() {
+            return Err(ConfigError::DataRootPath(name.clone()));
+        }
+        if root.max_depth > 16
+            || !(1..=1_000_000).contains(&root.max_releases)
+            || !(1..=100_000).contains(&root.max_files_per_release)
+        {
+            return Err(ConfigError::DataRootLimits(name.clone()));
+        }
+    }
+    Ok(())
 }
 
 fn validate_paths(paths: &Paths) -> Result<(), ConfigError> {
@@ -1168,6 +1194,12 @@ pub enum ConfigError {
     AbsolutePath(&'static str),
     #[error("path rewrites require a name and absolute local and remote prefixes")]
     PathRewrite,
+    #[error("data root name {0:?} is invalid")]
+    DataRootName(String),
+    #[error("data root {0:?} must use an absolute path")]
+    DataRootPath(String),
+    #[error("data root {0:?} has unsafe scan limits")]
+    DataRootLimits(String),
     #[error("path rewrites cannot have equal local prefixes for the same service")]
     AmbiguousPathRewrite,
     #[error("category and tag templates exceed their configured limits")]
@@ -1461,6 +1493,35 @@ mod tests {
         assert_eq!(config.arr[0].request_timeout, Duration::from_secs(15));
         assert_eq!(config.arr[1].kind, ArrKind::Radarr);
         assert!(!format!("{:?}", config.arr).contains("sonarr-secret"));
+    }
+
+    #[test]
+    fn loads_only_named_bounded_data_roots() {
+        let config = load_config(
+            r#"
+                [auth]
+                webhook_token = "webhook"
+                admin_token = "admin"
+                [data_scan.roots.media]
+                path = "/media/library"
+                max_depth = 2
+                max_releases = 1000
+                max_files_per_release = 100
+            "#,
+        )
+        .expect("load data root");
+
+        assert_eq!(config.data_roots["media"].path, Path::new("/media/library"));
+        for invalid in [
+            "[data_scan.roots.'../media']\npath = \"/media\"\nmax_depth = 1\nmax_releases = 1\nmax_files_per_release = 1",
+            "[data_scan.roots.media]\npath = \"relative\"\nmax_depth = 1\nmax_releases = 1\nmax_files_per_release = 1",
+            "[data_scan.roots.media]\npath = \"/media\"\nmax_depth = 17\nmax_releases = 1\nmax_files_per_release = 1",
+        ] {
+            let input = format!(
+                "[auth]\nwebhook_token = \"webhook\"\nadmin_token = \"admin\"\n{invalid}\n"
+            );
+            assert!(load_config(&input).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]

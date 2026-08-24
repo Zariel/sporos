@@ -532,6 +532,7 @@ mod tests {
                 link_root: directory.path().join("links"),
                 rewrite: Vec::new(),
             },
+            data_roots: Default::default(),
         };
         let lock_path = config.runtime.lock_path.clone();
         let database_path = config.runtime.database_path.clone();
