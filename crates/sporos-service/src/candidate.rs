@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use sporos_matcher::parse_release;
 use sporos_model::{
     CandidateId, InfoHashes, MatchingPolicy, PolicySnapshotId, TaskId, TaskKey, TorrentFile,
-    TorrentManifest,
+    TorrentManifest, TorrentPieceFile,
 };
 use sqlx::Row;
 use thiserror::Error;
@@ -120,6 +120,15 @@ impl CandidateIngress {
             },
             files,
             piece_length: Some(parsed.piece_length()),
+            piece_files: parsed
+                .piece_files()
+                .iter()
+                .map(|file| TorrentPieceFile {
+                    file_ordinal: file.file_ordinal(),
+                    offset: file.offset(),
+                    size: file.length(),
+                })
+                .collect(),
         };
         let torrent_name =
             std::str::from_utf8(parsed.name()).map_err(|_| CandidateError::InvalidUtf8Name)?;

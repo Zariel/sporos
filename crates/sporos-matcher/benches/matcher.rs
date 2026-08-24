@@ -18,6 +18,7 @@ fn main() {
             })
             .collect(),
         piece_length: Some(1_048_576),
+        piece_files: Vec::new(),
     };
     let release = parse_release("Benchmark.Show.S01");
     let sources: Vec<_> = (0..8)

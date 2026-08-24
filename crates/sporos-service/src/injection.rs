@@ -872,22 +872,42 @@ fn inspect_pieces(
     if piece_length == 0 {
         return Err(InjectionError::MissingPieceLength);
     }
-    let v2_only = manifest.hashes.v1.is_none() && manifest.hashes.v2.is_some();
-    let mut offset = 0_u64;
     let mut intervals = Vec::new();
-    for file in &manifest.files {
-        if v2_only {
-            offset = offset.div_ceil(piece_length).saturating_mul(piece_length);
+    let total = if manifest.piece_files.is_empty() {
+        // Compatibility with manifests accepted before protocol layout was stored.
+        let v2_only = manifest.hashes.v1.is_none() && manifest.hashes.v2.is_some();
+        let mut offset = 0_u64;
+        for file in &manifest.files {
+            if v2_only {
+                offset = offset.div_ceil(piece_length).saturating_mul(piece_length);
+            }
+            let end = offset
+                .checked_add(file.size)
+                .ok_or(InjectionError::TorrentSizeOverflow)?;
+            if mapped_ordinals.contains(&file.ordinal) && file.size > 0 {
+                intervals.push((offset, end));
+            }
+            offset = end;
         }
-        let end = offset
-            .checked_add(file.size)
-            .ok_or(InjectionError::TorrentSizeOverflow)?;
-        if mapped_ordinals.contains(&file.ordinal) && file.size > 0 {
-            intervals.push((offset, end));
+        offset
+    } else {
+        let mut total = 0_u64;
+        for file in &manifest.piece_files {
+            let end = file
+                .offset
+                .checked_add(file.size)
+                .ok_or(InjectionError::TorrentSizeOverflow)?;
+            if file
+                .file_ordinal
+                .is_some_and(|ordinal| mapped_ordinals.contains(&ordinal))
+                && file.size > 0
+            {
+                intervals.push((file.offset, end));
+            }
+            total = total.max(end);
         }
-        offset = end;
-    }
-    let total = offset;
+        total
+    };
     let expected =
         usize::try_from(total.div_ceil(piece_length)).map_err(|_| InjectionError::PieceCount)?;
     let mut index = 0_usize;
@@ -1064,7 +1084,7 @@ mod tests {
 
     use reqwest::Url;
     use sporos_matcher::parse_release;
-    use sporos_model::{InfoHashes, TorrentFile};
+    use sporos_model::{InfoHashes, TorrentFile, TorrentPieceFile};
     use tempfile::TempDir;
 
     use super::*;
@@ -1318,6 +1338,53 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn hybrid_padding_keeps_piece_intersections_aligned() {
+        let manifest = TorrentManifest {
+            hashes: InfoHashes {
+                v1: Some([1; 20]),
+                v2: Some([2; 32]),
+            },
+            files: vec![
+                TorrentFile {
+                    ordinal: 0,
+                    path: "root/a.bin".into(),
+                    size: 3,
+                    padding: false,
+                },
+                TorrentFile {
+                    ordinal: 1,
+                    path: "root/b.bin".into(),
+                    size: 3,
+                    padding: false,
+                },
+            ],
+            piece_length: Some(4),
+            piece_files: vec![
+                TorrentPieceFile {
+                    file_ordinal: Some(0),
+                    offset: 0,
+                    size: 3,
+                },
+                TorrentPieceFile {
+                    file_ordinal: None,
+                    offset: 3,
+                    size: 1,
+                },
+                TorrentPieceFile {
+                    file_ordinal: Some(1),
+                    offset: 4,
+                    size: 3,
+                },
+            ],
+        };
+
+        let inspection = inspect_pieces(&manifest, &BTreeSet::from([1]), b"[0,2]").unwrap();
+        assert!(inspection.integrity_safe);
+        let inspection = inspect_pieces(&manifest, &BTreeSet::from([1]), b"[2,0]").unwrap();
+        assert!(!inspection.integrity_safe);
+    }
+
     async fn project_source(storage: &Storage) {
         storage
             .project_qbit_batch(
@@ -1546,6 +1613,7 @@ mod tests {
                 },
             ],
             piece_length: Some(4),
+            piece_files: Vec::new(),
         }
     }
 }

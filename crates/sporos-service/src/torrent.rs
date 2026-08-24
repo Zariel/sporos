@@ -45,6 +45,27 @@ pub struct TorrentFile<'a> {
     pieces_root: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieceFile {
+    file_ordinal: Option<u32>,
+    offset: u64,
+    length: u64,
+}
+
+impl PieceFile {
+    pub const fn file_ordinal(self) -> Option<u32> {
+        self.file_ordinal
+    }
+
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+}
+
 impl<'a> TorrentFile<'a> {
     pub fn path(&self) -> &[&'a [u8]] {
         &self.path
@@ -69,6 +90,7 @@ pub struct ParsedTorrent<'a> {
     v2_hash: Option<[u8; 32]>,
     v1_pieces: Option<&'a [u8]>,
     files: Vec<TorrentFile<'a>>,
+    piece_files: Vec<PieceFile>,
 }
 
 impl<'a> ParsedTorrent<'a> {
@@ -103,6 +125,10 @@ impl<'a> ParsedTorrent<'a> {
     pub fn files(&self) -> &[TorrentFile<'a>] {
         &self.files
     }
+
+    pub fn piece_files(&self) -> &[PieceFile] {
+        &self.piece_files
+    }
 }
 
 #[derive(Debug, Error)]
@@ -119,36 +145,56 @@ pub enum TorrentParseError {
     ConflictingPaths,
     #[error("torrent piece hashes do not describe its file lengths")]
     InconsistentPieces,
+    #[error("hybrid torrent v1 and v2 file layouts differ")]
+    InconsistentHybrid,
 }
 
 fn parse_metainfo<'a>(metainfo: MetaInfo<'a>) -> Result<ParsedTorrent<'a>, TorrentParseError> {
     validate_component(metainfo.info.name)?;
 
-    let v1_files = metainfo
+    let v1_view = metainfo
         .info
         .v1
         .as_ref()
         .map(|v1| v1_files(metainfo.info.name, &v1.files))
         .transpose()?;
-    if let (Some(v1), Some(files)) = (&metainfo.info.v1, &v1_files) {
-        let total_length = files.iter().try_fold(0_u64, |total, file| {
-            total
-                .checked_add(file.length)
-                .ok_or(TorrentParseError::InconsistentPieces)
-        })?;
+    if let (Some(v1), Some(view)) = (&metainfo.info.v1, &v1_view) {
+        let total_length = view
+            .piece_files
+            .last()
+            .map_or(0, |file| file.offset.saturating_add(file.length));
         let expected = total_length.div_ceil(metainfo.info.piece_length);
         if usize::try_from(expected).ok() != Some(v1.pieces.len() / 20) {
             return Err(TorrentParseError::InconsistentPieces);
         }
     }
-    let v2_files = metainfo
+    let v2_view = metainfo
         .info
         .v2
         .as_ref()
-        .map(|v2| v2_files(&v2.file_tree))
+        .map(|v2| {
+            v2_files(
+                metainfo.info.name,
+                metainfo.info.piece_length,
+                &v2.file_tree,
+            )
+        })
         .transpose()?;
 
-    let files = v2_files.or(v1_files).expect("metainfo has a v1 or v2 view");
+    if let (Some(v1), Some(v2)) = (&v1_view, &v2_view)
+        && !hybrid_layout_matches(v1, v2)
+    {
+        return Err(TorrentParseError::InconsistentHybrid);
+    }
+    let view = match (v1_view, v2_view) {
+        (Some(v1), Some(v2)) => FileView {
+            files: v2.files,
+            piece_files: v1.piece_files,
+        },
+        (Some(v1), None) => v1,
+        (None, Some(v2)) => v2,
+        (None, None) => unreachable!("metainfo has a v1 or v2 view"),
+    };
     let version = match (&metainfo.info.v1, &metainfo.info.v2) {
         (Some(_), None) => TorrentVersion::V1,
         (None, Some(_)) => TorrentVersion::V2,
@@ -169,41 +215,131 @@ fn parse_metainfo<'a>(metainfo: MetaInfo<'a>) -> Result<ParsedTorrent<'a>, Torre
         v1_hash,
         v2_hash,
         v1_pieces: metainfo.info.v1.map(|v1| v1.pieces),
-        files,
+        files: view.files,
+        piece_files: view.piece_files,
     })
+}
+
+struct FileView<'a> {
+    files: Vec<TorrentFile<'a>>,
+    piece_files: Vec<PieceFile>,
+}
+
+fn hybrid_layout_matches(v1: &FileView<'_>, v2: &FileView<'_>) -> bool {
+    v1.files.len() == v2.files.len()
+        && v1
+            .files
+            .iter()
+            .zip(&v2.files)
+            .all(|(v1, v2)| v1.path == v2.path && v1.length == v2.length)
+        && v1
+            .piece_files
+            .iter()
+            .filter(|file| file.file_ordinal.is_some())
+            .eq(v2.piece_files.iter())
 }
 
 fn v1_files<'a>(
     name: &'a [u8],
     layout: &FileListV1<'a>,
-) -> Result<Vec<TorrentFile<'a>>, TorrentParseError> {
-    let files = match layout {
-        FileListV1::Single { length } => vec![TorrentFile {
-            path: vec![name],
-            length: *length,
-            pieces_root: None,
-        }],
+) -> Result<FileView<'a>, TorrentParseError> {
+    let raw = match layout {
+        FileListV1::Single { length } => vec![(vec![name], *length, false)],
         FileListV1::Multi { files } => files
             .iter()
-            .map(|file| TorrentFile {
-                path: std::iter::once(name)
-                    .chain(file.path.iter().copied())
-                    .collect(),
-                length: file.length,
-                pieces_root: None,
+            .map(|file| {
+                (
+                    std::iter::once(name)
+                        .chain(file.path.iter().copied())
+                        .collect(),
+                    file.length,
+                    file.path
+                        .first()
+                        .is_some_and(|component| *component == b".pad"),
+                )
             })
             .collect(),
     };
-    validate_files(&files)?;
-    Ok(files)
+    let raw_files: Vec<_> = raw
+        .iter()
+        .map(|(path, length, _)| TorrentFile {
+            path: path.clone(),
+            length: *length,
+            pieces_root: None,
+        })
+        .collect();
+    validate_files(&raw_files)?;
+    let mut files = Vec::new();
+    let mut piece_files = Vec::with_capacity(raw.len());
+    let mut offset = 0_u64;
+    for (path, length, padding) in raw {
+        let file_ordinal = if padding {
+            None
+        } else {
+            let ordinal = u32::try_from(files.len())
+                .map_err(|_| TorrentParseError::LimitExceeded("file count"))?;
+            files.push(TorrentFile {
+                path,
+                length,
+                pieces_root: None,
+            });
+            Some(ordinal)
+        };
+        piece_files.push(PieceFile {
+            file_ordinal,
+            offset,
+            length,
+        });
+        offset = offset
+            .checked_add(length)
+            .ok_or(TorrentParseError::InconsistentPieces)?;
+    }
+    Ok(FileView { files, piece_files })
 }
 
-fn v2_files<'a>(tree: &FileTreeNode<'a>) -> Result<Vec<TorrentFile<'a>>, TorrentParseError> {
+fn v2_files<'a>(
+    name: &'a [u8],
+    piece_length: u64,
+    tree: &FileTreeNode<'a>,
+) -> Result<FileView<'a>, TorrentParseError> {
     let mut files = Vec::new();
     let mut path = Vec::new();
     flatten_v2(tree, &mut path, &mut files);
+    let single_file = files.len() == 1 && files[0].path.len() == 1;
+    if !single_file {
+        for file in &mut files {
+            file.path.insert(0, name);
+        }
+    }
     validate_files(&files)?;
-    Ok(files)
+    let mut piece_files = Vec::with_capacity(files.len());
+    let mut end = 0_u64;
+    for (ordinal, file) in files.iter().enumerate() {
+        let offset = align_piece(end, piece_length)?;
+        piece_files.push(PieceFile {
+            file_ordinal: Some(
+                u32::try_from(ordinal)
+                    .map_err(|_| TorrentParseError::LimitExceeded("file count"))?,
+            ),
+            offset,
+            length: file.length,
+        });
+        end = offset
+            .checked_add(file.length)
+            .ok_or(TorrentParseError::InconsistentPieces)?;
+    }
+    Ok(FileView { files, piece_files })
+}
+
+fn align_piece(offset: u64, piece_length: u64) -> Result<u64, TorrentParseError> {
+    let remainder = offset % piece_length;
+    if remainder == 0 {
+        Ok(offset)
+    } else {
+        offset
+            .checked_add(piece_length - remainder)
+            .ok_or(TorrentParseError::InconsistentPieces)
+    }
 }
 
 fn flatten_v2<'a>(
@@ -329,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn prepends_the_qbittorrent_root_for_multifile_v2() {
+        let bytes = format!(
+            "d4:infod9:file treed5:a.bind0:d6:lengthi10000e11:pieces root32:{PIECES_ROOT}ee5:b.bind0:d6:lengthi10000e11:pieces root32:{PIECES_ROOT}eee12:meta versioni2e4:name4:root12:piece lengthi16384eee"
+        );
+        let parsed = TorrentParser.parse(bytes.as_bytes()).expect("parse v2");
+
+        assert_eq!(
+            parsed.files()[0].path(),
+            &[b"root".as_slice(), b"a.bin".as_slice()]
+        );
+        assert_eq!(
+            parsed.files()[1].path(),
+            &[b"root".as_slice(), b"b.bin".as_slice()]
+        );
+        assert_eq!(parsed.piece_files()[0].offset(), 0);
+        assert_eq!(parsed.piece_files()[1].offset(), 16_384);
+    }
+
+    #[test]
     fn parses_hybrid() {
         let bytes = format!(
             "d4:infod9:file treed5:hellod0:d6:lengthi13e11:pieces root32:{PIECES_ROOT}eee6:lengthi13e12:meta versioni2e4:name5:hello12:piece lengthi16384e6:pieces20:{PIECES}ee"
@@ -339,6 +494,40 @@ mod tests {
         assert!(parsed.v1_hash().is_some());
         assert!(parsed.v2_hash().is_some());
         assert_eq!(parsed.v1_pieces(), Some(PIECES.as_bytes()));
+    }
+
+    #[test]
+    fn validates_and_preserves_hybrid_padding_layout() {
+        let bytes = hybrid_multifile("b.bin");
+        let parsed = TorrentParser
+            .parse(bytes.as_bytes())
+            .expect("parse aligned hybrid");
+
+        assert_eq!(parsed.files().len(), 2);
+        assert_eq!(parsed.piece_files().len(), 3);
+        assert_eq!(parsed.piece_files()[0].file_ordinal(), Some(0));
+        assert_eq!(parsed.piece_files()[1].file_ordinal(), None);
+        assert_eq!(parsed.piece_files()[1].offset(), 10_000);
+        assert_eq!(parsed.piece_files()[1].length(), 6_384);
+        assert_eq!(parsed.piece_files()[2].file_ordinal(), Some(1));
+        assert_eq!(parsed.piece_files()[2].offset(), 16_384);
+    }
+
+    #[test]
+    fn rejects_disagreeing_hybrid_views() {
+        let bytes = hybrid_multifile("c.bin");
+        assert!(matches!(
+            TorrentParser.parse(bytes.as_bytes()),
+            Err(TorrentParseError::InconsistentHybrid)
+        ));
+    }
+
+    fn hybrid_multifile(v1_second_path: &str) -> String {
+        format!(
+            "d4:infod9:file treed5:a.bind0:d6:lengthi10000e11:pieces root32:{PIECES_ROOT}ee5:b.bind0:d6:lengthi10000e11:pieces root32:{PIECES_ROOT}eee5:filesld6:lengthi10000e4:pathl5:a.bineed6:lengthi6384e4:pathl4:.pad4:6384eed6:lengthi10000e4:pathl{}:{}eee12:meta versioni2e4:name4:root12:piece lengthi16384e6:pieces40:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaee",
+            v1_second_path.len(),
+            v1_second_path,
+        )
     }
 
     #[test]

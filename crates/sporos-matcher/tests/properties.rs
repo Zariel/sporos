@@ -117,6 +117,7 @@ fn manifest(sizes: &[u64]) -> TorrentManifest {
             })
             .collect(),
         piece_length: Some(1_048_576),
+        piece_files: Vec::new(),
     }
 }
 

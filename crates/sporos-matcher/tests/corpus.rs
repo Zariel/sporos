@@ -140,6 +140,7 @@ fn manifest(files: &[FileFixture], hash: Option<u8>, hash_v2: Option<u8>) -> Tor
             })
             .collect(),
         piece_length: Some(1_048_576),
+        piece_files: Vec::new(),
     }
 }
 

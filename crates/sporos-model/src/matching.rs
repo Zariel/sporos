@@ -117,10 +117,19 @@ pub struct TorrentFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentPieceFile {
+    pub file_ordinal: Option<u32>,
+    pub offset: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TorrentManifest {
     pub hashes: InfoHashes,
     pub files: Vec<TorrentFile>,
     pub piece_length: Option<u64>,
+    #[serde(default)]
+    pub piece_files: Vec<TorrentPieceFile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
