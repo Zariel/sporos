@@ -4,21 +4,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{MatchedPath, Path, Query, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 
+use crate::candidate::{CandidateError, CandidateIngress, CandidateSubmission};
 use crate::config::{Config, Matching, Secret, SourceFilters};
 use crate::preflight::SourceState;
 use crate::storage::Storage;
@@ -36,6 +38,9 @@ pub struct HttpState {
     inventory_stale_after: Option<Duration>,
     source_filters: SourceFilters,
     matching: Matching,
+    candidate_ingress: Arc<CandidateIngress>,
+    upload_permits: Arc<Semaphore>,
+    autobrr_body_limit_bytes: usize,
 }
 
 impl HttpState {
@@ -69,13 +74,20 @@ impl HttpState {
 }
 
 pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
-    let autobrr = Router::new()
+    let check = Router::new()
         .route("/api/v1/autobrr/check", post(autobrr_check))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_webhook,
         ))
         .layer(RequestBodyLimitLayer::new(64 * 1024));
+    let uploads = Router::new()
+        .route("/api/v1/autobrr/torrents", post(autobrr_torrent))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_webhook,
+        ))
+        .layer(RequestBodyLimitLayer::new(state.autobrr_body_limit_bytes));
     let admin = Router::new()
         .route("/api/v1/admin/tasks", get(list_tasks))
         .route("/api/v1/admin/tasks/{task_id}", get(get_task))
@@ -96,7 +108,8 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .merge(autobrr)
+        .merge(check)
+        .merge(uploads)
         .merge(admin)
         .fallback(not_found)
         .layer(
@@ -218,6 +231,176 @@ async fn autobrr_check(
         reason: "plausible_source",
         request_id: request_id.0,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutobrrTorrentRequest {
+    torrent_data: String,
+    torrent_name: Option<String>,
+    indexer: Option<String>,
+    category: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutobrrTorrentResponse {
+    candidate_id: String,
+    task_id: String,
+    duplicate: bool,
+    status: &'static str,
+    request_id: String,
+}
+
+async fn autobrr_torrent(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<AutobrrTorrentRequest>,
+) -> Result<(StatusCode, Json<AutobrrTorrentResponse>), Problem> {
+    validate_upload_metadata(&request, request_id.clone())?;
+    let _permit = Arc::clone(&state.upload_permits)
+        .try_acquire_owned()
+        .map_err(|_| {
+            Problem::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "upload_capacity_reached",
+                "Upload capacity reached",
+                "the bounded upload admission pool is full",
+                request_id.clone(),
+            )
+            .with_retry_after("1")
+        })?;
+    let bytes = STANDARD.decode(&request.torrent_data).map_err(|_| {
+        Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_torrent_data",
+            "Invalid torrent data",
+            "torrentData must be canonical base64",
+            request_id.clone(),
+        )
+    })?;
+    if STANDARD.encode(&bytes) != request.torrent_data {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_torrent_data",
+            "Invalid torrent data",
+            "torrentData must be canonical base64",
+            request_id,
+        ));
+    }
+    let accepted = state
+        .candidate_ingress
+        .accept(
+            &state.storage,
+            CandidateSubmission {
+                bytes,
+                announcement_name: request.torrent_name,
+                indexer: request.indexer,
+                category: request.category,
+                tags: request.tags,
+                request_id: request_id.0.clone(),
+                dry_run: request.dry_run,
+                received_at: now_ms(),
+            },
+        )
+        .await
+        .map_err(|error| candidate_problem(error, request_id.clone()))?;
+    Ok((
+        if accepted.duplicate {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(AutobrrTorrentResponse {
+            candidate_id: format!("cand_{}", encode_hex(accepted.candidate_id.as_bytes())),
+            task_id: format!("task_{}", encode_hex(accepted.task_id.as_bytes())),
+            duplicate: accepted.duplicate,
+            status: "queued",
+            request_id: request_id.0,
+        }),
+    ))
+}
+
+fn validate_upload_metadata(
+    request: &AutobrrTorrentRequest,
+    request_id: RequestId,
+) -> Result<(), Problem> {
+    let valid_optional = |value: &Option<String>, maximum: usize| {
+        value
+            .as_ref()
+            .is_none_or(|value| !value.is_empty() && value.len() <= maximum)
+    };
+    if request.torrent_data.is_empty() {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_torrent_data",
+            "Invalid torrent data",
+            "torrentData cannot be empty",
+            request_id,
+        ));
+    }
+    if !valid_optional(&request.torrent_name, 1024)
+        || !valid_optional(&request.indexer, 128)
+        || !valid_optional(&request.category, 128)
+        || request.tags.len() > 64
+        || request
+            .tags
+            .iter()
+            .any(|tag| tag.is_empty() || tag.len() > 128)
+    {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_candidate_metadata",
+            "Invalid candidate metadata",
+            "candidate metadata exceeds its configured field limits",
+            request_id,
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_problem(error: CandidateError, request_id: RequestId) -> Problem {
+    match error {
+        CandidateError::TorrentTooLarge => Problem::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "torrent_too_large",
+            "Torrent too large",
+            "decoded torrent data exceeds the configured byte limit",
+            request_id,
+        ),
+        CandidateError::TooManyFiles
+        | CandidateError::PathTooLong
+        | CandidateError::InvalidUtf8Name
+        | CandidateError::InvalidUtf8Path
+        | CandidateError::Torrent(_) => Problem::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_torrent",
+            "Invalid torrent",
+            "the torrent cannot pass structural validation",
+            request_id,
+        ),
+        CandidateError::Database(_) | CandidateError::DurableIngress(_) => Problem::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "storage_unavailable",
+            "Storage unavailable",
+            "the candidate could not be committed durably",
+            request_id,
+        ),
+        CandidateError::Json(_)
+        | CandidateError::BlobCollision
+        | CandidateError::CandidateCollision
+        | CandidateError::CandidateTaskCollision => Problem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "candidate_ingress_failed",
+            "Candidate ingress failed",
+            "the candidate identity could not be established safely",
+            request_id,
+        ),
+    }
 }
 
 async fn livez() -> StatusCode {
@@ -898,6 +1081,8 @@ pub struct Problem {
     code: &'static str,
     detail: &'static str,
     request_id: String,
+    #[serde(skip)]
+    retry_after: Option<&'static str>,
 }
 
 impl Problem {
@@ -916,7 +1101,13 @@ impl Problem {
             code,
             detail,
             request_id: request_id.0,
+            retry_after: None,
         }
+    }
+
+    fn with_retry_after(mut self, value: &'static str) -> Self {
+        self.retry_after = Some(value);
+        self
     }
 
     fn database(request_id: RequestId) -> Self {
@@ -933,7 +1124,14 @@ impl Problem {
 impl IntoResponse for Problem {
     fn into_response(self) -> Response {
         let status = self.status_code;
-        (status, Json(self)).into_response()
+        let retry_after = self.retry_after;
+        let mut response = (status, Json(self)).into_response();
+        if let Some(value) = retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static(value));
+        }
+        response
     }
 }
 
@@ -1192,6 +1390,92 @@ mod tests {
         .await;
         assert_eq!(rejected.0, 404);
         assert_eq!(rejected.1["code"], "no_match");
+    }
+
+    #[tokio::test]
+    async fn autobrr_upload_commits_before_acknowledgement_and_deduplicates() {
+        let (_directory, state) = test_state().await;
+        let app = test_router(state.clone());
+        let torrent = format!(
+            "d4:infod6:lengthi13e4:name18:Example.Movie.202412:piece lengthi16384e6:pieces20:{}ee",
+            "a".repeat(20)
+        );
+        let body = serde_json::json!({
+            "torrentData": STANDARD.encode(torrent.as_bytes()),
+            "torrentName": "Example.Movie.2024.1080p",
+            "indexer": "tracker",
+            "dryRun": true
+        })
+        .to_string();
+
+        let first = request(&app, "/api/v1/autobrr/torrents", Some("webhook"), &body).await;
+        let second = request(&app, "/api/v1/autobrr/torrents", Some("webhook"), &body).await;
+
+        assert_eq!(first.0, 202);
+        assert_eq!(second.0, 200);
+        assert_eq!(first.1["candidateId"], second.1["candidateId"]);
+        assert_eq!(first.1["taskId"], second.1["taskId"]);
+        assert_eq!(second.1["duplicate"], true);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sporos_blob")
+                .fetch_one(state.storage.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sporos_candidate_provenance")
+                .fetch_one(state.storage.pool())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn autobrr_upload_rejects_noncanonical_and_malformed_torrents() {
+        let (_directory, state) = test_state().await;
+        let app = test_router(state);
+        let invalid_base64 = request(
+            &app,
+            "/api/v1/autobrr/torrents",
+            Some("webhook"),
+            r#"{"torrentData":"not base64"}"#,
+        )
+        .await;
+        assert_eq!(invalid_base64.0, 400);
+        assert_eq!(invalid_base64.1["code"], "invalid_torrent_data");
+
+        let malformed = serde_json::json!({
+            "torrentData": STANDARD.encode(b"not a torrent")
+        })
+        .to_string();
+        let malformed = request(
+            &app,
+            "/api/v1/autobrr/torrents",
+            Some("webhook"),
+            &malformed,
+        )
+        .await;
+        assert_eq!(malformed.0, 422);
+        assert_eq!(malformed.1["code"], "invalid_torrent");
+    }
+
+    #[tokio::test]
+    async fn autobrr_upload_authenticates_before_body_admission() {
+        let (_directory, state) = test_state().await;
+        let app = test_router(state);
+        let response = app
+            .oneshot(
+                HttpRequest::post("/api/v1/autobrr/torrents")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b'x'; 12 * 1024 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
