@@ -16,6 +16,7 @@ const MAX_MUTATION_BYTES: usize = 4 * 1024;
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 const MAX_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILE_LIST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PIECE_STATES_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ApiKey(HeaderValue);
@@ -120,6 +121,25 @@ pub struct TorrentState {
 impl TorrentState {
     pub fn is_stopped(&self) -> bool {
         self.state.starts_with("stopped")
+    }
+
+    pub fn is_checking(&self) -> bool {
+        self.state.starts_with("checking")
+    }
+
+    pub fn is_started(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "downloading"
+                | "forcedDL"
+                | "queuedDL"
+                | "stalledDL"
+                | "metaDL"
+                | "uploading"
+                | "forcedUP"
+                | "queuedUP"
+                | "stalledUP"
+        )
     }
 }
 
@@ -303,15 +323,49 @@ impl QbittorrentClient {
     }
 
     pub async fn stop(&self, info_hash: &str) -> Result<(), QbittorrentError> {
+        self.empty_mutation("api/v2/torrents/stop", info_hash, "stop acknowledgement")
+            .await
+    }
+
+    pub async fn start(&self, info_hash: &str) -> Result<(), QbittorrentError> {
+        self.empty_mutation("api/v2/torrents/start", info_hash, "start acknowledgement")
+            .await
+    }
+
+    pub async fn force_recheck(&self, info_hash: &str) -> Result<(), QbittorrentError> {
+        self.empty_mutation(
+            "api/v2/torrents/recheck",
+            info_hash,
+            "recheck acknowledgement",
+        )
+        .await
+    }
+
+    pub async fn piece_states(&self, info_hash: &str) -> Result<Vec<u8>, QbittorrentError> {
         let response = self
-            .request(reqwest::Method::POST, "api/v2/torrents/stop")
+            .request(reqwest::Method::GET, "api/v2/torrents/pieceStates")
+            .query(&[("hash", info_hash)])
+            .send()
+            .await
+            .map_err(QbittorrentError::Request)?;
+        checked_body(response, MAX_PIECE_STATES_BYTES).await
+    }
+
+    async fn empty_mutation(
+        &self,
+        endpoint: &str,
+        info_hash: &str,
+        response_kind: &'static str,
+    ) -> Result<(), QbittorrentError> {
+        let response = self
+            .request(reqwest::Method::POST, endpoint)
             .form(&[("hashes", info_hash)])
             .send()
             .await
             .map_err(QbittorrentError::Request)?;
         let body = checked_body(response, MAX_MUTATION_BYTES).await?;
         if !body.is_empty() {
-            return Err(malformed_text("stop acknowledgement"));
+            return Err(malformed_text(response_kind));
         }
         Ok(())
     }
@@ -671,6 +725,53 @@ mod tests {
         assert!(stop.head.starts_with("POST /api/v2/torrents/stop HTTP/1.1"));
         assert_eq!(stop.body, b"hashes=0123");
         server.join().expect("fake server");
+    }
+
+    #[tokio::test]
+    async fn rechecks_starts_and_streams_piece_state_bytes() {
+        let (url, requests, server) = server(vec![
+            Reply {
+                status: "200 OK",
+                content_type: "text/plain",
+                body: b"",
+            },
+            Reply {
+                status: "200 OK",
+                content_type: "application/json",
+                body: b"[2,0,1]",
+            },
+            Reply {
+                status: "200 OK",
+                content_type: "text/plain",
+                body: b"",
+            },
+        ]);
+        let client = client(url);
+
+        client.force_recheck("0123").await.unwrap();
+        assert_eq!(client.piece_states("0123").await.unwrap(), b"[2,0,1]");
+        client.start("0123").await.unwrap();
+
+        let recheck = requests.recv().unwrap();
+        assert!(
+            recheck
+                .head
+                .starts_with("POST /api/v2/torrents/recheck HTTP/1.1")
+        );
+        assert_eq!(recheck.body, b"hashes=0123");
+        let pieces = requests.recv().unwrap();
+        assert!(
+            pieces
+                .head
+                .starts_with("GET /api/v2/torrents/pieceStates?hash=0123 HTTP/1.1")
+        );
+        let start = requests.recv().unwrap();
+        assert!(
+            start
+                .head
+                .starts_with("POST /api/v2/torrents/start HTTP/1.1")
+        );
+        server.join().unwrap();
     }
 
     #[tokio::test]
