@@ -34,8 +34,7 @@ static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct HttpState {
     storage: Arc<Storage>,
-    webhook_token: Secret,
-    admin_token: Secret,
+    api_key: Option<Secret>,
     readiness: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
     inventory_stale_after: Option<Duration>,
@@ -58,8 +57,7 @@ impl HttpState {
     ) -> Self {
         Self {
             storage,
-            webhook_token: config.auth.webhook_token.clone(),
-            admin_token: config.auth.admin_token.clone(),
+            api_key: config.auth.api_key.clone(),
             readiness: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(Metrics::new()),
             inventory_stale_after: config
@@ -98,14 +96,14 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
         .route("/api/v1/autobrr/check", post(autobrr_check))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_webhook,
+            require_api_key,
         ))
         .layer(RequestBodyLimitLayer::new(64 * 1024));
     let uploads = Router::new()
         .route("/api/v1/autobrr/torrents", post(autobrr_torrent))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_webhook,
+            require_api_key,
         ))
         .layer(RequestBodyLimitLayer::new(state.autobrr_body_limit_bytes));
     let admin = Router::new()
@@ -130,7 +128,10 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
             "/api/v1/admin/inventory/reconcile",
             post(request_inventory_reconcile),
         )
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ))
         .layer(RequestBodyLimitLayer::new(admin_body_limit));
 
     Router::new()
@@ -1486,19 +1487,14 @@ fn decode_cursor(cursor: &str) -> Result<(i64, Vec<u8>), ()> {
     }
 }
 
-async fn require_admin(State(state): State<HttpState>, request: Request, next: Next) -> Response {
-    authorize(&state.admin_token, request, next).await
+async fn require_api_key(State(state): State<HttpState>, request: Request, next: Next) -> Response {
+    authorize(state.api_key.as_ref(), request, next).await
 }
 
-pub async fn require_webhook(
-    State(state): State<HttpState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    authorize(&state.webhook_token, request, next).await
-}
-
-async fn authorize(expected: &Secret, request: Request, next: Next) -> Response {
+async fn authorize(expected: Option<&Secret>, request: Request, next: Next) -> Response {
+    let Some(expected) = expected else {
+        return next.run(request).await;
+    };
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -1785,30 +1781,45 @@ mod tests {
     use sporos_model::{PolicySnapshotId, TaskId, TaskKey};
 
     #[tokio::test]
-    async fn separates_admin_and_webhook_authentication() {
+    async fn uses_one_api_key_for_admin_and_webhooks() {
         let (_directory, state) = test_state().await;
         let app = test_router(state);
 
         assert_eq!(
-            request(&app, "/api/v1/admin/tasks", Some("webhook"), "")
+            request(&app, "/api/v1/admin/tasks", Some("wrong"), "")
                 .await
                 .0,
             401
         );
         assert_eq!(
-            request(&app, "/api/v1/admin/tasks", Some("admin"), "")
+            request(&app, "/api/v1/admin/tasks", Some("api"), "")
                 .await
                 .0,
             200
         );
         assert_eq!(
-            request(&app, "/_test/webhook", Some("admin"), r#"{"marker":1}"#)
+            request(&app, "/_test/webhook", Some("wrong"), r#"{"marker":1}"#)
                 .await
                 .0,
             401
         );
         assert_eq!(
-            request(&app, "/_test/webhook", Some("webhook"), r#"{"marker":1}"#)
+            request(&app, "/_test/webhook", Some("api"), r#"{"marker":1}"#)
+                .await
+                .0,
+            202
+        );
+    }
+
+    #[tokio::test]
+    async fn disables_api_authentication_when_unconfigured() {
+        let (_directory, mut state) = test_state().await;
+        state.api_key = None;
+        let app = test_router(state);
+
+        assert_eq!(request(&app, "/api/v1/admin/tasks", None, "").await.0, 200);
+        assert_eq!(
+            request(&app, "/_test/webhook", None, r#"{"marker":1}"#)
                 .await
                 .0,
             202
@@ -1829,8 +1840,8 @@ mod tests {
     async fn duplicate_webhook_requests_return_the_existing_task() {
         let (_directory, state) = test_state().await;
         let app = test_router(state);
-        let first = request(&app, "/_test/webhook", Some("webhook"), r#"{"marker":7}"#).await;
-        let second = request(&app, "/_test/webhook", Some("webhook"), r#"{"marker":7}"#).await;
+        let first = request(&app, "/_test/webhook", Some("api"), r#"{"marker":7}"#).await;
+        let second = request(&app, "/_test/webhook", Some("api"), r#"{"marker":7}"#).await;
 
         assert_eq!(first.0, 202);
         assert_eq!(second.0, 200);
@@ -1879,7 +1890,7 @@ mod tests {
         let accepted = request(
             &app,
             "/api/v1/autobrr/check",
-            Some("webhook"),
+            Some("api"),
             r#"{"torrentName":"Example.Show.S01E02.2160p","size":1010,"indexer":"tracker"}"#,
         )
         .await;
@@ -1891,7 +1902,7 @@ mod tests {
         let rejected = request(
             &app,
             "/api/v1/autobrr/check",
-            Some("webhook"),
+            Some("api"),
             r#"{"torrentName":"Other.Show.S01E02"}"#,
         )
         .await;
@@ -1915,8 +1926,8 @@ mod tests {
         })
         .to_string();
 
-        let first = request(&app, "/api/v1/autobrr/torrents", Some("webhook"), &body).await;
-        let second = request(&app, "/api/v1/autobrr/torrents", Some("webhook"), &body).await;
+        let first = request(&app, "/api/v1/autobrr/torrents", Some("api"), &body).await;
+        let second = request(&app, "/api/v1/autobrr/torrents", Some("api"), &body).await;
 
         assert_eq!(first.0, 202);
         assert_eq!(second.0, 200);
@@ -1946,7 +1957,7 @@ mod tests {
         let invalid_base64 = request(
             &app,
             "/api/v1/autobrr/torrents",
-            Some("webhook"),
+            Some("api"),
             r#"{"torrentData":"not base64"}"#,
         )
         .await;
@@ -1957,13 +1968,7 @@ mod tests {
             "torrentData": STANDARD.encode(b"not a torrent")
         })
         .to_string();
-        let malformed = request(
-            &app,
-            "/api/v1/autobrr/torrents",
-            Some("webhook"),
-            &malformed,
-        )
-        .await;
+        let malformed = request(&app, "/api/v1/autobrr/torrents", Some("api"), &malformed).await;
         assert_eq!(malformed.0, 422);
         assert_eq!(malformed.1["code"], "invalid_torrent");
     }
@@ -2025,21 +2030,21 @@ mod tests {
         state.inventory_stale_after = Some(Duration::from_secs(300));
         let app = test_router(state);
 
-        let status = request(&app, "/api/v1/admin/inventory", Some("admin"), "").await;
+        let status = request(&app, "/api/v1/admin/inventory", Some("api"), "").await;
         assert_eq!(status.0, 200);
         assert_eq!(status.1["configured"], true);
         assert_eq!(status.1["baselineComplete"], false);
         let first = request(
             &app,
             "/api/v1/admin/inventory/reconcile",
-            Some("admin"),
+            Some("api"),
             r#"{"full":true}"#,
         )
         .await;
         let duplicate = request(
             &app,
             "/api/v1/admin/inventory/reconcile",
-            Some("admin"),
+            Some("api"),
             r#"{"full":true}"#,
         )
         .await;
@@ -2051,7 +2056,7 @@ mod tests {
         let page = request(
             &app,
             "/api/v1/admin/inventory/torrents?limit=25",
-            Some("admin"),
+            Some("api"),
             "",
         )
         .await;
@@ -2099,7 +2104,7 @@ mod tests {
                 .route("/_test/webhook", post(fake_webhook))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
-                    require_webhook,
+                    require_api_key,
                 ))
                 .with_state(state),
         )
@@ -2127,8 +2132,7 @@ mod tests {
         };
         let state = HttpState {
             storage,
-            webhook_token: Secret::new("webhook"),
-            admin_token: Secret::new("admin"),
+            api_key: Some(Secret::new("api")),
             readiness: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(Metrics::new()),
             inventory_stale_after: None,

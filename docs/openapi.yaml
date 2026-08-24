@@ -33,7 +33,7 @@ paths:
     post:
       tags: [autobrr]
       operationId: autobrrCheck
-      security: [{webhookBearer: []}]
+      security: [{apiBearer: []}, {}]
       requestBody:
         required: true
         content:
@@ -47,7 +47,7 @@ paths:
     post:
       tags: [autobrr]
       operationId: ingestTorrent
-      security: [{webhookBearer: []}]
+      security: [{apiBearer: []}, {}]
       requestBody:
         required: true
         content:
@@ -60,7 +60,7 @@ paths:
     get:
       tags: [admin]
       operationId: listTasks
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "200": {description: Paginated tasks}
   /api/v1/admin/tasks/{task_id}:
@@ -68,7 +68,7 @@ paths:
     get:
       tags: [admin]
       operationId: getTask
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "200": {description: Task projection}
         "404": {$ref: "#/components/responses/NotFound"}
@@ -77,7 +77,7 @@ paths:
     get:
       tags: [admin]
       operationId: listTaskEvents
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "200": {description: Paginated task evidence}
   /api/v1/admin/tasks/{task_id}/retry:
@@ -85,7 +85,7 @@ paths:
     post:
       tags: [admin]
       operationId: retryTask
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "202": {description: New durable retry accepted}
         "409": {description: Task is not retryable}
@@ -94,7 +94,7 @@ paths:
     post:
       tags: [admin]
       operationId: cancelTask
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "202": {description: Workflow cancellation accepted}
         "409": {description: Task is already terminal}
@@ -102,7 +102,7 @@ paths:
     get:
       tags: [admin]
       operationId: listOperations
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "200": {description: Paginated operations}
   /api/v1/admin/operations/{operation_id}:
@@ -114,7 +114,7 @@ paths:
     get:
       tags: [admin]
       operationId: getOperation
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "200": {description: Operation projection}
         "404": {$ref: "#/components/responses/NotFound"}
@@ -122,7 +122,7 @@ paths:
     post:
       tags: [admin]
       operationId: startSearch
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       requestBody:
         required: true
         content:
@@ -134,7 +134,7 @@ paths:
     post:
       tags: [admin]
       operationId: startDataScan
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       requestBody:
         required: true
         content:
@@ -146,21 +146,21 @@ paths:
     get:
       tags: [admin]
       operationId: inventoryStatus
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "200": {description: Inventory status}
   /api/v1/admin/inventory/torrents:
     get:
       tags: [admin]
       operationId: listInventoryTorrents
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       responses:
         "200": {description: Paginated qBittorrent inventory}
   /api/v1/admin/inventory/reconcile:
     post:
       tags: [admin]
       operationId: reconcileInventory
-      security: [{adminBearer: []}]
+      security: [{apiBearer: []}, {}]
       requestBody:
         content:
           application/json:
@@ -173,8 +173,10 @@ paths:
         "202": {description: Reconciliation requested}
 components:
   securitySchemes:
-    webhookBearer: {type: http, scheme: bearer}
-    adminBearer: {type: http, scheme: bearer}
+    apiBearer:
+      type: http
+      scheme: bearer
+      description: Required only when auth.api_key is configured.
   parameters:
     TaskId:
       name: task_id

@@ -30,8 +30,7 @@ trap cleanup EXIT
   --tmpfs /tmp:rw,nosuid,nodev,size=16m \
   --volume "$volume:/data" \
   --publish 127.0.0.1::8080 \
-  --env 'SPOROS__AUTH__WEBHOOK_TOKEN="webhook-smoke"' \
-  --env 'SPOROS__AUTH__ADMIN_TOKEN="admin-smoke"' \
+  --env 'SPOROS__AUTH__API_KEY=api-smoke' \
   --env 'SPOROS__SERVER__SHUTDOWN_GRACE="1s"' \
   "$tag" >/dev/null
 

@@ -181,17 +181,17 @@ impl TorrentState {
 pub struct QbittorrentClient {
     client: Client,
     base_url: Url,
-    authorization: ApiKey,
+    authorization: Option<ApiKey>,
 }
 
 impl QbittorrentClient {
-    pub fn new(base_url: Url, api_key: ApiKey) -> Result<Self, QbittorrentConfigError> {
+    pub fn new(base_url: Url, api_key: Option<ApiKey>) -> Result<Self, QbittorrentConfigError> {
         Self::with_timeout(base_url, api_key, Duration::from_secs(30))
     }
 
     pub fn with_timeout(
         base_url: Url,
-        api_key: ApiKey,
+        api_key: Option<ApiKey>,
         timeout: Duration,
     ) -> Result<Self, QbittorrentConfigError> {
         if !matches!(base_url.scheme(), "http" | "https")
@@ -412,9 +412,11 @@ impl QbittorrentClient {
             .base_url
             .join(endpoint)
             .expect("fixed qBittorrent endpoint is a valid relative URL");
-        self.client
-            .request(method, url)
-            .header(AUTHORIZATION, self.authorization.0.clone())
+        let request = self.client.request(method, url);
+        match &self.authorization {
+            Some(api_key) => request.header(AUTHORIZATION, api_key.0.clone()),
+            None => request,
+        }
     }
 
     async fn version(
@@ -585,7 +587,7 @@ mod tests {
     }
 
     fn client(url: Url) -> QbittorrentClient {
-        QbittorrentClient::new(url, ApiKey::new(API_KEY).expect("API key")).expect("client")
+        QbittorrentClient::new(url, Some(ApiKey::new(API_KEY).expect("API key"))).expect("client")
     }
 
     async fn body_bytes(mut body: QbittorrentBody) -> Vec<u8> {
@@ -607,7 +609,7 @@ mod tests {
         );
         let url = Url::parse("http://user:password@localhost/").expect("URL");
         assert!(matches!(
-            QbittorrentClient::new(url, ApiKey::new(API_KEY).expect("API key")),
+            QbittorrentClient::new(url, Some(ApiKey::new(API_KEY).expect("API key"))),
             Err(QbittorrentConfigError::InvalidBaseUrl)
         ));
     }
@@ -646,6 +648,33 @@ mod tests {
                     .head
                     .contains(&format!("authorization: Bearer {API_KEY}"))
             );
+        }
+        server.join().expect("fake server");
+    }
+
+    #[tokio::test]
+    async fn supports_unauthenticated_versions() {
+        let (url, requests, server) = server(vec![
+            Reply {
+                status: "200 OK",
+                content_type: "text/plain",
+                body: b"v5.2.1",
+            },
+            Reply {
+                status: "200 OK",
+                content_type: "text/plain",
+                body: b"2.14.1",
+            },
+        ]);
+
+        QbittorrentClient::new(url, None)
+            .expect("client")
+            .validate_contract()
+            .await
+            .expect("versions");
+        for _ in 0..2 {
+            let request = requests.recv().expect("request");
+            assert!(!request.head.to_ascii_lowercase().contains("authorization:"));
         }
         server.join().expect("fake server");
     }

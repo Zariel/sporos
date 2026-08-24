@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -134,7 +133,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Status => status(&client, &base, cli.output).await,
         Command::Tasks { command } => {
-            let token = admin_token()?;
+            let api_key = api_key()?;
             match command {
                 TaskCommand::List {
                     state,
@@ -152,15 +151,39 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             query.append_pair("cursor", &cursor);
                         }
                     }
-                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                    request_json(
+                        &client,
+                        reqwest::Method::GET,
+                        url,
+                        &api_key,
+                        None,
+                        cli.output,
+                    )
+                    .await
                 }
                 TaskCommand::Show { task_id } => {
                     let url = base.join(&format!("/api/v1/admin/tasks/{task_id}"))?;
-                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                    request_json(
+                        &client,
+                        reqwest::Method::GET,
+                        url,
+                        &api_key,
+                        None,
+                        cli.output,
+                    )
+                    .await
                 }
                 TaskCommand::Events { task_id } => {
                     let url = base.join(&format!("/api/v1/admin/tasks/{task_id}/events"))?;
-                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                    request_json(
+                        &client,
+                        reqwest::Method::GET,
+                        url,
+                        &api_key,
+                        None,
+                        cli.output,
+                    )
+                    .await
                 }
                 TaskCommand::Retry { task_id } => {
                     let url = base.join(&format!("/api/v1/admin/tasks/{task_id}/retry"))?;
@@ -168,7 +191,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         &client,
                         reqwest::Method::POST,
                         url,
-                        &token,
+                        &api_key,
                         Some(serde_json::json!({})),
                         cli.output,
                     )
@@ -180,7 +203,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         &client,
                         reqwest::Method::POST,
                         url,
-                        &token,
+                        &api_key,
                         Some(serde_json::json!({})),
                         cli.output,
                     )
@@ -189,7 +212,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Operations { command } => {
-            let token = admin_token()?;
+            let api_key = api_key()?;
             match command {
                 OperationCommand::List {
                     kind,
@@ -207,16 +230,32 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             query.append_pair("cursor", &cursor);
                         }
                     }
-                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                    request_json(
+                        &client,
+                        reqwest::Method::GET,
+                        url,
+                        &api_key,
+                        None,
+                        cli.output,
+                    )
+                    .await
                 }
                 OperationCommand::Show { operation_id } => {
                     let url = base.join(&format!("/api/v1/admin/operations/{operation_id}"))?;
-                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                    request_json(
+                        &client,
+                        reqwest::Method::GET,
+                        url,
+                        &api_key,
+                        None,
+                        cli.output,
+                    )
+                    .await
                 }
             }
         }
         Command::Inventory { command } => {
-            let token = admin_token()?;
+            let api_key = api_key()?;
             match command {
                 InventoryCommand::Reconcile => {
                     let url = base.join("/api/v1/admin/inventory/reconcile")?;
@@ -224,7 +263,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         &client,
                         reqwest::Method::POST,
                         url,
-                        &token,
+                        &api_key,
                         Some(serde_json::json!({"full": true})),
                         cli.output,
                     )
@@ -237,13 +276,13 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             force,
             dry_run,
         } => {
-            let token = admin_token()?;
+            let api_key = api_key()?;
             let url = base.join("/api/v1/admin/searches")?;
             request_json(
                 &client,
                 reqwest::Method::POST,
                 url,
-                &token,
+                &api_key,
                 Some(serde_json::json!({
                     "source": {
                         "kind": "qbittorrent",
@@ -262,7 +301,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         Command::Data { command } => {
-            let token = admin_token()?;
+            let api_key = api_key()?;
             match command {
                 DataCommand::Scan {
                     root,
@@ -275,7 +314,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         &client,
                         reqwest::Method::POST,
                         url,
-                        &token,
+                        &api_key,
                         Some(serde_json::json!({
                             "root": root,
                             "indexerIds": indexers,
@@ -331,11 +370,14 @@ async fn request_json(
     client: &reqwest::Client,
     method: reqwest::Method,
     url: reqwest::Url,
-    token: &Secret,
+    api_key: &Option<Secret>,
     body: Option<Value>,
     output: Output,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut request = client.request(method, url).bearer_auth(token.expose());
+    let mut request = client.request(method, url);
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key.expose());
+    }
     if let Some(body) = body {
         request = request
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -386,10 +428,12 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a str {
     value.get(name).and_then(Value::as_str).unwrap_or("-")
 }
 
-fn admin_token() -> Result<Secret, Box<dyn std::error::Error>> {
-    let direct = std::env::var("SPOROS_ADMIN_TOKEN").ok();
-    let file = std::env::var_os("SPOROS_ADMIN_TOKEN_FILE").map(PathBuf::from);
-    Ok(Secret::resolve("SPOROS_ADMIN_TOKEN", direct, file)?)
+fn api_key() -> Result<Option<Secret>, Box<dyn std::error::Error>> {
+    std::env::var("SPOROS__AUTH__API_KEY")
+        .ok()
+        .map(|value| Secret::parse("SPOROS__AUTH__API_KEY", value))
+        .transpose()
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

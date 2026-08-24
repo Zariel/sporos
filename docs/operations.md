@@ -9,7 +9,9 @@ database, lock, migrations, runtime, and initial durable-start dispatch are
 ready. `/metrics` is OpenMetrics text and includes bounded-route HTTP counts and
 latency, outbox depth, task states, and inventory size/freshness.
 
-Use `SPOROS_ADMIN_TOKEN` or `SPOROS_ADMIN_TOKEN_FILE` with `sporosctl`:
+When the service has `SPOROS__AUTH__API_KEY` configured, supply the same
+environment variable to `sporosctl`. If the service has no API key,
+`sporosctl` sends no authorization header:
 
 ```console
 sporosctl status

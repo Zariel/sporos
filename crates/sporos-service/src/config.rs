@@ -13,7 +13,7 @@ use thiserror::Error;
 const DEFAULT_PATH: &str = "/config/sporos.toml";
 const MAX_SECRET_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Secret(String);
 
 impl Secret {
@@ -25,12 +25,8 @@ impl Secret {
         &self.0
     }
 
-    pub fn resolve(
-        field: &str,
-        direct: Option<String>,
-        file: Option<PathBuf>,
-    ) -> Result<Self, ConfigError> {
-        resolve_secret(field, direct, file)
+    pub fn parse(field: &str, value: String) -> Result<Self, ConfigError> {
+        secret(field, value)
     }
 }
 
@@ -76,7 +72,7 @@ pub struct ArrInstance {
 #[derive(Debug, Clone)]
 pub struct Qbittorrent {
     pub url: Url,
-    pub api_key: Secret,
+    pub api_key: Option<Secret>,
     pub request_timeout: Duration,
     pub sync_interval: Duration,
     pub full_reconcile_interval: Duration,
@@ -123,8 +119,7 @@ impl Default for Server {
 
 #[derive(Debug, Clone)]
 pub struct Auth {
-    pub webhook_token: Secret,
-    pub admin_token: Secret,
+    pub api_key: Option<Secret>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,7 +230,6 @@ struct RawConfig {
 struct RawQbittorrent {
     url: String,
     api_key: Option<String>,
-    api_key_file: Option<PathBuf>,
     #[serde(with = "duration")]
     request_timeout: Duration,
     #[serde(with = "duration")]
@@ -253,7 +247,6 @@ impl Default for RawQbittorrent {
         Self {
             url: String::new(),
             api_key: None,
-            api_key_file: None,
             request_timeout: Duration::from_secs(30),
             sync_interval: Duration::from_secs(10),
             full_reconcile_interval: Duration::from_secs(6 * 60 * 60),
@@ -269,7 +262,6 @@ impl Default for RawQbittorrent {
 struct RawProwlarr {
     url: String,
     api_key: Option<String>,
-    api_key_file: Option<PathBuf>,
     #[serde(with = "duration")]
     request_timeout: Duration,
     #[serde(with = "duration")]
@@ -285,7 +277,6 @@ impl Default for RawProwlarr {
         Self {
             url: String::new(),
             api_key: None,
-            api_key_file: None,
             request_timeout: Duration::from_secs(30),
             refresh_interval: Duration::from_secs(5 * 60),
             include_tags: Vec::new(),
@@ -299,10 +290,7 @@ impl Default for RawProwlarr {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawAuth {
-    webhook_token: Option<String>,
-    webhook_token_file: Option<PathBuf>,
-    admin_token: Option<String>,
-    admin_token_file: Option<PathBuf>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,7 +298,6 @@ struct RawAuth {
 struct ServiceConfig {
     url: String,
     api_key: Option<String>,
-    api_key_file: Option<PathBuf>,
     #[serde(with = "duration")]
     request_timeout: Duration,
     #[serde(flatten)]
@@ -322,7 +309,6 @@ impl Default for ServiceConfig {
         Self {
             url: String::new(),
             api_key: None,
-            api_key_file: None,
             request_timeout: Duration::from_secs(30),
             options: BTreeMap::new(),
         }
@@ -639,13 +625,17 @@ fn load(
         if path.iter().any(String::is_empty) {
             return Err(ConfigError::InvalidEnvironmentKey(key));
         }
-        let parsed = toml::from_str::<toml::Table>(&format!("value = {raw}"))
-            .map_err(|source| ConfigError::InvalidEnvironmentValue {
-                key: key.clone(),
-                source,
-            })?
-            .remove("value")
-            .expect("environment wrapper has value");
+        let parsed = if path.last().is_some_and(|field| field == "api_key") {
+            toml::Value::String(raw)
+        } else {
+            toml::from_str::<toml::Table>(&format!("value = {raw}"))
+                .map_err(|source| ConfigError::InvalidEnvironmentValue {
+                    key: key.clone(),
+                    source,
+                })?
+                .remove("value")
+                .expect("environment wrapper has value")
+        };
         set_path(&mut value, &path, parsed, &key)?;
     }
 
@@ -663,26 +653,13 @@ fn load(
     };
     validate_paths(&paths)?;
     validate_data_roots(&raw.data_scan.roots)?;
-    let webhook_token = resolve_secret(
-        "auth.webhook_token",
-        raw.auth.webhook_token,
-        raw.auth.webhook_token_file,
-    )?;
-    let admin_token = resolve_secret(
-        "auth.admin_token",
-        raw.auth.admin_token,
-        raw.auth.admin_token_file,
-    )?;
-    if webhook_token == admin_token {
-        return Err(ConfigError::SharedAuthToken);
-    }
+    let api_key = optional_secret("auth.api_key", raw.auth.api_key)?;
 
     let qbittorrent = raw
         .qbittorrent
         .map(|service| -> Result<Qbittorrent, ConfigError> {
             let url = Url::parse(&service.url).map_err(|_| ConfigError::QbittorrentUrl)?;
-            let api_key =
-                resolve_secret("qbittorrent.api_key", service.api_key, service.api_key_file)?;
+            let api_key = optional_secret("qbittorrent.api_key", service.api_key)?;
             Ok(Qbittorrent {
                 url,
                 api_key,
@@ -699,8 +676,7 @@ fn load(
         .prowlarr
         .map(|service| -> Result<Prowlarr, ConfigError> {
             let url = service_url(&service.url).ok_or(ConfigError::ProwlarrUrl)?;
-            let api_key =
-                resolve_secret("prowlarr.api_key", service.api_key, service.api_key_file)?;
+            let api_key = required_secret("prowlarr.api_key", service.api_key)?;
             Ok(Prowlarr {
                 url,
                 api_key,
@@ -737,11 +713,8 @@ fn load(
                 kind: kind_name,
                 name: name.clone(),
             })?;
-            let api_key = resolve_secret(
-                &format!("arr.{kind_name}.{name}.api_key"),
-                service.api_key,
-                service.api_key_file,
-            )?;
+            let api_key =
+                required_secret(&format!("arr.{kind_name}.{name}.api_key"), service.api_key)?;
             arr.push(ArrInstance {
                 kind,
                 name,
@@ -754,10 +727,7 @@ fn load(
 
     Ok(Config {
         server: raw.server,
-        auth: Auth {
-            webhook_token,
-            admin_token,
-        },
+        auth: Auth { api_key },
         runtime: raw.runtime,
         limits: raw.limits,
         logging: raw.logging,
@@ -1100,17 +1070,12 @@ fn service_url(value: &str) -> Option<Url> {
     Some(url)
 }
 
-fn resolve_secret(
-    field: &str,
-    direct: Option<String>,
-    file: Option<PathBuf>,
-) -> Result<Secret, ConfigError> {
-    match (direct, file) {
-        (Some(_), Some(_)) => Err(ConfigError::ConflictingSecretSources(field.to_owned())),
-        (None, None) => Err(ConfigError::MissingSecret(field.to_owned())),
-        (Some(value), None) => secret(field, value),
-        (None, Some(path)) => read_secret(field, &path),
-    }
+fn optional_secret(field: &str, value: Option<String>) -> Result<Option<Secret>, ConfigError> {
+    value.map(|value| secret(field, value)).transpose()
+}
+
+fn required_secret(field: &str, value: Option<String>) -> Result<Secret, ConfigError> {
+    optional_secret(field, value)?.ok_or_else(|| ConfigError::MissingSecret(field.to_owned()))
 }
 
 fn secret(field: &str, value: String) -> Result<Secret, ConfigError> {
@@ -1121,35 +1086,6 @@ fn secret(field: &str, value: String) -> Result<Secret, ConfigError> {
     } else {
         Ok(Secret::new(value))
     }
-}
-
-fn read_secret(field: &str, path: &Path) -> Result<Secret, ConfigError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| ConfigError::ReadSecret {
-        field: field.to_owned(),
-        path: path.to_owned(),
-        source,
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(ConfigError::SecretNotRegular {
-            field: field.to_owned(),
-            path: path.to_owned(),
-        });
-    }
-    if metadata.len() > MAX_SECRET_BYTES {
-        return Err(ConfigError::SecretTooLarge(field.to_owned()));
-    }
-    let mut value = fs::read_to_string(path).map_err(|source| ConfigError::ReadSecret {
-        field: field.to_owned(),
-        path: path.to_owned(),
-        source,
-    })?;
-    if value.ends_with('\n') {
-        value.pop();
-        if value.ends_with('\r') {
-            value.pop();
-        }
-    }
-    secret(field, value)
 }
 
 fn merge(base: &mut toml::Value, overlay: toml::Value) {
@@ -1259,25 +1195,12 @@ pub enum ConfigError {
     TooManyArrInstances,
     #[error("invalid {kind} instance name {name:?}")]
     ArrName { kind: &'static str, name: String },
-    #[error("{0} must specify either a direct value or a file")]
+    #[error("required secret {0} is not configured")]
     MissingSecret(String),
-    #[error("{0} cannot specify both a direct value and a file")]
-    ConflictingSecretSources(String),
     #[error("{0} cannot be empty")]
     EmptySecret(String),
     #[error("{0} exceeds the secret size limit")]
     SecretTooLarge(String),
-    #[error("secret file for {field} is not a regular file: {path}")]
-    SecretNotRegular { field: String, path: PathBuf },
-    #[error("failed to read secret file for {field}: {path}")]
-    ReadSecret {
-        field: String,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("webhook and administrative tokens must differ")]
-    SharedAuthToken,
 }
 
 mod duration {
@@ -1328,8 +1251,6 @@ mod duration {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
-
     use tempfile::TempDir;
 
     use super::*;
@@ -1344,8 +1265,7 @@ mod tests {
                 [server]
                 bind = "127.0.0.1:9000"
                 [auth]
-                webhook_token = "webhook"
-                admin_token = "admin"
+                api_key = "file-secret"
             "#,
         )
         .expect("write configuration");
@@ -1353,48 +1273,49 @@ mod tests {
         let config = load(
             &path,
             true,
-            [(
-                "SPOROS__SERVER__BIND".to_owned(),
-                "\"127.0.0.1:9001\"".to_owned(),
-            )],
+            [
+                (
+                    "SPOROS__SERVER__BIND".to_owned(),
+                    "\"127.0.0.1:9001\"".to_owned(),
+                ),
+                (
+                    "SPOROS__AUTH__API_KEY".to_owned(),
+                    "environment-secret".to_owned(),
+                ),
+            ],
         )
         .expect("load configuration");
 
         assert_eq!(config.server.bind, "127.0.0.1:9001".parse().unwrap());
-        assert_eq!(config.auth.webhook_token.expose(), "webhook");
+        assert_eq!(config.auth.api_key.unwrap().expose(), "environment-secret");
         assert_eq!(config.runtime.database_path, Path::new("/data/sporos.db"));
     }
 
     #[test]
-    fn accepts_environment_only_secrets() {
+    fn loads_optional_api_key() {
         let directory = TempDir::new().expect("create temporary directory");
         let config = load(
             &directory.path().join("missing.toml"),
             false,
-            [
-                (
-                    "SPOROS__AUTH__WEBHOOK_TOKEN".to_owned(),
-                    "\"webhook\"".to_owned(),
-                ),
-                (
-                    "SPOROS__AUTH__ADMIN_TOKEN".to_owned(),
-                    "\"admin\"".to_owned(),
-                ),
-            ],
+            [("SPOROS__AUTH__API_KEY".to_owned(), "api secret".to_owned())],
         )
         .expect("load environment configuration");
 
-        assert_eq!(config.auth.webhook_token.expose(), "webhook");
-        assert_eq!(config.auth.admin_token.expose(), "admin");
+        assert_eq!(config.auth.api_key.unwrap().expose(), "api secret");
+
+        let config = load(&directory.path().join("missing.toml"), false, [])
+            .expect("load without API authentication");
+        assert!(config.auth.api_key.is_none());
+
+        let config =
+            load_config("[auth]\napi_key = \"config-secret\"\n").expect("load configured API key");
+        assert_eq!(config.auth.api_key.unwrap().expose(), "config-secret");
     }
 
     #[test]
     fn loads_bounded_qbittorrent_settings() {
         let config = load_config(
             r#"
-                [auth]
-                webhook_token = "webhook"
-                admin_token = "admin"
                 [qbittorrent]
                 url = "http://qbittorrent:8080"
                 api_key = "qbt_0123456789abcdefghijklmnopqr"
@@ -1410,16 +1331,17 @@ mod tests {
         assert_eq!(qbittorrent.sync_interval, Duration::from_secs(15));
         assert_eq!(qbittorrent.inventory_batch_size, 400);
         assert_eq!(qbittorrent.database_batch_size, 100);
-        assert!(!format!("{qbittorrent:?}").contains(qbittorrent.api_key.expose()));
+        assert_eq!(
+            qbittorrent.api_key.as_ref().unwrap().expose(),
+            "qbt_0123456789abcdefghijklmnopqr"
+        );
+        assert!(!format!("{qbittorrent:?}").contains("qbt_0123456789abcdefghijklmnopqr"));
     }
 
     #[test]
     fn loads_typed_candidate_policy() {
         let config = load_config(
             r#"
-                [auth]
-                webhook_token = "webhook"
-                admin_token = "admin"
                 [sources]
                 include_categories = ["tv"]
                 [matching]
@@ -1497,9 +1419,7 @@ mod tests {
             "[injection.resume]\nmode = \"threshold\"",
             "[injection.resume]\nmode = \"threshold\"\nmin_present_ratio = 1.1",
         ] {
-            let config = format!(
-                "[auth]\nwebhook_token = \"webhook\"\nadmin_token = \"admin\"\n{invalid}\n"
-            );
+            let config = format!("{invalid}\n");
             assert!(load_config(&config).is_err(), "accepted {invalid}");
         }
     }
@@ -1508,12 +1428,8 @@ mod tests {
     fn rejects_unbounded_qbittorrent_batches() {
         let error = load_config(
             r#"
-                [auth]
-                webhook_token = "webhook"
-                admin_token = "admin"
                 [qbittorrent]
                 url = "http://qbittorrent:8080"
-                api_key = "secret"
                 inventory_batch_size = 501
             "#,
         )
@@ -1526,9 +1442,6 @@ mod tests {
     fn loads_named_optional_arr_instances() {
         let config = load_config(
             r#"
-                [auth]
-                webhook_token = "webhook"
-                admin_token = "admin"
                 [arr.sonarr.main]
                 url = "http://sonarr:8989"
                 api_key = "sonarr-secret"
@@ -1549,12 +1462,54 @@ mod tests {
     }
 
     #[test]
+    fn loads_downstream_keys_from_environment_overrides() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let path = directory.path().join("sporos.toml");
+        fs::write(
+            &path,
+            r#"
+                [qbittorrent]
+                url = "http://qbittorrent:8080"
+                [prowlarr]
+                url = "http://prowlarr:9696"
+                [arr.sonarr.main]
+                url = "http://sonarr:8989"
+            "#,
+        )
+        .expect("write configuration");
+
+        let config = load(
+            &path,
+            true,
+            [
+                (
+                    "SPOROS__QBITTORRENT__API_KEY".to_owned(),
+                    "qbt_0123456789abcdefghijklmnopqr".to_owned(),
+                ),
+                (
+                    "SPOROS__PROWLARR__API_KEY".to_owned(),
+                    "prowlarr-secret".to_owned(),
+                ),
+                (
+                    "SPOROS__ARR__SONARR__MAIN__API_KEY".to_owned(),
+                    "sonarr-secret".to_owned(),
+                ),
+            ],
+        )
+        .expect("load environment overrides");
+
+        assert_eq!(
+            config.qbittorrent.unwrap().api_key.unwrap().expose(),
+            "qbt_0123456789abcdefghijklmnopqr"
+        );
+        assert_eq!(config.prowlarr.unwrap().api_key.expose(), "prowlarr-secret");
+        assert_eq!(config.arr[0].api_key.expose(), "sonarr-secret");
+    }
+
+    #[test]
     fn loads_only_named_bounded_data_roots() {
         let config = load_config(
             r#"
-                [auth]
-                webhook_token = "webhook"
-                admin_token = "admin"
                 [data_scan.roots.media]
                 path = "/media/library"
                 max_depth = 2
@@ -1570,9 +1525,7 @@ mod tests {
             "[data_scan.roots.media]\npath = \"relative\"\nmax_depth = 1\nmax_releases = 1\nmax_files_per_release = 1",
             "[data_scan.roots.media]\npath = \"/media\"\nmax_depth = 17\nmax_releases = 1\nmax_files_per_release = 1",
         ] {
-            let input = format!(
-                "[auth]\nwebhook_token = \"webhook\"\nadmin_token = \"admin\"\n{invalid}\n"
-            );
+            let input = format!("{invalid}\n");
             assert!(load_config(&input).is_err(), "accepted {invalid}");
         }
     }
@@ -1581,9 +1534,6 @@ mod tests {
     fn loads_bounded_prowlarr_settings() {
         let config = load_config(
             r#"
-                [auth]
-                webhook_token = "webhook"
-                admin_token = "admin"
                 [prowlarr]
                 url = "http://prowlarr:9696/base"
                 api_key = "prowlarr-secret"
@@ -1608,58 +1558,32 @@ mod tests {
     }
 
     #[test]
-    fn reads_regular_secret_files_and_one_newline() {
+    fn requires_keys_for_authenticated_services() {
         let directory = TempDir::new().expect("create temporary directory");
-        let webhook = directory.path().join("webhook");
-        let admin = directory.path().join("admin");
-        fs::write(&webhook, "webhook\n\n").expect("write webhook token");
-        fs::write(&admin, "admin\r\n").expect("write admin token");
         let path = directory.path().join("sporos.toml");
-        fs::write(
-            &path,
-            format!(
-                "[auth]\nwebhook_token_file = {:?}\nadmin_token_file = {:?}\n",
-                webhook.display().to_string(),
-                admin.display().to_string()
-            ),
-        )
-        .expect("write configuration");
+        fs::write(&path, "[prowlarr]\nurl = \"http://prowlarr:9696\"\n")
+            .expect("write configuration");
 
-        let config = load(&path, true, []).expect("load configuration");
-        assert_eq!(config.auth.webhook_token.expose(), "webhook\n");
-        assert_eq!(config.auth.admin_token.expose(), "admin");
-        assert_eq!(
-            format!("{:?}", config.auth),
-            "Auth { webhook_token: Secret([REDACTED]), admin_token: Secret([REDACTED]) }"
+        let error = load(&path, true, []).expect_err("require Prowlarr API key");
+        assert!(matches!(error, ConfigError::MissingSecret(name) if name == "prowlarr.api_key"));
+
+        fs::write(&path, "[arr.sonarr.main]\nurl = \"http://sonarr:8989\"\n")
+            .expect("write configuration");
+        let error = load(&path, true, []).expect_err("require Arr API key");
+        assert!(
+            matches!(error, ConfigError::MissingSecret(name) if name == "arr.sonarr.main.api_key")
         );
     }
 
     #[test]
-    fn rejects_secret_source_conflicts() {
-        let error = load_config(
-            "[auth]\nwebhook_token = \"webhook\"\nwebhook_token_file = \"token\"\nadmin_token = \"admin\"\n",
-        )
-        .expect_err("reject conflicting secret sources");
-        assert!(matches!(error, ConfigError::ConflictingSecretSources(_)));
-    }
-
-    #[test]
-    fn rejects_shared_auth_tokens() {
-        let error = load_config("[auth]\nwebhook_token = \"shared\"\nadmin_token = \"shared\"\n")
-            .expect_err("reject shared auth tokens");
-        assert!(matches!(error, ConfigError::SharedAuthToken));
-    }
-
-    #[test]
-    fn rejects_symlinked_secret_files() {
+    fn permits_unauthenticated_qbittorrent() {
         let directory = TempDir::new().expect("create temporary directory");
-        let target = directory.path().join("target");
-        let link = directory.path().join("link");
-        fs::write(&target, "webhook").expect("write secret");
-        symlink(&target, &link).expect("create symlink");
+        let path = directory.path().join("sporos.toml");
+        fs::write(&path, "[qbittorrent]\nurl = \"http://qbittorrent:8080\"\n")
+            .expect("write configuration");
 
-        let error = read_secret("auth.webhook_token", &link).expect_err("reject symlink");
-        assert!(matches!(error, ConfigError::SecretNotRegular { .. }));
+        let config = load(&path, true, []).expect("load qBittorrent without authentication");
+        assert!(config.qbittorrent.unwrap().api_key.is_none());
     }
 
     #[test]
@@ -1683,11 +1607,7 @@ mod tests {
     fn load_config_with_env(key: &str, value: &str) -> Result<Config, ConfigError> {
         let directory = TempDir::new().expect("create temporary directory");
         let path = directory.path().join("sporos.toml");
-        fs::write(
-            &path,
-            "[auth]\nwebhook_token = \"webhook\"\nadmin_token = \"admin\"\n",
-        )
-        .expect("write configuration");
+        fs::write(&path, "").expect("write configuration");
         load(&path, true, [(key.to_owned(), value.to_owned())])
     }
 }

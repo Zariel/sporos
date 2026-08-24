@@ -1261,7 +1261,7 @@ mod tests {
         let executor = InjectionExecutor::new(
             Arc::clone(&storage),
             Some(
-                QbittorrentClient::new(url, ApiKey::new(API_KEY).unwrap())
+                QbittorrentClient::new(url, Some(ApiKey::new(API_KEY).unwrap()))
                     .expect("qBittorrent client"),
             ),
         );
@@ -1383,7 +1383,7 @@ mod tests {
         let (url, server) = qbit_server(vec![Vec::new()]);
         let executor = InjectionExecutor::new(
             Arc::clone(&storage),
-            Some(QbittorrentClient::new(url, ApiKey::new(API_KEY).unwrap()).unwrap()),
+            Some(QbittorrentClient::new(url, Some(ApiKey::new(API_KEY).unwrap())).unwrap()),
         );
 
         assert_eq!(executor.recheck(&input).await.unwrap(), waiting());
@@ -1463,7 +1463,7 @@ mod tests {
         ]);
         let executor = InjectionExecutor::new(
             Arc::clone(&storage),
-            Some(QbittorrentClient::new(url, ApiKey::new(API_KEY).unwrap()).unwrap()),
+            Some(QbittorrentClient::new(url, Some(ApiKey::new(API_KEY).unwrap())).unwrap()),
         );
         let input = InjectionInput {
             task_id: workflow_input.task_id,

@@ -1,12 +1,14 @@
 # Autobrr integration
 
-Use the webhook token, never the admin token, for both requests. Authentication
-is checked before the request body is admitted.
+If `auth.api_key` (or `SPOROS__AUTH__API_KEY`) is configured, use it for both
+requests. Authentication is checked before the request body is admitted. If it
+is unset, omit the `Authorization` header; the API is intentionally
+unauthenticated.
 
 ## External filter
 
 Send `POST /api/v1/autobrr/check` with
-`Authorization: Bearer <webhook token>` and this template:
+`Authorization: Bearer <API key>` (when configured) and this template:
 
 ```json
 {
@@ -22,7 +24,7 @@ is stale; configure autobrr to retry `503` and `429` when supported.
 
 ## Torrent action
 
-Send `POST /api/v1/autobrr/torrents` with the same bearer token:
+Send `POST /api/v1/autobrr/torrents` with the same optional bearer key:
 
 ```json
 {

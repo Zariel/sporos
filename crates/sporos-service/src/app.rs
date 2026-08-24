@@ -72,7 +72,11 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         .qbittorrent
         .as_ref()
         .map(|settings| {
-            let api_key = ApiKey::new(settings.api_key.expose())?;
+            let api_key = settings
+                .api_key
+                .as_ref()
+                .map(|api_key| ApiKey::new(api_key.expose()))
+                .transpose()?;
             QbittorrentClient::with_timeout(settings.url.clone(), api_key, settings.request_timeout)
         })
         .transpose()
@@ -630,10 +634,7 @@ mod tests {
                 shutdown_grace: Duration::from_millis(50),
                 ..Server::default()
             },
-            auth: Auth {
-                webhook_token: crate::config::Secret::new("webhook"),
-                admin_token: crate::config::Secret::new("admin"),
-            },
+            auth: Auth { api_key: None },
             runtime: RuntimeConfig {
                 data_dir: directory.path().to_owned(),
                 database_path: directory.path().join("sporos.db"),

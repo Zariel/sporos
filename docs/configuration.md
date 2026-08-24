@@ -9,14 +9,26 @@ SPOROS__SERVER__BIND='"127.0.0.1:9000"'
 SPOROS__INJECTION__DRY_RUN=true
 ```
 
-Secrets may come directly from environment for local development or a regular,
-non-symlinked file in production. Webhook and admin tokens must differ.
+Secrets may be set as `api_key` in TOML or through the corresponding environment
+override. Secret-file indirection is not supported. API-key environment values
+are raw strings rather than TOML expressions, so Kubernetes `Secret` values can
+be exposed directly with `env` or `envFrom`.
+
+`auth.api_key` is optional and, when set, is the single bearer key for both
+autobrr and admin API routes. Leaving it unset disables API authentication.
+`qbittorrent.api_key` is also optional; leaving it unset makes qBittorrent
+requests without an `Authorization` header. Prowlarr and each configured Arr
+instance require an API key.
+
+```console
+SPOROS__AUTH__API_KEY=sporos-secret
+SPOROS__QBITTORRENT__API_KEY=qbt_example
+SPOROS__PROWLARR__API_KEY=prowlarr-secret
+SPOROS__ARR__SONARR__MAIN__API_KEY=sonarr-secret
+SPOROS__ARR__RADARR__MAIN__API_KEY=radarr-secret
+```
 
 ```toml
-[auth]
-webhook_token_file = "/run/secrets/sporos-webhook-token"
-admin_token_file = "/run/secrets/sporos-admin-token"
-
 [server]
 bind = "0.0.0.0:8080"
 request_timeout = "30s"
@@ -32,7 +44,6 @@ lock_wait = "0s"
 
 [qbittorrent]
 url = "http://qbittorrent:8080"
-api_key_file = "/run/secrets/qbittorrent-api-key"
 request_timeout = "15s"
 sync_interval = "5s"
 full_reconcile_interval = "30m"
@@ -42,7 +53,6 @@ database_batch_size = 200
 
 [prowlarr]
 url = "http://prowlarr:9696"
-api_key_file = "/run/secrets/prowlarr-api-key"
 request_timeout = "15s"
 refresh_interval = "5m"
 include_tags = []
@@ -52,12 +62,10 @@ max_results_per_query = 100
 
 [arr.sonarr.main]
 url = "http://sonarr:8989"
-api_key_file = "/run/secrets/sonarr-api-key"
 request_timeout = "15s"
 
 [arr.radarr.main]
 url = "http://radarr:7878"
-api_key_file = "/run/secrets/radarr-api-key"
 request_timeout = "15s"
 
 [data_scan.roots.media]
@@ -117,8 +125,8 @@ outbox_batch_size = 100
 
 Only named data roots are accepted by the API. Root paths and the managed link
 root must be absolute. Configured bounds are validated at startup; unknown keys,
-unsafe names, conflicting secret sources, invalid URLs, and unbounded response
-limits fail closed.
+unsafe names, missing required API keys, invalid URLs, and unbounded response
+limits fail closed. Secret-file paths are not part of the TOML schema.
 
 `matching.mode` is `strict`, `flexible`, or `partial`. Resume policy is
 independent of matching. `complete_only` starts only a fully present candidate;

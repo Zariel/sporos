@@ -20,13 +20,13 @@ async fn stopped_add_is_safe_on_qbittorrent_5_2() {
     let api_key = required_env("SPOROS_QBITTORRENT_API_KEY");
     let client = QbittorrentClient::new(
         base_url.clone(),
-        ApiKey::new(&api_key).expect("qBittorrent API key"),
+        Some(ApiKey::new(&api_key).expect("qBittorrent API key")),
     )
     .expect("qBittorrent client");
 
     let wrong_key = QbittorrentClient::new(
         base_url,
-        ApiKey::new("qbt_abcdefghijklmnopqrstuvwxyz01").expect("fixture API key"),
+        Some(ApiKey::new("qbt_abcdefghijklmnopqrstuvwxyz01").expect("fixture API key")),
     )
     .expect("unauthenticated client");
     assert!(matches!(
