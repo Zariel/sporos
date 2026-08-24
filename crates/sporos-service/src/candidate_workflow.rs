@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use duroxide::OrchestrationContext;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum EvaluationResult {
     Waiting {
-        deadline_ms: i64,
+        delay_ms: u64,
         source_ids: Vec<[u8; 16]>,
     },
     Terminal {
@@ -55,20 +55,11 @@ pub async fn workflow(context: OrchestrationContext, input: String) -> Result<St
                 return crate::injection::run(&context, &input, plan_id).await;
             }
             EvaluationResult::Terminal { .. } => return Ok(output),
-            EvaluationResult::Waiting { deadline_ms, .. } => {
-                let remaining = deadline_ms.saturating_sub(now_ms());
-                if remaining <= 0 {
-                    continue;
-                }
-                let timer = Duration::from_millis(
-                    u64::try_from(remaining)
-                        .unwrap_or(u64::MAX)
-                        .min(RECONCILE_INTERVAL.as_millis() as u64),
-                );
+            EvaluationResult::Waiting { delay_ms, .. } => {
                 let _ = context
                     .select2(
                         context.dequeue_event(SOURCE_COMPLETED_EVENT),
-                        context.schedule_timer(timer),
+                        context.schedule_timer(Duration::from_millis(delay_ms)),
                     )
                     .await;
             }
@@ -147,7 +138,9 @@ impl Storage {
                 )
                 .await?;
                 return Ok(EvaluationResult::Waiting {
-                    deadline_ms: deadline,
+                    delay_ms: u64::try_from(deadline.saturating_sub(now))
+                        .unwrap_or(u64::MAX)
+                        .min(RECONCILE_INTERVAL.as_millis() as u64),
                     source_ids: waiting,
                 });
             }
@@ -824,7 +817,10 @@ fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[cfg(test)]
 fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);
@@ -1055,7 +1051,7 @@ mod tests {
         let client = Client::new(provider.clone());
         let (activities, orchestrations) =
             crate::engine::registries(Arc::clone(&storage), None, None, None);
-        let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
+        let runtime = Runtime::start_with_store(provider.clone(), activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(now_ms())
             .await
@@ -1078,6 +1074,11 @@ mod tests {
         })
         .await
         .expect("candidate did not begin waiting");
+
+        runtime.shutdown(Some(100)).await;
+        let (activities, orchestrations) =
+            crate::engine::registries(Arc::clone(&storage), None, None, None);
+        let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
 
         project_source(&storage, true, 13, 2).await;
         let source_id = sqlx::query_scalar::<_, Vec<u8>>(
