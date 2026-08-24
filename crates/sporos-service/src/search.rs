@@ -1032,6 +1032,8 @@ pub(crate) enum SearchError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use axum::Router;
     use axum::http::{HeaderValue, StatusCode};
     use axum::response::IntoResponse;
@@ -1286,11 +1288,20 @@ mod tests {
     }
 
     fn policy() -> SearchPolicy {
+        let link_root = PathBuf::from("/data/links");
         SearchPolicy::new(
             Matching::default(),
             SourceFilters::default(),
             Injection::default(),
-            Paths::default(),
+            Paths {
+                link_root: link_root.clone(),
+                rewrite: vec![crate::config::PathRewrite {
+                    name: "test-identity".to_owned(),
+                    remote: link_root.clone(),
+                    local: link_root,
+                    services: vec!["qbittorrent".to_owned()],
+                }],
+            },
         )
     }
 

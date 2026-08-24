@@ -377,17 +377,17 @@ impl Default for Paths {
 }
 
 impl Paths {
-    pub fn qbit_link_root(&self) -> PathBuf {
+    pub fn qbit_link_root(&self) -> Option<PathBuf> {
         self.local_to_remote("qbittorrent", &self.link_root)
     }
 
-    pub fn remote_to_local(&self, service: &str, path: &Path) -> PathBuf {
+    pub fn remote_to_local(&self, service: &str, path: &Path) -> Option<PathBuf> {
         rewrite_path(&self.rewrite, service, path, |rewrite| {
             (&rewrite.remote, &rewrite.local)
         })
     }
 
-    pub fn local_to_remote(&self, service: &str, path: &Path) -> PathBuf {
+    pub fn local_to_remote(&self, service: &str, path: &Path) -> Option<PathBuf> {
         rewrite_path(&self.rewrite, service, path, |rewrite| {
             (&rewrite.local, &rewrite.remote)
         })
@@ -399,7 +399,7 @@ fn rewrite_path<'a>(
     service: &str,
     path: &Path,
     direction: impl Fn(&'a PathRewrite) -> (&'a Path, &'a Path),
-) -> PathBuf {
+) -> Option<PathBuf> {
     rewrites
         .iter()
         .filter(|rewrite| {
@@ -416,7 +416,6 @@ fn rewrite_path<'a>(
         })
         .max_by_key(|(length, _)| *length)
         .map(|(_, rewritten)| rewritten)
-        .unwrap_or_else(|| path.to_owned())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1458,14 +1457,20 @@ mod tests {
         assert!(config.injection.dry_run);
         assert_eq!(
             config.paths.qbit_link_root(),
-            Path::new("/downloads/sporos/links")
+            Some(PathBuf::from("/downloads/sporos/links"))
         );
         assert_eq!(
             config.paths.remote_to_local(
                 "qbittorrent",
                 Path::new("/downloads/sporos/source/file.mkv")
             ),
-            Path::new("/srv/sporos/source/file.mkv")
+            Some(PathBuf::from("/srv/sporos/source/file.mkv"))
+        );
+        assert_eq!(
+            config
+                .paths
+                .remote_to_local("qbittorrent", Path::new("/unapproved/file.mkv")),
+            None
         );
         assert_eq!(
             config.injection.resume,

@@ -245,7 +245,13 @@ impl InjectionExecutor {
             return self.fail(input, "qbittorrent_not_stopped").await;
         }
         let namespace = plan.namespace_relative()?;
-        let links = plan.planned_links();
+        let links = match plan.planned_links() {
+            Ok(links) => links,
+            Err(InjectionError::UnmappedSourceRoot) => {
+                return self.fail(input, "unmapped_source_root").await;
+            }
+            Err(error) => return Err(error),
+        };
         let root = PathBuf::from(&plan.policy.namespace_local_root);
         let _permit = match &self.filesystem {
             Some(limiter) => Some(crate::execution::permit(limiter).await),
@@ -473,27 +479,32 @@ impl InjectionPlan {
             .map_err(|_| InjectionError::NamespaceOutsideRoot)
     }
 
-    fn planned_links(&self) -> Vec<PlannedLink> {
+    fn planned_links(&self) -> Result<Vec<PlannedLink>, InjectionError> {
         let paths = Paths {
             link_root: self.policy.namespace_local_root.clone().into(),
             rewrite: self.policy.path_rewrites.clone(),
         };
         self.mappings
             .iter()
-            .map(|mapping| PlannedLink {
-                source_root: if mapping.source_service == "data" {
+            .map(|mapping| {
+                let source_root = if mapping.source_service == "data" {
                     PathBuf::from(&mapping.source_root_remote)
                 } else {
-                    paths.remote_to_local(
-                        &mapping.source_service,
-                        Path::new(&mapping.source_root_remote),
-                    )
-                },
-                source_relative: PathBuf::from(&mapping.source_path),
-                destination_relative: PathBuf::from(&mapping.candidate_path),
-                expected_size: mapping.size,
-                expected_device: mapping.device,
-                expected_inode: mapping.inode,
+                    paths
+                        .remote_to_local(
+                            &mapping.source_service,
+                            Path::new(&mapping.source_root_remote),
+                        )
+                        .ok_or(InjectionError::UnmappedSourceRoot)?
+                };
+                Ok(PlannedLink {
+                    source_root,
+                    source_relative: PathBuf::from(&mapping.source_path),
+                    destination_relative: PathBuf::from(&mapping.candidate_path),
+                    expected_size: mapping.size,
+                    expected_device: mapping.device,
+                    expected_inode: mapping.inode,
+                })
             })
             .collect()
     }
@@ -1086,6 +1097,8 @@ enum InjectionError {
     MissingPieceLength,
     #[error("candidate namespace is outside its managed root")]
     NamespaceOutsideRoot,
+    #[error("external source root has no approved local path mapping")]
+    UnmappedSourceRoot,
     #[error("source file path is invalid")]
     InvalidSourcePath,
     #[error("candidate torrent size overflowed")]
@@ -1205,7 +1218,13 @@ mod tests {
         };
 
         assert_eq!(executor.prepare(&input).await.unwrap(), waiting());
-        let plan = storage.load_injection(&input).await.unwrap();
+        let mut plan = storage.load_injection(&input).await.unwrap();
+        let rewrites = std::mem::take(&mut plan.policy.path_rewrites);
+        assert!(matches!(
+            plan.planned_links(),
+            Err(InjectionError::UnmappedSourceRoot)
+        ));
+        plan.policy.path_rewrites = rewrites;
         let destination = Path::new(&plan.namespace_local).join(&plan.mappings[0].candidate_path);
         std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
         std::fs::hard_link(&source_file, &destination).unwrap();
@@ -1332,7 +1351,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let links = plan.planned_links();
+        let links = plan.planned_links().unwrap();
 
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].source_root, source_root);

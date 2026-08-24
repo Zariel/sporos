@@ -165,7 +165,12 @@ impl CandidateIngress {
                 ..self.injection.clone()
             },
             namespace_local_root: self.paths.link_root.to_string_lossy().into_owned(),
-            save_path_remote_root: self.paths.qbit_link_root().to_string_lossy().into_owned(),
+            save_path_remote_root: self
+                .paths
+                .qbit_link_root()
+                .ok_or(CandidateError::UnmappedLinkRoot)?
+                .to_string_lossy()
+                .into_owned(),
             path_rewrites: self.paths.rewrite.clone(),
         };
         let manifest_json = serde_json::to_string(&manifest)?;
@@ -372,6 +377,8 @@ pub enum CandidateError {
     CandidateCollision,
     #[error("candidate and policy refer to a different task")]
     CandidateTaskCollision,
+    #[error("managed link root has no explicit qBittorrent path mapping")]
+    UnmappedLinkRoot,
 }
 
 #[cfg(test)]
@@ -388,10 +395,7 @@ mod tests {
             Matching::default(),
             SourceFilters::default(),
             Injection::default(),
-            Paths {
-                link_root: directory.path().join("links"),
-                rewrite: Vec::new(),
-            },
+            paths(&directory),
         );
 
         let first = ingress
@@ -418,7 +422,7 @@ mod tests {
             Matching::default(),
             SourceFilters::default(),
             Injection::default(),
-            Paths::default(),
+            paths(&directory),
         );
 
         let normal = ingress
@@ -471,6 +475,19 @@ mod tests {
             request_id: format!("req-{received_at}"),
             dry_run,
             received_at,
+        }
+    }
+
+    fn paths(directory: &TempDir) -> Paths {
+        let link_root = directory.path().join("links");
+        Paths {
+            link_root: link_root.clone(),
+            rewrite: vec![crate::config::PathRewrite {
+                name: "test-identity".to_owned(),
+                remote: link_root.clone(),
+                local: link_root,
+                services: vec!["qbittorrent".to_owned()],
+            }],
         }
     }
 

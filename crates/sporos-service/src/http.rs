@@ -427,7 +427,8 @@ fn candidate_problem(error: CandidateError, request_id: RequestId) -> Problem {
         CandidateError::Json(_)
         | CandidateError::BlobCollision
         | CandidateError::CandidateCollision
-        | CandidateError::CandidateTaskCollision => Problem::new(
+        | CandidateError::CandidateTaskCollision
+        | CandidateError::UnmappedLinkRoot => Problem::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "candidate_ingress_failed",
             "Candidate ingress failed",
@@ -2114,6 +2115,16 @@ mod tests {
             .await
             .expect("open storage"),
         );
+        let link_root = directory.path().join("links");
+        let paths = crate::config::Paths {
+            link_root: link_root.clone(),
+            rewrite: vec![crate::config::PathRewrite {
+                name: "test-identity".to_owned(),
+                remote: link_root.clone(),
+                local: link_root,
+                services: vec!["qbittorrent".to_owned()],
+            }],
+        };
         let state = HttpState {
             storage,
             webhook_token: Secret::new("webhook"),
@@ -2127,13 +2138,13 @@ mod tests {
                 Matching::default(),
                 SourceFilters::default(),
                 crate::config::Injection::default(),
-                crate::config::Paths::default(),
+                paths.clone(),
             )),
             search_policy: SearchPolicy::new(
                 Matching::default(),
                 SourceFilters::default(),
                 crate::config::Injection::default(),
-                crate::config::Paths::default(),
+                paths,
             ),
             prowlarr_configured: false,
             prowlarr_client: None,
