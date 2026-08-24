@@ -502,7 +502,7 @@ mod tests {
                 .await
                 .expect("read Duroxide migration ledger");
 
-        assert_eq!(domain_version, 12);
+        assert_eq!(domain_version, 13);
         assert_eq!(duroxide_has_domain_version, 0);
     }
 
@@ -541,7 +541,7 @@ mod tests {
     async fn upgrades_n_minus_one_with_an_active_pinned_workflow() {
         let directory = TempDir::new().expect("create temporary directory");
         let database = directory.path().join("sporos.db");
-        apply_domain_through(&database, 11).await;
+        apply_domain_through(&database, 12).await;
         let database_url = format!("sqlite://{}", database.display());
         let old_provider = std::sync::Arc::new(
             SqliteProvider::new(
@@ -588,7 +588,7 @@ mod tests {
                 .fetch_one(storage.pool())
                 .await
                 .expect("read upgraded version"),
-            12
+            13
         );
         let provider = storage.duroxide_provider();
         let client = duroxide::Client::new(provider.clone());
@@ -748,7 +748,7 @@ mod tests {
         .fetch_one(storage.pool())
         .await
         .expect("count domain tables");
-        assert_eq!(domain_tables, 29);
+        assert_eq!(domain_tables, 31);
     }
 
     #[tokio::test]

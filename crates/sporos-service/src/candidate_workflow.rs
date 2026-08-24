@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sporos_matcher::{MatchRequest, Matcher, PureMatcher};
 use sporos_model::{
-    CandidateId, InfoHashes, LocalSourceFile, LocalSourceManifest, MatchDecision, MatchOutcome,
-    ReleaseDescriptor, SourceId, SourceKind, TaskId, TorrentManifest,
+    ArrKind, CandidateId, InfoHashes, LocalSourceFile, LocalSourceManifest, MatchDecision,
+    MatchOutcome, ReleaseDescriptor, SourceId, SourceKind, TaskId, TorrentManifest,
 };
 use sqlx::{QueryBuilder, Row, Sqlite};
 use thiserror::Error;
@@ -19,6 +19,7 @@ use crate::task_projection::{ProjectionOutcome, ProjectionUpdate};
 pub const EVALUATE_ACTIVITY: &str = "EvaluateCandidate";
 pub const SOURCE_COMPLETED_EVENT: &str = "SourceCompleted";
 const MAX_PLAUSIBLE_SOURCES: i64 = 64;
+const MAX_ALTERNATE_TITLES: usize = 32;
 const MAX_WAITERS_PER_COMPLETION: i64 = 1_024;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -196,13 +197,21 @@ impl Storage {
         let exclude_categories = serde_json::to_string(&policy.source_filters.exclude_categories)?;
         let include_tags = serde_json::to_string(&policy.source_filters.include_tags)?;
         let exclude_tags = serde_json::to_string(&policy.source_filters.exclude_tags)?;
+        let titles = reduction_titles(release);
+        let external_ids = reduction_external_ids(release);
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT id, v1_hash, v2_hash, release_json, is_complete,
                     file_manifest_version, file_manifest_state
              FROM sporos_qbit_torrent
-             WHERE available = 1 AND normalized_title = ",
+             WHERE available = 1 AND ",
         );
-        query.push_bind(release.primary_title.as_str());
+        push_source_reduction(
+            &mut query,
+            "sporos_qbit_torrent.id",
+            "qbittorrent",
+            &titles,
+            &external_ids,
+        );
         query.push(" AND (");
         query.push_bind(&include_categories);
         query.push(" = '[]' OR category IN (SELECT value FROM json_each(");
@@ -270,16 +279,21 @@ impl Storage {
         let remaining =
             MAX_PLAUSIBLE_SOURCES.saturating_sub(i64::try_from(sources.len()).unwrap_or(i64::MAX));
         if remaining > 0 {
-            let rows = sqlx::query(
+            let mut query = QueryBuilder::<Sqlite>::new(
                 "SELECT id, kind, release_json, last_seen_generation
                  FROM sporos_data_source
-                 WHERE available = 1 AND normalized_title = ?
-                 ORDER BY id LIMIT ?",
-            )
-            .bind(release.primary_title.as_str())
-            .bind(remaining)
-            .fetch_all(self.pool())
-            .await?;
+                 WHERE available = 1 AND ",
+            );
+            push_source_reduction(
+                &mut query,
+                "sporos_data_source.id",
+                "data",
+                &titles,
+                &external_ids,
+            );
+            query.push(" ORDER BY id LIMIT ");
+            query.push_bind(remaining);
+            let rows = query.build().fetch_all(self.pool()).await?;
             for row in rows {
                 let id = SourceId::from_bytes(bytes_16(row.try_get("id")?, "source ID")?);
                 let generation = row.try_get::<i64, _>("last_seen_generation")?;
@@ -527,6 +541,73 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+fn reduction_titles(release: &ReleaseDescriptor) -> Vec<String> {
+    std::iter::once(&release.primary_title)
+        .chain(release.alternate_titles.iter().take(MAX_ALTERNATE_TITLES))
+        .map(|title| title.as_str().to_owned())
+        .collect()
+}
+
+fn reduction_external_ids(release: &ReleaseDescriptor) -> Vec<(String, String)> {
+    let Some(identity) = &release.arr_identity else {
+        return Vec::new();
+    };
+    let kind = match identity.kind {
+        ArrKind::Movie => "movie",
+        ArrKind::Series => "series",
+    };
+    let mut ids = vec![(
+        format!("arr:{kind}:{}", identity.instance),
+        identity.entity_id.to_string(),
+    )];
+    ids.extend(
+        [
+            ("tvdb", identity.tvdb_id.map(|value| value.to_string())),
+            ("tmdb", identity.tmdb_id.map(|value| value.to_string())),
+            ("imdb", identity.imdb_id.clone()),
+        ]
+        .into_iter()
+        .filter_map(|(namespace, value)| value.map(|value| (namespace.to_owned(), value))),
+    );
+    ids
+}
+
+fn push_source_reduction(
+    query: &mut QueryBuilder<Sqlite>,
+    id_column: &str,
+    source_type: &str,
+    titles: &[String],
+    external_ids: &[(String, String)],
+) {
+    query.push("(EXISTS (SELECT 1 FROM sporos_source_title AS source_title WHERE source_title.source_id = ");
+    query.push(id_column.to_owned());
+    query.push(" AND source_title.source_type = ");
+    query.push_bind(source_type.to_owned());
+    query.push(" AND source_title.normalized_title IN (");
+    let mut separated = query.separated(", ");
+    for title in titles {
+        separated.push_bind(title.clone());
+    }
+    separated.push_unseparated("))");
+    if !external_ids.is_empty() {
+        query.push(" OR EXISTS (SELECT 1 FROM sporos_source_external_id AS source_external WHERE source_external.source_id = ");
+        query.push(id_column.to_owned());
+        query.push(" AND source_external.source_type = ");
+        query.push_bind(source_type.to_owned());
+        query.push(" AND (");
+        let mut separated = query.separated(" OR ");
+        for (namespace, value) in external_ids {
+            separated.push("(source_external.namespace = ");
+            separated.push_bind_unseparated(namespace.clone());
+            separated.push_unseparated(" AND source_external.value = ");
+            separated.push_bind_unseparated(value.clone());
+            separated.push_unseparated(")");
+        }
+        separated.push_unseparated("))");
+    }
+    query.push(")");
 }
 
 async fn persist_plan(
@@ -956,6 +1037,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arr_identity_reaches_the_matcher_across_different_titles() {
+        let directory = TempDir::new().expect("temporary directory");
+        let storage = open(&directory).await;
+        project_source(&storage, true, 13, 1).await;
+        let identity = sporos_model::ArrIdentity {
+            kind: ArrKind::Movie,
+            instance: "radarr".to_owned(),
+            entity_id: 42,
+            tvdb_id: None,
+            tmdb_id: Some(123),
+            imdb_id: None,
+        };
+        let mut source_release = sporos_matcher::parse_release("Original Title 2024");
+        source_release.arr_identity = Some(identity.clone());
+        replace_qbit_release(&storage, &source_release).await;
+        let input = accept(&storage, directory.path(), 10).await;
+        let mut candidate_release = sporos_matcher::parse_release("Localized Title 2024");
+        candidate_release.arr_identity = Some(identity);
+        sqlx::query("UPDATE sporos_candidate SET release_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&candidate_release).unwrap())
+            .bind(input.candidate_id.as_slice())
+            .execute(storage.pool())
+            .await
+            .unwrap();
+
+        let result = storage.evaluate_candidate(&input, 20).await.unwrap();
+
+        assert!(matches!(
+            result,
+            EvaluationResult::Terminal { ref state, plan_id: Some(_), .. }
+                if state == "dry_run_complete"
+        ));
+    }
+
+    #[tokio::test]
     async fn live_v2_and_hybrid_candidates_produce_injection_plans() {
         for hybrid in [false, true] {
             let directory = TempDir::new().expect("temporary directory");
@@ -1301,6 +1417,31 @@ mod tests {
                 .unwrap();
             storage.finish_qbit_manifest(&target, 1, 3).await.unwrap();
         }
+    }
+
+    async fn replace_qbit_release(storage: &Storage, release: &ReleaseDescriptor) {
+        let source_id = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT id FROM sporos_qbit_torrent WHERE qbit_id = ?",
+        )
+        .bind("b".repeat(40))
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let source_id: [u8; 16] = source_id.try_into().unwrap();
+        let mut transaction = storage.pool().begin().await.unwrap();
+        sqlx::query(
+            "UPDATE sporos_qbit_torrent SET normalized_title = ?, release_json = ? WHERE id = ?",
+        )
+        .bind(release.primary_title.as_str())
+        .bind(serde_json::to_string(release).unwrap())
+        .bind(source_id.as_slice())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        crate::source_facts::replace(&mut transaction, &source_id, "qbittorrent", release)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
     }
 
     async fn count(storage: &Storage, table: &str) -> i64 {

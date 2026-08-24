@@ -731,6 +731,7 @@ async fn persist_release(
         .bind(source_id.as_slice())
         .execute(&mut **transaction)
         .await?;
+    crate::source_facts::replace(transaction, &source_id, "data", &descriptor).await?;
     sqlx::query("UPDATE sporos_source_file SET available = 0 WHERE source_id = ?")
         .bind(source_id.as_slice())
         .execute(&mut **transaction)

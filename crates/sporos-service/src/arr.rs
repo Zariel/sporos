@@ -195,6 +195,7 @@ impl ArrEnricher {
                 }
             }
             release.arr_identity = Some(model);
+            let mut transaction = self.storage.pool().begin().await?;
             sqlx::query(
                 "UPDATE sporos_qbit_torrent SET release_json = ?, arr_identity_json = ?
                  WHERE id = ?",
@@ -202,8 +203,11 @@ impl ArrEnricher {
             .bind(serde_json::to_string(&release)?)
             .bind(serde_json::to_string(&identity)?)
             .bind(source_id.as_slice())
-            .execute(self.storage.pool())
+            .execute(&mut *transaction)
             .await?;
+            crate::source_facts::replace(&mut transaction, &source_id, "qbittorrent", &release)
+                .await?;
+            transaction.commit().await?;
             report.applied = true;
         }
         Ok(report)

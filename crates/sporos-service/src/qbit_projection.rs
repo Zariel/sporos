@@ -529,6 +529,7 @@ async fn project_torrent(
     .bind(now)
     .execute(&mut **transaction)
     .await?;
+    crate::source_facts::replace(transaction, &source_id, "qbittorrent", &release).await?;
 
     let completion = if became_complete {
         let completed_at = completed_at.expect("complete torrents have completion time");

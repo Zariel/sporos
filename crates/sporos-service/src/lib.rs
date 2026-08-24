@@ -21,6 +21,7 @@ pub mod qbit_projection;
 pub mod qbit_sync;
 pub mod qbittorrent;
 mod search;
+mod source_facts;
 pub mod storage;
 mod task_control;
 pub mod task_projection;

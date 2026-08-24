@@ -1515,6 +1515,11 @@ mod tests {
         .execute(storage.pool())
         .await
         .unwrap();
+        let mut transaction = storage.pool().begin().await.unwrap();
+        crate::source_facts::replace(&mut transaction, &source_id, "data", &release)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
     }
 
     async fn accept_candidate(

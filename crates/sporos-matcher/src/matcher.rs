@@ -731,6 +731,13 @@ fn compatible(
     source: &ReleaseDescriptor,
     season_mode: bool,
 ) -> Result<(), MatchReason> {
+    let same_arr_identity = matches!(
+        (&candidate.arr_identity, &source.arr_identity),
+        (Some(candidate), Some(source))
+            if candidate.kind == source.kind
+                && candidate.instance == source.instance
+                && candidate.entity_id == source.entity_id
+    );
     if let (Some(candidate), Some(source)) = (&candidate.arr_identity, &source.arr_identity)
         && (candidate.kind != source.kind
             || candidate.instance != source.instance
@@ -747,7 +754,7 @@ fn compatible(
     {
         return Err(MatchReason::MediaTypeConflict);
     }
-    if !titles_overlap(candidate, source) {
+    if !same_arr_identity && !titles_overlap(candidate, source) {
         return Err(MatchReason::TitleConflict);
     }
     if let (Some(candidate), Some(source)) = (candidate.year, source.year)
@@ -997,9 +1004,31 @@ fn no_match(
 
 #[cfg(test)]
 mod tests {
-    use sporos_model::{LocalSourceFile, MatchingPolicy, SourceId, TorrentFile};
+    use sporos_model::{
+        ArrIdentity, ArrKind, LocalSourceFile, MatchingPolicy, SourceId, TorrentFile,
+    };
 
-    use super::{AssignmentError, assign, hungarian};
+    use crate::parse_release;
+
+    use super::{AssignmentError, assign, compatible, hungarian};
+
+    #[test]
+    fn arr_identity_establishes_title_identity() {
+        let mut candidate = parse_release("Localized Series S01E01");
+        let mut source = parse_release("Original Series S01E01");
+        let identity = ArrIdentity {
+            kind: ArrKind::Series,
+            instance: "sonarr".to_owned(),
+            entity_id: 42,
+            tvdb_id: Some(123),
+            tmdb_id: None,
+            imdb_id: None,
+        };
+        candidate.arr_identity = Some(identity.clone());
+        source.arr_identity = Some(identity);
+
+        assert!(compatible(&candidate, &source, false).is_ok());
+    }
 
     #[test]
     fn rectangular_assignment_can_leave_rows_unmatched() {
