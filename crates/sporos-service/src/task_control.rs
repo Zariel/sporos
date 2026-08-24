@@ -64,7 +64,14 @@ impl TaskControl {
             .get_orchestration_status(&input.target_instance)
             .await?
         {
-            OrchestrationStatus::Running { .. } => return Ok(false),
+            OrchestrationStatus::Running { .. } => {
+                // Inspect before every submission so a retry after an ambiguous cancel
+                // response reconciles the durable side effect before repeating it.
+                self.client
+                    .cancel_instance(&input.target_instance, "operator request")
+                    .await?;
+                return Ok(false);
+            }
             OrchestrationStatus::Completed { .. } => ("completed", "cancellation_raced_completion"),
             OrchestrationStatus::Failed { details, .. } if cancelled(&details) => {
                 ("cancelled", "cancelled_by_operator")
@@ -88,9 +95,7 @@ pub(crate) async fn retry(
                 o.task_key, o.orchestration_name, o.orchestration_version,
                 o.instance_id, o.input_json
          FROM sporos_task t
-         JOIN sporos_outbox o ON o.id = (
-             SELECT max(latest.id) FROM sporos_outbox latest WHERE latest.task_id = t.id
-         )
+         JOIN sporos_outbox o ON o.instance_id = t.duroxide_instance_id
          WHERE t.id = ?",
     )
     .bind(task_id.as_slice())
@@ -173,16 +178,16 @@ pub(crate) async fn retry(
 
 pub(crate) async fn request_cancel(
     storage: &Storage,
-    client: &Client,
     task_id: [u8; 16],
     now: i64,
 ) -> Result<CancelAccepted, TaskControlError> {
+    let mut transaction = storage.pool().begin_with("BEGIN IMMEDIATE").await?;
     let row = sqlx::query(
         "SELECT state, projection_generation, terminal_at, duroxide_instance_id
          FROM sporos_task WHERE id = ?",
     )
     .bind(task_id.as_slice())
-    .fetch_optional(storage.pool())
+    .fetch_optional(&mut *transaction)
     .await?
     .ok_or(TaskControlError::TaskNotFound)?;
     let state: String = row.try_get("state")?;
@@ -200,24 +205,11 @@ pub(crate) async fn request_cancel(
         .try_get::<i64, _>("projection_generation")?
         .checked_add(1)
         .ok_or(TaskControlError::GenerationRange)?;
-    client
-        .cancel_instance(&target_instance, "operator request")
-        .await?;
     let input = CancellationInput {
         task_id,
         target_instance: target_instance.clone(),
     };
     let reconciliation_instance = format!("cancel-task:{}:{generation}", hex(&task_id));
-    client
-        .start_orchestration_versioned_typed(
-            reconciliation_instance,
-            ORCHESTRATION_NAME,
-            ORCHESTRATION_VERSION,
-            &input,
-        )
-        .await?;
-
-    let mut transaction = storage.pool().begin().await?;
     let changed = sqlx::query(
         "UPDATE sporos_task SET state = 'cancellation_requested',
          projection_generation = ?, reason_code = 'operator_cancel', updated_at = ?
@@ -230,6 +222,26 @@ pub(crate) async fn request_cancel(
     .await?
     .rows_affected();
     if changed == 1 {
+        let mut hash = Sha256::new();
+        hash.update(b"task-cancellation-v1");
+        hash.update(task_id);
+        hash.update(generation.to_be_bytes());
+        let task_key: [u8; 32] = hash.finalize().into();
+        sqlx::query(
+            "INSERT INTO sporos_outbox
+             (task_id, task_key, orchestration_name, orchestration_version, instance_id,
+              input_json, visible_at, start_delivery_attempt_count)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+        )
+        .bind(task_id.as_slice())
+        .bind(task_key.as_slice())
+        .bind(ORCHESTRATION_NAME)
+        .bind(ORCHESTRATION_VERSION)
+        .bind(&reconciliation_instance)
+        .bind(serde_json::to_string(&input).map_err(TaskControlError::EncodeCancellation)?)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
         sqlx::query(
             "INSERT INTO sporos_task_event
              (task_id, sequence, state, reason_code, detail_json, created_at)
@@ -237,7 +249,13 @@ pub(crate) async fn request_cancel(
         )
         .bind(task_id.as_slice())
         .bind(generation)
-        .bind(serde_json::json!({ "instanceId": target_instance }).to_string())
+        .bind(
+            serde_json::json!({
+                "instanceId": target_instance,
+                "reconciliationInstanceId": reconciliation_instance,
+            })
+            .to_string(),
+        )
         .bind(now)
         .execute(&mut *transaction)
         .await?;
@@ -372,6 +390,8 @@ pub(crate) enum TaskControlError {
     UnsupportedRetry,
     #[error("task projection generation is outside the supported range")]
     GenerationRange,
+    #[error("cancellation command could not be encoded")]
+    EncodeCancellation(#[source] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -397,6 +417,20 @@ mod tests {
              reason_code = 'fixture', terminal_at = 2 WHERE id = ?",
         )
         .bind([3_u8; 16].as_slice())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sporos_outbox
+             (task_id, task_key, orchestration_name, orchestration_version, instance_id,
+              input_json, visible_at, start_delivery_attempt_count)
+             VALUES (?, ?, ?, ?, ?, '{}', 2, 0)",
+        )
+        .bind([3_u8; 16].as_slice())
+        .bind([9_u8; 32].as_slice())
+        .bind(ORCHESTRATION_NAME)
+        .bind(ORCHESTRATION_VERSION)
+        .bind("cancel-task:fixture")
         .execute(storage.pool())
         .await
         .unwrap();
@@ -441,7 +475,17 @@ mod tests {
                 .fetch_one(storage.pool())
                 .await
                 .unwrap(),
-            2
+            3
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT orchestration_name FROM sporos_outbox WHERE instance_id = ?",
+            )
+            .bind(&accepted.instance_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap(),
+            FAKE_TASK_NAME
         );
     }
 
@@ -462,8 +506,20 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let accepted = request_cancel(&storage, &client, [7; 16], 3).await.unwrap();
+        let accepted = request_cancel(&storage, [7; 16], 3).await.unwrap();
         assert!(!accepted.duplicate);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM sporos_task WHERE id = ?")
+                .bind([7_u8; 16].as_slice())
+                .fetch_one(storage.pool())
+                .await
+                .unwrap(),
+            "cancellation_requested"
+        );
+        OutboxDispatcher::new(&storage, client.clone(), 10)
+            .run_once(4)
+            .await
+            .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let state =

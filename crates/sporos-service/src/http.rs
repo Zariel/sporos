@@ -12,7 +12,6 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use duroxide::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -47,7 +46,6 @@ pub struct HttpState {
     prowlarr_configured: bool,
     prowlarr_client: Option<ProwlarrClient>,
     data_roots: std::collections::BTreeSet<String>,
-    task_client: Client,
     upload_permits: Arc<Semaphore>,
     autobrr_body_limit_bytes: usize,
 }
@@ -59,7 +57,6 @@ impl HttpState {
         prowlarr_client: Option<ProwlarrClient>,
     ) -> Self {
         Self {
-            task_client: Client::new(storage.duroxide_provider()),
             storage,
             webhook_token: config.auth.webhook_token.clone(),
             admin_token: config.auth.admin_token.clone(),
@@ -1325,10 +1322,9 @@ async fn cancel_task(
     Path(task_id): Path<String>,
 ) -> Result<(StatusCode, Json<TaskActionResponse>), Problem> {
     let id = task_action_id(&task_id, request_id.clone())?;
-    let accepted =
-        crate::task_control::request_cancel(&state.storage, &state.task_client, id, now_ms())
-            .await
-            .map_err(|error| task_control_problem(error, request_id))?;
+    let accepted = crate::task_control::request_cancel(&state.storage, id, now_ms())
+        .await
+        .map_err(|error| task_control_problem(error, request_id))?;
     Ok((
         if accepted.duplicate {
             StatusCode::OK
@@ -1380,7 +1376,8 @@ fn task_control_problem(
         ),
         TaskControlError::Database(_)
         | TaskControlError::Duroxide(_)
-        | TaskControlError::GenerationRange => Problem::new(
+        | TaskControlError::GenerationRange
+        | TaskControlError::EncodeCancellation(_) => Problem::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "task_control_failed",
             "Task control failed",
@@ -2118,7 +2115,6 @@ mod tests {
             .expect("open storage"),
         );
         let state = HttpState {
-            task_client: Client::new(storage.duroxide_provider()),
             storage,
             webhook_token: Secret::new("webhook"),
             admin_token: Secret::new("admin"),
