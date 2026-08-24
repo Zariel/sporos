@@ -401,6 +401,13 @@ mod tests {
             metrics: Metrics::default(),
             qbittorrent: None,
             arr: Vec::new(),
+            sources: crate::config::SourceFilters::default(),
+            matching: crate::config::Matching::default(),
+            injection: crate::config::Injection::default(),
+            paths: crate::config::Paths {
+                link_root: directory.path().join("links"),
+                rewrite: Vec::new(),
+            },
         };
         let lock_path = config.runtime.lock_path.clone();
         let database_path = config.runtime.database_path.clone();

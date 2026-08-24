@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use reqwest::Url;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sporos_model::MatchingPolicy;
 use thiserror::Error;
 
 const DEFAULT_PATH: &str = "/config/sporos.toml";
@@ -49,6 +50,10 @@ pub struct Config {
     pub metrics: Metrics,
     pub qbittorrent: Option<Qbittorrent>,
     pub arr: Vec<ArrInstance>,
+    pub sources: SourceFilters,
+    pub matching: Matching,
+    pub injection: Injection,
+    pub paths: Paths,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,30 +290,88 @@ struct ArrConfig {
     radarr: BTreeMap<String, ServiceConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct PathsConfig {
     link_root: Option<PathBuf>,
     rewrite: Vec<PathRewrite>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PathRewrite {
-    name: String,
-    remote: PathBuf,
-    local: PathBuf,
-    services: Vec<String>,
+impl Default for PathsConfig {
+    fn default() -> Self {
+        Self {
+            link_root: Some(PathBuf::from("/data/links")),
+            rewrite: Vec::new(),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRewrite {
+    pub name: String,
+    pub remote: PathBuf,
+    pub local: PathBuf,
+    pub services: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Paths {
+    pub link_root: PathBuf,
+    pub rewrite: Vec<PathRewrite>,
+}
+
+impl Default for Paths {
+    fn default() -> Self {
+        Self {
+            link_root: PathBuf::from("/data/links"),
+            rewrite: Vec::new(),
+        }
+    }
+}
+
+impl Paths {
+    pub fn qbit_link_root(&self) -> PathBuf {
+        self.rewrite
+            .iter()
+            .filter(|rewrite| {
+                rewrite
+                    .services
+                    .iter()
+                    .any(|service| service == "qbittorrent")
+                    && self.link_root.starts_with(&rewrite.local)
+            })
+            .max_by_key(|rewrite| rewrite.local.components().count())
+            .and_then(|rewrite| {
+                self.link_root
+                    .strip_prefix(&rewrite.local)
+                    .ok()
+                    .map(|suffix| rewrite.remote.join(suffix))
+            })
+            .unwrap_or_else(|| self.link_root.clone())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct SourceFilters {
-    include_categories: Vec<String>,
-    exclude_categories: Vec<String>,
-    include_tags: Vec<String>,
-    exclude_tags: Vec<String>,
-    exclude_sporos_managed: bool,
+pub struct SourceFilters {
+    pub include_categories: Vec<String>,
+    pub exclude_categories: Vec<String>,
+    pub include_tags: Vec<String>,
+    pub exclude_tags: Vec<String>,
+    pub exclude_sporos_managed: bool,
+}
+
+impl Default for SourceFilters {
+    fn default() -> Self {
+        Self {
+            include_categories: Vec::new(),
+            exclude_categories: Vec::new(),
+            include_tags: Vec::new(),
+            exclude_tags: vec!["no-sporos".to_owned()],
+            exclude_sporos_managed: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +387,22 @@ struct MatchingConfig {
     pending_source_timeout: Duration,
     video_extensions: Vec<String>,
     optional_extensions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Matching {
+    pub policy: MatchingPolicy,
+    pub preflight_size_tolerance: f64,
+    pub max_torrent_bytes: usize,
+    pub max_files_per_torrent: usize,
+    pub max_path_bytes: usize,
+    pub pending_source_timeout: Duration,
+}
+
+impl Default for Matching {
+    fn default() -> Self {
+        matching(&MatchingConfig::default()).expect("default matching configuration is valid")
+    }
 }
 
 impl Default for MatchingConfig {
@@ -351,6 +430,28 @@ struct InjectionConfig {
     inherit_source_category: bool,
     inherit_source_tags: bool,
     resume: ResumeConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Injection {
+    pub dry_run: bool,
+    pub category_template: String,
+    pub tag_templates: Vec<String>,
+    pub inherit_source_category: bool,
+    pub inherit_source_tags: bool,
+}
+
+impl Default for Injection {
+    fn default() -> Self {
+        let raw = InjectionConfig::default();
+        Self {
+            dry_run: raw.dry_run,
+            category_template: raw.category_template,
+            tag_templates: raw.tag_templates,
+            inherit_source_category: raw.inherit_source_category,
+            inherit_source_tags: raw.inherit_source_tags,
+        }
+    }
 }
 
 impl Default for InjectionConfig {
@@ -448,6 +549,23 @@ fn load(
 
     let raw: RawConfig = value.try_into()?;
     validate_positive(&raw)?;
+    let matching = matching(&raw.matching)?;
+    let injection = Injection {
+        dry_run: raw.injection.dry_run,
+        category_template: raw.injection.category_template.clone(),
+        tag_templates: raw.injection.tag_templates.clone(),
+        inherit_source_category: raw.injection.inherit_source_category,
+        inherit_source_tags: raw.injection.inherit_source_tags,
+    };
+    let paths = Paths {
+        link_root: raw
+            .paths
+            .link_root
+            .clone()
+            .expect("default paths include a link root"),
+        rewrite: raw.paths.rewrite.clone(),
+    };
+    validate_paths(&paths)?;
     let webhook_token = resolve_secret(
         "auth.webhook_token",
         raw.auth.webhook_token,
@@ -518,7 +636,93 @@ fn load(
         metrics: raw.metrics,
         qbittorrent,
         arr,
+        sources: raw.sources,
+        matching,
+        injection,
+        paths,
     })
+}
+
+fn validate_paths(paths: &Paths) -> Result<(), ConfigError> {
+    if !paths.link_root.is_absolute() {
+        return Err(ConfigError::AbsolutePath("paths.link_root"));
+    }
+    for rewrite in &paths.rewrite {
+        if rewrite.name.is_empty() || !rewrite.remote.is_absolute() || !rewrite.local.is_absolute()
+        {
+            return Err(ConfigError::PathRewrite);
+        }
+    }
+    for (index, left) in paths.rewrite.iter().enumerate() {
+        if paths.rewrite[index + 1..].iter().any(|right| {
+            left.local == right.local
+                && left
+                    .services
+                    .iter()
+                    .any(|service| right.services.contains(service))
+        }) {
+            return Err(ConfigError::AmbiguousPathRewrite);
+        }
+    }
+    Ok(())
+}
+
+fn matching(config: &MatchingConfig) -> Result<Matching, ConfigError> {
+    let (allow_flexible, allow_partial) = match config.mode.as_str() {
+        "strict" => (false, false),
+        "flexible" => (true, false),
+        "partial" => (true, true),
+        _ => return Err(ConfigError::MatchingMode),
+    };
+    if !(0.0..=1.0).contains(&config.preflight_size_tolerance) {
+        return Err(ConfigError::PreflightTolerance);
+    }
+    let defaults = MatchingPolicy::default();
+    Ok(Matching {
+        policy: MatchingPolicy {
+            allow_flexible,
+            allow_partial,
+            allow_season_from_episodes: config.season_from_episodes,
+            primary_video_extensions: if config.video_extensions.is_empty() {
+                defaults.primary_video_extensions
+            } else {
+                normalized_extensions(&config.video_extensions)?
+            },
+            optional_extensions: if config.optional_extensions.is_empty() {
+                defaults.optional_extensions
+            } else {
+                normalized_extensions(&config.optional_extensions)?
+            },
+            optional_path_components: defaults.optional_path_components,
+        },
+        preflight_size_tolerance: config.preflight_size_tolerance,
+        max_torrent_bytes: config.max_torrent_bytes,
+        max_files_per_torrent: config.max_files_per_torrent,
+        max_path_bytes: config.max_path_bytes,
+        pending_source_timeout: config.pending_source_timeout,
+    })
+}
+
+fn normalized_extensions(values: &[String]) -> Result<Vec<String>, ConfigError> {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value
+            .strip_prefix('.')
+            .unwrap_or(value)
+            .to_ascii_lowercase();
+        if value.is_empty()
+            || value.len() > 16
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ConfigError::FileExtension);
+        }
+        if !normalized.contains(&value) {
+            normalized.push(value);
+        }
+    }
+    Ok(normalized)
 }
 
 fn validate_positive(config: &RawConfig) -> Result<(), ConfigError> {
@@ -554,6 +758,15 @@ fn validate_positive(config: &RawConfig) -> Result<(), ConfigError> {
             "limits.internal_channel_capacity",
             config.limits.internal_channel_capacity,
         ),
+        (
+            "matching.max_torrent_bytes",
+            config.matching.max_torrent_bytes,
+        ),
+        (
+            "matching.max_files_per_torrent",
+            config.matching.max_files_per_torrent,
+        ),
+        ("matching.max_path_bytes", config.matching.max_path_bytes),
     ];
     if let Some(qbittorrent) = &config.qbittorrent {
         values.extend([
@@ -593,6 +806,27 @@ fn validate_positive(config: &RawConfig) -> Result<(), ConfigError> {
             if value.is_zero() {
                 return Err(ConfigError::ZeroLimit(field));
             }
+        }
+    }
+    for (field, value, maximum) in [
+        (
+            "matching.max_torrent_bytes",
+            config.matching.max_torrent_bytes,
+            64 * 1024 * 1024,
+        ),
+        (
+            "matching.max_files_per_torrent",
+            config.matching.max_files_per_torrent,
+            1_000_000,
+        ),
+        (
+            "matching.max_path_bytes",
+            config.matching.max_path_bytes,
+            16_384,
+        ),
+    ] {
+        if value > maximum {
+            return Err(ConfigError::LimitTooLarge { field, maximum });
         }
     }
     if let Some((field, _)) = values.into_iter().find(|(_, value)| *value == 0) {
@@ -731,6 +965,18 @@ pub enum ConfigError {
     LimitTooLarge { field: &'static str, maximum: usize },
     #[error("invalid qBittorrent URL")]
     QbittorrentUrl,
+    #[error("matching.mode must be strict, flexible, or partial")]
+    MatchingMode,
+    #[error("matching.preflight_size_tolerance must be between zero and one")]
+    PreflightTolerance,
+    #[error("matching file extensions must be short alphanumeric values")]
+    FileExtension,
+    #[error("{0} must be an absolute path")]
+    AbsolutePath(&'static str),
+    #[error("path rewrites require a name and absolute local and remote prefixes")]
+    PathRewrite,
+    #[error("path rewrites cannot have equal local prefixes for the same service")]
+    AmbiguousPathRewrite,
     #[error("invalid {kind} URL for Arr instance {name}")]
     ArrUrl { kind: &'static str, name: String },
     #[error("{0} must specify either a direct value or a file")]
@@ -885,6 +1131,66 @@ mod tests {
         assert_eq!(qbittorrent.inventory_batch_size, 400);
         assert_eq!(qbittorrent.database_batch_size, 100);
         assert!(!format!("{qbittorrent:?}").contains(qbittorrent.api_key.expose()));
+    }
+
+    #[test]
+    fn loads_typed_candidate_policy() {
+        let config = load_config(
+            r#"
+                [auth]
+                webhook_token = "webhook"
+                admin_token = "admin"
+                [sources]
+                include_categories = ["tv"]
+                [matching]
+                mode = "flexible"
+                season_from_episodes = false
+                preflight_size_tolerance = 0.05
+                video_extensions = [".MKV", "mp4"]
+                [injection]
+                dry_run = true
+                [paths]
+                link_root = "/srv/sporos/links"
+                [[paths.rewrite]]
+                name = "qbit"
+                local = "/srv/sporos"
+                remote = "/downloads/sporos"
+                services = ["qbittorrent"]
+            "#,
+        )
+        .expect("load candidate policy");
+
+        assert_eq!(config.sources.include_categories, ["tv"]);
+        assert!(config.sources.exclude_sporos_managed);
+        assert!(config.matching.policy.allow_flexible);
+        assert!(!config.matching.policy.allow_partial);
+        assert!(!config.matching.policy.allow_season_from_episodes);
+        assert_eq!(
+            config.matching.policy.primary_video_extensions,
+            ["mkv", "mp4"]
+        );
+        assert_eq!(config.matching.preflight_size_tolerance, 0.05);
+        assert!(config.injection.dry_run);
+        assert_eq!(
+            config.paths.qbit_link_root(),
+            Path::new("/downloads/sporos/links")
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_or_unknown_candidate_policy() {
+        for invalid in [
+            "[matching]\nmode = \"guess\"",
+            "[matching]\npreflight_size_tolerance = 1.1",
+            "[matching]\nmax_torrent_bytes = 67108865",
+            "[matching]\nvideo_extensions = [\"../mkv\"]",
+            "[paths]\nlink_root = \"relative\"",
+        ] {
+            let config = format!(
+                "[auth]\nwebhook_token = \"webhook\"\nadmin_token = \"admin\"\n{invalid}\n"
+            );
+            assert!(load_config(&config).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]
