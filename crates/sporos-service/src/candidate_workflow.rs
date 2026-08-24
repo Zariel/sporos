@@ -119,12 +119,18 @@ impl Storage {
             }
         }
 
-        let decision = PureMatcher.evaluate(&MatchRequest {
+        let mut decision = PureMatcher.evaluate(&MatchRequest {
             candidate: &loaded.manifest,
             candidate_release: &loaded.release,
             sources: &available,
             policy: &loaded.policy.matching,
         });
+        if loaded.manifest.hashes.v2.is_some()
+            && !loaded.policy.injection.dry_run
+            && decision.outcome == MatchOutcome::Match
+        {
+            fail_closed_for_live_v2(&mut decision);
+        }
         if decision.outcome == MatchOutcome::NoMatch && !waiting.is_empty() {
             let deadline = loaded.deadline()?;
             if now < deadline {
@@ -530,6 +536,16 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+fn fail_closed_for_live_v2(decision: &mut MatchDecision) {
+    decision.outcome = MatchOutcome::Rejected;
+    decision.mode = None;
+    decision.reason = sporos_model::MatchReason::UnsupportedTorrent;
+    decision.source_ids.clear();
+    decision.mappings.clear();
+    decision.mapped_bytes = 0;
+    decision.requires_recheck = false;
 }
 
 async fn persist_plan(
@@ -950,6 +966,55 @@ mod tests {
             EvaluationResult::Terminal { ref state, plan_id: None, .. } if state == "rejected"
         ));
         assert_eq!(count(&storage, "sporos_injection_plan").await, 0);
+    }
+
+    #[tokio::test]
+    async fn live_v2_and_hybrid_candidates_fail_closed() {
+        for hybrid in [false, true] {
+            let directory = TempDir::new().expect("temporary directory");
+            let storage = open(&directory).await;
+            project_source(&storage, true, 13, 1).await;
+            let input = accept_with(
+                &storage,
+                directory.path(),
+                10,
+                Injection {
+                    dry_run: false,
+                    ..Injection::default()
+                },
+            )
+            .await;
+            let manifest_json = sqlx::query_scalar::<_, String>(
+                "SELECT manifest_json FROM sporos_candidate WHERE id = ?",
+            )
+            .bind(input.candidate_id.as_slice())
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+            let mut manifest: TorrentManifest = serde_json::from_str(&manifest_json).unwrap();
+            manifest.hashes.v2 = Some([2; 32]);
+            if !hybrid {
+                manifest.hashes.v1 = None;
+            }
+            sqlx::query("UPDATE sporos_candidate SET manifest_json = ? WHERE id = ?")
+                .bind(serde_json::to_string(&manifest).unwrap())
+                .bind(input.candidate_id.as_slice())
+                .execute(storage.pool())
+                .await
+                .unwrap();
+
+            let result = storage.evaluate_candidate(&input, 20).await.unwrap();
+            assert!(matches!(
+                result,
+                EvaluationResult::Terminal {
+                    ref state,
+                    ref reason_code,
+                    plan_id: None,
+                    ..
+                } if state == "rejected" && reason_code == "unsupported_torrent"
+            ));
+            assert_eq!(count(&storage, "sporos_injection_plan").await, 0);
+        }
     }
 
     #[tokio::test]
