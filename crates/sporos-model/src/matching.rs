@@ -167,6 +167,30 @@ pub struct MatchingPolicy {
     pub primary_video_extensions: Vec<String>,
     pub optional_extensions: Vec<String>,
     pub optional_path_components: Vec<String>,
+    #[serde(default = "default_max_assignment_files")]
+    pub max_assignment_files: usize,
+    #[serde(default = "default_max_candidate_edges")]
+    pub max_candidate_edges: usize,
+    #[serde(default = "default_max_assignment_component_files")]
+    pub max_assignment_component_files: usize,
+    #[serde(default = "default_max_assignment_operations")]
+    pub max_assignment_operations: u64,
+}
+
+const fn default_max_assignment_files() -> usize {
+    4_096
+}
+
+const fn default_max_candidate_edges() -> usize {
+    100_000
+}
+
+const fn default_max_assignment_component_files() -> usize {
+    128
+}
+
+const fn default_max_assignment_operations() -> u64 {
+    50_000_000
 }
 
 impl Default for MatchingPolicy {
@@ -191,6 +215,10 @@ impl Default for MatchingPolicy {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            max_assignment_files: default_max_assignment_files(),
+            max_candidate_edges: default_max_candidate_edges(),
+            max_assignment_component_files: default_max_assignment_component_files(),
+            max_assignment_operations: default_max_assignment_operations(),
         }
     }
 }
@@ -235,6 +263,7 @@ pub enum MatchReason {
     UnsupportedTorrent,
     UnsafeTorrentPath,
     HardlinkDeviceMismatch,
+    MatcherBudgetExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

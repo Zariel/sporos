@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sporos_model::{
     FileMapping, LocalSourceFile, LocalSourceManifest, MatchDecision, MatchEvidence, MatchMode,
@@ -104,7 +104,12 @@ enum SourceEvaluation {
 fn evaluate_source(request: &MatchRequest<'_>, source: &LocalSourceManifest) -> SourceEvaluation {
     let candidate_files = candidate_files(request.candidate);
     let source_files: Vec<_> = source.files.iter().map(|file| (source.id, file)).collect();
-    let assignment = assign(&candidate_files, &source_files, request.policy);
+    let assignment = match assign(&candidate_files, &source_files, request.policy) {
+        Ok(assignment) => assignment,
+        Err(AssignmentError::BudgetExceeded) => {
+            return SourceEvaluation::NoMatch(MatchReason::MatcherBudgetExceeded);
+        }
+    };
     if assignment.ambiguous {
         return SourceEvaluation::Ambiguous;
     }
@@ -173,7 +178,12 @@ fn evaluate_season(
         return SourceEvaluation::NoMatch(MatchReason::NoPrimaryVideoOverlap);
     }
     let candidate_files = candidate_files(request.candidate);
-    let assignment = assign_season(&candidate_files, &episode_sources, request.policy);
+    let assignment = match assign_season(&candidate_files, &episode_sources, request.policy) {
+        Ok(assignment) => assignment,
+        Err(AssignmentError::BudgetExceeded) => {
+            return SourceEvaluation::NoMatch(MatchReason::MatcherBudgetExceeded);
+        }
+    };
     if assignment.ambiguous {
         return SourceEvaluation::Ambiguous;
     }
@@ -206,16 +216,20 @@ fn candidate_files(manifest: &TorrentManifest) -> Vec<&TorrentFile> {
 }
 
 struct Assignment {
-    pairs: Vec<(usize, usize)>,
-    scores: Vec<Vec<Option<u32>>>,
+    pairs: Vec<(usize, usize, u32)>,
     ambiguous: bool,
+}
+
+#[derive(Debug)]
+enum AssignmentError {
+    BudgetExceeded,
 }
 
 fn assign(
     candidates: &[&TorrentFile],
     sources: &[(SourceId, &LocalSourceFile)],
     policy: &MatchingPolicy,
-) -> Assignment {
+) -> Result<Assignment, AssignmentError> {
     assign_with(candidates, sources, policy, |candidate, source, policy| {
         edge_score(candidate, source, policy, false)
     })
@@ -225,7 +239,7 @@ fn assign_season(
     candidates: &[&TorrentFile],
     sources: &[(SourceId, &LocalSourceFile)],
     policy: &MatchingPolicy,
-) -> Assignment {
+) -> Result<Assignment, AssignmentError> {
     assign_with(candidates, sources, policy, |candidate, source, policy| {
         edge_score(candidate, source, policy, true)
     })
@@ -236,21 +250,45 @@ fn assign_with(
     sources: &[(SourceId, &LocalSourceFile)],
     policy: &MatchingPolicy,
     score: impl Fn(&TorrentFile, &LocalSourceFile, &MatchingPolicy) -> Option<u32>,
-) -> Assignment {
-    let raw: Vec<Vec<Option<u32>>> = candidates
-        .iter()
-        .map(|candidate| {
-            sources
-                .iter()
-                .map(|(_, source)| score(candidate, source, policy))
-                .collect()
-        })
-        .collect();
+) -> Result<Assignment, AssignmentError> {
+    let mut source_buckets: BTreeMap<BucketKey, Vec<usize>> = BTreeMap::new();
+    for (index, (_, source)) in sources.iter().enumerate() {
+        source_buckets
+            .entry(bucket(
+                source.size,
+                &source.path,
+                primary_path(&source.path, policy),
+            ))
+            .or_default()
+            .push(index);
+    }
+    let mut edges = vec![Vec::new(); candidates.len()];
+    let mut reverse = vec![Vec::new(); sources.len()];
+    let mut edge_count = 0_usize;
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let key = bucket(candidate.size, &candidate.path, primary(candidate, policy));
+        for &source_index in source_buckets.get(&key).into_iter().flatten() {
+            if let Some(value) = score(candidate, sources[source_index].1, policy) {
+                edge_count = edge_count
+                    .checked_add(1)
+                    .ok_or(AssignmentError::BudgetExceeded)?;
+                if edge_count > policy.max_candidate_edges {
+                    return Err(AssignmentError::BudgetExceeded);
+                }
+                edges[candidate_index].push((source_index, value));
+                reverse[source_index].push(candidate_index);
+            }
+        }
+    }
+    let relevant_sources = reverse.iter().filter(|edges| !edges.is_empty()).count();
+    if candidates.len() + relevant_sources > policy.max_assignment_files {
+        return Err(AssignmentError::BudgetExceeded);
+    }
     let score_unit = u128::from(
-        raw.iter()
+        edges
+            .iter()
             .flatten()
-            .filter_map(|score| *score)
-            .map(u64::from)
+            .map(|(_, score)| u64::from(*score))
             .sum::<u64>(),
     ) + 1;
     let primary_bytes = candidates
@@ -260,40 +298,132 @@ fn assign_with(
             total + u128::from(candidate.size)
         });
     let required_unit = (primary_bytes + 1) * score_unit;
-    let weights: Vec<Vec<Option<u128>>> = raw
-        .iter()
-        .enumerate()
-        .map(|(candidate_index, scores)| {
-            scores
-                .iter()
-                .map(|score| {
-                    score.map(|score| {
-                        u128::from(score)
-                            + if primary(candidates[candidate_index], policy) {
-                                u128::from(candidates[candidate_index].size) * score_unit
-                            } else {
-                                0
-                            }
-                            + if required(candidates[candidate_index], policy) {
-                                required_unit
-                            } else {
-                                0
-                            }
-                    })
-                })
-                .collect()
-        })
-        .collect();
-    let (total, pairs) = optimal_assignment(&weights, None);
-    let ambiguous = pairs.iter().any(|&(candidate, source)| {
-        let (alternative, _) = optimal_assignment(&weights, Some((candidate, source)));
-        alternative == total
-    });
-    Assignment {
-        pairs,
-        scores: raw,
-        ambiguous,
+    let mut candidate_seen = vec![false; candidates.len()];
+    let mut source_seen = vec![false; sources.len()];
+    let mut pairs = Vec::new();
+    let mut operations = 0_u128;
+    for start in 0..candidates.len() {
+        if candidate_seen[start] || edges[start].is_empty() {
+            continue;
+        }
+        let (component_candidates, component_sources) = component(
+            start,
+            &edges,
+            &reverse,
+            &mut candidate_seen,
+            &mut source_seen,
+        );
+        if component_candidates.len() + component_sources.len()
+            > policy.max_assignment_component_files
+            || component_candidates.len() + component_sources.len() > policy.max_assignment_files
+        {
+            return Err(AssignmentError::BudgetExceeded);
+        }
+        let rows = component_candidates.len() as u128;
+        let columns = (component_sources.len() + component_candidates.len()) as u128;
+        let alternatives = component_candidates.len().min(component_sources.len()) as u128 + 1;
+        operations = operations.saturating_add(alternatives * rows * rows * columns);
+        if operations > u128::from(policy.max_assignment_operations) {
+            return Err(AssignmentError::BudgetExceeded);
+        }
+        let source_positions: BTreeMap<_, _> = component_sources
+            .iter()
+            .enumerate()
+            .map(|(position, source)| (*source, position))
+            .collect();
+        let mut raw = vec![vec![None; component_sources.len()]; component_candidates.len()];
+        let mut weights = vec![vec![None; component_sources.len()]; component_candidates.len()];
+        for (row, &candidate_index) in component_candidates.iter().enumerate() {
+            for &(source_index, value) in &edges[candidate_index] {
+                let column = source_positions[&source_index];
+                raw[row][column] = Some(value);
+                weights[row][column] = Some(
+                    u128::from(value)
+                        + if primary(candidates[candidate_index], policy) {
+                            u128::from(candidates[candidate_index].size) * score_unit
+                        } else {
+                            0
+                        }
+                        + if required(candidates[candidate_index], policy) {
+                            required_unit
+                        } else {
+                            0
+                        },
+                );
+            }
+        }
+        let (total, selected) = optimal_assignment(&weights, None);
+        if selected.iter().any(|&(candidate, source)| {
+            let (alternative, _) = optimal_assignment(&weights, Some((candidate, source)));
+            alternative == total
+        }) {
+            return Ok(Assignment {
+                pairs: Vec::new(),
+                ambiguous: true,
+            });
+        }
+        pairs.extend(selected.into_iter().map(|(candidate, source)| {
+            (
+                component_candidates[candidate],
+                component_sources[source],
+                raw[candidate][source].expect("selected edge has a score"),
+            )
+        }));
     }
+    Ok(Assignment {
+        pairs,
+        ambiguous: false,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BucketKey {
+    size: u64,
+    primary: bool,
+    extension: Option<String>,
+}
+
+fn bucket(size: u64, path: &str, primary: bool) -> BucketKey {
+    BucketKey {
+        size,
+        primary,
+        extension: (!primary).then(|| extension(path).unwrap_or("").to_ascii_lowercase()),
+    }
+}
+
+fn component(
+    start: usize,
+    edges: &[Vec<(usize, u32)>],
+    reverse: &[Vec<usize>],
+    candidate_seen: &mut [bool],
+    source_seen: &mut [bool],
+) -> (Vec<usize>, Vec<usize>) {
+    let mut candidates = Vec::new();
+    let mut sources = Vec::new();
+    let mut queue = VecDeque::from([(true, start)]);
+    candidate_seen[start] = true;
+    while let Some((candidate_side, index)) = queue.pop_front() {
+        if candidate_side {
+            candidates.push(index);
+            for &(source, _) in &edges[index] {
+                if !source_seen[source] {
+                    source_seen[source] = true;
+                    queue.push_back((false, source));
+                }
+            }
+        } else {
+            sources.push(index);
+            for &candidate in &reverse[index] {
+                if !candidate_seen[candidate] {
+                    candidate_seen[candidate] = true;
+                    queue.push_back((true, candidate));
+                }
+            }
+        }
+    }
+    candidates.sort_unstable();
+    sources.sort_unstable();
+    (candidates, sources)
 }
 
 fn optimal_assignment(
@@ -468,8 +598,7 @@ fn build_mappings(
     let mut mappings: Vec<_> = assignment
         .pairs
         .iter()
-        .map(|&(candidate_index, source_index)| {
-            let score = assignment.scores[candidate_index][source_index].unwrap_or(SCORE_ROLE);
+        .map(|&(candidate_index, source_index, score)| {
             let candidate = candidates[candidate_index];
             let (source_id, source) = sources[source_index];
             FileMapping {
@@ -814,6 +943,7 @@ fn file_failure_reason(
 
 fn best_reason(reasons: &[MatchReason]) -> MatchReason {
     const PRIORITY: &[MatchReason] = &[
+        MatchReason::MatcherBudgetExceeded,
         MatchReason::SeriesConflict,
         MatchReason::MediaTypeConflict,
         MatchReason::SeasonConflict,
@@ -867,12 +997,125 @@ fn no_match(
 
 #[cfg(test)]
 mod tests {
-    use super::hungarian;
+    use sporos_model::{LocalSourceFile, MatchingPolicy, SourceId, TorrentFile};
+
+    use super::{AssignmentError, assign, hungarian};
 
     #[test]
     fn rectangular_assignment_can_leave_rows_unmatched() {
         let assignment = hungarian(&[vec![-10, 0, 0], vec![-5, 0, 0]]);
         assert_eq!(assignment[0], 0);
         assert_ne!(assignment[1], 0);
+    }
+
+    #[test]
+    fn repeated_episode_sizes_split_into_sparse_components() {
+        let candidates: Vec<_> = (0..50)
+            .map(|index| candidate(index, &format!("Show.S01E{index:02}.mkv"), 100))
+            .collect();
+        let sources: Vec<_> = (0..50)
+            .map(|index| source(index, &format!("Other.Show.S01E{index:02}.mkv"), 100))
+            .collect();
+        let candidate_refs: Vec<_> = candidates.iter().collect();
+        let source_refs: Vec<_> = sources
+            .iter()
+            .map(|file| (SourceId::from_bytes([1; 16]), file))
+            .collect();
+        let policy = MatchingPolicy {
+            max_assignment_component_files: 4,
+            ..MatchingPolicy::default()
+        };
+
+        let assignment = assign(&candidate_refs, &source_refs, &policy).expect("sparse assignment");
+        assert_eq!(assignment.pairs.len(), 50);
+    }
+
+    #[test]
+    fn identical_sidecars_stop_at_the_edge_budget() {
+        let candidates: Vec<_> = (0..20)
+            .map(|index| candidate(index, &format!("candidate-{index}/same.srt"), 10))
+            .collect();
+        let sources: Vec<_> = (0..20)
+            .map(|index| source(index, &format!("source-{index}/same.srt"), 10))
+            .collect();
+        let candidate_refs: Vec<_> = candidates.iter().collect();
+        let source_refs: Vec<_> = sources
+            .iter()
+            .map(|file| (SourceId::from_bytes([1; 16]), file))
+            .collect();
+        let policy = MatchingPolicy {
+            max_candidate_edges: 100,
+            ..MatchingPolicy::default()
+        };
+
+        assert!(matches!(
+            assign(&candidate_refs, &source_refs, &policy),
+            Err(AssignmentError::BudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn irrelevant_source_files_do_not_enter_assignment() {
+        let candidates: Vec<_> = (0..1_000)
+            .map(|index| candidate(index, &format!("candidate-{index}.mkv"), 10))
+            .collect();
+        let sources: Vec<_> = (0..5_000)
+            .map(|index| source(index, &format!("source-{index}.mkv"), 11))
+            .collect();
+        let candidate_refs: Vec<_> = candidates.iter().collect();
+        let source_refs: Vec<_> = sources
+            .iter()
+            .map(|file| (SourceId::from_bytes([1; 16]), file))
+            .collect();
+        let policy = MatchingPolicy {
+            max_assignment_files: 1_100,
+            ..MatchingPolicy::default()
+        };
+
+        let assignment = assign(&candidate_refs, &source_refs, &policy).expect("empty assignment");
+        assert!(assignment.pairs.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_components_stop_at_the_component_budget() {
+        let candidates: Vec<_> = (0..5)
+            .map(|index| candidate(index, &format!("candidate-{index}.mkv"), 10))
+            .collect();
+        let sources: Vec<_> = (0..5)
+            .map(|index| source(index, &format!("source-{index}.mkv"), 10))
+            .collect();
+        let candidate_refs: Vec<_> = candidates.iter().collect();
+        let source_refs: Vec<_> = sources
+            .iter()
+            .map(|file| (SourceId::from_bytes([1; 16]), file))
+            .collect();
+        let policy = MatchingPolicy {
+            max_assignment_component_files: 8,
+            ..MatchingPolicy::default()
+        };
+
+        assert!(matches!(
+            assign(&candidate_refs, &source_refs, &policy),
+            Err(AssignmentError::BudgetExceeded)
+        ));
+    }
+
+    fn candidate(ordinal: u32, path: &str, size: u64) -> TorrentFile {
+        TorrentFile {
+            ordinal,
+            path: path.to_owned(),
+            size,
+            padding: false,
+        }
+    }
+
+    fn source(id: u32, path: &str, size: u64) -> LocalSourceFile {
+        LocalSourceFile {
+            id: u64::from(id),
+            path: path.to_owned(),
+            size,
+            device_id: None,
+            inode: None,
+        }
     }
 }

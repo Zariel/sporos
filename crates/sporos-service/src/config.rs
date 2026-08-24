@@ -450,6 +450,10 @@ struct MatchingConfig {
     max_torrent_bytes: usize,
     max_files_per_torrent: usize,
     max_path_bytes: usize,
+    max_assignment_files: usize,
+    max_candidate_edges: usize,
+    max_assignment_component_files: usize,
+    max_assignment_operations: u64,
     #[serde(with = "duration")]
     pending_source_timeout: Duration,
     video_extensions: Vec<String>,
@@ -483,6 +487,10 @@ impl Default for MatchingConfig {
             max_torrent_bytes: 8 * 1024 * 1024,
             max_files_per_torrent: 100_000,
             max_path_bytes: 4096,
+            max_assignment_files: 4_096,
+            max_candidate_edges: 100_000,
+            max_assignment_component_files: 128,
+            max_assignment_operations: 50_000_000,
             pending_source_timeout: Duration::from_secs(7 * 24 * 60 * 60),
             video_extensions: Vec::new(),
             optional_extensions: Vec::new(),
@@ -883,6 +891,18 @@ fn matching(config: &MatchingConfig) -> Result<Matching, ConfigError> {
     if !(0.0..=1.0).contains(&config.preflight_size_tolerance) {
         return Err(ConfigError::PreflightTolerance);
     }
+    if config.max_assignment_files == 0
+        || config.max_assignment_files > 100_000
+        || config.max_candidate_edges == 0
+        || config.max_candidate_edges > 1_000_000
+        || config.max_assignment_component_files == 0
+        || config.max_assignment_component_files > 1_024
+        || config.max_assignment_component_files > config.max_assignment_files
+        || config.max_assignment_operations == 0
+        || config.max_assignment_operations > 1_000_000_000
+    {
+        return Err(ConfigError::MatcherBudget);
+    }
     let defaults = MatchingPolicy::default();
     Ok(Matching {
         policy: MatchingPolicy {
@@ -900,6 +920,10 @@ fn matching(config: &MatchingConfig) -> Result<Matching, ConfigError> {
                 normalized_extensions(&config.optional_extensions)?
             },
             optional_path_components: defaults.optional_path_components,
+            max_assignment_files: config.max_assignment_files,
+            max_candidate_edges: config.max_candidate_edges,
+            max_assignment_component_files: config.max_assignment_component_files,
+            max_assignment_operations: config.max_assignment_operations,
         },
         preflight_size_tolerance: config.preflight_size_tolerance,
         max_torrent_bytes: config.max_torrent_bytes,
@@ -1202,6 +1226,8 @@ pub enum ConfigError {
     MatchingMode,
     #[error("matching.preflight_size_tolerance must be between zero and one")]
     PreflightTolerance,
+    #[error("matching assignment budgets must be positive and internally consistent")]
+    MatcherBudget,
     #[error("matching file extensions must be short alphanumeric values")]
     FileExtension,
     #[error("{0} must be an absolute path")]
@@ -1457,6 +1483,10 @@ mod tests {
             "[matching]\nmode = \"guess\"",
             "[matching]\npreflight_size_tolerance = 1.1",
             "[matching]\nmax_torrent_bytes = 67108865",
+            "[matching]\nmax_assignment_files = 0",
+            "[matching]\nmax_assignment_files = 10\nmax_assignment_component_files = 11",
+            "[matching]\nmax_candidate_edges = 1000001",
+            "[matching]\nmax_assignment_operations = 1000000001",
             "[matching]\nvideo_extensions = [\"../mkv\"]",
             "[paths]\nlink_root = \"relative\"",
             "[injection.resume]\nmode = \"threshold\"",
