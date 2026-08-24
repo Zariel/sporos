@@ -718,6 +718,14 @@ fn injection(config: &InjectionConfig) -> Result<Injection, ConfigError> {
     {
         return Err(ConfigError::TemplateLimit);
     }
+    if crate::template::validate(&config.category_template).is_err()
+        || config
+            .tag_templates
+            .iter()
+            .any(|template| crate::template::validate(template).is_err())
+    {
+        return Err(ConfigError::TemplateSyntax);
+    }
     Ok(Injection {
         dry_run: config.dry_run,
         category_template: config.category_template.clone(),
@@ -1072,6 +1080,8 @@ pub enum ConfigError {
     AmbiguousPathRewrite,
     #[error("category and tag templates exceed their configured limits")]
     TemplateLimit,
+    #[error("category or tag template uses unsupported syntax or variables")]
+    TemplateSyntax,
     #[error("injection.resume.mode is invalid")]
     ResumeMode,
     #[error("injection.resume.combine must be and or or")]

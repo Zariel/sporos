@@ -18,6 +18,7 @@ pub mod qbit_sync;
 pub mod qbittorrent;
 pub mod storage;
 pub mod task_projection;
+mod template;
 pub mod torrent;
 pub mod torznab;
 

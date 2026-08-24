@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -152,10 +151,15 @@ impl Storage {
         input: &CandidateWorkflowInput,
     ) -> Result<LoadedCandidate, CandidateWorkflowError> {
         let row = sqlx::query(
-            "SELECT c.manifest_json, c.release_json, c.created_at, p.payload_json
+            "SELECT c.manifest_json, c.release_json, c.created_at, p.payload_json,
+                    cp.trigger, cp.indexer_id, cp.indexer_name
              FROM sporos_candidate c
              JOIN sporos_candidate_task ct ON ct.candidate_id = c.id
              JOIN sporos_policy_snapshot p ON p.id = ct.policy_snapshot_id
+             JOIN sporos_candidate_provenance cp ON cp.id = (
+                 SELECT MIN(first_cp.id) FROM sporos_candidate_provenance first_cp
+                 WHERE first_cp.candidate_id = c.id
+             )
              WHERE c.id = ? AND ct.task_id = ? AND ct.policy_snapshot_id = ?",
         )
         .bind(input.candidate_id.as_slice())
@@ -173,6 +177,9 @@ impl Storage {
             release: serde_json::from_str(&row.try_get::<String, _>("release_json")?)?,
             policy: serde_json::from_str(&row.try_get::<String, _>("payload_json")?)?,
             created_at: row.try_get("created_at")?,
+            trigger: row.try_get("trigger")?,
+            indexer_id: row.try_get("indexer_id")?,
+            indexer_name: row.try_get("indexer_name")?,
         })
     }
 
@@ -504,10 +511,73 @@ async fn persist_plan(
         .join(candidate_key)
         .to_string_lossy()
         .into_owned();
-    let category = loaded.policy.injection.category_template.clone();
-    let mut tags = loaded.policy.injection.tag_templates.clone();
-    let mut seen = BTreeSet::new();
-    tags.retain(|tag| !tag.is_empty() && seen.insert(tag.clone()));
+    let source = source_template_data(transaction, &decision.source_ids).await?;
+    let mut context = crate::template::TemplateContext::default();
+    context.insert("trigger", &loaded.trigger);
+    context.insert(
+        "indexer_id",
+        loaded
+            .indexer_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+    );
+    context.insert(
+        "indexer_name",
+        loaded.indexer_name.as_deref().unwrap_or_default(),
+    );
+    context.insert(
+        "indexer_slug",
+        crate::template::slug(loaded.indexer_name.as_deref().unwrap_or_default()),
+    );
+    context.insert(
+        "match_mode",
+        decision
+            .mode
+            .map(|mode| enum_text(&mode))
+            .transpose()?
+            .unwrap_or_default(),
+    );
+    context.insert("source_category", &source.category);
+    context.insert("source_kind", &source.kind);
+    context.insert("video_kind", enum_text(&loaded.release.kind)?);
+    context.insert(
+        "year",
+        loaded
+            .release
+            .year
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    context.insert(
+        "season",
+        loaded
+            .release
+            .season
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    context.insert(
+        "episode",
+        loaded
+            .release
+            .episode
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    let category = if loaded.policy.injection.inherit_source_category && !source.category.is_empty()
+    {
+        source.category
+    } else {
+        context.render_category(&loaded.policy.injection.category_template)?
+    };
+    let inherited_tags = loaded
+        .policy
+        .injection
+        .inherit_source_tags
+        .then_some(source.tags)
+        .into_iter()
+        .flatten();
+    let tags = context.render_tags(&loaded.policy.injection.tag_templates, inherited_tags)?;
     let tags_json = serde_json::to_string(&tags)?;
     let resume_policy_json = serde_json::to_string(&loaded.policy.injection.resume)?;
     let material = serde_json::to_vec(&serde_json::json!({
@@ -558,12 +628,51 @@ async fn persist_plan(
     Ok(plan_id)
 }
 
+async fn source_template_data(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    source_ids: &[SourceId],
+) -> Result<SourceTemplateData, CandidateWorkflowError> {
+    let mut ids = source_ids.to_vec();
+    ids.sort_unstable_by_key(|id| *id.as_bytes());
+    let mut category = String::new();
+    let mut tags = Vec::new();
+    for source_id in ids {
+        let row = sqlx::query("SELECT category, tags_json FROM sporos_qbit_torrent WHERE id = ?")
+            .bind(source_id.as_bytes().as_slice())
+            .fetch_optional(&mut **transaction)
+            .await?;
+        let Some(row) = row else {
+            continue;
+        };
+        if category.is_empty() {
+            category = row.try_get("category")?;
+        }
+        tags.extend(serde_json::from_str::<Vec<String>>(
+            &row.try_get::<String, _>("tags_json")?,
+        )?);
+    }
+    Ok(SourceTemplateData {
+        category,
+        tags,
+        kind: "qbittorrent_torrent".to_owned(),
+    })
+}
+
+struct SourceTemplateData {
+    category: String,
+    tags: Vec<String>,
+    kind: String,
+}
+
 struct LoadedCandidate {
     id: CandidateId,
     manifest: TorrentManifest,
     release: ReleaseDescriptor,
     policy: CandidatePolicy,
     created_at: i64,
+    trigger: String,
+    indexer_id: Option<i64>,
+    indexer_name: Option<String>,
 }
 
 impl LoadedCandidate {
@@ -685,6 +794,14 @@ pub enum CandidateWorkflowError {
     MatchCollision,
     #[error("plan identity refers to different content")]
     PlanCollision,
+    #[error("candidate template is invalid")]
+    Template,
+}
+
+impl From<crate::template::TemplateError> for CandidateWorkflowError {
+    fn from(_: crate::template::TemplateError) -> Self {
+        Self::Template
+    }
 }
 
 #[cfg(test)]
@@ -740,6 +857,40 @@ mod tests {
                 .starts_with("/qbit-links/")
         );
         assert_eq!(plan.get::<String, _>("state"), "dry_run_complete");
+    }
+
+    #[tokio::test]
+    async fn plan_renders_restricted_category_and_tag_templates() {
+        let directory = TempDir::new().expect("temporary directory");
+        let storage = open(&directory).await;
+        project_source(&storage, true, 13, 1).await;
+        let input = accept_with(
+            &storage,
+            directory.path(),
+            10,
+            Injection {
+                dry_run: true,
+                category_template: "sporos/{{ indexer_slug }}".to_owned(),
+                tag_templates: vec![
+                    "sporos:{{ trigger }}".to_owned(),
+                    "sporos:{{ match_mode }}".to_owned(),
+                ],
+                ..Injection::default()
+            },
+        )
+        .await;
+
+        storage.evaluate_candidate(&input, 20).await.unwrap();
+
+        let row = sqlx::query("SELECT category, tags_json FROM sporos_injection_plan")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("category"), "sporos/fixture");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&row.get::<String, _>("tags_json")).unwrap(),
+            ["sporos:autobrr", "sporos:strict"]
+        );
     }
 
     #[tokio::test]
@@ -929,13 +1080,28 @@ mod tests {
         directory: &Path,
         received_at: i64,
     ) -> CandidateWorkflowInput {
-        let ingress = CandidateIngress::new(
-            Matching::default(),
-            SourceFilters::default(),
+        accept_with(
+            storage,
+            directory,
+            received_at,
             Injection {
                 dry_run: true,
                 ..Injection::default()
             },
+        )
+        .await
+    }
+
+    async fn accept_with(
+        storage: &Storage,
+        directory: &Path,
+        received_at: i64,
+        injection: Injection,
+    ) -> CandidateWorkflowInput {
+        let ingress = CandidateIngress::new(
+            Matching::default(),
+            SourceFilters::default(),
+            injection,
             Paths {
                 link_root: directory.join("links"),
                 rewrite: vec![crate::config::PathRewrite {
