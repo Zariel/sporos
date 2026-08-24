@@ -952,7 +952,8 @@ mod tests {
         .unwrap();
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = crate::engine::registries(Arc::clone(&storage), None);
+        let (activities, orchestrations) =
+            crate::engine::registries(Arc::clone(&storage), None, None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(now_ms())
@@ -1047,7 +1048,8 @@ mod tests {
         let instance: String = row.get("duroxide_instance_id");
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = crate::engine::registries(Arc::clone(&storage), None);
+        let (activities, orchestrations) =
+            crate::engine::registries(Arc::clone(&storage), None, None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(now_ms())
@@ -1131,6 +1133,8 @@ mod tests {
                     bytes,
                     announcement_name: Some("Example.Movie.2024.1080p".to_owned()),
                     indexer: Some("fixture".to_owned()),
+                    indexer_id: None,
+                    trigger: "autobrr".to_owned(),
                     category: None,
                     tags: Vec::new(),
                     request_id: "request".to_owned(),

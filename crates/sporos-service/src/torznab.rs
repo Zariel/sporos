@@ -129,6 +129,100 @@ pub fn parse_torznab(
     }
 }
 
+pub async fn parse_torznab_async(
+    reader: impl tokio::io::AsyncBufRead + Unpin,
+    result_limit: usize,
+    mut emit: impl FnMut(TorznabResult) -> Result<(), String>,
+) -> Result<usize, TorznabParseError> {
+    if result_limit == 0 {
+        return Ok(0);
+    }
+    let mut reader = Reader::from_reader(reader);
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    let mut item = None;
+    let mut field = None;
+    let mut emitted = 0_usize;
+
+    loop {
+        match reader
+            .read_event_into_async(&mut buffer)
+            .await
+            .map_err(classify_error)?
+        {
+            Event::Start(start) => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or(TorznabParseError::DepthExceeded)?;
+                if depth > MAX_DEPTH {
+                    return Err(TorznabParseError::DepthExceeded);
+                }
+                match start.local_name().as_ref() {
+                    "item" => item = Some(Item::default()),
+                    "title" if item.is_some() => field = Some(Field::Title),
+                    "guid" if item.is_some() => field = Some(Field::Guid),
+                    "link" if item.is_some() => field = Some(Field::Link),
+                    _ => {}
+                }
+            }
+            Event::Empty(start) if item.is_some() => match start.local_name().as_ref() {
+                "enclosure" => {
+                    if let Some(value) = attribute(&start, "url")? {
+                        item.as_mut().expect("checked above").set_url(value);
+                    }
+                }
+                "attr" if attribute(&start, "name")?.as_deref() == Some("size") => {
+                    let value = attribute(&start, "value")?;
+                    let item = item.as_mut().expect("checked above");
+                    match value.and_then(|value| value.parse().ok()) {
+                        Some(size) => item.size = Some(size),
+                        None => item.invalid = true,
+                    }
+                }
+                _ => {}
+            },
+            Event::Text(text) if item.is_some() && field.is_some() => append(
+                item.as_mut().expect("checked above"),
+                field.expect("checked above"),
+                text.xml10_content().as_ref(),
+            ),
+            Event::CData(text) if item.is_some() && field.is_some() => append(
+                item.as_mut().expect("checked above"),
+                field.expect("checked above"),
+                text.xml10_content().as_ref(),
+            ),
+            Event::GeneralRef(reference) => {
+                let value = resolve_reference(&reference)?;
+                if let (Some(item), Some(field)) = (&mut item, field) {
+                    let mut encoded = [0_u8; 4];
+                    append(item, field, value.encode_utf8(&mut encoded));
+                }
+            }
+            Event::End(end) => {
+                let name = end.local_name();
+                if matches!(name.as_ref(), "title" | "guid" | "link") {
+                    field = None;
+                }
+                if name.as_ref() == "item"
+                    && let Some(result) = item.take().and_then(Item::finish)
+                {
+                    emit(result).map_err(TorznabParseError::Consumer)?;
+                    emitted += 1;
+                    if emitted == result_limit {
+                        return Ok(emitted);
+                    }
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::DocType(_) | Event::PI(_) => return Err(TorznabParseError::ProhibitedXml),
+            Event::Eof => return Ok(emitted),
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Field {
     Title,

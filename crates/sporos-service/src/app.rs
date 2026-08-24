@@ -22,8 +22,10 @@ use crate::config::{Config, LogFormat, Logging};
 use crate::engine::registries;
 use crate::http::{HttpState, router};
 use crate::outbox::OutboxDispatcher;
+use crate::prowlarr::ProwlarrClient;
 use crate::qbit_sync::InventorySynchronizer;
 use crate::qbittorrent::{ApiKey, QbittorrentClient, QbittorrentConfigError};
+use crate::search::{SearchExecutor, SearchPolicy};
 use crate::storage::Storage;
 
 const OUTBOX_INTERVAL: Duration = Duration::from_millis(100);
@@ -82,6 +84,12 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
                     settings.database_batch_size,
                 )
             });
+    let prowlarr_api = config
+        .prowlarr
+        .as_ref()
+        .map(|settings| ProwlarrClient::new(settings, config.matching.max_torrent_bytes))
+        .transpose()
+        .map_err(|error| AppError::ProwlarrConfig(error.to_string()))?;
     let provider = storage.duroxide_provider();
     let client = Client::new(provider.clone());
     OutboxDispatcher::new(&storage, client.clone(), config.limits.outbox_batch_size)
@@ -92,9 +100,21 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         .await
         .map_err(AppError::Bind)?;
     let address = listener.local_addr().map_err(AppError::LocalAddress)?;
-    let (activities, orchestrations) = registries(Arc::clone(&storage), qbit_api);
+    let search = prowlarr_api.clone().map(|client| {
+        SearchExecutor::new(
+            Arc::clone(&storage),
+            client,
+            SearchPolicy::new(
+                config.matching.clone(),
+                config.sources.clone(),
+                config.injection.clone(),
+                config.paths.clone(),
+            ),
+        )
+    });
+    let (activities, orchestrations) = registries(Arc::clone(&storage), qbit_api, search);
     let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
-    let state = HttpState::new(Arc::clone(&storage), &config);
+    let state = HttpState::new(Arc::clone(&storage), &config, prowlarr_api.clone());
     let app: Router = router(state.clone(), config.server.admin_body_limit_bytes)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -146,6 +166,18 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             .await;
         })
     });
+    let (prowlarr_stop_tx, prowlarr_stop_rx) = watch::channel(false);
+    let prowlarr = config
+        .prowlarr
+        .as_ref()
+        .zip(prowlarr_api)
+        .map(|(settings, client)| {
+            let storage = Arc::clone(&storage);
+            let refresh_interval = settings.refresh_interval;
+            tokio::spawn(async move {
+                prowlarr_loop(client, storage, refresh_interval, prowlarr_stop_rx).await;
+            })
+        });
 
     state.set_ready(true);
     info!(
@@ -164,6 +196,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
     state.set_ready(false);
     let _ = outbox_stop_tx.send(true);
     let _ = qbit_stop_tx.send(true);
+    let _ = prowlarr_stop_tx.send(true);
     let _ = http_stop_tx.send(());
     info!(service = "sporos", "shutdown started");
 
@@ -189,6 +222,17 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             );
         }
     };
+    let prowlarr_shutdown = async {
+        if let Some(mut prowlarr) = prowlarr
+            && tokio::time::timeout(grace, &mut prowlarr).await.is_err()
+        {
+            prowlarr.abort();
+            warn!(
+                service = "sporos",
+                "Prowlarr observer exceeded shutdown grace"
+            );
+        }
+    };
     let server_shutdown = async {
         if server_result.is_none() && tokio::time::timeout(grace, &mut server).await.is_err() {
             server.abort();
@@ -199,6 +243,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         runtime_shutdown,
         outbox_shutdown,
         qbit_shutdown,
+        prowlarr_shutdown,
         server_shutdown
     );
 
@@ -210,6 +255,34 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         return Err(AppError::ServerStopped);
     }
     Ok(())
+}
+
+async fn prowlarr_loop(
+    client: ProwlarrClient,
+    storage: Arc<Storage>,
+    refresh_period: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(refresh_period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                match client.indexers().await {
+                    Ok(indexers) => match storage.project_indexers(&indexers, now_ms()).await {
+                        Ok(()) => info!(service = "sporos", count = indexers.len(), "Prowlarr indexers refreshed"),
+                        Err(error) => warn!(service = "sporos", error = %error, "Prowlarr indexer projection failed"),
+                    },
+                    Err(error) => warn!(service = "sporos", error = %error, "Prowlarr indexer refresh failed"),
+                }
+            }
+        }
+    }
 }
 
 async fn qbit_loop(
@@ -404,6 +477,8 @@ pub enum AppError {
     InitialOutboxDispatch(#[source] crate::outbox::DispatchError),
     #[error("invalid qBittorrent client configuration")]
     QbittorrentConfig(#[source] QbittorrentConfigError),
+    #[error("invalid Prowlarr client configuration")]
+    ProwlarrConfig(String),
     #[error("failed to bind the HTTP listener")]
     Bind(#[source] std::io::Error),
     #[error("failed to inspect the HTTP listener")]

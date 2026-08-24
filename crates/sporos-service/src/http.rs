@@ -23,6 +23,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use crate::candidate::{CandidateError, CandidateIngress, CandidateSubmission};
 use crate::config::{Config, Matching, Secret, SourceFilters};
 use crate::preflight::SourceState;
+use crate::prowlarr::ProwlarrClient;
+use crate::search::{BackfillSelection, SearchPolicy, accept_backfill};
 use crate::storage::Storage;
 use sporos_matcher::parse_release;
 
@@ -39,12 +41,19 @@ pub struct HttpState {
     source_filters: SourceFilters,
     matching: Matching,
     candidate_ingress: Arc<CandidateIngress>,
+    search_policy: SearchPolicy,
+    prowlarr_configured: bool,
+    prowlarr_client: Option<ProwlarrClient>,
     upload_permits: Arc<Semaphore>,
     autobrr_body_limit_bytes: usize,
 }
 
 impl HttpState {
-    pub fn new(storage: Arc<Storage>, config: &Config) -> Self {
+    pub(crate) fn new(
+        storage: Arc<Storage>,
+        config: &Config,
+        prowlarr_client: Option<ProwlarrClient>,
+    ) -> Self {
         Self {
             storage,
             webhook_token: config.auth.webhook_token.clone(),
@@ -63,6 +72,14 @@ impl HttpState {
                 config.injection.clone(),
                 config.paths.clone(),
             )),
+            search_policy: SearchPolicy::new(
+                config.matching.clone(),
+                config.sources.clone(),
+                config.injection.clone(),
+                config.paths.clone(),
+            ),
+            prowlarr_configured: config.prowlarr.is_some(),
+            prowlarr_client,
             upload_permits: Arc::new(Semaphore::new(config.limits.max_uploads)),
             autobrr_body_limit_bytes: config.server.autobrr_body_limit_bytes,
         }
@@ -90,6 +107,12 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
         .layer(RequestBodyLimitLayer::new(state.autobrr_body_limit_bytes));
     let admin = Router::new()
         .route("/api/v1/admin/tasks", get(list_tasks))
+        .route("/api/v1/admin/operations", get(list_operations))
+        .route(
+            "/api/v1/admin/operations/{operation_id}",
+            get(get_operation),
+        )
+        .route("/api/v1/admin/searches", post(start_inventory_search))
         .route("/api/v1/admin/tasks/{task_id}", get(get_task))
         .route("/api/v1/admin/tasks/{task_id}/events", get(get_task_events))
         .route("/api/v1/admin/inventory", get(get_inventory))
@@ -300,6 +323,8 @@ async fn autobrr_torrent(
                 bytes,
                 announcement_name: request.torrent_name,
                 indexer: request.indexer,
+                indexer_id: None,
+                trigger: "autobrr".to_owned(),
                 category: request.category,
                 tags: request.tags,
                 request_id: request_id.0.clone(),
@@ -584,6 +609,290 @@ async fn request_inventory_reconcile(
             duplicate: !queued,
         }),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InventorySearchRequest {
+    source: InventorySearchSource,
+    #[serde(default)]
+    indexer_ids: Vec<i64>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InventorySearchSource {
+    kind: String,
+    #[serde(default)]
+    hashes: Vec<String>,
+    #[serde(default)]
+    include_categories: Vec<String>,
+    #[serde(default)]
+    exclude_categories: Vec<String>,
+    #[serde(default)]
+    include_tags: Vec<String>,
+    #[serde(default)]
+    exclude_tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InventorySearchResponse {
+    operation_id: String,
+    task_id: String,
+    duplicate: bool,
+    status: &'static str,
+}
+
+async fn start_inventory_search(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<InventorySearchRequest>,
+) -> Result<(StatusCode, Json<InventorySearchResponse>), Problem> {
+    if !state.prowlarr_configured {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "prowlarr_not_configured",
+            "Prowlarr not configured",
+            "the Prowlarr integration is not configured",
+            request_id,
+        ));
+    }
+    if !request.indexer_ids.is_empty()
+        && let Some(client) = state.prowlarr_client.as_ref()
+    {
+        let indexers = client.indexers().await.map_err(|_| {
+            Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "prowlarr_unavailable",
+                "Prowlarr unavailable",
+                "the Prowlarr indexer projection could not be refreshed",
+                request_id.clone(),
+            )
+        })?;
+        state
+            .storage
+            .project_indexers(&indexers, now_ms())
+            .await
+            .map_err(|_| Problem::database(request_id.clone()))?;
+    }
+    if request.source.kind != "qbittorrent"
+        || request.indexer_ids.len() > 100
+        || request.source.hashes.len() > 10_000
+        || request
+            .source
+            .hashes
+            .iter()
+            .any(|hash| !valid_info_hash(hash))
+    {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_inventory_search",
+            "Invalid inventory search",
+            "source selection, hashes, or indexer IDs are invalid",
+            request_id,
+        ));
+    }
+    for indexer_id in &request.indexer_ids {
+        let eligible = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM sporos_indexer WHERE prowlarr_id = ? AND eligible = 1",
+        )
+        .bind(indexer_id)
+        .fetch_optional(state.storage.pool())
+        .await
+        .map_err(|_| Problem::database(request_id.clone()))?
+        .is_some();
+        if !eligible {
+            return Err(Problem::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "indexer_ineligible",
+                "Indexer is not eligible",
+                "an explicitly selected Prowlarr indexer is absent or unsafe",
+                request_id,
+            ));
+        }
+    }
+    let selection = BackfillSelection {
+        hashes: request.source.hashes,
+        include_categories: request.source.include_categories,
+        exclude_categories: request.source.exclude_categories,
+        include_tags: request.source.include_tags,
+        exclude_tags: request.source.exclude_tags,
+    };
+    let accepted = accept_backfill(
+        &state.storage,
+        state.search_policy.clone().with_dry_run(request.dry_run),
+        selection,
+        request.indexer_ids,
+        request.force.then_some(request_id.0.as_str()),
+        now_ms(),
+    )
+    .await
+    .map_err(|_| Problem::database(request_id))?;
+    Ok((
+        if accepted.duplicate {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(InventorySearchResponse {
+            operation_id: encode_hex(&accepted.operation_id),
+            task_id: encode_hex(&accepted.task_id),
+            duplicate: accepted.duplicate,
+            status: "queued",
+        }),
+    ))
+}
+
+fn valid_info_hash(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationQuery {
+    #[serde(default = "default_page_size")]
+    limit: usize,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationPage {
+    items: Vec<OperationView>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationView {
+    id: String,
+    kind: String,
+    state: String,
+    produced_tasks: i64,
+    completed_tasks: i64,
+    failed_tasks: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+async fn list_operations(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(query): Query<OperationQuery>,
+) -> Result<Json<OperationPage>, Problem> {
+    if !(1..=200).contains(&query.limit) {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_page_size",
+            "Invalid page size",
+            "limit must be between 1 and 200",
+            request_id,
+        ));
+    }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()
+        .map_err(|_| {
+            Problem::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_cursor",
+                "Invalid cursor",
+                "the pagination cursor is invalid",
+                request_id.clone(),
+            )
+        })?;
+    let fetch = i64::try_from(query.limit + 1).expect("page limit fits SQLite");
+    let rows = if let Some((created_at, id)) = cursor {
+        sqlx::query(
+            "SELECT * FROM sporos_operation
+             WHERE created_at < ? OR (created_at = ? AND id < ?)
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(created_at)
+        .bind(created_at)
+        .bind(id)
+        .bind(fetch)
+        .fetch_all(state.storage.pool())
+        .await
+    } else {
+        sqlx::query("SELECT * FROM sporos_operation ORDER BY created_at DESC, id DESC LIMIT ?")
+            .bind(fetch)
+            .fetch_all(state.storage.pool())
+            .await
+    }
+    .map_err(|_| Problem::database(request_id.clone()))?;
+    let has_more = rows.len() > query.limit;
+    let rows = rows.into_iter().take(query.limit).collect::<Vec<_>>();
+    let next_cursor = if has_more {
+        rows.last()
+            .map(encode_cursor)
+            .transpose()
+            .map_err(|_| Problem::database(request_id.clone()))?
+    } else {
+        None
+    };
+    let items = rows
+        .into_iter()
+        .map(operation_view)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| Problem::database(request_id))?;
+    Ok(Json(OperationPage { items, next_cursor }))
+}
+
+async fn get_operation(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(operation_id): Path<String>,
+) -> Result<Json<OperationView>, Problem> {
+    let id = parse_id(&operation_id).ok_or_else(|| {
+        Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_operation_id",
+            "Invalid operation ID",
+            "operation ID must be 32 lowercase hexadecimal characters",
+            request_id.clone(),
+        )
+    })?;
+    let row = sqlx::query("SELECT * FROM sporos_operation WHERE id = ?")
+        .bind(id.as_slice())
+        .fetch_optional(state.storage.pool())
+        .await
+        .map_err(|_| Problem::database(request_id.clone()))?
+        .ok_or_else(|| {
+            Problem::new(
+                StatusCode::NOT_FOUND,
+                "operation_not_found",
+                "Operation not found",
+                "no operation has that ID",
+                request_id.clone(),
+            )
+        })?;
+    Ok(Json(
+        operation_view(row).map_err(|_| Problem::database(request_id))?,
+    ))
+}
+
+fn operation_view(row: sqlx::sqlite::SqliteRow) -> Result<OperationView, sqlx::Error> {
+    Ok(OperationView {
+        id: encode_hex(&row.try_get::<Vec<u8>, _>("id")?),
+        kind: row.try_get("kind")?,
+        state: row.try_get("state")?,
+        produced_tasks: row.try_get("produced_tasks")?,
+        completed_tasks: row.try_get("completed_tasks")?,
+        failed_tasks: row.try_get("failed_tasks")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1623,6 +1932,14 @@ mod tests {
                 crate::config::Injection::default(),
                 crate::config::Paths::default(),
             )),
+            search_policy: SearchPolicy::new(
+                Matching::default(),
+                SourceFilters::default(),
+                crate::config::Injection::default(),
+                crate::config::Paths::default(),
+            ),
+            prowlarr_configured: false,
+            prowlarr_client: None,
             upload_permits: Arc::new(Semaphore::new(4)),
             autobrr_body_limit_bytes: 12 * 1024 * 1024,
         };

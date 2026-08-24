@@ -455,13 +455,15 @@ struct MatchingConfig {
     optional_extensions: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Matching {
     pub policy: MatchingPolicy,
     pub preflight_size_tolerance: f64,
     pub max_torrent_bytes: usize,
     pub max_files_per_torrent: usize,
     pub max_path_bytes: usize,
+    #[serde(with = "duration")]
     pub pending_source_timeout: Duration,
 }
 

@@ -42,6 +42,8 @@ pub struct CandidateSubmission {
     pub bytes: Vec<u8>,
     pub announcement_name: Option<String>,
     pub indexer: Option<String>,
+    pub indexer_id: Option<i64>,
+    pub trigger: String,
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub request_id: String,
@@ -248,11 +250,13 @@ impl CandidateIngress {
         }))?;
         sqlx::query(
             "INSERT INTO sporos_candidate_provenance (
-                candidate_id, trigger, indexer_name, announcement_name,
+                candidate_id, trigger, indexer_id, indexer_name, announcement_name,
                 request_id, received_at, detail_json
-             ) VALUES (?, 'autobrr', ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(candidate_id.as_bytes().as_slice())
+        .bind(submission.trigger)
+        .bind(submission.indexer_id)
         .bind(submission.indexer)
         .bind(submission.announcement_name)
         .bind(submission.request_id)
@@ -434,6 +438,8 @@ mod tests {
             bytes,
             announcement_name: Some("Example.Movie.2024.1080p".to_owned()),
             indexer: Some("fixture".to_owned()),
+            indexer_id: None,
+            trigger: "test".to_owned(),
             category: None,
             tags: Vec::new(),
             request_id: format!("req-{received_at}"),

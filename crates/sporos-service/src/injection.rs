@@ -1270,6 +1270,8 @@ mod tests {
                     bytes,
                     announcement_name: Some("Example.Movie.2024.1080p".to_owned()),
                     indexer: Some("fixture".to_owned()),
+                    indexer_id: None,
+                    trigger: "test".to_owned(),
                     category: None,
                     tags: Vec::new(),
                     request_id: "injection-test".to_owned(),
