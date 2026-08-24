@@ -436,8 +436,8 @@ pub use runtime::{
 
 // Re-export management types for convenience
 pub use providers::{
-    ExecutionInfo, InstanceInfo, ProviderAdmin, QueueDepths, ScheduledActivityIdentifier, SessionFetchConfig,
-    SystemMetrics, TagFilter,
+    ExecutionInfo, InstanceInfo, ProviderAdmin, QueueDepths, RootOrchestrationStart, ScheduledActivityIdentifier,
+    SessionFetchConfig, SystemMetrics, TagFilter,
 };
 
 // Re-export capability filtering types

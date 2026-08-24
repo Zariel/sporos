@@ -1,8 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use duroxide::providers::WorkItem;
-use duroxide::{Client, Event, EventKind};
+use duroxide::{Client, RootOrchestrationStart};
 use sqlx::Row;
 use thiserror::Error;
 
@@ -68,7 +67,7 @@ impl<'a> OutboxDispatcher<'a> {
                     mark_dispatched(self.storage, start.id, token, now_ms).await?;
                     report.dispatched += 1;
                 }
-                Err(error) => match reconcile(self.storage, &start).await? {
+                Err(error) => match reconcile(&self.client, &start).await? {
                     ExistingStart::Same => {
                         mark_dispatched(self.storage, start.id, token, now_ms).await?;
                         report.dispatched += 1;
@@ -274,71 +273,22 @@ enum ExistingStart {
 }
 
 async fn reconcile(
-    storage: &Storage,
+    client: &Client,
     expected: &OutboxStart,
 ) -> Result<ExistingStart, DispatchError> {
-    let queued = sqlx::query_scalar::<_, String>(
-        "SELECT work_item FROM orchestrator_queue WHERE instance_id = ? ORDER BY id",
-    )
-    .bind(&expected.instance_id)
-    .fetch_all(storage.pool())
-    .await?;
-    for item in queued {
-        let item: WorkItem =
-            serde_json::from_str(&item).map_err(DispatchError::CorruptDuroxideWork)?;
-        if let WorkItem::StartOrchestration {
-            orchestration,
-            input,
-            version,
-            parent_instance,
-            ..
-        } = item
-        {
-            return Ok(
-                if orchestration == expected.orchestration_name
-                    && version.as_deref() == Some(expected.orchestration_version.as_str())
-                    && input == expected.input_json
-                    && parent_instance.is_none()
-                {
-                    ExistingStart::Same
-                } else {
-                    ExistingStart::Collision
-                },
-            );
-        }
-    }
-
-    let history = sqlx::query_scalar::<_, String>(
-        "SELECT event_data FROM history
-         WHERE instance_id = ? AND execution_id = 1 AND event_id = 1",
-    )
-    .bind(&expected.instance_id)
-    .fetch_optional(storage.pool())
-    .await?;
-    let Some(history) = history else {
-        return Ok(ExistingStart::Missing);
-    };
-    let event: Event =
-        serde_json::from_str(&history).map_err(DispatchError::CorruptDuroxideHistory)?;
-    let EventKind::OrchestrationStarted {
-        name,
-        version,
-        input,
-        parent_instance,
-        ..
-    } = event.kind
-    else {
-        return Ok(ExistingStart::Collision);
-    };
     Ok(
-        if name == expected.orchestration_name
-            && version == expected.orchestration_version
-            && input == expected.input_json
-            && parent_instance.is_none()
+        match client
+            .inspect_root_orchestration_start(
+                &expected.instance_id,
+                &expected.orchestration_name,
+                Some(&expected.orchestration_version),
+                &expected.input_json,
+            )
+            .await?
         {
-            ExistingStart::Same
-        } else {
-            ExistingStart::Collision
+            RootOrchestrationStart::Same => ExistingStart::Same,
+            RootOrchestrationStart::Collision => ExistingStart::Collision,
+            RootOrchestrationStart::Missing => ExistingStart::Missing,
         },
     )
 }
@@ -367,10 +317,8 @@ pub enum DispatchError {
     CorruptAttemptCount,
     #[error("outbox row {0} lost its delivery lease")]
     LostLease(i64),
-    #[error("Duroxide queued work is unreadable")]
-    CorruptDuroxideWork(#[source] serde_json::Error),
-    #[error("Duroxide history is unreadable")]
-    CorruptDuroxideHistory(#[source] serde_json::Error),
+    #[error("Duroxide start inspection failed")]
+    Duroxide(#[from] duroxide::ClientError),
 }
 
 #[cfg(test)]

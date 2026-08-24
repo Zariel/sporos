@@ -13,8 +13,8 @@ use tracing::debug;
 
 use super::{
     DeleteInstanceResult, DispatcherCapabilityFilter, ExecutionInfo, InstanceFilter, InstanceInfo, OrchestrationItem,
-    Provider, ProviderAdmin, ProviderError, PruneOptions, PruneResult, QueueDepths, ScheduledActivityIdentifier,
-    SessionFetchConfig, SystemMetrics, TagFilter, WorkItem,
+    Provider, ProviderAdmin, ProviderError, PruneOptions, PruneResult, QueueDepths, RootOrchestrationStart,
+    ScheduledActivityIdentifier, SessionFetchConfig, SystemMetrics, TagFilter, WorkItem,
 };
 use crate::{Event, EventKind};
 
@@ -1748,6 +1748,56 @@ impl Provider for SqliteProvider {
         }
 
         Ok(events)
+    }
+
+    async fn inspect_root_orchestration_start(
+        &self,
+        instance: &str,
+        orchestration: &str,
+        version: Option<&str>,
+        input: &str,
+    ) -> Result<RootOrchestrationStart, ProviderError> {
+        let operation = "inspect_root_orchestration_start";
+        let queued = sqlx::query_scalar::<_, String>(
+            "SELECT work_item FROM orchestrator_queue WHERE instance_id = ? ORDER BY id",
+        )
+        .bind(instance)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Self::sqlx_to_provider_error(operation, error))?;
+        for item in queued {
+            let item: WorkItem = serde_json::from_str(&item).map_err(|error| {
+                ProviderError::permanent(operation, format!("Failed to deserialize queued work: {error}"))
+            })?;
+            if let WorkItem::StartOrchestration {
+                orchestration: recorded_orchestration,
+                version: recorded_version,
+                input: recorded_input,
+                parent_instance,
+                ..
+            } = item
+            {
+                return Ok(
+                    if recorded_orchestration == orchestration
+                        && recorded_version.as_deref() == version
+                        && recorded_input == input
+                        && parent_instance.is_none()
+                    {
+                        RootOrchestrationStart::Same
+                    } else {
+                        RootOrchestrationStart::Collision
+                    },
+                );
+            }
+        }
+
+        let history = self.read_with_execution(instance, crate::INITIAL_EXECUTION_ID).await?;
+        Ok(super::inspect_recorded_root_start(
+            &history,
+            orchestration,
+            version,
+            input,
+        ))
     }
 
     async fn read_with_execution(&self, instance: &str, execution_id: u64) -> Result<Vec<Event>, ProviderError> {
@@ -3496,21 +3546,31 @@ mod tests {
                 + 1
         };
 
-        provider
-            .enqueue_for_orchestrator(
-                WorkItem::StartOrchestration {
-                    instance: instance.to_string(),
-                    orchestration: orchestration.to_string(),
-                    version: Some(version.to_string()),
-                    input: input.to_string(),
-                    parent_instance: parent_instance.map(|s| s.to_string()),
-                    parent_id,
-                    parent_execution_id: None,
-                    execution_id: next_execution_id,
-                },
-                None,
-            )
-            .await?;
+        let work = if execs.is_empty() {
+            WorkItem::StartOrchestration {
+                instance: instance.to_string(),
+                orchestration: orchestration.to_string(),
+                version: Some(version.to_string()),
+                input: input.to_string(),
+                parent_instance: parent_instance.map(|s| s.to_string()),
+                parent_id,
+                parent_execution_id: None,
+                execution_id: next_execution_id,
+            }
+        } else {
+            WorkItem::ContinueAsNew {
+                instance: instance.to_string(),
+                orchestration: orchestration.to_string(),
+                version: Some(version.to_string()),
+                input: input.to_string(),
+                parent_instance: parent_instance.map(|s| s.to_string()),
+                parent_id,
+                parent_execution_id: None,
+                carry_forward_events: Vec::new(),
+                initial_custom_status: None,
+            }
+        };
+        provider.enqueue_for_orchestrator(work, None).await?;
 
         let (_item, lock_token, _attempt_count) = provider
             .fetch_orchestration_item(Duration::from_secs(30), Duration::ZERO, None)

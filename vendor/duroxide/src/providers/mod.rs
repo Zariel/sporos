@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::Event;
+use crate::{Event, EventKind};
 use std::any::Any;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -1600,6 +1600,21 @@ pub trait Provider: Any + Send + Sync {
     /// The runtime hot path uses `fetch_orchestration_item()` which loads history internally.
     async fn read(&self, instance: &str) -> Result<Vec<Event>, ProviderError>;
 
+    /// Verify whether an instance's root start matches an expected durable command.
+    ///
+    /// Providers with an atomic start reservation should override this method so a
+    /// queued, not-yet-executed start is visible as well as recorded history.
+    async fn inspect_root_orchestration_start(
+        &self,
+        instance: &str,
+        orchestration: &str,
+        version: Option<&str>,
+        input: &str,
+    ) -> Result<RootOrchestrationStart, ProviderError> {
+        let history = self.read_with_execution(instance, crate::INITIAL_EXECUTION_ID).await?;
+        Ok(inspect_recorded_root_start(&history, orchestration, version, input))
+    }
+
     // ===== History Reading and Testing Methods (NOT used by runtime hot path) =====
     // These methods are NOT called by the main runtime during orchestration execution.
     // They are used by testing, validation suites, client APIs, and debugging tools.
@@ -2164,6 +2179,47 @@ pub trait Provider: Any + Send + Sync {
     /// Providers compute this directly from storage (history table, kv_store table)
     /// rather than the runtime injecting stats into the KV store on every turn.
     async fn get_instance_stats(&self, instance: &str) -> Result<Option<crate::SystemStats>, ProviderError>;
+}
+
+/// Result of comparing a durable root-start command with provider state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootOrchestrationStart {
+    Missing,
+    Same,
+    Collision,
+}
+
+fn inspect_recorded_root_start(
+    history: &[Event],
+    orchestration: &str,
+    version: Option<&str>,
+    input: &str,
+) -> RootOrchestrationStart {
+    let Some(event) = history
+        .iter()
+        .find(|event| matches!(&event.kind, EventKind::OrchestrationStarted { .. }))
+    else {
+        return RootOrchestrationStart::Missing;
+    };
+    let EventKind::OrchestrationStarted {
+        name,
+        version: recorded_version,
+        input: recorded_input,
+        parent_instance,
+        ..
+    } = &event.kind
+    else {
+        unreachable!("filtered to orchestration start");
+    };
+    if name == orchestration
+        && recorded_version.as_str() == version.unwrap_or_default()
+        && recorded_input == input
+        && parent_instance.is_none()
+    {
+        RootOrchestrationStart::Same
+    } else {
+        RootOrchestrationStart::Collision
+    }
 }
 pub mod management;
 

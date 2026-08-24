@@ -8,7 +8,7 @@ use tracing::info;
 use crate::_typed_codec::{Codec, Json};
 use crate::providers::{
     DeleteInstanceResult, ExecutionInfo, InstanceFilter, InstanceInfo, InstanceTree, Provider, ProviderAdmin,
-    ProviderError, PruneOptions, PruneResult, QueueDepths, SystemMetrics, WorkItem,
+    ProviderError, PruneOptions, PruneResult, QueueDepths, RootOrchestrationStart, SystemMetrics, WorkItem,
 };
 use crate::{EventKind, OrchestrationStatus};
 use serde::Serialize;
@@ -313,6 +313,24 @@ impl Client {
         };
         self.store
             .enqueue_for_orchestrator(item, None)
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Compare an expected root start with the provider's durable reservation.
+    ///
+    /// This includes a start that has been accepted into the provider queue but
+    /// has not yet produced orchestration history.
+    pub async fn inspect_root_orchestration_start(
+        &self,
+        instance: &str,
+        orchestration: &str,
+        version: Option<&str>,
+        input: &str,
+    ) -> Result<RootOrchestrationStart, ClientError> {
+        validate_instance_id(instance)?;
+        self.store
+            .inspect_root_orchestration_start(instance, orchestration, version, input)
             .await
             .map_err(ClientError::from)
     }

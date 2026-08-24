@@ -4,7 +4,7 @@ This directory is based on `duroxide` 0.1.30, published from upstream commit
 `cfe0b8c957ef7ede43c6026ebba0052211de1a49`. The crates.io archive has SHA-256
 `92b17ebe10f702644ad65a9c624b4060023955b4cd145c23ed4c6942b17fdac9`.
 
-Sporos carries five SQLite-provider changes:
+Sporos carries six SQLite-provider changes:
 
 - expose a `NORMAL`/`FULL` synchronous-mode option, retaining `NORMAL` as the
   upstream-compatible default; and
@@ -15,10 +15,12 @@ Sporos carries five SQLite-provider changes:
 - disable SQLx's default database drivers and use its Tokio runtime without a
   TLS backend because this provider only opens SQLite databases; and
 - atomically reserve root orchestration identities with their queue entry so
-  duplicate instance starts return a permanent constraint error.
+  duplicate instance starts return a permanent constraint error; and
+- expose a narrow root-start inspection operation that verifies queued or
+  recorded start identity without exposing provider storage representation.
 
 These changes let Sporos require and inspect `synchronous=FULL`, use one
 connection per SQLite pool to avoid competing writers inside the single-active
-service, and ensure an unknown or incompatible migration cannot be hidden
-during startup. Keep the patch minimal and review it separately whenever
-Duroxide is upgraded.
+service, ensure an unknown or incompatible migration cannot be hidden during
+startup, and reconcile transactional outbox delivery through the provider API.
+Keep the patch minimal and review it separately whenever Duroxide is upgraded.
