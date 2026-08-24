@@ -193,9 +193,6 @@ impl InjectionExecutor {
                 qbit.stop(&state.hash).await?;
                 return Ok(waiting());
             }
-            if occupied_mappings(&plan)? {
-                return self.fail(input, "candidate_path_conflict").await;
-            }
             self.storage
                 .record_injection(input, &plan, &state, "added_stopped", None, None)
                 .await?;
@@ -853,19 +850,6 @@ fn ensure_namespace(plan: &InjectionPlan) -> Result<(), InjectionError> {
     Ok(())
 }
 
-fn occupied_mappings(plan: &InjectionPlan) -> Result<bool, InjectionError> {
-    for mapping in &plan.mappings {
-        match std::fs::symlink_metadata(
-            Path::new(&plan.namespace_local).join(&mapping.candidate_path),
-        ) {
-            Ok(_) => return Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(false)
-}
-
 fn same_save_path(actual: &str, expected: &str) -> bool {
     actual.trim_end_matches('/') == expected.trim_end_matches('/')
 }
@@ -1176,6 +1160,10 @@ mod tests {
         };
 
         assert_eq!(executor.prepare(&input).await.unwrap(), waiting());
+        let plan = storage.load_injection(&input).await.unwrap();
+        let destination = Path::new(&plan.namespace_local).join(&plan.mappings[0].candidate_path);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::hard_link(&source_file, &destination).unwrap();
         assert_eq!(executor.prepare(&input).await.unwrap(), StepResult::Ready);
         assert_eq!(
             executor.materialize(&input).await.unwrap(),
