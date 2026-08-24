@@ -3,7 +3,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use rustix::fd::{AsFd, OwnedFd};
-use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags, linkat, mkdirat, openat2};
+use rustix::fs::{ABS, AtFlags, Mode, OFlags, ResolveFlags, linkat, mkdirat, openat2};
 use rustix::io::Errno;
 use thiserror::Error;
 
@@ -11,6 +11,7 @@ const DIRECTORY_MODE: Mode = Mode::from_raw_mode(0o750);
 const RESOLVE_BENEATH: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_MAGICLINKS)
     .union(ResolveFlags::NO_SYMLINKS);
+const RESOLVE_ABSOLUTE: ResolveFlags = ResolveFlags::NO_MAGICLINKS.union(ResolveFlags::NO_SYMLINKS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedLink {
@@ -38,7 +39,8 @@ pub struct HardlinkMaterializer {
 
 impl HardlinkMaterializer {
     pub fn open(link_root: &Path) -> Result<Self, MaterializeError> {
-        let link_root = File::open(link_root).map_err(MaterializeError::OpenLinkRoot)?;
+        let link_root =
+            open_absolute_directory(link_root).map_err(MaterializeError::OpenLinkRoot)?;
         let metadata = link_root
             .metadata()
             .map_err(MaterializeError::InspectLinkRoot)?;
@@ -72,7 +74,7 @@ impl HardlinkMaterializer {
         validate_relative(&link.source_relative)?;
         validate_relative(&link.destination_relative)?;
         let source_root =
-            File::open(&link.source_root).map_err(MaterializeError::OpenSourceRoot)?;
+            open_absolute_directory(&link.source_root).map_err(MaterializeError::OpenSourceRoot)?;
         if !source_root
             .metadata()
             .map_err(MaterializeError::InspectSource)?
@@ -164,6 +166,20 @@ impl HardlinkMaterializer {
     }
 }
 
+fn open_absolute_directory(path: &Path) -> Result<File, Errno> {
+    if !path.is_absolute() {
+        return Err(Errno::INVAL);
+    }
+    openat2(
+        ABS,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE_ABSOLUTE,
+    )
+    .map(File::from)
+}
+
 fn ensure_directory(root: impl AsFd, relative: &Path) -> Result<OwnedFd, MaterializeError> {
     validate_relative(relative)?;
     let mut current = open_directory(root, ".")?;
@@ -210,7 +226,7 @@ fn validate_relative(path: &Path) -> Result<(), MaterializeError> {
 #[derive(Debug, Error)]
 pub enum MaterializeError {
     #[error("failed to open the managed link root")]
-    OpenLinkRoot(#[source] std::io::Error),
+    OpenLinkRoot(#[source] Errno),
     #[error("failed to inspect the managed link root")]
     InspectLinkRoot(#[source] std::io::Error),
     #[error("managed link root is not a directory")]
@@ -222,7 +238,7 @@ pub enum MaterializeError {
     #[error("failed to open a managed directory without following links")]
     OpenDirectory(#[source] Errno),
     #[error("failed to open an approved source root")]
-    OpenSourceRoot(#[source] std::io::Error),
+    OpenSourceRoot(#[source] Errno),
     #[error("approved source root is not a directory")]
     SourceRootNotDirectory,
     #[error("failed to open a source beneath its approved root")]
@@ -348,5 +364,41 @@ mod tests {
                 .is_err()
         );
         assert!(!outside.join("video.mkv").exists());
+    }
+
+    #[test]
+    fn rejects_symlinked_managed_and_source_roots() {
+        let directory = TempDir::new().unwrap();
+        let actual_source = directory.path().join("actual-source");
+        let actual_links = directory.path().join("actual-links");
+        std::fs::create_dir_all(&actual_source).unwrap();
+        std::fs::create_dir_all(&actual_links).unwrap();
+        std::fs::write(actual_source.join("video.mkv"), b"video").unwrap();
+        let linked_source = directory.path().join("source");
+        let linked_root = directory.path().join("links");
+        symlink(&actual_source, &linked_source).unwrap();
+        symlink(&actual_links, &linked_root).unwrap();
+
+        assert!(matches!(
+            HardlinkMaterializer::open(&linked_root),
+            Err(MaterializeError::OpenLinkRoot(_))
+        ));
+
+        let materializer = HardlinkMaterializer::open(&actual_links).unwrap();
+        let error = materializer
+            .materialize(
+                Path::new("candidate"),
+                &[PlannedLink {
+                    source_root: linked_source,
+                    source_relative: "video.mkv".into(),
+                    destination_relative: "video.mkv".into(),
+                    expected_size: 5,
+                    expected_device: None,
+                    expected_inode: None,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(error, MaterializeError::OpenSourceRoot(_)));
+        assert!(!actual_links.join("candidate/video.mkv").exists());
     }
 }
