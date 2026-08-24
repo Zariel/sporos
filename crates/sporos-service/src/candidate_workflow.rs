@@ -615,7 +615,10 @@ async fn persist_plan(
         .then_some(source.tags)
         .into_iter()
         .flatten();
-    let tags = context.render_tags(&loaded.policy.injection.tag_templates, inherited_tags)?;
+    let mut tags = context.render_tags(&loaded.policy.injection.tag_templates, inherited_tags)?;
+    if !tags.iter().any(|tag| tag == "sporos") {
+        tags.insert(0, "sporos".to_owned());
+    }
     let tags_json = serde_json::to_string(&tags)?;
     let resume_policy_json = serde_json::to_string(&loaded.policy.injection.resume)?;
     let material = serde_json::to_vec(&serde_json::json!({
@@ -932,7 +935,7 @@ mod tests {
         assert_eq!(row.get::<String, _>("category"), "sporos/fixture");
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&row.get::<String, _>("tags_json")).unwrap(),
-            ["sporos:autobrr", "sporos:strict"]
+            ["sporos", "sporos:autobrr", "sporos:strict"]
         );
     }
 
