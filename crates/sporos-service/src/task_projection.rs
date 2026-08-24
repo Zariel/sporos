@@ -1,3 +1,4 @@
+use duroxide::{AppErrorKind, Client, ErrorDetails, OrchestrationStatus};
 use sporos_model::TaskId;
 use sqlx::Row;
 use thiserror::Error;
@@ -24,6 +25,12 @@ pub enum ProjectionOutcome {
     Stale { actual_generation: u64 },
     Terminal { generation: u64 },
     Missing,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectionRepairReport {
+    pub inspected: usize,
+    pub repaired: usize,
 }
 
 impl Storage {
@@ -107,6 +114,107 @@ impl Storage {
         Ok(ProjectionOutcome::Applied {
             generation: next_generation,
         })
+    }
+
+    pub async fn repair_terminal_task_projections(
+        &self,
+        client: &Client,
+        limit: usize,
+        occurred_at: i64,
+    ) -> Result<ProjectionRepairReport, ProjectionRepairError> {
+        let rows = sqlx::query(
+            "SELECT id, projection_generation, duroxide_instance_id,
+                    duroxide_execution_id, observed_retry_count
+             FROM sporos_task
+             WHERE terminal_at IS NULL AND duroxide_instance_id IS NOT NULL
+             ORDER BY updated_at, id
+             LIMIT ?",
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.pool())
+        .await?;
+        let mut report = ProjectionRepairReport::default();
+        for row in rows {
+            report.inspected += 1;
+            let bytes: Vec<u8> = row.try_get("id")?;
+            let task_id = TaskId::from_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| ProjectionRepairError::InvalidTaskId)?,
+            );
+            let instance: String = row.try_get("duroxide_instance_id")?;
+            let status = client.get_orchestration_status(&instance).await?;
+            let Some((state, reason_code, detail_json)) = repaired_terminal(status) else {
+                continue;
+            };
+            let update = ProjectionUpdate {
+                task_id,
+                expected_generation: to_u64(row.try_get("projection_generation")?)?,
+                state,
+                reason_code: Some(reason_code),
+                execution_id: row.try_get("duroxide_execution_id")?,
+                observed_retry_count: to_u64(row.try_get("observed_retry_count")?)?,
+                detail_json: Some(detail_json),
+                occurred_at,
+                terminal: true,
+            };
+            if matches!(
+                self.project_task(&update).await?,
+                ProjectionOutcome::Applied { .. }
+            ) {
+                report.repaired += 1;
+            }
+        }
+        Ok(report)
+    }
+}
+
+fn repaired_terminal(status: OrchestrationStatus) -> Option<(String, String, String)> {
+    match status {
+        OrchestrationStatus::Completed { output, .. } => {
+            let result = serde_json::from_str::<serde_json::Value>(&output).ok();
+            let state = result
+                .as_ref()
+                .and_then(|value| value.get("state"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("completed")
+                .to_owned();
+            let reason = result
+                .as_ref()
+                .and_then(|value| value.get("reason_code"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("workflow_completed")
+                .to_owned();
+            Some((
+                state,
+                reason,
+                serde_json::json!({ "source": "duroxide_projection_repair" }).to_string(),
+            ))
+        }
+        OrchestrationStatus::Failed { details, .. } => {
+            let cancelled = matches!(
+                details,
+                ErrorDetails::Application {
+                    kind: AppErrorKind::Cancelled { .. },
+                    ..
+                }
+            );
+            Some((
+                if cancelled { "cancelled" } else { "failed" }.to_owned(),
+                if cancelled {
+                    "workflow_cancelled"
+                } else {
+                    "workflow_failed"
+                }
+                .to_owned(),
+                serde_json::json!({
+                    "source": "duroxide_projection_repair",
+                    "category": details.category().to_string(),
+                })
+                .to_string(),
+            ))
+        }
+        OrchestrationStatus::NotFound | OrchestrationStatus::Running { .. } => None,
     }
 }
 
@@ -197,8 +305,25 @@ pub enum ProjectionError {
     CorruptGeneration,
 }
 
+#[derive(Debug, Error)]
+pub enum ProjectionRepairError {
+    #[error("task projection repair database operation failed")]
+    Database(#[from] sqlx::Error),
+    #[error("task projection repair could not inspect Duroxide")]
+    Duroxide(#[from] duroxide::ClientError),
+    #[error("task projection repair failed to apply a projection")]
+    Projection(#[from] ProjectionError),
+    #[error("task projection repair found an invalid task identifier")]
+    InvalidTaskId,
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use duroxide::runtime::Runtime;
+    use duroxide::runtime::registry::ActivityRegistry;
+    use duroxide::{OrchestrationContext, OrchestrationRegistry};
     use tempfile::TempDir;
 
     use super::*;
@@ -295,6 +420,64 @@ mod tests {
             ProjectionOutcome::Missing
         );
         assert_eq!(event_count(&storage).await, 0);
+    }
+
+    #[tokio::test]
+    async fn repairs_a_failed_authoritative_workflow() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = open(&directory).await;
+        let provider = storage.duroxide_provider();
+        let client = Client::new(provider.clone());
+        let runtime = Runtime::start_with_store(
+            provider,
+            ActivityRegistry::builder().build(),
+            OrchestrationRegistry::builder()
+                .register_versioned("RepairFixture", "1.0.0", fail_fixture)
+                .build(),
+        )
+        .await;
+        client
+            .start_orchestration_versioned("fake-v1:1", "RepairFixture", "1.0.0", "{}")
+            .await
+            .expect("start failing workflow");
+        assert!(matches!(
+            client
+                .wait_for_orchestration("fake-v1:1", Duration::from_secs(5))
+                .await
+                .expect("wait for failure"),
+            OrchestrationStatus::Failed { .. }
+        ));
+
+        assert_eq!(
+            storage
+                .repair_terminal_task_projections(&client, 8, 5)
+                .await
+                .expect("repair projection"),
+            ProjectionRepairReport {
+                inspected: 1,
+                repaired: 1,
+            }
+        );
+        let row = sqlx::query(
+            "SELECT state, reason_code, projection_generation, terminal_at
+             FROM sporos_task WHERE id = ?",
+        )
+        .bind([1_u8; 16].as_slice())
+        .fetch_one(storage.pool())
+        .await
+        .expect("read repaired task");
+        assert_eq!(row.get::<String, _>("state"), "failed");
+        assert_eq!(row.get::<String, _>("reason_code"), "workflow_failed");
+        assert_eq!(row.get::<i64, _>("projection_generation"), 1);
+        assert_eq!(row.get::<i64, _>("terminal_at"), 5);
+        runtime.shutdown(None).await;
+    }
+
+    async fn fail_fixture(
+        _context: OrchestrationContext,
+        _input: String,
+    ) -> Result<String, String> {
+        Err("fixture failure".to_owned())
     }
 
     fn update(generation: u64, state: &str, terminal: bool) -> ProjectionUpdate {

@@ -31,6 +31,8 @@ use crate::search::{SearchExecutor, SearchPolicy};
 use crate::storage::Storage;
 
 const OUTBOX_INTERVAL: Duration = Duration::from_millis(100);
+const PROJECTION_REPAIR_INTERVAL: Duration = Duration::from_secs(5);
+const PROJECTION_REPAIR_BATCH_SIZE: usize = 32;
 
 pub fn init_logging(config: &Logging) -> Result<(), AppError> {
     let filter = EnvFilter::try_new(&config.level).map_err(AppError::LogFilter)?;
@@ -145,7 +147,9 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             .await
     });
     let (outbox_stop_tx, outbox_stop_rx) = watch::channel(false);
+    let (projection_stop_tx, projection_stop_rx) = watch::channel(false);
     let qbit_client = client.clone();
+    let projection_client = client.clone();
     let outbox_state = state.clone();
     let outbox_storage = Arc::clone(&storage);
     let outbox_batch_size = config.limits.outbox_batch_size;
@@ -158,6 +162,10 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             outbox_stop_rx,
         )
         .await;
+    });
+    let projection_storage = Arc::clone(&storage);
+    let projection_repair = tokio::spawn(async move {
+        projection_repair_loop(projection_storage, projection_client, projection_stop_rx).await;
     });
     let (qbit_stop_tx, qbit_stop_rx) = watch::channel(false);
     let qbit = synchronizer.map(|synchronizer| {
@@ -209,6 +217,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
 
     state.set_ready(false);
     let _ = outbox_stop_tx.send(true);
+    let _ = projection_stop_tx.send(true);
     let _ = qbit_stop_tx.send(true);
     let _ = prowlarr_stop_tx.send(true);
     let _ = http_stop_tx.send(());
@@ -222,6 +231,17 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             warn!(
                 service = "sporos",
                 "outbox dispatcher exceeded shutdown grace"
+            );
+        }
+    };
+    let projection_shutdown = async {
+        if tokio::time::timeout(grace, projection_repair)
+            .await
+            .is_err()
+        {
+            warn!(
+                service = "sporos",
+                "task projection repair exceeded shutdown grace"
             );
         }
     };
@@ -256,6 +276,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
     tokio::join!(
         runtime_shutdown,
         outbox_shutdown,
+        projection_shutdown,
         qbit_shutdown,
         prowlarr_shutdown,
         server_shutdown
@@ -269,6 +290,47 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         return Err(AppError::ServerStopped);
     }
     Ok(())
+}
+
+async fn projection_repair_loop(
+    storage: Arc<Storage>,
+    client: Client,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(PROJECTION_REPAIR_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                match storage
+                    .repair_terminal_task_projections(
+                        &client,
+                        PROJECTION_REPAIR_BATCH_SIZE,
+                        now_ms(),
+                    )
+                    .await
+                {
+                    Ok(report) if report.repaired > 0 => info!(
+                        service = "sporos",
+                        inspected = report.inspected,
+                        repaired = report.repaired,
+                        "terminal task projections repaired"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => warn!(
+                        service = "sporos",
+                        error = %error,
+                        "task projection repair failed"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 async fn prowlarr_loop(
