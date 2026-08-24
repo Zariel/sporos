@@ -47,6 +47,13 @@ pub async fn workflow(context: OrchestrationContext, input: String) -> Result<St
         let result: EvaluationResult = serde_json::from_str(&output)
             .map_err(|error| format!("invalid candidate evaluation result: {error}"))?;
         match result {
+            EvaluationResult::Terminal {
+                ref state,
+                plan_id: Some(plan_id),
+                ..
+            } if state == "planned" => {
+                return crate::injection::run(&context, &input, plan_id).await;
+            }
             EvaluationResult::Terminal { .. } => return Ok(output),
             EvaluationResult::Waiting { deadline_ms, .. } => {
                 let remaining = deadline_ms.saturating_sub(now_ms());
@@ -431,7 +438,7 @@ impl Storage {
             TaskId::from_bytes(input.task_id),
             state,
             Some(reason_code.clone()),
-            true,
+            state != "planned",
             serde_json::json!({
                 "matchId": encode_hex(&match_id),
                 "planId": plan_id.map(|id| encode_hex(&id)),
@@ -447,7 +454,7 @@ impl Storage {
         })
     }
 
-    async fn project_candidate_task(
+    pub(crate) async fn project_candidate_task(
         &self,
         task_id: TaskId,
         state: &str,
@@ -945,7 +952,7 @@ mod tests {
         .unwrap();
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = crate::engine::registries(Arc::clone(&storage));
+        let (activities, orchestrations) = crate::engine::registries(Arc::clone(&storage), None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(now_ms())
@@ -1040,7 +1047,7 @@ mod tests {
         let instance: String = row.get("duroxide_instance_id");
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = crate::engine::registries(Arc::clone(&storage));
+        let (activities, orchestrations) = crate::engine::registries(Arc::clone(&storage), None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(now_ms())

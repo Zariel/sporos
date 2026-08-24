@@ -105,12 +105,14 @@ struct AddReceipt {
     added_torrent_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct TorrentState {
     pub hash: String,
     pub name: String,
     pub state: String,
     pub amount_left: u64,
+    #[serde(default)]
+    pub progress: f64,
     pub save_path: String,
     pub content_path: String,
     pub category: String,

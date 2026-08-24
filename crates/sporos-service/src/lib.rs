@@ -10,6 +10,7 @@ pub mod durable_ingress;
 pub mod engine;
 pub mod hardlink;
 pub mod http;
+mod injection;
 pub mod inventory;
 pub mod outbox;
 pub mod preflight;

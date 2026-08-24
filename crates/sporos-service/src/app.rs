@@ -60,25 +60,28 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             .await
             .map_err(AppError::OpenStorage)?,
     );
-    let synchronizer = config
+    let qbit_api = config
         .qbittorrent
         .as_ref()
         .map(|settings| {
             let api_key = ApiKey::new(settings.api_key.expose())?;
-            let client = QbittorrentClient::with_timeout(
-                settings.url.clone(),
-                api_key,
-                settings.request_timeout,
-            )?;
-            Ok::<_, QbittorrentConfigError>(InventorySynchronizer::new(
-                Arc::clone(&storage),
-                client,
-                settings.inventory_batch_size,
-                settings.database_batch_size,
-            ))
+            QbittorrentClient::with_timeout(settings.url.clone(), api_key, settings.request_timeout)
         })
         .transpose()
         .map_err(AppError::QbittorrentConfig)?;
+    let synchronizer =
+        config
+            .qbittorrent
+            .as_ref()
+            .zip(qbit_api.clone())
+            .map(|(settings, client)| {
+                InventorySynchronizer::new(
+                    Arc::clone(&storage),
+                    client,
+                    settings.inventory_batch_size,
+                    settings.database_batch_size,
+                )
+            });
     let provider = storage.duroxide_provider();
     let client = Client::new(provider.clone());
     OutboxDispatcher::new(&storage, client.clone(), config.limits.outbox_batch_size)
@@ -89,7 +92,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         .await
         .map_err(AppError::Bind)?;
     let address = listener.local_addr().map_err(AppError::LocalAddress)?;
-    let (activities, orchestrations) = registries(Arc::clone(&storage));
+    let (activities, orchestrations) = registries(Arc::clone(&storage), qbit_api);
     let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
     let state = HttpState::new(Arc::clone(&storage), &config);
     let app: Router = router(state.clone(), config.server.admin_body_limit_bytes)

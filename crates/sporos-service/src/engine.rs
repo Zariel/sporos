@@ -22,9 +22,13 @@ pub struct FakeTaskInput {
     pub delay_ms: u64,
 }
 
-pub fn registries(storage: Arc<Storage>) -> (ActivityRegistry, OrchestrationRegistry) {
+pub fn registries(
+    storage: Arc<Storage>,
+    qbit: Option<crate::qbittorrent::QbittorrentClient>,
+) -> (ActivityRegistry, OrchestrationRegistry) {
     let completion_storage = Arc::clone(&storage);
     let candidate_storage = Arc::clone(&storage);
+    let injection_storage = Arc::clone(&storage);
     let activities = ActivityRegistry::builder()
         .register(
             PROJECT_TASK_ACTIVITY,
@@ -71,7 +75,9 @@ pub fn registries(storage: Arc<Storage>) -> (ActivityRegistry, OrchestrationRegi
                         .map_err(|error| format!("encode candidate evaluation: {error}"))
                 }
             },
-        )
+        );
+    let activities = crate::injection::InjectionExecutor::new(injection_storage, qbit)
+        .register(activities)
         .build();
     let orchestrations = OrchestrationRegistry::builder()
         .register_versioned(FAKE_TASK_NAME, FAKE_TASK_VERSION, fake_task)
@@ -221,7 +227,7 @@ mod tests {
         let storage = Arc::new(open(&directory).await);
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = registries(Arc::clone(&storage));
+        let (activities, orchestrations) = registries(Arc::clone(&storage), None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         let status = client
             .wait_for_orchestration("fake-v1:1", Duration::from_secs(7))
@@ -258,7 +264,7 @@ mod tests {
             .expect("accept crash-probe task");
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = registries(Arc::clone(&storage));
+        let (activities, orchestrations) = registries(Arc::clone(&storage), None);
         let _runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client, 1)
             .run_once(10)
@@ -279,7 +285,7 @@ mod tests {
             .expect("accept fake task");
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = registries(Arc::clone(&storage));
+        let (activities, orchestrations) = registries(Arc::clone(&storage), None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(10)
@@ -304,7 +310,7 @@ mod tests {
         let storage = Arc::new(open(&directory).await);
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = registries(Arc::clone(&storage));
+        let (activities, orchestrations) = registries(Arc::clone(&storage), None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         let input = serde_json::to_string(&FakeTaskInput {
             task_id: [9; 16],
@@ -354,7 +360,7 @@ mod tests {
             .expect("make projection stale");
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = registries(Arc::clone(&storage));
+        let (activities, orchestrations) = registries(Arc::clone(&storage), None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client.clone(), 1)
             .run_once(10)
@@ -379,7 +385,7 @@ mod tests {
             .expect("accept fake task");
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = registries(Arc::clone(&storage));
+        let (activities, orchestrations) = registries(Arc::clone(&storage), None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         OutboxDispatcher::new(&storage, client, 1)
             .run_once(10)
@@ -390,7 +396,7 @@ mod tests {
 
         let provider = storage.duroxide_provider();
         let client = Client::new(provider.clone());
-        let (activities, orchestrations) = registries(Arc::clone(&storage));
+        let (activities, orchestrations) = registries(Arc::clone(&storage), None);
         let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
         let status = client
             .wait_for_orchestration("fake-v1:1", Duration::from_secs(7))
