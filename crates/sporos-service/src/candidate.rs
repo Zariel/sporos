@@ -34,6 +34,7 @@ pub struct CandidatePolicy {
     pub injection: Injection,
     pub namespace_local_root: String,
     pub save_path_remote_root: String,
+    pub path_rewrites: Vec<crate::config::PathRewrite>,
 }
 
 #[derive(Debug)]
@@ -138,6 +139,7 @@ impl CandidateIngress {
             },
             namespace_local_root: self.paths.link_root.to_string_lossy().into_owned(),
             save_path_remote_root: self.paths.qbit_link_root().to_string_lossy().into_owned(),
+            path_rewrites: self.paths.rewrite.clone(),
         };
         let manifest_json = serde_json::to_string(&manifest)?;
         let release_json = serde_json::to_string(&release)?;

@@ -509,7 +509,7 @@ async fn persist_plan(
     let mut seen = BTreeSet::new();
     tags.retain(|tag| !tag.is_empty() && seen.insert(tag.clone()));
     let tags_json = serde_json::to_string(&tags)?;
-    let resume_policy_json = "{\"mode\":\"complete_only\",\"combine\":\"and\"}";
+    let resume_policy_json = serde_json::to_string(&loaded.policy.injection.resume)?;
     let material = serde_json::to_vec(&serde_json::json!({
         "matchId": encode_hex(&match_id),
         "candidateId": encode_hex(&input.candidate_id),
@@ -517,7 +517,7 @@ async fn persist_plan(
         "savePathRemote": save_path_remote,
         "category": category,
         "tags": tags,
-        "resumePolicy": resume_policy_json,
+        "resumePolicy": &resume_policy_json,
         "mappings": decision.mappings,
     }))?;
     let plan_digest: [u8; 32] = Sha256::digest(material).into();

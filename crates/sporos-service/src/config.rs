@@ -306,7 +306,7 @@ impl Default for PathsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PathRewrite {
     pub name: String,
@@ -332,24 +332,45 @@ impl Default for Paths {
 
 impl Paths {
     pub fn qbit_link_root(&self) -> PathBuf {
-        self.rewrite
-            .iter()
-            .filter(|rewrite| {
-                rewrite
-                    .services
-                    .iter()
-                    .any(|service| service == "qbittorrent")
-                    && self.link_root.starts_with(&rewrite.local)
-            })
-            .max_by_key(|rewrite| rewrite.local.components().count())
-            .and_then(|rewrite| {
-                self.link_root
-                    .strip_prefix(&rewrite.local)
-                    .ok()
-                    .map(|suffix| rewrite.remote.join(suffix))
-            })
-            .unwrap_or_else(|| self.link_root.clone())
+        self.local_to_remote("qbittorrent", &self.link_root)
     }
+
+    pub fn remote_to_local(&self, service: &str, path: &Path) -> PathBuf {
+        rewrite_path(&self.rewrite, service, path, |rewrite| {
+            (&rewrite.remote, &rewrite.local)
+        })
+    }
+
+    pub fn local_to_remote(&self, service: &str, path: &Path) -> PathBuf {
+        rewrite_path(&self.rewrite, service, path, |rewrite| {
+            (&rewrite.local, &rewrite.remote)
+        })
+    }
+}
+
+fn rewrite_path<'a>(
+    rewrites: &'a [PathRewrite],
+    service: &str,
+    path: &Path,
+    direction: impl Fn(&'a PathRewrite) -> (&'a Path, &'a Path),
+) -> PathBuf {
+    rewrites
+        .iter()
+        .filter(|rewrite| {
+            rewrite
+                .services
+                .iter()
+                .any(|candidate| candidate == service)
+        })
+        .filter_map(|rewrite| {
+            let (from, to) = direction(rewrite);
+            path.strip_prefix(from)
+                .ok()
+                .map(|suffix| (from.components().count(), to.join(suffix)))
+        })
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, rewritten)| rewritten)
+        .unwrap_or_else(|| path.to_owned())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +460,27 @@ pub struct Injection {
     pub tag_templates: Vec<String>,
     pub inherit_source_category: bool,
     pub inherit_source_tags: bool,
+    pub resume: ResumePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ResumePolicy {
+    Never,
+    CompleteOnly,
+    Threshold {
+        max_missing_bytes: Option<u64>,
+        min_present_ratio_ppm: Option<u32>,
+        combine: ThresholdCombination,
+    },
+    Always,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdCombination {
+    And,
+    Or,
 }
 
 impl Default for Injection {
@@ -450,6 +492,7 @@ impl Default for Injection {
             tag_templates: raw.tag_templates,
             inherit_source_category: raw.inherit_source_category,
             inherit_source_tags: raw.inherit_source_tags,
+            resume: resume_policy(&raw.resume).expect("default resume policy is valid"),
         }
     }
 }
@@ -472,6 +515,8 @@ impl Default for InjectionConfig {
 struct ResumeConfig {
     mode: String,
     combine: String,
+    max_missing_bytes: Option<u64>,
+    min_present_ratio: Option<f64>,
 }
 
 impl Default for ResumeConfig {
@@ -479,6 +524,8 @@ impl Default for ResumeConfig {
         Self {
             mode: "complete_only".to_owned(),
             combine: "and".to_owned(),
+            max_missing_bytes: None,
+            min_present_ratio: None,
         }
     }
 }
@@ -550,13 +597,7 @@ fn load(
     let raw: RawConfig = value.try_into()?;
     validate_positive(&raw)?;
     let matching = matching(&raw.matching)?;
-    let injection = Injection {
-        dry_run: raw.injection.dry_run,
-        category_template: raw.injection.category_template.clone(),
-        tag_templates: raw.injection.tag_templates.clone(),
-        inherit_source_category: raw.injection.inherit_source_category,
-        inherit_source_tags: raw.injection.inherit_source_tags,
-    };
+    let injection = injection(&raw.injection)?;
     let paths = Paths {
         link_root: raw
             .paths
@@ -655,7 +696,7 @@ fn validate_paths(paths: &Paths) -> Result<(), ConfigError> {
     }
     for (index, left) in paths.rewrite.iter().enumerate() {
         if paths.rewrite[index + 1..].iter().any(|right| {
-            left.local == right.local
+            (left.local == right.local || left.remote == right.remote)
                 && left
                     .services
                     .iter()
@@ -665,6 +706,58 @@ fn validate_paths(paths: &Paths) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+fn injection(config: &InjectionConfig) -> Result<Injection, ConfigError> {
+    if config.category_template.len() > 256
+        || config.tag_templates.len() > 64
+        || config
+            .tag_templates
+            .iter()
+            .any(|template| template.len() > 256)
+    {
+        return Err(ConfigError::TemplateLimit);
+    }
+    Ok(Injection {
+        dry_run: config.dry_run,
+        category_template: config.category_template.clone(),
+        tag_templates: config.tag_templates.clone(),
+        inherit_source_category: config.inherit_source_category,
+        inherit_source_tags: config.inherit_source_tags,
+        resume: resume_policy(&config.resume)?,
+    })
+}
+
+fn resume_policy(config: &ResumeConfig) -> Result<ResumePolicy, ConfigError> {
+    let combine = match config.combine.as_str() {
+        "and" => ThresholdCombination::And,
+        "or" => ThresholdCombination::Or,
+        _ => return Err(ConfigError::ThresholdCombination),
+    };
+    let min_present_ratio_ppm = config
+        .min_present_ratio
+        .map(|ratio| {
+            if ratio.is_finite() && (0.0..=1.0).contains(&ratio) {
+                Ok((ratio * 1_000_000.0).round() as u32)
+            } else {
+                Err(ConfigError::PresentRatio)
+            }
+        })
+        .transpose()?;
+    match config.mode.as_str() {
+        "never" => Ok(ResumePolicy::Never),
+        "complete_only" => Ok(ResumePolicy::CompleteOnly),
+        "always" => Ok(ResumePolicy::Always),
+        "threshold" if config.max_missing_bytes.is_some() || min_present_ratio_ppm.is_some() => {
+            Ok(ResumePolicy::Threshold {
+                max_missing_bytes: config.max_missing_bytes,
+                min_present_ratio_ppm,
+                combine,
+            })
+        }
+        "threshold" => Err(ConfigError::EmptyThreshold),
+        _ => Err(ConfigError::ResumeMode),
+    }
 }
 
 fn matching(config: &MatchingConfig) -> Result<Matching, ConfigError> {
@@ -977,6 +1070,16 @@ pub enum ConfigError {
     PathRewrite,
     #[error("path rewrites cannot have equal local prefixes for the same service")]
     AmbiguousPathRewrite,
+    #[error("category and tag templates exceed their configured limits")]
+    TemplateLimit,
+    #[error("injection.resume.mode is invalid")]
+    ResumeMode,
+    #[error("injection.resume.combine must be and or or")]
+    ThresholdCombination,
+    #[error("injection.resume.min_present_ratio must be between zero and one")]
+    PresentRatio,
+    #[error("threshold resume policy requires at least one threshold")]
+    EmptyThreshold,
     #[error("invalid {kind} URL for Arr instance {name}")]
     ArrUrl { kind: &'static str, name: String },
     #[error("{0} must specify either a direct value or a file")]
@@ -1156,6 +1259,10 @@ mod tests {
                 local = "/srv/sporos"
                 remote = "/downloads/sporos"
                 services = ["qbittorrent"]
+                [injection.resume]
+                mode = "threshold"
+                min_present_ratio = 0.10
+                combine = "or"
             "#,
         )
         .expect("load candidate policy");
@@ -1175,6 +1282,21 @@ mod tests {
             config.paths.qbit_link_root(),
             Path::new("/downloads/sporos/links")
         );
+        assert_eq!(
+            config.paths.remote_to_local(
+                "qbittorrent",
+                Path::new("/downloads/sporos/source/file.mkv")
+            ),
+            Path::new("/srv/sporos/source/file.mkv")
+        );
+        assert_eq!(
+            config.injection.resume,
+            ResumePolicy::Threshold {
+                max_missing_bytes: None,
+                min_present_ratio_ppm: Some(100_000),
+                combine: ThresholdCombination::Or,
+            }
+        );
     }
 
     #[test]
@@ -1185,6 +1307,8 @@ mod tests {
             "[matching]\nmax_torrent_bytes = 67108865",
             "[matching]\nvideo_extensions = [\"../mkv\"]",
             "[paths]\nlink_root = \"relative\"",
+            "[injection.resume]\nmode = \"threshold\"",
+            "[injection.resume]\nmode = \"threshold\"\nmin_present_ratio = 1.1",
         ] {
             let config = format!(
                 "[auth]\nwebhook_token = \"webhook\"\nadmin_token = \"admin\"\n{invalid}\n"
