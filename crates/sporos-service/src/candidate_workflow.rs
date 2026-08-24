@@ -1043,6 +1043,7 @@ mod tests {
     use crate::outbox::OutboxDispatcher;
 
     const CRASH_PROBE_DIRECTORY: &str = "SPOROS_CANDIDATE_CRASH_PROBE_DIRECTORY";
+    const TIMER_CRASH_PROBE_DIRECTORY: &str = "SPOROS_CANDIDATE_TIMER_CRASH_PROBE_DIRECTORY";
 
     #[tokio::test]
     async fn dry_run_persists_a_complete_plan_without_external_mutation() {
@@ -1419,6 +1420,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waiting_timer_survives_process_kill() {
+        let directory = TempDir::new().expect("temporary directory");
+        let marker = directory.path().join("candidate-timer-created");
+        let mut child = Command::new(std::env::current_exe().expect("locate test executable"))
+            .args([
+                "--exact",
+                "candidate_workflow::tests::candidate_timer_crash_probe",
+                "--nocapture",
+            ])
+            .env(TIMER_CRASH_PROBE_DIRECTORY, directory.path())
+            .spawn()
+            .expect("start candidate timer crash probe");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate did not durably create its waiting timer");
+        child.kill().expect("kill candidate process");
+        assert!(!child.wait().expect("wait for candidate process").success());
+
+        let storage = Arc::new(open(&directory).await);
+        let row = sqlx::query(
+            "SELECT t.duroxide_instance_id, o.input_json
+             FROM sporos_task t JOIN sporos_outbox o ON o.task_id = t.id
+             WHERE t.kind = 'process_candidate'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .expect("load waiting candidate task");
+        let instance: String = row.get("duroxide_instance_id");
+        let input: CandidateWorkflowInput =
+            serde_json::from_str(&row.get::<String, _>("input_json")).unwrap();
+        let provider = storage.duroxide_provider();
+        let client = Client::new(provider.clone());
+        let (activities, orchestrations) =
+            crate::engine::registries(Arc::clone(&storage), None, None, None);
+        let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
+        project_source(&storage, true, 13, 2).await;
+        client
+            .enqueue_event(&instance, SOURCE_COMPLETED_EVENT, "{}")
+            .await
+            .expect("wake recovered candidate");
+
+        assert!(matches!(
+            client
+                .wait_for_orchestration(&instance, Duration::from_secs(5))
+                .await
+                .expect("wait for recovered candidate"),
+            OrchestrationStatus::Completed { .. }
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM sporos_task WHERE id = ?")
+                .bind(input.task_id.as_slice())
+                .fetch_one(storage.pool())
+                .await
+                .unwrap(),
+            "dry_run_complete"
+        );
+        runtime.shutdown(Some(100)).await;
+    }
+
+    #[tokio::test]
     async fn candidate_crash_probe() {
         let Some(directory) = std::env::var_os(CRASH_PROBE_DIRECTORY) else {
             return;
@@ -1429,6 +1494,55 @@ mod tests {
         let _ = accept(&storage, root, now_ms()).await;
         std::fs::write(root.join("candidate-acknowledged"), b"acknowledged")
             .expect("write acknowledgement marker");
+        std::future::pending::<()>().await;
+    }
+
+    #[tokio::test]
+    async fn candidate_timer_crash_probe() {
+        let Some(directory) = std::env::var_os(TIMER_CRASH_PROBE_DIRECTORY) else {
+            return;
+        };
+        let root = Path::new(&directory);
+        let storage = Arc::new(open_path(root).await);
+        project_source(&storage, false, 13, 1).await;
+        let input = accept(&storage, root, now_ms()).await;
+        let instance = sqlx::query_scalar::<_, String>(
+            "SELECT duroxide_instance_id FROM sporos_task WHERE id = ?",
+        )
+        .bind(input.task_id.as_slice())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let provider = storage.duroxide_provider();
+        let client = Client::new(provider.clone());
+        let (activities, orchestrations) =
+            crate::engine::registries(Arc::clone(&storage), None, None, None);
+        let _runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
+        OutboxDispatcher::new(&storage, client, 1)
+            .run_once(now_ms())
+            .await
+            .expect("dispatch candidate workflow");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let timer = sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM history
+                     WHERE instance_id = ? AND event_type = 'TimerCreated'",
+                )
+                .bind(&instance)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+                let waiting = count(&storage, "sporos_waiting_source").await;
+                if timer == 1 && waiting == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate did not begin durable waiting");
+        std::fs::write(root.join("candidate-timer-created"), b"created")
+            .expect("write timer marker");
         std::future::pending::<()>().await;
     }
 

@@ -1119,6 +1119,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
     use std::thread;
 
     use reqwest::Url;
@@ -1134,6 +1135,7 @@ mod tests {
     use crate::qbittorrent::ApiKey;
 
     const API_KEY: &str = "qbt_0123456789abcdefghijklmnopqr";
+    const RECHECK_CRASH_PROBE_DIRECTORY: &str = "SPOROS_RECHECK_CRASH_PROBE_DIRECTORY";
 
     #[tokio::test]
     async fn injection_materializes_rechecks_and_verifies_final_state() {
@@ -1275,6 +1277,159 @@ mod tests {
         assert_eq!(injection.get::<String, _>("resume_decision"), "resume");
         assert_eq!(injection.get::<i64, _>("progress_ppm"), 1_000_000);
         assert_eq!(injection.get::<String, _>("state"), "completed");
+    }
+
+    #[tokio::test]
+    async fn recheck_submission_survives_process_kill() {
+        let directory = TempDir::new().unwrap();
+        let marker = directory.path().join("recheck-submitted");
+        let mut child = Command::new(std::env::current_exe().expect("locate test executable"))
+            .args([
+                "--exact",
+                "injection::tests::recheck_crash_probe",
+                "--nocapture",
+            ])
+            .env(RECHECK_CRASH_PROBE_DIRECTORY, directory.path())
+            .spawn()
+            .expect("start recheck crash probe");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recheck was not submitted");
+        child.kill().expect("kill recheck process");
+        assert!(!child.wait().expect("wait for recheck process").success());
+
+        let storage = Arc::new(
+            Storage::open(
+                directory.path().join("sporos.lock"),
+                directory.path().join("sporos.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let row = sqlx::query(
+            "SELECT o.input_json, ip.id AS plan_id
+             FROM sporos_outbox o
+             JOIN sporos_candidate_task ct ON ct.task_id = o.task_id
+             JOIN sporos_injection_plan ip ON ip.candidate_id = ct.candidate_id
+             WHERE o.orchestration_name = 'ProcessCandidate'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let workflow_input: CandidateWorkflowInput =
+            serde_json::from_str(&row.get::<String, _>("input_json")).unwrap();
+        let input = InjectionInput {
+            task_id: workflow_input.task_id,
+            candidate_id: workflow_input.candidate_id,
+            policy_snapshot_id: workflow_input.policy_snapshot_id,
+            plan_id: row.get::<Vec<u8>, _>("plan_id").try_into().unwrap(),
+        };
+        let (url, server) = qbit_server(vec![Vec::new()]);
+        let executor = InjectionExecutor::new(
+            Arc::clone(&storage),
+            Some(QbittorrentClient::new(url, ApiKey::new(API_KEY).unwrap()).unwrap()),
+        );
+
+        assert_eq!(executor.recheck(&input).await.unwrap(), waiting());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM sporos_injection WHERE plan_id = ?",
+            )
+            .bind(input.plan_id.as_slice())
+            .fetch_one(storage.pool())
+            .await
+            .unwrap(),
+            "recheck_requested"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recheck_crash_probe() {
+        let Some(directory) = std::env::var_os(RECHECK_CRASH_PROBE_DIRECTORY) else {
+            return;
+        };
+        let root = Path::new(&directory);
+        let source_root = root.join("source");
+        std::fs::create_dir(&source_root).unwrap();
+        std::fs::write(source_root.join("Example.Movie.2024"), b"source-bytes!").unwrap();
+        let storage = Arc::new(
+            Storage::open(root.join("sporos.lock"), root.join("sporos.db"))
+                .await
+                .unwrap(),
+        );
+        project_source(&storage).await;
+        let accepted = accept_candidate(&storage, root, &source_root).await;
+        let workflow_input: CandidateWorkflowInput = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT input_json FROM sporos_outbox WHERE task_id = ?",
+            )
+            .bind(accepted.task_id.as_bytes().as_slice())
+            .fetch_one(storage.pool())
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let EvaluationResult::Terminal {
+            plan_id: Some(plan_id),
+            ..
+        } = storage
+            .evaluate_candidate(&workflow_input, 20)
+            .await
+            .unwrap()
+        else {
+            panic!("candidate did not produce an injection plan");
+        };
+        let row = sqlx::query(
+            "SELECT ip.save_path_remote, c.v1_hash FROM sporos_injection_plan ip
+             JOIN sporos_candidate c ON c.id = ip.candidate_id WHERE ip.id = ?",
+        )
+        .bind(plan_id.as_slice())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let save_path: String = row.get("save_path_remote");
+        let hash = encode_hex(&row.get::<Vec<u8>, _>("v1_hash"));
+        let stopped = state(&hash, &save_path, "stoppedUP", 0, 1.0);
+        let (url, server) = qbit_server(vec![
+            b"v5.2.5".to_vec(),
+            b"2.14.3".to_vec(),
+            b"[]".to_vec(),
+            format!(
+                r#"{{"success_count":1,"failure_count":0,"pending_count":0,"added_torrent_ids":["{hash}"]}}"#
+            )
+            .into_bytes(),
+            b"v5.2.5".to_vec(),
+            b"2.14.3".to_vec(),
+            format!("[{stopped}]").into_bytes(),
+            format!("[{stopped}]").into_bytes(),
+            Vec::new(),
+        ]);
+        let executor = InjectionExecutor::new(
+            Arc::clone(&storage),
+            Some(QbittorrentClient::new(url, ApiKey::new(API_KEY).unwrap()).unwrap()),
+        );
+        let input = InjectionInput {
+            task_id: workflow_input.task_id,
+            candidate_id: workflow_input.candidate_id,
+            policy_snapshot_id: workflow_input.policy_snapshot_id,
+            plan_id,
+        };
+
+        assert_eq!(executor.prepare(&input).await.unwrap(), waiting());
+        assert_eq!(executor.prepare(&input).await.unwrap(), StepResult::Ready);
+        assert_eq!(
+            executor.materialize(&input).await.unwrap(),
+            StepResult::Ready
+        );
+        assert_eq!(executor.recheck(&input).await.unwrap(), waiting());
+        server.join().unwrap();
+        std::fs::write(root.join("recheck-submitted"), b"submitted").unwrap();
+        std::future::pending::<()>().await;
     }
 
     #[test]

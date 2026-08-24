@@ -39,6 +39,15 @@ while IFS= read -r source; do
     fi
 done < <(rg --files crates/sporos-service/src -g '*.rs')
 
+while IFS= read -r source; do
+    [[ $source == */duroxide_phase0.rs ]] && continue
+    if awk '/#\[cfg\(test\)\]/{exit} {print}' "$source" \
+        | rg -n 'orchestrator_queue|event_data|FROM[[:space:]]+history|duroxide::(Event|WorkItem)'; then
+        echo "production code reads Duroxide private storage: $source" >&2
+        exit 1
+    fi
+done < <(rg --files crates/sporos-service/src -g '*.rs')
+
 api_routes=(
     '/api/v1/autobrr/check' \
     '/api/v1/autobrr/torrents' \
