@@ -5,7 +5,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --locked --release --bins
 
-FROM docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 
 ARG VERSION=0.0.0
 ARG REVISION=unknown
@@ -16,10 +16,8 @@ LABEL org.opencontainers.image.title="Sporos" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build /src/target/release/sporos /usr/local/bin/sporos
-COPY --from=build /src/target/release/sporosctl /usr/local/bin/sporosctl
-RUN mkdir -p /data /config && chown 65532:65532 /data /config
+COPY --from=build --chown=65532:65532 /src/target/release/sporos /usr/local/bin/sporos
+COPY --from=build --chown=65532:65532 /src/target/release/sporosctl /usr/local/bin/sporosctl
 
 USER 65532:65532
 EXPOSE 8080
