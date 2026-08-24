@@ -1,5 +1,9 @@
 # Operations
 
+The administrative and webhook HTTP contract is published as
+[`openapi.yaml`](openapi.yaml). The repository checks its route set against the
+service router and rejects cleanup or deletion endpoints in both surfaces.
+
 `/livez` reports process liveness. `/readyz` becomes successful only after the
 database, lock, migrations, runtime, and initial durable-start dispatch are
 ready. `/metrics` is OpenMetrics text and includes bounded-route HTTP counts and

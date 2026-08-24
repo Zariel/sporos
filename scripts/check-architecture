@@ -39,18 +39,33 @@ while IFS= read -r source; do
     fi
 done < <(rg --files crates/sporos-service/src -g '*.rs')
 
-for route in \
+api_routes=(
     '/api/v1/autobrr/check' \
     '/api/v1/autobrr/torrents' \
     '/api/v1/admin/tasks' \
     '/api/v1/admin/operations' \
+    '/api/v1/admin/operations/{operation_id}' \
     '/api/v1/admin/searches' \
     '/api/v1/admin/data-scans' \
-    '/api/v1/admin/inventory'; do
+    '/api/v1/admin/tasks/{task_id}' \
+    '/api/v1/admin/tasks/{task_id}/retry' \
+    '/api/v1/admin/tasks/{task_id}/cancel' \
+    '/api/v1/admin/tasks/{task_id}/events' \
+    '/api/v1/admin/inventory' \
+    '/api/v1/admin/inventory/torrents' \
+    '/api/v1/admin/inventory/reconcile'
+)
+
+for route in "${api_routes[@]}"; do
     rg -F --quiet "$route" crates/sporos-service/src/http.rs
+    rg -F --quiet "  $route:" docs/openapi.yaml
 done
 
 if rg -n '/api/v1/.*(delete|cleanup|remove)' crates/sporos-service/src/http.rs; then
     echo 'administrative HTTP surface contains a cleanup route' >&2
+    exit 1
+fi
+if rg -n '^  /api/v1/.*(delete|cleanup|remove)' docs/openapi.yaml; then
+    echo 'administrative OpenAPI surface contains a cleanup route' >&2
     exit 1
 fi

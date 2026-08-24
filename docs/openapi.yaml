@@ -1,0 +1,248 @@
+openapi: 3.1.0
+info:
+  title: Sporos API
+  version: 1.0.0
+  description: Durable webhook ingestion and administrative operations.
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: health
+  - name: autobrr
+  - name: admin
+paths:
+  /livez:
+    get:
+      tags: [health]
+      operationId: live
+      responses:
+        "200": {description: Process is live}
+  /readyz:
+    get:
+      tags: [health]
+      operationId: ready
+      responses:
+        "200": {description: Service can durably accept work}
+        "503": {description: Service is not ready}
+  /metrics:
+    get:
+      tags: [health]
+      operationId: metrics
+      responses:
+        "200": {description: Prometheus text exposition}
+  /api/v1/autobrr/check:
+    post:
+      tags: [autobrr]
+      operationId: autobrrCheck
+      security: [{webhookBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AutobrrCheck"}
+      responses:
+        "200": {description: Provisional acceptance decision}
+        "404": {description: No plausible source, content: {application/problem+json: {schema: {$ref: "#/components/schemas/Problem"}}}}
+        "503": {description: Inventory unavailable, content: {application/problem+json: {schema: {$ref: "#/components/schemas/Problem"}}}}
+  /api/v1/autobrr/torrents:
+    post:
+      tags: [autobrr]
+      operationId: ingestTorrent
+      security: [{webhookBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AutobrrTorrent"}
+      responses:
+        "202": {description: Work was durably accepted}
+        "400": {description: Invalid torrent, content: {application/problem+json: {schema: {$ref: "#/components/schemas/Problem"}}}}
+  /api/v1/admin/tasks:
+    get:
+      tags: [admin]
+      operationId: listTasks
+      security: [{adminBearer: []}]
+      responses:
+        "200": {description: Paginated tasks}
+  /api/v1/admin/tasks/{task_id}:
+    parameters: [{$ref: "#/components/parameters/TaskId"}]
+    get:
+      tags: [admin]
+      operationId: getTask
+      security: [{adminBearer: []}]
+      responses:
+        "200": {description: Task projection}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/admin/tasks/{task_id}/events:
+    parameters: [{$ref: "#/components/parameters/TaskId"}]
+    get:
+      tags: [admin]
+      operationId: listTaskEvents
+      security: [{adminBearer: []}]
+      responses:
+        "200": {description: Paginated task evidence}
+  /api/v1/admin/tasks/{task_id}/retry:
+    parameters: [{$ref: "#/components/parameters/TaskId"}]
+    post:
+      tags: [admin]
+      operationId: retryTask
+      security: [{adminBearer: []}]
+      responses:
+        "202": {description: New durable retry accepted}
+        "409": {description: Task is not retryable}
+  /api/v1/admin/tasks/{task_id}/cancel:
+    parameters: [{$ref: "#/components/parameters/TaskId"}]
+    post:
+      tags: [admin]
+      operationId: cancelTask
+      security: [{adminBearer: []}]
+      responses:
+        "202": {description: Workflow cancellation accepted}
+        "409": {description: Task is already terminal}
+  /api/v1/admin/operations:
+    get:
+      tags: [admin]
+      operationId: listOperations
+      security: [{adminBearer: []}]
+      responses:
+        "200": {description: Paginated operations}
+  /api/v1/admin/operations/{operation_id}:
+    parameters:
+      - name: operation_id
+        in: path
+        required: true
+        schema: {type: string, pattern: "^[0-9a-f]{32}$"}
+    get:
+      tags: [admin]
+      operationId: getOperation
+      security: [{adminBearer: []}]
+      responses:
+        "200": {description: Operation projection}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/admin/searches:
+    post:
+      tags: [admin]
+      operationId: startSearch
+      security: [{adminBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SearchRequest"}
+      responses:
+        "202": {description: Search operation durably accepted}
+  /api/v1/admin/data-scans:
+    post:
+      tags: [admin]
+      operationId: startDataScan
+      security: [{adminBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/DataScanRequest"}
+      responses:
+        "202": {description: Data scan durably accepted}
+  /api/v1/admin/inventory:
+    get:
+      tags: [admin]
+      operationId: inventoryStatus
+      security: [{adminBearer: []}]
+      responses:
+        "200": {description: Inventory status}
+  /api/v1/admin/inventory/torrents:
+    get:
+      tags: [admin]
+      operationId: listInventoryTorrents
+      security: [{adminBearer: []}]
+      responses:
+        "200": {description: Paginated qBittorrent inventory}
+  /api/v1/admin/inventory/reconcile:
+    post:
+      tags: [admin]
+      operationId: reconcileInventory
+      security: [{adminBearer: []}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                full: {type: boolean, default: false}
+      responses:
+        "202": {description: Reconciliation requested}
+components:
+  securitySchemes:
+    webhookBearer: {type: http, scheme: bearer}
+    adminBearer: {type: http, scheme: bearer}
+  parameters:
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      schema: {type: string, pattern: "^[0-9a-f]{32}$"}
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+  schemas:
+    AutobrrCheck:
+      type: object
+      additionalProperties: false
+      required: [torrentName]
+      properties:
+        torrentName: {type: string, minLength: 1, maxLength: 1024}
+        size: {type: integer, minimum: 0}
+        indexer: {type: string, maxLength: 128}
+    SearchRequest:
+      type: object
+      additionalProperties: false
+      required: [source]
+      properties:
+        source: {$ref: "#/components/schemas/SearchSource"}
+        indexerIds: {type: array, items: {type: integer}}
+        force: {type: boolean, default: false}
+        dryRun: {type: boolean, default: false}
+    SearchSource:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind: {type: string, const: qbittorrent}
+        hashes: {type: array, maxItems: 10000, items: {type: string, pattern: "^([0-9a-f]{40}|[0-9a-f]{64})$"}}
+        includeCategories: {type: array, items: {type: string}}
+        excludeCategories: {type: array, items: {type: string}}
+        includeTags: {type: array, items: {type: string}}
+        excludeTags: {type: array, items: {type: string}}
+    AutobrrTorrent:
+      type: object
+      additionalProperties: false
+      required: [torrentData]
+      properties:
+        torrentData: {type: string, contentEncoding: base64}
+        torrentName: {type: string}
+        indexer: {type: string}
+        category: {type: string}
+        tags: {type: array, items: {type: string}}
+        dryRun: {type: boolean, default: false}
+    DataScanRequest:
+      type: object
+      additionalProperties: false
+      required: [root]
+      properties:
+        root: {type: string, minLength: 1}
+        indexerIds: {type: array, items: {type: integer}}
+        force: {type: boolean, default: false}
+        dryRun: {type: boolean, default: false}
+    Problem:
+      type: object
+      required: [type, title, status, code, detail, requestId]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        code: {type: string}
+        detail: {type: string}
+        requestId: {type: string}
