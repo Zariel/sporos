@@ -27,10 +27,29 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Inspect manual operations.
+    Operations {
+        #[command(subcommand)]
+        command: OperationCommand,
+    },
     /// Operate the qBittorrent inventory projection.
     Inventory {
         #[command(subcommand)]
         command: InventoryCommand,
+    },
+    /// Start a manual qBittorrent inventory search.
+    Search {
+        #[arg(long = "indexer")]
+        indexers: Vec<i64>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Operate configured data roots.
+    Data {
+        #[command(subcommand)]
+        command: DataCommand,
     },
 }
 
@@ -53,6 +72,41 @@ enum TaskCommand {
     },
     /// Show one task projection.
     Show { task_id: String },
+    /// Show durable task evidence.
+    Events { task_id: String },
+    /// Retry a failed or cancelled task through a new durable start.
+    Retry { task_id: String },
+    /// Request cancellation of the authoritative workflow.
+    Cancel { task_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum OperationCommand {
+    /// List recent operations using keyset pagination.
+    List {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=200))]
+        limit: u16,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Show one operation.
+    Show { operation_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum DataCommand {
+    /// Scan a configured data root.
+    Scan {
+        root: String,
+        #[arg(long = "indexer")]
+        indexers: Vec<i64>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -104,6 +158,61 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let url = base.join(&format!("/api/v1/admin/tasks/{task_id}"))?;
                     request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
                 }
+                TaskCommand::Events { task_id } => {
+                    let url = base.join(&format!("/api/v1/admin/tasks/{task_id}/events"))?;
+                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                }
+                TaskCommand::Retry { task_id } => {
+                    let url = base.join(&format!("/api/v1/admin/tasks/{task_id}/retry"))?;
+                    request_json(
+                        &client,
+                        reqwest::Method::POST,
+                        url,
+                        &token,
+                        Some(serde_json::json!({})),
+                        cli.output,
+                    )
+                    .await
+                }
+                TaskCommand::Cancel { task_id } => {
+                    let url = base.join(&format!("/api/v1/admin/tasks/{task_id}/cancel"))?;
+                    request_json(
+                        &client,
+                        reqwest::Method::POST,
+                        url,
+                        &token,
+                        Some(serde_json::json!({})),
+                        cli.output,
+                    )
+                    .await
+                }
+            }
+        }
+        Command::Operations { command } => {
+            let token = admin_token()?;
+            match command {
+                OperationCommand::List {
+                    kind,
+                    limit,
+                    cursor,
+                } => {
+                    let mut url = base.join("/api/v1/admin/operations")?;
+                    {
+                        let mut query = url.query_pairs_mut();
+                        query.append_pair("limit", &limit.to_string());
+                        if let Some(kind) = kind {
+                            query.append_pair("kind", &kind);
+                        }
+                        if let Some(cursor) = cursor {
+                            query.append_pair("cursor", &cursor);
+                        }
+                    }
+                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                }
+                OperationCommand::Show { operation_id } => {
+                    let url = base.join(&format!("/api/v1/admin/operations/{operation_id}"))?;
+                    request_json(&client, reqwest::Method::GET, url, &token, None, cli.output).await
+                }
             }
         }
         Command::Inventory { command } => {
@@ -117,6 +226,62 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         url,
                         &token,
                         Some(serde_json::json!({"full": true})),
+                        cli.output,
+                    )
+                    .await
+                }
+            }
+        }
+        Command::Search {
+            indexers,
+            force,
+            dry_run,
+        } => {
+            let token = admin_token()?;
+            let url = base.join("/api/v1/admin/searches")?;
+            request_json(
+                &client,
+                reqwest::Method::POST,
+                url,
+                &token,
+                Some(serde_json::json!({
+                    "source": {
+                        "kind": "qbittorrent",
+                        "hashes": [],
+                        "includeCategories": [],
+                        "excludeCategories": [],
+                        "includeTags": [],
+                        "excludeTags": []
+                    },
+                    "indexerIds": indexers,
+                    "force": force,
+                    "dryRun": dry_run
+                })),
+                cli.output,
+            )
+            .await
+        }
+        Command::Data { command } => {
+            let token = admin_token()?;
+            match command {
+                DataCommand::Scan {
+                    root,
+                    indexers,
+                    force,
+                    dry_run,
+                } => {
+                    let url = base.join("/api/v1/admin/data-scans")?;
+                    request_json(
+                        &client,
+                        reqwest::Method::POST,
+                        url,
+                        &token,
+                        Some(serde_json::json!({
+                            "root": root,
+                            "indexerIds": indexers,
+                            "force": force,
+                            "dryRun": dry_run
+                        })),
                         cli.output,
                     )
                     .await
@@ -238,6 +403,36 @@ mod tests {
                 .expect("parse status")
                 .command,
             Command::Status
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["sporosctl", "tasks", "events", "00"])
+                .expect("parse task events")
+                .command,
+            Command::Tasks {
+                command: TaskCommand::Events { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["sporosctl", "operations", "list", "--kind", "data_scan"])
+                .expect("parse operation list")
+                .command,
+            Command::Operations {
+                command: OperationCommand::List { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["sporosctl", "search", "--indexer", "7", "--dry-run"])
+                .expect("parse search")
+                .command,
+            Command::Search { dry_run: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["sporosctl", "data", "scan", "media", "--force"])
+                .expect("parse data scan")
+                .command,
+            Command::Data {
+                command: DataCommand::Scan { force: true, .. }
+            }
         ));
         assert!(matches!(
             Cli::try_parse_from([

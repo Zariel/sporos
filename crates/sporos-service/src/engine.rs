@@ -97,6 +97,8 @@ pub(crate) fn registries(
     } else {
         activities
     };
+    let activities =
+        crate::task_control::TaskControl::new(Arc::clone(&injection_storage)).register(activities);
     let activities = crate::injection::InjectionExecutor::new(injection_storage, qbit)
         .register(activities)
         .build();
@@ -126,6 +128,11 @@ pub(crate) fn registries(
             crate::data_scan::ORCHESTRATION_NAME,
             crate::data_scan::ORCHESTRATION_VERSION,
             crate::data_scan::workflow,
+        )
+        .register_versioned(
+            crate::task_control::ORCHESTRATION_NAME,
+            crate::task_control::ORCHESTRATION_VERSION,
+            crate::task_control::workflow,
         )
         .build();
     (activities, orchestrations)

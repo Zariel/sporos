@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use duroxide::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -46,6 +47,7 @@ pub struct HttpState {
     prowlarr_configured: bool,
     prowlarr_client: Option<ProwlarrClient>,
     data_roots: std::collections::BTreeSet<String>,
+    task_client: Client,
     upload_permits: Arc<Semaphore>,
     autobrr_body_limit_bytes: usize,
 }
@@ -57,6 +59,7 @@ impl HttpState {
         prowlarr_client: Option<ProwlarrClient>,
     ) -> Self {
         Self {
+            task_client: Client::new(storage.duroxide_provider()),
             storage,
             webhook_token: config.auth.webhook_token.clone(),
             admin_token: config.auth.admin_token.clone(),
@@ -118,6 +121,8 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
         .route("/api/v1/admin/searches", post(start_inventory_search))
         .route("/api/v1/admin/data-scans", post(start_data_scan))
         .route("/api/v1/admin/tasks/{task_id}", get(get_task))
+        .route("/api/v1/admin/tasks/{task_id}/retry", post(retry_task))
+        .route("/api/v1/admin/tasks/{task_id}/cancel", post(cancel_task))
         .route("/api/v1/admin/tasks/{task_id}/events", get(get_task_events))
         .route("/api/v1/admin/inventory", get(get_inventory))
         .route(
@@ -1287,6 +1292,106 @@ async fn get_task(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TaskActionResponse {
+    task_id: String,
+    state: &'static str,
+    instance_id: String,
+    duplicate: bool,
+}
+
+async fn retry_task(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(task_id): Path<String>,
+) -> Result<(StatusCode, Json<TaskActionResponse>), Problem> {
+    let id = task_action_id(&task_id, request_id.clone())?;
+    let accepted = crate::task_control::retry(&state.storage, id, now_ms())
+        .await
+        .map_err(|error| task_control_problem(error, request_id))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(TaskActionResponse {
+            task_id,
+            state: "queued",
+            instance_id: accepted.instance_id,
+            duplicate: false,
+        }),
+    ))
+}
+
+async fn cancel_task(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(task_id): Path<String>,
+) -> Result<(StatusCode, Json<TaskActionResponse>), Problem> {
+    let id = task_action_id(&task_id, request_id.clone())?;
+    let accepted =
+        crate::task_control::request_cancel(&state.storage, &state.task_client, id, now_ms())
+            .await
+            .map_err(|error| task_control_problem(error, request_id))?;
+    Ok((
+        if accepted.duplicate {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(TaskActionResponse {
+            task_id,
+            state: "cancellation_requested",
+            instance_id: accepted.target_instance,
+            duplicate: accepted.duplicate,
+        }),
+    ))
+}
+
+fn task_action_id(value: &str, request_id: RequestId) -> Result<[u8; 16], Problem> {
+    parse_id(value).ok_or_else(|| {
+        Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_task_id",
+            "Invalid task ID",
+            "task ID must be 32 lowercase hexadecimal characters",
+            request_id,
+        )
+    })
+}
+
+fn task_control_problem(
+    error: crate::task_control::TaskControlError,
+    request_id: RequestId,
+) -> Problem {
+    use crate::task_control::TaskControlError;
+    match error {
+        TaskControlError::TaskNotFound => Problem::new(
+            StatusCode::NOT_FOUND,
+            "task_not_found",
+            "Task not found",
+            "no task has that ID",
+            request_id,
+        ),
+        TaskControlError::TaskTerminal
+        | TaskControlError::TaskNotRetryable
+        | TaskControlError::UnsupportedRetry => Problem::new(
+            StatusCode::CONFLICT,
+            "task_action_conflict",
+            "Task action conflict",
+            "the task state or kind does not permit that action",
+            request_id,
+        ),
+        TaskControlError::Database(_)
+        | TaskControlError::Duroxide(_)
+        | TaskControlError::GenerationRange => Problem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "task_control_failed",
+            "Task control failed",
+            "the authoritative workflow action could not be recorded safely",
+            request_id,
+        ),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TaskEventView {
     sequence: i64,
     state: String,
@@ -2013,6 +2118,7 @@ mod tests {
             .expect("open storage"),
         );
         let state = HttpState {
+            task_client: Client::new(storage.duroxide_provider()),
             storage,
             webhook_token: Secret::new("webhook"),
             admin_token: Secret::new("admin"),
