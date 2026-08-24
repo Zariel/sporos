@@ -52,6 +52,14 @@ impl HttpState {
                 .map(|settings| settings.inventory_stale_after),
             source_filters: config.sources.clone(),
             matching: config.matching.clone(),
+            candidate_ingress: Arc::new(CandidateIngress::new(
+                config.matching.clone(),
+                config.sources.clone(),
+                config.injection.clone(),
+                config.paths.clone(),
+            )),
+            upload_permits: Arc::new(Semaphore::new(config.limits.max_uploads)),
+            autobrr_body_limit_bytes: config.server.autobrr_body_limit_bytes,
         }
     }
 
@@ -1325,6 +1333,14 @@ mod tests {
             inventory_stale_after: None,
             source_filters: SourceFilters::default(),
             matching: Matching::default(),
+            candidate_ingress: Arc::new(CandidateIngress::new(
+                Matching::default(),
+                SourceFilters::default(),
+                crate::config::Injection::default(),
+                crate::config::Paths::default(),
+            )),
+            upload_permits: Arc::new(Semaphore::new(4)),
+            autobrr_body_limit_bytes: 12 * 1024 * 1024,
         };
         (directory, state)
     }

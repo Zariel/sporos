@@ -19,6 +19,7 @@ macro_rules! byte_id {
     };
 }
 
+byte_id!(CandidateId, 16);
 byte_id!(PolicySnapshotId, 16);
 byte_id!(SourceId, 16);
 byte_id!(TaskId, 16);

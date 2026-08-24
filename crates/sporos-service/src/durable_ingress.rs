@@ -35,70 +35,7 @@ pub struct AcceptedTask {
 impl Storage {
     pub async fn accept_task(&self, task: &NewTask) -> Result<AcceptedTask, DurableIngressError> {
         let mut transaction = self.pool().begin().await?;
-
-        sqlx::query(
-            "INSERT INTO sporos_policy_snapshot (
-                id, config_hash, matcher_version, payload_json, created_at
-             ) VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO NOTHING",
-        )
-        .bind(task.policy.id.as_bytes().as_slice())
-        .bind(task.policy.config_hash.as_slice())
-        .bind(&task.policy.matcher_version)
-        .bind(&task.policy.payload_json)
-        .bind(task.policy.created_at)
-        .execute(&mut *transaction)
-        .await?;
-        verify_policy(&mut transaction, &task.policy).await?;
-
-        sqlx::query(
-            "INSERT INTO sporos_task (
-                id, kind, state, projection_generation, duroxide_instance_id,
-                policy_snapshot_id, observed_retry_count, created_at, updated_at
-             ) VALUES (?, ?, 'queued', 0, ?, ?, 0, ?, ?)
-             ON CONFLICT(id) DO NOTHING",
-        )
-        .bind(task.id.as_bytes().as_slice())
-        .bind(&task.kind)
-        .bind(&task.instance_id)
-        .bind(task.policy.id.as_bytes().as_slice())
-        .bind(task.created_at)
-        .bind(task.created_at)
-        .execute(&mut *transaction)
-        .await?;
-        verify_task(&mut transaction, task).await?;
-
-        sqlx::query(
-            "INSERT INTO sporos_task_event (
-                task_id, sequence, state, created_at
-             ) VALUES (?, 0, 'queued', ?)
-             ON CONFLICT(task_id, sequence) DO NOTHING",
-        )
-        .bind(task.id.as_bytes().as_slice())
-        .bind(task.created_at)
-        .execute(&mut *transaction)
-        .await?;
-
-        let inserted = sqlx::query(
-            "INSERT INTO sporos_outbox (
-                task_id, task_key, orchestration_name, orchestration_version,
-                instance_id, input_json, visible_at, start_delivery_attempt_count
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-             ON CONFLICT(task_key) DO NOTHING",
-        )
-        .bind(task.id.as_bytes().as_slice())
-        .bind(task.key.as_bytes().as_slice())
-        .bind(&task.orchestration_name)
-        .bind(&task.orchestration_version)
-        .bind(&task.instance_id)
-        .bind(&task.input_json)
-        .bind(task.created_at)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected()
-            == 1;
-        verify_outbox(&mut transaction, task).await?;
-
+        let inserted = accept_task_in(&mut transaction, task).await?;
         transaction.commit().await?;
         Ok(AcceptedTask {
             id: task.id,
@@ -107,12 +44,81 @@ impl Storage {
     }
 }
 
+pub(crate) async fn accept_task_in(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task: &NewTask,
+) -> Result<bool, DurableIngressError> {
+    sqlx::query(
+        "INSERT INTO sporos_policy_snapshot (
+                id, config_hash, matcher_version, payload_json, created_at
+             ) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(task.policy.id.as_bytes().as_slice())
+    .bind(task.policy.config_hash.as_slice())
+    .bind(&task.policy.matcher_version)
+    .bind(&task.policy.payload_json)
+    .bind(task.policy.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    verify_policy(transaction, &task.policy).await?;
+
+    sqlx::query(
+        "INSERT INTO sporos_task (
+                id, kind, state, projection_generation, duroxide_instance_id,
+                policy_snapshot_id, observed_retry_count, created_at, updated_at
+             ) VALUES (?, ?, 'queued', 0, ?, ?, 0, ?, ?)
+             ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(task.id.as_bytes().as_slice())
+    .bind(&task.kind)
+    .bind(&task.instance_id)
+    .bind(task.policy.id.as_bytes().as_slice())
+    .bind(task.created_at)
+    .bind(task.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    verify_task(transaction, task).await?;
+
+    sqlx::query(
+        "INSERT INTO sporos_task_event (
+                task_id, sequence, state, created_at
+             ) VALUES (?, 0, 'queued', ?)
+             ON CONFLICT(task_id, sequence) DO NOTHING",
+    )
+    .bind(task.id.as_bytes().as_slice())
+    .bind(task.created_at)
+    .execute(&mut **transaction)
+    .await?;
+
+    let inserted = sqlx::query(
+        "INSERT INTO sporos_outbox (
+                task_id, task_key, orchestration_name, orchestration_version,
+                instance_id, input_json, visible_at, start_delivery_attempt_count
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+             ON CONFLICT(task_key) DO NOTHING",
+    )
+    .bind(task.id.as_bytes().as_slice())
+    .bind(task.key.as_bytes().as_slice())
+    .bind(&task.orchestration_name)
+    .bind(&task.orchestration_version)
+    .bind(&task.instance_id)
+    .bind(&task.input_json)
+    .bind(task.created_at)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected()
+        == 1;
+    verify_outbox(transaction, task).await?;
+    Ok(inserted)
+}
+
 async fn verify_policy(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     expected: &PolicySnapshot,
 ) -> Result<(), DurableIngressError> {
     let row = sqlx::query(
-        "SELECT config_hash, matcher_version, payload_json, created_at
+        "SELECT config_hash, matcher_version, payload_json
          FROM sporos_policy_snapshot WHERE id = ?",
     )
     .bind(expected.id.as_bytes().as_slice())
@@ -121,8 +127,7 @@ async fn verify_policy(
 
     let matches = row.try_get::<Vec<u8>, _>("config_hash")?.as_slice() == expected.config_hash
         && row.try_get::<String, _>("matcher_version")? == expected.matcher_version
-        && row.try_get::<String, _>("payload_json")? == expected.payload_json
-        && row.try_get::<i64, _>("created_at")? == expected.created_at;
+        && row.try_get::<String, _>("payload_json")? == expected.payload_json;
     if matches {
         Ok(())
     } else {
@@ -135,7 +140,7 @@ async fn verify_task(
     expected: &NewTask,
 ) -> Result<(), DurableIngressError> {
     let row = sqlx::query(
-        "SELECT kind, duroxide_instance_id, policy_snapshot_id, created_at
+        "SELECT kind, duroxide_instance_id, policy_snapshot_id
          FROM sporos_task WHERE id = ?",
     )
     .bind(expected.id.as_bytes().as_slice())
@@ -145,8 +150,7 @@ async fn verify_task(
     let matches = row.try_get::<String, _>("kind")? == expected.kind
         && row.try_get::<String, _>("duroxide_instance_id")? == expected.instance_id
         && row.try_get::<Vec<u8>, _>("policy_snapshot_id")?.as_slice()
-            == expected.policy.id.as_bytes()
-        && row.try_get::<i64, _>("created_at")? == expected.created_at;
+            == expected.policy.id.as_bytes();
     if matches {
         Ok(())
     } else {
@@ -160,7 +164,7 @@ async fn verify_outbox(
 ) -> Result<(), DurableIngressError> {
     let row = sqlx::query(
         "SELECT task_id, orchestration_name, orchestration_version,
-                instance_id, input_json, visible_at
+                instance_id, input_json
          FROM sporos_outbox WHERE task_key = ?",
     )
     .bind(expected.key.as_bytes().as_slice())
@@ -175,8 +179,7 @@ async fn verify_outbox(
     let matches = row.try_get::<String, _>("orchestration_name")? == expected.orchestration_name
         && row.try_get::<String, _>("orchestration_version")? == expected.orchestration_version
         && row.try_get::<String, _>("instance_id")? == expected.instance_id
-        && row.try_get::<String, _>("input_json")? == expected.input_json
-        && row.try_get::<i64, _>("visible_at")? == expected.created_at;
+        && row.try_get::<String, _>("input_json")? == expected.input_json;
     if matches {
         Ok(())
     } else {
@@ -234,6 +237,20 @@ mod tests {
                 duplicate: true,
             }
         );
+        assert_counts(&storage, [1, 1, 1, 1]).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_identity_does_not_depend_on_retry_time() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = open_in(&directory).await;
+        let initial = task(1);
+        storage.accept_task(&initial).await.expect("accept task");
+        let mut retry = task(1);
+        retry.created_at = 99;
+        retry.policy.created_at = 99;
+
+        assert!(storage.accept_task(&retry).await.unwrap().duplicate);
         assert_counts(&storage, [1, 1, 1, 1]).await;
     }
 

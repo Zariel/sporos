@@ -432,7 +432,7 @@ struct InjectionConfig {
     resume: ResumeConfig,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Injection {
     pub dry_run: bool,
     pub category_template: String,
@@ -812,7 +812,7 @@ fn validate_positive(config: &RawConfig) -> Result<(), ConfigError> {
         (
             "matching.max_torrent_bytes",
             config.matching.max_torrent_bytes,
-            64 * 1024 * 1024,
+            8 * 1024 * 1024,
         ),
         (
             "matching.max_files_per_torrent",

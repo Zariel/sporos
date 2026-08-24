@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod arr;
+pub mod candidate;
 pub mod completion;
 pub mod config;
 pub mod durable_ingress;

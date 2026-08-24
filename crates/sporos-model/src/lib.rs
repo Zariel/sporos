@@ -3,7 +3,7 @@
 mod id;
 mod matching;
 
-pub use id::{PolicySnapshotId, SourceId, TaskId, TaskKey};
+pub use id::{CandidateId, PolicySnapshotId, SourceId, TaskId, TaskKey};
 pub use matching::{
     ArrIdentity, ArrKind, Date, FileMapping, InfoHashes, LocalSourceFile, LocalSourceManifest,
     MatchDecision, MatchEvidence, MatchMode, MatchOutcome, MatchReason, MatchingPolicy,
