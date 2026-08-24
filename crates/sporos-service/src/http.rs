@@ -19,8 +19,10 @@ use subtle::ConstantTimeEq;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::config::{Config, Secret};
+use crate::config::{Config, Matching, Secret, SourceFilters};
+use crate::preflight::SourceState;
 use crate::storage::Storage;
+use sporos_matcher::parse_release;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -32,6 +34,8 @@ pub struct HttpState {
     readiness: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
     inventory_stale_after: Option<Duration>,
+    source_filters: SourceFilters,
+    matching: Matching,
 }
 
 impl HttpState {
@@ -46,6 +50,8 @@ impl HttpState {
                 .qbittorrent
                 .as_ref()
                 .map(|settings| settings.inventory_stale_after),
+            source_filters: config.sources.clone(),
+            matching: config.matching.clone(),
         }
     }
 
@@ -55,6 +61,13 @@ impl HttpState {
 }
 
 pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
+    let autobrr = Router::new()
+        .route("/api/v1/autobrr/check", post(autobrr_check))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_webhook,
+        ))
+        .layer(RequestBodyLimitLayer::new(64 * 1024));
     let admin = Router::new()
         .route("/api/v1/admin/tasks", get(list_tasks))
         .route("/api/v1/admin/tasks/{task_id}", get(get_task))
@@ -75,6 +88,7 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .merge(autobrr)
         .merge(admin)
         .fallback(not_found)
         .layer(
@@ -86,6 +100,116 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
                 .layer(middleware::from_fn(request_id)),
         )
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutobrrCheckRequest {
+    torrent_name: String,
+    size: Option<u64>,
+    indexer: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutobrrCheckResponse {
+    decision: &'static str,
+    provisional: bool,
+    source_state: SourceState,
+    reason: &'static str,
+    request_id: String,
+}
+
+async fn autobrr_check(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<AutobrrCheckRequest>,
+) -> Result<Json<AutobrrCheckResponse>, Problem> {
+    if request.torrent_name.is_empty() || request.torrent_name.len() > 1024 {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_torrent_name",
+            "Invalid torrent name",
+            "torrentName must contain between 1 and 1024 UTF-8 bytes",
+            request_id,
+        ));
+    }
+    if request
+        .indexer
+        .as_ref()
+        .is_some_and(|value| value.len() > 128)
+    {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_indexer",
+            "Invalid indexer",
+            "indexer must not exceed 128 UTF-8 bytes",
+            request_id,
+        ));
+    }
+    let inventory = state
+        .storage
+        .qbit_inventory_state()
+        .await
+        .map_err(|_| Problem::database(request_id.clone()))?;
+    let usable = state.inventory_stale_after.is_some()
+        && inventory.has_baseline
+        && inventory.last_success_at.is_some_and(|success| {
+            now_ms().saturating_sub(success)
+                <= i64::try_from(
+                    state
+                        .inventory_stale_after
+                        .expect("checked inventory staleness")
+                        .as_millis(),
+                )
+                .unwrap_or(i64::MAX)
+        });
+    if !usable {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "inventory_unavailable",
+            "Inventory unavailable",
+            "the local qBittorrent inventory is not reconciled or is stale",
+            request_id,
+        ));
+    }
+
+    let release = parse_release(&request.torrent_name);
+    let source = state
+        .storage
+        .preflight_source(
+            &release,
+            request.size.filter(|size| *size > 0),
+            state.matching.preflight_size_tolerance,
+            &state.source_filters,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::preflight::PreflightError::Database(_) => Problem::database(request_id.clone()),
+            crate::preflight::PreflightError::SizeRange => Problem::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_size",
+                "Invalid size",
+                "size exceeds the supported SQLite integer range",
+                request_id.clone(),
+            ),
+        })?;
+    let Some(source_state) = source else {
+        return Err(Problem::new(
+            StatusCode::NOT_FOUND,
+            "no_match",
+            "No plausible source",
+            "no plausible local source matches the announced release",
+            request_id,
+        ));
+    };
+    Ok(Json(AutobrrCheckResponse {
+        decision: "accept",
+        provisional: true,
+        source_state,
+        reason: "plausible_source",
+        request_id: request_id.0,
+    }))
 }
 
 async fn livez() -> StatusCode {
@@ -944,6 +1068,7 @@ mod tests {
     use super::*;
     use crate::durable_ingress::{NewTask, PolicySnapshot};
     use crate::engine::{FAKE_TASK_NAME, FAKE_TASK_VERSION, FakeTaskInput};
+    use crate::inventory::{InventoryChange, InventoryDelta};
     use sporos_model::{PolicySnapshotId, TaskId, TaskKey};
 
     #[tokio::test]
@@ -998,6 +1123,67 @@ mod tests {
         assert_eq!(second.0, 200);
         assert_eq!(first.1["taskId"], second.1["taskId"]);
         assert_eq!(second.1["duplicate"], true);
+    }
+
+    #[tokio::test]
+    async fn autobrr_preflight_is_provisional_and_inventory_bounded() {
+        let (_directory, mut state) = test_state().await;
+        state.inventory_stale_after = Some(Duration::from_secs(300));
+        state
+            .storage
+            .project_qbit_batch(
+                &[InventoryChange::Upsert {
+                    qbit_id: "a".repeat(40),
+                    delta: Box::new(InventoryDelta {
+                        infohash_v1: Some("a".repeat(40)),
+                        name: Some("Example.Show.S01E02.1080p".to_owned()),
+                        total_size: Some(1_000),
+                        amount_left: Some(100),
+                        progress: Some(0.9),
+                        state: Some("downloading".to_owned()),
+                        save_path: Some("/downloads".to_owned()),
+                        content_path: Some("/downloads/example".to_owned()),
+                        category: Some(String::new()),
+                        tags: Some(String::new()),
+                        added_on: Some(1),
+                        completion_on: Some(0),
+                        ..InventoryDelta::default()
+                    }),
+                }],
+                1,
+                false,
+                now_ms(),
+            )
+            .await
+            .expect("project preflight source");
+        state
+            .storage
+            .finish_qbit_sync(1, Some(1), now_ms())
+            .await
+            .expect("finish inventory baseline");
+        let app = test_router(state);
+
+        let accepted = request(
+            &app,
+            "/api/v1/autobrr/check",
+            Some("webhook"),
+            r#"{"torrentName":"Example.Show.S01E02.2160p","size":1010,"indexer":"tracker"}"#,
+        )
+        .await;
+        assert_eq!(accepted.0, 200);
+        assert_eq!(accepted.1["decision"], "accept");
+        assert_eq!(accepted.1["provisional"], true);
+        assert_eq!(accepted.1["sourceState"], "downloading");
+
+        let rejected = request(
+            &app,
+            "/api/v1/autobrr/check",
+            Some("webhook"),
+            r#"{"torrentName":"Other.Show.S01E02"}"#,
+        )
+        .await;
+        assert_eq!(rejected.0, 404);
+        assert_eq!(rejected.1["code"], "no_match");
     }
 
     #[tokio::test]
@@ -1137,6 +1323,8 @@ mod tests {
             readiness: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(Metrics::new()),
             inventory_stale_after: None,
+            source_filters: SourceFilters::default(),
+            matching: Matching::default(),
         };
         (directory, state)
     }

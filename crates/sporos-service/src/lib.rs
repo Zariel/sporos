@@ -9,6 +9,7 @@ pub mod engine;
 pub mod http;
 pub mod inventory;
 pub mod outbox;
+pub mod preflight;
 pub mod qbit_projection;
 pub mod qbit_sync;
 pub mod qbittorrent;

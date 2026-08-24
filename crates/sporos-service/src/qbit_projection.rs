@@ -1,4 +1,6 @@
 use sha2::{Digest, Sha256};
+use sporos_matcher::parse_release;
+use sporos_model::VideoKind;
 use sqlx::{Row, Sqlite, Transaction};
 use thiserror::Error;
 
@@ -407,6 +409,11 @@ async fn project_torrent(
         return Err(ProjectionError::MissingField("infohash"));
     }
     let name = text(delta.name.as_ref(), existing.as_ref(), "name")?;
+    let release = parse_release(&name);
+    let release_json = serde_json::to_string(&release).map_err(ProjectionError::Release)?;
+    let air_date = release
+        .air_date
+        .map(|date| format!("{:04}-{:02}-{:02}", date.year, date.month, date.day));
     let total_size = integer(delta.total_size, existing.as_ref(), "total_size")?;
     let amount_left = integer(delta.amount_left, existing.as_ref(), "amount_left")?;
     let progress_ppm = delta
@@ -469,8 +476,10 @@ async fn project_torrent(
             id, qbit_id, v1_hash, v2_hash, name, total_size, amount_left,
             progress_ppm, state, save_path, content_path, category, tags_json,
             is_complete, available, file_manifest_version, file_manifest_state,
-            content_fingerprint, added_at, completed_at, last_seen_generation, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+            content_fingerprint, added_at, completed_at, release_json, normalized_title,
+            video_kind, release_year, season, episode, episode_end, absolute_episode, air_date,
+            last_seen_generation, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(qbit_id) WHERE qbit_id IS NOT NULL DO UPDATE SET
             v1_hash = excluded.v1_hash, v2_hash = excluded.v2_hash,
             name = excluded.name, total_size = excluded.total_size,
@@ -481,13 +490,18 @@ async fn project_torrent(
             available = 1, file_manifest_state = excluded.file_manifest_state,
             content_fingerprint = excluded.content_fingerprint,
             added_at = excluded.added_at, completed_at = excluded.completed_at,
+            release_json = excluded.release_json, normalized_title = excluded.normalized_title,
+            video_kind = excluded.video_kind, release_year = excluded.release_year,
+            season = excluded.season, episode = excluded.episode,
+            episode_end = excluded.episode_end, absolute_episode = excluded.absolute_episode,
+            air_date = excluded.air_date,
             last_seen_generation = excluded.last_seen_generation, updated_at = excluded.updated_at",
     )
     .bind(source_id.as_slice())
     .bind(qbit_id)
     .bind(v1)
     .bind(v2)
-    .bind(name)
+    .bind(&name)
     .bind(total_size)
     .bind(amount_left)
     .bind(progress_ppm)
@@ -502,6 +516,15 @@ async fn project_torrent(
     .bind(fingerprint.as_slice())
     .bind(added_at)
     .bind(completed_at)
+    .bind(release_json)
+    .bind(release.primary_title.as_str())
+    .bind(video_kind(release.kind))
+    .bind(release.year.map(i64::from))
+    .bind(release.season.map(i64::from))
+    .bind(release.episode.map(i64::from))
+    .bind(release.episode_end.map(i64::from))
+    .bind(release.absolute_episode.map(i64::from))
+    .bind(air_date)
     .bind(generation)
     .bind(now)
     .execute(&mut **transaction)
@@ -525,6 +548,18 @@ async fn project_torrent(
         completion,
         manifest_needed,
     })
+}
+
+fn video_kind(kind: VideoKind) -> &'static str {
+    match kind {
+        VideoKind::Movie => "movie",
+        VideoKind::Episode => "episode",
+        VideoKind::SeasonPack => "season_pack",
+        VideoKind::DateEpisode => "date_episode",
+        VideoKind::AbsoluteEpisode => "absolute_episode",
+        VideoKind::Disc => "disc",
+        VideoKind::UnknownVideo => "unknown_video",
+    }
 }
 
 fn source_id(qbit_id: &str) -> [u8; 16] {
@@ -694,6 +729,8 @@ pub enum ProjectionError {
     MissingSource,
     #[error("could not encode qBittorrent tags")]
     Tags(#[source] serde_json::Error),
+    #[error("could not encode qBittorrent release identity")]
+    Release(#[source] serde_json::Error),
     #[error("could not persist qBittorrent completion work")]
     Completion(#[from] CompletionError),
 }
