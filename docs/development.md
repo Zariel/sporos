@@ -69,7 +69,7 @@ cargo deny check
 cargo audit
 ```
 
-Phase 0 pins Duroxide 0.1.30. Its SQLite provider is vendored with a small,
+The workspace pins Duroxide 0.1.30. Its SQLite provider is vendored with a small,
 documented patch under `vendor/duroxide`; changes there must be reviewed
 separately from routine dependency updates. Torrent metainfo is parsed with the
 exactly pinned Magpie crates and the local bounded-decoder patch documented in
@@ -89,3 +89,13 @@ random loopback port, and verifies API-key authentication and stopped-add
 layout for single- and multi-file v1, v2, and hybrid torrents. The container
 and its temporary volumes are removed on exit. Set `CONTAINER_RUNTIME` or
 `QBITTORRENT_IMAGE` to override the defaults.
+
+## Complete local gate
+
+```console
+scripts/check
+```
+
+The script requires only the baseline Rust/C toolchain for formatting, linting,
+and tests. It automatically uses nextest and runs dependency policy/audit when
+those optional tools are installed. The Nix shell contains the complete set.
