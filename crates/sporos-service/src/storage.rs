@@ -448,6 +448,14 @@ mod tests {
 
     use super::*;
 
+    async fn retained_workflow(
+        context: duroxide::OrchestrationContext,
+        input: String,
+    ) -> Result<String, String> {
+        context.schedule_timer(Duration::from_millis(200)).await;
+        Ok(input)
+    }
+
     #[tokio::test]
     async fn applies_required_pragmas() {
         let directory = TempDir::new().expect("create temporary directory");
@@ -496,6 +504,225 @@ mod tests {
 
         assert_eq!(domain_version, 12);
         assert_eq!(duroxide_has_domain_version, 0);
+    }
+
+    #[tokio::test]
+    async fn online_backup_restores_a_valid_database() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = open_in(&directory).await.expect("open storage");
+        let backup = directory.path().join("backup.db");
+        sqlx::query("VACUUM INTO ?")
+            .bind(backup.to_str().expect("UTF-8 backup path"))
+            .execute(storage.pool())
+            .await
+            .expect("create online backup");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA quick_check")
+                .fetch_one(storage.pool())
+                .await
+                .expect("check source"),
+            "ok"
+        );
+        drop(storage);
+
+        let restored = Storage::open(directory.path().join("restore.lock"), backup)
+            .await
+            .expect("open restored backup");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA quick_check")
+                .fetch_one(restored.pool())
+                .await
+                .expect("check restored backup"),
+            "ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrades_n_minus_one_with_an_active_pinned_workflow() {
+        let directory = TempDir::new().expect("create temporary directory");
+        let database = directory.path().join("sporos.db");
+        apply_domain_through(&database, 11).await;
+        let database_url = format!("sqlite://{}", database.display());
+        let old_provider = std::sync::Arc::new(
+            SqliteProvider::new(
+                &database_url,
+                Some(DuroxideOptions {
+                    synchronous: DuroxideSynchronous::Full,
+                    max_connections: POOL_CONNECTIONS,
+                }),
+            )
+            .await
+            .expect("open N-1 Duroxide store"),
+        );
+        let client = duroxide::Client::new(old_provider.clone());
+        let old_activities = duroxide::runtime::registry::ActivityRegistry::builder().build();
+        let old_orchestrations = duroxide::OrchestrationRegistry::builder()
+            .register_versioned("RetainedWorkflow", "0.9.0", retained_workflow)
+            .build();
+        let old_runtime = duroxide::runtime::Runtime::start_with_store(
+            old_provider,
+            old_activities,
+            old_orchestrations,
+        )
+        .await;
+        client
+            .start_orchestration_versioned("upgrade-active", "RetainedWorkflow", "0.9.0", "{}")
+            .await
+            .expect("start N-1 workflow");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        old_runtime.shutdown(None).await;
+        assert!(matches!(
+            client
+                .get_orchestration_status("upgrade-active")
+                .await
+                .expect("read active workflow"),
+            duroxide::OrchestrationStatus::Running { .. }
+        ));
+        drop(client);
+
+        let storage = Storage::open(directory.path().join("sporos.lock"), &database)
+            .await
+            .expect("upgrade N-1 database");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT max(version) FROM sporos_schema_migration")
+                .fetch_one(storage.pool())
+                .await
+                .expect("read upgraded version"),
+            12
+        );
+        let provider = storage.duroxide_provider();
+        let client = duroxide::Client::new(provider.clone());
+        let activities = duroxide::runtime::registry::ActivityRegistry::builder().build();
+        let orchestrations = duroxide::OrchestrationRegistry::builder()
+            .register_versioned("RetainedWorkflow", "0.9.0", retained_workflow)
+            .register_versioned("RetainedWorkflow", "1.0.0", retained_workflow)
+            .build();
+        let runtime =
+            duroxide::runtime::Runtime::start_with_store(provider, activities, orchestrations)
+                .await;
+        assert!(matches!(
+            client
+                .wait_for_orchestration("upgrade-active", Duration::from_secs(5))
+                .await
+                .expect("resume retained workflow"),
+            duroxide::OrchestrationStatus::Completed { .. }
+        ));
+        runtime.shutdown(None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "24-hour storage write/read soak; run through scripts/soak"]
+    async fn storage_write_read_soak() {
+        let seconds = std::env::var("SPOROS_SOAK_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(24 * 60 * 60);
+        let directory = TempDir::new().expect("create temporary directory");
+        let storage = open_in(&directory).await.expect("open storage");
+        let started = std::time::Instant::now();
+        let initial_rss = resident_kib();
+        let mut iterations = 0_u64;
+        while started.elapsed() < Duration::from_secs(seconds) {
+            sqlx::query(
+                "INSERT INTO sporos_schema_metadata (key, value) VALUES ('soak_probe', ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(iterations.to_string())
+            .execute(storage.pool())
+            .await
+            .expect("write soak probe");
+            let observed = sqlx::query_scalar::<_, String>(
+                "SELECT value FROM sporos_schema_metadata WHERE key = 'soak_probe'",
+            )
+            .fetch_one(storage.pool())
+            .await
+            .expect("read soak probe");
+            assert_eq!(observed, iterations.to_string());
+            iterations = iterations.saturating_add(1);
+            if iterations.is_multiple_of(1_000) {
+                sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                    .execute(storage.pool())
+                    .await
+                    .expect("checkpoint soak WAL");
+                tokio::task::yield_now().await;
+            }
+        }
+        let final_rss = resident_kib();
+        eprintln!(
+            "soak seconds={seconds} iterations={iterations} initial_rss_kib={initial_rss} final_rss_kib={final_rss}"
+        );
+        assert!(iterations > 0);
+        assert!(
+            final_rss.saturating_sub(initial_rss) <= 256 * 1024,
+            "RSS grew by more than 256 MiB"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA quick_check")
+                .fetch_one(storage.pool())
+                .await
+                .expect("check soaked database"),
+            "ok"
+        );
+    }
+
+    fn resident_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmRSS:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    async fn apply_domain_through(database: &Path, maximum: i64) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(database)
+                    .create_if_missing(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("open N-1 database");
+        sqlx::query(
+            "CREATE TABLE sporos_schema_migration (
+                version INTEGER PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                checksum BLOB NOT NULL
+             ) STRICT",
+        )
+        .execute(&pool)
+        .await
+        .expect("create N-1 migration ledger");
+        for migration in MIGRATOR.iter().filter(|migration| {
+            !migration.migration_type.is_down_migration() && migration.version <= maximum
+        }) {
+            let mut transaction = pool.begin().await.expect("begin N-1 migration");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration.sql.as_ref()))
+                .execute(&mut *transaction)
+                .await
+                .expect("apply N-1 migration");
+            sqlx::query(
+                "INSERT INTO sporos_schema_migration (version, description, checksum)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(&mut *transaction)
+            .await
+            .expect("record N-1 migration");
+            transaction.commit().await.expect("commit N-1 migration");
+        }
+        pool.close().await;
     }
 
     #[tokio::test]

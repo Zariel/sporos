@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export SPOROS_SOAK_SECONDS=${SPOROS_SOAK_SECONDS:-86400}
+cargo test --release -p sporos-service storage_write_read_soak -- --ignored --nocapture

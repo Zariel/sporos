@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+production=(
+    crates/sporos-model/src
+    crates/sporos-matcher/src
+    crates/sporos-service/src
+)
+
+if rg -n 'remove_file|remove_dir(_all)?|unlink\(|torrents/delete|delete_torrent' "${production[@]}"; then
+    echo 'production code contains a deletion capability' >&2
+    exit 1
+fi
+
+while IFS= read -r source; do
+    [[ $source == */duroxide_phase0.rs ]] && continue
+    if awk '/#\[cfg\(test\)\]/{exit} {print}' "$source" \
+        | rg -n 'Command::new|std::process::Command|tokio::process'; then
+        echo "production code contains external command execution: $source" >&2
+        exit 1
+    fi
+done < <(rg --files "${production[@]}" -g '*.rs')
+
+if rg -n 'sporos-(service|testkit)|sqlx|reqwest|axum|duroxide' crates/sporos-matcher/Cargo.toml; then
+    echo 'pure matcher boundary contains an I/O or service dependency' >&2
+    exit 1
+fi
+
+if rg --files -g 'Chart.yaml' -g 'kustomization.yaml' -g '*.helm.yaml' -g '*deployment*.yaml' | rg .; then
+    echo 'repository contains a Kubernetes deployment artifact' >&2
+    exit 1
+fi
+
+while IFS= read -r source; do
+    [[ $source == */outbox.rs || $source == */duroxide_phase0.rs ]] && continue
+    if awk '/#\[cfg\(test\)\]/{exit} {print}' "$source" | rg -n 'lease_token|lease_until'; then
+        echo "start-command lease fields are used outside outbox.rs: $source" >&2
+        exit 1
+    fi
+done < <(rg --files crates/sporos-service/src -g '*.rs')
+
+for route in \
+    '/api/v1/autobrr/check' \
+    '/api/v1/autobrr/torrents' \
+    '/api/v1/admin/tasks' \
+    '/api/v1/admin/operations' \
+    '/api/v1/admin/searches' \
+    '/api/v1/admin/data-scans' \
+    '/api/v1/admin/inventory'; do
+    rg -F --quiet "$route" crates/sporos-service/src/http.rs
+done
+
+if rg -n '/api/v1/.*(delete|cleanup|remove)' crates/sporos-service/src/http.rs; then
+    echo 'administrative HTTP surface contains a cleanup route' >&2
+    exit 1
+fi

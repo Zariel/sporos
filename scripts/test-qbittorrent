@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for tool in cargo cc curl; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Missing required test tool: $tool" >&2
+        echo 'Install the standard Rust/C build tools or run this through nix develop.' >&2
+        exit 1
+    fi
+done
+
 api_key='qbt_0123456789abcdefghijklmnopqr'
 image_default='lscr.io/linuxserver/qbittorrent@sha256:128fc1ded61de40107311b6424a797ebffed0cda3451cd63776394d46cddf59c'
 image=${QBITTORRENT_IMAGE:-$image_default}

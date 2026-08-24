@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo nextest run --workspace --all-features --no-tests pass
+else
+    cargo test --workspace --all-features
+fi
+cargo test --workspace --doc
+
+if command -v cargo-deny >/dev/null 2>&1; then
+    cargo deny check
+fi
+if command -v cargo-audit >/dev/null 2>&1; then
+    cargo audit
+fi
+
+scripts/check-architecture
