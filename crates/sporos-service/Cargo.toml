@@ -19,6 +19,7 @@ magpie-bt-bencode.workspace = true
 magpie-bt-metainfo.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true
+rustix.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
