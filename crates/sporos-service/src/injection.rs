@@ -275,24 +275,27 @@ impl InjectionExecutor {
         if plan.injection_state.as_deref() == Some("finalizing") {
             return self.verify_final(input, &plan, qbit, &state).await;
         }
-        if plan.injection_state.as_deref() == Some("recheck_requested") {
-            if state.is_checking() {
+        match recheck_observation(plan.injection_state.as_deref(), &state) {
+            RecheckObservation::Checking => {
                 self.storage
                     .update_qbit_observation(input, &state, "checking")
                     .await?;
                 return Ok(waiting());
             }
-            let attempts = self.storage.bump_verification(input, &state).await?;
-            if attempts >= MAX_FINAL_VERIFY_ATTEMPTS {
-                return self.fail(input, "ambiguous_qbittorrent_state").await;
+            RecheckObservation::Settling => {
+                self.storage
+                    .update_qbit_observation(input, &state, "recheck_settling")
+                    .await?;
+                return Ok(waiting());
             }
-            return Ok(waiting());
-        }
-        if state.is_checking() {
-            self.storage
-                .update_qbit_observation(input, &state, "checking")
-                .await?;
-            return Ok(waiting());
+            RecheckObservation::Waiting => {
+                let attempts = self.storage.bump_verification(input, &state).await?;
+                if attempts >= MAX_FINAL_VERIFY_ATTEMPTS {
+                    return self.fail(input, "ambiguous_qbittorrent_state").await;
+                }
+                return Ok(waiting());
+            }
+            RecheckObservation::Inspect => {}
         }
         let pieces = qbit.piece_states(&hash).await?;
         let integrity = inspect_pieces(&plan.manifest, &plan.mapped_ordinals, &pieces)?;
@@ -360,6 +363,31 @@ enum Stage {
 fn waiting() -> StepResult {
     StepResult::Waiting {
         delay_ms: POLL_DELAY.as_millis() as u64,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecheckObservation {
+    Checking,
+    Settling,
+    Waiting,
+    Inspect,
+}
+
+fn recheck_observation(
+    injection_state: Option<&str>,
+    torrent: &TorrentState,
+) -> RecheckObservation {
+    if torrent.is_checking() {
+        return RecheckObservation::Checking;
+    }
+    if matches!(torrent.state.as_str(), "queuedDL" | "queuedUP") {
+        return RecheckObservation::Waiting;
+    }
+    match injection_state {
+        Some("recheck_requested") => RecheckObservation::Settling,
+        Some("recheck_settling" | "checking") => RecheckObservation::Inspect,
+        _ => RecheckObservation::Waiting,
     }
 }
 
@@ -1109,7 +1137,6 @@ mod tests {
         let save_path: String = row.get("save_path_remote");
         let hash = encode_hex(&row.get::<Vec<u8>, _>("v1_hash"));
         let stopped = state(&hash, &save_path, "stoppedUP", 0, 1.0);
-        let checking = state(&hash, &save_path, "checkingUP", 0, 1.0);
         let started = state(&hash, &save_path, "uploading", 0, 1.0);
         let (url, server) = qbit_server(vec![
             b"v5.2.5".to_vec(),
@@ -1124,7 +1151,7 @@ mod tests {
             format!("[{stopped}]").into_bytes(),
             format!("[{stopped}]").into_bytes(),
             Vec::new(),
-            format!("[{checking}]").into_bytes(),
+            format!("[{stopped}]").into_bytes(),
             format!("[{stopped}]").into_bytes(),
             b"[2]".to_vec(),
             Vec::new(),
@@ -1191,6 +1218,37 @@ mod tests {
         assert_eq!(injection.get::<String, _>("resume_decision"), "resume");
         assert_eq!(injection.get::<i64, _>("progress_ppm"), 1_000_000);
         assert_eq!(injection.get::<String, _>("state"), "completed");
+    }
+
+    #[test]
+    fn recheck_observation_does_not_require_a_transient_checking_state() {
+        let stopped: TorrentState =
+            serde_json::from_str(&state("hash", "/data", "stoppedUP", 0, 1.0)).unwrap();
+        let checking: TorrentState =
+            serde_json::from_str(&state("hash", "/data", "checkingUP", 0, 1.0)).unwrap();
+        let queued: TorrentState =
+            serde_json::from_str(&state("hash", "/data", "queuedUP", 0, 1.0)).unwrap();
+
+        assert_eq!(
+            recheck_observation(Some("recheck_requested"), &checking),
+            RecheckObservation::Checking
+        );
+        assert_eq!(
+            recheck_observation(Some("recheck_requested"), &stopped),
+            RecheckObservation::Settling
+        );
+        assert_eq!(
+            recheck_observation(Some("recheck_settling"), &stopped),
+            RecheckObservation::Inspect
+        );
+        assert_eq!(
+            recheck_observation(Some("recheck_requested"), &queued),
+            RecheckObservation::Waiting
+        );
+        assert_eq!(
+            recheck_observation(Some("checking"), &stopped),
+            RecheckObservation::Inspect
+        );
     }
 
     #[tokio::test]
