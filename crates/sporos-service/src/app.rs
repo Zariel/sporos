@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::candidate_workflow::SOURCE_COMPLETED_EVENT;
 use crate::config::{Config, LogFormat, Logging};
 use crate::engine::registries;
 use crate::http::{HttpState, router};
@@ -107,6 +108,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             .await
     });
     let (outbox_stop_tx, outbox_stop_rx) = watch::channel(false);
+    let qbit_client = client.clone();
     let outbox_state = state.clone();
     let outbox_storage = Arc::clone(&storage);
     let outbox_batch_size = config.limits.outbox_batch_size;
@@ -122,6 +124,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
     });
     let (qbit_stop_tx, qbit_stop_rx) = watch::channel(false);
     let qbit = synchronizer.map(|synchronizer| {
+        let qbit_storage = Arc::clone(&storage);
         let settings = config
             .qbittorrent
             .as_ref()
@@ -131,6 +134,8 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         tokio::spawn(async move {
             qbit_loop(
                 synchronizer,
+                qbit_storage,
+                qbit_client,
                 sync_interval,
                 full_reconcile_interval,
                 qbit_stop_rx,
@@ -206,6 +211,8 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
 
 async fn qbit_loop(
     synchronizer: InventorySynchronizer,
+    storage: Arc<Storage>,
+    client: Client,
     sync_period: Duration,
     full_period: Duration,
     mut stop: watch::Receiver<bool>,
@@ -244,12 +251,15 @@ async fn qbit_loop(
                 match synchronizer.reconcile_requested().await {
                     Ok(true) => {
                         match synchronizer.reconcile(now_ms()).await {
-                            Ok(report) => info!(
-                                service = "sporos",
-                                changed = report.changed,
-                                completions = report.completions.len(),
-                                "requested qBittorrent inventory reconciliation completed"
-                            ),
+                            Ok(report) => {
+                                info!(
+                                    service = "sporos",
+                                    changed = report.changed,
+                                    completions = report.completions.len(),
+                                    "requested qBittorrent inventory reconciliation completed"
+                                );
+                                finish_qbit_report(&synchronizer, &storage, &client, &report).await;
+                            }
                             Err(error) => {
                                 warn!(service = "sporos", error = %error, "requested qBittorrent inventory reconciliation failed");
                                 continue;
@@ -273,23 +283,58 @@ async fn qbit_loop(
                                 "qBittorrent inventory synchronized"
                             );
                         }
-                        if let Err(error) = synchronizer.refresh_manifests(8, now_ms()).await {
-                            warn!(service = "sporos", error = %error, "qBittorrent manifest refresh failed");
-                        }
+                        finish_qbit_report(&synchronizer, &storage, &client, &report).await;
                     }
                     Err(error) => warn!(service = "sporos", error = %error, "qBittorrent inventory sync failed"),
                 }
             }
             _ = full_interval.tick(), if contract_validated => {
                 match synchronizer.reconcile(now_ms()).await {
-                    Ok(report) => info!(
-                        service = "sporos",
-                        changed = report.changed,
-                        completions = report.completions.len(),
-                        "qBittorrent inventory reconciled"
-                    ),
+                    Ok(report) => {
+                        info!(
+                            service = "sporos",
+                            changed = report.changed,
+                            completions = report.completions.len(),
+                            "qBittorrent inventory reconciled"
+                        );
+                        finish_qbit_report(&synchronizer, &storage, &client, &report).await;
+                    }
                     Err(error) => warn!(service = "sporos", error = %error, "qBittorrent inventory reconciliation failed"),
                 }
+            }
+        }
+    }
+}
+
+async fn finish_qbit_report(
+    synchronizer: &InventorySynchronizer,
+    storage: &Storage,
+    client: &Client,
+    report: &crate::qbit_sync::SyncReport,
+) {
+    if let Err(error) = synchronizer.refresh_manifests(8, now_ms()).await {
+        warn!(service = "sporos", error = %error, "qBittorrent manifest refresh failed");
+        return;
+    }
+    for completion in &report.completions {
+        let instances = match storage
+            .waiting_candidate_instances(completion.source_id)
+            .await
+        {
+            Ok(instances) => instances,
+            Err(error) => {
+                warn!(service = "sporos", error = %error, "candidate completion waiters unavailable");
+                continue;
+            }
+        };
+        for instance in instances {
+            if let Err(error) = client
+                .enqueue_event(&instance, SOURCE_COMPLETED_EVENT, "{}")
+                .await
+            {
+                // The durable reconciliation timer remains authoritative if advisory
+                // completion delivery is temporarily unavailable.
+                warn!(service = "sporos", instance, error = %error, "candidate completion signal failed");
             }
         }
     }

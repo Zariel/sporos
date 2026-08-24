@@ -20,6 +20,7 @@ use crate::task_projection::{ProjectionOutcome, ProjectionUpdate};
 pub const EVALUATE_ACTIVITY: &str = "EvaluateCandidate";
 pub const SOURCE_COMPLETED_EVENT: &str = "SourceCompleted";
 const MAX_PLAUSIBLE_SOURCES: i64 = 64;
+const MAX_WAITERS_PER_COMPLETION: i64 = 1_024;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,7 +61,7 @@ pub async fn workflow(context: OrchestrationContext, input: String) -> Result<St
                 );
                 let _ = context
                     .select2(
-                        context.schedule_wait(SOURCE_COMPLETED_EVENT),
+                        context.dequeue_event(SOURCE_COMPLETED_EVENT),
                         context.schedule_timer(timer),
                     )
                     .await;
@@ -70,6 +71,24 @@ pub async fn workflow(context: OrchestrationContext, input: String) -> Result<St
 }
 
 impl Storage {
+    pub async fn waiting_candidate_instances(
+        &self,
+        source_id: [u8; 16],
+    ) -> Result<Vec<String>, CandidateWorkflowError> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT t.duroxide_instance_id
+             FROM sporos_waiting_source w
+             JOIN sporos_task t ON t.id = w.candidate_task_id
+             WHERE w.source_id = ? AND t.terminal_at IS NULL
+             ORDER BY t.duroxide_instance_id
+             LIMIT ?",
+        )
+        .bind(source_id.as_slice())
+        .bind(MAX_WAITERS_PER_COMPLETION)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     pub async fn evaluate_candidate(
         &self,
         input: &CandidateWorkflowInput,
@@ -670,12 +689,17 @@ pub enum CandidateWorkflowError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use duroxide::runtime::Runtime;
+    use duroxide::{Client, OrchestrationStatus};
     use tempfile::TempDir;
 
     use super::*;
     use crate::candidate::{CandidateIngress, CandidateSubmission};
     use crate::config::{Injection, Matching, Paths, SourceFilters};
     use crate::inventory::{InventoryChange, InventoryDelta, InventoryFile};
+    use crate::outbox::OutboxDispatcher;
 
     #[tokio::test]
     async fn dry_run_persists_a_complete_plan_without_external_mutation() {
@@ -750,6 +774,80 @@ mod tests {
                 if state == "dry_run_complete"
         ));
         assert_eq!(count(&storage, "sporos_waiting_source").await, 0);
+    }
+
+    #[tokio::test]
+    async fn completion_event_wakes_the_durable_workflow() {
+        let directory = TempDir::new().expect("temporary directory");
+        let storage = Arc::new(open(&directory).await);
+        project_source(&storage, false, 13, 1).await;
+        let input = accept(&storage, &directory, now_ms()).await;
+        let instance = sqlx::query_scalar::<_, String>(
+            "SELECT duroxide_instance_id FROM sporos_task WHERE id = ?",
+        )
+        .bind(input.task_id.as_slice())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let provider = storage.duroxide_provider();
+        let client = Client::new(provider.clone());
+        let (activities, orchestrations) = crate::engine::registries(Arc::clone(&storage));
+        let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
+        OutboxDispatcher::new(&storage, client.clone(), 1)
+            .run_once(now_ms())
+            .await
+            .expect("dispatch candidate workflow");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let subscription = sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM history
+                     WHERE instance_id = ? AND event_type = 'ExternalSubscribedPersistent'",
+                )
+                .bind(&instance)
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+                if count(&storage, "sporos_waiting_source").await == 1 && subscription == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate did not begin waiting");
+
+        project_source(&storage, true, 13, 2).await;
+        let source_id = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT id FROM sporos_qbit_torrent WHERE qbit_id = ?",
+        )
+        .bind("b".repeat(40))
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+        let instances = storage
+            .waiting_candidate_instances(source_id.try_into().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0], instance);
+        client
+            .enqueue_event(&instance, SOURCE_COMPLETED_EVENT, "{}")
+            .await
+            .expect("signal source completion");
+
+        let status = client
+            .wait_for_orchestration(&instance, Duration::from_secs(5))
+            .await
+            .expect("wait for candidate workflow");
+        assert!(matches!(status, OrchestrationStatus::Completed { .. }));
+        let task_state =
+            sqlx::query_scalar::<_, String>("SELECT state FROM sporos_task WHERE id = ?")
+                .bind(input.task_id.as_slice())
+                .fetch_one(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(task_state, "dry_run_complete");
+        runtime.shutdown(Some(100)).await;
     }
 
     async fn accept(
