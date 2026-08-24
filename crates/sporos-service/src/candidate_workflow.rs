@@ -114,18 +114,12 @@ impl Storage {
             }
         }
 
-        let mut decision = PureMatcher.evaluate(&MatchRequest {
+        let decision = PureMatcher.evaluate(&MatchRequest {
             candidate: &loaded.manifest,
             candidate_release: &loaded.release,
             sources: &available,
             policy: &loaded.policy.matching,
         });
-        if loaded.manifest.hashes.v2.is_some()
-            && !loaded.policy.injection.dry_run
-            && decision.outcome == MatchOutcome::Match
-        {
-            fail_closed_for_live_v2(&mut decision);
-        }
         if decision.outcome == MatchOutcome::NoMatch && !waiting.is_empty() {
             let deadline = loaded.deadline()?;
             if now < deadline {
@@ -533,16 +527,6 @@ impl Storage {
         }
         Ok(())
     }
-}
-
-fn fail_closed_for_live_v2(decision: &mut MatchDecision) {
-    decision.outcome = MatchOutcome::Rejected;
-    decision.mode = None;
-    decision.reason = sporos_model::MatchReason::UnsupportedTorrent;
-    decision.source_ids.clear();
-    decision.mappings.clear();
-    decision.mapped_bytes = 0;
-    decision.requires_recheck = false;
 }
 
 async fn persist_plan(
@@ -969,7 +953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_v2_and_hybrid_candidates_fail_closed() {
+    async fn live_v2_and_hybrid_candidates_produce_injection_plans() {
         for hybrid in [false, true] {
             let directory = TempDir::new().expect("temporary directory");
             let storage = open(&directory).await;
@@ -1008,12 +992,11 @@ mod tests {
                 result,
                 EvaluationResult::Terminal {
                     ref state,
-                    ref reason_code,
-                    plan_id: None,
+                    plan_id: Some(_),
                     ..
-                } if state == "rejected" && reason_code == "unsupported_torrent"
+                } if state == "planned"
             ));
-            assert_eq!(count(&storage, "sporos_injection_plan").await, 0);
+            assert_eq!(count(&storage, "sporos_injection_plan").await, 1);
         }
     }
 

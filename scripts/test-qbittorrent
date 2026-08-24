@@ -26,16 +26,19 @@ fi
 
 container="sporos-qbittorrent-$$"
 config_volume="$container-config"
-downloads_volume="$container-downloads"
+test_root=$(mktemp -d)
+downloads_dir="$test_root/downloads"
+sources_dir="$test_root/sources"
+mkdir -p "$downloads_dir" "$sources_dir"
 
 cleanup() {
     "$runtime" rm --force "$container" >/dev/null 2>&1 || true
-    "$runtime" volume rm --force "$config_volume" "$downloads_volume" >/dev/null 2>&1 || true
+    "$runtime" volume rm --force "$config_volume" >/dev/null 2>&1 || true
+    rm -rf "$test_root"
 }
 trap cleanup EXIT INT TERM
 
 "$runtime" volume create "$config_volume" >/dev/null
-"$runtime" volume create "$downloads_volume" >/dev/null
 # API_KEY is intentionally expanded by the container shell, not this script.
 # shellcheck disable=SC2016
 "$runtime" run --rm \
@@ -65,7 +68,7 @@ trap cleanup EXIT INT TERM
     --env TZ=UTC \
     --publish 127.0.0.1::8080 \
     --volume "$config_volume:/config" \
-    --volume "$downloads_volume:/downloads" \
+    --volume "$downloads_dir:/downloads" \
     "$image" >/dev/null
 
 published_port=$(
@@ -96,11 +99,12 @@ if ! curl --fail --silent --show-error \
 fi
 echo
 
+# The bind mount is shared with the host-side hardlink materializer. Rootless
+# container ID mapping can otherwise leave the test directory inaccessible.
+"$runtime" exec "$container" chmod 0777 /downloads
+
 SPOROS_QBITTORRENT_URL=$url \
 SPOROS_QBITTORRENT_API_KEY=$api_key \
+SPOROS_QBITTORRENT_DOWNLOADS=$downloads_dir \
+SPOROS_QBITTORRENT_SOURCES=$sources_dir \
 cargo test -p sporos-service --test qbittorrent_real -- --ignored --nocapture
-
-if [[ $("$runtime" exec "$container" find /downloads -type f -print -quit) ]]; then
-    echo 'qBittorrent materialised data before hardlink verification.' >&2
-    exit 1
-fi

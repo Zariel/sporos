@@ -1,8 +1,14 @@
+use std::io::Cursor;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::Url;
 use sporos_service::{
-    inventory::{InventoryChange, parse_files, parse_inventory, parse_main_data},
+    hardlink::{HardlinkMaterializer, PlannedLink},
+    inventory::{
+        InventoryChange, parse_files, parse_inventory, parse_main_data, parse_piece_states,
+    },
     qbittorrent::{AddTorrentRequest, ApiKey, QbittorrentClient, QbittorrentError},
     torrent::TorrentParser,
 };
@@ -54,6 +60,20 @@ async fn verify_case(client: &QbittorrentClient, case: Case) -> String {
         .or_else(|| parsed.v2_hash().map(Vec::from))
         .expect("torrent identity")
         .as_slice());
+    let parsed_files: Vec<_> = parsed
+        .files()
+        .iter()
+        .map(|file| {
+            (
+                file.path()
+                    .iter()
+                    .map(|component| std::str::from_utf8(component).expect("UTF-8 fixture"))
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                file.length(),
+            )
+        })
+        .collect();
     let save_path = format!("/downloads/{}", case.name);
     let tag = format!("sporos-phase0-{}", case.name);
     let submission = client
@@ -88,6 +108,10 @@ async fn verify_case(client: &QbittorrentClient, case: Case) -> String {
         case.name
     );
 
+    if let Some(files) = case.materialize {
+        materialize_and_recheck(client, case.name, &info_hash, &parsed_files, files).await;
+    }
+
     client
         .stop(&info_hash)
         .await
@@ -95,6 +119,79 @@ async fn verify_case(client: &QbittorrentClient, case: Case) -> String {
     let state = poll_stopped(client, &info_hash).await;
     assert!(state.is_stopped(), "torrent did not remain stopped");
     info_hash
+}
+
+async fn materialize_and_recheck(
+    client: &QbittorrentClient,
+    case_name: &str,
+    info_hash: &str,
+    parsed_files: &[(String, u64)],
+    files: Vec<Vec<u8>>,
+) {
+    let downloads = PathBuf::from(required_env("SPOROS_QBITTORRENT_DOWNLOADS"));
+    let source_root = PathBuf::from(required_env("SPOROS_QBITTORRENT_SOURCES")).join(case_name);
+    std::fs::create_dir_all(&source_root).expect("create source root");
+    let mut links = Vec::new();
+    for (index, ((destination, length), content)) in parsed_files.iter().zip(files).enumerate() {
+        assert_eq!(*length, content.len() as u64);
+        let candidate_path = downloads.join(case_name).join(destination);
+        assert!(
+            !candidate_path.exists(),
+            "{} materialised data before verification",
+            case_name
+        );
+        let source_relative = PathBuf::from(format!("{index}.source"));
+        std::fs::write(source_root.join(&source_relative), &content).expect("write source fixture");
+        links.push(PlannedLink {
+            source_root: source_root.clone(),
+            source_relative,
+            destination_relative: PathBuf::from(destination),
+            expected_size: *length,
+            expected_device: None,
+            expected_inode: None,
+        });
+    }
+    let materialized = HardlinkMaterializer::open(&downloads)
+        .expect("open download root")
+        .materialize(Path::new(case_name), &links)
+        .expect("materialize candidate tree");
+    assert_eq!(materialized.len(), links.len());
+    for (destination, _) in parsed_files {
+        let mut directory = downloads.join(case_name).join(destination);
+        directory.pop();
+        while directory.starts_with(downloads.join(case_name)) {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))
+                .expect("make bind-mounted fixture traversable");
+            if !directory.pop() {
+                break;
+            }
+        }
+    }
+
+    client
+        .force_recheck(info_hash)
+        .await
+        .expect("force recheck");
+    let state = poll_complete(client, info_hash).await;
+    assert_eq!(state.amount_left, 0, "{} amount left", case_name);
+    assert_eq!(state.progress, 1.0, "{} progress", case_name);
+    let body = client.piece_states(info_hash).await.expect("piece states");
+    let mut complete = true;
+    let count = parse_piece_states(Cursor::new(&body), body.len() as u64, 100, |state| {
+        complete &= state == 2;
+        Ok(())
+    })
+    .expect("parse piece states");
+    assert!(count > 0 && complete, "{} piece states", case_name);
+
+    for (index, (destination, _)) in parsed_files.iter().enumerate() {
+        let source = std::fs::metadata(source_root.join(format!("{index}.source")))
+            .expect("source metadata");
+        let destination = std::fs::metadata(downloads.join(case_name).join(destination))
+            .expect("destination metadata");
+        assert_eq!(source.dev(), destination.dev());
+        assert_eq!(source.ino(), destination.ino());
+    }
 }
 
 async fn verify_inventory_reads(client: &QbittorrentClient, hashes: &[String]) {
@@ -149,6 +246,7 @@ struct Case {
     torrent: Vec<u8>,
     content: &'static str,
     length: u64,
+    materialize: Option<Vec<Vec<u8>>>,
 }
 
 fn cases() -> Vec<Case> {
@@ -164,6 +262,7 @@ fn cases() -> Vec<Case> {
             .into_bytes(),
             content: "v1-file.bin",
             length: 4,
+            materialize: None,
         },
         Case {
             name: "v1-multi",
@@ -173,6 +272,7 @@ fn cases() -> Vec<Case> {
             .into_bytes(),
             content: "v1-root",
             length: 9,
+            materialize: None,
         },
         Case {
             name: "v2-single",
@@ -182,6 +282,7 @@ fn cases() -> Vec<Case> {
             .into_bytes(),
             content: "v2-file.bin",
             length: 4,
+            materialize: None,
         },
         Case {
             name: "v2-multi",
@@ -191,6 +292,7 @@ fn cases() -> Vec<Case> {
             .into_bytes(),
             content: "v2-root",
             length: 9,
+            materialize: None,
         },
         Case {
             name: "hybrid-single",
@@ -200,6 +302,7 @@ fn cases() -> Vec<Case> {
             .into_bytes(),
             content: "hybrid-file.bin",
             length: 4,
+            materialize: None,
         },
         Case {
             name: "hybrid-multi",
@@ -209,8 +312,57 @@ fn cases() -> Vec<Case> {
             .into_bytes(),
             content: "hybrid-root",
             length: 9,
+            materialize: None,
+        },
+        Case {
+            name: "v2-materialized",
+            torrent: valid_v2_multifile(b"aaaa", b"bbbbb", "v2-materialized"),
+            content: "v2-materialized",
+            length: 9,
+            materialize: Some(vec![b"aaaa".to_vec(), b"bbbbb".to_vec()]),
+        },
+        Case {
+            name: "hybrid-materialized",
+            torrent: valid_hybrid_multifile(b"aaaa", b"bbbbb", "hybrid-materialized"),
+            content: "hybrid-materialized",
+            length: 9,
+            materialize: Some(vec![b"aaaa".to_vec(), b"bbbbb".to_vec()]),
         },
     ]
+}
+
+fn valid_v2_multifile(first: &[u8], second: &[u8], name: &str) -> Vec<u8> {
+    let mut torrent = b"d4:infod9:file treed5:a.bind0:d6:lengthi4e11:pieces root32:".to_vec();
+    torrent.extend_from_slice(&magpie_bt_metainfo::sha256(first));
+    torrent.extend_from_slice(b"ee5:b.bind0:d6:lengthi5e11:pieces root32:");
+    torrent.extend_from_slice(&magpie_bt_metainfo::sha256(second));
+    torrent.extend_from_slice(b"eee12:meta versioni2e4:name");
+    push_bytes(&mut torrent, name.as_bytes());
+    torrent.extend_from_slice(b"12:piece lengthi16384eee");
+    torrent
+}
+
+fn valid_hybrid_multifile(first: &[u8], second: &[u8], name: &str) -> Vec<u8> {
+    let mut torrent = b"d4:infod9:file treed5:a.bind0:d6:lengthi4e11:pieces root32:".to_vec();
+    torrent.extend_from_slice(&magpie_bt_metainfo::sha256(first));
+    torrent.extend_from_slice(b"ee5:b.bind0:d6:lengthi5e11:pieces root32:");
+    torrent.extend_from_slice(&magpie_bt_metainfo::sha256(second));
+    torrent.extend_from_slice(b"eee5:filesld6:lengthi4e4:pathl5:a.bineed4:attr1:p6:lengthi16380e4:pathl4:.pad5:16380eed6:lengthi5e4:pathl5:b.bineee12:meta versioni2e4:name");
+    push_bytes(&mut torrent, name.as_bytes());
+    torrent.extend_from_slice(b"12:piece lengthi16384e6:pieces40:");
+    let mut first_piece = Vec::with_capacity(16_384);
+    first_piece.extend_from_slice(first);
+    first_piece.resize(16_384, 0);
+    torrent.extend_from_slice(&magpie_bt_metainfo::sha1(&first_piece));
+    torrent.extend_from_slice(&magpie_bt_metainfo::sha1(second));
+    torrent.extend_from_slice(b"ee");
+    torrent
+}
+
+fn push_bytes(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(value.len().to_string().as_bytes());
+    output.push(b':');
+    output.extend_from_slice(value);
 }
 
 async fn poll_visible(
@@ -248,6 +400,30 @@ async fn poll_stopped(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("torrent did not stop within ten seconds");
+}
+
+async fn poll_complete(
+    client: &QbittorrentClient,
+    info_hash: &str,
+) -> sporos_service::qbittorrent::TorrentState {
+    let mut last = None;
+    for _ in 0..200 {
+        if let Some(state) = client
+            .torrent_state(info_hash)
+            .await
+            .expect("torrent state")
+        {
+            if !state.is_checking() && state.amount_left == 0 && state.progress == 1.0 {
+                return state;
+            }
+            last = Some(state);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let pieces = client.piece_states(info_hash).await.ok();
+    panic!(
+        "torrent did not complete recheck within twenty seconds: state={last:?} pieces={pieces:?}"
+    );
 }
 
 fn assert_safe_state(state: &str) {
