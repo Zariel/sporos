@@ -128,6 +128,7 @@ pub(crate) struct SearchExecutor {
     client: ProwlarrClient,
     policy: SearchPolicy,
     arr: Option<crate::arr::ArrEnricher>,
+    limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl SearchExecutor {
@@ -137,11 +138,17 @@ impl SearchExecutor {
             client,
             policy,
             arr: None,
+            limiter: None,
         }
     }
 
     pub(crate) fn with_arr(mut self, arr: crate::arr::ArrEnricher) -> Self {
         self.arr = Some(arr);
+        self
+    }
+
+    pub(crate) fn with_limiter(mut self, limiter: Arc<tokio::sync::Semaphore>) -> Self {
+        self.limiter = Some(limiter);
         self
     }
 
@@ -164,11 +171,17 @@ impl SearchExecutor {
             },
         );
         let storage = Arc::clone(&self.storage);
+        let limiter = self.limiter.clone();
         activities.register(
             BACKFILL_ACTIVITY,
             move |_context: ActivityContext, input: String| {
                 let storage = Arc::clone(&storage);
+                let limiter = limiter.clone();
                 async move {
+                    let _permit = match &limiter {
+                        Some(limiter) => Some(crate::execution::permit(limiter).await),
+                        None => None,
+                    };
                     let input: BackfillInput = serde_json::from_str(&input)
                         .map_err(|error| format!("invalid backfill input: {error}"))?;
                     let page = produce_page(&storage, &input, now_ms())
@@ -214,6 +227,10 @@ impl SearchExecutor {
     }
 
     async fn execute(&self, input: &SearchInput, now: i64) -> Result<SearchOutcome, SearchError> {
+        let _permit = match &self.limiter {
+            Some(limiter) => Some(crate::execution::permit(limiter).await),
+            None => None,
+        };
         if let Some(arr) = &self.arr {
             // Enrichment is advisory: filename and file-tree matching remains available
             // while an Arr instance is down.

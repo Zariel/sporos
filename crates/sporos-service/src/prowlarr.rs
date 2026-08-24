@@ -11,6 +11,7 @@ use sporos_model::{ReleaseDescriptor, VideoKind};
 use sqlx::Row;
 use thiserror::Error;
 use tokio::io::BufReader;
+use tokio::sync::Semaphore;
 use tokio_util::io::StreamReader;
 
 use crate::config::Prowlarr;
@@ -29,6 +30,7 @@ pub(crate) struct ProwlarrClient {
     require_proxy_downloads: bool,
     max_results: usize,
     max_torrent_bytes: usize,
+    limiter: Option<std::sync::Arc<Semaphore>>,
 }
 
 impl ProwlarrClient {
@@ -52,7 +54,13 @@ impl ProwlarrClient {
             require_proxy_downloads: settings.require_proxy_downloads,
             max_results: settings.max_results_per_query,
             max_torrent_bytes,
+            limiter: None,
         })
+    }
+
+    pub(crate) fn with_limiter(mut self, limiter: std::sync::Arc<Semaphore>) -> Self {
+        self.limiter = Some(limiter);
+        self
     }
 
     pub(crate) async fn indexers(&self) -> Result<Vec<ProjectedIndexer>, ProwlarrError> {
@@ -73,6 +81,10 @@ impl ProwlarrClient {
         indexer_id: i64,
         query: &SearchQuery,
     ) -> Result<Vec<crate::torznab::TorznabResult>, ProwlarrError> {
+        let _permit = match &self.limiter {
+            Some(limiter) => Some(crate::execution::permit(limiter).await),
+            None => None,
+        };
         let url = self
             .base_url
             .join(&format!("api/v1/indexer/{indexer_id}/newznab"))
@@ -135,6 +147,10 @@ impl ProwlarrClient {
     }
 
     async fn get(&self, url: Url) -> Result<reqwest::Response, ProwlarrError> {
+        let _permit = match &self.limiter {
+            Some(limiter) => Some(crate::execution::permit(limiter).await),
+            None => None,
+        };
         self.client
             .get(url)
             .header("X-Api-Key", self.api_key.clone())

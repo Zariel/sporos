@@ -116,11 +116,28 @@ fn encode(result: StepResult) -> Result<String, String> {
 pub(crate) struct InjectionExecutor {
     storage: Arc<Storage>,
     qbit: Option<QbittorrentClient>,
+    candidate: Option<Arc<tokio::sync::Semaphore>>,
+    filesystem: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl InjectionExecutor {
     pub(crate) fn new(storage: Arc<Storage>, qbit: Option<QbittorrentClient>) -> Self {
-        Self { storage, qbit }
+        Self {
+            storage,
+            qbit,
+            candidate: None,
+            filesystem: None,
+        }
+    }
+
+    pub(crate) fn with_limiters(
+        mut self,
+        candidate: Arc<tokio::sync::Semaphore>,
+        filesystem: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        self.candidate = Some(candidate);
+        self.filesystem = Some(filesystem);
+        self
     }
 
     pub(crate) fn register(
@@ -153,6 +170,10 @@ impl InjectionExecutor {
     }
 
     async fn activity(&self, raw: &str, stage: Stage) -> Result<String, String> {
+        let _permit = match &self.candidate {
+            Some(limiter) => Some(crate::execution::permit(limiter).await),
+            None => None,
+        };
         let input: InjectionInput = serde_json::from_str(raw)
             .map_err(|error| format!("invalid injection activity input: {error}"))?;
         let result = match stage {
@@ -226,6 +247,10 @@ impl InjectionExecutor {
         let namespace = plan.namespace_relative()?;
         let links = plan.planned_links();
         let root = PathBuf::from(&plan.policy.namespace_local_root);
+        let _permit = match &self.filesystem {
+            Some(limiter) => Some(crate::execution::permit(limiter).await),
+            None => None,
+        };
         let results = tokio::task::spawn_blocking(move || {
             let materializer = HardlinkMaterializer::open(&root)?;
             let mut materialized = Vec::with_capacity(links.len());

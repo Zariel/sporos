@@ -32,16 +32,30 @@ pub struct FakeTaskInput {
     pub delay_ms: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn registries(
     storage: Arc<Storage>,
     qbit: Option<crate::qbittorrent::QbittorrentClient>,
     search: Option<crate::search::SearchExecutor>,
     data_scan: Option<crate::data_scan::DataScanExecutor>,
 ) -> (ActivityRegistry, OrchestrationRegistry) {
+    registries_with_limits(storage, qbit, search, data_scan, None)
+}
+
+pub(crate) fn registries_with_limits(
+    storage: Arc<Storage>,
+    qbit: Option<crate::qbittorrent::QbittorrentClient>,
+    search: Option<crate::search::SearchExecutor>,
+    data_scan: Option<crate::data_scan::DataScanExecutor>,
+    execution: Option<crate::execution::ExecutionLimits>,
+) -> (ActivityRegistry, OrchestrationRegistry) {
     let completion_storage = Arc::clone(&storage);
     let candidate_storage = Arc::clone(&storage);
     let injection_storage = Arc::clone(&storage);
     let completion_search = search.clone();
+    let candidate_limiter = execution
+        .as_ref()
+        .map(crate::execution::ExecutionLimits::candidate);
     let activities = ActivityRegistry::builder()
         .register(
             PROJECT_TASK_ACTIVITY,
@@ -84,7 +98,12 @@ pub(crate) fn registries(
             candidate_workflow::EVALUATE_ACTIVITY,
             move |_context: ActivityContext, input: String| {
                 let storage = Arc::clone(&candidate_storage);
+                let candidate_limiter = candidate_limiter.clone();
                 async move {
+                    let _permit = match &candidate_limiter {
+                        Some(limiter) => Some(crate::execution::permit(limiter).await),
+                        None => None,
+                    };
                     let input: crate::candidate::CandidateWorkflowInput =
                         serde_json::from_str(&input)
                             .map_err(|error| format!("invalid candidate evaluation: {error}"))?;
@@ -109,9 +128,13 @@ pub(crate) fn registries(
     };
     let activities =
         crate::task_control::TaskControl::new(Arc::clone(&injection_storage)).register(activities);
-    let activities = crate::injection::InjectionExecutor::new(injection_storage, qbit)
-        .register(activities)
-        .build();
+    let injection = crate::injection::InjectionExecutor::new(injection_storage, qbit);
+    let injection = if let Some(execution) = execution {
+        injection.with_limiters(execution.candidate(), execution.filesystem())
+    } else {
+        injection
+    };
+    let activities = injection.register(activities).build();
     let orchestrations = OrchestrationRegistry::builder()
         .register_versioned(FAKE_TASK_NAME, FAKE_TASK_VERSION, fake_task)
         .register_versioned(

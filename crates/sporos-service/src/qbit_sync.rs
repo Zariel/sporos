@@ -10,7 +10,6 @@ use crate::qbit_projection::{CompletionTransition, ProjectionError};
 use crate::qbittorrent::{QbittorrentClient, QbittorrentError, SupportedVersions};
 use crate::storage::Storage;
 
-const PARSER_CHANNEL_CAPACITY: usize = 32;
 const MAX_FILES_PER_TORRENT: usize = 100_000;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -27,6 +26,7 @@ pub struct InventorySynchronizer {
     client: QbittorrentClient,
     inventory_batch_size: usize,
     database_batch_size: usize,
+    channel_capacity: usize,
 }
 
 impl InventorySynchronizer {
@@ -35,12 +35,14 @@ impl InventorySynchronizer {
         client: QbittorrentClient,
         inventory_batch_size: usize,
         database_batch_size: usize,
+        channel_capacity: usize,
     ) -> Self {
         Self {
             storage,
             client,
             inventory_batch_size,
             database_batch_size,
+            channel_capacity,
         }
     }
 
@@ -75,6 +77,7 @@ impl InventorySynchronizer {
             state.has_baseline,
             state.generation,
             now,
+            self.channel_capacity,
         )
         .await
     }
@@ -137,7 +140,7 @@ impl InventorySynchronizer {
     async fn load_manifest_inner(&self, source_id: [u8; 16], now: i64) -> Result<usize, SyncError> {
         let target = self.storage.prepare_qbit_manifest(source_id).await?;
         let body = self.client.torrent_files(&target.qbit_id).await?;
-        let (sender, mut receiver) = mpsc::channel(PARSER_CHANNEL_CAPACITY);
+        let (sender, mut receiver) = mpsc::channel(self.channel_capacity);
         let parser = tokio::task::spawn_blocking(move || {
             crate::inventory::parse_files(
                 Cursor::new(body),
@@ -187,6 +190,7 @@ async fn apply_main_data(
     has_baseline: bool,
     current_generation: u64,
     now: i64,
+    channel_capacity: usize,
 ) -> Result<SyncReport, SyncError> {
     if database_batch_size == 0 {
         return Err(SyncError::ZeroBatchSize);
@@ -202,7 +206,7 @@ async fn apply_main_data(
     } else {
         current_generation
     };
-    let (sender, mut receiver) = mpsc::channel(PARSER_CHANNEL_CAPACITY);
+    let (sender, mut receiver) = mpsc::channel(channel_capacity);
     let parser = tokio::task::spawn_blocking(move || {
         parse_main_data(Cursor::new(body), u64::MAX, |change| {
             sender
@@ -307,7 +311,7 @@ mod tests {
         let storage = open(&directory).await;
         let body = full_update(1, 5, true);
 
-        let report = apply_main_data(&storage, body, 2, false, 0, 10)
+        let report = apply_main_data(&storage, body, 2, false, 0, 10, 32)
             .await
             .expect("apply initial inventory");
 
@@ -323,11 +327,11 @@ mod tests {
     async fn detects_downtime_completion_after_the_baseline() {
         let directory = TempDir::new().expect("temporary directory");
         let storage = open(&directory).await;
-        apply_main_data(&storage, full_update(1, 1, false), 2, false, 0, 10)
+        apply_main_data(&storage, full_update(1, 1, false), 2, false, 0, 10, 32)
             .await
             .unwrap();
 
-        let report = apply_main_data(&storage, full_update(2, 1, true), 2, true, 1, 20)
+        let report = apply_main_data(&storage, full_update(2, 1, true), 2, true, 1, 20, 32)
             .await
             .expect("apply restart inventory");
 
@@ -349,6 +353,7 @@ mod tests {
             false,
             0,
             10,
+            32,
         )
         .await
         .expect_err("require a full initial response");
@@ -365,9 +370,17 @@ mod tests {
         let directory = TempDir::new().expect("temporary directory");
         let storage = open(&directory).await;
         let started = std::time::Instant::now();
-        let report = apply_main_data(&storage, full_update(1, TORRENTS, true), 200, false, 0, 10)
-            .await
-            .expect("project target inventory");
+        let report = apply_main_data(
+            &storage,
+            full_update(1, TORRENTS, true),
+            200,
+            false,
+            0,
+            10,
+            32,
+        )
+        .await
+        .expect("project target inventory");
         assert_eq!(report.changed, TORRENTS);
         assert!(report.completions.is_empty());
         let operations = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sporos_operation")

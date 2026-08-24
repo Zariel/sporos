@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::http::StatusCode;
 use duroxide::Client;
-use duroxide::runtime::Runtime;
+use duroxide::runtime::{Runtime, RuntimeOptions};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
@@ -21,7 +21,8 @@ use crate::arr::ArrEnricher;
 use crate::candidate_workflow::SOURCE_COMPLETED_EVENT;
 use crate::config::{Config, LogFormat, Logging};
 use crate::data_scan::DataScanExecutor;
-use crate::engine::registries;
+use crate::engine::registries_with_limits;
+use crate::execution::ExecutionLimits;
 use crate::http::{HttpState, router};
 use crate::outbox::OutboxDispatcher;
 use crate::prowlarr::ProwlarrClient;
@@ -66,6 +67,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
             .await
             .map_err(AppError::OpenStorage)?,
     );
+    let execution = ExecutionLimits::new(&config.limits);
     let qbit_api = config
         .qbittorrent
         .as_ref()
@@ -86,12 +88,16 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
                     client,
                     settings.inventory_batch_size,
                     settings.database_batch_size,
+                    config.limits.internal_channel_capacity,
                 )
             });
     let prowlarr_api = config
         .prowlarr
         .as_ref()
-        .map(|settings| ProwlarrClient::new(settings, config.matching.max_torrent_bytes))
+        .map(|settings| {
+            ProwlarrClient::new(settings, config.matching.max_torrent_bytes)
+                .map(|client| client.with_limiter(execution.indexer()))
+        })
         .transpose()
         .map_err(|error| AppError::ProwlarrConfig(error.to_string()))?;
     let arr = (!config.arr.is_empty())
@@ -118,18 +124,33 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
                 config.injection.clone(),
                 config.paths.clone(),
             ),
-        );
+        )
+        .with_limiter(execution.search());
         if let Some(arr) = arr.clone() {
             executor.with_arr(arr)
         } else {
             executor
         }
     });
-    let data_scan = (!config.data_roots.is_empty())
-        .then(|| DataScanExecutor::new(Arc::clone(&storage), config.data_roots.clone()));
-    let (activities, orchestrations) =
-        registries(Arc::clone(&storage), qbit_api, search, data_scan);
-    let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
+    let data_scan = (!config.data_roots.is_empty()).then(|| {
+        DataScanExecutor::new(Arc::clone(&storage), config.data_roots.clone())
+            .with_limiter(execution.filesystem())
+    });
+    let (activities, orchestrations) = registries_with_limits(
+        Arc::clone(&storage),
+        qbit_api,
+        search,
+        data_scan,
+        Some(execution),
+    );
+    let runtime_options = runtime_options(&config.limits);
+    let runtime = Runtime::start_with_options(
+        provider,
+        activities,
+        orchestrations,
+        runtime_options.clone(),
+    )
+    .await;
     let state = HttpState::new(Arc::clone(&storage), &config, prowlarr_api.clone());
     let app: Router = router(state.clone(), config.server.admin_body_limit_bytes)
         .layer(TimeoutLayer::with_status_code(
@@ -206,6 +227,13 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         service = "sporos",
         version = env!("CARGO_PKG_VERSION"),
         bind = %address,
+        orchestration_concurrency = runtime_options.orchestration_concurrency,
+        activity_concurrency = runtime_options.worker_concurrency,
+        max_candidate_workflows = config.limits.max_candidate_workflows,
+        max_search_workflows = config.limits.max_search_workflows,
+        max_indexer_requests = config.limits.max_indexer_requests,
+        max_filesystem_operations = config.limits.max_filesystem_operations,
+        internal_channel_capacity = config.limits.internal_channel_capacity,
         "service ready"
     );
 
@@ -290,6 +318,21 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         return Err(AppError::ServerStopped);
     }
     Ok(())
+}
+
+fn runtime_options(limits: &crate::config::Limits) -> RuntimeOptions {
+    RuntimeOptions {
+        orchestration_concurrency: limits
+            .max_candidate_workflows
+            .saturating_add(limits.max_search_workflows)
+            .saturating_add(2),
+        worker_concurrency: limits
+            .max_candidate_workflows
+            .saturating_add(limits.max_search_workflows)
+            .saturating_add(limits.max_filesystem_operations)
+            .saturating_add(2),
+        ..RuntimeOptions::default()
+    }
 }
 
 async fn projection_repair_loop(

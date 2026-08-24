@@ -29,6 +29,7 @@ const MAX_FILE_DEPTH: usize = 16;
 pub(crate) struct DataScanExecutor {
     storage: Arc<Storage>,
     roots: Arc<BTreeMap<String, DataRoot>>,
+    filesystem: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl DataScanExecutor {
@@ -36,7 +37,13 @@ impl DataScanExecutor {
         Self {
             storage,
             roots: Arc::new(roots),
+            filesystem: None,
         }
+    }
+
+    pub(crate) fn with_limiter(mut self, limiter: Arc<tokio::sync::Semaphore>) -> Self {
+        self.filesystem = Some(limiter);
+        self
     }
 
     pub(crate) fn register(self, activities: ActivityRegistryBuilder) -> ActivityRegistryBuilder {
@@ -110,6 +117,10 @@ impl DataScanExecutor {
         let root_path = root.path.clone();
         let relative_for_scan = relative.clone();
         let root_for_scan = root.clone();
+        let _permit = match &self.filesystem {
+            Some(limiter) => Some(crate::execution::permit(limiter).await),
+            None => None,
+        };
         let page = tokio::task::spawn_blocking(move || {
             scan_directory(
                 &root_path,
