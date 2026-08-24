@@ -34,8 +34,9 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-08-23 --profile minimal
           cargo install --locked --version 0.13.2 cargo-fuzz
-      - run: cargo +nightly-2026-08-23 fuzz run torrent -- -max_total_time=600 -rss_limit_mb=1024
-      - run: cargo +nightly-2026-08-23 fuzz run torznab -- -max_total_time=600 -rss_limit_mb=1024
+      - run: scripts/fuzz
+        env:
+          SPOROS_FUZZ_SECONDS: "600"
 
   soak:
     runs-on: [self-hosted, linux, x64]

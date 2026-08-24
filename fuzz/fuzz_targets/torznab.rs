@@ -3,6 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 #[path = "../../crates/sporos-service/src/torznab.rs"]
+#[allow(dead_code)]
 mod torznab;
 
 use torznab::parse_torznab;

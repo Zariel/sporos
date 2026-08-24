@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+toolchain=${SPOROS_FUZZ_TOOLCHAIN:-nightly-2026-08-23}
+seconds=${SPOROS_FUZZ_SECONDS:-30}
+cargo_command=(cargo)
+if [[ $toolchain != default ]]; then
+    cargo_command+=("+$toolchain")
+fi
+
+for target in torrent torznab release matcher; do
+    "${cargo_command[@]}" fuzz run "$target" -- \
+        "-max_total_time=$seconds" -rss_limit_mb=1024
+done

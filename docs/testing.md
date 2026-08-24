@@ -23,6 +23,10 @@ The automated fault matrix maps to these focused tests:
 `sporos-testkit::ScriptedHttpServer` supplies ordered status/body/header replies,
 delays, dropped connections, and captured requests for new adapter scenarios.
 
+`scripts/fuzz` runs bounded smoke campaigns for torrent, Torznab, release-name,
+and matcher inputs. It requires nightly Rust plus `cargo-fuzz`; the optional
+`nix develop .#fuzz` shell supplies both.
+
 ## Target-scale performance
 
 ```console
