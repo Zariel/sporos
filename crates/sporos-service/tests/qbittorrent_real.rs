@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -176,11 +176,16 @@ async fn materialize_and_recheck(
     assert_eq!(state.amount_left, 0, "{} amount left", case_name);
     assert_eq!(state.progress, 1.0, "{} progress", case_name);
     let body = client.piece_states(info_hash).await.expect("piece states");
-    let mut complete = true;
-    let count = parse_piece_states(Cursor::new(&body), body.len() as u64, 100, |state| {
-        complete &= state == 2;
-        Ok(())
+    let (count, complete) = tokio::task::spawn_blocking(move || {
+        let mut complete = true;
+        let count = parse_piece_states(body, u64::MAX, 100, |state| {
+            complete &= state == 2;
+            Ok(())
+        })?;
+        Ok::<_, sporos_service::inventory::InventoryParseError>((count, complete))
     })
+    .await
+    .expect("join piece-state parser")
     .expect("parse piece states");
     assert!(count > 0 && complete, "{} piece states", case_name);
 
@@ -196,46 +201,60 @@ async fn materialize_and_recheck(
 
 async fn verify_inventory_reads(client: &QbittorrentClient, hashes: &[String]) {
     let main_body = client.sync_main_data(0).await.expect("full main data");
-    let mut identities = Vec::new();
-    let main = parse_main_data(main_body.as_slice(), u64::MAX, |change| {
-        if let InventoryChange::Upsert { qbit_id, delta } = change {
-            assert!(
-                delta
-                    .infohash_v1
-                    .as_deref()
-                    .is_some_and(|hash| !hash.is_empty())
-                    || delta
-                        .infohash_v2
+    let (main, identities) = tokio::task::spawn_blocking(move || {
+        let mut identities = Vec::new();
+        let main = parse_main_data(main_body, u64::MAX, |change| {
+            if let InventoryChange::Upsert { qbit_id, delta } = change {
+                assert!(
+                    delta
+                        .infohash_v1
                         .as_deref()
                         .is_some_and(|hash| !hash.is_empty())
-            );
-            identities.push(qbit_id);
-        }
-        Ok(())
+                        || delta
+                            .infohash_v2
+                            .as_deref()
+                            .is_some_and(|hash| !hash.is_empty())
+                );
+                identities.push(qbit_id);
+            }
+            Ok(())
+        })?;
+        Ok::<_, sporos_service::inventory::InventoryParseError>((main, identities))
     })
+    .await
+    .expect("join main-data parser")
     .expect("parse full main data");
     assert!(main.full_update);
     assert_eq!(main.changed, hashes.len());
 
     let page_body = client.inventory_page(0, 500).await.expect("inventory page");
-    let mut page_hashes = Vec::new();
-    let count = parse_inventory(page_body.as_slice(), u64::MAX, |torrent| {
-        assert!(!torrent.infohash_v1.is_empty() || !torrent.infohash_v2.is_empty());
-        page_hashes.push(torrent.hash);
-        Ok(())
+    let (count, page_hashes) = tokio::task::spawn_blocking(move || {
+        let mut page_hashes = Vec::new();
+        let count = parse_inventory(page_body, u64::MAX, |torrent| {
+            assert!(!torrent.infohash_v1.is_empty() || !torrent.infohash_v2.is_empty());
+            page_hashes.push(torrent.hash);
+            Ok(())
+        })?;
+        Ok::<_, sporos_service::inventory::InventoryParseError>((count, page_hashes))
     })
+    .await
+    .expect("join inventory parser")
     .expect("parse inventory page");
     assert_eq!(count, hashes.len());
     assert_eq!(page_hashes, identities);
 
     for hash in hashes {
         let body = client.torrent_files(hash).await.expect("torrent files");
-        let mut next = 0_usize;
-        let count = parse_files(body.as_slice(), u64::MAX, 100_000, |file| {
-            assert_eq!(file.index, next);
-            next += 1;
-            Ok(())
+        let count = tokio::task::spawn_blocking(move || {
+            let mut next = 0_usize;
+            parse_files(body, u64::MAX, 100_000, |file| {
+                assert_eq!(file.index, next);
+                next += 1;
+                Ok(())
+            })
         })
+        .await
+        .expect("join file-list parser")
         .expect("parse torrent files");
         assert!(count > 0);
     }
@@ -420,7 +439,16 @@ async fn poll_complete(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let pieces = client.piece_states(info_hash).await.ok();
+    let pieces = match client.piece_states(info_hash).await {
+        Ok(mut body) => tokio::task::spawn_blocking(move || {
+            let mut bytes = Vec::new();
+            body.read_to_end(&mut bytes).map(|_| bytes)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok),
+        Err(_) => None,
+    };
     panic!(
         "torrent did not complete recheck within twenty seconds: state={last:?} pieces={pieces:?}"
     );

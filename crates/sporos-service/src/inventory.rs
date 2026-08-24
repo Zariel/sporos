@@ -108,14 +108,26 @@ pub fn parse_main_data(
     byte_limit: u64,
     mut emit: impl FnMut(InventoryChange) -> Result<(), String>,
 ) -> Result<MainData, InventoryParseError> {
+    parse_main_data_with_header(reader, byte_limit, |_| Ok(()), &mut emit)
+}
+
+pub(crate) fn parse_main_data_with_header(
+    reader: impl Read,
+    byte_limit: u64,
+    mut emit_header: impl FnMut(MainData) -> Result<(), String>,
+    mut emit: impl FnMut(InventoryChange) -> Result<(), String>,
+) -> Result<MainData, InventoryParseError> {
     let reader = LimitedReader {
         inner: reader,
         remaining: byte_limit,
     };
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    let result = MainDataSeed { emit: &mut emit }
-        .deserialize(&mut deserializer)
-        .map_err(classify_error)?;
+    let result = MainDataSeed {
+        emit_header: &mut emit_header,
+        emit: &mut emit,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(classify_error)?;
     deserializer.end().map_err(classify_error)?;
     Ok(result)
 }
@@ -184,12 +196,14 @@ struct InventoryVisitor<F> {
     emit: F,
 }
 
-struct MainDataSeed<'a, F> {
+struct MainDataSeed<'a, H, F> {
+    emit_header: &'a mut H,
     emit: &'a mut F,
 }
 
-impl<'de, F> DeserializeSeed<'de> for MainDataSeed<'_, F>
+impl<'de, H, F> DeserializeSeed<'de> for MainDataSeed<'_, H, F>
 where
+    H: FnMut(MainData) -> Result<(), String>,
     F: FnMut(InventoryChange) -> Result<(), String>,
 {
     type Value = MainData;
@@ -198,16 +212,21 @@ where
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(MainDataVisitor { emit: self.emit })
+        deserializer.deserialize_map(MainDataVisitor {
+            emit_header: self.emit_header,
+            emit: self.emit,
+        })
     }
 }
 
-struct MainDataVisitor<'a, F> {
+struct MainDataVisitor<'a, H, F> {
+    emit_header: &'a mut H,
     emit: &'a mut F,
 }
 
-impl<'de, F> serde::de::Visitor<'de> for MainDataVisitor<'_, F>
+impl<'de, H, F> serde::de::Visitor<'de> for MainDataVisitor<'_, H, F>
 where
+    H: FnMut(MainData) -> Result<(), String>,
     F: FnMut(InventoryChange) -> Result<(), String>,
 {
     type Value = MainData;
@@ -222,18 +241,47 @@ where
     {
         let mut response_id = None;
         let mut full_update = false;
+        let mut header_emitted = false;
         let mut changed = 0_usize;
         let mut removed = 0_usize;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
-                "rid" => response_id = Some(map.next_value()?),
-                "full_update" => full_update = map.next_value()?,
+                "rid" => {
+                    let value = map.next_value()?;
+                    if header_emitted && response_id != Some(value) {
+                        return Err(serde::de::Error::custom(
+                            "main-data response ID changed after payload began",
+                        ));
+                    }
+                    response_id = Some(value);
+                }
+                "full_update" => {
+                    let value = map.next_value()?;
+                    if header_emitted && full_update != value {
+                        return Err(serde::de::Error::custom(
+                            "main-data update mode changed after payload began",
+                        ));
+                    }
+                    full_update = value;
+                }
                 "torrents" => {
+                    emit_main_data_header(
+                        &mut self.emit_header,
+                        &mut header_emitted,
+                        response_id,
+                        full_update,
+                    )?;
                     changed = map.next_value_seed(DeltaMapSeed {
                         emit: &mut self.emit,
                     })?;
                 }
                 "torrents_removed" => {
+                    emit_main_data_header(
+                        &mut self.emit_header,
+                        &mut header_emitted,
+                        response_id,
+                        full_update,
+                    )?;
                     removed = map.next_value_seed(RemovedSeed {
                         emit: &mut self.emit,
                     })?;
@@ -243,6 +291,12 @@ where
                 }
             }
         }
+        emit_main_data_header(
+            &mut self.emit_header,
+            &mut header_emitted,
+            response_id,
+            full_update,
+        )?;
         Ok(MainData {
             response_id: response_id.ok_or_else(|| serde::de::Error::missing_field("rid"))?,
             full_update,
@@ -250,6 +304,25 @@ where
             removed,
         })
     }
+}
+
+fn emit_main_data_header<E: serde::de::Error>(
+    emit: &mut impl FnMut(MainData) -> Result<(), String>,
+    emitted: &mut bool,
+    response_id: Option<u64>,
+    full_update: bool,
+) -> Result<(), E> {
+    if !*emitted {
+        emit(MainData {
+            response_id: response_id.ok_or_else(|| E::missing_field("rid"))?,
+            full_update,
+            changed: 0,
+            removed: 0,
+        })
+        .map_err(E::custom)?;
+        *emitted = true;
+    }
+    Ok(())
 }
 
 struct DeltaMapSeed<'a, F> {

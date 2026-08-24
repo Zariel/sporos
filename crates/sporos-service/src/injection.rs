@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::io::Cursor;
+use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -330,7 +330,13 @@ impl InjectionExecutor {
             RecheckObservation::Inspect => {}
         }
         let pieces = qbit.piece_states(&hash).await?;
-        let integrity = inspect_pieces(&plan.manifest, &plan.mapped_ordinals, &pieces)?;
+        let manifest = plan.manifest.clone();
+        let mapped_ordinals = plan.mapped_ordinals.clone();
+        let integrity = tokio::task::spawn_blocking(move || {
+            inspect_pieces(&manifest, &mapped_ordinals, pieces)
+        })
+        .await
+        .map_err(InjectionError::PieceParserTask)??;
         let resume =
             integrity.integrity_safe && resume_allowed(&plan.resume, state.amount_left, &integrity);
         self.storage
@@ -900,7 +906,7 @@ struct PieceInspection {
 fn inspect_pieces(
     manifest: &TorrentManifest,
     mapped_ordinals: &BTreeSet<u32>,
-    bytes: &[u8],
+    reader: impl Read,
 ) -> Result<PieceInspection, InjectionError> {
     let piece_length = manifest
         .piece_length
@@ -950,35 +956,28 @@ fn inspect_pieces(
     let mut interval = 0_usize;
     let mut integrity_safe = true;
     let mut present = 0_u64;
-    let count = parse_piece_states(
-        Cursor::new(bytes),
-        bytes.len() as u64,
-        MAX_PIECES,
-        |state| {
-            let start = u64::try_from(index)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(piece_length);
-            let end = start.saturating_add(piece_length).min(total);
-            while intervals
-                .get(interval)
-                .is_some_and(|(_, end)| *end <= start)
-            {
-                interval += 1;
-            }
-            if state == 2 {
-                present = present.saturating_add(end.saturating_sub(start));
-            } else if intervals
-                .get(interval)
-                .is_some_and(|(mapped_start, mapped_end)| {
-                    *mapped_start < end && *mapped_end > start
-                })
-            {
-                integrity_safe = false;
-            }
-            index += 1;
-            Ok(())
-        },
-    )?;
+    let count = parse_piece_states(reader, u64::MAX, MAX_PIECES, |state| {
+        let start = u64::try_from(index)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(piece_length);
+        let end = start.saturating_add(piece_length).min(total);
+        while intervals
+            .get(interval)
+            .is_some_and(|(_, end)| *end <= start)
+        {
+            interval += 1;
+        }
+        if state == 2 {
+            present = present.saturating_add(end.saturating_sub(start));
+        } else if intervals
+            .get(interval)
+            .is_some_and(|(mapped_start, mapped_end)| *mapped_start < end && *mapped_end > start)
+        {
+            integrity_safe = false;
+        }
+        index += 1;
+        Ok(())
+    })?;
     if count != expected {
         return Err(InjectionError::PieceCount);
     }
@@ -1081,6 +1080,8 @@ enum InjectionError {
     Materialize(#[from] MaterializeError),
     #[error("hardlink materializer task failed")]
     MaterializerTask(#[source] tokio::task::JoinError),
+    #[error("piece-state parser task failed")]
+    PieceParserTask(#[source] tokio::task::JoinError),
     #[error("candidate projection failed")]
     Projection(#[from] crate::candidate_workflow::CandidateWorkflowError),
     #[error("filesystem operation failed")]
@@ -1361,14 +1362,14 @@ mod tests {
     #[test]
     fn missing_piece_intersecting_a_link_is_never_safe() {
         let manifest = manifest();
-        let inspection = inspect_pieces(&manifest, &[0].into(), b"[2,0,2]").unwrap();
+        let inspection = inspect_pieces(&manifest, &[0].into(), &b"[2,0,2]"[..]).unwrap();
         assert!(!inspection.integrity_safe);
     }
 
     #[test]
     fn missing_piece_is_safe_when_isolated_to_an_unlinked_file() {
         let manifest = manifest();
-        let inspection = inspect_pieces(&manifest, &[0].into(), b"[2,2,0]").unwrap();
+        let inspection = inspect_pieces(&manifest, &[0].into(), &b"[2,2,0]"[..]).unwrap();
         assert!(inspection.integrity_safe);
         assert_eq!(inspection.present_ratio_ppm, 800_000);
         assert!(resume_allowed(
@@ -1423,9 +1424,9 @@ mod tests {
             ],
         };
 
-        let inspection = inspect_pieces(&manifest, &BTreeSet::from([1]), b"[0,2]").unwrap();
+        let inspection = inspect_pieces(&manifest, &BTreeSet::from([1]), &b"[0,2]"[..]).unwrap();
         assert!(inspection.integrity_safe);
-        let inspection = inspect_pieces(&manifest, &BTreeSet::from([1]), b"[2,0]").unwrap();
+        let inspection = inspect_pieces(&manifest, &BTreeSet::from([1]), &b"[2,0]"[..]).unwrap();
         assert!(!inspection.integrity_safe);
     }
 

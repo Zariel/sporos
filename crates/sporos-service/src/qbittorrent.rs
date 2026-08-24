@@ -1,5 +1,11 @@
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    io::{self, Read},
+    pin::Pin,
+    time::Duration,
+};
 
+use futures_util::TryStreamExt;
 use reqwest::{
     Client, StatusCode, Url,
     header::{AUTHORIZATION, HeaderValue},
@@ -8,6 +14,8 @@ use reqwest::{
 use semver::Version;
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::io::AsyncRead;
+use tokio_util::io::{StreamReader, SyncIoBridge};
 
 const MIN_APPLICATION_VERSION: Version = Version::new(5, 2, 0);
 const MIN_WEB_API_VERSION: Version = Version::new(2, 14, 1);
@@ -80,6 +88,30 @@ pub enum QbittorrentError {
 pub struct SupportedVersions {
     pub application: Version,
     pub web_api: Version,
+}
+
+pub struct QbittorrentBody {
+    inner: SyncIoBridge<Pin<Box<dyn AsyncRead + Send>>>,
+    remaining: usize,
+}
+
+impl Read for QbittorrentBody {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut extra = [0_u8; 1];
+            return match self.inner.read(&mut extra)? {
+                0 => Ok(0),
+                _ => Err(io::Error::from(io::ErrorKind::FileTooLarge)),
+            };
+        }
+        let allowed = self.remaining.min(buffer.len());
+        let count = self.inner.read(&mut buffer[..allowed])?;
+        self.remaining -= count;
+        Ok(count)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,21 +297,24 @@ impl QbittorrentClient {
         })
     }
 
-    pub async fn sync_main_data(&self, response_id: u64) -> Result<Vec<u8>, QbittorrentError> {
+    pub async fn sync_main_data(
+        &self,
+        response_id: u64,
+    ) -> Result<QbittorrentBody, QbittorrentError> {
         let response = self
             .request(reqwest::Method::GET, "api/v2/sync/maindata")
             .query(&[("rid", response_id)])
             .send()
             .await
             .map_err(QbittorrentError::Request)?;
-        checked_body(response, MAX_INVENTORY_BYTES).await
+        checked_stream(response, MAX_INVENTORY_BYTES)
     }
 
     pub async fn inventory_page(
         &self,
         offset: usize,
         limit: usize,
-    ) -> Result<Vec<u8>, QbittorrentError> {
+    ) -> Result<QbittorrentBody, QbittorrentError> {
         let response = self
             .request(reqwest::Method::GET, "api/v2/torrents/info")
             .query(&[
@@ -291,17 +326,17 @@ impl QbittorrentClient {
             .send()
             .await
             .map_err(QbittorrentError::Request)?;
-        checked_body(response, MAX_INVENTORY_BYTES).await
+        checked_stream(response, MAX_INVENTORY_BYTES)
     }
 
-    pub async fn torrent_files(&self, qbit_id: &str) -> Result<Vec<u8>, QbittorrentError> {
+    pub async fn torrent_files(&self, qbit_id: &str) -> Result<QbittorrentBody, QbittorrentError> {
         let response = self
             .request(reqwest::Method::GET, "api/v2/torrents/files")
             .query(&[("hash", qbit_id)])
             .send()
             .await
             .map_err(QbittorrentError::Request)?;
-        checked_body(response, MAX_FILE_LIST_BYTES).await
+        checked_stream(response, MAX_FILE_LIST_BYTES)
     }
 
     pub async fn torrent_state(
@@ -343,14 +378,14 @@ impl QbittorrentClient {
         .await
     }
 
-    pub async fn piece_states(&self, info_hash: &str) -> Result<Vec<u8>, QbittorrentError> {
+    pub async fn piece_states(&self, info_hash: &str) -> Result<QbittorrentBody, QbittorrentError> {
         let response = self
             .request(reqwest::Method::GET, "api/v2/torrents/pieceStates")
             .query(&[("hash", info_hash)])
             .send()
             .await
             .map_err(QbittorrentError::Request)?;
-        checked_body(response, MAX_PIECE_STATES_BYTES).await
+        checked_stream(response, MAX_PIECE_STATES_BYTES)
     }
 
     async fn empty_mutation(
@@ -405,6 +440,28 @@ impl QbittorrentClient {
             }
         })
     }
+}
+
+fn checked_stream(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<QbittorrentBody, QbittorrentError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(QbittorrentError::HttpStatus(status));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(QbittorrentError::ResponseTooLarge(limit));
+    }
+    let stream = response.bytes_stream().map_err(io::Error::other);
+    let reader = StreamReader::new(stream);
+    Ok(QbittorrentBody {
+        inner: SyncIoBridge::new(Box::pin(reader)),
+        remaining: limit,
+    })
 }
 
 async fn checked_body(
@@ -529,6 +586,16 @@ mod tests {
 
     fn client(url: Url) -> QbittorrentClient {
         QbittorrentClient::new(url, ApiKey::new(API_KEY).expect("API key")).expect("client")
+    }
+
+    async fn body_bytes(mut body: QbittorrentBody) -> Vec<u8> {
+        tokio::task::spawn_blocking(move || {
+            let mut bytes = Vec::new();
+            body.read_to_end(&mut bytes).expect("read streamed body");
+            bytes
+        })
+        .await
+        .expect("join body reader")
     }
 
     #[test]
@@ -751,7 +818,10 @@ mod tests {
         let client = client(url);
 
         client.force_recheck("0123").await.unwrap();
-        assert_eq!(client.piece_states("0123").await.unwrap(), b"[2,0,1]");
+        assert_eq!(
+            body_bytes(client.piece_states("0123").await.unwrap()).await,
+            b"[2,0,1]"
+        );
         client.start("0123").await.unwrap();
 
         let recheck = requests.recv().unwrap();
@@ -801,11 +871,17 @@ mod tests {
         let client = client(url);
 
         assert_eq!(
-            client.sync_main_data(7).await.expect("main data"),
+            body_bytes(client.sync_main_data(7).await.expect("main data")).await,
             main_data
         );
-        assert_eq!(client.inventory_page(500, 250).await.expect("page"), page);
-        assert_eq!(client.torrent_files("0123").await.expect("files"), files);
+        assert_eq!(
+            body_bytes(client.inventory_page(500, 250).await.expect("page")).await,
+            page
+        );
+        assert_eq!(
+            body_bytes(client.torrent_files("0123").await.expect("files")).await,
+            files
+        );
 
         let main_request = requests.recv().expect("main-data request");
         assert!(

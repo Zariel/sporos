@@ -1,11 +1,14 @@
-use std::io::Cursor;
 use std::sync::Arc;
 
-use serde::Deserialize;
+#[cfg(test)]
+use std::io::Cursor;
+
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::inventory::{InventoryChange, InventoryParseError, parse_inventory, parse_main_data};
+use crate::inventory::{
+    InventoryChange, InventoryParseError, MainData, parse_inventory, parse_main_data_with_header,
+};
 use crate::qbit_projection::{CompletionTransition, ProjectionError};
 use crate::qbittorrent::{QbittorrentClient, QbittorrentError, SupportedVersions};
 use crate::storage::Storage;
@@ -70,7 +73,7 @@ impl InventorySynchronizer {
         let state = self.storage.qbit_inventory_state().await?;
         let requested_id = state.response_id.unwrap_or(0);
         let body = self.client.sync_main_data(requested_id).await?;
-        apply_main_data(
+        apply_main_data_reader(
             &self.storage,
             body,
             self.database_batch_size,
@@ -98,11 +101,17 @@ impl InventorySynchronizer {
                 .client
                 .inventory_page(offset, self.inventory_batch_size)
                 .await?;
-            let mut page = Vec::with_capacity(self.inventory_batch_size);
-            let count = parse_inventory(Cursor::new(body), u64::MAX, |torrent| {
-                page.push(torrent.into());
-                Ok(())
-            })?;
+            let page_capacity = self.inventory_batch_size;
+            let (count, page) = tokio::task::spawn_blocking(move || {
+                let mut page = Vec::with_capacity(page_capacity);
+                let count = parse_inventory(body, u64::MAX, |torrent| {
+                    page.push(torrent.into());
+                    Ok(())
+                })?;
+                Ok::<_, InventoryParseError>((count, page))
+            })
+            .await
+            .map_err(SyncError::ParserTask)??;
             for batch in page.chunks(self.database_batch_size) {
                 let projected = self
                     .storage
@@ -142,16 +151,11 @@ impl InventorySynchronizer {
         let body = self.client.torrent_files(&target.qbit_id).await?;
         let (sender, mut receiver) = mpsc::channel(self.channel_capacity);
         let parser = tokio::task::spawn_blocking(move || {
-            crate::inventory::parse_files(
-                Cursor::new(body),
-                u64::MAX,
-                MAX_FILES_PER_TORRENT,
-                |file| {
-                    sender
-                        .blocking_send(file)
-                        .map_err(|_| "manifest projection stopped".to_owned())
-                },
-            )
+            crate::inventory::parse_files(body, u64::MAX, MAX_FILES_PER_TORRENT, |file| {
+                sender
+                    .blocking_send(file)
+                    .map_err(|_| "manifest projection stopped".to_owned())
+            })
         });
         let mut batch = Vec::with_capacity(self.database_batch_size);
         let mut count = 0_usize;
@@ -183,6 +187,7 @@ impl InventorySynchronizer {
     }
 }
 
+#[cfg(test)]
 async fn apply_main_data(
     storage: &Storage,
     body: Vec<u8>,
@@ -192,41 +197,84 @@ async fn apply_main_data(
     now: i64,
     channel_capacity: usize,
 ) -> Result<SyncReport, SyncError> {
+    apply_main_data_reader(
+        storage,
+        Cursor::new(body),
+        database_batch_size,
+        has_baseline,
+        current_generation,
+        now,
+        channel_capacity,
+    )
+    .await
+}
+
+async fn apply_main_data_reader(
+    storage: &Storage,
+    body: impl std::io::Read + Send + 'static,
+    database_batch_size: usize,
+    has_baseline: bool,
+    current_generation: u64,
+    now: i64,
+    channel_capacity: usize,
+) -> Result<SyncReport, SyncError> {
     if database_batch_size == 0 {
         return Err(SyncError::ZeroBatchSize);
     }
-    let header: MainDataHeader = serde_json::from_slice(&body).map_err(SyncError::Header)?;
-    if !has_baseline && !header.full_update {
-        return Err(SyncError::InitialUpdateNotFull);
-    }
-    let generation = if header.full_update {
-        current_generation
-            .checked_add(1)
-            .ok_or(SyncError::GenerationOverflow)?
-    } else {
-        current_generation
-    };
     let (sender, mut receiver) = mpsc::channel(channel_capacity);
     let parser = tokio::task::spawn_blocking(move || {
-        parse_main_data(Cursor::new(body), u64::MAX, |change| {
-            sender
-                .blocking_send(change)
-                .map_err(|_| "inventory projection stopped".to_owned())
-        })
+        parse_main_data_with_header(
+            body,
+            u64::MAX,
+            |header| {
+                sender
+                    .blocking_send(MainDataMessage::Header(header))
+                    .map_err(|_| "inventory projection stopped".to_owned())
+            },
+            |change| {
+                sender
+                    .blocking_send(MainDataMessage::Change(change))
+                    .map_err(|_| "inventory projection stopped".to_owned())
+            },
+        )
     });
 
-    let mut report = SyncReport {
-        full_update: header.full_update,
-        ..SyncReport::default()
-    };
+    let mut header = None;
+    let mut generation = None;
+    let mut report = SyncReport::default();
     let mut batch = Vec::with_capacity(database_batch_size);
-    while let Some(change) = receiver.recv().await {
-        batch.push(change);
-        if batch.len() == database_batch_size {
-            project_batch(storage, &mut report, &batch, generation, has_baseline, now).await?;
-            batch.clear();
+    while let Some(message) = receiver.recv().await {
+        match message {
+            MainDataMessage::Header(value) => {
+                if header.is_some() {
+                    return Err(SyncError::MetadataChanged);
+                }
+                if !has_baseline && !value.full_update {
+                    return Err(SyncError::InitialUpdateNotFull);
+                }
+                generation = Some(if value.full_update {
+                    current_generation
+                        .checked_add(1)
+                        .ok_or(SyncError::GenerationOverflow)?
+                } else {
+                    current_generation
+                });
+                report.full_update = value.full_update;
+                header = Some(value);
+            }
+            MainDataMessage::Change(change) => {
+                let generation = generation.ok_or(SyncError::MetadataChanged)?;
+                batch.push(change);
+                if batch.len() == database_batch_size {
+                    project_batch(storage, &mut report, &batch, generation, has_baseline, now)
+                        .await?;
+                    batch.clear();
+                }
+            }
         }
     }
+    let header = header.ok_or(SyncError::MetadataChanged)?;
+    let generation = generation.ok_or(SyncError::MetadataChanged)?;
     if !batch.is_empty() {
         project_batch(storage, &mut report, &batch, generation, has_baseline, now).await?;
     }
@@ -242,6 +290,11 @@ async fn apply_main_data(
         )
         .await?;
     Ok(report)
+}
+
+enum MainDataMessage {
+    Header(MainData),
+    Change(InventoryChange),
 }
 
 async fn project_batch(
@@ -261,14 +314,6 @@ async fn project_batch(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct MainDataHeader {
-    #[serde(rename = "rid")]
-    response_id: u64,
-    #[serde(default)]
-    full_update: bool,
-}
-
 #[derive(Debug, Error)]
 pub enum SyncError {
     #[error("qBittorrent inventory request failed")]
@@ -277,8 +322,6 @@ pub enum SyncError {
     Projection(#[from] ProjectionError),
     #[error("qBittorrent inventory response is invalid")]
     Parse(#[from] InventoryParseError),
-    #[error("qBittorrent main-data header is invalid")]
-    Header(#[source] serde_json::Error),
     #[error("qBittorrent did not provide a full initial inventory update")]
     InitialUpdateNotFull,
     #[error("qBittorrent changed main-data metadata while it was decoded")]
