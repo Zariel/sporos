@@ -494,7 +494,7 @@ mod tests {
                 .await
                 .expect("read Duroxide migration ledger");
 
-        assert_eq!(domain_version, 8);
+        assert_eq!(domain_version, 9);
         assert_eq!(duroxide_has_domain_version, 0);
     }
 

@@ -8,7 +8,7 @@ use sporos_model::TaskId;
 
 use crate::storage::Storage;
 use crate::task_projection::ProjectionUpdate;
-use crate::{completion, completion::CompletionInput};
+use crate::{candidate_workflow, completion, completion::CompletionInput};
 
 pub const FAKE_TASK_NAME: &str = "Phase1FakeTask";
 pub const FAKE_TASK_VERSION: &str = "1.0.0";
@@ -24,6 +24,7 @@ pub struct FakeTaskInput {
 
 pub fn registries(storage: Arc<Storage>) -> (ActivityRegistry, OrchestrationRegistry) {
     let completion_storage = Arc::clone(&storage);
+    let candidate_storage = Arc::clone(&storage);
     let activities = ActivityRegistry::builder()
         .register(
             PROJECT_TASK_ACTIVITY,
@@ -54,6 +55,23 @@ pub fn registries(storage: Arc<Storage>) -> (ActivityRegistry, OrchestrationRegi
                 }
             },
         )
+        .register(
+            candidate_workflow::EVALUATE_ACTIVITY,
+            move |_context: ActivityContext, input: String| {
+                let storage = Arc::clone(&candidate_storage);
+                async move {
+                    let input: crate::candidate::CandidateWorkflowInput =
+                        serde_json::from_str(&input)
+                            .map_err(|error| format!("invalid candidate evaluation: {error}"))?;
+                    let result = storage
+                        .evaluate_candidate(&input, now_ms())
+                        .await
+                        .map_err(|error| format!("evaluate candidate: {error}"))?;
+                    serde_json::to_string(&result)
+                        .map_err(|error| format!("encode candidate evaluation: {error}"))
+                }
+            },
+        )
         .build();
     let orchestrations = OrchestrationRegistry::builder()
         .register_versioned(FAKE_TASK_NAME, FAKE_TASK_VERSION, fake_task)
@@ -62,8 +80,20 @@ pub fn registries(storage: Arc<Storage>) -> (ActivityRegistry, OrchestrationRegi
             completion::ORCHESTRATION_VERSION,
             completion_workflow,
         )
+        .register_versioned(
+            crate::candidate::ORCHESTRATION_NAME,
+            crate::candidate::ORCHESTRATION_VERSION,
+            candidate_workflow::workflow,
+        )
         .build();
     (activities, orchestrations)
+}
+
+fn now_ms() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 async fn completion_workflow(
