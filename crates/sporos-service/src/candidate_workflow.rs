@@ -689,6 +689,7 @@ pub enum CandidateWorkflowError {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
     use std::sync::Arc;
 
     use duroxide::runtime::Runtime;
@@ -701,12 +702,14 @@ mod tests {
     use crate::inventory::{InventoryChange, InventoryDelta, InventoryFile};
     use crate::outbox::OutboxDispatcher;
 
+    const CRASH_PROBE_DIRECTORY: &str = "SPOROS_CANDIDATE_CRASH_PROBE_DIRECTORY";
+
     #[tokio::test]
     async fn dry_run_persists_a_complete_plan_without_external_mutation() {
         let directory = TempDir::new().expect("temporary directory");
         let storage = open(&directory).await;
         project_source(&storage, true, 13, 1).await;
-        let input = accept(&storage, &directory, 10).await;
+        let input = accept(&storage, directory.path(), 10).await;
 
         let result = storage
             .evaluate_candidate(&input, 20)
@@ -744,7 +747,7 @@ mod tests {
         let directory = TempDir::new().expect("temporary directory");
         let storage = open(&directory).await;
         project_source(&storage, true, 12, 1).await;
-        let input = accept(&storage, &directory, 10).await;
+        let input = accept(&storage, directory.path(), 10).await;
 
         let result = storage.evaluate_candidate(&input, 20).await.unwrap();
 
@@ -760,7 +763,7 @@ mod tests {
         let directory = TempDir::new().expect("temporary directory");
         let storage = open(&directory).await;
         project_source(&storage, false, 13, 1).await;
-        let input = accept(&storage, &directory, 10).await;
+        let input = accept(&storage, directory.path(), 10).await;
 
         let waiting = storage.evaluate_candidate(&input, 20).await.unwrap();
         assert!(matches!(waiting, EvaluationResult::Waiting { .. }));
@@ -781,7 +784,7 @@ mod tests {
         let directory = TempDir::new().expect("temporary directory");
         let storage = Arc::new(open(&directory).await);
         project_source(&storage, false, 13, 1).await;
-        let input = accept(&storage, &directory, now_ms()).await;
+        let input = accept(&storage, directory.path(), now_ms()).await;
         let instance = sqlx::query_scalar::<_, String>(
             "SELECT duroxide_instance_id FROM sporos_task WHERE id = ?",
         )
@@ -850,9 +853,80 @@ mod tests {
         runtime.shutdown(Some(100)).await;
     }
 
+    #[tokio::test]
+    async fn acknowledged_candidate_survives_process_kill() {
+        let directory = TempDir::new().expect("temporary directory");
+        let marker = directory.path().join("candidate-acknowledged");
+        let mut child = Command::new(std::env::current_exe().expect("locate test executable"))
+            .args([
+                "--exact",
+                "candidate_workflow::tests::candidate_crash_probe",
+                "--nocapture",
+            ])
+            .env(CRASH_PROBE_DIRECTORY, directory.path())
+            .spawn()
+            .expect("start candidate crash probe");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate was not acknowledged");
+        child.kill().expect("kill candidate process");
+        assert!(!child.wait().expect("wait for candidate process").success());
+
+        let storage = Arc::new(open(&directory).await);
+        let row = sqlx::query(
+            "SELECT t.id, t.duroxide_instance_id
+             FROM sporos_task t JOIN sporos_outbox o ON o.task_id = t.id
+             WHERE t.kind = 'process_candidate'",
+        )
+        .fetch_one(storage.pool())
+        .await
+        .expect("load acknowledged candidate task");
+        let task_id: Vec<u8> = row.get("id");
+        let instance: String = row.get("duroxide_instance_id");
+        let provider = storage.duroxide_provider();
+        let client = Client::new(provider.clone());
+        let (activities, orchestrations) = crate::engine::registries(Arc::clone(&storage));
+        let runtime = Runtime::start_with_store(provider, activities, orchestrations).await;
+        OutboxDispatcher::new(&storage, client.clone(), 1)
+            .run_once(now_ms())
+            .await
+            .expect("dispatch recovered candidate");
+
+        let status = client
+            .wait_for_orchestration(&instance, Duration::from_secs(5))
+            .await
+            .expect("wait for recovered candidate");
+        assert!(matches!(status, OrchestrationStatus::Completed { .. }));
+        let state = sqlx::query_scalar::<_, String>("SELECT state FROM sporos_task WHERE id = ?")
+            .bind(task_id)
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(state, "dry_run_complete");
+        runtime.shutdown(Some(100)).await;
+    }
+
+    #[tokio::test]
+    async fn candidate_crash_probe() {
+        let Some(directory) = std::env::var_os(CRASH_PROBE_DIRECTORY) else {
+            return;
+        };
+        let root = Path::new(&directory);
+        let storage = open_path(root).await;
+        project_source(&storage, true, 13, 1).await;
+        let _ = accept(&storage, root, now_ms()).await;
+        std::fs::write(root.join("candidate-acknowledged"), b"acknowledged")
+            .expect("write acknowledgement marker");
+        std::future::pending::<()>().await;
+    }
+
     async fn accept(
         storage: &Storage,
-        directory: &TempDir,
+        directory: &Path,
         received_at: i64,
     ) -> CandidateWorkflowInput {
         let ingress = CandidateIngress::new(
@@ -863,11 +937,11 @@ mod tests {
                 ..Injection::default()
             },
             Paths {
-                link_root: directory.path().join("links"),
+                link_root: directory.join("links"),
                 rewrite: vec![crate::config::PathRewrite {
                     name: "qbit".to_owned(),
                     remote: "/qbit-links".into(),
-                    local: directory.path().join("links"),
+                    local: directory.join("links"),
                     services: vec!["qbittorrent".to_owned()],
                 }],
             },
@@ -974,11 +1048,12 @@ mod tests {
     }
 
     async fn open(directory: &TempDir) -> Storage {
-        Storage::open(
-            directory.path().join("sporos.lock"),
-            directory.path().join("sporos.db"),
-        )
-        .await
-        .expect("open storage")
+        open_path(directory.path()).await
+    }
+
+    async fn open_path(directory: &Path) -> Storage {
+        Storage::open(directory.join("sporos.lock"), directory.join("sporos.db"))
+            .await
+            .expect("open storage")
     }
 }
