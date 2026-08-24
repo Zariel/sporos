@@ -5,44 +5,68 @@ on:
     - cron: "23 3 * * 1"
   workflow_dispatch:
 
+concurrency:
+  group: scheduled
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
   real-qbittorrent:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: scripts/test-qbittorrent
 
   performance:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: scripts/test-performance
 
   fuzz:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     container: docker.io/library/rust:1.98-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned fuzz toolchain
-        run: |
-          rustup toolchain install nightly-2026-08-23 --profile minimal
-          cargo install --locked --version 0.13.2 cargo-fuzz
+        run: rustup toolchain install nightly-2026-08-23 --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: nightly-2026-08-23
+      - name: Install pinned fuzz tool
+        run: cargo install --locked --version 0.13.2 cargo-fuzz
       - run: scripts/fuzz
         env:
           SPOROS_FUZZ_SECONDS: "600"
 
   soak:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 1500
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
       - run: scripts/soak
