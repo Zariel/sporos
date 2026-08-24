@@ -448,6 +448,7 @@ mod tests {
             logging: Logging::default(),
             metrics: Metrics::default(),
             qbittorrent: None,
+            prowlarr: None,
             arr: Vec::new(),
             sources: crate::config::SourceFilters::default(),
             matching: crate::config::Matching::default(),

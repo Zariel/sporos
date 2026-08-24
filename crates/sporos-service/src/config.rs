@@ -49,6 +49,7 @@ pub struct Config {
     pub logging: Logging,
     pub metrics: Metrics,
     pub qbittorrent: Option<Qbittorrent>,
+    pub prowlarr: Option<Prowlarr>,
     pub arr: Vec<ArrInstance>,
     pub sources: SourceFilters,
     pub matching: Matching,
@@ -81,6 +82,18 @@ pub struct Qbittorrent {
     pub inventory_batch_size: usize,
     pub database_batch_size: usize,
     pub inventory_stale_after: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct Prowlarr {
+    pub url: Url,
+    pub api_key: Secret,
+    pub request_timeout: Duration,
+    pub refresh_interval: Duration,
+    pub include_tags: Vec<i64>,
+    pub exclude_tags: Vec<i64>,
+    pub require_proxy_downloads: bool,
+    pub max_results_per_query: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,7 +220,7 @@ struct RawConfig {
     logging: Logging,
     metrics: Metrics,
     qbittorrent: Option<RawQbittorrent>,
-    prowlarr: Option<ServiceConfig>,
+    prowlarr: Option<RawProwlarr>,
     arr: ArrConfig,
     paths: PathsConfig,
     sources: SourceFilters,
@@ -246,6 +259,38 @@ impl Default for RawQbittorrent {
             inventory_batch_size: 500,
             database_batch_size: 200,
             inventory_stale_after: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawProwlarr {
+    url: String,
+    api_key: Option<String>,
+    api_key_file: Option<PathBuf>,
+    #[serde(with = "duration")]
+    request_timeout: Duration,
+    #[serde(with = "duration")]
+    refresh_interval: Duration,
+    include_tags: Vec<i64>,
+    exclude_tags: Vec<i64>,
+    require_proxy_downloads: bool,
+    max_results_per_query: usize,
+}
+
+impl Default for RawProwlarr {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            api_key: None,
+            api_key_file: None,
+            request_timeout: Duration::from_secs(30),
+            refresh_interval: Duration::from_secs(5 * 60),
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+            require_proxy_downloads: true,
+            max_results_per_query: 100,
         }
     }
 }
@@ -639,7 +684,24 @@ fn load(
             })
         })
         .transpose()?;
-    validate_optional_secrets(raw.prowlarr.as_ref(), "prowlarr.api_key")?;
+    let prowlarr = raw
+        .prowlarr
+        .map(|service| -> Result<Prowlarr, ConfigError> {
+            let url = service_url(&service.url).ok_or(ConfigError::ProwlarrUrl)?;
+            let api_key =
+                resolve_secret("prowlarr.api_key", service.api_key, service.api_key_file)?;
+            Ok(Prowlarr {
+                url,
+                api_key,
+                request_timeout: service.request_timeout,
+                refresh_interval: service.refresh_interval,
+                include_tags: service.include_tags,
+                exclude_tags: service.exclude_tags,
+                require_proxy_downloads: service.require_proxy_downloads,
+                max_results_per_query: service.max_results_per_query,
+            })
+        })
+        .transpose()?;
     let mut arr = Vec::new();
     for (kind_name, kind, services) in [
         ("sonarr", ArrKind::Sonarr, raw.arr.sonarr),
@@ -676,6 +738,7 @@ fn load(
         logging: raw.logging,
         metrics: raw.metrics,
         qbittorrent,
+        prowlarr,
         arr,
         sources: raw.sources,
         matching,
@@ -909,6 +972,25 @@ fn validate_positive(config: &RawConfig) -> Result<(), ConfigError> {
             }
         }
     }
+    if let Some(prowlarr) = &config.prowlarr {
+        if prowlarr.max_results_per_query == 0 {
+            return Err(ConfigError::ZeroLimit("prowlarr.max_results_per_query"));
+        }
+        if prowlarr.max_results_per_query > 1_000 {
+            return Err(ConfigError::LimitTooLarge {
+                field: "prowlarr.max_results_per_query",
+                maximum: 1_000,
+            });
+        }
+        for (field, value) in [
+            ("prowlarr.request_timeout", prowlarr.request_timeout),
+            ("prowlarr.refresh_interval", prowlarr.refresh_interval),
+        ] {
+            if value.is_zero() {
+                return Err(ConfigError::ZeroLimit(field));
+            }
+        }
+    }
     for (field, value, maximum) in [
         (
             "matching.max_torrent_bytes",
@@ -936,15 +1018,21 @@ fn validate_positive(config: &RawConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_optional_secrets(
-    service: Option<&ServiceConfig>,
-    field: &str,
-) -> Result<(), ConfigError> {
-    let Some(service) = service else {
-        return Ok(());
-    };
-    let _ = resolve_secret(field, service.api_key.clone(), service.api_key_file.clone())?;
-    Ok(())
+fn service_url(value: &str) -> Option<Url> {
+    let mut url = Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.cannot_be_a_base()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Some(url)
 }
 
 fn resolve_secret(
@@ -1066,6 +1154,8 @@ pub enum ConfigError {
     LimitTooLarge { field: &'static str, maximum: usize },
     #[error("invalid qBittorrent URL")]
     QbittorrentUrl,
+    #[error("invalid Prowlarr URL")]
+    ProwlarrUrl,
     #[error("matching.mode must be strict, flexible, or partial")]
     MatchingMode,
     #[error("matching.preflight_size_tolerance must be between zero and one")]
@@ -1369,6 +1459,36 @@ mod tests {
         assert_eq!(config.arr[0].request_timeout, Duration::from_secs(15));
         assert_eq!(config.arr[1].kind, ArrKind::Radarr);
         assert!(!format!("{:?}", config.arr).contains("sonarr-secret"));
+    }
+
+    #[test]
+    fn loads_bounded_prowlarr_settings() {
+        let config = load_config(
+            r#"
+                [auth]
+                webhook_token = "webhook"
+                admin_token = "admin"
+                [prowlarr]
+                url = "http://prowlarr:9696/base"
+                api_key = "prowlarr-secret"
+                request_timeout = "15s"
+                refresh_interval = "2m"
+                include_tags = [1, 2]
+                exclude_tags = [3]
+                require_proxy_downloads = true
+                max_results_per_query = 25
+            "#,
+        )
+        .expect("load Prowlarr settings");
+        let prowlarr = config.prowlarr.expect("Prowlarr configured");
+
+        assert_eq!(prowlarr.url.as_str(), "http://prowlarr:9696/base/");
+        assert_eq!(prowlarr.request_timeout, Duration::from_secs(15));
+        assert_eq!(prowlarr.refresh_interval, Duration::from_secs(120));
+        assert_eq!(prowlarr.include_tags, [1, 2]);
+        assert_eq!(prowlarr.exclude_tags, [3]);
+        assert_eq!(prowlarr.max_results_per_query, 25);
+        assert!(!format!("{prowlarr:?}").contains("prowlarr-secret"));
     }
 
     #[test]
