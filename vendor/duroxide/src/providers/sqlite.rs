@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used)]
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{AssertSqlSafe, Row, Sqlite, Transaction};
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
@@ -58,6 +58,16 @@ pub struct SqliteProvider {
 }
 
 impl SqliteProvider {
+    /// Create a provider over an existing, caller-configured SQLite pool.
+    ///
+    /// Sharing a single-connection pool lets applications colocate their own
+    /// tables with Duroxide without creating independent SQLite writers.
+    pub async fn from_pool(pool: SqlitePool) -> Result<Self, sqlx::Error> {
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        tracing::debug!("Successfully ran migrations");
+        Ok(Self { pool })
+    }
+
     /// Convert sqlx error to ProviderError with appropriate retry classification
     fn sqlx_to_provider_error(operation: &str, e: sqlx::Error) -> ProviderError {
         let error_msg = e.to_string();
@@ -1609,7 +1619,7 @@ impl Provider for SqliteProvider {
                 placeholders.join(", ")
             );
 
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
             for activity in &cancelled_activities {
                 query = query
                     .bind(&activity.instance)
@@ -1962,7 +1972,9 @@ impl Provider for SqliteProvider {
                 LIMIT 1
                 "#,
             );
-            let mut query = sqlx::query(&sql).bind(now_ms).bind(&config.owner_id);
+            let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(now_ms)
+                .bind(&config.owner_id);
             for val in &tag_values {
                 query = query.bind(val.as_str());
             }
@@ -1983,7 +1995,7 @@ impl Provider for SqliteProvider {
                 LIMIT 1
                 "#,
             );
-            let mut query = sqlx::query(&sql).bind(now_ms);
+            let mut query = sqlx::query(AssertSqlSafe(sql.as_str())).bind(now_ms);
             for val in &tag_values {
                 query = query.bind(val.as_str());
             }
@@ -2409,7 +2421,7 @@ impl Provider for SqliteProvider {
             owner_ids.len() + 3,
         );
 
-        let mut query = sqlx::query(&sql).bind(locked_until).bind(now_ms);
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str())).bind(locked_until).bind(now_ms);
         for owner_id in owner_ids {
             query = query.bind(owner_id);
         }
@@ -3038,7 +3050,7 @@ impl ProviderAdmin for SqliteProvider {
                 "#
             );
 
-            let mut query = sqlx::query(&check_sql);
+            let mut query = sqlx::query(AssertSqlSafe(check_sql.as_str()));
             for id in ids {
                 query = query.bind(id);
             }
@@ -3081,7 +3093,7 @@ impl ProviderAdmin for SqliteProvider {
             LIMIT 1
             "#
         );
-        let mut orphan_query = sqlx::query(&orphan_check_sql);
+        let mut orphan_query = sqlx::query(AssertSqlSafe(orphan_check_sql.as_str()));
         // Bind ids twice: once for parent_instance_id IN, once for instance_id NOT IN
         for id in ids {
             orphan_query = orphan_query.bind(id);
@@ -3109,7 +3121,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Count history events before deletion
         let count_history_sql = format!("SELECT COUNT(*) as count FROM history WHERE instance_id IN ({placeholders})");
-        let mut count_query = sqlx::query(&count_history_sql);
+        let mut count_query = sqlx::query(AssertSqlSafe(count_history_sql.as_str()));
         for id in ids {
             count_query = count_query.bind(id);
         }
@@ -3123,7 +3135,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Count executions before deletion
         let count_exec_sql = format!("SELECT COUNT(*) as count FROM executions WHERE instance_id IN ({placeholders})");
-        let mut count_query = sqlx::query(&count_exec_sql);
+        let mut count_query = sqlx::query(AssertSqlSafe(count_exec_sql.as_str()));
         for id in ids {
             count_query = count_query.bind(id);
         }
@@ -3138,7 +3150,7 @@ impl ProviderAdmin for SqliteProvider {
         // Count queue messages before deletion
         let count_orch_q_sql =
             format!("SELECT COUNT(*) as count FROM orchestrator_queue WHERE instance_id IN ({placeholders})");
-        let mut count_query = sqlx::query(&count_orch_q_sql);
+        let mut count_query = sqlx::query(AssertSqlSafe(count_orch_q_sql.as_str()));
         for id in ids {
             count_query = count_query.bind(id);
         }
@@ -3151,7 +3163,7 @@ impl ProviderAdmin for SqliteProvider {
 
         let count_worker_q_sql =
             format!("SELECT COUNT(*) as count FROM worker_queue WHERE instance_id IN ({placeholders})");
-        let mut count_query = sqlx::query(&count_worker_q_sql);
+        let mut count_query = sqlx::query(AssertSqlSafe(count_worker_q_sql.as_str()));
         for id in ids {
             count_query = count_query.bind(id);
         }
@@ -3167,7 +3179,7 @@ impl ProviderAdmin for SqliteProvider {
         // Bulk delete from all tables (order matters for FK constraints if any)
         // Delete history
         let del_history_sql = format!("DELETE FROM history WHERE instance_id IN ({placeholders})");
-        let mut del_query = sqlx::query(&del_history_sql);
+        let mut del_query = sqlx::query(AssertSqlSafe(del_history_sql.as_str()));
         for id in ids {
             del_query = del_query.bind(id);
         }
@@ -3178,7 +3190,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Delete executions
         let del_exec_sql = format!("DELETE FROM executions WHERE instance_id IN ({placeholders})");
-        let mut del_query = sqlx::query(&del_exec_sql);
+        let mut del_query = sqlx::query(AssertSqlSafe(del_exec_sql.as_str()));
         for id in ids {
             del_query = del_query.bind(id);
         }
@@ -3189,7 +3201,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Delete orchestrator queue
         let del_orch_q_sql = format!("DELETE FROM orchestrator_queue WHERE instance_id IN ({placeholders})");
-        let mut del_query = sqlx::query(&del_orch_q_sql);
+        let mut del_query = sqlx::query(AssertSqlSafe(del_orch_q_sql.as_str()));
         for id in ids {
             del_query = del_query.bind(id);
         }
@@ -3200,7 +3212,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Delete worker queue
         let del_worker_q_sql = format!("DELETE FROM worker_queue WHERE instance_id IN ({placeholders})");
-        let mut del_query = sqlx::query(&del_worker_q_sql);
+        let mut del_query = sqlx::query(AssertSqlSafe(del_worker_q_sql.as_str()));
         for id in ids {
             del_query = del_query.bind(id);
         }
@@ -3211,7 +3223,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Delete instance locks (important: before instances to prevent zombie recreation)
         let del_locks_sql = format!("DELETE FROM instance_locks WHERE instance_id IN ({placeholders})");
-        let mut del_query = sqlx::query(&del_locks_sql);
+        let mut del_query = sqlx::query(AssertSqlSafe(del_locks_sql.as_str()));
         for id in ids {
             del_query = del_query.bind(id);
         }
@@ -3222,7 +3234,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Delete KV store entries
         let del_kv_sql = format!("DELETE FROM kv_store WHERE instance_id IN ({placeholders})");
-        let mut del_query = sqlx::query(&del_kv_sql);
+        let mut del_query = sqlx::query(AssertSqlSafe(del_kv_sql.as_str()));
         for id in ids {
             del_query = del_query.bind(id);
         }
@@ -3233,7 +3245,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Delete KV delta entries
         let del_kv_delta_sql = format!("DELETE FROM kv_delta WHERE instance_id IN ({placeholders})");
-        let mut del_query = sqlx::query(&del_kv_delta_sql);
+        let mut del_query = sqlx::query(AssertSqlSafe(del_kv_delta_sql.as_str()));
         for id in ids {
             del_query = del_query.bind(id);
         }
@@ -3244,7 +3256,7 @@ impl ProviderAdmin for SqliteProvider {
 
         // Delete instances
         let del_instances_sql = format!("DELETE FROM instances WHERE instance_id IN ({placeholders})");
-        let mut del_query = sqlx::query(&del_instances_sql);
+        let mut del_query = sqlx::query(AssertSqlSafe(del_instances_sql.as_str()));
         for id in ids {
             del_query = del_query.bind(id);
         }
@@ -3300,7 +3312,7 @@ impl ProviderAdmin for SqliteProvider {
         sql.push_str(&format!(" LIMIT {limit}"));
 
         // Build and execute query
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
         if let Some(ref ids) = filter.instance_ids {
             for id in ids {
                 query = query.bind(id);
@@ -3381,7 +3393,7 @@ impl ProviderAdmin for SqliteProvider {
 
         let sql = format!("SELECT execution_id FROM executions WHERE {}", conditions.join(" AND "));
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
         query = query.bind(instance_id);
         query = query.bind(current_execution_id);
         if options.keep_last.is_some() {
@@ -3488,7 +3500,7 @@ impl ProviderAdmin for SqliteProvider {
         let limit = filter.limit.unwrap_or(1000);
         sql.push_str(&format!(" LIMIT {limit}"));
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
         if let Some(ref ids) = filter.instance_ids {
             for id in ids {
                 query = query.bind(id);

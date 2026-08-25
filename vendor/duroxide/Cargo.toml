@@ -36,7 +36,7 @@ futures = { version = "0.3", optional = true }
 metrics = "0.24"
 
 # SQLite support (optional, bundled)
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"], optional = true }
 libsqlite3-sys = { version = ">=0.28", features = ["bundled"], optional = true }
 
 [dev-dependencies]

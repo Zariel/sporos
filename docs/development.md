@@ -71,8 +71,11 @@ cargo audit
 
 The workspace pins Duroxide 0.1.30. Its SQLite provider is vendored with a small,
 documented patch under `vendor/duroxide`; changes there must be reviewed
-separately from routine dependency updates. Torrent metainfo is parsed with the
-exactly pinned Magpie crates and the local bounded-decoder patch documented in
+separately from routine dependency updates. The patch aligns Duroxide with the
+workspace SQLx release and permits construction from Sporos's configured pool,
+so domain and orchestration writes are serialized through one SQLite
+connection. Torrent metainfo is parsed with the exactly pinned Magpie crates
+and the local bounded-decoder patch documented in
 `docs/decisions/0001-torrent-parser.md`.
 
 ## External services

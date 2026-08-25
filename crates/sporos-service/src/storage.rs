@@ -6,8 +6,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use duroxide::providers::sqlite::SqliteProvider;
+#[cfg(test)]
 use duroxide::providers::sqlite::{
-    SqliteOptions as DuroxideOptions, SqliteProvider, SqliteSynchronous as DuroxideSynchronous,
+    SqliteOptions as DuroxideOptions, SqliteSynchronous as DuroxideSynchronous,
 };
 use fs2::FileExt;
 use sqlx::SqlitePool;
@@ -109,23 +111,12 @@ impl Storage {
             .await
             .map_err(StorageOpenError::Migrate)?;
 
-        let database_path = database_path.canonicalize().map_err(|source| {
-            StorageOpenError::CanonicalizeDatabase {
-                path: database_path.to_owned(),
-                source,
-            }
-        })?;
-        let database_url = format!("sqlite://{}", database_path.display());
+        // Domain transactions and Duroxide history share one serialized writer.
+        // Separate pools can produce SQLITE_BUSY_SNAPSHOT even with a busy timeout.
         let duroxide = std::sync::Arc::new(
-            SqliteProvider::new(
-                &database_url,
-                Some(DuroxideOptions {
-                    synchronous: DuroxideSynchronous::Full,
-                    max_connections: POOL_CONNECTIONS,
-                }),
-            )
-            .await
-            .map_err(StorageOpenError::ConnectDuroxide)?,
+            SqliteProvider::from_pool(pool.clone())
+                .await
+                .map_err(StorageOpenError::ConnectDuroxide)?,
         );
         let duroxide_effective_pragmas = inspect_duroxide_pragmas(&duroxide).await?;
 
@@ -207,18 +198,12 @@ pub enum StorageOpenError {
     },
     #[error("failed to connect to SQLite")]
     Connect(#[source] sqlx::Error),
-    #[error("failed to resolve SQLite database path {path}")]
-    CanonicalizeDatabase {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
     #[error("failed to connect Duroxide to SQLite")]
-    ConnectDuroxide(#[source] duroxide_sqlx::Error),
+    ConnectDuroxide(#[source] sqlx::Error),
     #[error("failed to inspect SQLite")]
     Inspect(#[source] sqlx::Error),
     #[error("failed to inspect Duroxide SQLite")]
-    InspectDuroxide(#[source] duroxide_sqlx::Error),
+    InspectDuroxide(#[source] sqlx::Error),
     #[error("failed to migrate Sporos domain tables")]
     Migrate(#[source] DomainMigrationError),
     #[error("SQLite {name} is {actual}; expected {expected}")]
@@ -375,7 +360,7 @@ async fn inspect_duroxide_pragmas(
     provider: &SqliteProvider,
 ) -> Result<EffectivePragmas, StorageOpenError> {
     let pool = provider.get_pool();
-    let journal_mode = duroxide_sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+    let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
         .fetch_one(pool)
         .await
         .map_err(StorageOpenError::InspectDuroxide)?;
@@ -386,7 +371,7 @@ async fn inspect_duroxide_pragmas(
         &journal_mode,
     )?;
 
-    let foreign_keys = duroxide_sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+    let foreign_keys = sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
         .fetch_one(pool)
         .await
         .map_err(StorageOpenError::InspectDuroxide)?;
@@ -397,7 +382,7 @@ async fn inspect_duroxide_pragmas(
         &foreign_keys.to_string(),
     )?;
 
-    let busy_timeout = duroxide_sqlx::query_scalar::<_, u64>("PRAGMA busy_timeout")
+    let busy_timeout = sqlx::query_scalar::<_, u64>("PRAGMA busy_timeout")
         .fetch_one(pool)
         .await
         .map_err(StorageOpenError::InspectDuroxide)?;
@@ -409,7 +394,7 @@ async fn inspect_duroxide_pragmas(
         &busy_timeout.to_string(),
     )?;
 
-    let synchronous = duroxide_sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+    let synchronous = sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
         .fetch_one(pool)
         .await
         .map_err(StorageOpenError::InspectDuroxide)?;
@@ -485,11 +470,25 @@ mod tests {
         let pool = storage.duroxide.get_pool();
         assert_eq!(pool.options().get_max_connections(), 1);
         let mut connection = pool.acquire().await.expect("acquire Duroxide connection");
-        let synchronous = duroxide_sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+        let synchronous = sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
             .fetch_one(&mut *connection)
             .await
             .expect("inspect Duroxide connection");
         assert_eq!(synchronous, 2);
+        drop(connection);
+
+        let domain_connection = storage
+            .pool
+            .acquire()
+            .await
+            .expect("acquire domain connection");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pool.acquire())
+                .await
+                .is_err(),
+            "Duroxide did not share the serialized domain pool"
+        );
+        drop(domain_connection);
     }
 
     #[tokio::test]
@@ -843,13 +842,12 @@ mod tests {
         drop(storage);
 
         let result = open_in(&directory).await;
-        let Err(StorageOpenError::ConnectDuroxide(duroxide_sqlx::Error::Migrate(error))) = result
-        else {
+        let Err(StorageOpenError::ConnectDuroxide(sqlx::Error::Migrate(error))) = result else {
             panic!("expected an unknown Duroxide migration error");
         };
         assert!(matches!(
             *error,
-            duroxide_sqlx::migrate::MigrateError::VersionMissing(999)
+            sqlx::migrate::MigrateError::VersionMissing(999)
         ));
     }
 

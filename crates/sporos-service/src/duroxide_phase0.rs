@@ -246,7 +246,7 @@ async fn terminates_an_orchestration_with_corrupted_history() {
     wait_for_event(&provider, "poison-probe", "ExternalSubscribed").await;
 
     runtime.shutdown(Some(50)).await;
-    let updated = duroxide_sqlx::query(
+    let updated = sqlx::query(
         "UPDATE history SET event_data = 'not-json' WHERE instance_id = ? AND event_id = (SELECT min(event_id) FROM history WHERE instance_id = ?)",
     )
     .bind("poison-probe")
@@ -276,7 +276,7 @@ async fn terminates_an_orchestration_with_corrupted_history() {
 
     let output = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let row = duroxide_sqlx::query_as::<_, (String, Option<String>)>(
+            let row = sqlx::query_as::<_, (String, Option<String>)>(
                 "SELECT status, output FROM executions WHERE instance_id = ?",
             )
             .bind("poison-probe")
@@ -293,7 +293,7 @@ async fn terminates_an_orchestration_with_corrupted_history() {
     .expect("poisoned orchestration did not terminate");
     assert!(output.contains("history deserialization failed"));
 
-    let queued = duroxide_sqlx::query_scalar::<_, i64>(
+    let queued = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM orchestrator_queue WHERE instance_id = ?",
     )
     .bind("poison-probe")
@@ -449,7 +449,7 @@ fn crash_options() -> RuntimeOptions {
 async fn wait_for_event(provider: &SqliteProvider, instance: &str, event_type: &str) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let count = duroxide_sqlx::query_scalar::<_, i64>(
+            let count = sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM history WHERE instance_id = ? AND event_type = ?",
             )
             .bind(instance)
