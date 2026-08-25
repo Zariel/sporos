@@ -226,6 +226,19 @@ async fn verify_inventory_reads(client: &QbittorrentClient, hashes: &[String]) {
     .expect("parse full main data");
     assert!(main.full_update);
     assert_eq!(main.changed, hashes.len());
+    let delta_body = client
+        .sync_main_data(main.response_id)
+        .await
+        .expect("incremental main data");
+    let delta =
+        tokio::task::spawn_blocking(move || parse_main_data(delta_body, u64::MAX, |_| Ok(())))
+            .await
+            .expect("join incremental main-data parser")
+            .expect("parse incremental main data");
+    assert!(
+        !delta.full_update,
+        "qBittorrent sync session was not retained"
+    );
 
     let page_body = client.inventory_page(0, 500).await.expect("inventory page");
     let (count, page_hashes) = tokio::task::spawn_blocking(move || {

@@ -211,6 +211,7 @@ impl QbittorrentClient {
 
         Ok(Self {
             client: Client::builder()
+                .cookie_store(true)
                 .timeout(timeout)
                 .build()
                 .map_err(QbittorrentConfigError::Client)?,
@@ -539,7 +540,7 @@ mod tests {
                     .expect("record request");
                 write!(
                     stream,
-                    "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nSet-Cookie: QBT_SID_80=test-session; HttpOnly; Path=/\r\nConnection: close\r\n\r\n",
                     reply.status,
                     reply.content_type,
                     reply.body.len()
@@ -676,6 +677,42 @@ mod tests {
             let request = requests.recv().expect("request");
             assert!(!request.head.to_ascii_lowercase().contains("authorization:"));
         }
+        server.join().expect("fake server");
+    }
+
+    #[tokio::test]
+    async fn retains_the_qbittorrent_sync_session() {
+        let (url, requests, server) = server(vec![
+            Reply {
+                status: "200 OK",
+                content_type: "application/json",
+                body: br#"{"rid":1,"full_update":true,"torrents":{}}"#,
+            },
+            Reply {
+                status: "200 OK",
+                content_type: "application/json",
+                body: br#"{"rid":1}"#,
+            },
+        ]);
+        let client = QbittorrentClient::new(url, None).expect("client");
+
+        body_bytes(client.sync_main_data(0).await.expect("initial inventory")).await;
+        body_bytes(client.sync_main_data(1).await.expect("inventory delta")).await;
+
+        assert!(
+            !requests
+                .recv()
+                .expect("initial request")
+                .head
+                .contains("cookie:")
+        );
+        assert!(
+            requests
+                .recv()
+                .expect("delta request")
+                .head
+                .contains("cookie: QBT_SID_80=test-session")
+        );
         server.join().expect("fake server");
     }
 
