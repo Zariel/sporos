@@ -144,11 +144,11 @@ pub fn router(state: HttpState, admin_body_limit: usize) -> Router {
         .fallback(not_found)
         .layer(
             ServiceBuilder::new()
+                .layer(middleware::from_fn(request_id))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     observe_request,
-                ))
-                .layer(middleware::from_fn(request_id)),
+                )),
         )
         .with_state(state)
 }
@@ -177,6 +177,14 @@ async fn autobrr_check(
     Json(request): Json<AutobrrCheckRequest>,
 ) -> Result<Json<AutobrrCheckResponse>, Problem> {
     if request.torrent_name.is_empty() || request.torrent_name.len() > 1024 {
+        tracing::info!(
+            service = "sporos",
+            request_id = %request_id.0,
+            decision = "reject",
+            reason = "invalid_torrent_name",
+            announcement_bytes = request.torrent_name.len(),
+            "Autobrr announcement rejected"
+        );
         return Err(Problem::new(
             StatusCode::BAD_REQUEST,
             "invalid_torrent_name",
@@ -190,6 +198,13 @@ async fn autobrr_check(
         .as_ref()
         .is_some_and(|value| value.len() > 128)
     {
+        tracing::info!(
+            service = "sporos",
+            request_id = %request_id.0,
+            decision = "reject",
+            reason = "invalid_indexer",
+            "Autobrr announcement rejected"
+        );
         return Err(Problem::new(
             StatusCode::BAD_REQUEST,
             "invalid_indexer",
@@ -198,11 +213,33 @@ async fn autobrr_check(
             request_id,
         ));
     }
-    let inventory = state
-        .storage
-        .qbit_inventory_state()
-        .await
-        .map_err(|_| Problem::database(request_id.clone()))?;
+    let release = parse_release(&request.torrent_name);
+    tracing::info!(
+        service = "sporos",
+        request_id = %request_id.0,
+        announcement = %request.torrent_name,
+        indexer = request.indexer.as_deref().unwrap_or(""),
+        announced_size = request.size.unwrap_or_default(),
+        size_known = request.size.is_some(),
+        normalized_title = release.primary_title.as_str(),
+        video_kind = ?release.kind,
+        "Autobrr announcement received"
+    );
+    let inventory = match state.storage.qbit_inventory_state().await {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            tracing::warn!(
+                service = "sporos",
+                request_id = %request_id.0,
+                announcement = %request.torrent_name,
+                decision = "retry",
+                reason = "inventory_database_unavailable",
+                error = %crate::error_report::ErrorReport::new(&error),
+                "Autobrr preflight could not inspect inventory"
+            );
+            return Err(Problem::database(request_id));
+        }
+    };
     let usable = state.inventory_stale_after.is_some()
         && inventory.has_baseline
         && inventory.last_success_at.is_some_and(|success| {
@@ -216,6 +253,16 @@ async fn autobrr_check(
                 .unwrap_or(i64::MAX)
         });
     if !usable {
+        tracing::warn!(
+            service = "sporos",
+            request_id = %request_id.0,
+            announcement = %request.torrent_name,
+            decision = "retry",
+            reason = "inventory_unavailable",
+            has_baseline = inventory.has_baseline,
+            last_success_at = inventory.last_success_at.unwrap_or_default(),
+            "Autobrr announcement deferred"
+        );
         return Err(Problem::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "inventory_unavailable",
@@ -225,8 +272,7 @@ async fn autobrr_check(
         ));
     }
 
-    let release = parse_release(&request.torrent_name);
-    let source = state
+    let source = match state
         .storage
         .preflight_source(
             &release,
@@ -236,18 +282,45 @@ async fn autobrr_check(
             &state.source_filters,
         )
         .await
-        .map_err(|error| match error {
-            crate::preflight::PreflightError::Database(_)
-            | crate::preflight::PreflightError::Json(_) => Problem::database(request_id.clone()),
-            crate::preflight::PreflightError::SizeRange => Problem::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_size",
-                "Invalid size",
-                "size exceeds the supported SQLite integer range",
-                request_id.clone(),
-            ),
-        })?;
+    {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(
+                service = "sporos",
+                request_id = %request_id.0,
+                announcement = %request.torrent_name,
+                decision = "error",
+                reason = "preflight_failed",
+                error = %crate::error_report::ErrorReport::new(&error),
+                "Autobrr preflight failed"
+            );
+            return Err(match error {
+                crate::preflight::PreflightError::Database(_)
+                | crate::preflight::PreflightError::Json(_) => {
+                    Problem::database(request_id.clone())
+                }
+                crate::preflight::PreflightError::SizeRange => Problem::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_size",
+                    "Invalid size",
+                    "size exceeds the supported SQLite integer range",
+                    request_id.clone(),
+                ),
+            });
+        }
+    };
     let Some(source_state) = source else {
+        tracing::info!(
+            service = "sporos",
+            request_id = %request_id.0,
+            announcement = %request.torrent_name,
+            indexer = request.indexer.as_deref().unwrap_or(""),
+            normalized_title = release.primary_title.as_str(),
+            video_kind = ?release.kind,
+            decision = "reject",
+            reason = "no_plausible_source",
+            "Autobrr preflight decided"
+        );
         return Err(Problem::new(
             StatusCode::NOT_FOUND,
             "no_match",
@@ -256,6 +329,19 @@ async fn autobrr_check(
             request_id,
         ));
     };
+    tracing::info!(
+        service = "sporos",
+        request_id = %request_id.0,
+        announcement = %request.torrent_name,
+        indexer = request.indexer.as_deref().unwrap_or(""),
+        normalized_title = release.primary_title.as_str(),
+        video_kind = ?release.kind,
+        decision = "accept",
+        reason = "plausible_source",
+        source_state = ?source_state,
+        provisional = true,
+        "Autobrr preflight decided"
+    );
     Ok(Json(AutobrrCheckResponse {
         decision: "accept",
         provisional: true,
@@ -293,10 +379,38 @@ async fn autobrr_torrent(
     Extension(request_id): Extension<RequestId>,
     Json(request): Json<AutobrrTorrentRequest>,
 ) -> Result<(StatusCode, Json<AutobrrTorrentResponse>), Problem> {
-    validate_upload_metadata(&request, request_id.clone())?;
+    if let Err(problem) = validate_upload_metadata(&request, request_id.clone()) {
+        tracing::info!(
+            service = "sporos",
+            request_id = %request_id.0,
+            decision = "reject",
+            reason = problem.code,
+            "Autobrr torrent submission rejected"
+        );
+        return Err(problem);
+    }
+    tracing::info!(
+        service = "sporos",
+        request_id = %request_id.0,
+        announcement = request.torrent_name.as_deref().unwrap_or(""),
+        indexer = request.indexer.as_deref().unwrap_or(""),
+        category = request.category.as_deref().unwrap_or(""),
+        tag_count = request.tags.len(),
+        encoded_bytes = request.torrent_data.len(),
+        dry_run = request.dry_run,
+        "Autobrr torrent submission received"
+    );
     let _permit = Arc::clone(&state.upload_permits)
         .try_acquire_owned()
         .map_err(|_| {
+            tracing::warn!(
+                service = "sporos",
+                request_id = %request_id.0,
+                announcement = request.torrent_name.as_deref().unwrap_or(""),
+                decision = "retry",
+                reason = "upload_capacity_reached",
+                "Autobrr torrent submission deferred"
+            );
             Problem::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "upload_capacity_reached",
@@ -306,7 +420,16 @@ async fn autobrr_torrent(
             )
             .with_retry_after("1")
         })?;
-    let bytes = STANDARD.decode(&request.torrent_data).map_err(|_| {
+    let bytes = STANDARD.decode(&request.torrent_data).map_err(|error| {
+        tracing::info!(
+            service = "sporos",
+            request_id = %request_id.0,
+            announcement = request.torrent_name.as_deref().unwrap_or(""),
+            decision = "reject",
+            reason = "invalid_torrent_data",
+            error = %error,
+            "Autobrr torrent submission rejected"
+        );
         Problem::new(
             StatusCode::BAD_REQUEST,
             "invalid_torrent_data",
@@ -316,6 +439,14 @@ async fn autobrr_torrent(
         )
     })?;
     if STANDARD.encode(&bytes) != request.torrent_data {
+        tracing::info!(
+            service = "sporos",
+            request_id = %request_id.0,
+            announcement = request.torrent_name.as_deref().unwrap_or(""),
+            decision = "reject",
+            reason = "noncanonical_torrent_data",
+            "Autobrr torrent submission rejected"
+        );
         return Err(Problem::new(
             StatusCode::BAD_REQUEST,
             "invalid_torrent_data",
@@ -324,7 +455,7 @@ async fn autobrr_torrent(
             request_id,
         ));
     }
-    let accepted = state
+    let accepted = match state
         .candidate_ingress
         .accept(
             &state.storage,
@@ -343,7 +474,39 @@ async fn autobrr_torrent(
             },
         )
         .await
-        .map_err(|error| candidate_problem(error, request_id.clone()))?;
+    {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            match &error {
+                CandidateError::TorrentTooLarge
+                | CandidateError::TooManyFiles
+                | CandidateError::PathTooLong
+                | CandidateError::InvalidUtf8Name
+                | CandidateError::InvalidUtf8Path
+                | CandidateError::Torrent(_) => {
+                    tracing::info!(
+                        service = "sporos",
+                        request_id = %request_id.0,
+                        decision = "reject",
+                        reason = "invalid_candidate",
+                        error = %crate::error_report::ErrorReport::new(&error),
+                        "Autobrr torrent submission rejected"
+                    );
+                }
+                _ => {
+                    tracing::warn!(
+                        service = "sporos",
+                        request_id = %request_id.0,
+                        decision = "error",
+                        reason = "candidate_ingress_failed",
+                        error = %crate::error_report::ErrorReport::new(&error),
+                        "Autobrr torrent submission failed"
+                    );
+                }
+            }
+            return Err(candidate_problem(error, request_id));
+        }
+    };
     Ok((
         if accepted.duplicate {
             StatusCode::OK
@@ -1542,14 +1705,41 @@ async fn observe_request(State(state): State<HttpState>, request: Request, next:
         .map(MatchedPath::as_str)
         .unwrap_or("unmatched")
         .to_owned();
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|request_id| request_id.0.clone())
+        .unwrap_or_default();
     let started = Instant::now();
     let response = next.run(request).await;
-    state.metrics.observe(
-        route,
-        method,
-        response.status().as_u16(),
-        started.elapsed().as_micros() as u64,
-    );
+    let status = response.status().as_u16();
+    let duration_micros = started.elapsed().as_micros() as u64;
+    state
+        .metrics
+        .observe(route.clone(), method.clone(), status, duration_micros);
+    if !matches!(route.as_str(), "/livez" | "/readyz" | "/metrics") {
+        if status >= 500 {
+            tracing::warn!(
+                service = "sporos",
+                request_id,
+                method,
+                route,
+                status,
+                duration_micros,
+                "HTTP request completed"
+            );
+        } else {
+            tracing::info!(
+                service = "sporos",
+                request_id,
+                method,
+                route,
+                status,
+                duration_micros,
+                "HTTP request completed"
+            );
+        }
+    }
     response
 }
 

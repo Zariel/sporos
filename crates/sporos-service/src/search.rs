@@ -251,6 +251,15 @@ impl SearchExecutor {
         let Some(source) = self.load_source(input).await? else {
             self.finish(input, now, "source_unavailable", true, 0, 0)
                 .await?;
+            tracing::info!(
+                service = "sporos",
+                attempt_id = %hex(&input.attempt_id),
+                source_id = %hex(&input.source_id),
+                indexer_id = input.indexer_id,
+                decision = "fail",
+                reason = "source_unavailable",
+                "Prowlarr search decided"
+            );
             return Ok(SearchOutcome::Failed {
                 reason: "source_unavailable".to_owned(),
             });
@@ -262,6 +271,15 @@ impl SearchExecutor {
         else {
             self.finish(input, now, "indexer_ineligible", true, 0, 0)
                 .await?;
+            tracing::info!(
+                service = "sporos",
+                attempt_id = %hex(&input.attempt_id),
+                source_id = %hex(&input.source_id),
+                indexer_id = input.indexer_id,
+                decision = "fail",
+                reason = "indexer_ineligible",
+                "Prowlarr search decided"
+            );
             return Ok(SearchOutcome::Failed {
                 reason: "indexer_ineligible".to_owned(),
             });
@@ -278,6 +296,16 @@ impl SearchExecutor {
             Ok(results) => results,
             Err(error) => return self.dependency_error(input, now, error).await,
         };
+        tracing::info!(
+            service = "sporos",
+            attempt_id = %hex(&input.attempt_id),
+            source_id = %hex(&input.source_id),
+            indexer_id = input.indexer_id,
+            indexer = %source.indexer_name,
+            normalized_title = source.release.primary_title.as_str(),
+            result_count = results.len(),
+            "Prowlarr search results received"
+        );
         let mut seen = 0_i64;
         let mut downloaded = 0_i64;
         for (ordinal, result) in results.into_iter().enumerate() {
@@ -391,6 +419,18 @@ impl SearchExecutor {
                     .await?;
                 }
                 Err(error) if candidate_rejected(&error) => {
+                    tracing::info!(
+                        service = "sporos",
+                        attempt_id = %hex(&input.attempt_id),
+                        source_id = %hex(&input.source_id),
+                        indexer_id = input.indexer_id,
+                        result_ordinal = ordinal,
+                        release = %result.title,
+                        decision = "reject",
+                        reason = "invalid_torrent",
+                        error = %crate::error_report::ErrorReport::new(&error),
+                        "Prowlarr candidate rejected"
+                    );
                     self.summarize(
                         input,
                         ordinal,
@@ -407,6 +447,17 @@ impl SearchExecutor {
         }
         self.finish(input, now, "completed", false, seen, downloaded)
             .await?;
+        tracing::info!(
+            service = "sporos",
+            attempt_id = %hex(&input.attempt_id),
+            source_id = %hex(&input.source_id),
+            indexer_id = input.indexer_id,
+            indexer = %source.indexer_name,
+            result_count = seen,
+            accepted_candidate_count = downloaded,
+            decision = "complete",
+            "Prowlarr search completed"
+        );
         Ok(SearchOutcome::Complete)
     }
 

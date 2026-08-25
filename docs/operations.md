@@ -43,6 +43,23 @@ same timer. A valid longer Prowlarr `Retry-After` value takes precedence.
 Healthy refresh intervals and state-observation timers remain periodic: they
 are scheduling and reconciliation controls, not failed-operation retries.
 
+## Structured decision logs
+
+Sporos logs operator-relevant ingress and workflow decisions as structured
+records. Correlate an Autobrr request through durable processing with
+`request_id`, `candidate_id`, and `task_id`; matching and injection records add
+`match_id` and `plan_id`. The `decision` and `reason` fields describe why an
+announcement was accepted, rejected, deferred, matched, stopped, resumed, or
+failed. Matching records also report source and mapping counts, mapped and
+missing bytes, and the selected mode. Injection records summarize link reuse,
+piece integrity, and the final qBittorrent state.
+
+Expected negative decisions such as `no_plausible_source` are `INFO`. Failures
+that need dependency, configuration, filesystem, or database attention are
+`WARN` or `ERROR` and include the complete causal chain in `error`. Health and
+metrics probes are excluded from HTTP access logs. Torrent payloads,
+authorization headers, and API keys are never logged.
+
 ## Backup and restore
 
 SQLite online backup is safe while the service runs, but a quiesced backup gives

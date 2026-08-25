@@ -219,6 +219,18 @@ impl InjectionExecutor {
             self.storage
                 .record_injection(input, &plan, &state, "added_stopped", None, None)
                 .await?;
+            tracing::info!(
+                service = "sporos",
+                task_id = %format!("task_{}", encode_hex(&input.task_id)),
+                candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+                plan_id = %format!("plan_{}", encode_hex(&input.plan_id)),
+                qbit_hash = %state.hash,
+                qbit_state = %state.state,
+                save_path = %plan.save_path_remote,
+                decision = "materialize",
+                reason = "torrent_stopped",
+                "Candidate injection prepared"
+            );
             return Ok(StepResult::Ready);
         }
         qbit.add_stopped(AddTorrentRequest {
@@ -229,6 +241,18 @@ impl InjectionExecutor {
             tags: plan.tags.clone(),
         })
         .await?;
+        tracing::info!(
+            service = "sporos",
+            task_id = %format!("task_{}", encode_hex(&input.task_id)),
+            candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+            plan_id = %format!("plan_{}", encode_hex(&input.plan_id)),
+            save_path = %plan.save_path_remote,
+            category = %plan.category,
+            tag_count = plan.tags.len(),
+            decision = "wait",
+            reason = "stopped_add_requested",
+            "Candidate submitted to qBittorrent"
+        );
         Ok(waiting())
     }
 
@@ -298,6 +322,18 @@ impl InjectionExecutor {
             );
             return self.fail(input, materialize_reason(&error)).await;
         }
+        tracing::info!(
+            service = "sporos",
+            task_id = %format!("task_{}", encode_hex(&input.task_id)),
+            candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+            plan_id = %format!("plan_{}", encode_hex(&input.plan_id)),
+            link_count = results.len(),
+            reused_link_count = results.iter().filter(|link| link.existing).count(),
+            linked_bytes = results.iter().map(|link| link.size).sum::<u64>(),
+            decision = "recheck",
+            reason = "links_materialized",
+            "Candidate hardlinks materialized"
+        );
         Ok(StepResult::Ready)
     }
 
@@ -306,10 +342,21 @@ impl InjectionExecutor {
         let Some(qbit) = &self.qbit else {
             return self.fail(input, "qbittorrent_unconfigured").await;
         };
-        qbit.force_recheck(&plan.hash()?).await?;
+        let hash = plan.hash()?;
+        qbit.force_recheck(&hash).await?;
         self.storage
             .set_injection_state(input, "recheck_requested")
             .await?;
+        tracing::info!(
+            service = "sporos",
+            task_id = %format!("task_{}", encode_hex(&input.task_id)),
+            candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+            plan_id = %format!("plan_{}", encode_hex(&input.plan_id)),
+            qbit_hash = %hash,
+            decision = "wait",
+            reason = "recheck_requested",
+            "Candidate recheck requested"
+        );
         Ok(waiting())
     }
 
@@ -360,6 +407,20 @@ impl InjectionExecutor {
         self.storage
             .record_resume_decision(input, &state, &integrity, resume)
             .await?;
+        tracing::info!(
+            service = "sporos",
+            task_id = %format!("task_{}", encode_hex(&input.task_id)),
+            candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+            plan_id = %format!("plan_{}", encode_hex(&input.plan_id)),
+            qbit_hash = %hash,
+            decision = if resume { "resume" } else { "stop" },
+            reason = if integrity.integrity_safe { "resume_policy" } else { "unsafe_piece_state" },
+            integrity_safe = integrity.integrity_safe,
+            missing_bytes = integrity.missing_bytes,
+            present_ratio_ppm = integrity.present_ratio_ppm,
+            amount_left = state.amount_left,
+            "Candidate resume decision recorded"
+        );
         if resume {
             qbit.start(&hash).await?;
         } else {
@@ -378,6 +439,18 @@ impl InjectionExecutor {
         let resume = plan.resume_decision.as_deref() == Some("resume");
         if (resume && state.is_started()) || (!resume && state.is_stopped()) {
             self.storage.finish_injection(input, state, resume).await?;
+            tracing::info!(
+                service = "sporos",
+                task_id = %format!("task_{}", encode_hex(&input.task_id)),
+                candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+                plan_id = %format!("plan_{}", encode_hex(&input.plan_id)),
+                qbit_hash = %state.hash,
+                qbit_state = %state.state,
+                amount_left = state.amount_left,
+                decision = "complete",
+                reason = if resume { "resumed" } else { "left_stopped" },
+                "Candidate injection completed"
+            );
             return Ok(StepResult::Terminal {
                 state: "completed".to_owned(),
                 reason_code: if resume { "resumed" } else { "left_stopped" }.to_owned(),
@@ -401,6 +474,15 @@ impl InjectionExecutor {
         reason: &str,
     ) -> Result<StepResult, InjectionError> {
         self.storage.fail_injection(input, reason, now_ms()).await?;
+        tracing::warn!(
+            service = "sporos",
+            task_id = %format!("task_{}", encode_hex(&input.task_id)),
+            candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+            plan_id = %format!("plan_{}", encode_hex(&input.plan_id)),
+            decision = "fail",
+            reason,
+            "Candidate injection failed"
+        );
         Ok(StepResult::Terminal {
             state: "failed".to_owned(),
             reason_code: reason.to_owned(),

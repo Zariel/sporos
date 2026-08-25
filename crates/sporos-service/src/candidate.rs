@@ -130,6 +130,14 @@ impl CandidateIngress {
                 })
                 .collect(),
         };
+        let torrent_bytes = submission.bytes.len();
+        let file_count = manifest.files.iter().filter(|file| !file.padding).count();
+        let content_bytes = manifest
+            .files
+            .iter()
+            .filter(|file| !file.padding)
+            .map(|file| file.size)
+            .sum::<u64>();
         let torrent_name =
             std::str::from_utf8(parsed.name()).map_err(|_| CandidateError::InvalidUtf8Name)?;
         let display_name = submission
@@ -275,8 +283,8 @@ impl CandidateIngress {
         }
 
         let detail_json = serde_json::to_string(&serde_json::json!({
-            "category": submission.category,
-            "tags": submission.tags,
+            "category": &submission.category,
+            "tags": &submission.tags,
         }))?;
         sqlx::query(
             "INSERT INTO sporos_candidate_provenance (
@@ -285,16 +293,37 @@ impl CandidateIngress {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(candidate_id.as_bytes().as_slice())
-        .bind(submission.trigger)
+        .bind(&submission.trigger)
         .bind(submission.indexer_id)
-        .bind(submission.indexer)
-        .bind(submission.announcement_name)
-        .bind(submission.request_id)
+        .bind(&submission.indexer)
+        .bind(&submission.announcement_name)
+        .bind(&submission.request_id)
         .bind(submission.received_at)
         .bind(detail_json)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+
+        tracing::info!(
+            service = "sporos",
+            request_id = %submission.request_id,
+            trigger = %submission.trigger,
+            announcement = submission.announcement_name.as_deref().unwrap_or(display_name),
+            indexer = submission.indexer.as_deref().unwrap_or(""),
+            candidate_id = %format!("cand_{}", encode_hex(candidate_id.as_bytes())),
+            task_id = %format!("task_{}", encode_hex(task_id.as_bytes())),
+            decision = if inserted { "accepted" } else { "duplicate" },
+            duplicate = !inserted,
+            normalized_title = release.primary_title.as_str(),
+            video_kind = ?release.kind,
+            torrent_bytes,
+            content_bytes,
+            file_count,
+            has_v1 = manifest.hashes.v1.is_some(),
+            has_v2 = manifest.hashes.v2.is_some(),
+            dry_run = policy.injection.dry_run,
+            "Candidate accepted durably"
+        );
 
         Ok(AcceptedCandidate {
             candidate_id,

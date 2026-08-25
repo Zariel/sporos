@@ -145,10 +145,25 @@ impl Storage {
                     now,
                 )
                 .await?;
+                let delay_ms = u64::try_from(deadline.saturating_sub(now))
+                    .unwrap_or(u64::MAX)
+                    .min(RECONCILE_INTERVAL.as_millis() as u64);
+                tracing::info!(
+                    service = "sporos",
+                    request_id = %loaded.request_id,
+                    candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+                    task_id = %format!("task_{}", encode_hex(&input.task_id)),
+                    announcement = %loaded.display_name,
+                    normalized_title = loaded.release.primary_title.as_str(),
+                    decision = "wait",
+                    reason = "pending_source",
+                    waiting_source_count = waiting.len(),
+                    delay_ms,
+                    deadline_ms = deadline,
+                    "Candidate evaluation decided"
+                );
                 return Ok(EvaluationResult::Waiting {
-                    delay_ms: u64::try_from(deadline.saturating_sub(now))
-                        .unwrap_or(u64::MAX)
-                        .min(RECONCILE_INTERVAL.as_millis() as u64),
+                    delay_ms,
                     source_ids: waiting,
                 });
             }
@@ -165,8 +180,8 @@ impl Storage {
         input: &CandidateWorkflowInput,
     ) -> Result<LoadedCandidate, CandidateWorkflowError> {
         let row = sqlx::query(
-            "SELECT c.manifest_json, c.release_json, c.created_at, p.payload_json,
-                    cp.trigger, cp.indexer_id, cp.indexer_name
+            "SELECT c.manifest_json, c.release_json, c.display_name, c.created_at, p.payload_json,
+                    cp.trigger, cp.indexer_id, cp.indexer_name, cp.request_id
              FROM sporos_candidate c
              JOIN sporos_candidate_task ct ON ct.candidate_id = c.id
              JOIN sporos_policy_snapshot p ON p.id = ct.policy_snapshot_id
@@ -190,10 +205,12 @@ impl Storage {
             manifest: serde_json::from_str(&manifest_json)?,
             release: serde_json::from_str(&row.try_get::<String, _>("release_json")?)?,
             policy: serde_json::from_str(&row.try_get::<String, _>("payload_json")?)?,
+            display_name: row.try_get("display_name")?,
             created_at: row.try_get("created_at")?,
             trigger: row.try_get("trigger")?,
             indexer_id: row.try_get("indexer_id")?,
             indexer_name: row.try_get("indexer_name")?,
+            request_id: row.try_get("request_id")?,
         })
     }
 
@@ -478,6 +495,8 @@ impl Storage {
         let match_id = first_16(&match_digest);
         let state = terminal_state(&decision, loaded.policy.injection.dry_run);
         let reason_code = enum_text(&decision.reason)?;
+        let outcome_code = enum_text(&decision.outcome)?;
+        let mode_code = decision.mode.map(|mode| enum_text(&mode)).transpose()?;
         let mut transaction = self.pool().begin().await?;
         sqlx::query("DELETE FROM sporos_waiting_source WHERE candidate_task_id = ?")
             .bind(input.task_id.as_slice())
@@ -494,8 +513,8 @@ impl Storage {
         .bind(match_id.as_slice())
         .bind(input.candidate_id.as_slice())
         .bind(MATCHER_VERSION)
-        .bind(decision.mode.map(|mode| enum_text(&mode)).transpose()?)
-        .bind(enum_text(&decision.outcome)?)
+        .bind(&mode_code)
+        .bind(&outcome_code)
         .bind(&reason_code)
         .bind(to_i64(decision.mapped_bytes, "mapped bytes")?)
         .bind(to_i64(decision.missing_bytes, "missing bytes")?)
@@ -557,6 +576,32 @@ impl Storage {
             now,
         )
         .await?;
+        tracing::info!(
+            service = "sporos",
+            request_id = %loaded.request_id,
+            trigger = %loaded.trigger,
+            indexer_id = loaded.indexer_id.unwrap_or_default(),
+            indexer = loaded.indexer_name.as_deref().unwrap_or(""),
+            candidate_id = %format!("cand_{}", encode_hex(&input.candidate_id)),
+            task_id = %format!("task_{}", encode_hex(&input.task_id)),
+            match_id = %format!("match_{}", encode_hex(&match_id)),
+            plan_id = plan_id.map(|id| format!("plan_{}", encode_hex(&id))).unwrap_or_default(),
+            announcement = %loaded.display_name,
+            normalized_title = loaded.release.primary_title.as_str(),
+            video_kind = ?loaded.release.kind,
+            decision = %outcome_code,
+            reason = %reason_code,
+            state,
+            match_mode = mode_code.as_deref().unwrap_or(""),
+            source_count = decision.source_ids.len(),
+            mapping_count = decision.mappings.len(),
+            mapped_bytes = decision.mapped_bytes,
+            missing_bytes = decision.missing_bytes,
+            present_ratio_ppm = decision.present_ratio.as_ppm(),
+            requires_recheck = decision.requires_recheck,
+            dry_run = loaded.policy.injection.dry_run,
+            "Candidate evaluation decided"
+        );
         Ok(EvaluationResult::Terminal {
             state: state.to_owned(),
             reason_code,
@@ -859,10 +904,12 @@ struct LoadedCandidate {
     manifest: TorrentManifest,
     release: ReleaseDescriptor,
     policy: CandidatePolicy,
+    display_name: String,
     created_at: i64,
     trigger: String,
     indexer_id: Option<i64>,
     indexer_name: Option<String>,
+    request_id: String,
 }
 
 impl LoadedCandidate {
