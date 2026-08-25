@@ -29,12 +29,15 @@ use crate::outbox::OutboxDispatcher;
 use crate::prowlarr::ProwlarrClient;
 use crate::qbit_sync::InventorySynchronizer;
 use crate::qbittorrent::{ApiKey, QbittorrentClient, QbittorrentConfigError};
+use crate::retry::Backoff;
 use crate::search::{SearchExecutor, SearchPolicy};
 use crate::storage::Storage;
 
 const OUTBOX_INTERVAL: Duration = Duration::from_millis(100);
 const PROJECTION_REPAIR_INTERVAL: Duration = Duration::from_secs(5);
 const PROJECTION_REPAIR_BATCH_SIZE: usize = 32;
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
 pub fn init_logging(config: &Logging) -> Result<(), AppError> {
     let filter = EnvFilter::try_new(&config.level).map_err(AppError::LogFilter)?;
@@ -352,8 +355,8 @@ async fn projection_repair_loop(
     client: Client,
     mut stop: watch::Receiver<bool>,
 ) {
-    let mut interval = tokio::time::interval(PROJECTION_REPAIR_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut next_run = tokio::time::Instant::now();
+    let mut backoff = Backoff::new(RETRY_BASE, RETRY_MAX);
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -361,7 +364,7 @@ async fn projection_repair_loop(
                     return;
                 }
             }
-            _ = interval.tick() => {
+            _ = tokio::time::sleep_until(next_run) => {
                 match storage
                     .repair_terminal_task_projections(
                         &client,
@@ -376,13 +379,22 @@ async fn projection_repair_loop(
                         repaired = report.repaired,
                         "terminal task projections repaired"
                     ),
-                    Ok(_) => {}
-                    Err(error) => warn!(
-                        service = "sporos",
-                        error = %ErrorReport::new(&error),
-                        "task projection repair failed"
-                    ),
+                    Ok(_) => {},
+                    Err(error) => {
+                        let delay = backoff.fail();
+                        next_run = tokio::time::Instant::now() + delay;
+                        warn!(
+                            service = "sporos",
+                            error = %ErrorReport::new(&error),
+                            consecutive_failures = backoff.failures(),
+                            retry_in_ms = delay.as_millis(),
+                            "task projection repair failed"
+                        );
+                        continue;
+                    }
                 }
+                backoff.reset();
+                next_run = tokio::time::Instant::now() + PROJECTION_REPAIR_INTERVAL;
             }
         }
     }
@@ -394,8 +406,8 @@ async fn prowlarr_loop(
     refresh_period: Duration,
     mut stop: watch::Receiver<bool>,
 ) {
-    let mut interval = tokio::time::interval(refresh_period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut next_run = tokio::time::Instant::now();
+    let mut backoff = Backoff::new(RETRY_BASE, RETRY_MAX);
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -403,13 +415,37 @@ async fn prowlarr_loop(
                     return;
                 }
             }
-            _ = interval.tick() => {
+            _ = tokio::time::sleep_until(next_run) => {
                 match client.indexers().await {
                     Ok(indexers) => match storage.project_indexers(&indexers, now_ms()).await {
-                        Ok(()) => info!(service = "sporos", count = indexers.len(), "Prowlarr indexers refreshed"),
-                        Err(error) => warn!(service = "sporos", error = %ErrorReport::new(&error), "Prowlarr indexer projection failed"),
+                        Ok(()) => {
+                            backoff.reset();
+                            next_run = tokio::time::Instant::now() + refresh_period;
+                            info!(service = "sporos", count = indexers.len(), "Prowlarr indexers refreshed");
+                        }
+                        Err(error) => {
+                            let delay = backoff.fail();
+                            next_run = tokio::time::Instant::now() + delay;
+                            warn!(
+                                service = "sporos",
+                                error = %ErrorReport::new(&error),
+                                consecutive_failures = backoff.failures(),
+                                retry_in_ms = delay.as_millis(),
+                                "Prowlarr indexer projection failed"
+                            );
+                        }
                     },
-                    Err(error) => warn!(service = "sporos", error = %ErrorReport::new(&error), "Prowlarr indexer refresh failed"),
+                    Err(error) => {
+                        let delay = backoff.fail();
+                        next_run = tokio::time::Instant::now() + delay;
+                        warn!(
+                            service = "sporos",
+                            error = %ErrorReport::new(&error),
+                            consecutive_failures = backoff.failures(),
+                            retry_in_ms = delay.as_millis(),
+                            "Prowlarr indexer refresh failed"
+                        );
+                    }
                 }
             }
         }
@@ -425,11 +461,11 @@ async fn qbit_loop(
     mut stop: watch::Receiver<bool>,
 ) {
     let mut contract_validated = false;
-    let mut sync_interval = tokio::time::interval(sync_period);
-    sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut full_interval =
-        tokio::time::interval_at(tokio::time::Instant::now() + full_period, full_period);
-    full_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let now = tokio::time::Instant::now();
+    let mut next_sync = now;
+    let mut next_full = now + full_period;
+    let mut retry_not_before = now;
+    let mut backoff = Backoff::new(RETRY_BASE, RETRY_MAX);
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -437,7 +473,7 @@ async fn qbit_loop(
                     return;
                 }
             }
-            _ = sync_interval.tick() => {
+            _ = tokio::time::sleep_until(next_sync.max(retry_not_before)) => {
                 if !contract_validated {
                     match synchronizer.negotiate().await {
                         Ok(versions) => {
@@ -450,7 +486,15 @@ async fn qbit_loop(
                             );
                         }
                         Err(error) => {
-                            warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent contract unavailable");
+                            let delay = backoff.fail();
+                            retry_not_before = tokio::time::Instant::now() + delay;
+                            warn!(
+                                service = "sporos",
+                                error = %ErrorReport::new(&error),
+                                consecutive_failures = backoff.failures(),
+                                retry_in_ms = delay.as_millis(),
+                                "qBittorrent contract unavailable"
+                            );
                             continue;
                         }
                     }
@@ -465,17 +509,46 @@ async fn qbit_loop(
                                     completions = report.completions.len(),
                                     "requested qBittorrent inventory reconciliation completed"
                                 );
-                                finish_qbit_report(&synchronizer, &storage, &client, &report).await;
+                                if let Err(error) =
+                                    finish_qbit_report(&synchronizer, &storage, &client, &report).await
+                                {
+                                    let delay = backoff.fail();
+                                    retry_not_before = tokio::time::Instant::now() + delay;
+                                    warn!(
+                                        service = "sporos",
+                                        error = %ErrorReport::new(&error),
+                                        consecutive_failures = backoff.failures(),
+                                        retry_in_ms = delay.as_millis(),
+                                        "qBittorrent manifest refresh failed"
+                                    );
+                                    continue;
+                                }
                             }
                             Err(error) => {
-                                warn!(service = "sporos", error = %ErrorReport::new(&error), "requested qBittorrent inventory reconciliation failed");
+                                let delay = backoff.fail();
+                                retry_not_before = tokio::time::Instant::now() + delay;
+                                warn!(
+                                    service = "sporos",
+                                    error = %ErrorReport::new(&error),
+                                    consecutive_failures = backoff.failures(),
+                                    retry_in_ms = delay.as_millis(),
+                                    "requested qBittorrent inventory reconciliation failed"
+                                );
                                 continue;
                             }
                         }
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent inventory state unavailable");
+                        let delay = backoff.fail();
+                        retry_not_before = tokio::time::Instant::now() + delay;
+                        warn!(
+                            service = "sporos",
+                            error = %ErrorReport::new(&error),
+                            consecutive_failures = backoff.failures(),
+                            retry_in_ms = delay.as_millis(),
+                            "qBittorrent inventory state unavailable"
+                        );
                         continue;
                     }
                 }
@@ -490,12 +563,39 @@ async fn qbit_loop(
                                 "qBittorrent inventory synchronized"
                             );
                         }
-                        finish_qbit_report(&synchronizer, &storage, &client, &report).await;
+                        if let Err(error) =
+                            finish_qbit_report(&synchronizer, &storage, &client, &report).await
+                        {
+                            let delay = backoff.fail();
+                            retry_not_before = tokio::time::Instant::now() + delay;
+                            warn!(
+                                service = "sporos",
+                                error = %ErrorReport::new(&error),
+                                consecutive_failures = backoff.failures(),
+                                retry_in_ms = delay.as_millis(),
+                                "qBittorrent manifest refresh failed"
+                            );
+                            continue;
+                        }
+                        backoff.reset();
+                        let now = tokio::time::Instant::now();
+                        retry_not_before = now;
+                        next_sync = now + sync_period;
                     }
-                    Err(error) => warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent inventory sync failed"),
+                    Err(error) => {
+                        let delay = backoff.fail();
+                        retry_not_before = tokio::time::Instant::now() + delay;
+                        warn!(
+                            service = "sporos",
+                            error = %ErrorReport::new(&error),
+                            consecutive_failures = backoff.failures(),
+                            retry_in_ms = delay.as_millis(),
+                            "qBittorrent inventory sync failed"
+                        );
+                    }
                 }
             }
-            _ = full_interval.tick(), if contract_validated => {
+            _ = tokio::time::sleep_until(next_full.max(retry_not_before)), if contract_validated => {
                 match synchronizer.reconcile(now_ms()).await {
                     Ok(report) => {
                         info!(
@@ -504,9 +604,37 @@ async fn qbit_loop(
                             completions = report.completions.len(),
                             "qBittorrent inventory reconciled"
                         );
-                        finish_qbit_report(&synchronizer, &storage, &client, &report).await;
+                        match finish_qbit_report(&synchronizer, &storage, &client, &report).await {
+                            Ok(()) => {
+                                backoff.reset();
+                                let now = tokio::time::Instant::now();
+                                retry_not_before = now;
+                                next_full = now + full_period;
+                            }
+                            Err(error) => {
+                                let delay = backoff.fail();
+                                retry_not_before = tokio::time::Instant::now() + delay;
+                                warn!(
+                                    service = "sporos",
+                                    error = %ErrorReport::new(&error),
+                                    consecutive_failures = backoff.failures(),
+                                    retry_in_ms = delay.as_millis(),
+                                    "qBittorrent manifest refresh failed"
+                                );
+                            }
+                        }
                     }
-                    Err(error) => warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent inventory reconciliation failed"),
+                    Err(error) => {
+                        let delay = backoff.fail();
+                        retry_not_before = tokio::time::Instant::now() + delay;
+                        warn!(
+                            service = "sporos",
+                            error = %ErrorReport::new(&error),
+                            consecutive_failures = backoff.failures(),
+                            retry_in_ms = delay.as_millis(),
+                            "qBittorrent inventory reconciliation failed"
+                        );
+                    }
                 }
             }
         }
@@ -518,11 +646,8 @@ async fn finish_qbit_report(
     storage: &Storage,
     client: &Client,
     report: &crate::qbit_sync::SyncReport,
-) {
-    if let Err(error) = synchronizer.refresh_manifests(8, now_ms()).await {
-        warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent manifest refresh failed");
-        return;
-    }
+) -> Result<(), crate::qbit_sync::SyncError> {
+    synchronizer.refresh_manifests(8, now_ms()).await?;
     for completion in &report.completions {
         let instances = match storage
             .waiting_candidate_instances(completion.source_id)
@@ -545,6 +670,7 @@ async fn finish_qbit_report(
             }
         }
     }
+    Ok(())
 }
 
 async fn dispatch_loop(
@@ -554,8 +680,8 @@ async fn dispatch_loop(
     readiness: HttpState,
     mut stop: watch::Receiver<bool>,
 ) {
-    let mut interval = tokio::time::interval(OUTBOX_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut next_run = tokio::time::Instant::now();
+    let mut backoff = Backoff::new(RETRY_BASE, RETRY_MAX);
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -563,23 +689,37 @@ async fn dispatch_loop(
                     return;
                 }
             }
-            _ = interval.tick() => {
+            _ = tokio::time::sleep_until(next_run) => {
                 match OutboxDispatcher::new(&storage, client.clone(), batch_size)
                     .run_once(now_ms())
                     .await
                 {
-                    Ok(report) if report.claimed > 0 => info!(
-                        service = "sporos",
-                        claimed = report.claimed,
-                        dispatched = report.dispatched,
-                        retrying = report.retrying,
-                        permanently_failed = report.permanently_failed,
-                        "outbox batch processed"
-                    ),
-                    Ok(_) => {}
+                    Ok(report) => {
+                        readiness.set_ready(true);
+                        backoff.reset();
+                        next_run = tokio::time::Instant::now() + OUTBOX_INTERVAL;
+                        if report.claimed > 0 {
+                            info!(
+                                service = "sporos",
+                                claimed = report.claimed,
+                                dispatched = report.dispatched,
+                                retrying = report.retrying,
+                                permanently_failed = report.permanently_failed,
+                                "outbox batch processed"
+                            );
+                        }
+                    }
                     Err(error) => {
                         readiness.set_ready(false);
-                        error!(service = "sporos", error = %ErrorReport::new(&error), "outbox dispatcher unavailable");
+                        let delay = backoff.fail();
+                        next_run = tokio::time::Instant::now() + delay;
+                        error!(
+                            service = "sporos",
+                            error = %ErrorReport::new(&error),
+                            consecutive_failures = backoff.failures(),
+                            retry_in_ms = delay.as_millis(),
+                            "outbox dispatcher unavailable"
+                        );
                     }
                 }
             }

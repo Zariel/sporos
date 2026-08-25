@@ -26,7 +26,8 @@ const BACKFILL_ACTIVITY: &str = "ProduceInventorySearchPage";
 const BACKFILL_PAGE_SIZE: i64 = 100;
 const MATCHER_VERSION: &str = "sporos-matcher/1";
 const MIN_REQUEST_GAP_MS: i64 = 1_000;
-const DEFAULT_RETRY_MS: i64 = 60_000;
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -503,11 +504,35 @@ impl SearchExecutor {
         now: i64,
         error: ProwlarrError,
     ) -> Result<SearchOutcome, SearchError> {
+        let attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT dependency_attempts FROM sporos_search_attempt WHERE id = ?",
+        )
+        .bind(input.attempt_id.as_slice())
+        .fetch_one(self.storage.pool())
+        .await?;
+        let attempt = u32::try_from(attempts)
+            .map_err(|_| SearchError::StoredRange)?
+            .saturating_add(1);
+        let calculated = crate::retry::deterministic(
+            RETRY_BASE,
+            RETRY_MAX,
+            attempt,
+            &[input.attempt_id.as_slice(), &input.indexer_id.to_le_bytes()],
+        );
+        let calculated_ms =
+            i64::try_from(calculated.as_millis()).expect("calculated retry delay fits i64");
         let delay = match error {
             ProwlarrError::RateLimited { retry_after } => retry_after
                 .and_then(|value| i64::try_from(value.as_millis()).ok())
-                .unwrap_or(DEFAULT_RETRY_MS),
-            ProwlarrError::Request(_) | ProwlarrError::HttpStatus(_) => DEFAULT_RETRY_MS,
+                .map_or(calculated_ms, |delay| delay.max(calculated_ms)),
+            ProwlarrError::Request(_) => calculated_ms,
+            ProwlarrError::HttpStatus(status)
+                if status.is_server_error()
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                calculated_ms
+            }
             other => {
                 self.finish(input, now, "invalid_search_response", true, 0, 0)
                     .await?;
@@ -1058,6 +1083,8 @@ pub(crate) enum SearchError {
     SourceUnavailable,
     #[error("database contains an invalid identifier")]
     InvalidStoredId,
+    #[error("database contains an invalid dependency attempt count")]
+    StoredRange,
 }
 
 impl SearchError {
@@ -1069,9 +1096,11 @@ impl SearchError {
             Self::Prowlarr(error) if retryable_prowlarr(error) => {
                 crate::activity_failure::transient("prowlarr_unavailable", self)
             }
-            Self::Prowlarr(_) | Self::Json(_) | Self::SourceUnavailable | Self::InvalidStoredId => {
-                crate::activity_failure::permanent("invalid_search_state", self)
-            }
+            Self::Prowlarr(_)
+            | Self::Json(_)
+            | Self::SourceUnavailable
+            | Self::InvalidStoredId
+            | Self::StoredRange => crate::activity_failure::permanent("invalid_search_state", self),
         }
     }
 }
@@ -1242,6 +1271,82 @@ mod tests {
             3_100
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn dependency_retries_back_off_deterministically() {
+        let (_directory, storage) = open().await;
+        let source_id = source_id(1);
+        insert_source(&storage, source_id, 1).await;
+        insert_indexer(&storage, 7).await;
+        let input = accept_search(&storage, source_id, 7).await;
+        let executor = executor(Arc::clone(&storage), "http://127.0.0.1:1/");
+
+        let first = executor
+            .dependency_error(
+                &input,
+                100,
+                ProwlarrError::HttpStatus(StatusCode::SERVICE_UNAVAILABLE),
+            )
+            .await
+            .unwrap();
+        let second = executor
+            .dependency_error(
+                &input,
+                2_000,
+                ProwlarrError::HttpStatus(StatusCode::SERVICE_UNAVAILABLE),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            first,
+            SearchOutcome::Waiting {
+                delay_ms: 1_000,
+                ..
+            }
+        ));
+        let expected = crate::retry::deterministic(
+            RETRY_BASE,
+            RETRY_MAX,
+            2,
+            &[input.attempt_id.as_slice(), &input.indexer_id.to_le_bytes()],
+        );
+        assert!(matches!(
+            second,
+            SearchOutcome::Waiting { delay_ms, .. }
+                if delay_ms == u64::try_from(expected.as_millis()).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn permanent_dependency_responses_do_not_retry() {
+        let (_directory, storage) = open().await;
+        let source_id = source_id(1);
+        insert_source(&storage, source_id, 1).await;
+        insert_indexer(&storage, 7).await;
+        let input = accept_search(&storage, source_id, 7).await;
+
+        let outcome = executor(Arc::clone(&storage), "http://127.0.0.1:1/")
+            .dependency_error(
+                &input,
+                100,
+                ProwlarrError::HttpStatus(StatusCode::BAD_REQUEST),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, SearchOutcome::Failed { .. }));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT dependency_attempts FROM sporos_search_attempt WHERE id = ?",
+            )
+            .bind(input.attempt_id.as_slice())
+            .fetch_one(storage.pool())
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

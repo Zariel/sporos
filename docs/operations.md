@@ -32,6 +32,17 @@ durable reconciliation workflow. It never removes torrents, files, or links.
 A retry is accepted only for a failed or cancelled supported task; it preserves
 old task events and atomically enqueues a new version-pinned instance.
 
+## Failure diagnosis and retry timing
+
+Runtime warning and error records include the complete causal chain in the
+`error` field. Transient dependency and background-service failures retry with
+exponential backoff from one second to five minutes and 20% bounded jitter.
+Durable workflow jitter is derived from workflow identity so replay uses the
+same timer. A valid longer Prowlarr `Retry-After` value takes precedence.
+
+Healthy refresh intervals and state-observation timers remain periodic: they
+are scheduling and reconciliation controls, not failed-operation retries.
+
 ## Backup and restore
 
 SQLite online backup is safe while the service runs, but a quiesced backup gives

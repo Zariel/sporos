@@ -22,6 +22,7 @@ mod prowlarr;
 pub mod qbit_projection;
 pub mod qbit_sync;
 pub mod qbittorrent;
+mod retry;
 mod search;
 mod source_facts;
 pub mod storage;
