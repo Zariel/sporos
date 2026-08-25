@@ -18,6 +18,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use thiserror::Error;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(75);
 const POOL_CONNECTIONS: NonZeroU32 = NonZeroU32::MIN;
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
@@ -103,6 +104,7 @@ impl Storage {
             .busy_timeout(BUSY_TIMEOUT);
         let pool = SqlitePoolOptions::new()
             .max_connections(POOL_CONNECTIONS.get())
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect_with(options)
             .await
             .map_err(StorageOpenError::Connect)?;
@@ -467,6 +469,10 @@ mod tests {
         );
 
         assert_eq!(storage.pool.options().get_max_connections(), 1);
+        assert_eq!(
+            storage.pool.options().get_acquire_timeout(),
+            POOL_ACQUIRE_TIMEOUT
+        );
         let pool = storage.duroxide.get_pool();
         assert_eq!(pool.options().get_max_connections(), 1);
         let mut connection = pool.acquire().await.expect("acquire Duroxide connection");

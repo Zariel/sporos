@@ -204,7 +204,7 @@ impl Runtime {
                 }
 
                 let handle = tokio::spawn(async move {
-                    let mut consecutive_retryable_errors: u32 = 0;
+                    let mut consecutive_fetch_errors: u32 = 0;
 
                     loop {
                         if shutdown.load(Ordering::Relaxed) {
@@ -225,25 +225,41 @@ impl Runtime {
                         .await
                         {
                             Ok(found) => {
-                                consecutive_retryable_errors = 0;
+                                consecutive_fetch_errors = 0;
                                 found
                             }
                             Err(e) if e.is_retryable() => {
-                                // Exponential backoff for retryable errors (database locks, etc.)
-                                consecutive_retryable_errors += 1;
-                                let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors)).min(3000);
-                                warn!(
-                                    "Error fetching work item (retryable, attempt {}): {:?}, backing off {}ms",
-                                    consecutive_retryable_errors, e, backoff_ms
+                                consecutive_fetch_errors += 1;
+                                let delay = super::provider_retry_delay(
+                                    Duration::from_millis(200),
+                                    Duration::from_secs(3),
+                                    consecutive_fetch_errors,
+                                    &[worker_id.as_bytes(), b"fetch-activity"],
                                 );
-                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                warn!(
+                                    attempt = consecutive_fetch_errors,
+                                    retry_in_ms = delay.as_millis(),
+                                    error = %e,
+                                    "Error fetching work item; retrying"
+                                );
+                                tokio::time::sleep(delay).await;
                                 continue;
                             }
                             Err(e) => {
-                                // Permanent errors - log and continue with normal polling
-                                warn!("Error fetching work item (permanent): {:?}", e);
-                                consecutive_retryable_errors = 0;
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                consecutive_fetch_errors += 1;
+                                let delay = super::provider_retry_delay(
+                                    Duration::from_millis(200),
+                                    Duration::from_secs(3),
+                                    consecutive_fetch_errors,
+                                    &[worker_id.as_bytes(), b"fetch-activity-permanent"],
+                                );
+                                warn!(
+                                    attempt = consecutive_fetch_errors,
+                                    retry_in_ms = delay.as_millis(),
+                                    error = %e,
+                                    "Error fetching work item (permanent)"
+                                );
+                                tokio::time::sleep(delay).await;
                                 continue;
                             }
                         };
@@ -341,10 +357,12 @@ async fn process_next_work_item(
                         worker_id = %worker_id,
                         "Session capacity exceeded after fetch (race), abandoning work item"
                     );
-                    let _ = rt
-                        .history_store
-                        .abandon_work_item(&token, Some(Duration::from_millis(100)), true)
-                        .await;
+                    let delay = super::jitter_delay(
+                        Duration::from_millis(100),
+                        attempt_count.max(1),
+                        &[sid.as_bytes(), b"session-capacity"],
+                    );
+                    let _ = rt.history_store.abandon_work_item(&token, Some(delay), true).await;
                     return Ok(true);
                 }
                 Some(guard)
@@ -701,7 +719,15 @@ async fn handle_activity_error(
 ///
 /// The poison message handling will eventually fail the activity if genuinely missing.
 async fn abandon_unregistered_activity(rt: &Arc<Runtime>, ctx: &ActivityWorkContext) {
-    let backoff = rt.options.unregistered_backoff.delay(ctx.attempt_count);
+    let backoff = super::jitter_delay(
+        rt.options.unregistered_backoff.delay(ctx.attempt_count),
+        ctx.attempt_count.max(1),
+        &[
+            ctx.instance.as_bytes(),
+            &ctx.activity_id.to_le_bytes(),
+            b"unregistered-activity",
+        ],
+    );
     let remaining_attempts = rt.options.max_attempts.saturating_sub(ctx.attempt_count);
 
     tracing::warn!(
@@ -746,17 +772,28 @@ async fn handle_activity_outcome(
             ActivityOutcome::Cancelled => {}
         },
         Err(e) => {
+            let delay = super::provider_retry_delay(
+                Duration::from_millis(100),
+                Duration::from_secs(3),
+                ctx.attempt_count.max(1),
+                &[
+                    ctx.instance.as_bytes(),
+                    &ctx.activity_id.to_le_bytes(),
+                    b"abandon-after-ack",
+                ],
+            );
             warn!(
                 instance = %ctx.instance,
                 execution_id = ctx.execution_id,
                 activity_id = ctx.activity_id,
                 worker_id = %ctx.worker_id,
                 error = %e,
+                retry_in_ms = delay.as_millis(),
                 "worker: atomic ack failed, abandoning work item"
             );
             let _ = rt
                 .history_store
-                .abandon_work_item(&ctx.lock_token, Some(Duration::from_millis(100)), false)
+                .abandon_work_item(&ctx.lock_token, Some(delay), false)
                 .await;
             rt.record_activity_infra_error();
         }

@@ -384,7 +384,7 @@ impl Runtime {
                 let worker_id = format!("orch-{worker_idx}-{}", rt.runtime_id);
                 let handle = tokio::spawn(async move {
                     // debug!("Orchestration worker {} started", worker_id);
-                    let mut consecutive_retryable_errors = 0u32;
+                    let mut consecutive_fetch_errors = 0u32;
                     loop {
                         // Check shutdown flag before fetching
                         if shutdown.load(Ordering::Relaxed) {
@@ -408,7 +408,7 @@ impl Runtime {
                         {
                             Ok(Some((item, lock_token, attempt_count))) => {
                                 // Reset error counter on success
-                                consecutive_retryable_errors = 0;
+                                consecutive_fetch_errors = 0;
 
                                 // Runtime-side compatibility check (defense-in-depth).
                                 // Even if the provider filter missed this item (bug, provider ignoring filter),
@@ -438,9 +438,14 @@ impl Runtime {
                                     // a single runtime encounters incompatible items. The item still
                                     // reaches max_attempts quickly (e.g., 10 × 1s = 10s) while
                                     // avoiding CPU burn and starvation of compatible work items.
+                                    let delay = super::jitter_delay(
+                                        Duration::from_secs(1),
+                                        attempt_count.max(1),
+                                        &[item.instance.as_bytes(), b"unsupported-version"],
+                                    );
                                     let _ = rt
                                         .history_store
-                                        .abandon_orchestration_item(&lock_token, Some(Duration::from_secs(1)), false)
+                                        .abandon_orchestration_item(&lock_token, Some(delay), false)
                                         .await;
                                     continue;
                                 }
@@ -482,23 +487,39 @@ impl Runtime {
                             }
                             Ok(None) => {
                                 // No work available - reset error counter
-                                consecutive_retryable_errors = 0;
+                                consecutive_fetch_errors = 0;
                             }
                             Err(e) => {
                                 if e.is_retryable() {
-                                    // Exponential backoff for retryable errors (database locks, etc.)
-                                    consecutive_retryable_errors += 1;
-                                    let backoff_ms = (100 * 2_u64.pow(consecutive_retryable_errors)).min(3000);
-                                    warn!(
-                                        "Error fetching orchestration item (retryable, attempt {}): {:?}, backing off {}ms",
-                                        consecutive_retryable_errors, e, backoff_ms
+                                    consecutive_fetch_errors += 1;
+                                    let delay = super::provider_retry_delay(
+                                        Duration::from_millis(200),
+                                        Duration::from_secs(3),
+                                        consecutive_fetch_errors,
+                                        &[worker_id.as_bytes(), b"fetch-orchestration"],
                                     );
-                                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                    warn!(
+                                        attempt = consecutive_fetch_errors,
+                                        retry_in_ms = delay.as_millis(),
+                                        error = %e,
+                                        "Error fetching orchestration item; retrying"
+                                    );
+                                    tokio::time::sleep(delay).await;
                                 } else {
-                                    // Permanent errors - log and continue with normal polling
-                                    warn!("Error fetching orchestration item (permanent): {:?}", e);
-                                    consecutive_retryable_errors = 0;
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    consecutive_fetch_errors += 1;
+                                    let delay = super::provider_retry_delay(
+                                        Duration::from_millis(200),
+                                        Duration::from_secs(3),
+                                        consecutive_fetch_errors,
+                                        &[worker_id.as_bytes(), b"fetch-orchestration-permanent"],
+                                    );
+                                    warn!(
+                                        attempt = consecutive_fetch_errors,
+                                        retry_in_ms = delay.as_millis(),
+                                        error = %e,
+                                        "Error fetching orchestration item (permanent)"
+                                    );
+                                    tokio::time::sleep(delay).await;
                                 }
                                 continue;
                             }
@@ -565,17 +586,22 @@ impl Runtime {
         // so the count keeps growing. Once attempt_count exceeds max_attempts (checked above),
         // the poison path terminates it.
         if let Some(ref error) = item.history_error {
-            // Fixed 1s backoff gives another node (which may run a newer duroxide
+            // A short backoff gives another node (which may run a newer duroxide
             // version capable of deserialising these events) a window to pick it up,
             // without the exponential growth that would slow down the poison path.
-            let backoff = Duration::from_secs(1);
+            let backoff = super::jitter_delay(
+                Duration::from_secs(1),
+                attempt_count.max(1),
+                &[instance.as_bytes(), b"history-deserialization"],
+            );
             let remaining = self.options.max_attempts.saturating_sub(attempt_count);
             warn!(
                 instance = %instance,
                 error = %error,
                 attempt = attempt_count,
                 max_attempts = self.options.max_attempts,
-                "History deserialization failed, abandoning with 1s backoff ({}/{}, {} remaining)",
+                backoff_ms = backoff.as_millis(),
+                "History deserialization failed, abandoning with backoff ({}/{}, {} remaining)",
                 attempt_count, self.options.max_attempts, remaining,
             );
             // ignore_attempt = false: keep the incremented attempt_count so we eventually reach poison
@@ -684,7 +710,11 @@ impl Runtime {
                     }
                     Err(OrchestrationProcessingError::UnregisteredOrchestration) => {
                         // Orchestration not registered - abandon with exponential backoff
-                        let backoff = self.options.unregistered_backoff.delay(attempt_count);
+                        let backoff = super::jitter_delay(
+                            self.options.unregistered_backoff.delay(attempt_count),
+                            attempt_count.max(1),
+                            &[instance.as_bytes(), b"unregistered-orchestration"],
+                        );
                         let remaining_attempts = self.options.max_attempts.saturating_sub(attempt_count);
 
                         tracing::warn!(
@@ -1187,12 +1217,21 @@ impl Runtime {
                         return Err(e);
                     }
 
-                    // Retryable error - retry with backoff
                     if attempts < max_attempts {
-                        let backoff_ms = 10u64.saturating_mul(1 << attempts);
-                        warn!(attempts, backoff_ms, error = %e, "ack_orchestration_item failed; retrying");
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         attempts += 1;
+                        let delay = super::provider_retry_delay(
+                            Duration::from_millis(10),
+                            Duration::from_millis(160),
+                            attempts,
+                            &[lock_token.as_bytes(), b"ack-orchestration"],
+                        );
+                        warn!(
+                            attempt = attempts,
+                            retry_in_ms = delay.as_millis(),
+                            error = %e,
+                            "ack_orchestration_item failed; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
                         continue;
                     } else {
                         warn!(attempts, error = %e, "Failed to ack_orchestration_item after max retries");
