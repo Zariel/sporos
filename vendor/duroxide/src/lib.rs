@@ -1484,6 +1484,7 @@ pub struct RetryPolicy {
     /// Retries only occur for activity errors, not timeouts. None = no timeout.
     pub timeout: Option<std::time::Duration>,
     error_filter: Option<fn(&str) -> bool>,
+    jitter_percent: Option<u8>,
 }
 
 impl Default for RetryPolicy {
@@ -1493,6 +1494,7 @@ impl Default for RetryPolicy {
             backoff: BackoffStrategy::default(),
             timeout: None,
             error_filter: None,
+            jitter_percent: None,
         }
     }
 }
@@ -1542,6 +1544,18 @@ impl RetryPolicy {
         self
     }
 
+    /// Apply deterministic downward jitter to each backoff delay.
+    ///
+    /// The percentage sets the size of the jitter window below the calculated
+    /// delay. The orchestration identity and activity invocation provide a
+    /// stable key, so replay always schedules the same timer while separate
+    /// workflow instances do not retry in lockstep.
+    pub fn with_jitter(mut self, percent: u8) -> Self {
+        assert!(percent <= 100, "jitter percentage cannot exceed 100");
+        self.jitter_percent = Some(percent);
+        self
+    }
+
     fn should_retry_error(&self, error: &str) -> bool {
         self.error_filter.is_none_or(|filter| filter(error))
     }
@@ -1549,6 +1563,54 @@ impl RetryPolicy {
     /// Compute delay for given attempt using the configured backoff strategy.
     pub fn delay_for_attempt(&self, attempt: u32) -> std::time::Duration {
         self.backoff.delay_for_attempt(attempt)
+    }
+
+    fn retry_delay(&self, attempt: u32, key: &[&[u8]]) -> std::time::Duration {
+        let delay = self.delay_for_attempt(attempt);
+        let Some(percent) = self.jitter_percent else {
+            return delay;
+        };
+        jitter_delay(delay, percent, key, attempt)
+    }
+}
+
+fn jitter_delay(delay: std::time::Duration, percent: u8, key: &[&[u8]], attempt: u32) -> std::time::Duration {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for part in key {
+        for byte in part.iter().chain([0].iter()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    for byte in attempt.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let delay_nanos = delay.as_nanos();
+    let window = delay_nanos.saturating_mul(u128::from(percent)) / 100;
+    let offset = window.saturating_mul(u128::from(hash)) / u128::from(u64::MAX);
+    let jittered = delay_nanos - window + offset;
+    let seconds = u64::try_from(jittered / 1_000_000_000).expect("jitter cannot make a duration larger");
+    let nanoseconds = u32::try_from(jittered % 1_000_000_000).expect("nanosecond remainder fits u32");
+    std::time::Duration::new(seconds, nanoseconds)
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::*;
+
+    #[test]
+    fn jitter_is_bounded_deterministic_and_instance_specific() {
+        let policy = RetryPolicy::new(3)
+            .with_backoff(BackoffStrategy::Fixed {
+                delay: std::time::Duration::from_secs(10),
+            })
+            .with_jitter(20);
+
+        let first = policy.retry_delay(2, &[b"instance-a", b"activity", b"input"]);
+        assert_eq!(first, policy.retry_delay(2, &[b"instance-a", b"activity", b"input"]));
+        assert_ne!(first, policy.retry_delay(2, &[b"instance-b", b"activity", b"input"]));
+        assert!((std::time::Duration::from_secs(8)..=std::time::Duration::from_secs(10)).contains(&first));
     }
 }
 
@@ -2993,6 +3055,7 @@ impl OrchestrationContext {
     ) -> Result<String, String> {
         let name = name.into();
         let input = input.into();
+        let instance_id = self.instance_id();
         let mut last_error = String::new();
 
         for attempt in 1..=policy.max_attempts {
@@ -3031,7 +3094,8 @@ impl OrchestrationContext {
                                 name, attempt, policy.max_attempts, e
                             ),
                         );
-                        let delay = policy.delay_for_attempt(attempt);
+                        let delay =
+                            policy.retry_delay(attempt, &[instance_id.as_bytes(), name.as_bytes(), input.as_bytes()]);
                         if !delay.is_zero() {
                             self.schedule_timer(delay).await;
                         }
@@ -3100,6 +3164,7 @@ impl OrchestrationContext {
         let name = name.into();
         let input = input.into();
         let session_id = session_id.into();
+        let instance_id = self.instance_id();
         let mut last_error = String::new();
 
         for attempt in 1..=policy.max_attempts {
@@ -3123,7 +3188,7 @@ impl OrchestrationContext {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     last_error = e.clone();
-                    if attempt < policy.max_attempts {
+                    if attempt < policy.max_attempts && policy.should_retry_error(&e) {
                         self.trace(
                             "warn",
                             format!(
@@ -3131,10 +3196,20 @@ impl OrchestrationContext {
                                 name, session_id, attempt, policy.max_attempts, e
                             ),
                         );
-                        let delay = policy.delay_for_attempt(attempt);
+                        let delay = policy.retry_delay(
+                            attempt,
+                            &[
+                                instance_id.as_bytes(),
+                                name.as_bytes(),
+                                session_id.as_bytes(),
+                                input.as_bytes(),
+                            ],
+                        );
                         if !delay.is_zero() {
                             self.schedule_timer(delay).await;
                         }
+                    } else if !policy.should_retry_error(&e) {
+                        return Err(e);
                     }
                 }
             }

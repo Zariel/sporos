@@ -21,8 +21,9 @@ pub(crate) fn activity_retry_policy() -> RetryPolicy {
         .with_backoff(BackoffStrategy::Exponential {
             base: Duration::from_secs(1),
             multiplier: 2.0,
-            max: Duration::from_secs(30),
+            max: Duration::from_secs(5 * 60),
         })
+        .with_jitter(20)
         .with_error_filter(crate::activity_failure::retryable)
 }
 

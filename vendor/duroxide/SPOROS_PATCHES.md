@@ -4,7 +4,7 @@ This directory is based on `duroxide` 0.1.30, published from upstream commit
 `cfe0b8c957ef7ede43c6026ebba0052211de1a49`. The crates.io archive has SHA-256
 `92b17ebe10f702644ad65a9c624b4060023955b4cd145c23ed4c6942b17fdac9`.
 
-Sporos carries seven focused changes:
+Sporos carries eight focused changes:
 
 - expose a `NORMAL`/`FULL` synchronous-mode option, retaining `NORMAL` as the
   upstream-compatible default; and
@@ -20,11 +20,13 @@ Sporos carries seven focused changes:
   recorded start identity without exposing provider storage representation;
   and
 - allow an activity retry policy to apply a deterministic error filter so
-  callers can avoid retrying classified permanent application failures.
+  callers can avoid retrying classified permanent application failures; and
+- apply bounded, deterministic activity-retry jitter keyed by orchestration
+  identity so replay is stable without synchronizing dependency retries.
 
 These changes let Sporos require and inspect `synchronous=FULL`, use one
 connection per SQLite pool to avoid competing writers inside the single-active
 service, ensure an unknown or incompatible migration cannot be hidden during
 startup, reconcile transactional outbox delivery through the provider API, and
-delegate classified retry timing to the durable runtime.
+delegate classified retry timing and jitter to the durable runtime.
 Keep the patch minimal and review it separately whenever Duroxide is upgraded.
