@@ -167,7 +167,13 @@ struct OwnershipLock(File);
 
 impl Drop for OwnershipLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::warn!(
+                service = "sporos",
+                error = %crate::error_report::ErrorReport::new(&error),
+                "failed to release the storage ownership lock"
+            );
+        }
     }
 }
 

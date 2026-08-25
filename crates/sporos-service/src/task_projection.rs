@@ -503,7 +503,7 @@ mod tests {
                 kind: AppErrorKind::OrchestrationFailed,
                 message: crate::activity_failure::permanent(
                     "invalid_candidate_state",
-                    "missing manifest",
+                    &std::io::Error::other("missing manifest"),
                 ),
                 retryable: false,
             },

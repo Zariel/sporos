@@ -175,7 +175,7 @@ impl InjectionExecutor {
             None => None,
         };
         let input: InjectionInput = serde_json::from_str(raw).map_err(|error| {
-            crate::activity_failure::permanent("invalid_injection_input", error)
+            crate::activity_failure::permanent("invalid_injection_input", &error)
         })?;
         let result = match stage {
             Stage::Prepare => self.prepare(&input).await,
@@ -185,7 +185,7 @@ impl InjectionExecutor {
         }
         .map_err(|error| error.activity_failure())?;
         serde_json::to_string(&result)
-            .map_err(|error| crate::activity_failure::permanent("encode_injection_result", error))
+            .map_err(|error| crate::activity_failure::permanent("encode_injection_result", &error))
     }
 
     async fn prepare(&self, input: &InjectionInput) -> Result<StepResult, InjectionError> {
@@ -274,12 +274,28 @@ impl InjectionExecutor {
         .map_err(InjectionError::MaterializerTask)?;
         let (results, outcome) = match results {
             Ok(results) => results,
-            Err(error) => return self.fail(input, materialize_reason(&error)).await,
+            Err(error) => {
+                tracing::warn!(
+                    service = "sporos",
+                    task_id = %encode_hex(&input.task_id),
+                    plan_id = %encode_hex(&input.plan_id),
+                    error = %crate::error_report::ErrorReport::new(&error),
+                    "hardlink materializer could not open its roots"
+                );
+                return self.fail(input, materialize_reason(&error)).await;
+            }
         };
         self.storage
             .persist_links(input, &plan, &results, outcome.is_ok())
             .await?;
         if let Err(error) = outcome {
+            tracing::warn!(
+                service = "sporos",
+                task_id = %encode_hex(&input.task_id),
+                plan_id = %encode_hex(&input.plan_id),
+                error = %crate::error_report::ErrorReport::new(&error),
+                "hardlink materialization stopped"
+            );
             return self.fail(input, materialize_reason(&error)).await;
         }
         Ok(StepResult::Ready)

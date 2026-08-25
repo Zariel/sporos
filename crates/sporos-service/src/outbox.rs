@@ -67,38 +67,48 @@ impl<'a> OutboxDispatcher<'a> {
                     mark_dispatched(self.storage, start.id, token, now_ms).await?;
                     report.dispatched += 1;
                 }
-                Err(error) => match reconcile(&self.client, &start).await? {
-                    ExistingStart::Same => {
-                        mark_dispatched(self.storage, start.id, token, now_ms).await?;
-                        report.dispatched += 1;
+                Err(error) => {
+                    tracing::warn!(
+                        service = "sporos",
+                        outbox_id = start.id,
+                        instance = start.instance_id,
+                        retryable = error.is_retryable(),
+                        error = %crate::error_report::ErrorReport::new(&error),
+                        "outbox start delivery failed; reconciling acceptance"
+                    );
+                    match reconcile(&self.client, &start).await? {
+                        ExistingStart::Same => {
+                            mark_dispatched(self.storage, start.id, token, now_ms).await?;
+                            report.dispatched += 1;
+                        }
+                        ExistingStart::Collision => {
+                            mark_permanent(
+                                self.storage,
+                                start.id,
+                                token,
+                                now_ms,
+                                "duroxide_identity_collision",
+                            )
+                            .await?;
+                            report.permanently_failed += 1;
+                        }
+                        ExistingStart::Missing if error.is_retryable() => {
+                            mark_retry(self.storage, &start, token, now_ms).await?;
+                            report.retrying += 1;
+                        }
+                        ExistingStart::Missing => {
+                            mark_permanent(
+                                self.storage,
+                                start.id,
+                                token,
+                                now_ms,
+                                "duroxide_start_rejected",
+                            )
+                            .await?;
+                            report.permanently_failed += 1;
+                        }
                     }
-                    ExistingStart::Collision => {
-                        mark_permanent(
-                            self.storage,
-                            start.id,
-                            token,
-                            now_ms,
-                            "duroxide_identity_collision",
-                        )
-                        .await?;
-                        report.permanently_failed += 1;
-                    }
-                    ExistingStart::Missing if error.is_retryable() => {
-                        mark_retry(self.storage, &start, token, now_ms).await?;
-                        report.retrying += 1;
-                    }
-                    ExistingStart::Missing => {
-                        mark_permanent(
-                            self.storage,
-                            start.id,
-                            token,
-                            now_ms,
-                            "duroxide_start_rejected",
-                        )
-                        .await?;
-                        report.permanently_failed += 1;
-                    }
-                },
+                }
             }
         }
         Ok(report)

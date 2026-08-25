@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use sporos_service::app::{init_logging, run};
+use sporos_service::app::{display_error, init_logging, run};
 use sporos_service::config::Config;
 
 #[tokio::main]
@@ -8,18 +8,18 @@ async fn main() -> ExitCode {
     let config = match Config::load() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("configuration error: {error}");
+            eprintln!("configuration error: {}", display_error(&error));
             return ExitCode::FAILURE;
         }
     };
     if let Err(error) = init_logging(&config.logging) {
-        eprintln!("logging error: {error}");
+        eprintln!("logging error: {}", display_error(&error));
         return ExitCode::FAILURE;
     }
     match run(config, shutdown_signal()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!(service = "sporos", error = %error, "service stopped");
+            tracing::error!(service = "sporos", error = %display_error(&error), "service stopped");
             ExitCode::FAILURE
         }
     }
@@ -34,12 +34,16 @@ async fn shutdown_signal() {
         tokio::select! {
             _ = terminate.recv() => {}
             result = tokio::signal::ctrl_c() => {
-                let _ = result;
+                if let Err(error) = result {
+                    tracing::error!(service = "sporos", error = %display_error(&error), "SIGINT listener failed");
+                }
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(service = "sporos", error = %display_error(&error), "shutdown signal listener failed");
+        }
     }
 }

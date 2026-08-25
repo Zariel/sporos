@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::StatusCode;
 use serde_json::Value;
+use sporos_service::app::display_error;
 use sporos_service::config::Secret;
 
 #[derive(Debug, Parser)]
@@ -119,7 +120,7 @@ async fn main() -> ExitCode {
     match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("sporosctl: {error}");
+            eprintln!("sporosctl: {}", display_error(error.as_ref()));
             ExitCode::FAILURE
         }
     }

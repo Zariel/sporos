@@ -47,14 +47,14 @@ impl TaskControl {
             let control = self.clone();
             async move {
                 let input: CancellationInput = serde_json::from_str(&input).map_err(|error| {
-                    crate::activity_failure::permanent("invalid_cancellation_input", error)
+                    crate::activity_failure::permanent("invalid_cancellation_input", &error)
                 })?;
                 let done = control
                     .reconcile(&input)
                     .await
                     .map_err(|error| error.activity_failure())?;
                 serde_json::to_string(&CancellationStep { done }).map_err(|error| {
-                    crate::activity_failure::permanent("encode_cancellation_result", error)
+                    crate::activity_failure::permanent("encode_cancellation_result", &error)
                 })
             }
         })

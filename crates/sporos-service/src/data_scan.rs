@@ -51,14 +51,14 @@ impl DataScanExecutor {
             let executor = self.clone();
             async move {
                 let input: ScanInput = serde_json::from_str(&input).map_err(|error| {
-                    crate::activity_failure::permanent("invalid_data_scan_input", error)
+                    crate::activity_failure::permanent("invalid_data_scan_input", &error)
                 })?;
                 let step = executor
                     .scan_page(&input, now_ms())
                     .await
                     .map_err(|error| error.activity_failure())?;
                 serde_json::to_string(&step).map_err(|error| {
-                    crate::activity_failure::permanent("encode_data_scan_result", error)
+                    crate::activity_failure::permanent("encode_data_scan_result", &error)
                 })
             }
         })
@@ -71,6 +71,12 @@ impl DataScanExecutor {
         match safe_root(&root.path) {
             Ok(()) => {}
             Err(ScanFsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    service = "sporos",
+                    root = input.root_name,
+                    error = %crate::error_report::ErrorReport::new(&error),
+                    "data root is unavailable"
+                );
                 sqlx::query(
                     "UPDATE sporos_data_source SET available = 0, updated_at = ?
                      WHERE root_name = ?",
@@ -81,7 +87,15 @@ impl DataScanExecutor {
                 .await?;
                 return self.finish(input, now, "root_unavailable", false).await;
             }
-            Err(_) => return self.finish(input, now, "unsafe_root", true).await,
+            Err(error) => {
+                tracing::warn!(
+                    service = "sporos",
+                    root = input.root_name,
+                    error = %crate::error_report::ErrorReport::new(&error),
+                    "data root failed its safety check"
+                );
+                return self.finish(input, now, "unsafe_root", true).await;
+            }
         };
         let directory = sqlx::query(
             "SELECT relative_path, depth, cursor_name

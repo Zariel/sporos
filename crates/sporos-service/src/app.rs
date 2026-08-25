@@ -22,6 +22,7 @@ use crate::candidate_workflow::SOURCE_COMPLETED_EVENT;
 use crate::config::{Config, LogFormat, Logging};
 use crate::data_scan::DataScanExecutor;
 use crate::engine::registries_with_limits;
+use crate::error_report::ErrorReport;
 use crate::execution::ExecutionLimits;
 use crate::http::{HttpState, router};
 use crate::outbox::OutboxDispatcher;
@@ -54,6 +55,13 @@ pub fn init_logging(config: &Logging) -> Result<(), AppError> {
             .try_init()
             .map_err(AppError::LogSubscriber),
     }
+}
+
+/// Format an error with its complete source chain for operator-facing output.
+pub fn display_error<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl std::fmt::Display + 'a {
+    ErrorReport::new(error)
 }
 
 pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(), AppError> {
@@ -103,11 +111,11 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
                 .map(|client| client.with_limiter(execution.indexer()))
         })
         .transpose()
-        .map_err(|error| AppError::ProwlarrConfig(error.to_string()))?;
+        .map_err(|error| AppError::ProwlarrConfig(Box::new(error)))?;
     let arr = (!config.arr.is_empty())
         .then(|| ArrEnricher::new(Arc::clone(&storage), &config.arr))
         .transpose()
-        .map_err(|error| AppError::ArrConfig(error.to_string()))?;
+        .map_err(|error| AppError::ArrConfig(Box::new(error)))?;
     let provider = storage.duroxide_provider();
     let client = Client::new(provider.clone());
     OutboxDispatcher::new(&storage, client.clone(), config.limits.outbox_batch_size)
@@ -371,7 +379,7 @@ async fn projection_repair_loop(
                     Ok(_) => {}
                     Err(error) => warn!(
                         service = "sporos",
-                        error = %error,
+                        error = %ErrorReport::new(&error),
                         "task projection repair failed"
                     ),
                 }
@@ -399,9 +407,9 @@ async fn prowlarr_loop(
                 match client.indexers().await {
                     Ok(indexers) => match storage.project_indexers(&indexers, now_ms()).await {
                         Ok(()) => info!(service = "sporos", count = indexers.len(), "Prowlarr indexers refreshed"),
-                        Err(error) => warn!(service = "sporos", error = %error, "Prowlarr indexer projection failed"),
+                        Err(error) => warn!(service = "sporos", error = %ErrorReport::new(&error), "Prowlarr indexer projection failed"),
                     },
-                    Err(error) => warn!(service = "sporos", error = %error, "Prowlarr indexer refresh failed"),
+                    Err(error) => warn!(service = "sporos", error = %ErrorReport::new(&error), "Prowlarr indexer refresh failed"),
                 }
             }
         }
@@ -442,7 +450,7 @@ async fn qbit_loop(
                             );
                         }
                         Err(error) => {
-                            warn!(service = "sporos", error = %error, "qBittorrent contract unavailable");
+                            warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent contract unavailable");
                             continue;
                         }
                     }
@@ -460,14 +468,14 @@ async fn qbit_loop(
                                 finish_qbit_report(&synchronizer, &storage, &client, &report).await;
                             }
                             Err(error) => {
-                                warn!(service = "sporos", error = %error, "requested qBittorrent inventory reconciliation failed");
+                                warn!(service = "sporos", error = %ErrorReport::new(&error), "requested qBittorrent inventory reconciliation failed");
                                 continue;
                             }
                         }
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        warn!(service = "sporos", error = %error, "qBittorrent inventory state unavailable");
+                        warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent inventory state unavailable");
                         continue;
                     }
                 }
@@ -484,7 +492,7 @@ async fn qbit_loop(
                         }
                         finish_qbit_report(&synchronizer, &storage, &client, &report).await;
                     }
-                    Err(error) => warn!(service = "sporos", error = %error, "qBittorrent inventory sync failed"),
+                    Err(error) => warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent inventory sync failed"),
                 }
             }
             _ = full_interval.tick(), if contract_validated => {
@@ -498,7 +506,7 @@ async fn qbit_loop(
                         );
                         finish_qbit_report(&synchronizer, &storage, &client, &report).await;
                     }
-                    Err(error) => warn!(service = "sporos", error = %error, "qBittorrent inventory reconciliation failed"),
+                    Err(error) => warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent inventory reconciliation failed"),
                 }
             }
         }
@@ -512,7 +520,7 @@ async fn finish_qbit_report(
     report: &crate::qbit_sync::SyncReport,
 ) {
     if let Err(error) = synchronizer.refresh_manifests(8, now_ms()).await {
-        warn!(service = "sporos", error = %error, "qBittorrent manifest refresh failed");
+        warn!(service = "sporos", error = %ErrorReport::new(&error), "qBittorrent manifest refresh failed");
         return;
     }
     for completion in &report.completions {
@@ -522,7 +530,7 @@ async fn finish_qbit_report(
         {
             Ok(instances) => instances,
             Err(error) => {
-                warn!(service = "sporos", error = %error, "candidate completion waiters unavailable");
+                warn!(service = "sporos", error = %ErrorReport::new(&error), "candidate completion waiters unavailable");
                 continue;
             }
         };
@@ -533,7 +541,7 @@ async fn finish_qbit_report(
             {
                 // The durable reconciliation timer remains authoritative if advisory
                 // completion delivery is temporarily unavailable.
-                warn!(service = "sporos", instance, error = %error, "candidate completion signal failed");
+                warn!(service = "sporos", instance, error = %ErrorReport::new(&error), "candidate completion signal failed");
             }
         }
     }
@@ -571,7 +579,7 @@ async fn dispatch_loop(
                     Ok(_) => {}
                     Err(error) => {
                         readiness.set_ready(false);
-                        error!(service = "sporos", error = %error, "outbox dispatcher unavailable");
+                        error!(service = "sporos", error = %ErrorReport::new(&error), "outbox dispatcher unavailable");
                     }
                 }
             }
@@ -601,9 +609,9 @@ pub enum AppError {
     #[error("invalid qBittorrent client configuration")]
     QbittorrentConfig(#[source] QbittorrentConfigError),
     #[error("invalid Prowlarr client configuration")]
-    ProwlarrConfig(String),
-    #[error("invalid Arr client configuration: {0}")]
-    ArrConfig(String),
+    ProwlarrConfig(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("invalid Arr client configuration")]
+    ArrConfig(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("failed to bind the HTTP listener")]
     Bind(#[source] std::io::Error),
     #[error("failed to inspect the HTTP listener")]

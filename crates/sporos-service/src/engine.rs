@@ -66,8 +66,21 @@ pub(crate) fn registries_with_limits(
                 async move {
                     // Projection failure is deliberately best-effort: Duroxide history is
                     // authoritative and repair can recreate this operator-facing state.
-                    if let Ok(update) = serde_json::from_str::<ProjectionActivity>(&input) {
-                        let _ = storage.project_task(&update.into()).await;
+                    match serde_json::from_str::<ProjectionActivity>(&input) {
+                        Ok(update) => {
+                            if let Err(error) = storage.project_task(&update.into()).await {
+                                tracing::warn!(
+                                    service = "sporos",
+                                    error = %crate::error_report::ErrorReport::new(&error),
+                                    "best-effort task projection failed"
+                                );
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            service = "sporos",
+                            error = %crate::error_report::ErrorReport::new(&error),
+                            "best-effort task projection input is invalid"
+                        ),
                     }
                     Ok(input)
                 }
@@ -80,7 +93,7 @@ pub(crate) fn registries_with_limits(
                 let completion_search = completion_search.clone();
                 async move {
                     let input: CompletionInput = serde_json::from_str(&input).map_err(|error| {
-                        crate::activity_failure::permanent("invalid_completion_input", error)
+                        crate::activity_failure::permanent("invalid_completion_input", &error)
                     })?;
                     if let Some(search) = completion_search.as_ref() {
                         search
@@ -91,7 +104,7 @@ pub(crate) fn registries_with_limits(
                         storage.project_completion(&input).await.map_err(|error| {
                             crate::activity_failure::transient(
                                 "completion_projection_failed",
-                                error,
+                                &error,
                             )
                         })?;
                     }
@@ -111,14 +124,14 @@ pub(crate) fn registries_with_limits(
                     };
                     let input: crate::candidate::CandidateWorkflowInput =
                         serde_json::from_str(&input).map_err(|error| {
-                            crate::activity_failure::permanent("invalid_candidate_input", error)
+                            crate::activity_failure::permanent("invalid_candidate_input", &error)
                         })?;
                     let result = storage
                         .evaluate_candidate(&input, now_ms())
                         .await
                         .map_err(|error| error.activity_failure())?;
                     serde_json::to_string(&result).map_err(|error| {
-                        crate::activity_failure::permanent("encode_candidate_result", error)
+                        crate::activity_failure::permanent("encode_candidate_result", &error)
                     })
                 }
             },
@@ -305,9 +318,10 @@ mod tests {
                     let attempts = Arc::clone(&transient_counter);
                     async move {
                         if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                            let error = std::io::Error::other("retry");
                             Err(crate::activity_failure::transient(
                                 "fixture_unavailable",
-                                "retry",
+                                &error,
                             ))
                         } else {
                             Ok("complete".to_owned())
@@ -321,9 +335,10 @@ mod tests {
                     let attempts = Arc::clone(&permanent_counter);
                     async move {
                         attempts.fetch_add(1, Ordering::SeqCst);
+                        let error = std::io::Error::other("stop");
                         Err(crate::activity_failure::permanent(
                             "invalid_fixture",
-                            "stop",
+                            &error,
                         ))
                     }
                 },

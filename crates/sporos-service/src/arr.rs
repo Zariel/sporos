@@ -167,8 +167,14 @@ impl ArrEnricher {
                                 .await?;
                             identity
                         }
-                        Err(_) => {
+                        Err(error) => {
                             report.failed += 1;
+                            tracing::warn!(
+                                service = "sporos",
+                                arr_instance = instance.name,
+                                error = %crate::error_report::ErrorReport::new(&error),
+                                "advisory Arr enrichment failed"
+                            );
                             continue;
                         }
                     }

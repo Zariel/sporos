@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::error::Error;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,11 +16,11 @@ struct ActivityFailure {
     message: String,
 }
 
-pub(crate) fn transient(code: &str, error: impl Display) -> String {
+pub(crate) fn transient(code: &str, error: &(dyn Error + 'static)) -> String {
     encode(FailureClass::Transient, code, error)
 }
 
-pub(crate) fn permanent(code: &str, error: impl Display) -> String {
+pub(crate) fn permanent(code: &str, error: &(dyn Error + 'static)) -> String {
     encode(FailureClass::Permanent, code, error)
 }
 
@@ -34,11 +34,11 @@ pub(crate) fn permanent_reason(raw: &str) -> Option<String> {
     matches!(failure.class, FailureClass::Permanent).then_some(failure.code)
 }
 
-fn encode(class: FailureClass, code: &str, error: impl Display) -> String {
+fn encode(class: FailureClass, code: &str, error: &(dyn Error + 'static)) -> String {
     serde_json::to_string(&ActivityFailure {
         class,
         code: code.to_owned(),
-        message: error.to_string(),
+        message: crate::error_report::ErrorReport::new(error).to_string(),
     })
     .expect("activity failure fields are serializable")
 }
@@ -49,8 +49,10 @@ mod tests {
 
     #[test]
     fn classifies_structured_failures() {
-        let transient = transient("database_unavailable", "busy");
-        let permanent = permanent("invalid_input", "bad payload");
+        let transient_error = std::io::Error::other("busy");
+        let permanent_error = std::io::Error::other("bad payload");
+        let transient = transient("database_unavailable", &transient_error);
+        let permanent = permanent("invalid_input", &permanent_error);
 
         assert!(retryable(&transient));
         assert!(!retryable(&permanent));
@@ -60,4 +62,19 @@ mod tests {
             Some("invalid_input")
         );
     }
+
+    #[test]
+    fn preserves_the_complete_error_chain() {
+        let source = std::io::Error::other("database is locked");
+        let error = FixtureError(source);
+
+        let encoded = transient("database_unavailable", &error);
+        let failure: ActivityFailure = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(failure.message, "projection failed: database is locked");
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("projection failed")]
+    struct FixtureError(#[source] std::io::Error);
 }

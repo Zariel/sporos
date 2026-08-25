@@ -160,14 +160,14 @@ impl SearchExecutor {
                 let executor = executor.clone();
                 async move {
                     let input: SearchInput = serde_json::from_str(&input).map_err(|error| {
-                        crate::activity_failure::permanent("invalid_search_input", error)
+                        crate::activity_failure::permanent("invalid_search_input", &error)
                     })?;
                     let outcome = executor
                         .execute(&input, now_ms())
                         .await
                         .map_err(|error| error.activity_failure())?;
                     serde_json::to_string(&outcome).map_err(|error| {
-                        crate::activity_failure::permanent("encode_search_result", error)
+                        crate::activity_failure::permanent("encode_search_result", &error)
                     })
                 }
             },
@@ -185,13 +185,13 @@ impl SearchExecutor {
                         None => None,
                     };
                     let input: BackfillInput = serde_json::from_str(&input).map_err(|error| {
-                        crate::activity_failure::permanent("invalid_backfill_input", error)
+                        crate::activity_failure::permanent("invalid_backfill_input", &error)
                     })?;
                     let page = produce_page(&storage, &input, now_ms())
                         .await
                         .map_err(|error| error.activity_failure())?;
                     serde_json::to_string(&page).map_err(|error| {
-                        crate::activity_failure::permanent("encode_backfill_result", error)
+                        crate::activity_failure::permanent("encode_backfill_result", &error)
                     })
                 }
             },
@@ -238,7 +238,14 @@ impl SearchExecutor {
         if let Some(arr) = &self.arr {
             // Enrichment is advisory: filename and file-tree matching remains available
             // while an Arr instance is down.
-            let _ = arr.enrich_source(input.source_id, now).await;
+            if let Err(error) = arr.enrich_source(input.source_id, now).await {
+                tracing::warn!(
+                    service = "sporos",
+                    source_id = %hex(&input.source_id),
+                    error = %crate::error_report::ErrorReport::new(&error),
+                    "advisory Arr enrichment could not update its cache"
+                );
+            }
         }
         let Some(source) = self.load_source(input).await? else {
             self.finish(input, now, "source_unavailable", true, 0, 0)
@@ -297,7 +304,16 @@ impl SearchExecutor {
                 Err(error @ ProwlarrError::RateLimited { .. }) => {
                     return self.dependency_error(input, now, error).await;
                 }
-                Err(ProwlarrError::UnsafeDownloadUrl | ProwlarrError::RedirectRejected) => {
+                Err(
+                    error @ (ProwlarrError::UnsafeDownloadUrl | ProwlarrError::RedirectRejected),
+                ) => {
+                    tracing::warn!(
+                        service = "sporos",
+                        indexer_id = input.indexer_id,
+                        result_ordinal = ordinal,
+                        error = %crate::error_report::ErrorReport::new(&error),
+                        "Prowlarr candidate download rejected"
+                    );
                     self.summarize(
                         input,
                         ordinal,
@@ -310,7 +326,17 @@ impl SearchExecutor {
                     .await?;
                     continue;
                 }
-                Err(_) => {
+                Err(error) if retryable_prowlarr(&error) => {
+                    return self.dependency_error(input, now, error).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        service = "sporos",
+                        indexer_id = input.indexer_id,
+                        result_ordinal = ordinal,
+                        error = %crate::error_report::ErrorReport::new(&error),
+                        "Prowlarr candidate download failed permanently"
+                    );
                     self.summarize(
                         input,
                         ordinal,
