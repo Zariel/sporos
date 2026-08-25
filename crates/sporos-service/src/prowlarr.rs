@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use crate::config::Prowlarr;
 use crate::storage::Storage;
 
 const MAX_INDEXER_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TAG_BYTES: usize = 1024 * 1024;
 const MAX_TORZNAB_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -25,8 +26,8 @@ pub(crate) struct ProwlarrClient {
     client: reqwest::Client,
     base_url: Url,
     api_key: HeaderValue,
-    include_tags: BTreeSet<i64>,
-    exclude_tags: BTreeSet<i64>,
+    include_tags: BTreeSet<String>,
+    exclude_tags: BTreeSet<String>,
     require_proxy_downloads: bool,
     max_results: usize,
     max_torrent_bytes: usize,
@@ -49,8 +50,8 @@ impl ProwlarrClient {
                 .map_err(ProwlarrError::Client)?,
             base_url: settings.url.clone(),
             api_key,
-            include_tags: settings.include_tags.iter().copied().collect(),
-            exclude_tags: settings.exclude_tags.iter().copied().collect(),
+            include_tags: settings.include_tags.iter().cloned().collect(),
+            exclude_tags: settings.exclude_tags.iter().cloned().collect(),
             require_proxy_downloads: settings.require_proxy_downloads,
             max_results: settings.max_results_per_query,
             max_torrent_bytes,
@@ -64,6 +65,7 @@ impl ProwlarrClient {
     }
 
     pub(crate) async fn indexers(&self) -> Result<Vec<ProjectedIndexer>, ProwlarrError> {
+        let (include_tags, exclude_tags) = self.tag_ids().await?;
         let response = self
             .get(self.base_url.join("api/v1/indexer").expect("fixed path"))
             .await?;
@@ -72,8 +74,31 @@ impl ProwlarrClient {
             .map_err(|source| ProwlarrError::Malformed("indexer projection", source))?;
         resources
             .into_iter()
-            .map(|resource| self.project(resource))
+            .map(|resource| self.project(resource, &include_tags, &exclude_tags))
             .collect()
+    }
+
+    async fn tag_ids(&self) -> Result<(BTreeSet<i64>, BTreeSet<i64>), ProwlarrError> {
+        if self.include_tags.is_empty() && self.exclude_tags.is_empty() {
+            return Ok((BTreeSet::new(), BTreeSet::new()));
+        }
+        let response = self
+            .get(self.base_url.join("api/v1/tag").expect("fixed path"))
+            .await?;
+        let body = checked_body(response, MAX_TAG_BYTES).await?;
+        let resources: Vec<TagResource> = serde_json::from_slice(&body)
+            .map_err(|source| ProwlarrError::Malformed("tag catalogue", source))?;
+        let mut ids_by_label = BTreeMap::<String, Vec<i64>>::new();
+        for resource in resources {
+            ids_by_label
+                .entry(resource.label)
+                .or_default()
+                .push(resource.id);
+        }
+        Ok((
+            resolve_tag_ids(&self.include_tags, &ids_by_label)?,
+            resolve_tag_ids(&self.exclude_tags, &ids_by_label)?,
+        ))
     }
 
     pub(crate) async fn search(
@@ -159,7 +184,12 @@ impl ProwlarrClient {
             .map_err(ProwlarrError::Request)
     }
 
-    fn project(&self, resource: IndexerResource) -> Result<ProjectedIndexer, ProwlarrError> {
+    fn project(
+        &self,
+        resource: IndexerResource,
+        include_tags: &BTreeSet<i64>,
+        exclude_tags: &BTreeSet<i64>,
+    ) -> Result<ProjectedIndexer, ProwlarrError> {
         let name = resource
             .name
             .filter(|name| !name.is_empty())
@@ -173,11 +203,9 @@ impl ProwlarrClient {
             Some("search_unsupported")
         } else if self.require_proxy_downloads && resource.redirect {
             Some("redirect_enabled")
-        } else if tags.iter().any(|tag| self.exclude_tags.contains(tag)) {
+        } else if tags.iter().any(|tag| exclude_tags.contains(tag)) {
             Some("excluded_tag")
-        } else if !self.include_tags.is_empty()
-            && !tags.iter().any(|tag| self.include_tags.contains(tag))
-        {
+        } else if !include_tags.is_empty() && !tags.iter().any(|tag| include_tags.contains(tag)) {
             Some("missing_include_tag")
         } else if resource
             .status
@@ -208,6 +236,20 @@ impl ProwlarrClient {
     }
 }
 
+fn resolve_tag_ids(
+    labels: &BTreeSet<String>,
+    ids_by_label: &BTreeMap<String, Vec<i64>>,
+) -> Result<BTreeSet<i64>, ProwlarrError> {
+    labels
+        .iter()
+        .map(|label| match ids_by_label.get(label).map(Vec::as_slice) {
+            Some([id]) => Ok(*id),
+            Some(_) => Err(ProwlarrError::AmbiguousTag(label.clone())),
+            None => Err(ProwlarrError::UnknownTag(label.clone())),
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IndexerResource {
@@ -226,6 +268,12 @@ struct IndexerResource {
     tags: Option<Vec<i64>>,
     capabilities: Option<Value>,
     status: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TagResource {
+    id: i64,
+    label: String,
 }
 
 pub(crate) struct ProjectedIndexer {
@@ -438,6 +486,10 @@ pub(crate) enum ProwlarrError {
     Malformed(&'static str, #[source] serde_json::Error),
     #[error("Prowlarr response omitted {0}")]
     MalformedField(&'static str),
+    #[error("configured Prowlarr tag {0:?} does not exist")]
+    UnknownTag(String),
+    #[error("configured Prowlarr tag {0:?} resolves to multiple IDs")]
+    AmbiguousTag(String),
     #[error("Prowlarr download URL is not a same-origin proxy URL")]
     UnsafeDownloadUrl,
     #[error("Prowlarr download redirect was rejected")]
@@ -454,6 +506,34 @@ pub(crate) enum ProwlarrError {
 mod tests {
     use super::*;
     use sporos_model::{NormalizedTitle, ReleaseDescriptor};
+
+    #[test]
+    fn tag_labels_resolve_to_internal_ids() {
+        let labels = BTreeSet::from(["sporos".to_owned(), "trusted".to_owned()]);
+        let catalogue = BTreeMap::from([
+            ("sporos".to_owned(), vec![4]),
+            ("trusted".to_owned(), vec![9]),
+        ]);
+
+        assert_eq!(
+            resolve_tag_ids(&labels, &catalogue).unwrap(),
+            BTreeSet::from([4, 9])
+        );
+    }
+
+    #[test]
+    fn unresolved_or_ambiguous_tag_labels_fail_closed() {
+        let unknown =
+            resolve_tag_ids(&BTreeSet::from(["missing".to_owned()]), &BTreeMap::new()).unwrap_err();
+        assert!(matches!(unknown, ProwlarrError::UnknownTag(label) if label == "missing"));
+
+        let ambiguous = resolve_tag_ids(
+            &BTreeSet::from(["sporos".to_owned()]),
+            &BTreeMap::from([("sporos".to_owned(), vec![4, 7])]),
+        )
+        .unwrap_err();
+        assert!(matches!(ambiguous, ProwlarrError::AmbiguousTag(label) if label == "sporos"));
+    }
 
     #[test]
     fn query_uses_only_advertised_capabilities() {

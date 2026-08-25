@@ -87,8 +87,8 @@ pub struct Prowlarr {
     pub api_key: Secret,
     pub request_timeout: Duration,
     pub refresh_interval: Duration,
-    pub include_tags: Vec<i64>,
-    pub exclude_tags: Vec<i64>,
+    pub include_tags: Vec<String>,
+    pub exclude_tags: Vec<String>,
     pub require_proxy_downloads: bool,
     pub max_results_per_query: usize,
 }
@@ -266,8 +266,8 @@ struct RawProwlarr {
     request_timeout: Duration,
     #[serde(with = "duration")]
     refresh_interval: Duration,
-    include_tags: Vec<i64>,
-    exclude_tags: Vec<i64>,
+    include_tags: Vec<String>,
+    exclude_tags: Vec<String>,
     require_proxy_downloads: bool,
     max_results_per_query: usize,
 }
@@ -1539,8 +1539,8 @@ mod tests {
                 api_key = "prowlarr-secret"
                 request_timeout = "15s"
                 refresh_interval = "2m"
-                include_tags = [1, 2]
-                exclude_tags = [3]
+                include_tags = ["sporos", "trusted"]
+                exclude_tags = ["disabled"]
                 require_proxy_downloads = true
                 max_results_per_query = 25
             "#,
@@ -1551,8 +1551,8 @@ mod tests {
         assert_eq!(prowlarr.url.as_str(), "http://prowlarr:9696/base/");
         assert_eq!(prowlarr.request_timeout, Duration::from_secs(15));
         assert_eq!(prowlarr.refresh_interval, Duration::from_secs(120));
-        assert_eq!(prowlarr.include_tags, [1, 2]);
-        assert_eq!(prowlarr.exclude_tags, [3]);
+        assert_eq!(prowlarr.include_tags, ["sporos", "trusted"]);
+        assert_eq!(prowlarr.exclude_tags, ["disabled"]);
         assert_eq!(prowlarr.max_results_per_query, 25);
         assert!(!format!("{prowlarr:?}").contains("prowlarr-secret"));
     }

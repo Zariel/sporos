@@ -20,6 +20,10 @@ autobrr and admin API routes. Leaving it unset disables API authentication.
 requests without an `Authorization` header. Prowlarr and each configured Arr
 instance require an API key.
 
+Prowlarr `include_tags` and `exclude_tags` contain tag labels, not Prowlarr's
+internal numeric tag IDs. Every configured label must resolve uniquely when the
+indexer catalogue is refreshed.
+
 ```console
 SPOROS__AUTH__API_KEY=sporos-secret
 SPOROS__QBITTORRENT__API_KEY=qbt_example
@@ -55,7 +59,7 @@ database_batch_size = 200
 url = "http://prowlarr:9696"
 request_timeout = "15s"
 refresh_interval = "5m"
-include_tags = []
+include_tags = ["sporos"]
 exclude_tags = []
 require_proxy_downloads = true
 max_results_per_query = 100

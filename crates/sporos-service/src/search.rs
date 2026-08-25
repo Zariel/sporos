@@ -1119,6 +1119,8 @@ fn retryable_prowlarr(error: &ProwlarrError) -> bool {
         | ProwlarrError::ResponseTooLarge(_)
         | ProwlarrError::Malformed(_, _)
         | ProwlarrError::MalformedField(_)
+        | ProwlarrError::UnknownTag(_)
+        | ProwlarrError::AmbiguousTag(_)
         | ProwlarrError::UnsafeDownloadUrl
         | ProwlarrError::RedirectRejected
         | ProwlarrError::Torznab(_)
