@@ -159,6 +159,7 @@ struct AutobrrCheckRequest {
     torrent_name: String,
     size: Option<u64>,
     indexer: Option<String>,
+    indexer_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,10 +194,10 @@ async fn autobrr_check(
             request_id,
         ));
     }
-    if request
-        .indexer
-        .as_ref()
-        .is_some_and(|value| value.len() > 128)
+    if [&request.indexer, &request.indexer_name]
+        .into_iter()
+        .flatten()
+        .any(|value| value.len() > 128)
     {
         tracing::info!(
             service = "sporos",
@@ -209,7 +210,7 @@ async fn autobrr_check(
             StatusCode::BAD_REQUEST,
             "invalid_indexer",
             "Invalid indexer",
-            "indexer must not exceed 128 UTF-8 bytes",
+            "indexer and indexerName must not exceed 128 UTF-8 bytes",
             request_id,
         ));
     }
@@ -218,7 +219,8 @@ async fn autobrr_check(
         service = "sporos",
         request_id = %request_id.0,
         announcement = %request.torrent_name,
-        indexer = request.indexer.as_deref().unwrap_or(""),
+        tracker = request.indexer.as_deref().unwrap_or(""),
+        tracker_name = request.indexer_name.as_deref().unwrap_or(""),
         announced_size = request.size.unwrap_or_default(),
         size_known = request.size.is_some(),
         normalized_title = release.primary_title.as_str(),
@@ -314,7 +316,8 @@ async fn autobrr_check(
             service = "sporos",
             request_id = %request_id.0,
             announcement = %request.torrent_name,
-            indexer = request.indexer.as_deref().unwrap_or(""),
+            tracker = request.indexer.as_deref().unwrap_or(""),
+            tracker_name = request.indexer_name.as_deref().unwrap_or(""),
             normalized_title = release.primary_title.as_str(),
             video_kind = ?release.kind,
             decision = "reject",
@@ -333,7 +336,8 @@ async fn autobrr_check(
         service = "sporos",
         request_id = %request_id.0,
         announcement = %request.torrent_name,
-        indexer = request.indexer.as_deref().unwrap_or(""),
+        tracker = request.indexer.as_deref().unwrap_or(""),
+        tracker_name = request.indexer_name.as_deref().unwrap_or(""),
         normalized_title = release.primary_title.as_str(),
         video_kind = ?release.kind,
         decision = "accept",
@@ -357,6 +361,7 @@ struct AutobrrTorrentRequest {
     torrent_data: String,
     torrent_name: Option<String>,
     indexer: Option<String>,
+    indexer_name: Option<String>,
     category: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
@@ -393,7 +398,8 @@ async fn autobrr_torrent(
         service = "sporos",
         request_id = %request_id.0,
         announcement = request.torrent_name.as_deref().unwrap_or(""),
-        indexer = request.indexer.as_deref().unwrap_or(""),
+        tracker = request.indexer.as_deref().unwrap_or(""),
+        tracker_name = request.indexer_name.as_deref().unwrap_or(""),
         category = request.category.as_deref().unwrap_or(""),
         tag_count = request.tags.len(),
         encoded_bytes = request.torrent_data.len(),
@@ -543,6 +549,7 @@ fn validate_upload_metadata(
     }
     if !valid_optional(&request.torrent_name, 1024)
         || !valid_optional(&request.indexer, 128)
+        || !valid_optional(&request.indexer_name, 128)
         || !valid_optional(&request.category, 128)
         || request.tags.len() > 64
         || request

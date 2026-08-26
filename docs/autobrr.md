@@ -14,7 +14,8 @@ Send `POST /api/v1/autobrr/check` with
 {
   "torrentName": {{ toRawJson .TorrentName }},
   "size": {{ .Size }},
-  "indexer": {{ toRawJson .Indexer }}
+  "indexer": {{ toRawJson .Indexer }},
+  "indexerName": {{ toRawJson .IndexerName }}
 }
 ```
 
@@ -31,6 +32,7 @@ Send `POST /api/v1/autobrr/torrents` with the same optional bearer key:
   "torrentData": "{{ .TorrentDataRawBytes | toString | b64enc }}",
   "torrentName": {{ toRawJson .TorrentName }},
   "indexer": {{ toRawJson .Indexer }},
+  "indexerName": {{ toRawJson .IndexerName }},
   "category": {{ toRawJson .Category }},
   "tags": []
 }
