@@ -34,9 +34,11 @@ scripts/test-performance
 ```
 
 The release-mode inventory gate projects 10,000 torrents and streams 60,000
-files while enforcing a 512 MiB process peak. Matcher benchmarks record strict,
-flexible, partial, and season inputs. Run the service container itself under a
-1 GiB cgroup when collecting release measurements.
+files while enforcing a 512 MiB process peak. The idle-dispatch benchmark uses
+the live 14-orchestration/18-activity shape against a file-backed,
+single-connection SQLite provider. Matcher benchmarks record strict, flexible,
+partial, and season inputs. Run the service container itself under a 1 GiB
+cgroup when collecting release measurements.
 
 ## Soak
 

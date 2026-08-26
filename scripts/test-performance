@@ -3,4 +3,5 @@ set -euo pipefail
 
 cargo test --release -p sporos-service \
     target_inventory_stays_within_the_memory_budget -- --ignored --nocapture
+cargo bench -p sporos-service --bench idle_dispatch
 cargo bench -p sporos-matcher --bench matcher

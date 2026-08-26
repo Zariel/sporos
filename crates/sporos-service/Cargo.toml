@@ -42,3 +42,7 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "idle_dispatch"
+harness = false
