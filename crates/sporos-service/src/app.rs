@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -373,7 +373,7 @@ async fn projection_repair_loop(
                     )
                     .await
                 {
-                    Ok(report) if report.repaired > 0 => info!(
+                    Ok(report) if report.repaired > 0 => debug!(
                         service = "sporos",
                         inspected = report.inspected,
                         repaired = report.repaired,
@@ -421,7 +421,7 @@ async fn prowlarr_loop(
                         Ok(()) => {
                             backoff.reset();
                             next_run = tokio::time::Instant::now() + refresh_period;
-                            info!(service = "sporos", count = indexers.len(), "Prowlarr indexers refreshed");
+                            debug!(service = "sporos", count = indexers.len(), "Prowlarr indexers refreshed");
                         }
                         Err(error) => {
                             let delay = backoff.fail();
@@ -555,7 +555,7 @@ async fn qbit_loop(
                 match synchronizer.sync_once(now_ms()).await {
                     Ok(report) => {
                         if report.changed > 0 || !report.completions.is_empty() {
-                            info!(
+                            debug!(
                                 service = "sporos",
                                 changed = report.changed,
                                 completions = report.completions.len(),
@@ -598,7 +598,7 @@ async fn qbit_loop(
             _ = tokio::time::sleep_until(next_full.max(retry_not_before)), if contract_validated => {
                 match synchronizer.reconcile(now_ms()).await {
                     Ok(report) => {
-                        info!(
+                        debug!(
                             service = "sporos",
                             changed = report.changed,
                             completions = report.completions.len(),

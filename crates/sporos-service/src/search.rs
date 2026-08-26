@@ -286,12 +286,34 @@ impl SearchExecutor {
         };
         if let Some(next) = self.claim_indexer(input.indexer_id, now).await? {
             self.wait(input, next, "indexer_rate_limit").await?;
+            tracing::info!(
+                service = "sporos",
+                attempt_id = %hex(&input.attempt_id),
+                source_id = %hex(&input.source_id),
+                indexer_id = input.indexer_id,
+                indexer = %source.indexer_name,
+                decision = "wait",
+                reason = "indexer_rate_limit",
+                retry_in_ms = next.saturating_sub(now),
+                "Prowlarr indexer search deferred"
+            );
             return Ok(SearchOutcome::Waiting {
                 next_eligible_at: next,
                 delay_ms: u64::try_from(next.saturating_sub(now)).unwrap_or(u64::MAX),
             });
         }
         self.mark_searching(input, now).await?;
+        tracing::info!(
+            service = "sporos",
+            attempt_id = %hex(&input.attempt_id),
+            source_id = %hex(&input.source_id),
+            indexer_id = input.indexer_id,
+            indexer = %source.indexer_name,
+            normalized_title = source.release.primary_title.as_str(),
+            video_kind = ?source.release.kind,
+            query = ?query,
+            "Prowlarr indexer search started"
+        );
         let results = match self.client.search(input.indexer_id, &query).await {
             Ok(results) => results,
             Err(error) => return self.dependency_error(input, now, error).await,
@@ -310,7 +332,21 @@ impl SearchExecutor {
         let mut downloaded = 0_i64;
         for (ordinal, result) in results.into_iter().enumerate() {
             seen += 1;
-            let eligible = plausible(&source.release, source.total_size, &result);
+            let filter_reason = plausibility(&source.release, source.total_size, &result).err();
+            let eligible = filter_reason.is_none();
+            tracing::info!(
+                service = "sporos",
+                attempt_id = %hex(&input.attempt_id),
+                source_id = %hex(&input.source_id),
+                indexer_id = input.indexer_id,
+                indexer = %source.indexer_name,
+                result_ordinal = ordinal,
+                release = %result.title,
+                result_size = ?result.size,
+                decision = if eligible { "download" } else { "filter" },
+                reason = filter_reason.unwrap_or("plausible"),
+                "Prowlarr search result decided"
+            );
             self.summarize(
                 input,
                 ordinal,
@@ -572,21 +608,31 @@ impl SearchExecutor {
         );
         let calculated_ms =
             i64::try_from(calculated.as_millis()).expect("calculated retry delay fits i64");
-        let delay = match error {
+        let delay = match &error {
             ProwlarrError::RateLimited { retry_after } => retry_after
                 .and_then(|value| i64::try_from(value.as_millis()).ok())
                 .map_or(calculated_ms, |delay| delay.max(calculated_ms)),
             ProwlarrError::Request(_) => calculated_ms,
             ProwlarrError::HttpStatus(status)
                 if status.is_server_error()
-                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
-                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+                    || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
             {
                 calculated_ms
             }
             other => {
                 self.finish(input, now, "invalid_search_response", true, 0, 0)
                     .await?;
+                tracing::warn!(
+                    service = "sporos",
+                    attempt_id = %hex(&input.attempt_id),
+                    source_id = %hex(&input.source_id),
+                    indexer_id = input.indexer_id,
+                    decision = "fail",
+                    reason = "invalid_search_response",
+                    error = %crate::error_report::ErrorReport::new(other),
+                    "Prowlarr indexer search failed"
+                );
                 return Ok(SearchOutcome::Failed {
                     reason: other.to_string(),
                 });
@@ -605,6 +651,18 @@ impl SearchExecutor {
         .execute(self.storage.pool())
         .await?;
         self.wait(input, next, "dependency_unavailable").await?;
+        tracing::warn!(
+            service = "sporos",
+            attempt_id = %hex(&input.attempt_id),
+            source_id = %hex(&input.source_id),
+            indexer_id = input.indexer_id,
+            decision = "retry",
+            reason = "dependency_unavailable",
+            error = %crate::error_report::ErrorReport::new(&error),
+            dependency_attempt = attempt,
+            retry_in_ms = next.saturating_sub(now),
+            "Prowlarr indexer search failed"
+        );
         Ok(SearchOutcome::Waiting {
             next_eligible_at: next,
             delay_ms: u64::try_from(next.saturating_sub(now)).unwrap_or(u64::MAX),
@@ -1023,17 +1081,25 @@ struct SummaryUpdate<'a> {
     candidate_id: Option<[u8; 16]>,
 }
 
-fn plausible(
+fn plausibility(
     source: &ReleaseDescriptor,
     source_size: u64,
     result: &crate::torznab::TorznabResult,
-) -> bool {
-    if result.size == Some(0) || result.size.is_some_and(|size| size < source_size / 20) {
-        return false;
+) -> Result<(), &'static str> {
+    if result.size == Some(0) {
+        return Err("empty_result");
+    }
+    if result.size.is_some_and(|size| size < source_size / 20) {
+        return Err("result_too_small");
     }
     let candidate = parse_release(&result.title);
-    candidate.primary_title == source.primary_title
-        && (candidate.year.is_none() || source.year.is_none() || candidate.year == source.year)
+    if candidate.primary_title != source.primary_title {
+        return Err("title_mismatch");
+    }
+    if candidate.year.is_some() && source.year.is_some() && candidate.year != source.year {
+        return Err("year_mismatch");
+    }
+    Ok(())
 }
 
 fn source_allowed(category: &str, tags: &[String], filters: &SourceFilters) -> bool {
