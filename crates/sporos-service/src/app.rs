@@ -36,6 +36,10 @@ use crate::storage::Storage;
 const OUTBOX_INTERVAL: Duration = Duration::from_millis(100);
 const PROJECTION_REPAIR_INTERVAL: Duration = Duration::from_secs(5);
 const PROJECTION_REPAIR_BATCH_SIZE: usize = 32;
+// The SQLite provider returns immediately instead of long-polling. A one-second
+// idle interval retains bounded pickup latency without making every dispatcher
+// execute an empty transaction ten times per second.
+const DUROXIDE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
@@ -337,6 +341,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
 
 fn runtime_options(limits: &crate::config::Limits) -> RuntimeOptions {
     RuntimeOptions {
+        dispatcher_min_poll_interval: DUROXIDE_IDLE_POLL_INTERVAL,
         orchestration_concurrency: limits
             .max_candidate_workflows
             .saturating_add(limits.max_search_workflows)
